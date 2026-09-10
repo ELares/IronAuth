@@ -552,7 +552,11 @@ async fn discovery_advertises_the_verification_endpoint_and_nothing_ssf_puts_els
         doc["events_supported"],
         serde_json::json!([
             VERIFICATION_EVENT_TYPE,
-            ironauth_oidc::caep::SESSION_REVOKED
+            ironauth_oidc::caep::SESSION_REVOKED,
+            ironauth_oidc::risc::ACCOUNT_DISABLED,
+            ironauth_oidc::risc::ACCOUNT_ENABLED,
+            ironauth_oidc::risc::ACCOUNT_PURGED,
+            ironauth_oidc::risc::IDENTIFIER_CHANGED,
         ])
     );
 

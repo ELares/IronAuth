@@ -655,6 +655,15 @@ name = "ssf_session_fanout"
 path = "tests/ssf_session_fanout.rs"
 required-features = ["testing"]
 
+# The user lifecycle to RISC fan-out (issue #144 criterion 3): a REAL state change through
+# the store call an admin or SCIM write performs, reaching a receiver as the documented
+# RISC type. The producer lives inside `enqueue_domain_event`, so a hand-built message
+# would measure the consumer and miss the half that can actually be missing.
+[[test]]
+name = "ssf_lifecycle_fanout"
+path = "tests/ssf_lifecycle_fanout.rs"
+required-features = ["testing"]
+
 # Signup fraud review queue (issue #82, PR 2): a quarantined user re-consents on every
 # authorization and never receives a sensitive scope, and a risky signup is quarantined
 # (recoverable) instead of blocked when the flag is on. Needs a real database.

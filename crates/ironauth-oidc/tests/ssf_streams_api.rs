@@ -587,6 +587,10 @@ async fn discovery_advertises_only_what_is_mounted() {
         serde_json::json!([
             ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE,
             ironauth_oidc::caep::SESSION_REVOKED,
+            ironauth_oidc::risc::ACCOUNT_DISABLED,
+            ironauth_oidc::risc::ACCOUNT_ENABLED,
+            ironauth_oidc::risc::ACCOUNT_PURGED,
+            ironauth_oidc::risc::IDENTIFIER_CHANGED,
         ])
     );
 
@@ -818,7 +822,13 @@ async fn an_update_recomputes_what_the_transmitter_agreed_to_send() {
     let created = seeded_stream(&harness, &auth).await;
     let stream_id = created["stream_id"].as_str().expect("stream_id").to_owned();
 
-    let unsupported = "https://schemas.openid.net/secevent/risc/event-type/account-disabled";
+    // AN EVENT TYPE NOTHING EMITS, which has to be chosen with care: this was
+    // `account-disabled` until the RISC lifecycle fan-out landed (issue #144) and began
+    // emitting it, at which point this test would have gone vacuous -- every requested
+    // type deliverable, and "excludes what it cannot produce" with nothing to exclude.
+    // `credential-compromise` is RECEIVED from a Cross-Account Protection transmitter and
+    // never sent, so it is stably outside `EVENTS_SUPPORTED`.
+    let unsupported = ironauth_oidc::risc::CREDENTIAL_COMPROMISE;
     let body = serde_json::json!({
         "stream_id": stream_id,
         "events_requested": [

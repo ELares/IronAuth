@@ -22264,6 +22264,36 @@ pub const SSF_PUSH_CONSUMER: &str = "ssf.push";
 /// still exist is the one case that accumulates, and it is the operator's own act.
 pub const SSF_SESSION_FANOUT_CONSUMER: &str = "ssf.session_fanout";
 
+/// The registered consumer name the USER LIFECYCLE to Shared Signals fan-out drains under
+/// (issue #144 criterion 3).
+///
+/// One message is ONE domain event, and the handler explodes it into one RISC SET per
+/// stream that should hear about it. It is a sibling of [`SSF_SESSION_FANOUT_CONSUMER`]
+/// and separate from it for the same reason that one is separate from the back-channel
+/// fan-out: a failure minting a RISC event must not hold up a session revocation, which
+/// is the more urgent of the two.
+pub const SSF_LIFECYCLE_CONSUMER: &str = "ssf.lifecycle";
+
+/// The domain event types that become a RISC signal (issue #144 criterion 3).
+///
+/// THE PRODUCER'S SET, and the reason it lives in the store rather than beside the
+/// mapping that consumes it: [`enqueue_domain_event`] writes the trigger, and it runs
+/// here. `ironauth_oidc::risc` re-exports this rather than keeping a second list, because
+/// a type in one list and not the other is either a trigger no consumer can use or a
+/// lifecycle signal that never leaves.
+///
+/// It is a WHITELIST rather than a `user.` prefix test. `user.signed_in` and
+/// `user.created` are user events and neither is an account lifecycle transition, and a
+/// prefix test would turn every sign-in into a RISC fan-out.
+pub const SSF_LIFECYCLE_EVENT_TYPES: &[&str] = &[
+    "user.deactivated",
+    "user.state_changed",
+    "user.deleted",
+    "user.deprovisioned",
+    "user.identifier_added",
+    "user.identifier_removed",
+];
+
 /// The registered consumer name a dead-letter REPLAY COMMAND drains under (issue #106).
 ///
 /// A separate consumer from [`WEBHOOK_DELIVERY_CONSUMER`] rather than a special message on
@@ -22832,7 +22862,77 @@ pub(crate) async fn enqueue_domain_event(
             },
         )
         .await?;
+        enqueue_ssf_lifecycle_trigger(tx, env, scope, event).await?;
     }
+    Ok(())
+}
+
+/// Write the Shared Signals trigger for a domain event that is an account lifecycle
+/// transition (issue #144 criterion 3).
+///
+/// # This is on the path of EVERY domain write, so it does as little as possible
+///
+/// The first thing it does is a lookup against [`SSF_LIFECYCLE_EVENT_TYPES`], which is
+/// false for all but six of the catalog's types. Every other domain write pays one string
+/// comparison per entry and returns, and in particular pays no query: a sign-in, a token
+/// issuance and a client update never reach the read below.
+///
+/// # Why it asks whether a stream exists
+///
+/// The consumer that drains this runs only where `ssf.enabled` is set, because that is
+/// the switch its worker pool rides. A discriminator row written where no consumer runs
+/// stays in `outbox_messages` forever: nothing reaps unclaimed work and the application
+/// role has no DELETE on that table. A stream can only exist where the receiver-facing
+/// surface was mounted, so its presence is exactly the condition under which the consumer
+/// has work to do.
+///
+/// The read is bounded to ONE row and hits the `(tenant_id, environment_id, status)`
+/// index, and it runs INSIDE the caller's transaction rather than opening its own,
+/// because a separate connection could see a different snapshot and because the trigger
+/// must commit with the event it describes or not at all.
+///
+/// A deployment that turns `ssf.enabled` OFF while streams still exist is the one case
+/// that accumulates, and it is the operator's own act. It is also exactly what the
+/// pre-existing [`WEBHOOK_EVENT_CONSUMER`] row does when `webhooks.delivery_enabled` is
+/// off, which is why this is not a new hazard class.
+async fn enqueue_ssf_lifecycle_trigger(
+    tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
+    scope: Scope,
+    event: &DomainEvent<'_>,
+) -> Result<(), StoreError> {
+    let Some(event_type) = event.envelope.get("type").and_then(|t| t.as_str()) else {
+        return Ok(());
+    };
+    if !SSF_LIFECYCLE_EVENT_TYPES.contains(&event_type) {
+        return Ok(());
+    }
+    let any_stream: Option<i64> = sqlx::query_scalar(
+        "SELECT 1::bigint FROM ssf_streams          WHERE tenant_id = $1 AND environment_id = $2 AND status IN ('enabled', 'paused')          LIMIT 1",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(StoreError::Database)?;
+    if any_stream.is_none() {
+        return Ok(());
+    }
+    enqueue_outbox_in_tx(
+        tx,
+        env,
+        scope,
+        &NewOutboxMessage {
+            consumer: SSF_LIFECYCLE_CONSUMER,
+            // THE DOMAIN EVENT'S OWN ID, which its producer minted once. It is the same
+            // handle the webhook row uses, so a redelivery of either carries the same
+            // identity, and it is what the per-stream `jti` is derived from.
+            idempotency_key: event.id,
+            ordering_key: event.subject,
+            payload: event.envelope.clone(),
+        },
+    )
+    .await?;
     Ok(())
 }
 

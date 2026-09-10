@@ -223,6 +223,10 @@ fn the_advertised_events_are_exactly_the_ones_this_build_emits() {
         [
             ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE,
             ironauth_oidc::caep::SESSION_REVOKED,
+            ironauth_oidc::risc::ACCOUNT_DISABLED,
+            ironauth_oidc::risc::ACCOUNT_ENABLED,
+            ironauth_oidc::risc::ACCOUNT_PURGED,
+            ironauth_oidc::risc::IDENTIFIER_CHANGED,
         ],
         "the advertised event list is not the set this build can produce"
     );
@@ -239,12 +243,13 @@ fn the_advertised_events_are_exactly_the_ones_this_build_emits() {
             "{unemitted} is advertised but nothing emits it"
         );
     }
-    for advertised in EVENTS_SUPPORTED {
-        assert!(
-            !advertised.contains("/risc/"),
-            "a RISC event type is advertised before its vocabulary lands: {advertised}"
-        );
-    }
+    // AND THE INBOUND-ONLY RISC TYPE STAYS OUT. `credential-compromise` is a signal this
+    // build RECEIVES from a Cross-Account Protection transmitter, never one it sends, so
+    // advertising it would invite a receiver to subscribe to something we never emit.
+    assert!(
+        !EVENTS_SUPPORTED.contains(&ironauth_oidc::risc::CREDENTIAL_COMPROMISE),
+        "an inbound-only type is advertised as emitted"
+    );
 }
 
 #[tokio::test]

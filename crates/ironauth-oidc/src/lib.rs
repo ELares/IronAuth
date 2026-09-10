@@ -178,6 +178,8 @@ mod registry;
 mod resource;
 mod response;
 mod revocation;
+/// The RISC vocabulary: this deployment's user lifecycle as Shared Signals states it (#144).
+pub mod risc;
 mod risk;
 mod risk_signals;
 pub mod routing;
@@ -434,7 +436,7 @@ pub use sector::{
     SectorError, check_sector_document, sector_uri_required, validate_sector_identifier,
 };
 pub use session::{PEER_IP_HEADER, SESSION_COOKIE, clear_set_cookie};
-pub use ssf_fanout::SsfSessionFanOutConsumer;
+pub use ssf_fanout::{SsfLifecycleFanOutConsumer, SsfSessionFanOutConsumer};
 pub use state::{
     OidcState, PASSWORD_BREACHED_AT_LOGIN_TOTAL, PASSWORD_SCREEN_TOTAL, ResourceTargetError,
     describe_screening_metrics,

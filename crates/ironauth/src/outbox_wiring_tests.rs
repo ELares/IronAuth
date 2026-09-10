@@ -910,9 +910,10 @@ async fn ssf_consumers_are_registered_by_name() {
         // eye rather than a restatement of the code.
         vec![
             ironauth_store::SESSION_ENDED_CONSUMER,
+            ironauth_store::SSF_LIFECYCLE_CONSUMER,
             ironauth_store::SSF_PUSH_CONSUMER,
             ironauth_store::SSF_SESSION_FANOUT_CONSUMER,
         ],
-        "the Shared Signals worker must register its producer as well as its two drains"
+        "the Shared Signals worker must register its producer as well as its three drains"
     );
 }

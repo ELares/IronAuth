@@ -58,11 +58,20 @@ pub const VERIFICATION_EVENT_TYPE: &str =
 /// was empty while nothing produced a SET, gained the verification event with the verification
 /// endpoint, and gains `session-revoked` with the session-end fan-out (issue #144).
 ///
-/// STILL NO OTHER CAEP TYPE AND NO RISC TYPE. `caep::CREDENTIAL_CHANGE` and its neighbours are
-/// defined in the vocabulary but have no producer, so they stay out of this list;
-/// `caep::tests::the_defined_but_unemitted_types_are_not_advertised` is what keeps the two
-/// facts from drifting apart.
-pub const EVENTS_SUPPORTED: &[&str] = &[VERIFICATION_EVENT_TYPE, crate::caep::SESSION_REVOKED];
+/// STILL NO TYPE WITHOUT A PRODUCER. `caep::CREDENTIAL_CHANGE` and its neighbours are defined
+/// in the vocabulary and emitted by nothing, and `risc::CREDENTIAL_COMPROMISE` is a type this
+/// build RECEIVES rather than sends; all of them stay out of this list.
+/// `caep::tests::the_defined_but_unemitted_types_are_not_advertised` and
+/// `risc::tests::the_inbound_only_type_is_not_advertised_as_emitted` keep those facts from
+/// drifting apart.
+pub const EVENTS_SUPPORTED: &[&str] = &[
+    VERIFICATION_EVENT_TYPE,
+    crate::caep::SESSION_REVOKED,
+    crate::risc::ACCOUNT_DISABLED,
+    crate::risc::ACCOUNT_ENABLED,
+    crate::risc::ACCOUNT_PURGED,
+    crate::risc::IDENTIFIER_CHANGED,
+];
 
 /// The event types this build can actually deliver to a stream negotiating `format`.
 ///
@@ -70,11 +79,11 @@ pub const EVENTS_SUPPORTED: &[&str] = &[VERIFICATION_EVENT_TYPE, crate::caep::SE
 /// that an event type is only deliverable if this build can name its subject in the
 /// format the stream asked for.
 ///
-/// `email` is the case that bites. A session end names the user by internal id, and there
-/// is no read that turns that into an address a receiver would recognise, so the
-/// session-end fan-out cannot serve an `email` stream. SSF's own verification event is
-/// different: section 7.1.4 pins its `sub_id` to `opaque` whatever the stream negotiated,
-/// so it is deliverable to every stream regardless.
+/// `email` is the case that bites. A session end and a user lifecycle change both name the
+/// user by internal id, and there is no read that turns that into an address a receiver
+/// would recognise, so neither fan-out can serve an `email` stream. SSF's own verification
+/// event is different: section 7.1.4 pins its `sub_id` to `opaque` whatever the stream
+/// negotiated, so it is deliverable to every stream regardless.
 ///
 /// This exists because `events_delivered` is a PROMISE. A transmitter that put
 /// `session-revoked` in an `email` stream's `events_delivered` would be telling that
