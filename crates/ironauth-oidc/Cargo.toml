@@ -613,6 +613,10 @@ name = "ssf_set"
 path = "tests/ssf_set.rs"
 
 [[test]]
+name = "ssf_set_corpus"
+path = "tests/ssf_set_corpus.rs"
+
+[[test]]
 name = "ssf_streams_api"
 path = "tests/ssf_streams_api.rs"
 required-features = ["testing"]

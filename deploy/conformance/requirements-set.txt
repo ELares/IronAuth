@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The SECOND JOSE implementation, for the external SET validation lane (issue #143).
+#
+# #143's criterion is that emitted Security Event Tokens "validate with an
+# external, independent JWT/SET library against the environment JWKS". That is
+# the one obligation this repository CANNOT meet with its own code: verifying an
+# ironauth-jose signature with ironauth-jose is one implementation agreeing with
+# itself, and a shared misreading of RFC 8417 or RFC 7515 passes in both
+# directions. So scripts/validate-set-external.py deliberately depends on a third
+# party, which is the exact opposite of the stdlib-only rule the other gates
+# follow, and the reason is stated here so nobody "fixes" it later.
+#
+# SEPARATE FROM requirements.txt because the packages are separate concerns and
+# the jobs that need them are different ones. The conformance harness needs a
+# YAML parser and an HTTP client; this lane needs a JOSE library and its crypto
+# backend. Folding them together would make every conformance job install a
+# cryptography wheel it never imports.
+#
+# Pinned to ONE version and ONE artifact hash, transitive closure included, for
+# the reason requirements.txt states: a range means a rerun months later resolves
+# different code. Install with --require-hashes so pip REFUSES anything whose
+# bits do not match:
+#
+#     pip install --require-hashes -r requirements-set.txt
+#
+# The hashes are for CPython 3.12 on linux x86_64, which is what CI pins with
+# actions/setup-python. On another platform (a developer's macOS box) the wheel
+# legitimately differs, so install the same exact versions without the flag:
+#
+#     pip install -r requirements-set.txt
+#
+# WHO NEEDS WHAT
+#   PyJWT         the independent verifier. The whole point of the lane.
+#   cryptography  PyJWT's backend for EdDSA, ECDSA and RSA. PyJWT verifies
+#                 nothing but HMAC without it, so the three algorithms a
+#                 provisioned environment actually holds all route through here.
+#   cffi          cryptography's binding layer.
+#   pycparser     cffi's parser.
+#
+# TO BUMP: change the version, then re-resolve the hash with
+#     pip download --no-deps --only-binary=:all: \
+#         --platform manylinux2014_x86_64 --python-version 3.12 \
+#         --implementation cp --abi cp312 <pkg>==<version>
+#     pip hash <the downloaded artifact>
+
+PyJWT==2.10.1 \
+    --hash=sha256:dcdd193e30abefd5debf142f9adfcdd2b58004e644f25406ffaebd50bd98dacb
+
+cryptography==50.0.1 \
+    --hash=sha256:ff838d62ec1bfce4f9ba7fa16f4a7b554cd8d0c299e6be37502161a660c84eef
+
+cffi==2.1.1 \
+    --hash=sha256:c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf
+
+pycparser==3.0 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
