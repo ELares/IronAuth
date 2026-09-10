@@ -86,8 +86,17 @@ cold_p95_micros = 1000
 # ratio onto another machine's numbers is a guess wearing a calculation, and the spread on that
 # runner has been wide enough in the past to reach 100 from here.
 #
-# So: the criterion holds today and the RELATIVE check below is what will say whether it keeps
-# holding. That is the arm this file's baseline exists for.
+# So: the criterion holds today, and the question is what will say whether it keeps holding.
+#
+# THIS SENTENCE USED TO ANSWER "the relative check below", AND FOR WARM THAT IS FALSE. With the
+# recorded baseline at 91.204us the warm regression arm is unreachable -- the arithmetic is
+# thirty lines down, beside the gate it cannot fire before. A reader who stopped here would
+# take the opposite of the truth away, which is why the correction is here rather than only
+# there.
+#
+# What actually guards warm is the ABSOLUTE gate. What the relative arm guards is COLD, where
+# the baseline sits far enough under its own bound for a delta to fire first, and that is the
+# arm this file's baseline earns its keep on.
 #
 # Measured on one machine, same benchmark, THREE runs each side, with the before taken by
 # checking out main's `engine.rs` rather than by stashing (stashing leaves the committed change
