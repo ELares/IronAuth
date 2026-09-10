@@ -642,3 +642,39 @@ async fn a_set_carrying_several_events_is_refused_rather_than_partly_applied() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(live_sessions(&harness, &user).await, 1);
 }
+
+#[tokio::test]
+async fn a_subject_at_another_issuer_is_refused() {
+    // `sub_id.iss` is a value INSIDE the token, so it is chosen by whoever minted it, and
+    // it feeds straight into the account-link lookup that decides whose sessions end. A
+    // transmitter may speak only about its OWN subjects.
+    //
+    // Today the deployment's connector holds only Google links, so a foreign subject would
+    // also fail to resolve -- which is exactly why this test pins the CHECK rather than the
+    // outcome: point `connector_id` at a connector carrying links from several issuers and
+    // the resolve stops being a fence, while this stays one.
+    let mut harness = Harness::start_store_backed().await;
+    let key = transmitter_key(1);
+    let user = seed_linked_user(&harness, "foreignsub@example.test").await;
+    seed_session_and_device(&harness, &user, 42).await;
+    harness.enable_risc_receiver(&receiver_config(&key));
+    let (path, audience) = scope_path_and_audience(&harness);
+    let now = epoch_secs(harness.state().now());
+
+    let set = signed_set(
+        &key,
+        GOOGLE_ISS,
+        &audience,
+        now,
+        "jti-foreign-subject",
+        CREDENTIAL_COMPROMISE,
+        // The TRANSMITTER is Google and the token is genuinely Google-signed; only the
+        // subject claims to belong to somebody else.
+        "https://login.microsoftonline.com/common/v2.0",
+        GOOGLE_SUB,
+    );
+    let (status, _headers, body) = harness.send(push(&path, set)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(live_sessions(&harness, &user).await, 1);
+    assert_eq!(live_devices(&harness, &user).await, 1);
+}

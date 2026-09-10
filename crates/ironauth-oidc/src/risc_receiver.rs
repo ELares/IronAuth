@@ -172,7 +172,7 @@ pub(crate) async fn receive(
         return rejected();
     }
 
-    let Some(signal) = parse_signal(&verified) else {
+    let Some(signal) = parse_signal(&verified, &cfg.issuer) else {
         return rejected();
     };
 
@@ -236,7 +236,7 @@ fn server_error() -> Response {
 /// reading a different subject from the one that was sent. It also keeps address-matching
 /// structurally out of reach: nothing here ever resolves a local user from an email, so a
 /// transmitter cannot end the sessions of everyone whose address it can name.
-fn parse_signal(verified: &VerifiedToken) -> Option<Signal> {
+fn parse_signal(verified: &VerifiedToken, transmitter: &str) -> Option<Signal> {
     let claims = verified.claims();
     let jti = claims
         .get("jti")
@@ -253,11 +253,20 @@ fn parse_signal(verified: &VerifiedToken) -> Option<Signal> {
     if sub_id.get("format").and_then(Value::as_str)? != "iss_sub" {
         return None;
     }
+    // THE SUBJECT'S ISSUER MUST BE THE TRANSMITTER. `sub_id.iss` is a value inside the
+    // token, so it is chosen by whoever minted it, and it feeds straight into the
+    // account-link lookup that decides WHOSE sessions end. Pinning it says a transmitter
+    // may speak only about its own subjects: Google may tell us about Google accounts,
+    // and a Google-signed token naming a subject at some other issuer is refused rather
+    // than resolved against whatever connector happens to be configured.
+    //
+    // It is also the real wire format. Google Cross-Account Protection sets `sub_id.iss`
+    // to its own issuer, so nothing conforming is lost.
     let subject_issuer = sub_id
         .get("iss")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|iss| !iss.is_empty())?
+        .filter(|iss| !iss.is_empty() && *iss == transmitter)?
         .to_owned();
     let subject = sub_id
         .get("sub")
