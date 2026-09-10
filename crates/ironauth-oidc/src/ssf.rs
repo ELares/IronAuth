@@ -53,6 +53,15 @@ use serde::Deserialize;
 use crate::client_auth::{ClientAuthInputs, ClientAuthMethod, authenticate_client_self_scoped};
 use crate::error::TokenError;
 use crate::ssf_set::EVENTS_SUPPORTED;
+
+/// The Shared Signals specification version this transmitter implements.
+///
+/// The CAEP Interoperability Profile section 2.3.1 requires `spec_version` in the
+/// transmitter configuration document and requires its value to be `1_0` or greater. SSF
+/// 1.0 is the FINAL specification this build implements, so `1_0` is the truthful answer;
+/// claiming a later one to look current would tell a receiver to apply rules this
+/// transmitter does not follow.
+pub const SSF_SPEC_VERSION: &str = "1_0";
 use crate::state::OidcState;
 use crate::util::client_service_actor;
 
@@ -1583,15 +1592,22 @@ pub async fn configuration(
     // transmitter. `verification_endpoint`, `add_subject_endpoint` and
     // `remove_subject_endpoint` each appeared here in the slice that mounted it, never before.
     //
-    // `default_subjects` IS STILL ABSENT, and deliberately. It would tell a receiver whether a
-    // new stream starts subscribed to everyone or to no one, and that is a claim about a
-    // fan-out this build does not have: the CAEP and RISC vocabularies are the next issue's, so
-    // nothing yet reads the subject list at all. Advertising a default for a decision nothing
-    // makes would be the same defect as advertising an event type nothing emits.
+    // `default_subjects` IS STILL ABSENT, and still deliberately, though the reason has
+    // changed. It used to be that nothing read the subject list at all; the CAEP and RISC
+    // fan-outs (issues #144) now do. What is still missing is a DEFAULT: a new stream
+    // starts with an empty filter, which `SsfStreamSubjectRepo::count` defines as "no
+    // filter, tell me everything", and SSF gives no vocabulary for saying that here. A
+    // value invented for this field would be a claim about a policy nothing applies.
     json(
         StatusCode::OK,
         &serde_json::json!({
             "issuer": issuer,
+            // REQUIRED BY THE CAEP INTEROPERABILITY PROFILE section 2.3.1, which says the
+            // value MUST be `1_0` or greater. It was absent, which is the one field of the
+            // profile's seven that this document was missing, and its absence is exactly
+            // the kind a receiver cannot work around: the profile has receivers read this
+            // to decide which version's rules to apply.
+            "spec_version": SSF_SPEC_VERSION,
             // THE HELPER, not a hand-written path. This said
             // `{issuer}/.well-known/jwks.json`, which nothing mounts: the served route is
             // `{issuer}/jwks.json`. A receiver bootstraps from this document to fetch the keys

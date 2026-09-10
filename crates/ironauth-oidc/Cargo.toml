@@ -607,6 +607,14 @@ required-features = ["testing"]
 # Google RISC SET through the real router, asserting the configured protections reach the
 # LINKED local user with an audit trail, and that a forged, replayed, wrong-audience,
 # wrong-issuer or stale token protects nothing.
+# The CAEP Interoperability Profile as executable requirements (issue #144 criterion 6):
+# one test per normative transmitter requirement, each traceable from
+# docs/conformance/caep-interop-checklist.md and enforced by scripts/caep-interop-scan.sh.
+[[test]]
+name = "caep_interop_profile"
+path = "tests/caep_interop_profile.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "risc_receiver"
 path = "tests/risc_receiver.rs"
