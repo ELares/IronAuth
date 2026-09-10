@@ -3570,7 +3570,10 @@ async fn a_neighbours_contact_is_not_removed_and_answers_as_a_success_does() {
     let neighbour = add_contact(&harness, &theirs, "ops@initech.test", "technical").await;
     let cookie = open_session_in(&harness, "contacts", "k-probe", &mine).await;
 
-    let form = format!("action=remove&contact={}", urlencode(&neighbour.to_string()));
+    let form = format!(
+        "action=remove&contact={}",
+        urlencode(&neighbour.to_string())
+    );
     let (foreign_status, _, body) = harness
         .post_form(&change_path(&harness), &form, Some(&cookie))
         .await;
@@ -3600,7 +3603,11 @@ async fn a_neighbours_contact_is_not_removed_and_answers_as_a_success_does() {
     // AND A MALFORMED FIELD IS THE ONE THAT DIFFERS, which is fine: it reveals nothing about
     // who exists, only that the request was not well formed.
     let (status, _, body) = harness
-        .post_form(&change_path(&harness), "action=remove&contact=not-a-handle", Some(&cookie))
+        .post_form(
+            &change_path(&harness),
+            "action=remove&contact=not-a-handle",
+            Some(&cookie),
+        )
         .await;
     assert_eq!(status, 400, "{body}");
 }
