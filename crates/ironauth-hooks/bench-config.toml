@@ -89,10 +89,16 @@ cold_p95_micros = 1000
 # So: the criterion holds today, and the question is what will say whether it keeps holding.
 #
 # THIS SENTENCE USED TO ANSWER "the relative check below", AND FOR WARM THAT IS FALSE. With the
-# recorded baseline at 91.204us the warm regression arm is unreachable -- the arithmetic is
-# thirty lines down, beside the gate it cannot fire before. A reader who stopped here would
-# take the opposite of the truth away, which is why the correction is here rather than only
-# there.
+# recorded baseline at 91.204us the warm regression arm is never the BINDING one: it can fire,
+# and does at 136.9us and above, but the absolute gate has already failed the run by then, so
+# it never decides an outcome on its own. The arithmetic sits beside the warm gate below. A
+# reader who stopped here would take the opposite of the truth away, which is why the
+# correction is here rather than only there.
+#
+# NOT "unreachable", which is what the first draft of this said and what the gate script warns
+# about in as many words: "unreachable" is the claim each of the three previous rounds turned
+# out to be wrong about. The arm runs on every CI pass and prints on a large enough warm
+# regression; what it cannot do is be the reason a run failed.
 #
 # What actually guards warm is the ABSOLUTE gate. What the relative arm guards is COLD, where
 # the baseline sits far enough under its own bound for a delta to fire first, and that is the
@@ -119,11 +125,13 @@ cold_p95_micros = 1000
 # would infer from 17us. That is recorded here because the margin is the thing a future
 # change has to respect, and reading it off the dev-machine figures would badly overestimate it.
 #
-# One consequence worth stating: with a baseline that close to the bound, the regression
-# check on warm is unreachable. The gate allows a baseline plus its tolerance, and
-# 91.204 * 1.5 is past 100, so the ABSOLUTE gate always fires first. The warm baseline
-# therefore records a figure rather than enforcing a delta, and it is the cold number where
-# the regression check does real work.
+# One consequence worth stating: with a baseline that close to the bound, the warm regression
+# check is never the binding arm. The gate allows a baseline plus its tolerance, and
+# 91.204 * 1.5 is 136.806, past this 100 gate, so the ABSOLUTE gate always fails the run
+# first. The relative arm still runs and still prints above 136.806; it simply cannot be the
+# reason a run failed. The warm baseline therefore records a figure rather than enforcing a
+# delta, and it is the cold number where the regression check does real work -- there
+# 384.886 * 1.5 is 577.329, comfortably under the 1000 gate, so the delta fires first.
 warm_p95_micros = 100
 
 [target]
