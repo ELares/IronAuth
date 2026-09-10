@@ -52,11 +52,12 @@ use ironauth_jose::{EmissionOptions, TokenTyp, sign_jws_with_policy};
 use ironauth_store::outbox::{ConsumerError, OutboxConsumer};
 use ironauth_store::{
     BACKCHANNEL_LOGOUT_CONSUMER, IssuedTokenId, NewOutboxMessage, OutboxMessage,
-    SESSION_ENDED_CONSUMER, Scope, SessionId, Store,
+    SESSION_ENDED_CONSUMER, SSF_SESSION_FANOUT_CONSUMER, Scope, SessionId, Store,
 };
 use serde_json::json;
 
 use crate::issuer::IssuerRegistry;
+use crate::ssf_fanout;
 
 /// The `events` member value: the back-channel-logout event URI mapping to an empty
 /// object (OIDC Back-Channel Logout 2.4).
@@ -225,6 +226,20 @@ impl LogoutSender for FetchLogoutSender {
 /// The payload key naming the ended SSO session, written by the session-ended producer
 /// and read by [`SessionEndedExplodeConsumer`].
 const PAYLOAD_SESSION_ID: &str = "session_id";
+/// The payload key naming the user the ended session belonged to.
+///
+/// Written by the session-ended producer and forwarded onto the Shared Signals trigger.
+/// This spelling and the producer's are two literals that must agree, and nothing in the
+/// type system makes them: `the_shared_signals_trigger_reads_the_producers_own_keys` is
+/// what holds them together, by driving a REAL session end rather than a hand-built
+/// payload.
+const PAYLOAD_SUBJECT: &str = "subject";
+/// The payload key carrying the internal end cause, as `SessionEndCause::as_str` spells
+/// it. See [`PAYLOAD_SUBJECT`] for what keeps this literal honest.
+const PAYLOAD_CAUSE: &str = "cause";
+/// The payload key carrying when the session ended, in microseconds. See
+/// [`PAYLOAD_SUBJECT`] for what keeps this literal honest.
+const PAYLOAD_OCCURRED_AT: &str = "occurred_at_unix_micros";
 /// The payload key naming the target relying party on a per-RP delivery message.
 const PAYLOAD_CLIENT_ID: &str = "client_id";
 /// The payload key carrying THAT client's own per-(client, session) `sid`.
@@ -356,7 +371,7 @@ impl SessionEndedExplodeConsumer {
                 })
             })
             .collect();
-        let messages: Vec<NewOutboxMessage<'_>> = keys
+        let mut messages: Vec<NewOutboxMessage<'_>> = keys
             .iter()
             .zip(payloads)
             .map(|(key, payload)| NewOutboxMessage {
@@ -368,11 +383,78 @@ impl SessionEndedExplodeConsumer {
                 payload,
             })
             .collect();
+        // THE SHARED SIGNALS TRIGGER, in the SAME slice so it commits with the deliveries
+        // above or not at all. It is one message, not one per stream: the per-stream
+        // explode belongs to the consumer that can fail without taking these deliveries
+        // down with it. See `ssf_fanout` for why the two are separate consumers.
+        let ssf_payload = self
+            .ssf_trigger_payload(env, scope, message, session_text)
+            .await?;
+        if let Some(payload) = &ssf_payload {
+            messages.push(NewOutboxMessage {
+                consumer: SSF_SESSION_FANOUT_CONSUMER,
+                idempotency_key: session_text,
+                // The session is the ordering group, so one subject's ends reach a stream
+                // in the order they happened.
+                ordering_key: session_text,
+                payload: payload.clone(),
+            });
+        }
         scoped
             .outbox()
             .enqueue_all(env, &messages)
             .await
             .map_err(|_| ConsumerError::retryable(STORE_ERROR_LABEL))
+    }
+
+    /// The Shared Signals trigger payload, or `None` when there is nothing to trigger.
+    ///
+    /// # Why this asks whether a stream exists
+    ///
+    /// The fan-out consumer runs only where `ssf.enabled` is set, because that is the
+    /// switch its worker pool rides. A discriminator row written where no consumer runs
+    /// stays in `outbox_messages` forever: nothing reaps unclaimed work and the
+    /// application role has no DELETE on that table. Asking whether ANY stream retains
+    /// events is exactly the condition under which the consumer has work to do, and a
+    /// stream can only exist where the receiver-facing surface was mounted.
+    ///
+    /// It is a query on the session-end path, which is a hot path, so it is bounded to
+    /// ONE row and reads an index. It is here rather than inside the session-end
+    /// TRANSACTION for the reason the module header gives for the whole fan-out.
+    ///
+    /// A read failure is retryable rather than swallowed: returning `None` on error would
+    /// silently drop a security signal every time the database hiccuped, and the
+    /// back-channel deliveries in the same slice are re-enqueued idempotently on retry.
+    async fn ssf_trigger_payload(
+        &self,
+        env: &Env,
+        scope: Scope,
+        message: &OutboxMessage,
+        session_text: &str,
+    ) -> Result<Option<serde_json::Value>, ConsumerError> {
+        let any_stream = self
+            .store
+            .scoped(scope)
+            .ssf_streams()
+            .retaining_in_scope(1)
+            .await
+            .map_err(|_| ConsumerError::retryable(STORE_ERROR_LABEL))?;
+        if any_stream.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(json!({
+            ssf_fanout::PAYLOAD_SESSION_ID: session_text,
+            ssf_fanout::PAYLOAD_SUBJECT: payload_str(message, PAYLOAD_SUBJECT)?,
+            ssf_fanout::PAYLOAD_CAUSE: payload_str(message, PAYLOAD_CAUSE)?,
+            ssf_fanout::PAYLOAD_OCCURRED_AT: message
+                .payload
+                .get(PAYLOAD_OCCURRED_AT)
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))?,
+            // Minted HERE, once, and carried on the immutable payload, so every attempt
+            // of this fan-out derives the SAME per-stream jti. See `ssf_fanout`.
+            ssf_fanout::PAYLOAD_JTI: IssuedTokenId::generate(env, &scope).to_string(),
+        })))
     }
 }
 

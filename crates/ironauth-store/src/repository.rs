@@ -22240,6 +22240,27 @@ pub const WEBHOOK_DELIVERY_CONSUMER: &str = "webhook.delivery";
 /// block each other.
 pub const SSF_PUSH_CONSUMER: &str = "ssf.push";
 
+/// The registered consumer name the SESSION-END to Shared Signals fan-out drains under
+/// (issue #144).
+///
+/// One message is ONE ENDED SESSION, and the handler explodes it into one SET per stream
+/// that retains the subject. It is a SEPARATE consumer from
+/// [`SESSION_ENDED_CONSUMER`] rather than more work inside that handler because the two
+/// have different failure domains: an environment with no usable signing key cannot mint a
+/// SET, and folding that into the back-channel fan-out would dead-letter every relying
+/// party's logout over a Shared Signals problem they have no stake in.
+///
+/// # Why a message is only produced when a stream exists
+///
+/// This consumer runs only where `ssf.enabled` is set, because that is the switch its
+/// worker pool rides. A discriminator row written where no consumer runs would sit in
+/// `outbox_messages` forever: the table has no reaper for unclaimed work and grants the
+/// application role no DELETE. The producer therefore asks whether ANY stream retains
+/// events before it writes the row, which is exactly the condition under which this
+/// consumer has something to do. A deployment that turns `ssf.enabled` OFF while streams
+/// still exist is the one case that accumulates, and it is the operator's own act.
+pub const SSF_SESSION_FANOUT_CONSUMER: &str = "ssf.session_fanout";
+
 /// The registered consumer name a dead-letter REPLAY COMMAND drains under (issue #106).
 ///
 /// A separate consumer from [`WEBHOOK_DELIVERY_CONSUMER`] rather than a special message on

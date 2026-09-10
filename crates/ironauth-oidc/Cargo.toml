@@ -646,6 +646,15 @@ name = "ssf_receiver_conformance"
 path = "tests/ssf_receiver_conformance.rs"
 required-features = ["testing"]
 
+# The session-end to CAEP `session-revoked` fan-out (issue #144): the first general
+# producer the Shared Signals subsystem has. Drives a REAL revoke through the real explode
+# and the real fan-out, which is what proves the mapping table reaches a stream and what
+# gives issue #143's per-stream subject rendering its end-to-end proof.
+[[test]]
+name = "ssf_session_fanout"
+path = "tests/ssf_session_fanout.rs"
+required-features = ["testing"]
+
 # Signup fraud review queue (issue #82, PR 2): a quarantined user re-consents on every
 # authorization and never receives a sensitive scope, and a risky signup is quarantined
 # (recoverable) instead of blocked when the flag is on. Needs a real database.

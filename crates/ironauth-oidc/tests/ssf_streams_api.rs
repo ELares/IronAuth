@@ -112,10 +112,15 @@ async fn a_receiver_creates_reads_and_deletes_its_own_stream() {
     assert!(stream_id.starts_with("sst_"), "{body}");
     assert_eq!(created["delivery"]["method"], "urn:ietf:rfc:8935");
     assert_eq!(created["format"], "email");
-    // WHAT IT AGREED TO SEND is the intersection with what this build emits, which is empty
-    // until the vocabularies land. The receiver can SEE that the type it asked for is not
-    // coming, which is the whole reason both halves are published.
-    assert_eq!(created["events_delivered"], serde_json::json!([]));
+    // WHAT IT AGREED TO SEND is the intersection with what this build emits. This asked for
+    // CAEP `session-revoked`, the session-end fan-out emits it (issue #144), so it comes
+    // back. It was `[]` while nothing produced that type, and the change is the point: the
+    // receiver reads this field to learn which of the types it asked for are actually
+    // coming, and it has to move when a producer lands.
+    assert_eq!(
+        created["events_delivered"],
+        serde_json::json!([ironauth_oidc::caep::SESSION_REVOKED])
+    );
     assert_eq!(
         created["events_requested"].as_array().expect("array").len(),
         1
@@ -563,12 +568,17 @@ async fn discovery_advertises_only_what_is_mounted() {
         doc.get("default_subjects").is_none(),
         "a default-subjects policy is advertised that no fan-out applies: {body}"
     );
-    // AND EXACTLY THE EVENT TYPES THIS BUILD EMITS, which is now SSF's own verification event
-    // and still nothing from CAEP or RISC. Asserting emptiness was right while nothing produced
-    // a SET; asserting only non-emptiness would pass the day a type nothing emits was added.
+    // AND EXACTLY THE EVENT TYPES THIS BUILD EMITS: SSF's own verification event, and CAEP
+    // `session-revoked` now that the session-end fan-out produces it (issue #144). Still
+    // nothing else from CAEP and nothing from RISC. Asserting emptiness was right while
+    // nothing produced a SET; asserting only non-emptiness would pass the day a type nothing
+    // emits was added, which is the failure this exact-equality exists to prevent.
     assert_eq!(
         doc["events_supported"],
-        serde_json::json!([ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE])
+        serde_json::json!([
+            ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE,
+            ironauth_oidc::caep::SESSION_REVOKED,
+        ])
     );
 
     // THE HOLD POLICY IS PUBLISHED, because the poll response cannot carry it. RFC 8936 makes

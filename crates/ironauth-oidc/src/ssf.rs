@@ -347,12 +347,11 @@ pub async fn create_stream(
     // is computed here rather than echoed back: a receiver that asked for an event type this
     // build does not produce must be able to SEE that it is not coming.
     //
-    // THE INTERSECTION IS NO LONGER ALWAYS EMPTY. This comment said it was, which was true
-    // while `EVENTS_SUPPORTED` was, and the verification endpoint changed that: a receiver
-    // asking for SSF's verification event now gets it back in `events_delivered`. The CAEP and
-    // RISC vocabularies are still the next issue's, so every other request is still refused by
-    // omission. The `a_receiver_is_told_which_of_its_requested_events_will_arrive` test drives
-    // both halves.
+    // THE INTERSECTION GROWS WITH `EVENTS_SUPPORTED` AND NOWHERE ELSE. It was empty while that
+    // list was, gained SSF's verification event with the verification endpoint, and gains
+    // CAEP's `session-revoked` with the session-end fan-out (issue #144). Every event type
+    // without a producer -- the rest of CAEP, all of RISC -- is still refused by omission. The
+    // `a_receiver_is_told_which_of_its_requested_events_will_arrive` test drives both halves.
     let delivered: Vec<String> = request
         .events_requested
         .iter()

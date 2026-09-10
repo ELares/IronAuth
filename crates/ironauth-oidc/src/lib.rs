@@ -85,6 +85,7 @@ mod backchannel;
 mod backchannel_approve;
 pub mod branding;
 mod broker_overlay;
+pub mod caep;
 mod challenge;
 /// Client ID Metadata Document hardening (issue #128): the pure rules a URL `client_id`
 /// and its fetched document must satisfy before either is trusted.
@@ -194,6 +195,8 @@ mod sms_conversion;
 mod sms_otp;
 /// Shared Signals stream management and discovery (#143).
 pub mod ssf;
+/// The session-end to Shared Signals fan-out: CAEP `session-revoked` per stream (#144).
+pub mod ssf_fanout;
 /// RFC 8935 push delivery for Shared Signals streams (#143).
 pub mod ssf_push;
 /// Security Event Tokens: the RFC 8417 framing a Shared Signals transmitter mints (#143).
@@ -431,6 +434,7 @@ pub use sector::{
     SectorError, check_sector_document, sector_uri_required, validate_sector_identifier,
 };
 pub use session::{PEER_IP_HEADER, SESSION_COOKIE, clear_set_cookie};
+pub use ssf_fanout::SsfSessionFanOutConsumer;
 pub use state::{
     OidcState, PASSWORD_BREACHED_AT_LOGIN_TOTAL, PASSWORD_SCREEN_TOTAL, ResourceTargetError,
     describe_screening_metrics,

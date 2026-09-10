@@ -10,12 +10,12 @@
 //! # What this module does NOT decide
 //!
 //! It does not decide WHAT happened. [`SecurityEvent`] carries an event type URI and an opaque
-//! payload, and this module never inspects either: the CAEP and RISC vocabularies -- which URI
-//! means "the session was revoked" and what its payload must contain -- are the next issue's,
-//! and [`EVENTS_SUPPORTED`] names only SSF's own verification event until they land. A
-//! transmitter that named
-//! event types it cannot produce would publish that list in its discovery document, which is
-//! the one place a receiver reads to decide what to ask for.
+//! payload, and this module never inspects either. Which URI means "the session was revoked",
+//! and what belongs in its payload, is the CAEP vocabulary's answer and lives in
+//! [`crate::caep`]; RISC has no producer here yet. [`EVENTS_SUPPORTED`] names only the types
+//! something in this build actually emits, because a transmitter that named event types it
+//! cannot produce would publish that list in its discovery document, which is the one place a
+//! receiver reads to decide what to ask for.
 //!
 //! # The subject is an RFC 9493 identifier, rendered per stream, at the TOP LEVEL
 //!
@@ -44,23 +44,25 @@ use crate::issuer::IssuerRegistry;
 
 /// The SSF 1.0 verification event, which a receiver asks for to prove its delivery path works.
 ///
-/// SSF'S OWN EVENT TYPE rather than a CAEP or RISC one, which is why it can be here while the
-/// vocabularies are still the next issue's: section 7.1.4 defines it as part of stream
-/// management, so a transmitter that serves a verification endpoint emits exactly this and
-/// nothing about it waits on #144.
+/// SSF'S OWN EVENT TYPE rather than a CAEP or RISC one: section 7.1.4 defines it as part of
+/// stream management, so a transmitter that serves a verification endpoint emits exactly this
+/// and nothing about it waited on the vocabularies in [`crate::caep`].
 pub const VERIFICATION_EVENT_TYPE: &str =
     "https://schemas.openid.net/secevent/ssf/event-type/verification";
 
 /// The event type URIs this build can transmit.
 ///
-/// ONE ENTRY, and it is the one the surface actually emits. This was empty while nothing
-/// produced a SET at all; the verification endpoint changed that, so the list changed with it. A
-/// discovery document advertising an event type nothing emits would tell a receiver to request a
-/// signal it will never be sent, and a receiver cannot distinguish that from a quiet period.
+/// EVERY ENTRY IS EMITTED BY SOMETHING. A discovery document advertising an event type nothing
+/// emits would tell a receiver to request a signal it will never be sent, and a receiver cannot
+/// distinguish that from a quiet period. The list has grown once per producer that landed: it
+/// was empty while nothing produced a SET, gained the verification event with the verification
+/// endpoint, and gains `session-revoked` with the session-end fan-out (issue #144).
 ///
-/// STILL NO CAEP OR RISC TYPE. Those vocabularies are the next issue's, and this list must grow
-/// when they land rather than in anticipation of them.
-pub const EVENTS_SUPPORTED: &[&str] = &[VERIFICATION_EVENT_TYPE];
+/// STILL NO OTHER CAEP TYPE AND NO RISC TYPE. `caep::CREDENTIAL_CHANGE` and its neighbours are
+/// defined in the vocabulary but have no producer, so they stay out of this list;
+/// `caep::tests::the_defined_but_unemitted_types_are_not_advertised` is what keeps the two
+/// facts from drifting apart.
+pub const EVENTS_SUPPORTED: &[&str] = &[VERIFICATION_EVENT_TYPE, crate::caep::SESSION_REVOKED];
 
 /// One subject, in the RFC 9493 format its stream negotiated.
 ///

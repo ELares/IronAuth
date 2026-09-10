@@ -41,9 +41,9 @@ use ironauth_oidc::ssf_push::{FetchSsfPushSender, SsfPushConsumer};
 use ironauth_oidc::{
     BackChannelLogoutConsumer, CredentialClass, DiscoveryCapabilities, DiscoveryState,
     FederationKeyResolver, FederationRuntime, FetchLogoutSender, IssuerRegistry, IssuerState,
-    JwksCacheWindow, OidcState, SessionEndedExplodeConsumer, canonical_login_identifier,
-    canonical_step_up_acr, discovery_router, is_known_step_up_acr, issuer_router,
-    known_step_up_acrs, oidc_router,
+    JwksCacheWindow, OidcState, SessionEndedExplodeConsumer, SsfSessionFanOutConsumer,
+    canonical_login_identifier, canonical_step_up_acr, discovery_router, is_known_step_up_acr,
+    issuer_router, known_step_up_acrs, oidc_router,
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_scim::{ScimLimits, ScimState, scim_router};
@@ -501,7 +501,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // so a deployment that sets it and nothing else must drain what that surface accepts.
         // BOUND so the shutdown below can await it.
         let ssf_push_pools = match ssf_push_inputs {
-            Some(inputs) => spawn_ssf_push_pools(inputs).await,
+            Some(inputs) => spawn_ssf_push_pools(inputs, server.base_url()).await,
             None => Vec::new(),
         };
         // The message delivery worker (issue #111), behind its own switch for the reason every
@@ -2500,8 +2500,15 @@ struct SsfPushInputs {
     ssf: ironauth_config::SsfConfig,
     /// The shared `[outbox]` tuning its pool is built from.
     outbox: OutboxConfig,
-    /// The OIDC settings. Only the outbound request timeout is read now: the registry that
-    /// signs a SET lives on the request path, not here (issue #1200).
+    /// The OIDC settings: the outbound request timeout, and the JWKS cache window the
+    /// signing registry is built from.
+    ///
+    /// The registry came BACK here with issue #144. Issue #1200 removed it because the
+    /// only producer of a SET was then the verification endpoint, which is on the request
+    /// path; the session-end fan-out is a producer that runs in THIS worker, so the thing
+    /// that signs has to be reachable from it. The delivery consumer beside it still holds
+    /// no registry, which is what #1200 actually settled: a redelivery re-sends a stored
+    /// token instead of minting a new one.
     oidc: OidcConfig,
     /// The data-plane DSN the worker drains and reads streams on.
     data_plane_dsn: String,
@@ -4575,7 +4582,7 @@ async fn spawn_webhook_delivery_pools(inputs: WebhookDeliveryInputs) -> Vec<Outb
 ///
 /// Every early return is logged and starts NOTHING. The queue is durable, so a SET enqueued
 /// while no worker runs is delivered whenever one starts.
-async fn spawn_ssf_push_pools(inputs: SsfPushInputs) -> Vec<OutboxWorkerPool> {
+async fn spawn_ssf_push_pools(inputs: SsfPushInputs, issuer_base: String) -> Vec<OutboxWorkerPool> {
     let SsfPushInputs {
         ssf,
         outbox,
@@ -4585,7 +4592,6 @@ async fn spawn_ssf_push_pools(inputs: SsfPushInputs) -> Vec<OutboxWorkerPool> {
         master,
         env,
     } = inputs;
-    let _ = ssf;
 
     let Some(control_dsn) = control_dsn else {
         tracing::error!(
@@ -4638,15 +4644,33 @@ async fn spawn_ssf_push_pools(inputs: SsfPushInputs) -> Vec<OutboxWorkerPool> {
         }
     };
 
-    let mut consumers = ConsumerRegistry::new();
-    if let Err(error) = consumers.register(Arc::new(SsfPushConsumer::new(
+    // The registry the FAN-OUT signs through. It is built here rather than shared from the
+    // request path because this worker may run in a process that serves no requests, and a
+    // registry derived a second way could stamp an `iss` the request path never would.
+    // `server.base_url()` is the same value the back-channel worker is handed, so the two
+    // workers and the request path all sign under one issuer base.
+    let registry = Arc::new(IssuerRegistry::store_backed(
+        issuer_base,
+        JwksCacheWindow::clamped(oidc.jwks_cache_max_age_secs),
         data_store.clone(),
-        master,
-        sender,
-    )) as Arc<dyn OutboxConsumer>)
-    {
-        tracing::error!(%error, "SSF push worker not started: duplicate consumer name");
-        return Vec::new();
+    ));
+
+    let mut consumers = ConsumerRegistry::new();
+    // Two registrations, and a duplicate name is fatal for the pools: two consumers under
+    // one name means one subsystem's messages vanish into the other's handler.
+    let registrations: [Arc<dyn OutboxConsumer>; 2] = [
+        Arc::new(SsfPushConsumer::new(data_store.clone(), master, sender)),
+        Arc::new(SsfSessionFanOutConsumer::new(
+            data_store.clone(),
+            Arc::clone(&registry),
+            ssf.max_owed_sets_per_stream,
+        )),
+    ];
+    for consumer in registrations {
+        if let Err(error) = consumers.register(consumer) {
+            tracing::error!(%error, "SSF push worker not started: duplicate consumer name");
+            return Vec::new();
+        }
     }
 
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
