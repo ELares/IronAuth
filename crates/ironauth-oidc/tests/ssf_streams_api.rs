@@ -112,10 +112,24 @@ async fn a_receiver_creates_reads_and_deletes_its_own_stream() {
     assert!(stream_id.starts_with("sst_"), "{body}");
     assert_eq!(created["delivery"]["method"], "urn:ietf:rfc:8935");
     assert_eq!(created["format"], "email");
-    // WHAT IT AGREED TO SEND is the intersection with what this build emits, which is empty
-    // until the vocabularies land. The receiver can SEE that the type it asked for is not
-    // coming, which is the whole reason both halves are published.
-    assert_eq!(created["events_delivered"], serde_json::json!([]));
+    // WHAT IT AGREED TO SEND is the intersection with what this build emits AND can render
+    // for THIS stream. This stream negotiated `email`, and a session end names the user by
+    // internal id with no read that turns that into an address, so the session-end fan-out
+    // cannot serve it: the promise is withheld rather than made and then broken.
+    //
+    // `events_delivered` is what a receiver reads to learn which of the types it asked for
+    // are actually coming, and it cannot tell a promised-but-never-sent event from a quiet
+    // period. An earlier version of this PR advertised `session-revoked` here and then had
+    // the fan-out skip the stream forever.
+    assert_eq!(
+        created["format"], "email",
+        "this assertion is about an email stream specifically"
+    );
+    assert_eq!(
+        created["events_delivered"],
+        serde_json::json!([]),
+        "an email stream was promised an event the fan-out cannot render for it"
+    );
     assert_eq!(
         created["events_requested"].as_array().expect("array").len(),
         1
@@ -563,12 +577,17 @@ async fn discovery_advertises_only_what_is_mounted() {
         doc.get("default_subjects").is_none(),
         "a default-subjects policy is advertised that no fan-out applies: {body}"
     );
-    // AND EXACTLY THE EVENT TYPES THIS BUILD EMITS, which is now SSF's own verification event
-    // and still nothing from CAEP or RISC. Asserting emptiness was right while nothing produced
-    // a SET; asserting only non-emptiness would pass the day a type nothing emits was added.
+    // AND EXACTLY THE EVENT TYPES THIS BUILD EMITS: SSF's own verification event, and CAEP
+    // `session-revoked` now that the session-end fan-out produces it (issue #144). Still
+    // nothing else from CAEP and nothing from RISC. Asserting emptiness was right while
+    // nothing produced a SET; asserting only non-emptiness would pass the day a type nothing
+    // emits was added, which is the failure this exact-equality exists to prevent.
     assert_eq!(
         doc["events_supported"],
-        serde_json::json!([ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE])
+        serde_json::json!([
+            ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE,
+            ironauth_oidc::caep::SESSION_REVOKED,
+        ])
     );
 
     // THE HOLD POLICY IS PUBLISHED, because the poll response cannot carry it. RFC 8936 makes
@@ -1263,4 +1282,35 @@ async fn input_the_schema_refuses_is_a_bad_request_on_update_as_it_is_on_create(
     assert_eq!(status, StatusCode::OK, "{text}");
     let cleared: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
     assert_eq!(cleared["description"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn a_stream_that_can_be_rendered_for_is_promised_the_event() {
+    // THE OTHER SIDE of the email carve-out above. Without this, the narrowing could be a
+    // blanket "promise nothing" and both assertions would pass: an empty
+    // `events_delivered` is the correct answer for email and the WRONG answer for every
+    // other format, so the two have to be pinned together.
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let path = streams_path(&harness);
+    let body = serde_json::json!({
+        "delivery": { "method": "urn:ietf:rfc:8936" },
+        "events_requested": [ironauth_oidc::caep::SESSION_REVOKED],
+        "aud": ["https://receiver.example.com"],
+        "format": "iss_sub",
+    })
+    .to_string();
+    let (status, body) = send(&harness, "POST", &path, Some(&auth), Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let created: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(created["format"], "iss_sub");
+    assert_eq!(
+        created["events_delivered"],
+        serde_json::json!([ironauth_oidc::caep::SESSION_REVOKED]),
+        "a stream whose subject this build CAN render was refused the promise: {body}"
+    );
 }

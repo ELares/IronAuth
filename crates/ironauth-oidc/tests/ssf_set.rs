@@ -162,7 +162,9 @@ fn each_format_renders_its_rfc_9493_members_and_labels_itself_with_the_stored_on
 fn the_subject_is_a_top_level_sub_id_and_not_an_in_event_member() {
     // SSF 1.0 section 3.1.2 makes the top-level `sub_id` a MUST for a new event type and says
     // such a type MUST NOT name its primary subject with an in-event `subject`. The carve-out
-    // in 3.1.1 is for event types already defined in CAEP or RISC; this build defines none.
+    // in 3.1.1 lets an event type already defined in CAEP or RISC ALSO carry an in-event
+    // `subject`; this build emits one such type (CAEP `session-revoked`, issue #144) and
+    // declines the carve-out, so every emitted type names its subject exactly one way.
     let audience = vec!["https://receiver.example.com".to_owned()];
     let subject = subject();
     let event = event();
@@ -208,22 +210,39 @@ fn an_empty_audience_omits_the_claim_rather_than_minting_one_nobody_matches() {
 
 /// The advertised event list is exactly what the surface emits, and nothing from a vocabulary.
 ///
-/// The list was empty while nothing produced a SET. The verification endpoint changed that, so
-/// this pins the new shape from BOTH sides: the verification type is present, and no CAEP or
-/// RISC type is, because those vocabularies are the next issue's. Asserting only that the list
-/// is non-empty would pass the day somebody advertised a type nothing emits, which is the
-/// failure the original empty assertion existed to prevent.
+/// The list grows once per PRODUCER, never once per event type someone defined. It was empty
+/// while nothing produced a SET, gained the verification type with the verification endpoint,
+/// and gained CAEP `session-revoked` with the session-end fan-out (issue #144). Exact equality
+/// rather than a containment check: asserting only that the list holds what we expect would
+/// pass the day somebody advertised a fourth type nothing emits, which is the failure the
+/// original empty assertion existed to prevent.
 #[test]
 fn the_advertised_events_are_exactly_the_ones_this_build_emits() {
     assert_eq!(
         EVENTS_SUPPORTED,
-        [ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE],
+        [
+            ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE,
+            ironauth_oidc::caep::SESSION_REVOKED,
+        ],
         "the advertised event list is not the set this build can produce"
     );
+    // Named absence beside the equality above, because the equality alone reads as an
+    // arbitrary list. These three are DEFINED in the vocabulary and have no producer, so a
+    // build that starts advertising one has advertised a signal that never arrives.
+    for unemitted in [
+        ironauth_oidc::caep::CREDENTIAL_CHANGE,
+        ironauth_oidc::caep::TOKEN_CLAIMS_CHANGE,
+        ironauth_oidc::caep::ASSURANCE_LEVEL_CHANGE,
+    ] {
+        assert!(
+            !EVENTS_SUPPORTED.contains(&unemitted),
+            "{unemitted} is advertised but nothing emits it"
+        );
+    }
     for advertised in EVENTS_SUPPORTED {
         assert!(
-            !advertised.contains("/caep/") && !advertised.contains("/risc/"),
-            "a CAEP or RISC event type is advertised before its vocabulary lands: {advertised}"
+            !advertised.contains("/risc/"),
+            "a RISC event type is advertised before its vocabulary lands: {advertised}"
         );
     }
 }

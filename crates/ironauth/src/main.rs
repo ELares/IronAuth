@@ -41,9 +41,9 @@ use ironauth_oidc::ssf_push::{FetchSsfPushSender, SsfPushConsumer};
 use ironauth_oidc::{
     BackChannelLogoutConsumer, CredentialClass, DiscoveryCapabilities, DiscoveryState,
     FederationKeyResolver, FederationRuntime, FetchLogoutSender, IssuerRegistry, IssuerState,
-    JwksCacheWindow, OidcState, SessionEndedExplodeConsumer, canonical_login_identifier,
-    canonical_step_up_acr, discovery_router, is_known_step_up_acr, issuer_router,
-    known_step_up_acrs, oidc_router,
+    JwksCacheWindow, OidcState, SessionEndedExplodeConsumer, SsfSessionFanOutConsumer,
+    canonical_login_identifier, canonical_step_up_acr, discovery_router, is_known_step_up_acr,
+    issuer_router, known_step_up_acrs, oidc_router,
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_scim::{ScimLimits, ScimState, scim_router};
@@ -501,7 +501,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // so a deployment that sets it and nothing else must drain what that surface accepts.
         // BOUND so the shutdown below can await it.
         let ssf_push_pools = match ssf_push_inputs {
-            Some(inputs) => spawn_ssf_push_pools(inputs).await,
+            Some(inputs) => spawn_ssf_push_pools(inputs, server.base_url()).await,
             None => Vec::new(),
         };
         // The message delivery worker (issue #111), behind its own switch for the reason every
@@ -2500,8 +2500,15 @@ struct SsfPushInputs {
     ssf: ironauth_config::SsfConfig,
     /// The shared `[outbox]` tuning its pool is built from.
     outbox: OutboxConfig,
-    /// The OIDC settings. Only the outbound request timeout is read now: the registry that
-    /// signs a SET lives on the request path, not here (issue #1200).
+    /// The OIDC settings: the outbound request timeout, and the JWKS cache window the
+    /// signing registry is built from.
+    ///
+    /// The registry came BACK here with issue #144. Issue #1200 removed it because the
+    /// only producer of a SET was then the verification endpoint, which is on the request
+    /// path; the session-end fan-out is a producer that runs in THIS worker, so the thing
+    /// that signs has to be reachable from it. The delivery consumer beside it still holds
+    /// no registry, which is what #1200 actually settled: a redelivery re-sends a stored
+    /// token instead of minting a new one.
     oidc: OidcConfig,
     /// The data-plane DSN the worker drains and reads streams on.
     data_plane_dsn: String,
@@ -4575,7 +4582,45 @@ async fn spawn_webhook_delivery_pools(inputs: WebhookDeliveryInputs) -> Vec<Outb
 ///
 /// Every early return is logged and starts NOTHING. The queue is durable, so a SET enqueued
 /// while no worker runs is delivered whenever one starts.
-async fn spawn_ssf_push_pools(inputs: SsfPushInputs) -> Vec<OutboxWorkerPool> {
+/// Every consumer the Shared Signals worker registers (issues #143, #144).
+///
+/// A function rather than an inline array so the SET of names is assertable without
+/// booting a worker: `ssf_consumers_are_registered_by_name` reads it, and a registration
+/// dropped from this list is a queue nothing drains.
+///
+/// # Why the session-ended explode is here
+///
+/// It is ALSO registered by the back-channel logout pool, and that is not a duplicate by
+/// accident. That pool rides `oidc.backchannel_logout_enabled`, which is off by default,
+/// and it holds the only writer of the Shared Signals trigger. Registering the fan-out
+/// alone would mean a deployment that sets `ssf.enabled` and nothing else mounts the
+/// receiver-facing surface, accepts streams, drains a queue nothing ever writes to, and
+/// reports perfect health. That is the exact failure `ssf_push_inputs` was split out to
+/// prevent, one switch further along.
+///
+/// Two pools draining ONE consumer name is safe and is what the substrate is for. A claim
+/// takes a lease, so at most one worker holds a message at a time, and the explode is
+/// idempotent through `enqueue_all`, which skips an existing (consumer, idempotency_key)
+/// instead of raising. With both switches on the queue simply has two drainers.
+fn ssf_consumers<S: ironauth_oidc::ssf_push::SsfPushSender + Send + Sync + 'static>(
+    data_store: &Store,
+    master: Arc<ironauth_jose::MasterKey>,
+    sender: S,
+    registry: &Arc<IssuerRegistry>,
+    owed_ceiling: u32,
+) -> Vec<Arc<dyn OutboxConsumer>> {
+    vec![
+        Arc::new(SsfPushConsumer::new(data_store.clone(), master, sender)),
+        Arc::new(SsfSessionFanOutConsumer::new(
+            data_store.clone(),
+            Arc::clone(registry),
+            owed_ceiling,
+        )),
+        Arc::new(SessionEndedExplodeConsumer::new(data_store.clone())),
+    ]
+}
+
+async fn spawn_ssf_push_pools(inputs: SsfPushInputs, issuer_base: String) -> Vec<OutboxWorkerPool> {
     let SsfPushInputs {
         ssf,
         outbox,
@@ -4585,7 +4630,6 @@ async fn spawn_ssf_push_pools(inputs: SsfPushInputs) -> Vec<OutboxWorkerPool> {
         master,
         env,
     } = inputs;
-    let _ = ssf;
 
     let Some(control_dsn) = control_dsn else {
         tracing::error!(
@@ -4623,12 +4667,14 @@ async fn spawn_ssf_push_pools(inputs: SsfPushInputs) -> Vec<OutboxWorkerPool> {
         }
     };
 
-    // NO ISSUER REGISTRY HERE ANY MORE (issue #1200). The worker used to hold one because it
-    // minted the SET on every delivery attempt; the token is minted once, at enqueue, on the
-    // request path that already has the registry it needs. A worker that cannot sign cannot
-    // re-sign, which is the property the fix is about, and dropping the ISSUER BASE from this
-    // function's signature is how that shows up at the call site: there is nothing left here
-    // that needs to know what this deployment's issuer is called.
+    // THE DELIVERY CONSUMER STILL HOLDS NO REGISTRY (issue #1200): the token is minted once,
+    // at enqueue, and a redelivery re-sends the stored bytes. A worker that cannot sign
+    // cannot re-sign, which is the property that fix is about, and it is unchanged.
+    //
+    // THIS FUNCTION DOES HOLD ONE AGAIN (issue #144), because the session-end fan-out is a
+    // PRODUCER and it runs in this pool group. Issue #1200 could drop the issuer base from
+    // the signature only while every producer of a SET was on the request path; that stopped
+    // being true when a producer moved into a worker.
     let timeout = std::time::Duration::from_secs(oidc.backchannel_logout_request_timeout_secs);
     let sender = match FetchSsfPushSender::with_timeout(timeout) {
         Ok(sender) => sender,
@@ -4638,15 +4684,29 @@ async fn spawn_ssf_push_pools(inputs: SsfPushInputs) -> Vec<OutboxWorkerPool> {
         }
     };
 
-    let mut consumers = ConsumerRegistry::new();
-    if let Err(error) = consumers.register(Arc::new(SsfPushConsumer::new(
+    // The registry the FAN-OUT signs through. It is built here rather than shared from the
+    // request path because this worker may run in a process that serves no requests, and a
+    // registry derived a second way could stamp an `iss` the request path never would.
+    // `server.base_url()` is the same value the back-channel worker is handed, so the two
+    // workers and the request path all sign under one issuer base.
+    let registry = Arc::new(IssuerRegistry::store_backed(
+        issuer_base,
+        JwksCacheWindow::clamped(oidc.jwks_cache_max_age_secs),
         data_store.clone(),
+    ));
+
+    let mut consumers = ConsumerRegistry::new();
+    for consumer in ssf_consumers(
+        &data_store,
         master,
         sender,
-    )) as Arc<dyn OutboxConsumer>)
-    {
-        tracing::error!(%error, "SSF push worker not started: duplicate consumer name");
-        return Vec::new();
+        &registry,
+        ssf.max_owed_sets_per_stream,
+    ) {
+        if let Err(error) = consumers.register(consumer) {
+            tracing::error!(%error, "SSF push worker not started: duplicate consumer name");
+            return Vec::new();
+        }
     }
 
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
