@@ -100,6 +100,10 @@ pub const STATUS_PATH: &str = "/t/{tenant_id}/e/{environment_id}/ssf/status";
 /// is collecting for, so a credential holding several poll streams names the one it means
 /// instead of the transmitter guessing.
 pub const POLL_PATH: &str = "/t/{tenant_id}/e/{environment_id}/ssf/poll/{stream_id}";
+/// The SSF 1.0 section 8.1.4 add-subject endpoint, per environment.
+pub const ADD_SUBJECT_PATH: &str = "/t/{tenant_id}/e/{environment_id}/ssf/subjects/add";
+/// The SSF 1.0 section 8.1.5 remove-subject endpoint, per environment.
+pub const REMOVE_SUBJECT_PATH: &str = "/t/{tenant_id}/e/{environment_id}/ssf/subjects/remove";
 /// The SSF 1.0 section 7.1.4 verification endpoint, per environment.
 ///
 /// Per environment rather than per stream, unlike the poll endpoint, because the request body
@@ -1059,6 +1063,194 @@ struct VerificationRequest {
     state: Option<String>,
 }
 
+/// What a receiver posts to add or remove one subject from its stream.
+///
+/// `stream_id` and `subject` are REQUIRED by both sections 8.1.4 and 8.1.5; `verified` is
+/// section 8.1.4's optional boolean and is ignored by a removal, which names no assertion.
+#[derive(Debug, Deserialize)]
+struct SubjectRequest {
+    stream_id: String,
+    subject: serde_json::Value,
+    /// The receiver's assertion that it has verified the subject is its own. Absent means true,
+    /// which section 8.1.4 specifies.
+    verified: Option<bool>,
+}
+
+/// `POST {issuer}/ssf/subjects/add` -- SSF 1.0 section 8.1.4.
+///
+/// # 200, and what `verified` does and does not mean
+///
+/// The flag is RECORDED, NOT ACTED ON. It is the receiver's assertion about its own records,
+/// and a transmitter that treated it as permission would be taking the receiver's word for who
+/// it may be told about. What decides that is the receiver owning the stream, which the fence
+/// below proves.
+///
+/// # Idempotent
+///
+/// Adding a subject twice is the same row and the same 200, because the row is keyed on the
+/// blind index of the rendered identifier. A repeated add refreshes `verified` and nothing
+/// else.
+pub async fn add_subject(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let (stream, request, scope) =
+        match subject_request_target(&state, &headers, &tenant_id, &environment_id, &body).await {
+            Ok(target) => target,
+            Err(response) => return *response,
+        };
+    let Some(subject) = crate::ssf_set::SubjectIdentifier::from_rendered(&request.subject) else {
+        return invalid_request(
+            "subject must be an RFC 9493 subject identifier in a format this transmitter \
+             renders: email, iss_sub or opaque",
+        );
+    };
+    let rendered = canonical_subject(&subject);
+    // THE STORE'S OWN BOUND, not a number chosen here. It used to be `MAX_ENDPOINT_BYTES`,
+    // which is sized for the plaintext endpoint column 0216 holds and is larger than what the
+    // sealed subject column accepts, so a rendering between the two bounds passed this check
+    // and then 500ed on the CHECK. Reading the store's constant is what keeps the door and the
+    // column from drifting apart again.
+    if rendered.len() > ironauth_store::MAX_SUBJECT_BYTES {
+        return invalid_request("subject is longer than this transmitter stores");
+    }
+    match state
+        .store()
+        .scoped(scope)
+        .ssf_stream_subjects()
+        .add(
+            state.env(),
+            &stream.id,
+            subject.format(),
+            &rendered,
+            request.verified.unwrap_or(true),
+            state.ssf_max_subjects_per_stream(),
+        )
+        .await
+    {
+        Ok(()) => json(
+            StatusCode::OK,
+            &serde_json::json!({ "stream_id": stream.id.to_string() }),
+        ),
+        // THE LIST IS BOUNDED, and reaching it REFUSES rather than evicting: a receiver silently
+        // stopping being told about a subject it added is a delivery gap it cannot detect.
+        Err(StoreError::QuotaExceeded) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            serde_json::json!({
+                "error": "too_many_requests",
+                "error_description":
+                    "this stream already filters by the most subjects this environment holds",
+            })
+            .to_string(),
+        )
+            .into_response(),
+        Err(_) => server_error(),
+    }
+}
+
+/// `POST {issuer}/ssf/subjects/remove` -- SSF 1.0 section 8.1.5.
+///
+/// # 204 whether or not the subject was there
+///
+/// Section 8.1.5 lets a transmitter "stay silent" and answer 204 for a subject it does not
+/// recognise, and this does. The alternative distinguishes "was on your list" from "was not",
+/// which is a fact about the receiver's own list and therefore harmless -- but only if the
+/// stream is the receiver's, and a handler that answered differently per case would have to get
+/// that right in two places instead of one. One answer is the smaller thing to keep correct.
+pub async fn remove_subject(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let (stream, request, scope) =
+        match subject_request_target(&state, &headers, &tenant_id, &environment_id, &body).await {
+            Ok(target) => target,
+            Err(response) => return *response,
+        };
+    let Some(subject) = crate::ssf_set::SubjectIdentifier::from_rendered(&request.subject) else {
+        return invalid_request(
+            "subject must be an RFC 9493 subject identifier in a format this transmitter \
+             renders: email, iss_sub or opaque",
+        );
+    };
+    match state
+        .store()
+        .scoped(scope)
+        .ssf_stream_subjects()
+        .remove(&stream.id, &canonical_subject(&subject))
+        .await
+    {
+        Ok(_) => no_content(),
+        Err(_) => server_error(),
+    }
+}
+
+/// The canonical rendering a subject is keyed and sealed by.
+///
+/// DERIVED FROM THE PARSED IDENTIFIER, not from the request bytes. Two receivers sending the
+/// same subject with their JSON members in a different order, or with different whitespace,
+/// mean the same subject and must hash to the same blind index -- otherwise a removal would
+/// miss the row its own add created.
+fn canonical_subject(subject: &crate::ssf_set::SubjectIdentifier) -> String {
+    subject.render().to_string()
+}
+
+/// Authenticate, parse, and resolve the stream a subject request names.
+///
+/// # A failed credential is a 401, like every other endpoint here
+///
+/// This answered the uniform not-found, and justified it with "an unauthenticated caller learns
+/// nothing about whether the surface is mounted". That reason was false in the same commit that
+/// wrote it: the UNAUTHENTICATED discovery document advertises both of these endpoints by URL,
+/// so there is nothing left to hide, and hiding it cost the `WWW-Authenticate` challenge that
+/// tells a client HOW to authenticate. The eight sibling SSF handlers all answer 401, and a
+/// surface where two endpoints disagree with the rest is one a receiver cannot write a single
+/// error path for.
+///
+/// The not-found is still what a stream the caller does not own gets, which is the fence that
+/// actually matters.
+async fn subject_request_target(
+    state: &OidcState,
+    headers: &HeaderMap,
+    tenant_id: &str,
+    environment_id: &str,
+    body: &str,
+) -> Result<(SsfStream, SubjectRequest, Scope), Box<Response>> {
+    let Some((client, scope)) = authenticated(state, headers, tenant_id, environment_id).await
+    else {
+        return Err(Box::new(unauthorized()));
+    };
+    let Ok(request) = serde_json::from_str::<SubjectRequest>(body) else {
+        return Err(Box::new(invalid_request(
+            "the request body must be a JSON object with a stream_id and a subject",
+        )));
+    };
+    let Ok(id) = SsfStreamId::parse_in_scope(&request.stream_id, &scope) else {
+        return Err(Box::new(not_found()));
+    };
+    // THE RECEIVER FENCE, before the subject is even looked at: another receiver's stream and an
+    // absent one are the same not-found, so neither endpoint can be used to learn which streams
+    // exist.
+    match state
+        .store()
+        .scoped(scope)
+        .ssf_streams()
+        .get_for_client(&id, &client)
+        .await
+    {
+        Ok(stream) => Ok((stream, request, scope)),
+        Err(StoreError::NotFound) => Err(Box::new(not_found())),
+        Err(_) => Err(Box::new(server_error())),
+    }
+}
+
 /// `POST {issuer}/ssf/verify` -- SSF 1.0 section 7.1.4 stream verification.
 ///
 /// # 204, and what it does and does not promise
@@ -1369,10 +1561,15 @@ pub async fn configuration(
     }
     let issuer = state.issuers().issuer_for(&scope);
     let base = format!("{issuer}/ssf");
-    // IT ADVERTISES ONLY WHAT IS MOUNTED. SSF 1.0 also defines add-subject and remove-subject
-    // endpoints; this build serves neither, so naming them would tell a receiver to call a 404.
-    // They appear here in the slice that mounts them, which is what just happened to
-    // `verification_endpoint`.
+    // IT ADVERTISES ONLY WHAT IS MOUNTED, which is now every endpoint SSF 1.0 defines for a
+    // transmitter. `verification_endpoint`, `add_subject_endpoint` and
+    // `remove_subject_endpoint` each appeared here in the slice that mounted it, never before.
+    //
+    // `default_subjects` IS STILL ABSENT, and deliberately. It would tell a receiver whether a
+    // new stream starts subscribed to everyone or to no one, and that is a claim about a
+    // fan-out this build does not have: the CAEP and RISC vocabularies are the next issue's, so
+    // nothing yet reads the subject list at all. Advertising a default for a decision nothing
+    // makes would be the same defect as advertising an event type nothing emits.
     json(
         StatusCode::OK,
         &serde_json::json!({
@@ -1386,6 +1583,8 @@ pub async fn configuration(
             "configuration_endpoint": format!("{base}/streams"),
             "status_endpoint": format!("{base}/status"),
             "verification_endpoint": format!("{base}/verify"),
+            "add_subject_endpoint": format!("{base}/subjects/add"),
+            "remove_subject_endpoint": format!("{base}/subjects/remove"),
             // `min_verification_interval` IS NOT HERE, and that is a correction. It was, and
             // SSF 1.0 does not define it as transmitter metadata: it is a read-only STREAM
             // configuration property, so a conformant receiver reads it off its own stream and

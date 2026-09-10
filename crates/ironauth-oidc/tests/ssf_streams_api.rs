@@ -535,15 +535,34 @@ async fn discovery_advertises_only_what_is_mounted() {
             .expect("status_endpoint")
             .ends_with("/ssf/status")
     );
-    // NOTHING THIS BUILD DOES NOT SERVE. SSF 1.0 also defines add-subject and remove-subject
-    // endpoints; naming one here would tell a receiver to call a 404. `verification_endpoint`
-    // left this list when the endpoint was mounted, which is the only way an entry may leave it.
-    for absent in ["add_subject_endpoint", "remove_subject_endpoint"] {
+    // EVERY ENDPOINT SSF 1.0 DEFINES FOR A TRANSMITTER IS NOW MOUNTED, so the absent-list this
+    // assertion used to hold is empty and the check inverts: each name must be PRESENT and must
+    // point at this issuer. `verification_endpoint` left the absent list when it was mounted,
+    // then the two subject endpoints did, which is the only way an entry may leave it.
+    //
+    // The `ssf_subjects` and `ssf_verification` suites CALL what these advertise; this asserts
+    // the document names them at all, which is the half a suite testing the handler cannot see.
+    for (field, suffix) in [
+        ("verification_endpoint", "/ssf/verify"),
+        ("add_subject_endpoint", "/ssf/subjects/add"),
+        ("remove_subject_endpoint", "/ssf/subjects/remove"),
+    ] {
+        let advertised = doc[field]
+            .as_str()
+            .unwrap_or_else(|| panic!("discovery does not advertise {field}: {body}"));
         assert!(
-            doc.get(absent).is_none(),
-            "discovery advertises {absent}, which is not mounted: {body}"
+            advertised.ends_with(suffix),
+            "{field} does not name {suffix}: {advertised}"
         );
     }
+    // AND STILL NOT `default_subjects`, which would tell a receiver whether a new stream starts
+    // subscribed to everyone or to no one. Nothing reads the subject list yet, so advertising a
+    // default for a decision no fan-out makes is the same defect as advertising an event type
+    // nothing emits.
+    assert!(
+        doc.get("default_subjects").is_none(),
+        "a default-subjects policy is advertised that no fan-out applies: {body}"
+    );
     // AND EXACTLY THE EVENT TYPES THIS BUILD EMITS, which is now SSF's own verification event
     // and still nothing from CAEP or RISC. Asserting emptiness was right while nothing produced
     // a SET; asserting only non-emptiness would pass the day a type nothing emits was added.

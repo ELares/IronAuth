@@ -973,6 +973,14 @@ pub struct SsfConfig {
     /// prevent, and a refusal is visible to the producer and to an operator.
     pub max_owed_sets_per_stream: u32,
 
+    /// The most subjects one stream may filter by.
+    ///
+    /// A subject list is receiver-chosen storage that the fan-out reads on every event, so an
+    /// unbounded one is both unbounded rows and unbounded work per signal. Reaching it REFUSES,
+    /// which a receiver can see and act on, rather than evicting a subject it would then
+    /// silently stop being told about.
+    pub max_subjects_per_stream: u32,
+
     /// The shortest interval between two verification requests for one stream.
     ///
     /// SSF 1.0 section 7.1.4 lets a receiver ASK to be sent a verification event so it can prove
@@ -998,6 +1006,9 @@ impl Default for SsfConfig {
             // A receiver polling even once an hour drains far more than this per interval, so
             // reaching it means collection has stopped rather than fallen behind.
             max_owed_sets_per_stream: 1000,
+            // A receiver filtering by more people than this is administering a directory, not
+            // a subject list, and wants the whole environment's signals instead.
+            max_subjects_per_stream: 10_000,
             // A minute. A receiver verifying its delivery path does so when it configures a
             // stream and when it suspects a problem, not on a loop, so this is generous for
             // every honest use and still bounds a broken client to sixty SETs an hour.
@@ -6001,6 +6012,14 @@ pub const SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS: u64 = 366 * 24 * 60 * 60;
 /// which is a deployment that looks enabled and works for nobody. If the intent is to serve no
 /// streams, `ssf.enabled = false` says so and answers 404.
 fn validate_ssf(ssf: &SsfConfig) -> Result<(), ConfigError> {
+    if ssf.enabled && ssf.max_subjects_per_stream == 0 {
+        return Err(ConfigError::Invalid {
+            message: "ssf.max_subjects_per_stream must be at least 1 when ssf.enabled is true: \
+                      zero refuses every subject a receiver tries to filter by, so add-subject \
+                      could never succeed"
+                .to_owned(),
+        });
+    }
     if ssf.enabled && ssf.min_verification_interval_secs == 0 {
         return Err(ConfigError::Invalid {
             message: "ssf.min_verification_interval_secs must be at least 1 when ssf.enabled is \
@@ -8397,6 +8416,14 @@ mod tests {
                 },
             ),
             (
+                "a stream that may filter by nothing",
+                SsfConfig {
+                    enabled: true,
+                    max_subjects_per_stream: 0,
+                    ..SsfConfig::default()
+                },
+            ),
+            (
                 "no floor under the verification rate",
                 SsfConfig {
                     enabled: true,
@@ -8424,6 +8451,7 @@ mod tests {
                 enabled: true,
                 max_streams_per_client: 1,
                 max_owed_sets_per_stream: 1,
+                max_subjects_per_stream: 1,
                 min_verification_interval_secs: 1,
             })
             .is_ok(),

@@ -819,6 +819,7 @@ async fn a_verification_for_a_stream_that_is_already_full_is_refused_as_a_rate_l
         enabled: true,
         max_streams_per_client: 20,
         max_owed_sets_per_stream: 1,
+        max_subjects_per_stream: 20,
         min_verification_interval_secs: 1,
     });
     let (client, secret) = harness

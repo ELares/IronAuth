@@ -243,6 +243,7 @@ pub struct OidcState {
     ssf_max_streams_per_client: u32,
     ssf_max_owed_sets_per_stream: u32,
     ssf_min_verification_interval_secs: u32,
+    ssf_max_subjects_per_stream: u32,
     // Whether the experimental IdP-side FedCM surface (issue #83) is armed. Kept
     // OUTSIDE `Inner` and set through the builder for the SAME anti-bypass reason as
     // global-token-revocation: it is NOT a plain `OidcConfig` toggle an operator can
@@ -1072,6 +1073,8 @@ impl OidcState {
                 .max_owed_sets_per_stream,
             ssf_min_verification_interval_secs: ironauth_config::SsfConfig::default()
                 .min_verification_interval_secs,
+            ssf_max_subjects_per_stream: ironauth_config::SsfConfig::default()
+                .max_subjects_per_stream,
             fedcm_enabled: false,
             agent_vault_enabled: false,
             cimd_enabled: false,
@@ -1309,6 +1312,7 @@ impl OidcState {
         self.ssf_max_streams_per_client = config.max_streams_per_client;
         self.ssf_max_owed_sets_per_stream = config.max_owed_sets_per_stream;
         self.ssf_min_verification_interval_secs = config.min_verification_interval_secs;
+        self.ssf_max_subjects_per_stream = config.max_subjects_per_stream;
         self
     }
 
@@ -1334,6 +1338,12 @@ impl OidcState {
     #[must_use]
     pub fn ssf_min_verification_interval_secs(&self) -> u32 {
         self.ssf_min_verification_interval_secs
+    }
+
+    /// The most subjects one stream may filter by.
+    #[must_use]
+    pub fn ssf_max_subjects_per_stream(&self) -> u32 {
+        self.ssf_max_subjects_per_stream
     }
 
     /// Arm (or not) the experimental IdP-side FedCM surface (issue #83).

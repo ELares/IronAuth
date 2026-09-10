@@ -1170,6 +1170,11 @@ pub fn oidc_router(state: OidcState) -> Router {
             // beside the delivery endpoints: it is a receiver asking the transmitter to do
             // something, not a delivery channel.
             .route(ssf::VERIFICATION_PATH, post(ssf::verification))
+            // SSF 1.0 sections 8.1.4 and 8.1.5. Two paths rather than one with an action
+            // member, because the spec defines two endpoints and advertises them separately:
+            // a receiver discovers which of the two a transmitter supports.
+            .route(ssf::ADD_SUBJECT_PATH, post(ssf::add_subject))
+            .route(ssf::REMOVE_SUBJECT_PATH, post(ssf::remove_subject))
             .route(ssf::CONFIGURATION_PATH, get(ssf::configuration));
     }
 

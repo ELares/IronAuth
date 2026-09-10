@@ -2783,6 +2783,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "max_subjects_per_stream": {
+          "default": 10000,
+          "description": "The most subjects one stream may filter by.\n\nA subject list is receiver-chosen storage that the fan-out reads on every event, so an\nunbounded one is both unbounded rows and unbounded work per signal. Reaching it REFUSES,\nwhich a receiver can see and act on, rather than evicting a subject it would then\nsilently stop being told about.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "min_verification_interval_secs": {
           "default": 60,
           "description": "The shortest interval between two verification requests for one stream.\n\nSSF 1.0 section 7.1.4 lets a receiver ASK to be sent a verification event so it can prove\nthe delivery path works without waiting for a real signal. The request is one small POST\nand the work is not: each one mints a signed SET and either queues a row a poll receiver\nmust collect or an outbox message a worker must deliver. The spec anticipates exactly\nthis, defining 429 as the answer and naming `min_verification_interval` as the floor a\ntransmitter advertises.\n\nIt is ADVERTISED as well as enforced, in the SSF configuration document, so a receiver\ncan pace itself rather than discovering the limit by being refused.",
@@ -3462,6 +3469,7 @@
         "enabled": false,
         "max_owed_sets_per_stream": 1000,
         "max_streams_per_client": 20,
+        "max_subjects_per_stream": 10000,
         "min_verification_interval_secs": 60
       },
       "description": "The Shared Signals transmitter (issue #143). OFF by default, so the default boot\nmounts no stream-management surface and serves no SSF discovery document."

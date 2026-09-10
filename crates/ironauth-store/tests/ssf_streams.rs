@@ -796,3 +796,141 @@ async fn an_update_merged_against_a_stale_read_is_refused() {
         "a retry after re-reading was refused: {retried:?}"
     );
 }
+
+/// The per-stream subject ceiling refuses, and refuses rather than evicting.
+///
+/// `MAX_STREAM_SUBJECTS` is stated in the migration header, the constant's doc and the 429
+/// branch, and nothing drove any of them: the surface tests add two or three subjects against a
+/// ceiling of ten thousand, so deleting the count conjunct left every one of them green.
+#[tokio::test]
+async fn the_subject_ceiling_refuses_and_evicts_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client = seed_client(&db, &env, scope, "receiver").await;
+    let id = poll_stream(&db, &env, scope, &client).await;
+
+    let scoped = db.store().scoped(scope);
+    let subjects = scoped.ssf_stream_subjects();
+    // A CEILING OF TWO, passed in. The first version of this test seeded two subjects against
+    // the shipped bound of ten thousand and claimed to drive the ceiling; it drove nothing, and
+    // deleting the count conjunct left it green. That is why the bound is a parameter.
+    let ceiling = 2;
+    for n in 0..ceiling {
+        subjects
+            .add(
+                &env,
+                &id,
+                ironauth_store::SsfSubjectFormat::Opaque,
+                &format!("{{\"format\":\"opaque\",\"id\":\"subject-{n}\"}}"),
+                true,
+                ceiling,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("seed subject {n}: {error:?}"));
+    }
+    assert_eq!(
+        subjects.count(&id).await.expect("count"),
+        i64::from(ceiling)
+    );
+
+    let outcome = subjects
+        .add(
+            &env,
+            &id,
+            ironauth_store::SsfSubjectFormat::Opaque,
+            "{\"format\":\"opaque\",\"id\":\"one-too-many\"}",
+            true,
+            ceiling,
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(StoreError::QuotaExceeded)),
+        "the subject past the ceiling was not refused: {outcome:?}"
+    );
+    assert_eq!(
+        subjects.count(&id).await.expect("count"),
+        i64::from(ceiling),
+        "the refusal evicted a subject to make room"
+    );
+
+    // A REPEATED ADD IS NOT A NEW SUBJECT, so it must still succeed AT the ceiling: the row
+    // already exists and the conflict path spends nothing. This is the case a naive count
+    // conjunct gets wrong, refusing a receiver that is only correcting what it asserted.
+    subjects
+        .add(
+            &env,
+            &id,
+            ironauth_store::SsfSubjectFormat::Opaque,
+            "{\"format\":\"opaque\",\"id\":\"subject-0\"}",
+            false,
+            ceiling,
+        )
+        .await
+        .expect("a repeated add at the ceiling is not a new subject");
+    assert_eq!(
+        subjects.count(&id).await.expect("count"),
+        i64::from(ceiling),
+        "a repeated add created a row"
+    );
+
+    let stored = subjects.list(&id, 100).await.expect("list");
+    assert!(
+        stored
+            .iter()
+            .any(|subject| subject.rendered.contains("subject-0") && !subject.verified),
+        "the repeated add did not refresh what the receiver asserted: {stored:?}"
+    );
+}
+
+/// A rendering longer than the store holds is refused BEFORE it is sealed.
+///
+/// The bound cannot live in the schema: 0221's CHECK bounds the CIPHERTEXT, which is the
+/// plaintext plus the AEAD nonce and tag, so a rule about the rendering has nowhere else to be
+/// true. Sizing the two the same was the original mistake, and it turned an accepted request
+/// into a 500.
+#[tokio::test]
+async fn a_subject_longer_than_the_store_holds_is_refused_before_sealing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client = seed_client(&db, &env, scope, "receiver").await;
+    let id = poll_stream(&db, &env, scope, &client).await;
+    let subjects = db.store().scoped(scope);
+    let subjects = subjects.ssf_stream_subjects();
+
+    let at_bound = "x".repeat(ironauth_store::MAX_SUBJECT_BYTES);
+    subjects
+        .add(
+            &env,
+            &id,
+            ironauth_store::SsfSubjectFormat::Opaque,
+            &at_bound,
+            true,
+            10,
+        )
+        .await
+        .expect("a rendering exactly at the bound is held");
+
+    let over = "x".repeat(ironauth_store::MAX_SUBJECT_BYTES + 1);
+    let outcome = subjects
+        .add(
+            &env,
+            &id,
+            ironauth_store::SsfSubjectFormat::Opaque,
+            &over,
+            true,
+            10,
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(StoreError::Invalid)),
+        "a rendering one byte over the bound was accepted, or failed as a database error \
+         instead of a refusal: {outcome:?}"
+    );
+    assert_eq!(
+        subjects.count(&id).await.expect("count"),
+        1,
+        "the oversized rendering was stored anyway"
+    );
+}

@@ -101,6 +101,8 @@
 /t/{tenant_id}/e/{environment_id}/ssf/poll/{stream_id}
 /t/{tenant_id}/e/{environment_id}/ssf/status
 /t/{tenant_id}/e/{environment_id}/ssf/streams
+/t/{tenant_id}/e/{environment_id}/ssf/subjects/add
+/t/{tenant_id}/e/{environment_id}/ssf/subjects/remove
 /t/{tenant_id}/e/{environment_id}/ssf/verify
 /t/{tenant_id}/e/{environment_id}/webauthn/authenticate/options
 /t/{tenant_id}/e/{environment_id}/webauthn/authenticate/verify
