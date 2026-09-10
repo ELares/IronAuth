@@ -322,9 +322,14 @@ pub async fn create_stream(
 
     // WHAT THIS TRANSMITTER AGREED TO SEND is the intersection with what it can emit, and it
     // is computed here rather than echoed back: a receiver that asked for an event type this
-    // build does not produce must be able to SEE that it is not coming. Today
-    // `EVENTS_SUPPORTED` is empty (the CAEP and RISC vocabularies are the next issue), so this
-    // is the empty set for every stream, which is the honest answer and not a bug.
+    // build does not produce must be able to SEE that it is not coming.
+    //
+    // THE INTERSECTION IS NO LONGER ALWAYS EMPTY. This comment said it was, which was true
+    // while `EVENTS_SUPPORTED` was, and the verification endpoint changed that: a receiver
+    // asking for SSF's verification event now gets it back in `events_delivered`. The CAEP and
+    // RISC vocabularies are still the next issue's, so every other request is still refused by
+    // omission. The `a_receiver_is_told_which_of_its_requested_events_will_arrive` test drives
+    // both halves.
     let delivered: Vec<String> = request
         .events_requested
         .iter()
@@ -777,20 +782,9 @@ pub async fn verification(
         return not_delivering(stream.status);
     }
 
-    // THE SLOT BEFORE THE WORK. Taken first so a refused request costs a single UPDATE rather
-    // than a signature, and taken atomically so a burst cannot all pass one stale instant.
-    match state
-        .store()
-        .scoped(scope)
-        .ssf_streams()
-        .claim_verification(&id, &client, state.ssf_min_verification_interval_secs())
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return too_many_verifications(state.ssf_min_verification_interval_secs()),
-        Err(_) => return server_error(),
-    }
-
+    // EVERY REFUSAL THAT COSTS NOTHING COMES FIRST. An earlier version claimed the rate-limit
+    // slot before validating `state`, so a receiver sending an over-long value got a 400 AND
+    // lost its interval, for a request that minted and queued nothing.
     let mut payload = serde_json::Map::new();
     if let Some(echoed) = &request.state {
         // ECHOED VERBATIM AND BOUNDED. Section 7.1.4 says the transmitter returns the value the
@@ -803,6 +797,47 @@ pub async fn verification(
             "state".to_owned(),
             serde_json::Value::String(echoed.clone()),
         );
+    }
+
+    // THE BUDGET THE RECEIVER CANNOT RESET, claimed BEFORE the per-stream slot.
+    //
+    // The per-stream floor below is keyed on a column of `ssf_streams`, a row the receiver
+    // deletes at will: `create -> verify -> delete -> create` gives a stream whose
+    // `last_verification_at` is NULL and passes immediately, so on its own that floor bounds
+    // nothing. This one is keyed on the CLIENT and survives the churn. It is claimed first so a
+    // receiver that has exhausted it has spent nothing else.
+    //
+    // THE ALLOWANCE IS THE STREAM CEILING: a receiver may hold that many streams and verify
+    // each once per interval, so that count is exactly the honest maximum.
+    match state
+        .store()
+        .scoped(scope)
+        .ssf_streams()
+        .claim_client_verification(
+            &client,
+            state.ssf_min_verification_interval_secs(),
+            state.ssf_max_streams_per_client(),
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return too_many_verifications(state.ssf_min_verification_interval_secs()),
+        Err(_) => return server_error(),
+    }
+
+    // THE PER-STREAM SLOT, which is the floor a receiver can act on: it names THIS stream, so a
+    // receiver polling several knows which one to back off. Taken atomically, so a burst cannot
+    // all pass one stale instant.
+    match state
+        .store()
+        .scoped(scope)
+        .ssf_streams()
+        .claim_verification(&id, &client, state.ssf_min_verification_interval_secs())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return too_many_verifications(state.ssf_min_verification_interval_secs()),
+        Err(_) => return server_error(),
     }
     let event = crate::ssf_set::SecurityEvent {
         event_type: crate::ssf_set::VERIFICATION_EVENT_TYPE.to_owned(),
@@ -941,12 +976,16 @@ fn owed_queue_full() -> Response {
 
 /// The receiver asked for a verification event again too soon.
 fn too_many_verifications(min_interval_secs: u32) -> Response {
+    // RETRY-AFTER NAMES THE INTERVAL. It said `0`, which is the one value that makes the header
+    // worse than absent: a receiver obeying it retries immediately and is refused again, so the
+    // header turned a rate limit into an invitation to spin.
+    let retry_after = min_interval_secs.to_string();
     (
         StatusCode::TOO_MANY_REQUESTS,
         [
             (header::CONTENT_TYPE, "application/json"),
             (header::CACHE_CONTROL, "no-store"),
-            (header::RETRY_AFTER, "0"),
+            (header::RETRY_AFTER, retry_after.as_str()),
         ],
         serde_json::json!({
             "error": "too_many_requests",
@@ -1007,10 +1046,10 @@ pub async fn configuration(
             "configuration_endpoint": format!("{base}/streams"),
             "status_endpoint": format!("{base}/status"),
             "verification_endpoint": format!("{base}/verify"),
-            // ADVERTISED BECAUSE IT IS ENFORCED. Section 7.1.4 pairs `min_verification_interval`
-            // with the 429 a receiver gets for asking too often, and publishing it is what lets
-            // a receiver pace itself instead of discovering the floor by being refused.
-            "min_verification_interval": state.ssf_min_verification_interval_secs(),
+            // `min_verification_interval` IS NOT HERE, and that is a correction. It was, and
+            // SSF 1.0 does not define it as transmitter metadata: it is a read-only STREAM
+            // configuration property, so a conformant receiver reads it off its own stream and
+            // would never have found it in this document. `render_stream` carries it now.
             "delivery_methods_supported": DELIVERY_METHODS_SUPPORTED,
             // WHAT A POLL RECEIVER CANNOT LEARN FROM A RESPONSE. RFC 8936 defaults
             // `returnImmediately` to false, meaning "hold the request open", and this
@@ -1019,8 +1058,10 @@ pub async fn configuration(
             // from a long poll that timed out. Publishing it here is the only place it can
             // learn the policy BEFORE it builds a client around waiting.
             "long_poll_supported": false,
-            // EMPTY UNTIL SOMETHING EMITS. See `ssf_set::EVENTS_SUPPORTED`: advertising a type
-            // nothing produces tells a receiver to request a signal it will never be sent.
+            // EXACTLY WHAT THIS BUILD EMITS. See `ssf_set::EVENTS_SUPPORTED`: it was empty
+            // while nothing produced a SET, and it names SSF's own verification event now that
+            // the verification endpoint does. Advertising a type nothing produces would tell a
+            // receiver to request a signal it will never be sent.
             "events_supported": EVENTS_SUPPORTED,
             // NARROWED TO WHAT IS ACCEPTED. `authenticate_client_self_scoped` reads the
             // Authorization header, so `client_secret_basic` is the method that reaches these
@@ -1074,6 +1115,12 @@ fn render_stream(state: &OidcState, scope: Scope, stream: &SsfStream) -> serde_j
         "events_supported": EVENTS_SUPPORTED,
         "events_requested": stream.events_requested,
         "events_delivered": stream.events_delivered,
+        // TRANSMITTER-SUPPLIED AND READ-ONLY, which is what SSF 1.0 makes it: the receiver
+        // cannot set it, and it is here rather than in the discovery document because the
+        // stream configuration object is where the spec defines it and therefore the only
+        // place a conformant receiver looks. Publishing it is what lets a receiver pace itself
+        // instead of discovering the floor by being refused.
+        "min_verification_interval": state.ssf_min_verification_interval_secs(),
         "format": stream.subject_format.as_str(),
         "description": stream.description,
     })

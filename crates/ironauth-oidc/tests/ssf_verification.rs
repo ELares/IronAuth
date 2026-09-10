@@ -10,14 +10,19 @@
 //! receiver's own conformance check depends on:
 //!
 //! - the SET REALLY ARRIVES, by the delivery method the stream negotiated. A 204 that queued
-//!   nothing would be the exact failure verification exists to detect, so every test here reads
-//!   the delivery side rather than the status code;
+//!   nothing would be the exact failure verification exists to detect, so wherever a test
+//!   asserts a verification SUCCEEDED it reads the delivery side and not merely the status.
+//!   The cases that assert a status alone are the ones whose whole subject IS the status: that
+//!   two refusals are indistinguishable, that a second stream is not refused, and that the
+//!   advertised endpoint answers at all;
 //! - the subject is an OPAQUE identifier naming the STREAM, whatever format the stream
 //!   negotiated. Section 7.1.4 requires it, and a stream that negotiated `email` getting an
 //!   email-shaped subject here would name a person who has nothing to do with the event;
 //! - `state` comes back verbatim, because the 204 names nothing and echoing it is the receiver's
 //!   only way to match the SET it collects to the request it made;
-//! - the rate limit is real and per stream.
+//! - the rate limit is real, per stream, AND not resettable by the receiver. The per-stream
+//!   column lives on a row the receiver deletes at will, so a second floor keyed on the client
+//!   is what actually bounds the work; both are driven here.
 //!
 //! # This is the first production caller of the two queues
 //!
@@ -444,14 +449,13 @@ async fn a_paused_stream_is_verified_and_a_disabled_one_is_refused() {
     }
 }
 
-/// Discovery advertises the endpoint and the interval, and the endpoint resolves.
+/// Discovery advertises the endpoint, the endpoint resolves, and it advertises nothing else.
 ///
 /// The `jwks_uri` lesson applied to a second field: this surface once published a path nothing
 /// mounted and every assertion about the document passed anyway. So the advertised endpoint is
-/// CALLED here rather than eyeballed, and the advertised interval is required to be the one the
-/// handler enforces.
+/// CALLED here rather than eyeballed.
 #[tokio::test]
-async fn discovery_advertises_the_verification_endpoint_and_the_interval_it_enforces() {
+async fn discovery_advertises_the_verification_endpoint_and_nothing_ssf_puts_elsewhere() {
     let mut harness = Harness::start_store_backed().await;
     harness.enable_ssf(20);
     let (client, secret) = harness
@@ -474,10 +478,14 @@ async fn discovery_advertises_the_verification_endpoint_and_the_interval_it_enfo
     assert_eq!(status, StatusCode::OK, "{body}");
     let doc: serde_json::Value = serde_json::from_str(&body).expect("a configuration document");
 
-    assert_eq!(
-        doc["min_verification_interval"],
-        serde_json::json!(harness.state().ssf_min_verification_interval_secs()),
-        "the advertised interval is not the one the handler enforces"
+    // NOT IN THIS DOCUMENT. SSF 1.0 makes `min_verification_interval` a read-only STREAM
+    // configuration property; it was published here, where a conformant receiver never looks
+    // for it. `a_receiver_is_told_which_of_its_requested_events_will_arrive` pins it on the
+    // stream object, and `the_enforced_interval_is_the_one_that_is_advertised` measures the
+    // number the handler actually enforces rather than reading it back off its own accessor.
+    assert!(
+        doc.get("min_verification_interval").is_none(),
+        "the transmitter metadata carries a member SSF does not define for it: {body}"
     );
     // AND THE EVENT IS ADVERTISED, since the transmitter can now emit one.
     assert_eq!(
@@ -498,5 +506,276 @@ async fn discovery_advertises_the_verification_endpoint_and_the_interval_it_enfo
         status,
         StatusCode::NO_CONTENT,
         "the advertised verification endpoint does not serve a verification: {text}"
+    );
+}
+
+/// An SSF config with a one-second interval and an allowance of `allowance`.
+///
+/// SHORT ENOUGH TO WAIT OUT. A test measuring a limit has to set it: against the shipped sixty
+/// seconds these tests would either take a minute each or assert nothing.
+fn quick_ssf(allowance: u32) -> ironauth_config::SsfConfig {
+    ironauth_config::SsfConfig {
+        enabled: true,
+        max_streams_per_client: allowance,
+        min_verification_interval_secs: 1,
+        ..ironauth_config::SsfConfig::default()
+    }
+}
+
+/// Deleting and recreating a stream does NOT hand the receiver a fresh verification budget.
+///
+/// THE BYPASS THIS EXISTS TO CLOSE. The per-stream floor lives on `ssf_streams`, a row the
+/// receiver deletes at will, so `create -> verify -> delete -> create` gives a stream whose
+/// `last_verification_at` is NULL and passes immediately. Measured in review: the loop minted
+/// signed SETs as fast as a client could issue three requests, and the advertised floor stopped
+/// none of it. The budget keyed on the CLIENT is what makes the bound real.
+#[tokio::test]
+async fn a_receiver_cannot_reset_its_verification_budget_by_recreating_the_stream() {
+    let mut harness = Harness::start_store_backed().await;
+    // An allowance of one, so the second verification of the window must be refused however
+    // the receiver arranges its streams.
+    harness.enable_ssf_with(&quick_ssf(1));
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+
+    let first = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+    let (status, body) = ask(&harness, &auth, &first, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // Destroy the row the per-stream floor lives on, exactly as the bypass does.
+    let env = harness.state().env().clone();
+    harness
+        .db()
+        .store()
+        .scoped(harness.scope())
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .ssf_streams()
+        .delete(&env, &first, &client)
+        .await
+        .expect("the receiver deletes its own stream");
+
+    let second = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+    let (status, body) = ask(&harness, &auth, &second, None).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a recreated stream handed the receiver a fresh verification slot: {body}"
+    );
+    assert!(
+        owed_tokens(&harness, &second).await.is_empty(),
+        "the refused request minted a SET anyway"
+    );
+}
+
+/// The interval the limiter ENFORCES is measured, not read back off the document that states it.
+///
+/// The discovery assertion compares the published number against the same accessor the handler
+/// reads, so it cannot tell an enforcing handler from one that ignores the value entirely. This
+/// drives the clock instead: refused inside the window, allowed once it has passed.
+#[tokio::test]
+async fn the_enforced_interval_is_the_one_that_is_advertised() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf_with(&quick_ssf(10));
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let id = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+
+    let (status, body) = ask(&harness, &auth, &id, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, body) = ask(&harness, &auth, &id, None).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a second verification inside the interval was accepted: {body}"
+    );
+
+    // PAST THE ADVERTISED INTERVAL, and the same request now succeeds. If the handler enforced
+    // some other number this is the assertion that would fail.
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    let (status, body) = ask(&harness, &auth, &id, None).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the interval the handler enforces is longer than the one it advertises: {body}"
+    );
+    assert_eq!(
+        owed_tokens(&harness, &id).await.len(),
+        2,
+        "the accepted requests did not each queue a SET"
+    );
+}
+
+/// The refusal tells the receiver how long to wait.
+///
+/// `Retry-After: 0` was the first version, and it is the one value that makes the header worse
+/// than absent: a receiver obeying it retries immediately and is refused again, so the header
+/// turns a rate limit into an invitation to spin.
+#[tokio::test]
+async fn the_rate_limit_refusal_names_the_interval_in_retry_after() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf_with(&quick_ssf(10));
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let id = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+    ask(&harness, &auth, &id, None).await;
+
+    let body = serde_json::json!({ "stream_id": id.to_string() }).to_string();
+    let request = Request::builder()
+        .method("POST")
+        .uri(verify_uri(&harness))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, &auth)
+        .body(Body::from(body))
+        .expect("request builds");
+    let (status, headers, text) = harness.send(request).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{text}");
+    assert_eq!(
+        headers
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1"),
+        "the refusal did not tell the receiver to wait the interval it enforces"
+    );
+}
+
+/// An over-long `state` is refused WITHOUT spending the receiver's slot.
+///
+/// A 400 for a request that minted and queued nothing must not also cost an interval: the
+/// receiver fixes its request and asks again, and it should not have to wait to do so.
+#[tokio::test]
+async fn an_over_long_state_is_refused_and_costs_no_slot() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf_with(&quick_ssf(10));
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let id = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+
+    let too_long = "x".repeat(253);
+    let (status, body) = ask(&harness, &auth, &id, Some(&too_long)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        owed_tokens(&harness, &id).await.is_empty(),
+        "the refused request queued a SET"
+    );
+
+    // THE SLOT SURVIVED. This is the half that fails if the limiter is claimed before the
+    // request is validated.
+    let (status, body) = ask(&harness, &auth, &id, Some("fixed")).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "a 400 spent the receiver's verification slot: {body}"
+    );
+}
+
+/// A receiver is told which of the events it asked for will actually arrive.
+///
+/// `events_delivered` is the intersection of what the receiver requested with what this build
+/// emits, and it stopped always being empty when the verification endpoint landed. Both halves
+/// are driven: the type this build emits comes back, and one it does not is dropped.
+#[tokio::test]
+async fn a_receiver_is_told_which_of_its_requested_events_will_arrive() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+
+    let body = serde_json::json!({
+        "delivery": { "method": "urn:ietf:rfc:8936" },
+        "events_requested": [
+            VERIFICATION_EVENT_TYPE,
+            "https://schemas.openid.net/secevent/caep/event-type/session-revoked",
+        ],
+        "aud": ["https://receiver.example.com"],
+        "format": "iss_sub",
+    })
+    .to_string();
+    let scope = harness.scope();
+    let (status, text) = post(
+        &harness,
+        &format!(
+            "/t/{}/e/{}/ssf/streams",
+            scope.tenant(),
+            scope.environment()
+        ),
+        Some(&auth),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    let created: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
+    assert_eq!(
+        created["events_delivered"],
+        serde_json::json!([VERIFICATION_EVENT_TYPE]),
+        "the transmitter did not agree to send the one event it can emit"
+    );
+    // AND THE STREAM OBJECT CARRIES THE INTERVAL, which is where SSF 1.0 defines it. It was
+    // published in the transmitter metadata document instead, where a conformant receiver never
+    // looks for it.
+    assert_eq!(
+        created["min_verification_interval"],
+        serde_json::json!(harness.state().ssf_min_verification_interval_secs()),
+        "the stream configuration does not carry the verification interval: {text}"
+    );
+}
+
+/// A receiver that has stopped collecting is told so, and it is a 429 rather than a 500.
+///
+/// `owed_queue_full` is the only answer to a full poll queue and nothing drove it. The
+/// distinction it draws matters operationally: a full queue means the RECEIVER stopped
+/// collecting, so a 500 would send an operator looking at the transmitter, and the two 429s
+/// differ in what they tell the receiver to do -- wait, versus collect what you already have.
+#[tokio::test]
+async fn a_verification_for_a_stream_that_is_already_full_is_refused_as_a_rate_limit() {
+    let mut harness = Harness::start_store_backed().await;
+    // An owed ceiling of one, so a single pre-queued SET fills the stream.
+    harness.enable_ssf_with(&ironauth_config::SsfConfig {
+        enabled: true,
+        max_streams_per_client: 20,
+        max_owed_sets_per_stream: 1,
+        min_verification_interval_secs: 1,
+    });
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let id = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+
+    let env = harness.state().env().clone();
+    harness
+        .db()
+        .store()
+        .scoped(harness.scope())
+        .ssf_stream_sets()
+        .queue(&env, &id, "evt_backlog", "header.payload.sig", 1)
+        .await
+        .expect("fill the stream's queue");
+
+    let (status, body) = ask(&harness, &auth, &id, None).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a verification for a full stream was not refused as a rate limit: {body}"
+    );
+    // AND IT SAYS WHICH 429 IT IS. The two refusals are fixed by different actions, so a
+    // receiver that cannot tell them apart cannot act on either.
+    assert!(
+        body.contains("acknowledge what you have been given"),
+        "the refusal reads as a rate limit rather than a full queue: {body}"
+    );
+    assert_eq!(
+        owed_tokens(&harness, &id).await.len(),
+        1,
+        "the refused verification queued a SET past the ceiling"
     );
 }

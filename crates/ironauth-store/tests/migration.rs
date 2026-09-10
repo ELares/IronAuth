@@ -101,7 +101,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      LDAP sync runs, \
      Shared Signals streams, \
      Shared Signals stream SETs, \
-     Shared Signals stream verification";
+     Shared Signals stream verification, \
+     Shared Signals verification budget";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -732,7 +733,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        218,
+        219,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -775,7 +776,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176,
             177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193,
             194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210,
-            211, 212, 213, 214, 215, 216, 217, 218
+            211, 212, 213, 214, 215, 216, 217, 218, 219
         ]
     );
     let phase_of = |version: i64| async move {
@@ -8337,8 +8338,7 @@ async fn the_narrowed_tables_grant_the_data_plane_exactly_their_writers_columns(
         ("agent_vault_approvals", vec!["state", "decided_at"]),
         // `revoke_session_set` names one column; `mint` is an INSERT and `redeem` a SELECT.
         ("native_sso_device_secrets", vec!["revoked_at"]),
-        // `ActingSsfStreamRepo::set_status` names all three and is the only UPDATE on the
-        // table (issue #143). Absent: `client_id`, which decides WHOSE stream it is, and
+        // `ActingSsfStreamRepo::set_status` names the first three (issue #143). Absent: `client_id`, which decides WHOSE stream it is, and
         // `push_endpoint_url` / `push_secret_name`, which decide where its security events go
         // and what credential is presented -- a data plane that could write those could
         // re-point another receiver's stream at an endpoint it chose. Also absent are the
@@ -8358,6 +8358,14 @@ async fn the_narrowed_tables_grant_the_data_plane_exactly_their_writers_columns(
                 "updated_at",
                 "last_verification_at",
             ],
+        ),
+        // `claim_verification`'s sibling: `claim_client_verification` upserts one row per
+        // receiver and names exactly the two columns that describe the window (0219). Absent:
+        // `client_id`, which decides WHOSE budget it is -- a data plane that could write it
+        // could move a receiver's spend onto a neighbour and refuse them instead.
+        (
+            "ssf_verification_budget",
+            vec!["window_started_at", "spent"],
         ),
     ] {
         let mut writable = writable_columns(pool, "ironauth_app", table).await;

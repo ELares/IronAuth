@@ -68,9 +68,9 @@ pub const PAYLOAD_EVENT: &str = "event";
 
 /// Queue one SET for one push stream.
 ///
-/// The producer's entry point. #143 ships the delivery machinery and the CAEP and RISC
-/// vocabularies are the next issue's, so the only callers today are tests and the fan-out that
-/// lands with those vocabularies; this is the shape it will call.
+/// The producer's entry point. Its first production caller is the SSF 1.0 verification
+/// endpoint, which needs no event vocabulary; the general fan-out lands with the CAEP and RISC
+/// vocabularies in the next issue, and this is the shape it will call too.
 ///
 /// # The two keys carry the two guarantees
 ///
