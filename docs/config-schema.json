@@ -2363,6 +2363,63 @@
       },
       "type": "object"
     },
+    "RiscReceiverConfig": {
+      "additionalProperties": false,
+      "description": "The Google Cross-Account Protection receiver (issue #144).\n\nGoogle Cross-Account Protection is a RISC transmitter: when a Google account is believed\ncompromised, disabled or purged, Google pushes a signed Security Event Token to receivers\nthat have registered for it. For a deployment whose users sign in WITH Google, consuming\nthat stream closes a real account-takeover path -- the attacker holds the upstream\naccount, and without this the local sessions minted from it keep working.\n\n# Why this is its own section and not a third-party signal source\n\nIssue #144 puts the general-purpose case out of scope on purpose: \"only the Google\nCross-Account Protection consumer ships here\", and \"this receiver deliberately applies\nits own fixed, per-environment configured action set so the Google consumer never depends\non an experimental feature.\" The typed third-party risk-signal seam is\nexperimental-flagged; a protection that ends sessions must not be reachable only when an\nexperiment is switched on.\n\n# Nothing here has a usable default\n\nEvery field that names the transmitter -- the issuer, its keys, the algorithms, the\nconnector its subjects belong to -- is empty by default and validated when `enabled` is\nset. A receiver with a default issuer would either accept nothing or, worse, accept\nsomething.",
+      "properties": {
+        "algorithms": {
+          "default": [],
+          "description": "The JWS algorithm allowlist an inbound SET may be signed with, as JOSE `alg` names.\n\nGoogle signs with `RS256`. Taken from configuration rather than from the token\nheader, so an attacker cannot pick the algorithm that checks their own signature;\n`alg=none` and the HMAC families are structurally inexpressible in the core anyway.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "audience": {
+          "default": "",
+          "description": "The `aud` an inbound SET must carry.\n\nFOR GOOGLE THIS IS THE APP'S OAUTH CLIENT ID, not a URL. Google Cross-Account\nProtection stamps the receiving app's client id\n(`123456789-abcdefg.apps.googleusercontent.com`), which is what its own\ndocumentation shows and what a real token carries. An earlier version of this\nreceiver pinned `aud` to this environment's issuer URL, which is the SSF 1.0 shape\nand would have refused every genuine Google token.\n\nIt is configured rather than derived because only the operator knows which of\ntheir OAuth clients is registered with the transmitter.",
+          "type": "string"
+        },
+        "connector_id": {
+          "default": "",
+          "description": "The federation connector whose subjects this transmitter speaks about.\n\nAn inbound SET names a subject in the transmitter's own namespace, and this is what\nturns that into a LOCAL user: the connector plus the composite of the SET's issuer\nand subject is the key `account_links` is resolved on. Without it a signal could only\nbe matched by guessing, and matching the wrong user would end a stranger's sessions.",
+          "type": "string"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Whether to mount the receiver endpoint. Off by default, and off is a uniform 404 on\nthe receiver path rather than a 501: a transmitter probing a deployment that has not\nenabled it learns that it does not implement it, which is true.",
+          "type": "boolean"
+        },
+        "issuer": {
+          "default": "",
+          "description": "The transmitter's issuer, which is BOTH the `iss` an inbound SET must carry and the\nvalue its signature is verified under.\n\nFor Google Cross-Account Protection this is `https://accounts.google.com`. It is\noperator-configured rather than read off the token, because a value read off an\nunverified token selects the key that will check it, which is no check at all.",
+          "type": "string"
+        },
+        "jwks": {
+          "default": "",
+          "description": "The transmitter's registered PUBLIC keys, as a JWKS JSON document.\n\nThe ONLY key source. A key from the token header is never consulted, and the JOSE\ncore reads only public JWK members.",
+          "type": "string"
+        },
+        "max_issuance_age_secs": {
+          "default": 3600,
+          "description": "How old an inbound SET's `iat` may be, in seconds, before it is refused.\n\nTHIS IS A REPLAY BOUND AND NOT AN EXPIRY, and the distinction matters because this\ncodebase holds that SETs must not expire (SSF 1.0 section 4.1.7; see\n`VerificationPolicy::allow_absent_exp`). The durable defence against replay here is\nthe `jti` table, which never forgets. This bound exists because issue #144 criterion\n5 asks for it explicitly, and it is generous by default so that a receiver recovering\nfrom an outage still accepts the backlog it most needs.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revoke_sessions": {
+          "default": true,
+          "description": "Whether a protective signal ends the linked user's sessions.",
+          "type": "boolean"
+        },
+        "revoke_trusted_devices": {
+          "default": true,
+          "description": "Whether a protective signal revokes the linked user's remembered devices.\n\nTHIS IS THE STEP-UP HALF. A remembered device is precisely what lets the next sign-in\nskip the strong factor, so revoking sessions while leaving trust in place invites\nwhoever holds the upstream account back in with one password.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "RiskConfig": {
       "additionalProperties": false,
       "description": "The minimal risk-engine settings (issue #79).\n\nThe design bet is LEGIBILITY over ML: a small set of EXPLAINABLE signals feed a\nthree-level score (LOW/MED/HIGH) and a three-verb action vocabulary\n(block/challenge/notify), and every decision is traceable and auditable. Each signal\nis INDEPENDENTLY toggleable per environment, so a deployment enables only the signals\nit wants. OFF by default ([`enabled`](Self::enabled) false): the whole engine is inert\nuntil a tenant opts in, so no decision is recorded, no notification is sent, and\nstep-up is never forced by risk. The `GeoIP` and IP-reputation providers are PLUGGABLE\nSEAMS with null defaults (no bundled third-party dependency), so the engine runs\ncomplete with ZERO third-party services; the allow/deny lists below are the only\nbuilt-in IP-reputation input.",
@@ -3434,6 +3491,21 @@
         ]
       },
       "description": "Per-tenant and per-environment quota fairness settings (issue #50). The\noperator-plane noisy-neighbor guard: nested token buckets that keep one\ntenant or environment from starving another. Safe defaults, fully tunable\n(the tunability principle); a burst of 0 for a dimension means unlimited\n(the single-tenant self-hoster posture)."
+    },
+    "risc_receiver": {
+      "$ref": "#/$defs/RiscReceiverConfig",
+      "default": {
+        "algorithms": [],
+        "audience": "",
+        "connector_id": "",
+        "enabled": false,
+        "issuer": "",
+        "jwks": "",
+        "max_issuance_age_secs": 3600,
+        "revoke_sessions": true,
+        "revoke_trusted_devices": true
+      },
+      "description": "The Google Cross-Account Protection RISC receiver (issue #144). OFF by default, so\nthe default boot mounts no receiver endpoint and accepts no inbound SET."
     },
     "scim": {
       "$ref": "#/$defs/ScimConfig",

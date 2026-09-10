@@ -1622,6 +1622,21 @@ async fn build_oidc_plane(
     .with_org_provisioning(org_provisioning)
     .with_global_token_revocation_enabled(surfaces.global_revocation)
     .with_ssf(&config.ssf)
+    .with_risc_receiver(&{
+        // CHECKED HERE, where the JOSE core is reachable and the operator is still
+        // watching the log. See `unrecognised_risc_algorithms`.
+        let unreadable = unrecognised_risc_algorithms(&config.risc_receiver);
+        if !unreadable.is_empty() {
+            tracing::error!(
+                algorithms = ?unreadable,
+                "risc_receiver.algorithms names algorithms this build does not recognise; \
+                 the receiver is left OFF rather than mounted refusing every token"
+            );
+            ironauth_config::RiscReceiverConfig::default()
+        } else {
+            config.risc_receiver.clone()
+        }
+    })
     .with_fedcm_enabled(surfaces.fedcm)
     .with_agent_vault_enabled(surfaces.agent_vault)
     .with_risk_signals_enabled(surfaces.risk_signals)
@@ -4602,6 +4617,27 @@ async fn spawn_webhook_delivery_pools(inputs: WebhookDeliveryInputs) -> Vec<Outb
 /// takes a lease, so at most one worker holds a message at a time, and the explode is
 /// idempotent through `enqueue_all`, which skips an existing (consumer, idempotency_key)
 /// instead of raising. With both switches on the queue simply has two drainers.
+/// Refuse to serve with a RISC receiver whose algorithm allowlist this build cannot read
+/// (issue #144).
+///
+/// `ironauth-config` validates that the list is non-empty, and cannot do more: it is the
+/// workspace leaf and has no JOSE dependency. But non-empty is not the same as usable.
+/// `JwsAlgorithm::from_jose_name` silently drops a name it does not know, so `["RS-256"]`
+/// or `["rsa256"]` reaches the receiver as NO algorithms and refuses every token, while
+/// the configuration file looks correct and the endpoint answers.
+///
+/// Returning the offending names rather than a bool so the operator is told WHICH ones.
+fn unrecognised_risc_algorithms(cfg: &ironauth_config::RiscReceiverConfig) -> Vec<String> {
+    if !cfg.enabled {
+        return Vec::new();
+    }
+    cfg.algorithms
+        .iter()
+        .filter(|name| ironauth_jose::JwsAlgorithm::from_jose_name(name).is_none())
+        .cloned()
+        .collect()
+}
+
 fn ssf_consumers<S: ironauth_oidc::ssf_push::SsfPushSender + Send + Sync + 'static>(
     data_store: &Store,
     master: Arc<ironauth_jose::MasterKey>,

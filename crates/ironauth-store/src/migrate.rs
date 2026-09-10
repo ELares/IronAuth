@@ -1821,6 +1821,25 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0221_ssf_stream_subjects.sql"),
         },
+        Migration {
+            version: 222,
+            name: "trusted_device_upstream_compromise",
+            // EXPAND. It WIDENS a CHECK: every value an older binary can write still
+            // satisfies the new constraint, and the one value it cannot write is the one
+            // only the new binary produces. A rolling upgrade is safe in both directions
+            // until something actually writes `upstream_compromise`, which only the new
+            // receiver does.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0222_trusted_device_upstream_compromise.sql"),
+        },
+        Migration {
+            version: 223,
+            name: "risc_received_sets",
+            // EXPAND. A new table with no writer on any older binary: an old binary mounts
+            // no RISC receiver, so nothing reads or writes it during a rolling upgrade.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0223_risc_received_sets.sql"),
+        },
     ]
 }
 

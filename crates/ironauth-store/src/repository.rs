@@ -337,6 +337,15 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The inbound RISC SETs this environment has already acted on (issue #144).
+    #[must_use]
+    pub fn risc_received_sets(&self) -> RiscReceivedSetRepo<'a> {
+        RiscReceivedSetRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The SETs each Shared Signals stream owes its receiver (issue #143).
     #[must_use]
     pub fn ssf_stream_sets(&self) -> SsfStreamSetRepo<'a> {
@@ -22264,6 +22273,82 @@ pub const SSF_PUSH_CONSUMER: &str = "ssf.push";
 /// still exist is the one case that accumulates, and it is the operator's own act.
 pub const SSF_SESSION_FANOUT_CONSUMER: &str = "ssf.session_fanout";
 
+/// The receiver's memory of which inbound RISC Security Event Tokens it has already acted
+/// on (issue #144).
+///
+/// NOT AUDITED and NOT ACTING-SCOPED, unlike most writes in this file. A row here is not a
+/// decision anybody made; it is the receiver noticing it has seen a token before. The
+/// decision it guards -- ending sessions, revoking device trust -- is audited where it
+/// happens.
+pub struct RiscReceivedSetRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl RiscReceivedSetRepo<'_> {
+    /// Whether this `(issuer, jti)` has already been acted on.
+    ///
+    /// A READ, taken before the work. The WRITE is [`Self::claim`], taken after it
+    /// succeeds; see the receiver for why that ordering is the safe one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn seen(&self, issuer: &str, jti: &str) -> Result<bool, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1::bigint FROM risc_received_sets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND issuer = $3 AND jti = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(issuer)
+        .bind(jti)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StoreError::Database)?;
+        Ok(found.is_some())
+    }
+
+    /// Claim one `(issuer, jti)` for this environment.
+    ///
+    /// `Ok(true)` means this token had not been seen and the caller may act on it.
+    /// `Ok(false)` means it HAS been seen and the caller must not: the protections this
+    /// receiver applies are not idempotent in the way a delivery is, and re-applying them
+    /// would end sessions the user has since legitimately started and revoke devices they
+    /// have since re-trusted.
+    ///
+    /// THE INSERT IS THE CLAIM. The composite primary key makes a duplicate a unique
+    /// violation, so two concurrent deliveries of one SET admit exactly one. A
+    /// read-then-write would let both reads miss and both callers act, which is the whole
+    /// failure this guards.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure. A conflict is NOT an error here:
+    /// it is the answer.
+    pub async fn claim(&self, env: &Env, issuer: &str, jti: &str) -> Result<bool, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let inserted = sqlx::query(
+            "INSERT INTO risc_received_sets \
+             (tenant_id, environment_id, issuer, jti, seen_at) \
+             VALUES ($1, $2, $3, $4, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(issuer)
+        .bind(jti)
+        .bind(epoch_micros(env.clock().now_utc()).to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(StoreError::Database)?;
+        tx.commit().await?;
+        Ok(inserted.rows_affected() == 1)
+    }
+}
+
 /// The registered consumer name the USER LIFECYCLE to Shared Signals fan-out drains under
 /// (issue #144 criterion 3).
 ///
@@ -27731,6 +27816,17 @@ pub enum TrustedDeviceRevokeReason {
     PasswordChange,
     /// An MFA factor removal/regeneration invalidated the device's trust (per policy).
     FactorChange,
+    /// An UPSTREAM identity provider reported the federated account compromised
+    /// (issue #144). Not an act by anyone inside this system, which is why it is its own
+    /// reason rather than `admin`: the reason column is read by a human deciding whether
+    /// a revocation was expected, and naming an operator who did nothing would mislead
+    /// exactly that reader.
+    ///
+    /// Revoking device trust is the STEP-UP half of the configured protection. A
+    /// remembered device is precisely what lets the next sign-in skip the strong factor,
+    /// so ending sessions while leaving trust in place would invite whoever holds the
+    /// upstream account back in with one password.
+    UpstreamCompromise,
 }
 
 impl TrustedDeviceRevokeReason {
@@ -27742,6 +27838,7 @@ impl TrustedDeviceRevokeReason {
             TrustedDeviceRevokeReason::Admin => "admin",
             TrustedDeviceRevokeReason::PasswordChange => "password_change",
             TrustedDeviceRevokeReason::FactorChange => "factor_change",
+            TrustedDeviceRevokeReason::UpstreamCompromise => "upstream_compromise",
         }
     }
 }

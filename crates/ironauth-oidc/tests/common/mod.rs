@@ -1756,6 +1756,28 @@ impl Harness {
         self.state = state;
     }
 
+    /// Arm the Google Cross-Account Protection receiver (issue #144) for the harness scope
+    /// and rebuild the protocol router.
+    ///
+    /// Builds a fresh state over the SAME master-key-wired store, env and registry, so a
+    /// test can seed an account link before arming the receiver and still have the handler
+    /// read it.
+    pub fn enable_risc_receiver(&mut self, cfg: &ironauth_config::RiscReceiverConfig) {
+        let state = self.state.clone().with_risc_receiver(cfg);
+        let issuer_state = IssuerState::new(Arc::clone(&self.registry), self.env.clone());
+        let discovery_state = DiscoveryState::new(
+            ISSUER_BASE,
+            JwksCacheWindow::clamped(OidcConfig::default().jwks_cache_max_age_secs),
+            DiscoveryCapabilities::from_config(&OidcConfig::default()),
+            Arc::clone(&self.registry),
+            self.env.clone(),
+        );
+        self.router = oidc_router(state.clone())
+            .merge(issuer_router(issuer_state))
+            .merge(discovery_router(discovery_state));
+        self.state = state;
+    }
+
     /// Arm the experimental third-party risk-signal ingestion surface (issue #82, PR 1) for
     /// the harness scope and rebuild the protocol router. Builds a fresh state over the SAME
     /// master-key-wired store, env, and registry, with the risk engine ENABLED and the given

@@ -623,6 +623,19 @@ mod tests {
     /// must state rather than one they can omit.
     const PLANE_LOCAL_KEYS: &[(&str, Reach, &str)] = &[
         (
+            "risc_receiver",
+            Reach::OnePlaneOrNoState,
+            "read at boot in ONE place, and it is not the management plane (issue #144). The \
+             OIDC plane's state builder takes `with_risc_receiver(&config.risc_receiver)`, \
+             which arms the Google Cross-Account Protection receiver endpoint; nothing else \
+             reads it.\n\n\
+             IT IS PUBLIC-PLANE ONLY, and more strongly so than its `ssf` sibling: the caller \
+             is an EXTERNAL TRANSMITTER presenting no credential at all. The SET's signature, \
+             checked against the operator-registered keys, IS the authorization, so there is \
+             no operator credential involved and nothing under `/v1/tenants/...` serves it. \
+             Off is a uniform 404 on the receiver path.",
+        ),
+        (
             "ssf",
             Reach::OnePlaneOrNoState,
             "read at boot in two places, NEITHER of them the management plane (issue #143). \
