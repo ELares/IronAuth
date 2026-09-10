@@ -125,6 +125,7 @@ crates/ironauth-store/src/repository.rs:unassign_with_event:3
 crates/ironauth-store/src/repository.rs:unlink_external_id_with_event:1
 crates/ironauth-store/src/repository.rs:unpin_certificate:1
 crates/ironauth-store/src/repository.rs:update_claims:1
+crates/ironauth-store/src/repository.rs:update_configuration:1
 crates/ironauth-store/src/repository.rs:update_with_event:4
 crates/ironauth-store/src/repository.rs:verify_dynamic_client_with_event:1
 crates/ironauth-store/src/repository.rs:withdraw_with_event:1

@@ -330,6 +330,15 @@ impl<'a> ScopedStore<'a> {
 
     /// The SETs each Shared Signals stream owes its receiver (issue #143).
     #[must_use]
+    pub fn ssf_stream_subjects(&self) -> SsfStreamSubjectRepo<'a> {
+        SsfStreamSubjectRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The SETs each Shared Signals stream owes its receiver (issue #143).
+    #[must_use]
     pub fn ssf_stream_sets(&self) -> SsfStreamSetRepo<'a> {
         SsfStreamSetRepo {
             store: self.store,
@@ -61442,6 +61451,12 @@ const RECOVERY_CODE_BIDX_LABEL: &str = "ironauth.bidx.recovery-code.v1";
 /// The AAD label domain-separating a sealed recipient email on an `email_otp_codes` or
 /// `magic_link_tokens` row (issue #68) from every other envelope context, so a recipient
 /// address ciphertext never authenticates under another column's context.
+/// The AEAD label for a stream subject's sealed identifier (issue #143).
+const SSF_STREAM_SUBJECT_SEAL_LABEL: &str = "ironauth.ssf-stream-subject.identifier.v1";
+
+/// The blind-index label for a stream subject's rendered identifier (issue #143).
+const SSF_STREAM_SUBJECT_BIDX_LABEL: &str = "ironauth.ssf-stream-subject.bidx.v1";
+
 /// The AEAD label for a queued SET's sealed token (issue #143).
 const SSF_STREAM_SET_SEAL_LABEL: &str = "ironauth.ssf-stream-set.set-jws.v1";
 
@@ -62272,6 +62287,54 @@ fn ssf_stream_set_seal_aad(
         .text(&scope.environment().to_string())
         .text(&stream_id.to_string())
         .text(jti)
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The blind-index context for a stream subject: the label, the scope, the STREAM, and the
+/// canonical rendering, length-prefixed.
+///
+/// THE STREAM IS IN THE KEY, which the message recipient's index does not need and this does.
+/// Without it, one receiver holding a database dump could test whether ANOTHER receiver's
+/// stream is watching a subject it knows, by comparing indexes across rows. With it, the same
+/// address under two streams hashes to two values.
+fn ssf_stream_subject_bidx_aad(scope: Scope, stream_id: &SsfStreamId, rendered: &str) -> Aad {
+    Aad::builder()
+        .text(SSF_STREAM_SUBJECT_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .text(&stream_id.to_string())
+        .field(rendered.as_bytes())
+        .build()
+}
+
+/// The deterministic blind index for a stream subject.
+fn ssf_stream_subject_blind_index(
+    master: &MasterKey,
+    scope: Scope,
+    stream_id: &SsfStreamId,
+    rendered: &str,
+) -> BlindIndex {
+    master.blind_index(&ssf_stream_subject_bidx_aad(scope, stream_id, rendered))
+}
+
+/// The sealing context for a stream subject: the label, the scope, the STREAM, the blind index
+/// that keys the row, and the DEK version.
+///
+/// The whole primary key is bound in, so a ciphertext copied out of one row fails to open in
+/// another rather than naming the wrong person to the wrong receiver.
+fn ssf_stream_subject_seal_aad(
+    scope: Scope,
+    stream_id: &SsfStreamId,
+    bidx: &[u8],
+    dek_version: i32,
+) -> Aad {
+    Aad::builder()
+        .text(SSF_STREAM_SUBJECT_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .text(&stream_id.to_string())
+        .field(bidx)
         .version(i64::from(dek_version))
         .build()
 }
@@ -82045,6 +82108,253 @@ pub struct QueuedSet {
     pub set_jws: String,
     /// When it was queued.
     pub queued_at_unix_micros: i64,
+}
+
+/// One subject a stream has asked to be told about.
+#[derive(Debug, Clone)]
+pub struct SsfStreamSubject {
+    /// The RFC 9493 format the receiver used.
+    pub format: SsfSubjectFormat,
+    /// The rendered identifier, opened.
+    pub rendered: String,
+    /// Whether the RECEIVER asserted it has verified this subject is its own.
+    pub verified: bool,
+    /// When it was added.
+    pub added_at_unix_micros: i64,
+}
+
+/// The most subjects one stream may filter by.
+///
+/// A subject list is receiver-chosen storage that the fan-out reads on every event, so an
+/// unbounded one is both unbounded rows and unbounded work per signal. Reaching it REFUSES,
+/// which a receiver can see and act on, rather than evicting a subject it would then silently
+/// stop being told about.
+pub const MAX_STREAM_SUBJECTS: i64 = 10_000;
+
+/// The subjects each Shared Signals stream has asked to be told about (issue #143).
+///
+/// # The identifier is sealed and the key is a blind index
+///
+/// An RFC 9493 subject in the `email` format names a real address. It is also a LOOKUP KEY: a
+/// removal names a subject and has to find its row. A deterministic seal would serve the lookup
+/// and leak equality to anyone holding the ciphertext, so the two jobs are split -- an HMAC
+/// keys the row, and the seal carries the value.
+pub struct SsfStreamSubjectRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SsfStreamSubjectRepo<'_> {
+    /// Add a subject to a stream, or update what the receiver asserts about one already there.
+    ///
+    /// IDEMPOTENT, because SSF has a repeated add succeed rather than conflict: the row is keyed
+    /// on the blind index, so adding the same subject twice is one row, and the second add
+    /// refreshes `verified`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the handle is out of scope; [`StoreError::QuotaExceeded`]
+    /// when the stream already holds [`MAX_STREAM_SUBJECTS`]; [`StoreError::Encryption`] if the
+    /// environment has no active DEK; [`StoreError::Database`] on a persistence failure.
+    pub async fn add(
+        &self,
+        env: &Env,
+        stream_id: &SsfStreamId,
+        format: SsfSubjectFormat,
+        rendered: &str,
+        verified: bool,
+    ) -> Result<(), StoreError> {
+        if stream_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let bidx = ssf_stream_subject_blind_index(master, self.scope, stream_id, rendered);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let (dek_version, dek) = fetch_active_dek(&mut tx, self.scope, master).await?;
+        let sealed = dek.seal(
+            env.entropy(),
+            &ssf_stream_subject_seal_aad(self.scope, stream_id, bidx.as_bytes(), dek_version),
+            rendered.as_bytes(),
+        );
+        // THE CEILING IS A CONJUNCT OF THE INSERT, the shape every other bound here uses: a
+        // count taken first lets concurrent adds all see the same under-limit total and all
+        // commit. The `ON CONFLICT` is what makes a repeated add idempotent, and it is
+        // evaluated only when the row already exists, so it does not spend ceiling.
+        let inserted = sqlx::query(
+            "INSERT INTO ssf_stream_subjects \
+             (tenant_id, environment_id, stream_id, subject_bidx, subject_format, \
+              subject_sealed, pii_dek_version, verified) \
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8 \
+             WHERE (SELECT count(*) FROM ssf_stream_subjects \
+                    WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3) < $9 \
+                OR EXISTS (SELECT 1 FROM ssf_stream_subjects \
+                           WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3 \
+                             AND subject_bidx = $4) \
+             ON CONFLICT (tenant_id, environment_id, stream_id, subject_bidx) \
+             DO UPDATE SET verified = EXCLUDED.verified",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(stream_id.to_string())
+        .bind(bidx.as_bytes())
+        .bind(format.as_str())
+        .bind(sealed.as_bytes())
+        .bind(dek_version)
+        .bind(verified)
+        .bind(MAX_STREAM_SUBJECTS)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            return Err(StoreError::QuotaExceeded);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Remove a subject from a stream. `true` if a row went away.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the handle is out of scope; [`StoreError::Encryption`] if the
+    /// environment has no master key; [`StoreError::Database`] on a persistence failure.
+    pub async fn remove(
+        &self,
+        stream_id: &SsfStreamId,
+        rendered: &str,
+    ) -> Result<bool, StoreError> {
+        if stream_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let bidx = ssf_stream_subject_blind_index(master, self.scope, stream_id, rendered);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let deleted = sqlx::query(
+            "DELETE FROM ssf_stream_subjects \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3 \
+               AND subject_bidx = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(stream_id.to_string())
+        .bind(bidx.as_bytes())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(deleted.rows_affected() > 0)
+    }
+
+    /// Whether this stream asked to be told about `rendered`.
+    ///
+    /// THE FAN-OUT'S READ. An empty list means the receiver expressed no filter, which is why
+    /// this cannot be the only thing a producer consults: see [`Self::count`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if the environment has no master key;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn contains(
+        &self,
+        stream_id: &SsfStreamId,
+        rendered: &str,
+    ) -> Result<bool, StoreError> {
+        if stream_id.scope() != self.scope {
+            return Ok(false);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let bidx = ssf_stream_subject_blind_index(master, self.scope, stream_id, rendered);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1::bigint FROM ssf_stream_subjects \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3 \
+               AND subject_bidx = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(stream_id.to_string())
+        .bind(bidx.as_bytes())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(found.is_some())
+    }
+
+    /// How many subjects this stream filters by.
+    ///
+    /// ZERO MEANS NO FILTER, not "no subjects": a stream that has never called add-subject is
+    /// one whose receiver wants everything. A producer therefore asks this BEFORE
+    /// [`Self::contains`], or it would deliver nothing to every stream that never filtered.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn count(&self, stream_id: &SsfStreamId) -> Result<i64, StoreError> {
+        if stream_id.scope() != self.scope {
+            return Ok(0);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ssf_stream_subjects \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(stream_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Every subject this stream filters by, oldest first, opened.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if a row cannot be opened; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn list(
+        &self,
+        stream_id: &SsfStreamId,
+        limit: i64,
+    ) -> Result<Vec<SsfStreamSubject>, StoreError> {
+        if stream_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT subject_bidx, subject_format, subject_sealed, pii_dek_version, verified, \
+                    (EXTRACT(EPOCH FROM added_at) * 1000000)::bigint AS added_us \
+             FROM ssf_stream_subjects \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3 \
+             ORDER BY added_at, subject_bidx LIMIT $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(stream_id.to_string())
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let dek_version: i32 = row.get("pii_dek_version");
+            let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+            let bidx: Vec<u8> = row.get("subject_bidx");
+            let sealed: Vec<u8> = row.get("subject_sealed");
+            let plain = dek.open(
+                &ssf_stream_subject_seal_aad(self.scope, stream_id, &bidx, dek_version),
+                &Sealed::from_bytes(sealed)?,
+            )?;
+            let stored: String = row.get("subject_format");
+            out.push(SsfStreamSubject {
+                format: SsfSubjectFormat::parse(&stored).ok_or(StoreError::Encryption)?,
+                rendered: String::from_utf8(plain).map_err(|_| StoreError::Encryption)?,
+                verified: row.get("verified"),
+                added_at_unix_micros: row.get("added_us"),
+            });
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
 }
 
 /// The longest Security Event Token this store will hold for a receiver.
