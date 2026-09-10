@@ -41,12 +41,19 @@
 //!
 //! # What a stream has to do to be sent one
 //!
-//! It has to be retaining (enabled or paused), and its `events_delivered` has to name the
-//! CAEP type. That second check is not a formality: `events_delivered` is the intersection
-//! this transmitter computed at stream creation between what the receiver asked for and
-//! what this build emits, so a receiver that never asked for session revocation does not
-//! get it, and a stream created before this producer existed does not silently begin
-//! receiving a new event type.
+//! Three things, and all three are checked:
+//!
+//! - it has to be RETAINING, which is enabled or paused;
+//! - its `events_delivered` has to name the CAEP type. That is not a formality:
+//!   `events_delivered` is the intersection this transmitter computed at stream creation
+//!   between what the receiver asked for and what this build emits, so a receiver that
+//!   never asked for session revocation does not get it, and a stream created before this
+//!   producer existed does not silently begin receiving a new event type;
+//! - its SUBJECT FILTER has to admit the subject, where it declared one. The add-subject
+//!   and remove-subject endpoints shipped with the transmitter and this producer is the
+//!   first place their list can take effect. An empty list means no filter and admits
+//!   everything, which is why the count is asked before the membership. See
+//!   [`Self::stream_wants`](SsfSessionFanOutConsumer::stream_wants).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -73,19 +80,30 @@ pub const PAYLOAD_CAUSE: &str = "cause";
 pub const PAYLOAD_OCCURRED_AT: &str = "occurred_at_unix_micros";
 /// The base every per-stream `jti` is derived from.
 pub const PAYLOAD_JTI: &str = "jti";
+/// How the session-ended record spells the principal that ended it: `human`, `service`,
+/// or `agent`. It is what decides CAEP's `initiating_entity`, and where it cannot decide,
+/// the member is omitted rather than guessed. See [`crate::caep::initiating_entity`].
+pub const PAYLOAD_ACTOR_KIND: &str = "actor_kind";
 
 const MALFORMED_PAYLOAD_LABEL: &str = "malformed_payload";
 const STORE_ERROR_LABEL: &str = "store_error";
 const MINT_LABEL: &str = "set_mint_failed";
+/// The environment has no active envelope key, so a poll SET cannot be SEALED at rest.
+/// Distinct from [`MINT_LABEL`], which is about signing: an operator chasing one would
+/// look in the wrong place for the other.
+const NO_ENVELOPE_KEY_LABEL: &str = "no_envelope_key";
 
 /// How many streams one ended session can fan out to.
 ///
 /// A bound rather than an unpaginated read because the handler holds the result in memory
 /// and writes one row per entry. It is deliberately far above
 /// `ssf.max_streams_per_client`, which is the per-client bound an operator tunes: this one
-/// is the structural ceiling on an environment, and a deployment that reaches it has more
-/// receivers than this fan-out was designed for and should be told rather than quietly
-/// served in part.
+/// is the structural ceiling on an environment.
+///
+/// REACHING IT IS REPORTED, not silent. An environment with more retaining streams than
+/// this would otherwise be served in part, and a Shared Signals receiver cannot tell a
+/// revocation it was never sent from a quiet period. The handler logs when the read comes
+/// back full, which is the only honest thing it can do without paginating.
 const MAX_STREAMS_PER_EVENT: i64 = 512;
 
 /// Derive the `jti` for one stream's copy of one event.
@@ -171,7 +189,16 @@ impl SsfSessionFanOutConsumer {
             .and_then(serde_json::Value::as_i64)
             .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))?;
 
-        let event = caep::session_end_event(cause, occurred);
+        // A message written before this key existed has no actor, and an empty kind reaches
+        // `initiating_entity` as "not a service and not an agent", which yields `None`.
+        // That is the same answer a human gets, and it is the right one: an unknown
+        // principal is exactly what must not be reported as a known one.
+        let actor_kind = message
+            .payload
+            .get(PAYLOAD_ACTOR_KIND)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let event = caep::session_end_event(cause, actor_kind, occurred);
         let issuer = self.issuers.issuer_for(&scope);
 
         let streams = self
@@ -181,6 +208,14 @@ impl SsfSessionFanOutConsumer {
             .retaining_in_scope(MAX_STREAMS_PER_EVENT)
             .await
             .map_err(|_| ConsumerError::retryable(STORE_ERROR_LABEL))?;
+        if i64::try_from(streams.len()).unwrap_or(i64::MAX) >= MAX_STREAMS_PER_EVENT {
+            tracing::error!(
+                bound = MAX_STREAMS_PER_EVENT,
+                "session revocation fan-out reached its stream bound: this environment has \
+                 at least this many retaining streams and any beyond the bound were NOT \
+                 sent this event"
+            );
+        }
 
         for stream in &streams {
             if !stream
@@ -199,11 +234,51 @@ impl SsfSessionFanOutConsumer {
                 );
                 continue;
             };
+            if !self.stream_wants(scope, &stream.id, &rendered).await? {
+                continue;
+            }
             let jti = stream_jti(trigger_jti, &stream.id);
             self.deliver(env, scope, stream, &jti, &rendered, &event)
                 .await?;
         }
         Ok(())
+    }
+
+    /// Whether this stream's SUBJECT FILTER admits `rendered` (issue #143).
+    ///
+    /// The add-subject and remove-subject endpoints let a receiver narrow a stream to the
+    /// subjects it actually cares about, and this producer is the first and only place
+    /// that narrowing can take effect. Without this read the filter is a list the surface
+    /// writes and nothing consults, and a receiver that asked to hear about ONE user is
+    /// sent every user in the environment.
+    ///
+    /// THE COUNT IS ASKED FIRST, and that ordering is not an optimisation. An empty list
+    /// means the receiver expressed no filter and wants everything, so `contains` alone
+    /// would answer `false` for every stream that never filtered and deliver nothing at
+    /// all. The store documents both halves on
+    /// [`SsfStreamSubjectRepo::count`](ironauth_store::SsfStreamSubjectRepo::count).
+    ///
+    /// The rendering compared is the same one the SET will carry, produced by the same
+    /// [`SubjectIdentifier::render`], so a stream whose filter names a subject in its
+    /// negotiated format matches by construction rather than by two spellings agreeing.
+    async fn stream_wants(
+        &self,
+        scope: Scope,
+        stream_id: &SsfStreamId,
+        rendered: &SubjectIdentifier,
+    ) -> Result<bool, ConsumerError> {
+        let subjects = self.store.scoped(scope).ssf_stream_subjects();
+        let filtered = subjects
+            .count(stream_id)
+            .await
+            .map_err(|_| ConsumerError::retryable(STORE_ERROR_LABEL))?;
+        if filtered == 0 {
+            return Ok(true);
+        }
+        subjects
+            .contains(stream_id, &rendered.render().to_string())
+            .await
+            .map_err(|_| ConsumerError::retryable(STORE_ERROR_LABEL))
     }
 
     /// Make one stream's copy durable by the method that stream negotiated.
@@ -260,25 +335,33 @@ impl SsfSessionFanOutConsumer {
                     .queue(env, &stream.id, jti, &token, self.owed_ceiling)
                     .await
             }
-            SsfDelivery::Push { .. } => crate::ssf_push::enqueue_push(
-                &self.store,
-                &self.issuers,
-                env,
-                scope,
-                &crate::ssf_push::QueuedPush {
-                    stream_id: &stream.id,
-                    jti,
-                    subject,
-                    event,
-                    audience: &stream.audience,
-                },
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| match error {
-                crate::ssf_push::PushEnqueueError::Mint(_) => StoreError::Encryption,
-                crate::ssf_push::PushEnqueueError::Store(error) => error,
-            }),
+            SsfDelivery::Push { .. } => {
+                // A MINT FAILURE KEEPS ITS OWN LABEL. Folding it into the store outcome
+                // below would report an unsignable environment under whatever label the
+                // store arm carries, and an operator reading a dead letter would go
+                // looking at the database for a signing-key problem.
+                match crate::ssf_push::enqueue_push(
+                    &self.store,
+                    &self.issuers,
+                    env,
+                    scope,
+                    &crate::ssf_push::QueuedPush {
+                        stream_id: &stream.id,
+                        jti,
+                        subject,
+                        event,
+                        audience: &stream.audience,
+                    },
+                )
+                .await
+                {
+                    Ok(_) => Ok(()),
+                    Err(crate::ssf_push::PushEnqueueError::Mint(_)) => {
+                        return Err(ConsumerError::retryable(MINT_LABEL));
+                    }
+                    Err(crate::ssf_push::PushEnqueueError::Store(error)) => Err(error),
+                }
+            }
         };
         match outcome {
             Ok(())
@@ -292,9 +375,11 @@ impl SsfSessionFanOutConsumer {
                 );
                 Ok(())
             }
-            // An unsignable environment reaches here as `Encryption` from the push arm,
-            // and it is the one case that is worth retrying for every stream at once.
-            Err(StoreError::Encryption) => Err(ConsumerError::retryable(MINT_LABEL)),
+            // AN ENVIRONMENT WITH NO ENVELOPE KEY, which is what the poll arm answers when
+            // it cannot seal. It is a configuration problem rather than a signing one and
+            // says so, because the two send an operator to different places. A mint
+            // failure never reaches here: both arms label it before this match.
+            Err(StoreError::Encryption) => Err(ConsumerError::retryable(NO_ENVELOPE_KEY_LABEL)),
             Err(_) => Err(ConsumerError::retryable(STORE_ERROR_LABEL)),
         }
     }

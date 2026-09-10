@@ -64,6 +64,31 @@ pub const VERIFICATION_EVENT_TYPE: &str =
 /// facts from drifting apart.
 pub const EVENTS_SUPPORTED: &[&str] = &[VERIFICATION_EVENT_TYPE, crate::caep::SESSION_REVOKED];
 
+/// The event types this build can actually deliver to a stream negotiating `format`.
+///
+/// A SUBSET OF [`EVENTS_SUPPORTED`], and the reason it is not always the whole list is
+/// that an event type is only deliverable if this build can name its subject in the
+/// format the stream asked for.
+///
+/// `email` is the case that bites. A session end names the user by internal id, and there
+/// is no read that turns that into an address a receiver would recognise, so the
+/// session-end fan-out cannot serve an `email` stream. SSF's own verification event is
+/// different: section 7.1.4 pins its `sub_id` to `opaque` whatever the stream negotiated,
+/// so it is deliverable to every stream regardless.
+///
+/// This exists because `events_delivered` is a PROMISE. A transmitter that put
+/// `session-revoked` in an `email` stream's `events_delivered` would be telling that
+/// receiver the event is coming, and then never sending it, which a receiver cannot
+/// distinguish from a quiet period. Advertising a type nothing emits and promising a type
+/// this stream will never be sent are the same defect at two different scopes.
+#[must_use]
+pub fn events_deliverable_to(format: SsfSubjectFormat) -> Vec<&'static str> {
+    match format {
+        SsfSubjectFormat::Email => vec![VERIFICATION_EVENT_TYPE],
+        SsfSubjectFormat::IssSub | SsfSubjectFormat::Opaque => EVENTS_SUPPORTED.to_vec(),
+    }
+}
+
 /// One subject, in the RFC 9493 format its stream negotiated.
 ///
 /// Only the three formats [`SsfSubjectFormat`] stores are representable, so a stream cannot ask
@@ -200,10 +225,14 @@ pub enum MintError {
 pub fn build_set_claims(issuer: &str, iat: i64, spec: &SetToMint<'_>) -> serde_json::Value {
     // THE SUBJECT IS A TOP-LEVEL `sub_id`, which SSF 1.0 section 3.1.2 makes a MUST for a new
     // event type -- and the same section says such a type MUST NOT use the `subject` member
-    // inside `events` to name its primary subject. The carve-out in section 3.1.1, which lets
-    // an event type defined in CAEP or RISC ALSO carry an in-event `subject`, does not reach
-    // anything here: the one type this build emits is SSF's own verification event, which is
-    // defined in neither (see `EVENTS_SUPPORTED`).
+    // inside `events` to name its primary subject.
+    //
+    // Section 3.1.1's carve-out DOES now reach one of the two types this build emits: it lets
+    // an event type defined in CAEP or RISC also carry an in-event `subject`, and CAEP
+    // `session-revoked` is such a type (issue #144). The carve-out is permissive rather than
+    // mandatory, and this build declines it, so both emitted types name their subject exactly
+    // one way. A transmitter that used the top level for one type and an in-event member for
+    // the other would make a receiver implement two subject readers to follow one stream.
     //
     // An earlier version of this put the subject only in the event payload and cited SSF 1.0
     // for it. SSF says the reverse.

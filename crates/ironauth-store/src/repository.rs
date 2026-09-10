@@ -22244,7 +22244,10 @@ pub const SSF_PUSH_CONSUMER: &str = "ssf.push";
 /// (issue #144).
 ///
 /// One message is ONE ENDED SESSION, and the handler explodes it into one SET per stream
-/// that retains the subject. It is a SEPARATE consumer from
+/// that is retaining, has agreed to the event type, and whose subject filter admits the
+/// subject. "Retaining" is the STATUS predicate (enabled or paused) and says nothing about
+/// which subjects a stream asked for; the filter is a separate read, and conflating the
+/// two in this sentence once described a producer that consulted only the first. It is a SEPARATE consumer from
 /// [`SESSION_ENDED_CONSUMER`] rather than more work inside that handler because the two
 /// have different failure domains: an environment with no usable signing key cannot mint a
 /// SET, and folding that into the back-channel fan-out would dead-letter every relying

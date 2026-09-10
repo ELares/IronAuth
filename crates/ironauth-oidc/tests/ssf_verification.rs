@@ -546,10 +546,14 @@ async fn discovery_advertises_the_verification_endpoint_and_nothing_ssf_puts_els
         doc.get("min_verification_interval").is_none(),
         "the transmitter metadata carries a member SSF does not define for it: {body}"
     );
-    // AND THE EVENT IS ADVERTISED, since the transmitter can now emit one.
+    // AND THE EVENTS ARE ADVERTISED: SSF's own verification event, and CAEP
+    // `session-revoked` now that the session-end fan-out emits it (issue #144).
     assert_eq!(
         doc["events_supported"],
-        serde_json::json!([VERIFICATION_EVENT_TYPE])
+        serde_json::json!([
+            VERIFICATION_EVENT_TYPE,
+            ironauth_oidc::caep::SESSION_REVOKED
+        ])
     );
 
     let advertised = doc["verification_endpoint"]
@@ -783,7 +787,14 @@ async fn a_receiver_is_told_which_of_its_requested_events_will_arrive() {
         "delivery": { "method": "urn:ietf:rfc:8936" },
         "events_requested": [
             VERIFICATION_EVENT_TYPE,
-            "https://schemas.openid.net/secevent/caep/event-type/session-revoked",
+            // EMITTED, so it comes back.
+            ironauth_oidc::caep::SESSION_REVOKED,
+            // DEFINED IN THE VOCABULARY AND EMITTED BY NOTHING, so it must not. This was
+            // `session-revoked` while that type had no producer; when the producer landed
+            // (issue #144) this half of the test would have become vacuous, because every
+            // requested type would have been deliverable and "refused by omission" would
+            // have had nothing left to refuse.
+            ironauth_oidc::caep::CREDENTIAL_CHANGE,
         ],
         "aud": ["https://receiver.example.com"],
         "format": "iss_sub",
@@ -805,8 +816,12 @@ async fn a_receiver_is_told_which_of_its_requested_events_will_arrive() {
     let created: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
     assert_eq!(
         created["events_delivered"],
-        serde_json::json!([VERIFICATION_EVENT_TYPE]),
-        "the transmitter did not agree to send the one event it can emit"
+        serde_json::json!([
+            VERIFICATION_EVENT_TYPE,
+            ironauth_oidc::caep::SESSION_REVOKED
+        ]),
+        "the transmitter did not agree to send the events it can emit, or agreed to one \
+         it cannot: {text}"
     );
     // AND THE STREAM OBJECT CARRIES THE INTERVAL, which is where SSF 1.0 defines it. It was
     // published in the transmitter metadata document instead, where a conformant receiver never

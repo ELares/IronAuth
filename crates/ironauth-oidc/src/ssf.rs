@@ -352,10 +352,15 @@ pub async fn create_stream(
     // CAEP's `session-revoked` with the session-end fan-out (issue #144). Every event type
     // without a producer -- the rest of CAEP, all of RISC -- is still refused by omission. The
     // `a_receiver_is_told_which_of_its_requested_events_will_arrive` test drives both halves.
+    //
+    // AND IT IS NARROWED BY THIS STREAM'S SUBJECT FORMAT, because `events_delivered` is a
+    // promise to THIS receiver rather than a copy of the discovery document. See
+    // `events_deliverable_to`.
+    let deliverable = crate::ssf_set::events_deliverable_to(format);
     let delivered: Vec<String> = request
         .events_requested
         .iter()
-        .filter(|requested| EVENTS_SUPPORTED.contains(&requested.as_str()))
+        .filter(|requested| deliverable.contains(&requested.as_str()))
         .cloned()
         .collect();
 
@@ -558,9 +563,13 @@ async fn update_stream(
         (None, Merge::DeleteOmitted) => None,
         (None, Merge::KeepOmitted) => current.description.clone(),
     };
+    // NARROWED BY THE STREAM'S OWN FORMAT, exactly as at creation. The format is
+    // transmitter-supplied and an update that tries to change it is refused above, so
+    // `current` is the right source and cannot go stale within this request.
+    let deliverable = crate::ssf_set::events_deliverable_to(current.subject_format);
     let delivered: Vec<String> = requested
         .iter()
-        .filter(|event| EVENTS_SUPPORTED.contains(&event.as_str()))
+        .filter(|event| deliverable.contains(&event.as_str()))
         .cloned()
         .collect();
 

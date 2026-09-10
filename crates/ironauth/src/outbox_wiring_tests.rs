@@ -870,3 +870,49 @@ async fn messaging_consumers_are_registered_by_name() {
          dropping either leaves a queue nothing drains"
     );
 }
+
+#[tokio::test]
+async fn ssf_consumers_are_registered_by_name() {
+    // THE FAN-OUT IS USELESS WITHOUT ITS PRODUCER. `ssf.session_fanout` drains a queue
+    // whose only writer is the session-ended explode, and that explode is otherwise
+    // registered only by the back-channel logout pool, which rides
+    // `oidc.backchannel_logout_enabled` and is off by default. A deployment that sets
+    // `ssf.enabled` alone would then mount the receiver-facing surface, accept streams,
+    // and drain a queue nothing ever writes to, reporting perfect health throughout.
+    //
+    // So all THREE names must be here. Dropping `session_ended` makes the feature inert;
+    // dropping either of the others leaves a queue nothing drains.
+    struct NoSender;
+    impl ironauth_oidc::ssf_push::SsfPushSender for NoSender {
+        async fn push(
+            &self,
+            _url: &str,
+            _bearer: Option<&str>,
+            _set: &str,
+        ) -> ironauth_oidc::ssf_push::PushOutcome {
+            unreachable!("this test registers consumers, it does not run them")
+        }
+    }
+
+    let db = TestDatabase::start().await;
+    let registry = Arc::new(ironauth_oidc::IssuerRegistry::store_backed(
+        "https://issuer.example".to_owned(),
+        ironauth_oidc::JwksCacheWindow::clamped(600),
+        db.store().clone(),
+    ));
+    let consumers = super::ssf_consumers(db.store(), db.master_key(), NoSender, &registry, 1_000);
+    let mut names: Vec<&str> = consumers.iter().map(|c| c.name()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        // Sorted, and written out rather than derived from the same array the factory
+        // builds, so this is an expectation a reader can check against the boot path by
+        // eye rather than a restatement of the code.
+        vec![
+            ironauth_store::SESSION_ENDED_CONSUMER,
+            ironauth_store::SSF_PUSH_CONSUMER,
+            ironauth_store::SSF_SESSION_FANOUT_CONSUMER,
+        ],
+        "the Shared Signals worker must register its producer as well as its two drains"
+    );
+}

@@ -4582,6 +4582,44 @@ async fn spawn_webhook_delivery_pools(inputs: WebhookDeliveryInputs) -> Vec<Outb
 ///
 /// Every early return is logged and starts NOTHING. The queue is durable, so a SET enqueued
 /// while no worker runs is delivered whenever one starts.
+/// Every consumer the Shared Signals worker registers (issues #143, #144).
+///
+/// A function rather than an inline array so the SET of names is assertable without
+/// booting a worker: `ssf_consumers_are_registered_by_name` reads it, and a registration
+/// dropped from this list is a queue nothing drains.
+///
+/// # Why the session-ended explode is here
+///
+/// It is ALSO registered by the back-channel logout pool, and that is not a duplicate by
+/// accident. That pool rides `oidc.backchannel_logout_enabled`, which is off by default,
+/// and it holds the only writer of the Shared Signals trigger. Registering the fan-out
+/// alone would mean a deployment that sets `ssf.enabled` and nothing else mounts the
+/// receiver-facing surface, accepts streams, drains a queue nothing ever writes to, and
+/// reports perfect health. That is the exact failure `ssf_push_inputs` was split out to
+/// prevent, one switch further along.
+///
+/// Two pools draining ONE consumer name is safe and is what the substrate is for. A claim
+/// takes a lease, so at most one worker holds a message at a time, and the explode is
+/// idempotent through `enqueue_all`, which skips an existing (consumer, idempotency_key)
+/// instead of raising. With both switches on the queue simply has two drainers.
+fn ssf_consumers<S: ironauth_oidc::ssf_push::SsfPushSender + Send + Sync + 'static>(
+    data_store: &Store,
+    master: Arc<ironauth_jose::MasterKey>,
+    sender: S,
+    registry: &Arc<IssuerRegistry>,
+    owed_ceiling: u32,
+) -> Vec<Arc<dyn OutboxConsumer>> {
+    vec![
+        Arc::new(SsfPushConsumer::new(data_store.clone(), master, sender)),
+        Arc::new(SsfSessionFanOutConsumer::new(
+            data_store.clone(),
+            Arc::clone(registry),
+            owed_ceiling,
+        )),
+        Arc::new(SessionEndedExplodeConsumer::new(data_store.clone())),
+    ]
+}
+
 async fn spawn_ssf_push_pools(inputs: SsfPushInputs, issuer_base: String) -> Vec<OutboxWorkerPool> {
     let SsfPushInputs {
         ssf,
@@ -4629,12 +4667,14 @@ async fn spawn_ssf_push_pools(inputs: SsfPushInputs, issuer_base: String) -> Vec
         }
     };
 
-    // NO ISSUER REGISTRY HERE ANY MORE (issue #1200). The worker used to hold one because it
-    // minted the SET on every delivery attempt; the token is minted once, at enqueue, on the
-    // request path that already has the registry it needs. A worker that cannot sign cannot
-    // re-sign, which is the property the fix is about, and dropping the ISSUER BASE from this
-    // function's signature is how that shows up at the call site: there is nothing left here
-    // that needs to know what this deployment's issuer is called.
+    // THE DELIVERY CONSUMER STILL HOLDS NO REGISTRY (issue #1200): the token is minted once,
+    // at enqueue, and a redelivery re-sends the stored bytes. A worker that cannot sign
+    // cannot re-sign, which is the property that fix is about, and it is unchanged.
+    //
+    // THIS FUNCTION DOES HOLD ONE AGAIN (issue #144), because the session-end fan-out is a
+    // PRODUCER and it runs in this pool group. Issue #1200 could drop the issuer base from
+    // the signature only while every producer of a SET was on the request path; that stopped
+    // being true when a producer moved into a worker.
     let timeout = std::time::Duration::from_secs(oidc.backchannel_logout_request_timeout_secs);
     let sender = match FetchSsfPushSender::with_timeout(timeout) {
         Ok(sender) => sender,
@@ -4656,17 +4696,13 @@ async fn spawn_ssf_push_pools(inputs: SsfPushInputs, issuer_base: String) -> Vec
     ));
 
     let mut consumers = ConsumerRegistry::new();
-    // Two registrations, and a duplicate name is fatal for the pools: two consumers under
-    // one name means one subsystem's messages vanish into the other's handler.
-    let registrations: [Arc<dyn OutboxConsumer>; 2] = [
-        Arc::new(SsfPushConsumer::new(data_store.clone(), master, sender)),
-        Arc::new(SsfSessionFanOutConsumer::new(
-            data_store.clone(),
-            Arc::clone(&registry),
-            ssf.max_owed_sets_per_stream,
-        )),
-    ];
-    for consumer in registrations {
+    for consumer in ssf_consumers(
+        &data_store,
+        master,
+        sender,
+        &registry,
+        ssf.max_owed_sets_per_stream,
+    ) {
         if let Err(error) = consumers.register(consumer) {
             tracing::error!(%error, "SSF push worker not started: duplicate consumer name");
             return Vec::new();

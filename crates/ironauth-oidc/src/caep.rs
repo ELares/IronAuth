@@ -34,8 +34,12 @@ use ironauth_store::SessionEndCause;
 
 use crate::ssf_set::SecurityEvent;
 
-/// CAEP 1.0: every token and session minted under the named session is no longer to be
-/// honoured.
+/// CAEP 1.0: a session belonging to the named subject was revoked.
+///
+/// THE SUBJECT IS THE USER, not the ended session. RFC 9493 gives this build three subject
+/// formats and none of them names a session, so `sub_id` carries the user the session
+/// belonged to. A receiver acts on that by ending what it holds for that user; it cannot
+/// single out the one session, and this transmitter must not imply that it can.
 pub const SESSION_REVOKED: &str =
     "https://schemas.openid.net/secevent/caep/event-type/session-revoked";
 
@@ -93,17 +97,25 @@ impl InitiatingEntity {
 /// Every field is what a RECEIVER is told. `cause` is not carried into the SET: it is this
 /// deployment's internal spelling, and a receiver that branched on it would be coupled to
 /// a vocabulary we change freely.
+///
+/// THERE IS NO `initiating_entity` COLUMN HERE, and its absence is the finding that
+/// reshaped this table. A cause does not determine who acted. `UserRevokedAll` is written
+/// by the admin session surface, by SCIM deprovisioning, by the self-service account and
+/// trusted-device surfaces, and by the risk engine: one cause spanning CAEP's `admin`,
+/// `system`, `user` and `policy`. A table that answered `user` for it would have been
+/// wrong three times out of four, and confidently. See [`initiating_entity`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionEndMapping {
     /// The CAEP event type URI the cause becomes.
     pub event_type: &'static str,
-    /// Who initiated it.
-    pub initiating_entity: InitiatingEntity,
     /// The administrator-facing reason, in English.
     ///
     /// CAEP renders `reason_admin` as an object keyed by language tag; this is the value
     /// under `en`. It is prose for a human reading an audit trail, and MUST NOT be parsed:
     /// anything a receiver needs to branch on belongs in a typed member.
+    ///
+    /// It describes WHAT happened and never WHO did it, for the reason the struct doc
+    /// gives: the cause does not know who did it.
     pub reason_admin_en: &'static str,
 }
 
@@ -113,45 +125,62 @@ pub struct SessionEndMapping {
 /// before it is a silently unmapped signal in production.
 ///
 /// All six rows carry the same `event_type` and that is the correct answer, not a
-/// degenerate one: CAEP has exactly one event for "this session is over", and the reason
-/// it happened is carried in the members beside it. The rows differ in the two places CAEP
-/// gives us to differ, which is what
-/// `each_session_end_cause_maps_to_its_own_documented_row` pins.
+/// degenerate one: CAEP has exactly one event for "this session is over". What differs
+/// between them is the human-readable reason, which is the only thing the cause alone
+/// actually determines.
 #[must_use]
 pub fn map_session_end(cause: SessionEndCause) -> SessionEndMapping {
+    let reason_admin_en = match cause {
+        SessionEndCause::Revoked => "This session was revoked individually.",
+        SessionEndCause::BulkRevoked => "This session was revoked as part of a set.",
+        SessionEndCause::UserRevokedAll => "Every session belonging to this user was revoked.",
+        SessionEndCause::LoggedOut => "The user logged out.",
+        SessionEndCause::ReplacedByOtherSubject => {
+            "A different user authenticated on the same browser session."
+        }
+        SessionEndCause::PasswordChanged => {
+            "The user's password changed, which ends their other sessions."
+        }
+    };
+    SessionEndMapping {
+        event_type: SESSION_REVOKED,
+        reason_admin_en,
+    }
+}
+
+/// Who set this off, when this build can actually tell (CAEP 1.0 `initiating_entity`).
+///
+/// `None` MEANS NOT STATED, and that is a deliberate answer rather than a gap. CAEP makes
+/// the member OPTIONAL, and a receiver reads an absent value as "the transmitter did not
+/// say". Naming the wrong initiator is strictly worse than naming none: an audit trail
+/// that records an operator revoking a session the user themselves ended is evidence of
+/// something that did not happen.
+///
+/// # What is knowable here
+///
+/// The session-ended record carries an ACTOR KIND, which this deployment spells `human`,
+/// `service`, or `agent`. That separates "a person did this" from "something automated
+/// did this", and the automated half maps cleanly onto CAEP's `system`. It does NOT
+/// separate an operator from the subject acting on their own account, which is exactly
+/// CAEP's `admin` versus `user` distinction, so a human actor yields `None`.
+///
+/// Two causes are decided by the cause itself and override the actor:
+///
+/// - `LoggedOut` is written only by the RP logout path, which is the end user's own act
+///   whatever principal carries it, so it is `user`.
+/// - `ReplacedByOtherSubject` is structural. The outgoing user did not ask for it and
+///   neither did an operator; a different subject authenticated and this session ended as
+///   a consequence. Nobody INITIATED it against this user, which is `system`.
+#[must_use]
+pub fn initiating_entity(cause: SessionEndCause, actor_kind: &str) -> Option<InitiatingEntity> {
     match cause {
-        SessionEndCause::Revoked => SessionEndMapping {
-            event_type: SESSION_REVOKED,
-            initiating_entity: InitiatingEntity::Admin,
-            reason_admin_en: "An operator revoked this session through the management API.",
-        },
-        SessionEndCause::BulkRevoked => SessionEndMapping {
-            event_type: SESSION_REVOKED,
-            initiating_entity: InitiatingEntity::Admin,
-            reason_admin_en: "An operator revoked a set of sessions that included this one.",
-        },
-        SessionEndCause::UserRevokedAll => SessionEndMapping {
-            event_type: SESSION_REVOKED,
-            initiating_entity: InitiatingEntity::User,
-            reason_admin_en: "The user signed out of every session.",
-        },
-        SessionEndCause::LoggedOut => SessionEndMapping {
-            event_type: SESSION_REVOKED,
-            initiating_entity: InitiatingEntity::User,
-            reason_admin_en: "The user logged out.",
-        },
-        // SYSTEM, not user: the outgoing user did not ask for this. A different subject
-        // authenticated on the same browser session, and their session ends as a
-        // consequence of someone else's act.
-        SessionEndCause::ReplacedByOtherSubject => SessionEndMapping {
-            event_type: SESSION_REVOKED,
-            initiating_entity: InitiatingEntity::System,
-            reason_admin_en: "A different user authenticated on the same browser session.",
-        },
-        SessionEndCause::PasswordChanged => SessionEndMapping {
-            event_type: SESSION_REVOKED,
-            initiating_entity: InitiatingEntity::User,
-            reason_admin_en: "The user changed their password, which ends their other sessions.",
+        SessionEndCause::LoggedOut => Some(InitiatingEntity::User),
+        SessionEndCause::ReplacedByOtherSubject => Some(InitiatingEntity::System),
+        _ => match actor_kind {
+            "service" | "agent" => Some(InitiatingEntity::System),
+            // A HUMAN, AND THAT IS ALL WE KNOW. `admin` and `user` are the same actor kind
+            // here, so either answer would be a coin flip recorded as a fact.
+            _ => None,
         },
     }
 }
@@ -162,8 +191,16 @@ pub fn map_session_end(cause: SessionEndCause) -> SessionEndMapping {
 /// outbox message, not the moment this SET is built. A retry re-renders the same body, and
 /// a receiver comparing `event_timestamp` against its own record of the session sees the
 /// end, not the delivery.
+///
+/// `actor_kind` is the session-ended record's own actor spelling. It is passed through
+/// rather than interpreted here beyond what [`initiating_entity`] can support, and when
+/// that answers `None` the member is OMITTED rather than filled with a guess.
 #[must_use]
-pub fn session_end_event(cause: SessionEndCause, occurred_at_unix_micros: i64) -> SecurityEvent {
+pub fn session_end_event(
+    cause: SessionEndCause,
+    actor_kind: &str,
+    occurred_at_unix_micros: i64,
+) -> SecurityEvent {
     let mapping = map_session_end(cause);
     let mut payload = serde_json::Map::new();
     // CAEP renders `event_timestamp` in SECONDS. The internal stamp is microseconds, and
@@ -173,10 +210,12 @@ pub fn session_end_event(cause: SessionEndCause, occurred_at_unix_micros: i64) -
         "event_timestamp".to_owned(),
         serde_json::Value::from(occurred_at_unix_micros.div_euclid(1_000_000)),
     );
-    payload.insert(
-        "initiating_entity".to_owned(),
-        serde_json::Value::String(mapping.initiating_entity.as_str().to_owned()),
-    );
+    if let Some(entity) = initiating_entity(cause, actor_kind) {
+        payload.insert(
+            "initiating_entity".to_owned(),
+            serde_json::Value::String(entity.as_str().to_owned()),
+        );
+    }
     payload.insert(
         "reason_admin".to_owned(),
         serde_json::json!({ "en": mapping.reason_admin_en }),
@@ -191,99 +230,184 @@ pub fn session_end_event(cause: SessionEndCause, occurred_at_unix_micros: i64) -
 mod tests {
     use super::*;
 
-    /// Every cause this build can record, so the table-driven tests below cannot pass by
-    /// covering a subset. A new variant makes `map_session_end` fail to compile; this list
-    /// is what makes the new variant fail the TESTS too if someone adds a row without
-    /// deciding whether it is distinguishable.
-    const ALL_CAUSES: &[SessionEndCause] = &[
-        SessionEndCause::Revoked,
-        SessionEndCause::BulkRevoked,
-        SessionEndCause::UserRevokedAll,
-        SessionEndCause::LoggedOut,
-        SessionEndCause::ReplacedByOtherSubject,
-        SessionEndCause::PasswordChanged,
-    ];
+    /// Every cause this build can record.
+    ///
+    /// The `match` below is the GUARD, and it is why this list cannot quietly fall behind
+    /// the enum: adding a seventh variant makes this function fail to compile, so a new
+    /// cause cannot be added without also being added here and therefore covered by every
+    /// table-driven test in this module. An earlier version of this asserted a hard-coded
+    /// length instead, which a new variant would have satisfied by simply not appearing.
+    fn all_causes() -> Vec<SessionEndCause> {
+        let exhaustive = |cause: SessionEndCause| match cause {
+            SessionEndCause::Revoked
+            | SessionEndCause::BulkRevoked
+            | SessionEndCause::UserRevokedAll
+            | SessionEndCause::LoggedOut
+            | SessionEndCause::ReplacedByOtherSubject
+            | SessionEndCause::PasswordChanged => (),
+        };
+        let causes = vec![
+            SessionEndCause::Revoked,
+            SessionEndCause::BulkRevoked,
+            SessionEndCause::UserRevokedAll,
+            SessionEndCause::LoggedOut,
+            SessionEndCause::ReplacedByOtherSubject,
+            SessionEndCause::PasswordChanged,
+        ];
+        for cause in &causes {
+            exhaustive(*cause);
+        }
+        causes
+    }
 
     #[test]
-    fn the_cause_list_covers_every_variant_the_store_can_record() {
-        // The guard on the guard: `ALL_CAUSES` is hand-written, so it can fall behind the
-        // enum and quietly shrink every table-driven test below. `from_wire` is the
-        // store's own parser, so round-tripping every wire string it accepts proves the
-        // list is complete without this test knowing the variants a second time.
-        for wire in [
-            "revoked",
-            "bulk_revoked",
-            "user_revoked_all",
-            "logged_out",
-            "replaced_by_other_subject",
-            "password_changed",
-        ] {
-            let cause = SessionEndCause::from_wire(wire).expect("store parses its own wire string");
-            assert!(
-                ALL_CAUSES.contains(&cause),
-                "{wire} is a recordable cause the mapping tests never see"
+    fn the_cause_list_round_trips_through_the_stores_own_parser() {
+        // The compile-time guard in `all_causes` catches an ADDED variant. This catches a
+        // RENAMED wire string, which would compile fine and silently stop matching what
+        // the store writes onto a session-ended message.
+        for cause in all_causes() {
+            assert_eq!(
+                SessionEndCause::from_wire(cause.as_str()),
+                Some(cause),
+                "{} does not round-trip through the store's parser",
+                cause.as_str()
             );
         }
+    }
+
+    #[test]
+    fn each_session_end_cause_maps_to_its_own_documented_reason() {
+        // Distinctness AND identity. Distinctness alone would pass with two causes' reasons
+        // swapped, so every row is also pinned to its exact text.
+        for (cause, expected) in [
+            (
+                SessionEndCause::Revoked,
+                "This session was revoked individually.",
+            ),
+            (
+                SessionEndCause::BulkRevoked,
+                "This session was revoked as part of a set.",
+            ),
+            (
+                SessionEndCause::UserRevokedAll,
+                "Every session belonging to this user was revoked.",
+            ),
+            (SessionEndCause::LoggedOut, "The user logged out."),
+            (
+                SessionEndCause::ReplacedByOtherSubject,
+                "A different user authenticated on the same browser session.",
+            ),
+            (
+                SessionEndCause::PasswordChanged,
+                "The user's password changed, which ends their other sessions.",
+            ),
+        ] {
+            let row = map_session_end(cause);
+            assert_eq!(row.event_type, SESSION_REVOKED, "{}", cause.as_str());
+            assert_eq!(row.reason_admin_en, expected, "{}", cause.as_str());
+        }
+
+        let mut reasons = std::collections::BTreeSet::new();
+        for cause in all_causes() {
+            assert!(
+                reasons.insert(map_session_end(cause).reason_admin_en),
+                "{} reuses another cause's reason",
+                cause.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn a_reason_never_asserts_who_acted() {
+        // The property that pairs with `initiating_entity` answering `None` for a human:
+        // saying "an operator revoked this" in prose would smuggle back the claim the typed
+        // member deliberately withholds, and an auditor reads the prose.
+        for cause in all_causes() {
+            let reason = map_session_end(cause).reason_admin_en.to_lowercase();
+            for forbidden in ["operator", "administrator", "admin "] {
+                assert!(
+                    !reason.contains(forbidden),
+                    "{} names an initiator in prose that the typed member will not state: {reason}",
+                    cause.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_automated_actor_is_the_system_and_a_human_is_not_guessed_at() {
+        // THE FINDING THIS ENCODES: one cause spans several initiators. `UserRevokedAll` is
+        // written by the admin surface, by SCIM deprovisioning, by the self-service account
+        // and trusted-device surfaces, and by the risk engine. Any fixed answer for it would
+        // be wrong most of the time, so the actor decides, and where the actor cannot decide
+        // nothing is said.
+        for cause in [
+            SessionEndCause::Revoked,
+            SessionEndCause::BulkRevoked,
+            SessionEndCause::UserRevokedAll,
+            SessionEndCause::PasswordChanged,
+        ] {
+            assert_eq!(
+                initiating_entity(cause, "service"),
+                Some(InitiatingEntity::System),
+                "{} by a service is not a human act",
+                cause.as_str()
+            );
+            assert_eq!(
+                initiating_entity(cause, "agent"),
+                Some(InitiatingEntity::System),
+                "{} by an agent is not a human act",
+                cause.as_str()
+            );
+            assert_eq!(
+                initiating_entity(cause, "human"),
+                None,
+                "{} by a human was reported as admin or user, which this build cannot tell apart",
+                cause.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn two_causes_are_decided_by_the_cause_whatever_the_actor() {
+        // A logout is the end user's act whatever principal carries it, and a replacement
+        // is nobody's act against the outgoing user. Both must hold for EVERY actor kind,
+        // otherwise the override is not an override.
+        for actor in ["human", "service", "agent", "unknown"] {
+            assert_eq!(
+                initiating_entity(SessionEndCause::LoggedOut, actor),
+                Some(InitiatingEntity::User),
+                "a logout under a {actor} actor"
+            );
+            assert_eq!(
+                initiating_entity(SessionEndCause::ReplacedByOtherSubject, actor),
+                Some(InitiatingEntity::System),
+                "a replacement under a {actor} actor"
+            );
+        }
+    }
+
+    #[test]
+    fn the_event_body_omits_the_initiator_it_cannot_support() {
+        let human = session_end_event(SessionEndCause::Revoked, "human", 1_700_000_000_000_000);
+        assert!(
+            !human.payload.contains_key("initiating_entity"),
+            "a guess was recorded as a fact: {:?}",
+            human.payload
+        );
+        let service = session_end_event(SessionEndCause::Revoked, "service", 1_700_000_000_000_000);
         assert_eq!(
-            ALL_CAUSES.len(),
-            6,
-            "a new cause needs a documented mapping"
+            service
+                .payload
+                .get("initiating_entity")
+                .and_then(serde_json::Value::as_str),
+            Some("system")
         );
     }
 
     #[test]
-    fn each_session_end_cause_maps_to_its_own_documented_row() {
-        // NOT a distinctness assertion over the whole row: all six share an event type, so
-        // requiring whole-row distinctness would be satisfied by the reason string alone
-        // and would say nothing about `initiating_entity`. Each column is checked for what
-        // it is actually supposed to carry.
-        let mut reasons = std::collections::BTreeSet::new();
-        for &cause in ALL_CAUSES {
-            let row = map_session_end(cause);
-            assert_eq!(
-                row.event_type,
-                SESSION_REVOKED,
-                "{} is a session end and CAEP has one event for that",
-                cause.as_str()
-            );
-            assert!(
-                reasons.insert(row.reason_admin_en),
-                "{} reuses another cause's reason, so an audit trail cannot tell them apart",
-                cause.as_str()
-            );
-        }
-        assert_eq!(reasons.len(), ALL_CAUSES.len());
-    }
-
-    #[test]
-    fn the_initiator_is_the_one_the_cause_names() {
-        // Pinned cause by cause rather than by counting distinct values: a table that maps
-        // every cause to `System` has exactly as many distinct values as one that maps
-        // nothing at all, and "at least two distinct initiators" would pass while the user
-        // and the admin were swapped.
-        for (cause, expected) in [
-            (SessionEndCause::Revoked, InitiatingEntity::Admin),
-            (SessionEndCause::BulkRevoked, InitiatingEntity::Admin),
-            (SessionEndCause::UserRevokedAll, InitiatingEntity::User),
-            (SessionEndCause::LoggedOut, InitiatingEntity::User),
-            (
-                SessionEndCause::ReplacedByOtherSubject,
-                InitiatingEntity::System,
-            ),
-            (SessionEndCause::PasswordChanged, InitiatingEntity::User),
-        ] {
-            assert_eq!(
-                map_session_end(cause).initiating_entity,
-                expected,
-                "{} names the wrong initiator",
-                cause.as_str()
-            );
-        }
-    }
-
-    #[test]
     fn the_event_body_carries_the_end_moment_in_seconds() {
-        let event = session_end_event(SessionEndCause::LoggedOut, 1_700_000_000_500_000);
+        let event = session_end_event(SessionEndCause::LoggedOut, "human", 1_700_000_000_500_000);
         assert_eq!(event.event_type, SESSION_REVOKED);
         assert_eq!(
             event
@@ -312,11 +436,29 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_epoch_stamp_floors_instead_of_rounding_into_the_future() {
+        // What `div_euclid` is FOR. Plain `/` truncates toward zero, so a stamp half a
+        // second before the epoch would render as 0: the same second the epoch begins, and
+        // therefore later than the moment it describes. Both other timestamp tests use
+        // positive stamps, where the two operators agree, so without this the justification
+        // written beside the call is unmeasured.
+        let event = session_end_event(SessionEndCause::LoggedOut, "human", -500_000);
+        assert_eq!(
+            event
+                .payload
+                .get("event_timestamp")
+                .and_then(serde_json::Value::as_i64),
+            Some(-1),
+            "a pre-epoch stamp rounded toward zero and landed in its own future"
+        );
+    }
+
+    #[test]
     fn the_body_reports_the_end_moment_and_not_the_build_moment() {
         // The two arguments are independent, so a body that stamped `now` would still pass
         // every assertion above. Two ends an hour apart must render an hour apart.
-        let early = session_end_event(SessionEndCause::Revoked, 1_700_000_000_000_000);
-        let late = session_end_event(SessionEndCause::Revoked, 1_700_003_600_000_000);
+        let early = session_end_event(SessionEndCause::Revoked, "human", 1_700_000_000_000_000);
+        let late = session_end_event(SessionEndCause::Revoked, "human", 1_700_003_600_000_000);
         let stamp = |event: &SecurityEvent| {
             event
                 .payload

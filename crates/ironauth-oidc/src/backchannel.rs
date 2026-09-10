@@ -230,9 +230,11 @@ const PAYLOAD_SESSION_ID: &str = "session_id";
 ///
 /// Written by the session-ended producer and forwarded onto the Shared Signals trigger.
 /// This spelling and the producer's are two literals that must agree, and nothing in the
-/// type system makes them: `the_shared_signals_trigger_reads_the_producers_own_keys` is
-/// what holds them together, by driving a REAL session end rather than a hand-built
-/// payload.
+/// type system makes them. What holds them together is that EVERY test in the
+/// `ssf_session_fanout` suite drives a real `sessions().revoke(..)` rather than a
+/// hand-built payload, and asserts on values that can only have come through these keys:
+/// `a_revoked_session_reaches_a_poll_stream_as_a_caep_session_revoked` reads the subject
+/// back out of the delivered token, so a misspelling here empties that assertion.
 const PAYLOAD_SUBJECT: &str = "subject";
 /// The payload key carrying the internal end cause, as `SessionEndCause::as_str` spells
 /// it. See [`PAYLOAD_SUBJECT`] for what keeps this literal honest.
@@ -240,6 +242,9 @@ const PAYLOAD_CAUSE: &str = "cause";
 /// The payload key carrying when the session ended, in microseconds. See
 /// [`PAYLOAD_SUBJECT`] for what keeps this literal honest.
 const PAYLOAD_OCCURRED_AT: &str = "occurred_at_unix_micros";
+/// The payload key carrying how the producer spelled the principal that ended the
+/// session. See [`PAYLOAD_SUBJECT`] for what keeps this literal honest.
+const PAYLOAD_ACTOR_KIND: &str = "actor_kind";
 /// The payload key naming the target relying party on a per-RP delivery message.
 const PAYLOAD_CLIENT_ID: &str = "client_id";
 /// The payload key carrying THAT client's own per-(client, session) `sid`.
@@ -394,8 +399,12 @@ impl SessionEndedExplodeConsumer {
             messages.push(NewOutboxMessage {
                 consumer: SSF_SESSION_FANOUT_CONSUMER,
                 idempotency_key: session_text,
-                // The session is the ordering group, so one subject's ends reach a stream
-                // in the order they happened.
+                // A SINGLETON ORDERING GROUP, the same shape the per-RP deliveries above
+                // take. A session ends exactly once, so keying the group on it means
+                // nothing ever queues behind anything: this buys independence, NOT
+                // ordering. Keying on the SUBJECT would order one user's successive ends,
+                // and would also let one stuck fan-out hold up every later revocation for
+                // that user, which is the wrong trade for a security signal.
                 ordering_key: session_text,
                 payload: payload.clone(),
             });
@@ -454,6 +463,10 @@ impl SessionEndedExplodeConsumer {
             // Minted HERE, once, and carried on the immutable payload, so every attempt
             // of this fan-out derives the SAME per-stream jti. See `ssf_fanout`.
             ssf_fanout::PAYLOAD_JTI: IssuedTokenId::generate(env, &scope).to_string(),
+            // WHO ENDED IT, which is what decides CAEP's `initiating_entity`. Forwarded
+            // rather than interpreted here: the fan-out owns that mapping, and it omits
+            // the member where this kind cannot settle it.
+            ssf_fanout::PAYLOAD_ACTOR_KIND: payload_str(message, PAYLOAD_ACTOR_KIND)?,
         })))
     }
 }

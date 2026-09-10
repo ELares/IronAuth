@@ -112,14 +112,23 @@ async fn a_receiver_creates_reads_and_deletes_its_own_stream() {
     assert!(stream_id.starts_with("sst_"), "{body}");
     assert_eq!(created["delivery"]["method"], "urn:ietf:rfc:8935");
     assert_eq!(created["format"], "email");
-    // WHAT IT AGREED TO SEND is the intersection with what this build emits. This asked for
-    // CAEP `session-revoked`, the session-end fan-out emits it (issue #144), so it comes
-    // back. It was `[]` while nothing produced that type, and the change is the point: the
-    // receiver reads this field to learn which of the types it asked for are actually
-    // coming, and it has to move when a producer lands.
+    // WHAT IT AGREED TO SEND is the intersection with what this build emits AND can render
+    // for THIS stream. This stream negotiated `email`, and a session end names the user by
+    // internal id with no read that turns that into an address, so the session-end fan-out
+    // cannot serve it: the promise is withheld rather than made and then broken.
+    //
+    // `events_delivered` is what a receiver reads to learn which of the types it asked for
+    // are actually coming, and it cannot tell a promised-but-never-sent event from a quiet
+    // period. An earlier version of this PR advertised `session-revoked` here and then had
+    // the fan-out skip the stream forever.
+    assert_eq!(
+        created["format"], "email",
+        "this assertion is about an email stream specifically"
+    );
     assert_eq!(
         created["events_delivered"],
-        serde_json::json!([ironauth_oidc::caep::SESSION_REVOKED])
+        serde_json::json!([]),
+        "an email stream was promised an event the fan-out cannot render for it"
     );
     assert_eq!(
         created["events_requested"].as_array().expect("array").len(),
@@ -1273,4 +1282,35 @@ async fn input_the_schema_refuses_is_a_bad_request_on_update_as_it_is_on_create(
     assert_eq!(status, StatusCode::OK, "{text}");
     let cleared: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
     assert_eq!(cleared["description"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn a_stream_that_can_be_rendered_for_is_promised_the_event() {
+    // THE OTHER SIDE of the email carve-out above. Without this, the narrowing could be a
+    // blanket "promise nothing" and both assertions would pass: an empty
+    // `events_delivered` is the correct answer for email and the WRONG answer for every
+    // other format, so the two have to be pinned together.
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let path = streams_path(&harness);
+    let body = serde_json::json!({
+        "delivery": { "method": "urn:ietf:rfc:8936" },
+        "events_requested": [ironauth_oidc::caep::SESSION_REVOKED],
+        "aud": ["https://receiver.example.com"],
+        "format": "iss_sub",
+    })
+    .to_string();
+    let (status, body) = send(&harness, "POST", &path, Some(&auth), Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+    let created: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(created["format"], "iss_sub");
+    assert_eq!(
+        created["events_delivered"],
+        serde_json::json!([ironauth_oidc::caep::SESSION_REVOKED]),
+        "a stream whose subject this build CAN render was refused the promise: {body}"
+    );
 }

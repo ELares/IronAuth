@@ -35,6 +35,7 @@ use std::time::Duration;
 use common::Harness;
 use ironauth_env::Env;
 use ironauth_oidc::caep;
+use ironauth_oidc::ssf_set::SubjectIdentifier;
 use ironauth_oidc::{SessionEndedExplodeConsumer, SsfSessionFanOutConsumer};
 use ironauth_store::outbox::{DrainStats, OutboxConsumer, OutboxWorker, WorkerSettings};
 use ironauth_store::{
@@ -309,10 +310,34 @@ async fn a_revoked_session_reaches_a_poll_stream_as_a_caep_session_revoked() {
     assert_eq!(owed.len(), 1, "one ended session is one SET");
     let (event_type, body) = sole_event(&owed[0]);
     assert_eq!(event_type, caep::SESSION_REVOKED);
+    // THE INITIATOR IS NOT STATED, and that is the assertion. The session was revoked by a
+    // service actor in this test, so it IS stated here; the human case is pinned in the
+    // caep unit tests. See `initiating_entity`: a cause alone cannot name an initiator,
+    // because `UserRevokedAll` alone is written by an admin surface, by SCIM, by
+    // self-service, and by the risk engine.
     assert_eq!(
         body["initiating_entity"].as_str(),
-        Some("admin"),
-        "an operator revoke is an admin-initiated event: {body}"
+        Some("system"),
+        "a service actor is an automated initiator: {body}"
+    );
+    // THE END MOMENT, IN SECONDS, END TO END. Without this the fan-out could stamp any
+    // moment it liked and every other assertion here would still hold.
+    let stamped = body["event_timestamp"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("no event_timestamp: {body}"));
+    let now_secs = harness
+        .state()
+        .env()
+        .clock()
+        .now_utc()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs()
+        .try_into()
+        .unwrap_or(i64::MAX);
+    assert!(
+        (stamped - now_secs).abs() <= 60,
+        "event_timestamp {stamped} is not the moment the session ended (now {now_secs})"
     );
     assert_eq!(
         owed[0]["sub_id"]["format"].as_str(),
@@ -332,16 +357,42 @@ async fn every_end_cause_reaches_a_stream_as_its_documented_row() {
     // drives each cause through an actual revoke and reads what a receiver would get, so a
     // mapping that is right in the table and lost on the way out fails here.
     //
-    // `initiating_entity` is the column checked because it is the one that VARIES: all six
-    // causes are one CAEP type, so asserting the type alone would pass against a fan-out
-    // that ignored the cause entirely.
-    for (cause, expected_entity) in [
-        (SessionEndCause::Revoked, "admin"),
-        (SessionEndCause::BulkRevoked, "admin"),
-        (SessionEndCause::UserRevokedAll, "user"),
-        (SessionEndCause::LoggedOut, "user"),
-        (SessionEndCause::ReplacedByOtherSubject, "system"),
-        (SessionEndCause::PasswordChanged, "user"),
+    // THE REASON IS THE ASSERTED COLUMN, because it is the one the CAUSE determines. The
+    // initiator does not come from the cause at all: `UserRevokedAll` is written by the
+    // admin surface, by SCIM deprovisioning, by self-service, and by the risk engine, so
+    // it is decided by the ACTOR instead, and every revoke in this suite runs under one
+    // service actor. Asserting the initiator per cause here would therefore be asserting
+    // the same value six times and calling it a table.
+    for (cause, expected_reason, expected_entity) in [
+        (
+            SessionEndCause::Revoked,
+            "This session was revoked individually.",
+            "system",
+        ),
+        (
+            SessionEndCause::BulkRevoked,
+            "This session was revoked as part of a set.",
+            "system",
+        ),
+        (
+            SessionEndCause::UserRevokedAll,
+            "Every session belonging to this user was revoked.",
+            "system",
+        ),
+        // THE TWO THE CAUSE DECIDES, and they must hold under this service actor even
+        // though every other row answers `system` for it. That is what makes them
+        // overrides rather than coincidences.
+        (SessionEndCause::LoggedOut, "The user logged out.", "user"),
+        (
+            SessionEndCause::ReplacedByOtherSubject,
+            "A different user authenticated on the same browser session.",
+            "system",
+        ),
+        (
+            SessionEndCause::PasswordChanged,
+            "The user's password changed, which ends their other sessions.",
+            "system",
+        ),
     ] {
         let harness = Harness::start_store_backed().await;
         provision_envelope(&harness).await;
@@ -367,6 +418,12 @@ async fn every_end_cause_reaches_a_stream_as_its_documented_row() {
         assert_eq!(owed.len(), 1, "{} produced no SET", cause.as_str());
         let (event_type, body) = sole_event(&owed[0]);
         assert_eq!(event_type, caep::SESSION_REVOKED, "{}", cause.as_str());
+        assert_eq!(
+            body["reason_admin"]["en"].as_str(),
+            Some(expected_reason),
+            "{} carried the wrong reason: {body}",
+            cause.as_str()
+        );
         assert_eq!(
             body["initiating_entity"].as_str(),
             Some(expected_entity),
@@ -419,11 +476,12 @@ async fn one_event_renders_its_subject_per_stream() {
     assert_eq!(opaque.len(), 1, "the opaque stream is owed one SET");
     assert_eq!(iss_sub[0]["sub_id"]["format"].as_str(), Some("iss_sub"));
     assert_eq!(iss_sub[0]["sub_id"]["sub"].as_str(), Some(SUBJECT));
-    assert!(
-        iss_sub[0]["sub_id"]["iss"]
-            .as_str()
-            .is_some_and(|iss| !iss.is_empty()),
-        "iss_sub names the issuer that minted the subject: {}",
+    // THE EXACT ISSUER, not merely a non-empty string. Non-emptiness would be satisfied by
+    // the receiver's own audience, or by any other string that happened to be in scope.
+    assert_eq!(
+        iss_sub[0]["sub_id"]["iss"].as_str(),
+        Some(harness.state().issuers().issuer_for(&scope).as_str()),
+        "iss_sub names something other than the issuer that minted the subject: {}",
         iss_sub[0]
     );
     assert_eq!(opaque[0]["sub_id"]["format"].as_str(), Some("opaque"));
@@ -638,4 +696,143 @@ async fn a_receiver_at_its_ceiling_does_not_block_a_healthy_one() {
         still_owed, 1,
         "the ceiling evicted an owed event instead of refusing the new one"
     );
+}
+
+/// Add one subject to a stream's filter, as the add-subject endpoint does.
+async fn filter_to(harness: &Harness, stream: &SsfStreamId, subject: &SubjectIdentifier) {
+    let env = harness.state().env().clone();
+    store_of(harness)
+        .scoped(harness.scope())
+        .ssf_stream_subjects()
+        .add(
+            &env,
+            stream,
+            subject.format(),
+            &subject.render().to_string(),
+            true,
+            10_000,
+        )
+        .await
+        .expect("add a subject to the filter");
+}
+
+#[tokio::test]
+async fn a_stream_that_filtered_to_one_subject_hears_only_about_that_subject() {
+    // THE FILTER IS THE POINT OF THE ADD-SUBJECT ENDPOINT, and this producer is the first
+    // and only place it can take effect. Without this read the list is something the
+    // surface writes and nothing consults, and a receiver that asked about one user is
+    // sent a SET for every user in the environment.
+    //
+    // TWO STREAMS, so the test distinguishes "the filter was applied" from "nothing was
+    // delivered at all": the unfiltered stream must still receive both events.
+    let harness = Harness::start_store_backed().await;
+    provision_envelope(&harness).await;
+    let scope = harness.scope();
+    let env = harness.state().env().clone();
+    let store = store_of(&harness);
+    let client = a_client(&harness).await;
+    let filtered = seed_stream(
+        &harness,
+        &client,
+        poll_stream(),
+        SsfSubjectFormat::Opaque,
+        &revocation_only(),
+    )
+    .await;
+    let unfiltered = seed_stream(
+        &harness,
+        &client,
+        poll_stream(),
+        SsfSubjectFormat::Opaque,
+        &revocation_only(),
+    )
+    .await;
+    let wanted = SubjectIdentifier::Opaque {
+        id: SUBJECT.to_owned(),
+    };
+    filter_to(&harness, &filtered, &wanted).await;
+
+    // The subject it asked about, and a different one it did not.
+    for subject in [SUBJECT, "usr_someone_else"] {
+        let session = create_session(&store, &env, scope, subject).await;
+        end_session(&store, &env, scope, &session, SessionEndCause::LoggedOut).await;
+        explode_pass(&harness, scope).await;
+        fanout_pass(&harness, scope).await;
+    }
+
+    let filtered_owed = owed_claims(&harness, &filtered).await;
+    assert_eq!(
+        filtered_owed.len(),
+        1,
+        "a stream filtered to one subject was sent {} events",
+        filtered_owed.len()
+    );
+    assert_eq!(
+        filtered_owed[0]["sub_id"]["id"].as_str(),
+        Some(SUBJECT),
+        "the one event it got is about the wrong person"
+    );
+    // AND THE FILTER DID NOT SILENCE THE OTHER STREAM. An empty subject list means the
+    // receiver expressed no filter and wants everything; a producer that asked only
+    // `contains` would deliver nothing to every stream that never filtered.
+    assert_eq!(
+        owed_claims(&harness, &unfiltered).await.len(),
+        2,
+        "a stream that never filtered was silenced"
+    );
+}
+
+#[tokio::test]
+async fn a_push_stream_is_enqueued_for_delivery() {
+    // THE PUSH HALF OF `deliver`, which every other test in this suite leaves untouched
+    // because they all negotiate poll. A push arm that silently did nothing would ship
+    // green without this.
+    let harness = Harness::start_store_backed().await;
+    provision_envelope(&harness).await;
+    let scope = harness.scope();
+    let env = harness.state().env().clone();
+    let store = store_of(&harness);
+    let client = a_client(&harness).await;
+    let stream = seed_stream(
+        &harness,
+        &client,
+        SsfDelivery::Push {
+            endpoint_url: "https://receiver.example.com/events".to_owned(),
+            secret_name: None,
+        },
+        SsfSubjectFormat::Opaque,
+        &revocation_only(),
+    )
+    .await;
+
+    let session = create_session(&store, &env, scope, SUBJECT).await;
+    end_session(&store, &env, scope, &session, SessionEndCause::LoggedOut).await;
+    explode_pass(&harness, scope).await;
+    assert_eq!(fanout_pass(&harness, scope).await.completed, 1);
+
+    // Nothing landed in the POLL queue: a push stream is served by the outbox.
+    assert!(
+        owed_claims(&harness, &stream).await.is_empty(),
+        "a push stream was queued as though it polled"
+    );
+    // And the delivery message is there, carrying the minted token.
+    let claimed = store
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::SSF_PUSH_CONSUMER,
+            Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim the push delivery");
+    assert_eq!(claimed.len(), 1, "one push delivery per stream per event");
+    let set = claimed[0].payload["set"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no minted token on the delivery: {}", claimed[0].payload));
+    let claims = claims_of(set);
+    let (event_type, _) = sole_event(&claims);
+    assert_eq!(event_type, caep::SESSION_REVOKED);
+    assert_eq!(claims["sub_id"]["id"].as_str(), Some(SUBJECT));
 }

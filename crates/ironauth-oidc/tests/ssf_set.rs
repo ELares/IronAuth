@@ -162,7 +162,9 @@ fn each_format_renders_its_rfc_9493_members_and_labels_itself_with_the_stored_on
 fn the_subject_is_a_top_level_sub_id_and_not_an_in_event_member() {
     // SSF 1.0 section 3.1.2 makes the top-level `sub_id` a MUST for a new event type and says
     // such a type MUST NOT name its primary subject with an in-event `subject`. The carve-out
-    // in 3.1.1 is for event types already defined in CAEP or RISC; this build defines none.
+    // in 3.1.1 lets an event type already defined in CAEP or RISC ALSO carry an in-event
+    // `subject`; this build emits one such type (CAEP `session-revoked`, issue #144) and
+    // declines the carve-out, so every emitted type names its subject exactly one way.
     let audience = vec!["https://receiver.example.com".to_owned()];
     let subject = subject();
     let event = event();
