@@ -81893,15 +81893,19 @@ pub struct SsfStream {
     pub updated_at_unix_micros: i64,
 }
 
-/// The three properties SSF 1.0 lets a receiver change on its own stream.
+/// Everything a stream configuration update writes.
 ///
-/// EXACTLY THE RECEIVER-SUPPLIED SET, and no more. `stream_id`, `iss`, `aud`, `events_supported`,
-/// `events_delivered`, `min_verification_interval` and `inactivity_timeout` are all
-/// Transmitter-Supplied: the spec says a request MAY carry them but they MUST match, so the
-/// surface refuses a mismatch and never reaches this type with one.
+/// THREE OF THESE ARE THE RECEIVER'S AND ONE IS THE TRANSMITTER'S, which is why this is not
+/// simply "the receiver-supplied set". SSF 1.0 makes `events_requested`, `delivery` and
+/// `description` Receiver-Supplied; `events_delivered` is Transmitter-Supplied and is here
+/// because the transmitter is what writes it, recomputed by the caller from
+/// `events_requested` rather than accepted from the request.
 ///
-/// `events_delivered` is computed by the caller from `events_requested` and written here,
-/// because it is the transmitter's ANSWER rather than the receiver's request.
+/// THE OTHER TRANSMITTER-SUPPLIED PROPERTIES ARE ABSENT because nothing writes them:
+/// `stream_id`, `iss`, `aud` and `events_supported` are compared by the surface, which answers
+/// 400 on a mismatch, so a request trying to change one never reaches this type.
+/// `min_verification_interval` is served from configuration rather than stored, and this build
+/// has no `inactivity_timeout` at all.
 #[derive(Debug, Clone)]
 pub struct SsfStreamUpdate<'a> {
     /// Where its SETs go, and how.
@@ -81912,6 +81916,19 @@ pub struct SsfStreamUpdate<'a> {
     pub events_delivered: &'a [String],
     /// The receiver's label. `None` DELETES it, which is what a PUT omitting it means.
     pub description: Option<&'a str>,
+    /// The `updated_at` the caller merged against, in microseconds.
+    ///
+    /// OPTIMISTIC CONCURRENCY, and it is needed because the merge cannot happen inside this
+    /// statement: a PATCH fills its omitted properties from the stream as it stands, and what
+    /// `events_delivered` should become depends on the event vocabulary the OIDC crate owns, so
+    /// the read happens up there. That leaves a window, and the window is reachable: a PATCH
+    /// naming only `description` racing one naming only `delivery` would silently restore the
+    /// old endpoint, and BOTH receivers would get a 200 whose body already reflected the
+    /// revert.
+    ///
+    /// So the value the caller read is a conjunct of the UPDATE. A racing write moves
+    /// `updated_at`, the statement matches no row, and the loser is told rather than ignored.
+    pub expected_updated_at_unix_micros: i64,
 }
 
 /// A stream to create.
@@ -82644,7 +82661,9 @@ impl ActingSsfStreamRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if the handle or the client is out of scope, or the stream is
-    /// not this receiver's; [`StoreError::Database`] on a persistence failure.
+    /// not this receiver's; [`StoreError::Conflict`] if the stream changed since the caller read
+    /// it, which is a lost update refused rather than performed;
+    /// [`StoreError::Database`] on a persistence failure.
     pub async fn update_configuration(
         &self,
         env: &Env,
@@ -82673,6 +82692,7 @@ impl ActingSsfStreamRepo<'_> {
         let requested = serde_json::Value::from(update.events_requested.to_vec());
         let delivered = serde_json::Value::from(update.events_delivered.to_vec());
         let description = update.description.map(ToOwned::to_owned);
+        let expected_updated_at = update.expected_updated_at_unix_micros;
         // THE DETAIL NAMES THE METHOD AND THE ENDPOINT, for the reason `create` gives: an
         // operator reading the log for "where are our signals going" needs the edit that MOVED
         // an endpoint as much as the create that first named one.
@@ -82705,7 +82725,8 @@ impl ActingSsfStreamRepo<'_> {
                          events_requested = $4, events_delivered = $5, description = $6, \
                          updated_at = now() \
                      WHERE tenant_id = $7 AND environment_id = $8 AND id = $9 \
-                       AND client_id = $10",
+                       AND client_id = $10 \
+                       AND (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint = $11",
                 )
                 .bind(method)
                 .bind(&endpoint)
@@ -82717,19 +82738,46 @@ impl ActingSsfStreamRepo<'_> {
                 .bind(scope.environment().to_string())
                 .bind(stream.to_string())
                 .bind(&client)
+                .bind(expected_updated_at)
                 .execute(&mut **tx)
                 .await?;
                 if updated.rows_affected() == 0 {
-                    return Err(StoreError::NotFound);
+                    // WHICH CONJUNCT FAILED? The receiver needs to know: a stream that is not
+                    // theirs is a permanent not-found, and one that moved under them is a
+                    // conflict they fix by re-reading. Asked inside the same transaction, with
+                    // the receiver fence intact so this cannot become a way to probe.
+                    // `1::bigint` AND NOT `1`. A bare literal is INT4 and the decode wanted
+                    // INT8, so this arm answered `Database` instead of `Conflict` -- a real
+                    // lost update would have surfaced as a 500. Caught by the test below,
+                    // which is the only thing that ever executes this branch.
+                    let still_theirs: Option<i64> = sqlx::query_scalar(
+                        "SELECT 1::bigint FROM ssf_streams \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                           AND client_id = $4",
+                    )
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(stream.to_string())
+                    .bind(&client)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+                    return Err(if still_theirs.is_some() {
+                        StoreError::Conflict
+                    } else {
+                        StoreError::NotFound
+                    });
                 }
+                // ENQUEUED IN THE SAME TRANSACTION as the write, exactly as `create` does. An
+                // earlier version took this parameter and discarded it with `let _ = event;`
+                // AFTER the transaction had already committed, so a caller passing one got a
+                // silent no-op: the signature promised a domain event and nothing emitted it.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
             Some(&detail),
         )
-        .await?;
-        let _ = event;
-        Ok(())
+        .await
     }
 
     /// Move a stream between the three statuses.

@@ -24,8 +24,8 @@ use base64::engine::general_purpose::STANDARD;
 use common::Harness;
 use ironauth_oidc::ClientAuthMethod;
 use ironauth_store::{
-    ClientId, CorrelationId, NewSsfStream, SsfDelivery, SsfStreamId, SsfStreamStatus, StoreError,
-    SsfSubjectFormat,
+    ClientId, CorrelationId, NewSsfStream, SsfDelivery, SsfStreamId, SsfStreamStatus,
+    SsfSubjectFormat, StoreError,
 };
 
 fn basic(client_id: &ClientId, secret: &str) -> String {
@@ -71,11 +71,19 @@ async fn provision_envelope(harness: &Harness, env: &ironauth_env::Env) {
     for (label, outcome) in [
         (
             "kek",
-            acting.envelope().provision_kek(env, &harness.db().master_key()).await.map(|_| ()),
+            acting
+                .envelope()
+                .provision_kek(env, &harness.db().master_key())
+                .await
+                .map(|_| ()),
         ),
         (
             "dek",
-            acting.envelope().provision_dek(env, &harness.db().master_key()).await.map(|_| ()),
+            acting
+                .envelope()
+                .provision_dek(env, &harness.db().master_key())
+                .await
+                .map(|_| ()),
         ),
     ] {
         match outcome {
@@ -640,7 +648,10 @@ async fn a_receiver_asking_to_be_held_is_answered_immediately_and_told_so_in_adv
     assert_eq!(status, StatusCode::OK, "{body}");
     let page: serde_json::Value = serde_json::from_str(&body).expect("a poll document");
     assert!(
-        page["sets"].as_object().expect("sets is an object").is_empty(),
+        page["sets"]
+            .as_object()
+            .expect("sets is an object")
+            .is_empty(),
         "an empty queue returned events: {body}"
     );
     assert_eq!(page["moreAvailable"], serde_json::json!(false));

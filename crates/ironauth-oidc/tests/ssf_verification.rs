@@ -126,14 +126,15 @@ async fn stream(
 
 fn verify_uri(harness: &Harness) -> String {
     let scope = harness.scope();
-    format!(
-        "/t/{}/e/{}/ssf/verify",
-        scope.tenant(),
-        scope.environment()
-    )
+    format!("/t/{}/e/{}/ssf/verify", scope.tenant(), scope.environment())
 }
 
-async fn post(harness: &Harness, uri: &str, auth: Option<&str>, body: String) -> (StatusCode, String) {
+async fn post(
+    harness: &Harness,
+    uri: &str,
+    auth: Option<&str>,
+    body: String,
+) -> (StatusCode, String) {
     let mut builder = Request::builder()
         .method("POST")
         .uri(uri)
@@ -215,7 +216,13 @@ async fn a_poll_receiver_is_owed_a_verification_set_naming_its_stream_opaquely()
         .create_confidential_client(ClientAuthMethod::Basic)
         .await;
     let auth = basic(&client, &secret);
-    let id = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::Email).await;
+    let id = stream(
+        &harness,
+        &client,
+        &SsfDelivery::Poll,
+        SsfSubjectFormat::Email,
+    )
+    .await;
 
     let (status, body) = ask(&harness, &auth, &id, Some("probe-42")).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
@@ -258,7 +265,13 @@ async fn a_verification_without_state_carries_no_state_member() {
         .create_confidential_client(ClientAuthMethod::Basic)
         .await;
     let auth = basic(&client, &secret);
-    let id = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+    let id = stream(
+        &harness,
+        &client,
+        &SsfDelivery::Poll,
+        SsfSubjectFormat::IssSub,
+    )
+    .await;
 
     let (status, body) = ask(&harness, &auth, &id, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
@@ -342,8 +355,20 @@ async fn a_second_verification_is_refused_and_a_second_stream_is_not() {
         .create_confidential_client(ClientAuthMethod::Basic)
         .await;
     let auth = basic(&client, &secret);
-    let first = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
-    let second = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+    let first = stream(
+        &harness,
+        &client,
+        &SsfDelivery::Poll,
+        SsfSubjectFormat::IssSub,
+    )
+    .await;
+    let second = stream(
+        &harness,
+        &client,
+        &SsfDelivery::Poll,
+        SsfSubjectFormat::IssSub,
+    )
+    .await;
 
     let (status, body) = ask(&harness, &auth, &first, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
@@ -381,7 +406,13 @@ async fn a_second_receiver_reaches_no_stream_and_learns_nothing() {
         .create_confidential_client(ClientAuthMethod::Basic)
         .await;
     let intruder_auth = basic(&intruder, &intruder_secret);
-    let id = stream(&harness, &owner, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+    let id = stream(
+        &harness,
+        &owner,
+        &SsfDelivery::Poll,
+        SsfSubjectFormat::IssSub,
+    )
+    .await;
 
     let (owned_status, body) = ask(&harness, &intruder_auth, &id, None).await;
     assert_eq!(
@@ -427,7 +458,13 @@ async fn a_paused_stream_is_verified_and_a_disabled_one_is_refused() {
             .create_confidential_client(ClientAuthMethod::Basic)
             .await;
         let auth = basic(&client, &secret);
-        let id = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+        let id = stream(
+            &harness,
+            &client,
+            &SsfDelivery::Poll,
+            SsfSubjectFormat::IssSub,
+        )
+        .await;
         let env = harness.state().env().clone();
         harness
             .db()
@@ -440,7 +477,10 @@ async fn a_paused_stream_is_verified_and_a_disabled_one_is_refused() {
             .expect("set the status");
 
         let (status, body) = ask(&harness, &auth, &id, None).await;
-        assert_eq!(status, expected, "a {label} stream answered wrongly: {body}");
+        assert_eq!(
+            status, expected,
+            "a {label} stream answered wrongly: {body}"
+        );
         assert_eq!(
             owed_tokens(&harness, &id).await.len(),
             owed_after,
@@ -462,7 +502,13 @@ async fn discovery_advertises_the_verification_endpoint_and_nothing_ssf_puts_els
         .create_confidential_client(ClientAuthMethod::Basic)
         .await;
     let auth = basic(&client, &secret);
-    let id = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+    let id = stream(
+        &harness,
+        &client,
+        &SsfDelivery::Poll,
+        SsfSubjectFormat::IssSub,
+    )
+    .await;
 
     let scope = harness.scope();
     let request = Request::builder()
@@ -540,7 +586,13 @@ async fn a_receiver_cannot_reset_its_verification_budget_by_recreating_the_strea
         .await;
     let auth = basic(&client, &secret);
 
-    let first = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+    let first = stream(
+        &harness,
+        &client,
+        &SsfDelivery::Poll,
+        SsfSubjectFormat::IssSub,
+    )
+    .await;
     let (status, body) = ask(&harness, &auth, &first, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 
@@ -556,7 +608,13 @@ async fn a_receiver_cannot_reset_its_verification_budget_by_recreating_the_strea
         .await
         .expect("the receiver deletes its own stream");
 
-    let second = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+    let second = stream(
+        &harness,
+        &client,
+        &SsfDelivery::Poll,
+        SsfSubjectFormat::IssSub,
+    )
+    .await;
     let (status, body) = ask(&harness, &auth, &second, None).await;
     assert_eq!(
         status,
@@ -582,7 +640,13 @@ async fn the_enforced_interval_is_the_one_that_is_advertised() {
         .create_confidential_client(ClientAuthMethod::Basic)
         .await;
     let auth = basic(&client, &secret);
-    let id = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+    let id = stream(
+        &harness,
+        &client,
+        &SsfDelivery::Poll,
+        SsfSubjectFormat::IssSub,
+    )
+    .await;
 
     let (status, body) = ask(&harness, &auth, &id, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
@@ -622,7 +686,13 @@ async fn the_rate_limit_refusal_names_the_interval_in_retry_after() {
         .create_confidential_client(ClientAuthMethod::Basic)
         .await;
     let auth = basic(&client, &secret);
-    let id = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+    let id = stream(
+        &harness,
+        &client,
+        &SsfDelivery::Poll,
+        SsfSubjectFormat::IssSub,
+    )
+    .await;
     ask(&harness, &auth, &id, None).await;
 
     let body = serde_json::json!({ "stream_id": id.to_string() }).to_string();
@@ -656,7 +726,13 @@ async fn an_over_long_state_is_refused_and_costs_no_slot() {
         .create_confidential_client(ClientAuthMethod::Basic)
         .await;
     let auth = basic(&client, &secret);
-    let id = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+    let id = stream(
+        &harness,
+        &client,
+        &SsfDelivery::Poll,
+        SsfSubjectFormat::IssSub,
+    )
+    .await;
 
     let too_long = "x".repeat(253);
     let (status, body) = ask(&harness, &auth, &id, Some(&too_long)).await;
@@ -749,7 +825,13 @@ async fn a_verification_for_a_stream_that_is_already_full_is_refused_as_a_rate_l
         .create_confidential_client(ClientAuthMethod::Basic)
         .await;
     let auth = basic(&client, &secret);
-    let id = stream(&harness, &client, &SsfDelivery::Poll, SsfSubjectFormat::IssSub).await;
+    let id = stream(
+        &harness,
+        &client,
+        &SsfDelivery::Poll,
+        SsfSubjectFormat::IssSub,
+    )
+    .await;
 
     let env = harness.state().env().clone();
     harness

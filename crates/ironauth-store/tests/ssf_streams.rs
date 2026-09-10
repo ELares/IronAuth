@@ -438,11 +438,19 @@ async fn provision_envelope(db: &TestDatabase, env: &Env, scope: Scope) {
     for (label, outcome) in [
         (
             "kek",
-            acting.envelope().provision_kek(env, &db.master_key()).await.map(|_| ()),
+            acting
+                .envelope()
+                .provision_kek(env, &db.master_key())
+                .await
+                .map(|_| ()),
         ),
         (
             "dek",
-            acting.envelope().provision_dek(env, &db.master_key()).await.map(|_| ()),
+            acting
+                .envelope()
+                .provision_dek(env, &db.master_key())
+                .await
+                .map(|_| ()),
         ),
     ] {
         match outcome {
@@ -665,6 +673,10 @@ async fn a_configuration_update_for_another_receiver_matches_no_row() {
                 events_requested: &none,
                 events_delivered: &none,
                 description: Some("moved"),
+                // The owner's own value, so the ONLY thing that can refuse this write is the
+                // receiver conjunct. A stale timestamp here would make the test pass for the
+                // wrong reason.
+                expected_updated_at_unix_micros: before.updated_at_unix_micros,
             },
             None,
         )
@@ -693,4 +705,94 @@ async fn a_configuration_update_for_another_receiver_matches_no_row() {
         "the refused update rewrote the owner's description"
     );
     assert_eq!(after.events_requested, before.events_requested);
+}
+
+/// A stale update is refused rather than silently reverting the write that beat it.
+///
+/// The merge cannot happen inside the statement -- a PATCH fills its omitted properties from the
+/// stream as it stands, and what `events_delivered` should become depends on the event
+/// vocabulary the OIDC crate owns -- so the read happens above the store and leaves a window.
+/// The window is REACHABLE: a PATCH naming only the description, racing one naming only the
+/// delivery, would restore the old endpoint, and both receivers would get a success whose body
+/// already reflected the loss.
+///
+/// DRIVEN AS A REAL SEQUENCE rather than as a contrived timestamp: both updates merge against
+/// the SAME read, exactly as two concurrent requests would.
+#[tokio::test]
+async fn an_update_merged_against_a_stale_read_is_refused() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client = seed_client(&db, &env, scope, "receiver").await;
+    let id = poll_stream(&db, &env, scope, &client).await;
+
+    // ONE read, shared by both writers, which is what makes them concurrent.
+    let seen = db
+        .store()
+        .scoped(scope)
+        .ssf_streams()
+        .get_for_client(&id, &client)
+        .await
+        .expect("read the stream");
+    let none: Vec<String> = Vec::new();
+    let update = |description: &'static str| ironauth_store::SsfStreamUpdate {
+        delivery: &SsfDelivery::Poll,
+        events_requested: &none,
+        events_delivered: &none,
+        description: Some(description),
+        expected_updated_at_unix_micros: seen.updated_at_unix_micros,
+    };
+
+    let writes = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    writes
+        .ssf_streams()
+        .update_configuration(&env, &id, &client, update("the first writer"), None)
+        .await
+        .expect("the first update lands");
+
+    let second = writes
+        .ssf_streams()
+        .update_configuration(&env, &id, &client, update("the second writer"), None)
+        .await;
+    assert!(
+        matches!(second, Err(StoreError::Conflict)),
+        "an update merged against a stale read silently clobbered the write that beat it: \
+         {second:?}"
+    );
+
+    // AND THE WINNER'S VALUE SURVIVED, which is the half that separates a refusal from a
+    // rejection reported after the damage.
+    let after = db
+        .store()
+        .scoped(scope)
+        .ssf_streams()
+        .get_for_client(&id, &client)
+        .await
+        .expect("read the stream back");
+    assert_eq!(after.description.as_deref(), Some("the first writer"));
+
+    // A FRESH READ SUCCEEDS, so the refusal is a retry instruction and not a dead end.
+    let retried = writes
+        .ssf_streams()
+        .update_configuration(
+            &env,
+            &id,
+            &client,
+            ironauth_store::SsfStreamUpdate {
+                delivery: &SsfDelivery::Poll,
+                events_requested: &none,
+                events_delivered: &none,
+                description: Some("the second writer"),
+                expected_updated_at_unix_micros: after.updated_at_unix_micros,
+            },
+            None,
+        )
+        .await;
+    assert!(
+        retried.is_ok(),
+        "a retry after re-reading was refused: {retried:?}"
+    );
 }

@@ -231,6 +231,12 @@ fn validate_delivery(
     Ok(delivery)
 }
 
+/// The delivery method and the subject format a CREATE request asks for, or the 400 that says
+/// why not.
+///
+/// The delivery half is [`validate_delivery`], shared with the update path; everything below is
+/// specific to a create, because `aud` and `format` are fixed at creation and no update writes
+/// them.
 fn validate(
     request: &CreateStreamRequest,
     client_id: &ClientId,
@@ -513,22 +519,10 @@ async fn update_stream(
         return response;
     }
 
-    let delivery = match request.delivery.as_ref() {
-        Some(requested) => match validate_delivery(requested, &client_id) {
-            Ok(delivery) => delivery,
-            Err(response) => return *response,
-        },
-        // A PUT WITHOUT `delivery` IS REFUSED rather than deleting it. Section 8.1.3 makes an
-        // omitted receiver-supplied property a deletion request, and a stream with no delivery
-        // method is not a thing this schema can hold or this transmitter can serve: 0216's
-        // CHECK ties the method to the endpoint, and there is no third state. So the honest
-        // answer is that the request is invalid, not that the stream is now undeliverable.
-        None if merge == Merge::DeleteOmitted => {
-            return invalid_request(
-                "a replacement must carry delivery; a stream cannot exist without one",
-            );
-        }
-        None => current.delivery.clone(),
+    let delivery = match resolve_delivery(&state, scope, &id, &request, &current, &client_id, merge)
+    {
+        Ok(delivery) => delivery,
+        Err(response) => return *response,
     };
 
     let requested = match (request.events_requested, merge) {
@@ -536,13 +530,25 @@ async fn update_stream(
         (None, Merge::DeleteOmitted) => Vec::new(),
         (None, Merge::KeepOmitted) => current.events_requested.clone(),
     };
-    if requested.len() > MAX_EVENTS_REQUESTED {
-        return invalid_request("events_requested names more event types than this transmitter accepts");
+    // EVERY BOUND CREATE MIRRORS, MIRRORED HERE TOO. The update path inherited create's
+    // `Err(_) => server_error()` mapping without inheriting the bounds that justify it, which
+    // turned a receiver's fixable input into a transmitter fault: an empty `description`
+    // violates 0216's `ssf_streams_description_shaped` CHECK and surfaced as a 500 where the
+    // identical value on create answers 400.
+    if let Err(response) = bounded(&requested, MAX_EVENTS_REQUESTED, "events_requested") {
+        return *response;
     }
     let description = match (request.description, merge) {
         (Some(description), _) => {
-            if description.len() > MAX_TEXT_BYTES {
-                return invalid_request("description is longer than this transmitter stores");
+            // THE SAME TWO HALVES CREATE CHECKS. Blank is refused rather than stored, because
+            // 0216's CHECK refuses it and a `CHECK` violation reaches the caller as a 500. A
+            // receiver clearing its label sends an empty string, which is the obvious thing to
+            // send, so this is the likely input rather than a corner.
+            if description.trim().is_empty() || description.len() > MAX_TEXT_BYTES {
+                return invalid_request(
+                    "description must be non-empty and at most 252 bytes; omit it in a \
+                     replacement to clear it",
+                );
             }
             Some(description)
         }
@@ -570,6 +576,7 @@ async fn update_stream(
                 events_requested: &requested,
                 events_delivered: &delivered,
                 description: description.as_deref(),
+                expected_updated_at_unix_micros: current.updated_at_unix_micros,
             },
             None,
         )
@@ -577,6 +584,11 @@ async fn update_stream(
     match outcome {
         Ok(()) => {}
         Err(StoreError::NotFound) => return not_found(),
+        // THE STREAM MOVED UNDER THIS REQUEST. A PATCH fills its omitted properties from the
+        // stream as it stands, so two concurrent ones naming different properties would
+        // otherwise revert each other silently and hand BOTH receivers a 200 whose body already
+        // reflected the loss. Told rather than ignored, and fixed by re-reading.
+        Err(StoreError::Conflict) => return stream_changed(),
         Err(_) => return server_error(),
     }
 
@@ -593,6 +605,80 @@ async fn update_stream(
         Ok(stream) => json(StatusCode::OK, &render_stream(&state, scope, &stream)),
         Err(_) => server_error(),
     }
+}
+
+/// The delivery this update should store, or the 400 that says why not.
+///
+/// # The published poll address may be echoed back, and it has to be
+///
+/// A PUT must carry the full receiver-supplied set, so the spec's own read-modify-write hands
+/// the transmitter back exactly what it published, and for a poll stream that includes the
+/// `delivery.endpoint_url` this surface synthesises. `validate_delivery` refuses a poll delivery
+/// naming an endpoint, which is right at CREATE -- there is no address yet, so naming one is a
+/// receiver inventing a value it does not own -- and made every poll stream un-PUT-able here.
+///
+/// MATCHED, NOT IGNORED, which is the rule the transmitter-supplied properties follow: echoing
+/// our own address back is fine, naming a different one is a receiver trying to choose where it
+/// collects from, and that is still a 400.
+///
+/// # An omitted delivery
+///
+/// A PATCH leaves the stream's own; a PUT is refused. Section 8.1.3 makes an omitted
+/// receiver-supplied property a deletion request, and a stream with no delivery method is not a
+/// state 0216's CHECK can hold or this transmitter can serve, so the honest answer is that the
+/// request is invalid rather than that the stream is now unreachable.
+#[allow(clippy::too_many_arguments)]
+fn resolve_delivery(
+    state: &OidcState,
+    scope: Scope,
+    id: &SsfStreamId,
+    request: &UpdateStreamRequest,
+    current: &SsfStream,
+    client_id: &ClientId,
+    merge: Merge,
+) -> Result<SsfDelivery, Box<Response>> {
+    let Some(requested) = request.delivery.as_ref() else {
+        if merge == Merge::DeleteOmitted {
+            return Err(Box::new(invalid_request(
+                "a replacement must carry delivery; a stream cannot exist without one",
+            )));
+        }
+        return Ok(current.delivery.clone());
+    };
+    let echoed_our_own_address = requested.method.as_str() == SSF_DELIVERY_POLL
+        && requested.endpoint_url.as_deref() == Some(poll_address(state, scope, id).as_str());
+    if echoed_our_own_address {
+        let normalised = DeliveryRequest {
+            method: requested.method.clone(),
+            endpoint_url: None,
+            authorization_secret_name: requested.authorization_secret_name.clone(),
+        };
+        return validate_delivery(&normalised, client_id);
+    }
+    validate_delivery(requested, client_id)
+}
+
+/// The stream changed between the read this update merged against and the write.
+///
+/// 409 rather than one of the four codes section 8.1.2 lists, because none of them says this:
+/// the request was well formed, authorized, and for a stream that exists. A receiver retrying
+/// after a fresh read succeeds, which is what the header tells it to do.
+fn stream_changed() -> Response {
+    (
+        StatusCode::CONFLICT,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        serde_json::json!({
+            "error": "conflict",
+            "error_description":
+                "this stream changed while the update was being prepared; read it again and \
+                 reapply the change",
+        })
+        .to_string(),
+    )
+        .into_response()
 }
 
 /// The 400 for a Transmitter-Supplied property the request tried to change, if there is one.
@@ -618,7 +704,10 @@ fn read_only_mismatch(
         return mismatched("format");
     }
     if let Some(supported) = &request.events_supported
-        && supported.iter().map(String::as_str).ne(EVENTS_SUPPORTED.iter().copied())
+        && supported
+            .iter()
+            .map(String::as_str)
+            .ne(EVENTS_SUPPORTED.iter().copied())
     {
         return mismatched("events_supported");
     }
@@ -1099,12 +1188,11 @@ pub async fn verification(
     let subject = crate::ssf_set::SubjectIdentifier::Opaque { id: id.to_string() };
     let jti = verification_jti(state.env());
 
-    let queued = match deliver_verification(&state, scope, &stream, &id, &jti, &subject, &event)
-        .await
-    {
-        Ok(queued) => queued,
-        Err(response) => return response,
-    };
+    let queued =
+        match deliver_verification(&state, scope, &stream, &id, &jti, &subject, &event).await {
+            Ok(queued) => queued,
+            Err(response) => return response,
+        };
     let _ = queued;
     no_content()
 }
@@ -1328,6 +1416,17 @@ pub async fn configuration(
     )
 }
 
+/// Where a receiver collects this stream's SETs from.
+///
+/// DERIVED ONCE and used by both the renderer that publishes it and the update path that has to
+/// accept it echoed back. Two derivations of one address is how a transmitter comes to refuse
+/// the configuration it just handed out, which is exactly what happened: a PUT must carry the
+/// full receiver-supplied set, so the spec's own read-modify-write returns this value, and the
+/// delivery validator refused it.
+fn poll_address(state: &OidcState, scope: Scope, stream: &SsfStreamId) -> String {
+    format!("{}/ssf/poll/{}", state.issuers().issuer_for(&scope), stream)
+}
+
 /// The SSF 1.0 stream configuration object.
 fn render_stream(state: &OidcState, scope: Scope, stream: &SsfStream) -> serde_json::Value {
     let mut delivery = serde_json::Map::new();
@@ -1349,11 +1448,7 @@ fn render_stream(state: &OidcState, scope: Scope, stream: &SsfStream) -> serde_j
         SsfDelivery::Poll => {
             delivery.insert(
                 "endpoint_url".to_owned(),
-                serde_json::Value::String(format!(
-                    "{}/ssf/poll/{}",
-                    state.issuers().issuer_for(&scope),
-                    stream.id
-                )),
+                serde_json::Value::String(poll_address(state, scope, &stream.id)),
             );
         }
     }

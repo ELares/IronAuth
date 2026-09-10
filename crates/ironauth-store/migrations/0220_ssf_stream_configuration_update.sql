@@ -8,8 +8,9 @@
 -- WHAT SSF 1.0 LETS A RECEIVER CHANGE is exactly three properties of its own stream:
 -- `events_requested`, `delivery` and `description`. Everything else in the stream configuration
 -- object is Transmitter-Supplied and read-only, and the surface refuses a request that tries to
--- change one. So the grant is: the two columns behind `delivery`, the two behind the event
--- negotiation, and the description.
+-- change one. So the grant is SIX COLUMNS: the three behind `delivery` (the method and the two
+-- push fields), the two behind the event negotiation, and the description. `updated_at` is not
+-- among them because 0216 granted it already for `set_status`, and this statement writes it too.
 --
 -- `events_delivered` IS IN THE LIST AND IS NOT RECEIVER-SUPPLIED. It is the transmitter's answer
 -- to `events_requested` -- the intersection with what this build emits -- so it is recomputed

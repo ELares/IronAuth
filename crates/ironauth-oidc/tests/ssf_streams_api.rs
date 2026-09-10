@@ -685,8 +685,7 @@ async fn a_patch_changes_the_named_property_and_leaves_the_rest() {
     // UNTOUCHED, because the request did not name them.
     assert_eq!(patched["delivery"], created["delivery"]);
     assert_eq!(
-        patched["events_requested"],
-        created["events_requested"],
+        patched["events_requested"], created["events_requested"],
         "a patch that named only the description changed the event negotiation"
     );
     assert_eq!(patched["events_delivered"], created["events_delivered"]);
@@ -701,7 +700,10 @@ async fn a_patch_changes_the_named_property_and_leaves_the_rest() {
     .await;
     assert_eq!(status, StatusCode::OK, "{text}");
     let read_back: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
-    assert_eq!(read_back, patched, "the PATCH response is not what was stored");
+    assert_eq!(
+        read_back, patched,
+        "the PATCH response is not what was stored"
+    );
 }
 
 /// PUT deletes what it omits.
@@ -762,8 +764,11 @@ async fn a_put_deletes_the_receiver_properties_it_omits() {
 ///
 /// THE REQUESTED SET HAS TO CONTAIN SOMETHING UNSUPPORTED for this to bite, which is the whole
 /// point of the case. Measured: with `events_delivered = events_requested.clone()` substituted
-/// for the intersection, every other test in this file still passed, because each of them
-/// happens to end with an empty set either way.
+/// for the intersection, every other test in this file still passed, because every one of them
+/// requests only types this build supports -- so the intersection and the echo agree. (An
+/// earlier version of this note said they all end with an EMPTY set, which is wrong: three of
+/// them end with a one-element set. The reason they survive is that nothing they ask for is
+/// ever dropped, not that nothing is ever delivered.)
 #[tokio::test]
 async fn an_update_recomputes_what_the_transmitter_agreed_to_send() {
     let mut harness = Harness::start_store_backed().await;
@@ -1006,8 +1011,14 @@ async fn a_transmitter_supplied_property_may_be_echoed_but_not_changed() {
         ("aud", serde_json::json!(["https://somebody-else.example"])),
         ("iss", serde_json::json!("https://issuer.example/t/x/e/y")),
         ("format", serde_json::json!("email")),
-        ("events_supported", serde_json::json!(["https://made.up/event"])),
-        ("events_delivered", serde_json::json!(["https://made.up/event"])),
+        (
+            "events_supported",
+            serde_json::json!(["https://made.up/event"]),
+        ),
+        (
+            "events_delivered",
+            serde_json::json!(["https://made.up/event"]),
+        ),
         ("min_verification_interval", serde_json::json!(9999)),
     ] {
         let mut body = serde_json::Map::new();
@@ -1090,4 +1101,147 @@ async fn a_replacement_without_a_delivery_is_refused() {
         after["delivery"], created["delivery"],
         "the refused replacement changed the delivery anyway"
     );
+}
+
+/// A receiver can PUT back exactly the configuration it was given.
+///
+/// THE SPEC MANDATES THE ROUND TRIP. A PUT must carry the full receiver-supplied set, "not only
+/// those specifically intended to be changed", so the natural client is read-modify-write: GET
+/// the stream, change one field, PUT the whole thing. For a POLL stream that body includes the
+/// `delivery.endpoint_url` this transmitter synthesises, and the delivery validator refused it,
+/// so every poll stream was un-PUT-able and the transmitter rejected the document it had just
+/// published.
+///
+/// UNMODIFIED, DELIBERATELY. The read-modify-write is driven with NO edit at all, because that
+/// is the case where every value came from the transmitter: if the round trip cannot survive
+/// changing nothing, no edit built on it can survive either.
+#[tokio::test]
+async fn a_poll_stream_can_be_replaced_with_exactly_what_the_transmitter_published() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let created = seeded_stream(&harness, &auth).await;
+    let stream_id = created["stream_id"].as_str().expect("stream_id").to_owned();
+    assert!(
+        created["delivery"]["endpoint_url"].is_string(),
+        "the fixture does not publish a poll address, so this proves nothing: {created}"
+    );
+
+    let body = serde_json::json!({
+        "stream_id": stream_id,
+        "delivery": created["delivery"],
+        "events_requested": created["events_requested"],
+        "description": created["description"],
+    })
+    .to_string();
+    let (status, text) = send(
+        &harness,
+        "PUT",
+        &streams_path(&harness),
+        Some(&auth),
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the transmitter refused the configuration it published: {text}"
+    );
+    let replaced: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
+    assert_eq!(
+        replaced, created,
+        "a replacement that changed nothing changed something"
+    );
+
+    // A DIFFERENT ADDRESS IS STILL REFUSED. Tolerating our own value must not become tolerating
+    // any value: a receiver does not get to choose where it collects from.
+    let elsewhere = serde_json::json!({
+        "stream_id": stream_id,
+        "delivery": {
+            "method": "urn:ietf:rfc:8936",
+            "endpoint_url": "https://attacker.example/collect",
+        },
+    })
+    .to_string();
+    let (status, text) = send(
+        &harness,
+        "PUT",
+        &streams_path(&harness),
+        Some(&auth),
+        Some(elsewhere),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a receiver chose its own poll address: {text}"
+    );
+}
+
+/// Input the schema refuses is a 400, not a 500.
+///
+/// The update path inherited create's `Err(_) => server_error()` mapping without inheriting the
+/// bounds that justify it. An empty `description` violates 0216's `ssf_streams_description_shaped`
+/// CHECK, so it reached Postgres and came back as a transmitter fault -- for the obvious thing a
+/// receiver sends when clearing its label, and for input the identical create refuses with a
+/// 400.
+#[tokio::test]
+async fn input_the_schema_refuses_is_a_bad_request_on_update_as_it_is_on_create() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let created = seeded_stream(&harness, &auth).await;
+    let stream_id = created["stream_id"].as_str().expect("stream_id").to_owned();
+
+    for (label, value) in [
+        ("an empty description", serde_json::json!("")),
+        ("a whitespace description", serde_json::json!("   ")),
+    ] {
+        for method in ["PATCH", "PUT"] {
+            let body = serde_json::json!({
+                "stream_id": stream_id,
+                "delivery": created["delivery"],
+                "description": value,
+            })
+            .to_string();
+            let (status, text) = send(
+                &harness,
+                method,
+                &streams_path(&harness),
+                Some(&auth),
+                Some(body),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{method} with {label} was not a bad request: {text}"
+            );
+        }
+    }
+
+    // THE WAY TO CLEAR IT is to omit it from a replacement, which is what the spec defines a
+    // deletion to be. A refusal with no way to achieve the intent would just be a trap.
+    let body = serde_json::json!({
+        "stream_id": stream_id,
+        "delivery": created["delivery"],
+    })
+    .to_string();
+    let (status, text) = send(
+        &harness,
+        "PUT",
+        &streams_path(&harness),
+        Some(&auth),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let cleared: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
+    assert_eq!(cleared["description"], serde_json::Value::Null);
 }
