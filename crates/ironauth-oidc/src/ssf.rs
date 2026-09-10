@@ -1391,10 +1391,11 @@ pub async fn verification(
 
 /// Make the verification SET durable by the method its stream negotiated.
 ///
-/// THE TWO METHODS STORE DIFFERENT THINGS, which is why this is a match rather than one call.
-/// Poll stores the SIGNED TOKEN, because RFC 8936 redelivers an unacknowledged SET and a
-/// receiver comparing two deliveries must see the same bytes; push stores the INGREDIENTS on the
-/// outbox, which is the shape `enqueue_push` already had.
+/// BOTH METHODS STORE THE SIGNED TOKEN, and this is a match because they store it in
+/// different PLACES: poll writes it into `ssf_stream_sets`, sealed under the environment DEK,
+/// and push onto the transactional outbox. Push used to store the INGREDIENTS and re-mint on
+/// every attempt; issue #1200 settled that the other way, so a redelivery is byte-identical
+/// whichever method carries it.
 ///
 /// The `Err` arm is a response rather than an error type because every failure here has exactly
 /// one right answer and the caller would only re-derive it.

@@ -702,6 +702,15 @@ async fn a_receiver_outage_delays_delivery_and_loses_nothing() {
                  WHERE completed_at IS NULL AND dead_lettered_at IS NULL",
             )
             .await;
+        // THE CLOCK MOVES BETWEEN ATTEMPTS, and without this the byte-identity assertion below
+        // is VACUOUS. The harness clock is frozen at the epoch and this suite never advanced
+        // it, and the environment signs with Ed25519, which is deterministic: a consumer
+        // re-minting per attempt would therefore have stamped the same `iat` and produced the
+        // same bytes, so the assertion passed against the very defect it names. An hour is
+        // more than enough to move `iat`, which is stamped in whole seconds.
+        harness
+            .clock()
+            .advance(std::time::Duration::from_secs(3_600));
         attempts += drain_push(&harness, &receiver, 1).await;
     }
     assert_eq!(
@@ -739,6 +748,25 @@ async fn a_receiver_outage_delays_delivery_and_loses_nothing() {
     // deterministic. A receiver that caches by `jti` and compares what it was sent -- which is
     // the dedup strategy 0217 assumes for poll -- would see two tokens claiming to be one
     // event and have no way to explain the difference.
+    //
+    // WHAT THIS ASSERTION CAN AND CANNOT DEMONSTRATE, stated because the first version of it
+    // was vacuous and the honest replacement is not a stronger proof but a smaller claim.
+    //
+    // It could not catch the original defect. The harness clock was frozen at the epoch and
+    // the environment signs with Ed25519, which is deterministic, so a consumer re-minting per
+    // attempt produced four IDENTICAL tokens: the assertion passed against exactly the code it
+    // was written to fail. The clock now advances an hour between attempts, which removes that
+    // specific reason for it to be vacuous.
+    //
+    // It still cannot be shown failing against the real defect, and the reason is the fix
+    // itself: `SsfPushConsumer` no longer holds an `IssuerRegistry`, so a consumer CANNOT
+    // re-mint. Reinstating the defect would mean re-adding the registry first. The property is
+    // therefore guarded by construction, and this assertion is the tripwire for a change that
+    // put a signer back within reach of the delivery path.
+    //
+    // A probe that appended a mint-time stamp to the token was tried and rejected as evidence:
+    // it changes the bytes but also breaks the signature, so both halves failed because the
+    // receiver refused them, not because they differed.
     let tokens = receiver.tokens();
     assert_eq!(tokens.len(), 4, "the receiver did not see four deliveries");
     assert!(

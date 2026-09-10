@@ -8,26 +8,33 @@
 //! is specific to SSF: which stream a message names, how its SET is minted, and what a
 //! receiver's answer means.
 //!
-//! # The `jti` is minted once, by the producer
+//! # The whole SET is minted once, by the producer
 //!
 //! RFC 8417 requires a `jti` and receivers dedup on it, so a redelivery MUST carry the same
-//! one. It therefore travels on the message's immutable payload and the SET is minted around
-//! it at each attempt, which is the shape `backchannel` records for its Logout Token: minting
-//! here would give every retry a fresh id and turn one event into N events in the receiver's
-//! log. That is also what makes at-least-once delivery safe to expose to a receiver -- the
-//! duplicate is detectable BY the receiver, which is the only place it can be.
+//! one. The TOKEN is byte-identical across attempts too, which is a stronger claim and the one
+//! issue #1200 settled: a receiver that caches by `jti` and compares what it was sent would
+//! otherwise see two tokens claiming to be one event, with a restamped `iat` and, for any
+//! algorithm that is not deterministic, a different signature.
 //!
-//! The TOKEN is not byte-identical across attempts, and the claim is not that it is: `iat` is
-//! stamped at each mint, so the JWS differs. What is stable is the `jti`, which is the handle a
-//! receiver dedups on, and that is the whole of what at-least-once requires.
+//! An earlier version of this file minted inside the consumer and said here, in as many words,
+//! that byte-identity "is not the claim". Migration 0217 had already argued the opposite for
+//! poll delivery, and there was no reason for the two delivery methods to disagree about what
+//! a redelivery is.
 //!
-//! # The stream is re-read at delivery, not carried
+//! # What travels, and what is re-read at delivery
 //!
-//! Only the `stream_id` travels. The endpoint, the audience, the credential name and the
-//! status are read from the row at each attempt, so a receiver that re-points its endpoint
-//! while a message is queued is delivered to at the NEW address, and one that deletes its
-//! stream stops being delivered to at all. Carrying them would have pinned a snapshot taken
-//! before the outage that caused the retry.
+//! THE SIGNED TOKEN TRAVELS, on the message's immutable payload, along with the `stream_id`
+//! that routes it. Everything the token ASSERTS is therefore fixed at enqueue: `iss`, `aud`,
+//! `iat`, the subject and the event body.
+//!
+//! THE DESTINATION IS NOT. The endpoint, the credential name and the status are read from the
+//! stream row at each attempt, so a receiver that re-points its endpoint while a message is
+//! queued is delivered to at the NEW address, one that pauses stops being delivered to for the
+//! duration, and one that deletes its stream stops entirely.
+//!
+//! The split is deliberate: WHERE a SET goes is the receiver's to change while it waits, and
+//! WHAT it says is not. `aud` sits on the token side because SSF makes it transmitter-supplied
+//! and no configuration update can change it.
 //!
 //! # What a receiver's answer means
 //!
@@ -137,10 +144,20 @@ pub async fn enqueue_push(
                 consumer: SSF_PUSH_CONSUMER,
                 idempotency_key: &idempotency,
                 ordering_key: &ordering,
-                // THE SUBJECT IS NO LONGER A SEPARATE MEMBER, which is a small improvement and
-                // not a fix: `outbox_messages.payload` is plaintext jsonb, and the subject is
-                // still readable inside the token's base64url payload. What changes is that
-                // there is now ONE copy of it here rather than two.
+                // THE SUBJECT IS NO LONGER A SEPARATE MEMBER, and this is NOT a privacy
+                // improvement: `outbox_messages.payload` is plaintext jsonb, and the subject
+                // is still readable inside the token's base64url payload. It was one readable
+                // copy before and it is one readable copy now -- an earlier version of this
+                // comment claimed the count went from two to one, which was wrong, because
+                // the old payload carried the ingredients and no token.
+                //
+                // ROLLING UPGRADES: this changes a DURABLE wire format, and a consumer of
+                // either vintage permanently dead-letters the other's rows. That is safe only
+                // because nothing has shipped -- the repository has no release tag, and the
+                // SSF surface is off by default -- so no queued row of the old shape exists
+                // anywhere. Once a release carries this table, a change of this kind needs a
+                // release where the consumer reads both shapes before one where it writes the
+                // new one.
                 payload: serde_json::json!({
                     PAYLOAD_STREAM_ID: ordering,
                     PAYLOAD_JTI: queued.jti,
@@ -352,11 +369,14 @@ impl<S: SsfPushSender> SsfPushConsumer<S> {
         message: &OutboxMessage,
     ) -> Result<(), ConsumerError> {
         let stream_text = payload_str(message, PAYLOAD_STREAM_ID)?;
-        let jti = payload_str(message, PAYLOAD_JTI)?;
+        // THE `jti` IS READ AND NOT USED for delivery, because the token already carries it.
+        // It stays a required member so a malformed message fails HERE, on its first claim,
+        // rather than at the receiver: the `jti` is what an operator correlates a delivery
+        // with, and a queued row without one is not a message this consumer can account for.
+        let _jti = payload_str(message, PAYLOAD_JTI)?;
         // THE TOKEN AS IT WAS MINTED, not ingredients to re-mint one. Every attempt POSTs
         // these same bytes; see `PAYLOAD_SET`.
         let set = payload_str(message, PAYLOAD_SET)?;
-        let _ = &jti;
 
         let id = SsfStreamId::parse_in_scope(&stream_text, &scope)
             .map_err(|_| ConsumerError::permanent("stream_id_malformed"))?;
