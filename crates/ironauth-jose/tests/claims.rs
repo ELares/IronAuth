@@ -77,6 +77,166 @@ fn expired_within_skew_is_accepted() {
 }
 
 #[test]
+fn allow_absent_exp_admits_a_set_that_omits_it_and_relaxes_nothing_else() {
+    // SSF 1.0 section 4.1.7 makes a SET's absent `exp` a MUST NOT; RFC 8417 section 2.2 gives
+    // the reason -- a SET is historical in nature, so an expiry would make a receiver that was
+    // down through the window discard exactly the events it needs. `allow_absent_exp` admits
+    // that shape and only that shape.
+    let signer = common::Ed25519Signer::new();
+    let key = TrustedKey::ed25519(None, signer.public_key()).expect("valid key");
+    let base = || {
+        VerificationPolicy::new(
+            vec![JwsAlgorithm::EdDsa],
+            vec![key.clone()],
+            common::ISS,
+            common::AUD,
+            common::TYP_NOT_UNDER_TEST,
+        )
+        .expect("valid policy")
+        .with_skew(Duration::from_secs(60))
+    };
+
+    let no_exp = token(
+        &signer,
+        &format!(
+            r#"{{"iss":"{}","aud":"{}","nbf":{},"iat":{}}}"#,
+            common::ISS,
+            common::AUD,
+            NOW_I - 60,
+            NOW_I - 60
+        ),
+    );
+
+    // THE DEFAULT IS UNCHANGED. Without the opt-in, a token with no `exp` is still refused --
+    // this is the assertion that makes the knob a relaxation somebody chose rather than a
+    // weakening of every policy in the tree.
+    assert_eq!(
+        verify(&no_exp, &base(), &common::now_clock())
+            .map(|_| ())
+            .map_err(|e| e.reason()),
+        Err(RejectReason::ClaimMissing),
+        "a missing exp must still reject by default"
+    );
+
+    // With the opt-in it verifies.
+    assert!(
+        verify(
+            &no_exp,
+            &base().allow_absent_exp(true),
+            &common::now_clock()
+        )
+        .is_ok(),
+        "allow_absent_exp must accept a token that omits exp"
+    );
+
+    // PRESENCE ONLY. An `exp` that IS present is still enforced against the clock, so this
+    // cannot be used to accept a stale access token that happens to carry one.
+    let expired = token(
+        &signer,
+        &common::claims_with(
+            common::ISS,
+            r#""client-abc""#,
+            NOW_I - 100_000,
+            NOW_I - 200_000,
+            NOW_I - 200_000,
+        ),
+    );
+    assert_eq!(
+        verify(
+            &expired,
+            &base().allow_absent_exp(true),
+            &common::now_clock()
+        )
+        .map(|_| ())
+        .map_err(|e| e.reason()),
+        Err(RejectReason::Expired),
+        "allow_absent_exp must not waive a PRESENT exp"
+    );
+
+    // And it relaxes exp alone: a wrong issuer is still rejected.
+    let wrong_iss = token(
+        &signer,
+        &format!(
+            r#"{{"iss":"https://evil.example","aud":"{}","nbf":{},"iat":{}}}"#,
+            common::AUD,
+            NOW_I - 60,
+            NOW_I - 60
+        ),
+    );
+    assert_eq!(
+        verify(
+            &wrong_iss,
+            &base().allow_absent_exp(true),
+            &common::now_clock()
+        )
+        .map(|_| ())
+        .map_err(|e| e.reason()),
+        Err(RejectReason::IssuerMismatch),
+        "allow_absent_exp relaxes exp presence and nothing else"
+    );
+}
+
+/// `allow_absent_exp` relaxes the PRESENCE of `exp` and nothing that runs after it.
+///
+/// Its own test rather than more lines on the one above, which sits against the crate's
+/// hundred-line clippy ceiling. What it adds is the direction that was untested: `iss` and
+/// `aud` are checked BEFORE the expiry, so a policy that had skipped the whole claim stage
+/// would still have failed them. `nbf` runs after, so this is the assertion that separates
+/// "relaxes exp presence" from "skips what follows it".
+#[test]
+fn allow_absent_exp_leaves_every_neighbouring_check_enforced() {
+    let signer = common::Ed25519Signer::new();
+    let key = TrustedKey::ed25519(None, signer.public_key()).expect("valid key");
+    let relaxed = || {
+        VerificationPolicy::new(
+            vec![JwsAlgorithm::EdDsa],
+            vec![key.clone()],
+            common::ISS,
+            common::AUD,
+            common::TYP_NOT_UNDER_TEST,
+        )
+        .expect("valid policy")
+        .with_skew(Duration::from_secs(60))
+        .allow_absent_exp(true)
+    };
+
+    let not_yet = token(
+        &signer,
+        &format!(
+            r#"{{"iss":"{}","aud":"{}","nbf":{},"iat":{}}}"#,
+            common::ISS,
+            common::AUD,
+            NOW_I + 100_000,
+            NOW_I - 60
+        ),
+    );
+    assert_eq!(
+        verify(&not_yet, &relaxed(), &common::now_clock())
+            .map(|_| ())
+            .map_err(|e| e.reason()),
+        Err(RejectReason::NotYetValid),
+        "nbf runs after exp and must still be enforced"
+    );
+
+    let wrong_iss = token(
+        &signer,
+        &format!(
+            r#"{{"iss":"https://evil.example","aud":"{}","nbf":{},"iat":{}}}"#,
+            common::AUD,
+            NOW_I - 60,
+            NOW_I - 60
+        ),
+    );
+    assert_eq!(
+        verify(&wrong_iss, &relaxed(), &common::now_clock())
+            .map(|_| ())
+            .map_err(|e| e.reason()),
+        Err(RejectReason::IssuerMismatch),
+        "allow_absent_exp relaxes exp presence and nothing else"
+    );
+}
+
+#[test]
 fn allow_expired_accepts_a_past_exp_but_still_requires_every_other_check() {
     // RP-Initiated Logout's id_token_hint is a PAST id token accepted ONLY to target
     // a session. allow_expired waives the "now > exp" rejection and nothing else.

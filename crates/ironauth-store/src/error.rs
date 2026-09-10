@@ -85,12 +85,17 @@ pub enum StoreError {
     ///
     /// The caller reconciles: read current state directly, then resume from a fresh cursor.
     RetentionGap,
-    /// A dynamic client registration would exceed the environment's configured
-    /// registered-client quota (issue #31). Enforced atomically inside the
-    /// registration transaction (under a per-scope advisory lock, so a concurrent
-    /// pair of registrations cannot both slip past the cap), so nothing is written
-    /// when it fires. The registration endpoint maps it to a typed refusal and a
-    /// `dcr.quota_hit` audit event.
+    /// A write would exceed a configured per-scope ceiling. Enforced ATOMICALLY inside the
+    /// same transaction as the write, so nothing is written when it fires and a concurrent
+    /// pair cannot both slip past the cap.
+    ///
+    /// Two callers today:
+    ///
+    /// - dynamic client registration against the environment's registered-client quota
+    ///   (issue #31), under a per-scope advisory lock; the endpoint maps it to a typed refusal
+    ///   and a `dcr.quota_hit` audit event;
+    /// - a Shared Signals stream against the receiver's `max_streams_per_client` (issue #143),
+    ///   where the count is a conjunct of the INSERT.
     QuotaExceeded,
     /// An envelope-encryption operation failed (issue #48): a wrapped key or a
     /// sealed payload could not be authenticated and decrypted. This is

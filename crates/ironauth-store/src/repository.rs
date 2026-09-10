@@ -82089,7 +82089,13 @@ impl ActingSsfStreamRepo<'_> {
     /// [`StoreError::NotFound`] if the handle or the client is out of scope;
     /// [`StoreError::Conflict`] if the handle is already used;
     /// [`StoreError::Database`] on a persistence failure.
-    pub async fn create(&self, env: &Env, stream: NewSsfStream<'_>) -> Result<(), StoreError> {
+    pub async fn create(
+        &self,
+        env: &Env,
+        stream: NewSsfStream<'_>,
+        ceiling: u32,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if stream.id.scope() != self.scope || stream.client_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -82130,12 +82136,20 @@ impl ActingSsfStreamRepo<'_> {
                 target: &id,
             },
             async move |tx| {
-                sqlx::query(
+                // THE CEILING IS A CONJUNCT OF THE INSERT, not a count the caller took first.
+                // A read-then-write across two transactions lets N concurrent creates all see
+                // the same under-limit count and all commit, so a receiver could exceed the
+                // bound by exactly the number of requests it sent at once. Here the count is
+                // evaluated inside the same statement, so the losers insert no row.
+                let inserted = sqlx::query(
                     "INSERT INTO ssf_streams \
                      (id, tenant_id, environment_id, client_id, delivery_method, \
                       push_endpoint_url, push_secret_name, events_requested, events_delivered, \
                       subject_format, audience, description) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                     SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12 \
+                     WHERE (SELECT count(*) FROM ssf_streams \
+                            WHERE tenant_id = $2 AND environment_id = $3 AND client_id = $4) \
+                           < $13",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -82149,16 +82163,24 @@ impl ActingSsfStreamRepo<'_> {
                 .bind(subject_format)
                 .bind(&audience)
                 .bind(&description)
+                .bind(i64::from(ceiling))
                 .execute(&mut **tx)
                 .await
-                .map(|_| ())
                 .map_err(|error| {
                     if is_unique_violation(&error) {
                         StoreError::Conflict
                     } else {
                         StoreError::Database(error)
                     }
-                })
+                })?;
+                if inserted.rows_affected() == 0 {
+                    // The `WHERE` matched nothing, which for this statement means the receiver
+                    // is already at its ceiling. Distinct from `Conflict`, which is a handle
+                    // collision, so the surface can answer each one for what it is.
+                    return Err(StoreError::QuotaExceeded);
+                }
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
             },
             false,
             Some(&detail),

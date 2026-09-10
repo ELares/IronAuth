@@ -94,7 +94,13 @@ pub(crate) fn parse_and_enforce(
 
     let skew = i64::try_from(policy.max_skew.as_secs()).unwrap_or(i64::MAX);
 
-    let expiration = enforce_exp(&raw, now_secs, skew, policy.allow_expired)?;
+    let expiration = enforce_exp(
+        &raw,
+        now_secs,
+        skew,
+        policy.allow_expired,
+        policy.allow_absent_exp,
+    )?;
     let not_before = enforce_nbf(&raw, now_secs, skew)?;
     let issued_at = enforce_iat(&raw, now_secs, skew, policy.require_iat)?;
 
@@ -216,12 +222,21 @@ fn enforce_exp(
     now_secs: i64,
     skew: i64,
     allow_expired: bool,
+    allow_absent_exp: bool,
 ) -> Result<Option<i64>, RejectReason> {
     match raw.get("exp") {
-        // exp is required regardless: a token without an expiry is refused even when
-        // allow_expired is set, so the relaxation admits only a well-formed PAST exp,
-        // never a token that simply omits one.
-        None | Some(Value::Null) => Err(RejectReason::ClaimMissing),
+        // exp is required unless the caller opted into its ABSENCE, which is a different
+        // relaxation from `allow_expired`: that one still requires the claim and admits only a
+        // well-formed PAST value. Only the RFC 8417 SET profile sets this, because a SET reports
+        // a past event and is spec'd to carry no expiry at all. With it off, a token that simply
+        // omits `exp` is refused exactly as before -- including when `allow_expired` is on.
+        None | Some(Value::Null) => {
+            if allow_absent_exp {
+                Ok(None)
+            } else {
+                Err(RejectReason::ClaimMissing)
+            }
+        }
         Some(value) => {
             let exp = numeric_date(value)?;
             // Rejected once now has passed exp plus the tolerated skew, UNLESS the
