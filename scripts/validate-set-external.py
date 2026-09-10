@@ -14,10 +14,17 @@ written by the minting side in the same run: a validator holding its own copy of
 issuer would keep passing after the issuer stopped matching.
 
 NEGATIVE CONTROLS ARE THE OTHER HALF, and the reason is that a validator misconfigured into
-accepting anything reports the same "all valid" a working one does. Four mutations are applied to
-every token and every one MUST be rejected: a flipped signature byte, another case's key, a
-declared algorithm that is not the one it was signed with, and a wrong audience. A corpus that
-passes the positive check while any negative control also passes is a FAILURE, not a pass.
+accepting anything reports the same "all valid" a working one does. Every mutation below is
+applied to every token and every one MUST be rejected; a corpus that passes the positive check
+while any control is ACCEPTED is a failure, not a pass. The count is derived from CONTROLS rather
+than written out, because two files stating a number the code computes is how one of them goes
+stale.
+
+THE WRONG-KEY CONTROL USES A DECOY OF THE SAME ALGORITHM, which is the difference between a
+control and a formality. Offering an EdDSA token an ES256 key is refused by PyJWT's key-type
+check before any signature math runs, so those cross-case controls -- kept, because they do catch
+a validator with verification switched off -- cannot tell you the signature is checked. The decoy
+can, and its rejection must be an InvalidSignatureError specifically rather than any exception.
 """
 
 import base64
@@ -35,9 +42,21 @@ except ImportError:  # pragma: no cover - the gate provisions this
         "    python3 -m pip install --require-hashes -r deploy/conformance/requirements-set.txt"
     )
 
-# The corpus covers the algorithms `DayOneSigningKeys` provisions. A run finding fewer than this
-# has a corpus that did not write, which must not read as "everything validated".
-EXPECTED_CASES = {"eddsa", "es256", "rs256"}
+# The corpus covers the algorithms `DayOneSigningKeys` provisions, and each directory is bound to
+# the algorithm it is named for.
+#
+# A BARE SET OF NAMES WAS NOT ENOUGH. It matched on directory names alone, so a corpus of three
+# EdDSA tokens in directories named eddsa, es256 and rs256 passed the whole lane while the summary
+# printed "3 algorithms validated" -- measured by a reviewer, not hypothesised. The value is the
+# `alg` the token in that directory must declare, so the matrix cannot degrade into one algorithm
+# repeated three times.
+EXPECTED_CASES = {"eddsa": "EdDSA", "es256": "ES256", "rs256": "RS256"}
+
+# The controls every token gets regardless of how many cases there are: a flipped signature bit,
+# a declared algorithm it was not signed with, a wrong audience, a wrong issuer, and a decoy key
+# of its own algorithm. The cross-case key controls are counted separately, since there is one
+# per OTHER case.
+CONTROLS_PER_TOKEN = 5
 
 
 def b64url_decode(segment: str) -> bytes:
@@ -71,12 +90,24 @@ def decode(token: str, key, alg: str, audience: str, issuer: str) -> dict:
     )
 
 
-def rejects(label: str, control: str, thunk) -> list[str]:
-    """Run a negative control. It must raise; returning normally is a failure."""
+def rejects(label: str, control: str, thunk, expect=Exception) -> list[str]:
+    """Run a negative control. It must raise `expect`; anything else is a failure.
+
+    THE EXCEPTION TYPE IS PART OF THE CONTROL where it can be. A helper that accepted any
+    exception would count a TypeError raised before verification began as proof that verification
+    rejects the mutation, which is the difference between a control and a formality. `expect`
+    stays broad for the mutations that legitimately fail several ways and is narrowed to
+    InvalidSignatureError for the decoy, where the whole point is WHICH check fired.
+    """
     try:
         thunk()
-    except Exception:  # noqa: BLE001 - any rejection is the pass condition
+    except expect:
         return []
+    except Exception as error:  # noqa: BLE001 - rejected, but not for the reason claimed
+        return [
+            f"{label}: the {control} control was rejected by {type(error).__name__}, "
+            f"not {expect.__name__}; it does not test what it claims to"
+        ]
     return [f"{label}: the {control} control was ACCEPTED; this validator proves nothing"]
 
 
@@ -87,6 +118,15 @@ def check_case(case: pathlib.Path, others: dict) -> list[str]:
     token = (case / "set.jwt").read_text().strip()
     jwks_text = (case / "jwks.json").read_text()
     expect = json.loads((case / "expect.json").read_text())
+
+    # THE DIRECTORY NAME IS A CLAIM ABOUT THE ALGORITHM, and this is where it is checked. Without
+    # it `expect.json` and the token agree with each other while both disagree with the matrix the
+    # lane reports.
+    if expect["alg"] != EXPECTED_CASES[label]:
+        failures.append(
+            f"{label}: the corpus case declares alg {expect['alg']!r}, but a case in this "
+            f"directory must be {EXPECTED_CASES[label]!r}"
+        )
 
     header = json.loads(b64url_decode(token.split(".")[0]))
     if header.get("typ") != expect["typ"]:
@@ -143,11 +183,21 @@ def check_case(case: pathlib.Path, others: dict) -> list[str]:
     # The negative controls. Each varies EXACTLY ONE thing from the call that just succeeded, so a
     # rejection names the mutation that caused it.
     head, payload, signature = token.split(".")
-    # A DECODED BYTE, not a base64url character. Substituting the last character was the first
-    # version and it FAILED THIS CONTROL for RS256: a 256-byte signature ends in a one-byte
-    # group, whose final character carries four bits the decoder discards, so 'B' and 'C' decode
-    # to the same byte and the "tampered" token was the original. Flipping a bit of the first
-    # signature byte and re-encoding changes the signature for every algorithm and length.
+    # A DECODED BYTE, not a base64url character, and the reason is worth stating correctly
+    # because the first attempt to state it was misleading.
+    #
+    # Substituting the LAST CHARACTER was the first version, and it was accepted for RS256 on the
+    # run that caught it. The note then blamed the 256-byte RSA signature, which is wrong: every
+    # signature here is 1 mod 3 bytes long (EdDSA and ES256 are 64, RSA is 256), so all three end
+    # in a one-byte group whose final character carries four bits the decoder discards. Which
+    # algorithm trips is a COIN FLIP, about one run in four per algorithm: the substitution is a
+    # no-op exactly when the original last character and its replacement agree in their top two
+    # bits, and the signature changes every run because `iat` does. On the run in question the
+    # RSA signature happened to end in 'A' and the replacement was 'B' -- 0 and 1, both with top
+    # two bits 00 -- while EdDSA and ES256 happened to end in 'g' and 'w' and escaped.
+    #
+    # Flipping a bit of the first signature byte and re-encoding changes the signature every
+    # time, for every algorithm and every length.
     raw = bytearray(b64url_decode(signature))
     raw[0] ^= 0x01
     tampered = base64.urlsafe_b64encode(bytes(raw)).rstrip(b"=").decode("ascii")
@@ -185,6 +235,32 @@ def check_case(case: pathlib.Path, others: dict) -> list[str]:
         lambda: decode(
             token, key, expect["alg"], "https://receiver.example/somebody-else", expect["iss"]
         ),
+        expect=jwt.InvalidAudienceError,
+    )
+    # THE ISSUER, which had no control at all. Every other control handed the decoder the correct
+    # `iss`, so deleting `issuer=` from the decode call left the lane printing "clean" -- and the
+    # issuer is what ties a SET to the environment whose keys signed it.
+    failures += rejects(
+        label,
+        "wrong-issuer",
+        lambda: decode(
+            token, key, expect["alg"], expect["aud"], "https://issuer.example/t/nobody/e/nowhere"
+        ),
+        expect=jwt.InvalidIssuerError,
+    )
+    # THE DECOY: a key of the SAME algorithm that signed nothing, so PyJWT reaches the signature
+    # and fails THERE. The cross-case controls above cannot get that far.
+    decoy_text = (case / "decoy_jwks.json").read_text()
+    decoy_kid = json.loads(decoy_text)["keys"][0]["kid"]
+    try:
+        decoy = key_for(decoy_text, decoy_kid)
+    except AssertionError as error:
+        return failures + [f"{label}: the decoy key set is unusable: {error}"]
+    failures += rejects(
+        label,
+        "same-algorithm-decoy-key",
+        lambda: decode(token, decoy, expect["alg"], expect["aud"], expect["iss"]),
+        expect=jwt.InvalidSignatureError,
     )
     return failures
 
@@ -198,9 +274,9 @@ def main() -> int:
 
     cases = sorted(p for p in root.iterdir() if p.is_dir())
     found = {p.name for p in cases}
-    if found != EXPECTED_CASES:
-        missing = sorted(EXPECTED_CASES - found)
-        extra = sorted(found - EXPECTED_CASES)
+    if found != set(EXPECTED_CASES):
+        missing = sorted(set(EXPECTED_CASES) - found)
+        extra = sorted(found - set(EXPECTED_CASES))
         print(
             f"validate-set-external: the corpus covers {sorted(found)}, expected "
             f"{sorted(EXPECTED_CASES)} (missing {missing}, unexpected {extra}).\n"
@@ -229,11 +305,14 @@ def main() -> int:
             print(f"  {failure}", file=sys.stderr)
         return 1
 
-    controls = 3 + len(cases) - 1
+    # COUNTED FROM THE CORPUS, not from the directory count. `len(cases)` is unconditionally
+    # three by the time this line runs -- the name check above returns 1 on any other value -- so
+    # printing it as an algorithm count was a constant wearing the grammar of a measurement.
+    algorithms = sorted({json.loads((case / "expect.json").read_text())["alg"] for case in cases})
     print(
-        f"validate-set-external: clean ({len(cases)} algorithms validated by PyJWT "
-        f"{jwt.__version__} against the published JWKS; {controls} negative controls "
-        "rejected per algorithm)"
+        f"validate-set-external: clean ({len(algorithms)} algorithms validated by PyJWT "
+        f"{jwt.__version__} against the published JWKS: {', '.join(algorithms)}; "
+        f"{CONTROLS_PER_TOKEN + len(cases) - 1} negative controls rejected per token)"
     )
     return 0
 
