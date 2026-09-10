@@ -1391,10 +1391,11 @@ pub async fn verification(
 
 /// Make the verification SET durable by the method its stream negotiated.
 ///
-/// THE TWO METHODS STORE DIFFERENT THINGS, which is why this is a match rather than one call.
-/// Poll stores the SIGNED TOKEN, because RFC 8936 redelivers an unacknowledged SET and a
-/// receiver comparing two deliveries must see the same bytes; push stores the INGREDIENTS on the
-/// outbox, which is the shape `enqueue_push` already had.
+/// BOTH METHODS STORE THE SIGNED TOKEN, and this is a match because they store it in
+/// different PLACES: poll writes it into `ssf_stream_sets`, sealed under the environment DEK,
+/// and push onto the transactional outbox. Push used to store the INGREDIENTS and re-mint on
+/// every attempt; issue #1200 settled that the other way, so a redelivery is byte-identical
+/// whichever method carries it.
 ///
 /// The `Err` arm is a response rather than an error type because every failure here has exactly
 /// one right answer and the caller would only re-derive it.
@@ -1442,6 +1443,7 @@ async fn deliver_verification(
         }
         SsfDelivery::Push { .. } => crate::ssf_push::enqueue_push(
             state.store(),
+            state.issuers(),
             state.env(),
             scope,
             &crate::ssf_push::QueuedPush {
@@ -1449,10 +1451,16 @@ async fn deliver_verification(
                 jti,
                 subject,
                 event,
+                audience: &stream.audience,
             },
         )
         .await
-        .map_err(|error| queue_refusal(&error)),
+        .map_err(|error| match error {
+            // A QUEUE THAT IS FULL IS THE RECEIVER'S DOING; anything else here is ours,
+            // including an environment that cannot sign.
+            crate::ssf_push::PushEnqueueError::Store(error) => queue_refusal(&error),
+            crate::ssf_push::PushEnqueueError::Mint(_) => server_error(),
+        }),
     }
 }
 

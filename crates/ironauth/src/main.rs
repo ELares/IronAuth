@@ -501,7 +501,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // so a deployment that sets it and nothing else must drain what that surface accepts.
         // BOUND so the shutdown below can await it.
         let ssf_push_pools = match ssf_push_inputs {
-            Some(inputs) => spawn_ssf_push_pools(inputs, server.base_url()).await,
+            Some(inputs) => spawn_ssf_push_pools(inputs).await,
             None => Vec::new(),
         };
         // The message delivery worker (issue #111), behind its own switch for the reason every
@@ -2500,9 +2500,10 @@ struct SsfPushInputs {
     ssf: ironauth_config::SsfConfig,
     /// The shared `[outbox]` tuning its pool is built from.
     outbox: OutboxConfig,
-    /// The OIDC settings, for the issuer registry that SIGNS each SET.
+    /// The OIDC settings. Only the outbound request timeout is read now: the registry that
+    /// signs a SET lives on the request path, not here (issue #1200).
     oidc: OidcConfig,
-    /// The data-plane DSN the worker drains, reads streams on, and signs through.
+    /// The data-plane DSN the worker drains and reads streams on.
     data_plane_dsn: String,
     /// The control-plane DSN it enumerates scopes on.
     control_dsn: Option<String>,
@@ -4574,7 +4575,7 @@ async fn spawn_webhook_delivery_pools(inputs: WebhookDeliveryInputs) -> Vec<Outb
 ///
 /// Every early return is logged and starts NOTHING. The queue is durable, so a SET enqueued
 /// while no worker runs is delivered whenever one starts.
-async fn spawn_ssf_push_pools(inputs: SsfPushInputs, issuer_base: String) -> Vec<OutboxWorkerPool> {
+async fn spawn_ssf_push_pools(inputs: SsfPushInputs) -> Vec<OutboxWorkerPool> {
     let SsfPushInputs {
         ssf,
         outbox,
@@ -4622,13 +4623,12 @@ async fn spawn_ssf_push_pools(inputs: SsfPushInputs, issuer_base: String) -> Vec
         }
     };
 
-    // THE SAME STORE-BACKED REGISTRY the mint, the JWKS and discovery read (issue #194), so a
-    // SET is signed by the key the environment publishes and never by a divergent one.
-    let registry = Arc::new(IssuerRegistry::store_backed(
-        issuer_base,
-        JwksCacheWindow::clamped(oidc.jwks_cache_max_age_secs),
-        data_store.clone(),
-    ));
+    // NO ISSUER REGISTRY HERE ANY MORE (issue #1200). The worker used to hold one because it
+    // minted the SET on every delivery attempt; the token is minted once, at enqueue, on the
+    // request path that already has the registry it needs. A worker that cannot sign cannot
+    // re-sign, which is the property the fix is about, and dropping the ISSUER BASE from this
+    // function's signature is how that shows up at the call site: there is nothing left here
+    // that needs to know what this deployment's issuer is called.
     let timeout = std::time::Duration::from_secs(oidc.backchannel_logout_request_timeout_secs);
     let sender = match FetchSsfPushSender::with_timeout(timeout) {
         Ok(sender) => sender,
@@ -4641,7 +4641,6 @@ async fn spawn_ssf_push_pools(inputs: SsfPushInputs, issuer_base: String) -> Vec
     let mut consumers = ConsumerRegistry::new();
     if let Err(error) = consumers.register(Arc::new(SsfPushConsumer::new(
         data_store.clone(),
-        registry,
         master,
         sender,
     )) as Arc<dyn OutboxConsumer>)

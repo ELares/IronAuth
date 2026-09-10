@@ -328,12 +328,25 @@ async fn a_push_receivers_verification_is_enqueued_for_the_push_worker() {
         1,
         "the push stream's verification was not enqueued for delivery"
     );
-    assert_eq!(
-        claimed[0].payload[ironauth_oidc::ssf_push::PAYLOAD_EVENT_TYPE],
-        serde_json::json!(VERIFICATION_EVENT_TYPE)
+    // THE QUEUED MESSAGE CARRIES THE SIGNED TOKEN, not ingredients to re-mint one (issue
+    // #1200), so what this reads is the SET itself. Decoding it here rather than trusting a
+    // separate `sub_id` member is also stricter: the member could agree with the request while
+    // the token disagreed with both.
+    let set = claimed[0].payload[ironauth_oidc::ssf_push::PAYLOAD_SET]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "the queued message carries no SET: {:?}",
+                claimed[0].payload
+            )
+        });
+    let claims = claims_of(set);
+    assert!(
+        !claims["events"][VERIFICATION_EVENT_TYPE].is_null(),
+        "the queued SET is not keyed by the verification event type: {claims}"
     );
     assert_eq!(
-        claimed[0].payload[ironauth_oidc::ssf_push::PAYLOAD_SUB_ID],
+        claims["sub_id"],
         serde_json::json!({ "format": "opaque", "id": id.to_string() })
     );
     assert!(

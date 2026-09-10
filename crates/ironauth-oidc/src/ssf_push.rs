@@ -8,26 +8,33 @@
 //! is specific to SSF: which stream a message names, how its SET is minted, and what a
 //! receiver's answer means.
 //!
-//! # The `jti` is minted once, by the producer
+//! # The whole SET is minted once, by the producer
 //!
 //! RFC 8417 requires a `jti` and receivers dedup on it, so a redelivery MUST carry the same
-//! one. It therefore travels on the message's immutable payload and the SET is minted around
-//! it at each attempt, which is the shape `backchannel` records for its Logout Token: minting
-//! here would give every retry a fresh id and turn one event into N events in the receiver's
-//! log. That is also what makes at-least-once delivery safe to expose to a receiver -- the
-//! duplicate is detectable BY the receiver, which is the only place it can be.
+//! one. The TOKEN is byte-identical across attempts too, which is a stronger claim and the one
+//! issue #1200 settled: a receiver that caches by `jti` and compares what it was sent would
+//! otherwise see two tokens claiming to be one event, with a restamped `iat` and, for any
+//! algorithm that is not deterministic, a different signature.
 //!
-//! The TOKEN is not byte-identical across attempts, and the claim is not that it is: `iat` is
-//! stamped at each mint, so the JWS differs. What is stable is the `jti`, which is the handle a
-//! receiver dedups on, and that is the whole of what at-least-once requires.
+//! An earlier version of this file minted inside the consumer and said here, in as many words,
+//! that byte-identity "is not the claim". Migration 0217 had already argued the opposite for
+//! poll delivery, and there was no reason for the two delivery methods to disagree about what
+//! a redelivery is.
 //!
-//! # The stream is re-read at delivery, not carried
+//! # What travels, and what is re-read at delivery
 //!
-//! Only the `stream_id` travels. The endpoint, the audience, the credential name and the
-//! status are read from the row at each attempt, so a receiver that re-points its endpoint
-//! while a message is queued is delivered to at the NEW address, and one that deletes its
-//! stream stops being delivered to at all. Carrying them would have pinned a snapshot taken
-//! before the outage that caused the retry.
+//! THE SIGNED TOKEN TRAVELS, on the message's immutable payload, along with the `stream_id`
+//! that routes it. Everything the token ASSERTS is therefore fixed at enqueue: `iss`, `aud`,
+//! `iat`, the subject and the event body.
+//!
+//! THE DESTINATION IS NOT. The endpoint, the credential name and the status are read from the
+//! stream row at each attempt, so a receiver that re-points its endpoint while a message is
+//! queued is delivered to at the NEW address, one that pauses stops being delivered to for the
+//! duration, and one that deletes its stream stops entirely.
+//!
+//! The split is deliberate: WHERE a SET goes is the receiver's to change while it waits, and
+//! WHAT it says is not. `aud` sits on the token side because SSF makes it transmitter-supplied
+//! and no configuration update can change it.
 //!
 //! # What a receiver's answer means
 //!
@@ -59,12 +66,16 @@ use crate::ssf_set::{MintError, SecurityEvent, SetToMint, SubjectIdentifier, min
 pub const PAYLOAD_STREAM_ID: &str = "stream_id";
 /// The payload key carrying the SET's dedup handle.
 pub const PAYLOAD_JTI: &str = "jti";
-/// The payload key carrying the RFC 9493 subject identifier, already rendered.
-pub const PAYLOAD_SUB_ID: &str = "sub_id";
-/// The payload key carrying the event type URI.
-pub const PAYLOAD_EVENT_TYPE: &str = "event_type";
-/// The payload key carrying the event's own members.
-pub const PAYLOAD_EVENT: &str = "event";
+/// The payload key carrying the SIGNED token, minted once at enqueue.
+///
+/// THE TOKEN AND NOT THE INGREDIENTS, which is a change from the first version and the point
+/// of issue #1200. The consumer used to mint on every attempt, so a retry re-sent a DIFFERENT
+/// token under the same `jti`: a fresh `iat`, and a fresh signature for any algorithm that is
+/// not deterministic. 0217 argues the opposite for poll delivery in as many words -- "a
+/// receiver comparing two deliveries of one event must see the same token: re-minting would
+/// restamp `iat` and change the JWS while the `jti` stayed put, which is a difference a
+/// receiver cannot explain" -- and there was no reason for push to disagree.
+pub const PAYLOAD_SET: &str = "set";
 
 /// Queue one SET for one push stream.
 ///
@@ -84,17 +95,46 @@ pub const PAYLOAD_EVENT: &str = "event";
 /// make a redelivery of one event to one receiver a no-op, which is what
 /// [`OutboxRepo::enqueue_once`] answers `false` for.
 ///
+/// # The token is minted HERE, once
+///
+/// Every retry then re-POSTs the same bytes, which is what a receiver deduplicating by `jti`
+/// and comparing what it was sent requires. It also means a key rotation between the first
+/// attempt and a later one cannot re-sign a SET the receiver already half-processed: the
+/// retired key stays in the published JWKS for its retention window, so the original token
+/// keeps verifying.
+///
+/// WHAT THIS DOES NOT CHANGE is where the SET goes. The consumer still RE-READS the stream on
+/// every attempt, so a receiver that re-points its endpoint during an outage is delivered to
+/// at the new address; only the token itself is fixed.
+///
 /// # Errors
 ///
-/// Whatever the outbox enqueue returns.
+/// [`PushEnqueueError::Mint`] if the environment cannot sign, and
+/// [`PushEnqueueError::Store`] for whatever the outbox enqueue returns.
 pub async fn enqueue_push(
     store: &Store,
+    issuers: &IssuerRegistry,
     env: &Env,
     scope: Scope,
     queued: &QueuedPush<'_>,
-) -> Result<bool, StoreError> {
+) -> Result<bool, PushEnqueueError> {
     let ordering = queued.stream_id.to_string();
     let idempotency = format!("{}:{}", queued.stream_id, queued.jti);
+    // THE AUDIENCE COMES FROM THE STREAM, read by the caller. It is transmitter-supplied and no
+    // update can change it, so freezing it here cannot go stale.
+    let set = mint_set(
+        issuers,
+        env,
+        scope,
+        &SetToMint {
+            audience: queued.audience,
+            jti: queued.jti,
+            subject: queued.subject,
+            event: queued.event,
+        },
+    )
+    .await
+    .map_err(PushEnqueueError::Mint)?;
     store
         .scoped(scope)
         .outbox()
@@ -104,17 +144,50 @@ pub async fn enqueue_push(
                 consumer: SSF_PUSH_CONSUMER,
                 idempotency_key: &idempotency,
                 ordering_key: &ordering,
+                // THE SUBJECT IS NO LONGER A SEPARATE MEMBER, and this is NOT a privacy
+                // improvement: `outbox_messages.payload` is plaintext jsonb, and the subject
+                // is still readable inside the token's base64url payload. It was one readable
+                // copy before and it is one readable copy now -- an earlier version of this
+                // comment claimed the count went from two to one, which was wrong, because
+                // the old payload carried the ingredients and no token.
+                //
+                // ROLLING UPGRADES: this changes a DURABLE wire format, and a consumer of
+                // either vintage permanently dead-letters the other's rows. That is safe only
+                // because nothing has shipped -- the repository has no release tag, and the
+                // SSF surface is off by default -- so no queued row of the old shape exists
+                // anywhere. Once a release carries this table, a change of this kind needs a
+                // release where the consumer reads both shapes before one where it writes the
+                // new one.
                 payload: serde_json::json!({
                     PAYLOAD_STREAM_ID: ordering,
                     PAYLOAD_JTI: queued.jti,
-                    PAYLOAD_SUB_ID: queued.subject.render(),
-                    PAYLOAD_EVENT_TYPE: queued.event.event_type,
-                    PAYLOAD_EVENT: serde_json::Value::Object(queued.event.payload.clone()),
+                    PAYLOAD_SET: set,
                 }),
             },
         )
         .await
+        .map_err(PushEnqueueError::Store)
 }
+
+/// Why a SET could not be queued for push delivery.
+#[derive(Debug)]
+pub enum PushEnqueueError {
+    /// The environment could not sign it.
+    Mint(MintError),
+    /// The outbox refused the write.
+    Store(StoreError),
+}
+
+impl std::fmt::Display for PushEnqueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mint(_) => f.write_str("the security event token could not be signed"),
+            Self::Store(_) => f.write_str("the delivery queue refused the write"),
+        }
+    }
+}
+
+impl std::error::Error for PushEnqueueError {}
 
 /// One SET to queue for one stream.
 #[derive(Debug, Clone)]
@@ -127,6 +200,11 @@ pub struct QueuedPush<'a> {
     pub subject: &'a SubjectIdentifier,
     /// What happened.
     pub event: &'a SecurityEvent,
+    /// The `aud` its SET is minted for, from the stream.
+    ///
+    /// PASSED IN RATHER THAN READ HERE, because the caller has already resolved the stream to
+    /// decide it is a push stream at all, and a second read could see a different row.
+    pub audience: &'a [String],
 }
 
 /// What one push attempt produced.
@@ -255,9 +333,13 @@ impl SsfPushSender for FetchSsfPushSender {
 }
 
 /// The outbox consumer that pushes one queued SET.
+///
+/// NO ISSUER REGISTRY, since issue #1200. It held one while it minted the token on every
+/// attempt; the token is minted once at enqueue now, so a registry here would be a capability
+/// nothing exercises. Dropping it also makes the shape of the fix visible in the type: a
+/// consumer that cannot sign cannot re-sign.
 pub struct SsfPushConsumer<S> {
     store: Store,
-    issuers: Arc<IssuerRegistry>,
     /// Opens the receiver's bearer, when it asked for one. The stream row holds a NAME; the
     /// value is opened per attempt and lives only as long as the POST.
     master: Arc<MasterKey>,
@@ -265,18 +347,12 @@ pub struct SsfPushConsumer<S> {
 }
 
 impl<S: SsfPushSender> SsfPushConsumer<S> {
-    /// Build the consumer over a store, the per-environment issuer registry that signs SETs,
-    /// and one outbound seam.
+    /// Build the consumer over a store, the master key that opens a receiver's bearer, and one
+    /// outbound seam.
     #[must_use]
-    pub fn new(
-        store: Store,
-        issuers: Arc<IssuerRegistry>,
-        master: Arc<MasterKey>,
-        sender: S,
-    ) -> Self {
+    pub fn new(store: Store, master: Arc<MasterKey>, sender: S) -> Self {
         Self {
             store,
-            issuers,
             master,
             sender,
         }
@@ -285,24 +361,22 @@ impl<S: SsfPushSender> SsfPushConsumer<S> {
     /// Deliver ONE queued SET.
     async fn deliver_one(
         &self,
-        env: &Env,
+        // UNUSED SINCE THE TOKEN STOPPED BEING MINTED HERE (issue #1200), and kept because the
+        // `OutboxConsumer` seam hands one to every consumer and a signature that drops it
+        // would be the odd one out.
+        _env: &Env,
         scope: Scope,
         message: &OutboxMessage,
     ) -> Result<(), ConsumerError> {
         let stream_text = payload_str(message, PAYLOAD_STREAM_ID)?;
-        let jti = payload_str(message, PAYLOAD_JTI)?;
-        let event_type = payload_str(message, PAYLOAD_EVENT_TYPE)?;
-        let subject = message
-            .payload
-            .get(PAYLOAD_SUB_ID)
-            .and_then(SubjectIdentifier::from_rendered)
-            .ok_or_else(|| ConsumerError::permanent("payload_subject_unreadable"))?;
-        let event_body = message
-            .payload
-            .get(PAYLOAD_EVENT)
-            .and_then(serde_json::Value::as_object)
-            .cloned()
-            .unwrap_or_default();
+        // THE `jti` IS READ AND NOT USED for delivery, because the token already carries it.
+        // It stays a required member so a malformed message fails HERE, on its first claim,
+        // rather than at the receiver: the `jti` is what an operator correlates a delivery
+        // with, and a queued row without one is not a message this consumer can account for.
+        let _jti = payload_str(message, PAYLOAD_JTI)?;
+        // THE TOKEN AS IT WAS MINTED, not ingredients to re-mint one. Every attempt POSTs
+        // these same bytes; see `PAYLOAD_SET`.
+        let set = payload_str(message, PAYLOAD_SET)?;
 
         let id = SsfStreamId::parse_in_scope(&stream_text, &scope)
             .map_err(|_| ConsumerError::permanent("stream_id_malformed"))?;
@@ -355,28 +429,6 @@ impl<S: SsfPushSender> SsfPushConsumer<S> {
             // one is a producer bug, and delivering it anywhere would be worse than refusing.
             return Err(ConsumerError::permanent("stream_is_not_push"));
         };
-
-        let set = mint_set(
-            &self.issuers,
-            env,
-            scope,
-            &SetToMint {
-                audience: &stream.audience,
-                jti: &jti,
-                subject: &subject,
-                event: &SecurityEvent {
-                    event_type,
-                    payload: event_body,
-                },
-            },
-        )
-        .await
-        .map_err(|error| match error {
-            // NO KEY YET is a wait, not a rejection: an environment whose signing key has not
-            // loaded will have one.
-            MintError::NoSigningKey => ConsumerError::retryable("no_signing_key"),
-            MintError::Signing => ConsumerError::permanent("set_could_not_be_signed"),
-        })?;
 
         let bearer = match secret_name {
             None => None,

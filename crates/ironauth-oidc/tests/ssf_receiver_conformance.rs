@@ -91,6 +91,9 @@ struct Receiver {
     keys: Vec<TrustedKey>,
     seen: Arc<Mutex<Vec<String>>>,
     verdicts: Arc<Mutex<Vec<Verdict>>>,
+    /// The raw token of every delivery, in order. What `verdicts` cannot answer: two
+    /// deliveries can carry one `jti` and different BYTES.
+    tokens: Arc<Mutex<Vec<String>>>,
     /// How many more delivery attempts to refuse before accepting again.
     outage: Arc<Mutex<u32>>,
 }
@@ -141,12 +144,17 @@ impl Receiver {
             keys,
             seen: Arc::new(Mutex::new(Vec::new())),
             verdicts: Arc::new(Mutex::new(Vec::new())),
+            tokens: Arc::new(Mutex::new(Vec::new())),
             outage: Arc::new(Mutex::new(0)),
         }
     }
 
     /// Take delivery of one SET, exactly as a receiver would.
     fn accept(&self, set: &str) -> Verdict {
+        self.tokens
+            .lock()
+            .expect("not poisoned")
+            .push(set.to_owned());
         let verdict = self.judge(set);
         self.verdicts
             .lock()
@@ -215,6 +223,11 @@ impl Receiver {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Every token this receiver was handed, in order, byte for byte.
+    fn tokens(&self) -> Vec<String> {
+        self.tokens.lock().expect("not poisoned").clone()
     }
 
     /// Every `jti` this receiver was handed, in order, redeliveries included.
@@ -405,7 +418,6 @@ async fn drain_push(harness: &Harness, receiver: &Receiver, rounds: usize) -> us
     let scope = harness.scope();
     let consumer = SsfPushConsumer::new(
         harness.db().store().clone(),
-        harness.state().issuers().clone(),
         harness.db().master_key(),
         receiver.clone(),
     );
@@ -690,6 +702,15 @@ async fn a_receiver_outage_delays_delivery_and_loses_nothing() {
                  WHERE completed_at IS NULL AND dead_lettered_at IS NULL",
             )
             .await;
+        // THE CLOCK MOVES BETWEEN ATTEMPTS, and without this the byte-identity assertion below
+        // is VACUOUS. The harness clock is frozen at the epoch and this suite never advanced
+        // it, and the environment signs with Ed25519, which is deterministic: a consumer
+        // re-minting per attempt would therefore have stamped the same `iat` and produced the
+        // same bytes, so the assertion passed against the very defect it names. An hour is
+        // more than enough to move `iat`, which is stamped in whole seconds.
+        harness
+            .clock()
+            .advance(std::time::Duration::from_secs(3_600));
         attempts += drain_push(&harness, &receiver, 1).await;
     }
     assert_eq!(
@@ -719,6 +740,43 @@ async fn a_receiver_outage_delays_delivery_and_loses_nothing() {
         handled.windows(2).all(|pair| pair[0] == pair[1]),
         "the attempts carried different events, so the one queued before the outage was not \
          the one delivered after it: {handled:?}"
+    );
+
+    // AND BYTE FOR BYTE THE SAME TOKEN, which the `jti` comparison above cannot see (issue
+    // #1200). The consumer used to mint on every attempt, so a retry re-sent a DIFFERENT token
+    // under the same `jti`: a fresh `iat`, and a fresh signature for any algorithm that is not
+    // deterministic. A receiver that caches by `jti` and compares what it was sent -- which is
+    // the dedup strategy 0217 assumes for poll -- would see two tokens claiming to be one
+    // event and have no way to explain the difference.
+    //
+    // WHAT THIS ASSERTION CAN AND CANNOT DEMONSTRATE, stated because the first version of it
+    // was vacuous and the honest replacement is not a stronger proof but a smaller claim.
+    //
+    // It could not catch the original defect. The harness clock was frozen at the epoch and
+    // the environment signs with Ed25519, which is deterministic, so a consumer re-minting per
+    // attempt produced four IDENTICAL tokens: the assertion passed against exactly the code it
+    // was written to fail. The clock now advances an hour between attempts, which removes that
+    // specific reason for it to be vacuous.
+    //
+    // It still cannot be shown failing against the real defect, and the reason is the fix
+    // itself: `SsfPushConsumer` no longer holds an `IssuerRegistry`, so a consumer CANNOT
+    // re-mint. Reinstating the defect would mean re-adding the registry first. The property is
+    // therefore guarded by construction, and this assertion is the tripwire for a change that
+    // put a signer back within reach of the delivery path.
+    //
+    // A probe that appended a mint-time stamp to the token was tried and rejected as evidence:
+    // it changes the bytes but also breaks the signature, so both halves failed because the
+    // receiver refused them, not because they differed.
+    let tokens = receiver.tokens();
+    assert_eq!(tokens.len(), 4, "the receiver did not see four deliveries");
+    assert!(
+        tokens.windows(2).all(|pair| pair[0] == pair[1]),
+        "the retries re-signed the event instead of re-sending it: the four deliveries carry \
+         {} distinct tokens",
+        tokens
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
     );
     assert_eq!(
         receiver.accepted().len(),

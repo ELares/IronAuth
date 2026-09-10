@@ -135,6 +135,11 @@ async fn seed_stream(harness: &Harness, client: &ClientId, delivery: SsfDelivery
     id
 }
 
+/// The `aud` every stream here is created with, and therefore the one its SETs must name.
+fn audience() -> Vec<String> {
+    vec!["https://receiver.example.com".to_owned()]
+}
+
 fn push_stream() -> SsfDelivery {
     SsfDelivery::Push {
         endpoint_url: "https://receiver.example.com/events".to_owned(),
@@ -176,6 +181,7 @@ async fn queue_one(
     let scope = harness.scope();
     let queued = enqueue_push(
         store,
+        harness.state().issuers(),
         &env,
         scope,
         &QueuedPush {
@@ -183,6 +189,7 @@ async fn queue_one(
             jti,
             subject: &subject(),
             event: &event(),
+            audience: &audience(),
         },
     )
     .await
@@ -204,7 +211,6 @@ async fn queue_one(
 fn consumer<S: SsfPushSender>(harness: &Harness, sender: S) -> SsfPushConsumer<S> {
     SsfPushConsumer::new(
         harness.db().store().clone(),
-        Arc::clone(harness.state().issuers()),
         harness.db().master_key(),
         sender,
     )
@@ -453,13 +459,16 @@ async fn one_event_for_one_receiver_is_queued_once() {
         .0;
     let stream = seed_stream(&harness, &client, push_stream()).await;
     let store = harness.db().store().clone();
+    let registry = std::sync::Arc::clone(harness.state().issuers());
 
     let queued = |jti: &'static str| {
         let store = store.clone();
         let env = env.clone();
+        let issuers = std::sync::Arc::clone(&registry);
         async move {
             enqueue_push(
                 &store,
+                &issuers,
                 &env,
                 scope,
                 &QueuedPush {
@@ -467,6 +476,7 @@ async fn one_event_for_one_receiver_is_queued_once() {
                     jti,
                     subject: &subject(),
                     event: &event(),
+                    audience: &audience(),
                 },
             )
             .await
