@@ -535,20 +535,22 @@ async fn discovery_advertises_only_what_is_mounted() {
             .expect("status_endpoint")
             .ends_with("/ssf/status")
     );
-    // NOTHING THIS SLICE DOES NOT SERVE. SSF 1.0 also defines add-subject, remove-subject and
-    // verification endpoints; naming one here would tell a receiver to call a 404.
-    for absent in [
-        "add_subject_endpoint",
-        "remove_subject_endpoint",
-        "verification_endpoint",
-    ] {
+    // NOTHING THIS BUILD DOES NOT SERVE. SSF 1.0 also defines add-subject and remove-subject
+    // endpoints; naming one here would tell a receiver to call a 404. `verification_endpoint`
+    // left this list when the endpoint was mounted, which is the only way an entry may leave it.
+    for absent in ["add_subject_endpoint", "remove_subject_endpoint"] {
         assert!(
             doc.get(absent).is_none(),
             "discovery advertises {absent}, which is not mounted: {body}"
         );
     }
-    // AND NO EVENT TYPE, because nothing emits one yet.
-    assert_eq!(doc["events_supported"], serde_json::json!([]));
+    // AND EXACTLY THE EVENT TYPES THIS BUILD EMITS, which is now SSF's own verification event
+    // and still nothing from CAEP or RISC. Asserting emptiness was right while nothing produced
+    // a SET; asserting only non-emptiness would pass the day a type nothing emits was added.
+    assert_eq!(
+        doc["events_supported"],
+        serde_json::json!([ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE])
+    );
 
     // THE HOLD POLICY IS PUBLISHED, because the poll response cannot carry it. RFC 8936 makes
     // `returnImmediately: false` the default -- "hold the request open" -- and this transmitter

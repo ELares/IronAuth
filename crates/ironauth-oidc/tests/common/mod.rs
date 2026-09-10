@@ -1732,7 +1732,16 @@ impl Harness {
             max_streams_per_client,
             ..ironauth_config::SsfConfig::default()
         };
-        let state = self.state.clone().with_ssf(&ssf);
+        self.enable_ssf_with(&ssf);
+    }
+
+    /// Arm the Shared Signals surface with an explicit configuration.
+    ///
+    /// A TEST THAT MEASURES A LIMIT HAS TO SET IT. The rate-limit tests need an interval short
+    /// enough to wait out and an allowance small enough to exhaust; against the shipped default
+    /// of sixty seconds they would either take a minute or assert nothing.
+    pub fn enable_ssf_with(&mut self, ssf: &ironauth_config::SsfConfig) {
+        let state = self.state.clone().with_ssf(ssf);
         let issuer_state = IssuerState::new(Arc::clone(&self.registry), self.env.clone());
         let discovery_state = DiscoveryState::new(
             ISSUER_BASE,

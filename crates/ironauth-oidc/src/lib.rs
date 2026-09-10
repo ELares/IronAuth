@@ -1160,6 +1160,10 @@ pub fn oidc_router(state: OidcState) -> Router {
                 get(ssf::read_status).post(ssf::update_status),
             )
             .route(ssf::POLL_PATH, post(ssf::poll))
+            // SSF 1.0 section 7.1.4. Mounted with the rest of stream management rather than
+            // beside the delivery endpoints: it is a receiver asking the transmitter to do
+            // something, not a delivery channel.
+            .route(ssf::VERIFICATION_PATH, post(ssf::verification))
             .route(ssf::CONFIGURATION_PATH, get(ssf::configuration));
     }
 

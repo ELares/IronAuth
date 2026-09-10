@@ -82348,6 +82348,128 @@ impl SsfStreamRepo<'_> {
             .and_then(|row| ssf_stream_from_row(&row, self.scope))
     }
 
+    /// Take this stream's verification slot, or report that it is too soon.
+    ///
+    /// SSF 1.0 section 7.1.4 defines 429 as the answer to a receiver asking for a verification
+    /// event too often, and this is what makes that answer possible: `true` means the slot was
+    /// taken and the caller may mint, `false` means one interval has not passed.
+    ///
+    /// ATOMIC, and it has to be. A read-then-act would let a burst of concurrent requests all
+    /// see the same stale instant and all pass, which is exactly the shape a rate limit is
+    /// attacked with. The instant is compared and written in ONE statement, so the second
+    /// request in a burst matches no row.
+    ///
+    /// FENCED ON THE RECEIVER, like every other read here, though nothing depends on that: the
+    /// caller has already resolved the stream through [`Self::get_for_client`] and answered the
+    /// uniform not-found, so by the time this runs the receiver is known to own the row. The
+    /// conjunct is here so the statement cannot be reused somewhere that has not proved it.
+    ///
+    /// It is NOT a second not-found: the surface maps `false` to the 429, because the only way
+    /// to reach here with a stream the caller does not own is a code path that skipped the
+    /// fence, and answering that as "too soon" leaks less than answering it as "no such
+    /// stream".
+    ///
+    /// NOT AUDITED, unlike the status write. This records the instant of a rate-limit decision,
+    /// not a change to what the stream IS, and one audit row per verification request would be
+    /// the same traffic the interval exists to bound.
+    ///
+    /// SO A COMPLETED VERIFICATION LEAVES NO PERMANENT RECORD, which is worth stating rather
+    /// than glossing. An earlier version of this paragraph said the SET was the durable trail;
+    /// it is not, because 0217 makes DELETE the acknowledgement and the outbox message is
+    /// consumed on success, so both are gone once delivery works. What remains is this column,
+    /// which the next request overwrites. A verification is a liveness probe the receiver asked
+    /// for and got, not a security event about a subject, so nothing here needs to survive it;
+    /// an operator wanting a history of probes wants a different feature.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn claim_verification(
+        &self,
+        id: &SsfStreamId,
+        client_id: &ClientId,
+        min_interval_secs: u32,
+    ) -> Result<bool, StoreError> {
+        if id.scope() != self.scope || client_id.scope() != self.scope {
+            return Ok(false);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let updated = sqlx::query(
+            "UPDATE ssf_streams SET last_verification_at = now() \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 AND client_id = $4 \
+               AND (last_verification_at IS NULL \
+                    OR last_verification_at <= now() - ($5::text || ' seconds')::interval)",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(client_id.to_string())
+        .bind(i64::from(min_interval_secs).to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Spend one of this RECEIVER's verification requests for the current window.
+    ///
+    /// `true` means the request may proceed, `false` that the receiver has used its whole
+    /// allowance and must wait for the window to roll.
+    ///
+    /// THE COUNTER THE RECEIVER CANNOT RESET. [`Self::claim_verification`] spaces out requests
+    /// for ONE stream, and its column lives on a row the receiver deletes at will: measured in
+    /// review, `create -> verify -> delete -> create` mints signed SETs as fast as a client can
+    /// issue three requests, because a fresh stream's `last_verification_at` is NULL. This is
+    /// keyed on the CLIENT, whose row the receiver cannot delete, so it survives that churn.
+    ///
+    /// ATOMIC, in the strongest form available here: one `INSERT ... ON CONFLICT DO UPDATE ...
+    /// RETURNING` takes the row lock, so concurrent claims serialise instead of all reading the
+    /// same stale count.
+    ///
+    /// CLAMPED at one past the allowance, so a client hammering a closed window neither grows
+    /// the stored number without bound nor overflows the column, and the refusal stays a
+    /// refusal rather than becoming a longer and longer debt.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn claim_client_verification(
+        &self,
+        client_id: &ClientId,
+        window_secs: u32,
+        allowance: u32,
+    ) -> Result<bool, StoreError> {
+        if client_id.scope() != self.scope {
+            return Ok(false);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let spent: i32 = sqlx::query_scalar(
+            "INSERT INTO ssf_verification_budget \
+             (tenant_id, environment_id, client_id, window_started_at, spent) \
+             VALUES ($1, $2, $3, now(), 1) \
+             ON CONFLICT (tenant_id, environment_id, client_id) DO UPDATE SET \
+               window_started_at = CASE \
+                 WHEN ssf_verification_budget.window_started_at \
+                      <= now() - ($4::text || ' seconds')::interval \
+                 THEN now() ELSE ssf_verification_budget.window_started_at END, \
+               spent = CASE \
+                 WHEN ssf_verification_budget.window_started_at \
+                      <= now() - ($4::text || ' seconds')::interval \
+                 THEN 1 \
+                 ELSE LEAST(ssf_verification_budget.spent + 1, $5::integer + 1) END \
+             RETURNING spent",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id.to_string())
+        .bind(i64::from(window_secs).to_string())
+        .bind(i32::try_from(allowance).unwrap_or(i32::MAX - 1))
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(spent <= i32::try_from(allowance).unwrap_or(i32::MAX - 1))
+    }
+
     /// Every stream in the scope that would KEEP an event generated now, oldest first.
     ///
     /// This is the fan-out's read, and it is deliberately [`SsfStreamStatus::retains`] rather

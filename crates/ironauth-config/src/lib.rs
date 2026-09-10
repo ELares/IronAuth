@@ -972,6 +972,19 @@ pub struct SsfConfig {
     /// because dropping the oldest events silently is the failure the whole subsystem exists to
     /// prevent, and a refusal is visible to the producer and to an operator.
     pub max_owed_sets_per_stream: u32,
+
+    /// The shortest interval between two verification requests for one stream.
+    ///
+    /// SSF 1.0 section 7.1.4 lets a receiver ASK to be sent a verification event so it can prove
+    /// the delivery path works without waiting for a real signal. The request is one small POST
+    /// and the work is not: each one mints a signed SET and either queues a row a poll receiver
+    /// must collect or an outbox message a worker must deliver. The spec anticipates exactly
+    /// this, defining 429 as the answer and naming `min_verification_interval` as the floor a
+    /// transmitter advertises.
+    ///
+    /// It is ADVERTISED as well as enforced, in the SSF configuration document, so a receiver
+    /// can pace itself rather than discovering the limit by being refused.
+    pub min_verification_interval_secs: u32,
 }
 
 impl Default for SsfConfig {
@@ -985,6 +998,10 @@ impl Default for SsfConfig {
             // A receiver polling even once an hour drains far more than this per interval, so
             // reaching it means collection has stopped rather than fallen behind.
             max_owed_sets_per_stream: 1000,
+            // A minute. A receiver verifying its delivery path does so when it configures a
+            // stream and when it suspects a problem, not on a loop, so this is generous for
+            // every honest use and still bounds a broken client to sixty SETs an hour.
+            min_verification_interval_secs: 60,
         }
     }
 }
@@ -5984,6 +6001,14 @@ pub const SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS: u64 = 366 * 24 * 60 * 60;
 /// which is a deployment that looks enabled and works for nobody. If the intent is to serve no
 /// streams, `ssf.enabled = false` says so and answers 404.
 fn validate_ssf(ssf: &SsfConfig) -> Result<(), ConfigError> {
+    if ssf.enabled && ssf.min_verification_interval_secs == 0 {
+        return Err(ConfigError::Invalid {
+            message: "ssf.min_verification_interval_secs must be at least 1 when ssf.enabled is \
+                      true: zero lets one receiver mint an unbounded number of signed SETs, \
+                      which is the work the interval exists to bound"
+                .to_owned(),
+        });
+    }
     if ssf.enabled && ssf.max_owed_sets_per_stream == 0 {
         return Err(ConfigError::Invalid {
             message: "ssf.max_owed_sets_per_stream must be at least 1 when ssf.enabled is true: \
@@ -8371,6 +8396,14 @@ mod tests {
                     ..SsfConfig::default()
                 },
             ),
+            (
+                "no floor under the verification rate",
+                SsfConfig {
+                    enabled: true,
+                    min_verification_interval_secs: 0,
+                    ..SsfConfig::default()
+                },
+            ),
         ] {
             assert!(
                 validate_ssf(&ssf).is_err(),
@@ -8391,9 +8424,10 @@ mod tests {
                 enabled: true,
                 max_streams_per_client: 1,
                 max_owed_sets_per_stream: 1,
+                min_verification_interval_secs: 1,
             })
             .is_ok(),
-            "one stream owed one SET is a usable pair of ceilings"
+            "one stream owed one SET a second apart is a usable set of floors"
         );
     }
 
