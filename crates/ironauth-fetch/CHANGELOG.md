@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add the `SsfPush` `FetchPurpose` variant (issue #143): pushing a Security Event Token to a
+  Shared Signals receiver under RFC 8935. Its own label rather than `WebhookDelivery`'s, on
+  both axes this enum splits on. The URL is chosen by the RECEIVER through an OAuth-protected
+  stream-management call rather than by the tenant's operator, so a different party can point
+  it; and it carries a security event about a subject rather than a notification a tenant may
+  drop, so an outage budget that is unremarkable for a webhook is an unnoticed gap in a
+  customer's threat signal here. One metric series for both would hide that.
+
 - Add a PER-REQUEST timeout to `FetchRequest` (issue #112, PR A). `FetchLimits.total_timeout`
   is fixed on a `Fetcher` at construction, so a per-target deadline could not be expressed at
   all: a sync flow target that must trigger its failure policy rather than hang the signup it

@@ -194,6 +194,8 @@ mod sms_conversion;
 mod sms_otp;
 /// Shared Signals stream management and discovery (#143).
 pub mod ssf;
+/// RFC 8935 push delivery for Shared Signals streams (#143).
+pub mod ssf_push;
 /// Security Event Tokens: the RFC 8417 framing a Shared Signals transmitter mints (#143).
 pub mod ssf_set;
 mod state;

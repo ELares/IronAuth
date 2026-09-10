@@ -143,6 +143,17 @@ pub enum FetchPurpose {
     HookFetch,
     /// Delivering a webhook to a tenant-configured target.
     WebhookDelivery,
+    /// Pushing a Security Event Token to a Shared Signals receiver (RFC 8935, issue #143).
+    ///
+    /// Distinct from [`FetchPurpose::WebhookDelivery`] on both axes this enum splits on. WHO
+    /// CHOSE THE URL: a webhook endpoint is configured by the tenant's operator, while an SSF
+    /// push endpoint is supplied by the RECEIVER through an OAuth-protected stream-management
+    /// call -- a different party, reachable by a different credential. WHAT IT CARRIES: a
+    /// webhook is a notification a tenant may drop, while a SET reports a security event about
+    /// a subject, so an outage budget that is unremarkable for one is an unnoticed gap in a
+    /// customer's threat signal for the other. Collapsing the two would hide exactly that in
+    /// one metric series.
+    SsfPush,
     /// Handing one outbound MESSAGE to a generic HTTP email or SMS provider (issue #111).
     ///
     /// Distinct from [`FetchPurpose::WebhookDelivery`] for the same reason the others are:
@@ -264,6 +275,7 @@ impl FetchPurpose {
             FetchPurpose::ClientMetadata => "client_metadata",
             FetchPurpose::HookFetch => "hook_fetch",
             FetchPurpose::WebhookDelivery => "webhook_delivery",
+            FetchPurpose::SsfPush => "ssf_push",
             FetchPurpose::MessageDelivery => "message_delivery",
             FetchPurpose::LogStreamDelivery => "log_stream_delivery",
             FetchPurpose::FlowTarget => "flow_target",

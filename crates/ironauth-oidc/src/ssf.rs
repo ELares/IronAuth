@@ -56,6 +56,18 @@ use crate::ssf_set::EVENTS_SUPPORTED;
 use crate::state::OidcState;
 use crate::util::client_service_actor;
 
+/// The namespace a receiver's push credential must live in.
+///
+/// `delivery.authorization_secret_name` is supplied by the RECEIVER, and the delivery worker
+/// opens it and presents it as a Bearer to a URL the same receiver chose. Without a namespace
+/// that is a read primitive for every secret in the environment: a receiver could name the
+/// LDAP bind password or an outbound SCIM credential and have this deployment POST it to them.
+///
+/// The same shape `ldap_connectors::BIND_SECRET_PREFIX` uses, and enforced in the same two
+/// places for the same reason -- here at the door, and again at the READ, because a row written
+/// before this rule existed or imported by a config restore never passed the door.
+pub const PUSH_SECRET_PREFIX: &str = "ssf_push_";
+
 /// The delivery methods this deployment can actually perform.
 ///
 /// ONE list, read by both [`validate`] and [`configuration`]. It held both SSF methods while
@@ -209,6 +221,16 @@ fn validate(
                 return Err(Box::new(invalid_request(
                     "delivery.authorization_secret_name must be non-empty and at most 252 bytes",
                 )));
+            }
+            // THE NAMESPACE. See `PUSH_SECRET_PREFIX`: without it this field is a read
+            // primitive for every secret in the environment, delivered to an address the same
+            // receiver supplied.
+            if !name.starts_with(PUSH_SECRET_PREFIX) {
+                return Err(Box::new(invalid_request(&format!(
+                    "invalid_authorization_secret_name: it must begin with \
+                     {PUSH_SECRET_PREFIX:?}, which is the namespace a receiver's push \
+                     credential lives in"
+                ))));
             }
         }
     }

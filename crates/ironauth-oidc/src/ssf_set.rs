@@ -88,6 +88,31 @@ impl SubjectIdentifier {
         }
     }
 
+    /// Rebuild an identifier from the object [`Self::render`] produced.
+    ///
+    /// The inverse of `render`, and it exists because a queued push carries the subject as the
+    /// rendered object: the producer knows the stream's negotiated format, the delivery worker
+    /// only has to reproduce what was decided. `None` for anything this build does not render,
+    /// which the caller turns into a permanent failure rather than a SET naming a subject it
+    /// guessed at.
+    #[must_use]
+    pub fn from_rendered(value: &serde_json::Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let text = |key: &str| object.get(key).and_then(serde_json::Value::as_str);
+        match SsfSubjectFormat::parse(text("format")?)? {
+            SsfSubjectFormat::Email => Some(Self::Email {
+                email: text("email")?.to_owned(),
+            }),
+            SsfSubjectFormat::IssSub => Some(Self::IssSub {
+                iss: text("iss")?.to_owned(),
+                sub: text("sub")?.to_owned(),
+            }),
+            SsfSubjectFormat::Opaque => Some(Self::Opaque {
+                id: text("id")?.to_owned(),
+            }),
+        }
+    }
+
     /// The RFC 9493 JSON object.
     ///
     /// `format` is taken from [`Self::format`] rather than written again here: the two would

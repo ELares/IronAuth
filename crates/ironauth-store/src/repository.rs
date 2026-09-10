@@ -22213,6 +22213,15 @@ pub const BACKCHANNEL_LOGOUT_CONSUMER: &str = "backchannel_logout";
 /// literal from the one the consumer registers would list and replay NOTHING, silently.
 pub const WEBHOOK_DELIVERY_CONSUMER: &str = "webhook.delivery";
 
+/// The consumer that pushes one Security Event Token to one Shared Signals receiver
+/// (RFC 8935, issue #143).
+///
+/// One message is ONE SET for ONE stream, so a receiver that is down delays only its own
+/// deliveries: the `ordering_key` is the stream, which the outbox uses to keep a stream's
+/// events in order and never in flight together, and two streams are two groups that cannot
+/// block each other.
+pub const SSF_PUSH_CONSUMER: &str = "ssf.push";
+
 /// The registered consumer name a dead-letter REPLAY COMMAND drains under (issue #106).
 ///
 /// A separate consumer from [`WEBHOOK_DELIVERY_CONSUMER`] rather than a special message on
@@ -82038,6 +82047,43 @@ impl SsfStreamRepo<'_> {
         rows.iter()
             .map(|row| ssf_stream_from_row(row, self.scope))
             .collect()
+    }
+
+    /// One stream by handle, for the DELIVERY path.
+    ///
+    /// The other single-stream read is [`Self::get_for_client`], which takes the receiver
+    /// because a receiver must reach exactly its own. This one does not, and that is the same
+    /// exception [`Self::retaining_in_scope`] documents: a delivery worker draining the outbox
+    /// acts for the ENVIRONMENT, and the stream it must load is named by the queued message
+    /// rather than by any caller's credential. Nothing a receiver can call reaches it.
+    ///
+    /// It is a separate method rather than a `client_id: Option<_>` on the fenced one, because
+    /// an optional fence is one a caller can pass `None` to by accident.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for a handle from another scope or one that no longer exists --
+    /// which for the delivery path means the receiver deleted its stream and the queued message
+    /// has nowhere to go.
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn for_delivery(&self, id: &SsfStreamId) -> Result<SsfStream, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {SSF_STREAM_COLUMNS} FROM ssf_streams \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.ok_or(StoreError::NotFound)
+            .and_then(|row| ssf_stream_from_row(&row, self.scope))
     }
 
     /// Every stream in the scope that would KEEP an event generated now, oldest first.

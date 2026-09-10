@@ -53,7 +53,11 @@ fn push_body() -> String {
             "endpoint_url": "https://receiver.example.com/events",
             // SET ON THE REQUEST so the response can be scanned for it. Without this the
             // "not echoed" assertion below passed against a string that was never sent.
-            "authorization_secret_name": "receiver-bearer",
+            //
+            // INSIDE `ssf::PUSH_SECRET_PREFIX`: a receiver may only name a credential in its
+            // own namespace, or it could have this deployment open the LDAP bind password and
+            // POST it to an address the receiver chose.
+            "authorization_secret_name": "ssf_push_receiver_bearer",
         },
         "events_requested": ["https://schemas.openid.net/secevent/caep/event-type/session-revoked"],
         "aud": ["https://receiver.example.com"],
@@ -111,7 +115,7 @@ async fn a_receiver_creates_reads_and_deletes_its_own_stream() {
     );
     // THE PUSH CREDENTIAL'S NAME IS NOT ECHOED BACK.
     assert!(
-        !body.contains("authorization_secret_name") && !body.contains("receiver-bearer"),
+        !body.contains("authorization_secret_name") && !body.contains("ssf_push_receiver_bearer"),
         "the response repeats the credential the receiver supplied: {body}"
     );
 
@@ -325,6 +329,20 @@ async fn the_delivery_object_is_validated_before_anything_is_written() {
             serde_json::json!({
                 "delivery": { "method": "urn:ietf:rfc:8935", "endpoint_url": "https://r.example.com/e" },
                 "aud": (0..9).map(|n| format!("https://r{n}.example.com")).collect::<Vec<_>>(),
+            }),
+        ),
+        (
+            "a credential outside the receiver's own namespace",
+            serde_json::json!({
+                "delivery": {
+                    "method": "urn:ietf:rfc:8935",
+                    "endpoint_url": "https://r.example.com/e",
+                    // The LDAP bind password's namespace. Accepting this would let a receiver
+                    // have the delivery worker open that secret and POST it to an address the
+                    // same receiver supplied.
+                    "authorization_secret_name": "ldap_bind_corp",
+                },
+                "aud": ["https://receiver.example.com"],
             }),
         ),
         (

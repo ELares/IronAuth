@@ -37,6 +37,7 @@ use ironauth_config::{
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
+use ironauth_oidc::ssf_push::{FetchSsfPushSender, SsfPushConsumer};
 use ironauth_oidc::{
     BackChannelLogoutConsumer, CredentialClass, DiscoveryCapabilities, DiscoveryState,
     FederationKeyResolver, FederationRuntime, FetchLogoutSender, IssuerRegistry, IssuerState,
@@ -2193,6 +2194,14 @@ struct BackChannelWorkerInputs {
     control_dsn: Option<String>,
     /// The environment seam (deterministic clock and entropy).
     env: Env,
+    /// Whether the Shared Signals surface is armed (issue #143), and the master key its push
+    /// consumer opens a receiver's credential with. Both live here because that consumer joins
+    /// THESE pools: this function's header says the second subsystem to arrive extends it
+    /// rather than copying it, and a third does the same.
+    ssf_enabled: bool,
+    /// The master key, when one is configured. `None` leaves the push consumer unregistered
+    /// rather than started without the ability to open a credential a stream names.
+    master: Option<Arc<ironauth_jose::MasterKey>>,
 }
 
 /// What the ASYNC flow-target delivery worker (issue #112 criterion 2) needs, captured
@@ -2517,6 +2526,8 @@ fn backchannel_worker_inputs(config: &Config, env: &Env) -> Option<BackChannelWo
         data_plane_dsn: config.database.url.expose().to_owned(),
         control_dsn: select_control_dsn(config),
         env: env.clone(),
+        ssf_enabled: config.ssf.enabled,
+        master: resolve_master_key(config),
     })
 }
 
@@ -3486,6 +3497,8 @@ async fn spawn_backchannel_logout_pools(
         data_plane_dsn,
         control_dsn,
         env,
+        ssf_enabled,
+        master,
     } = inputs;
 
     let Some(control_dsn) = control_dsn else {
@@ -3542,13 +3555,42 @@ async fn spawn_backchannel_logout_pools(
     // answer to it: two consumers under one name means one subsystem's messages vanish
     // into another's handler. It cannot happen with these two fixed registrations, so it
     // is reported and treated as fatal for the pools rather than silently tolerated.
-    for consumer in [
+    let mut registrations: Vec<Arc<dyn OutboxConsumer>> = vec![
         Arc::new(SessionEndedExplodeConsumer::new(data_store.clone())) as Arc<dyn OutboxConsumer>,
         Arc::new(BackChannelLogoutConsumer::new(
             Arc::clone(&registry),
             sender,
         )) as Arc<dyn OutboxConsumer>,
-    ] {
+    ];
+    // The SSF push consumer (issue #143), registered ONLY when the surface is armed. With it
+    // off no stream can be created, so the queue it would drain is necessarily empty and a pool
+    // for it is a poller with nothing to poll.
+    if ssf_enabled {
+        match (
+            FetchSsfPushSender::with_timeout(request_timeout),
+            master.clone(),
+        ) {
+            (Ok(push), Some(master)) => registrations.push(Arc::new(SsfPushConsumer::new(
+                data_store.clone(),
+                Arc::clone(&registry),
+                master,
+                push,
+            ))
+                as Arc<dyn OutboxConsumer>),
+            // THE OTHER CONSUMERS STILL START. A SET that cannot be pushed waits in a durable
+            // queue; a session that cannot be logged out of does not.
+            (Err(error), _) => {
+                tracing::error!(%error, "SSF push consumer not registered: fetcher setup failed");
+            }
+            (_, None) => {
+                tracing::error!(
+                    "SSF push consumer not registered: no master key, so a receiver's push \
+                     credential could not be opened"
+                );
+            }
+        }
+    }
+    for consumer in registrations {
         if let Err(error) = consumers.register(consumer) {
             tracing::error!(%error, "back-channel logout worker not started: duplicate consumer name");
             return Vec::new();
