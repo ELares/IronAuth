@@ -56,6 +56,29 @@ use crate::ssf_set::EVENTS_SUPPORTED;
 use crate::state::OidcState;
 use crate::util::client_service_actor;
 
+/// The namespace ONE receiver's push credential must live in.
+///
+/// `delivery.authorization_secret_name` is supplied by the RECEIVER, and the delivery worker
+/// opens it and presents it as a Bearer to a URL the same receiver chose. Two escapes have to
+/// be closed, not one:
+///
+/// - an environment-wide namespace stops a receiver naming the LDAP bind password or an
+///   outbound SCIM credential, which is what `ldap_connectors::BIND_SECRET_PREFIX` does for its
+///   own subsystem;
+/// - but a namespace shared by every receiver stops nothing between them. Receiver A names the
+///   secret receiver B registered and has this deployment POST B's bearer to A's endpoint. The
+///   prefix therefore carries the OWNING CLIENT.
+///
+/// Enforced in the two places `ldap_connectors` enforces its own, for the same reason: at the
+/// door so a receiver cannot ask, and again at the READ, because a row written before this rule
+/// existed or restored by a config import never passed the door. The read compares against the
+/// stream's OWN `client_id`, which the row carries, so a stream cannot be made to open a
+/// credential belonging to a different receiver even if its name was written directly.
+#[must_use]
+pub fn push_secret_prefix(client_id: &ClientId) -> String {
+    format!("ssf_push_{client_id}_")
+}
+
 /// The delivery methods this deployment can actually perform.
 ///
 /// ONE list, read by both [`validate`] and [`configuration`]. It held both SSF methods while
@@ -119,6 +142,7 @@ struct StatusRequest {
 /// targeted test does not see and only clippy does.
 fn validate(
     request: &CreateStreamRequest,
+    client_id: &ClientId,
 ) -> Result<(SsfDelivery, SsfSubjectFormat), Box<Response>> {
     let delivery = match request.delivery.method.as_str() {
         SSF_DELIVERY_PUSH => {
@@ -210,6 +234,14 @@ fn validate(
                     "delivery.authorization_secret_name must be non-empty and at most 252 bytes",
                 )));
             }
+            // THE NAMESPACE, and it names THIS receiver. See `push_secret_prefix`.
+            let prefix = push_secret_prefix(client_id);
+            if !name.starts_with(&prefix) {
+                return Err(Box::new(invalid_request(&format!(
+                    "invalid_authorization_secret_name: it must begin with {prefix:?}, which is \
+                     the namespace this receiver's own push credentials live in"
+                ))));
+            }
         }
     }
     Ok((delivery, format))
@@ -272,7 +304,7 @@ pub async fn create_stream(
         return invalid_request("the request body must be a JSON stream configuration");
     };
 
-    let (delivery, format) = match validate(&request) {
+    let (delivery, format) = match validate(&request, &client_id) {
         Ok(pair) => pair,
         Err(response) => return *response,
     };

@@ -37,6 +37,7 @@ use ironauth_config::{
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
+use ironauth_oidc::ssf_push::{FetchSsfPushSender, SsfPushConsumer};
 use ironauth_oidc::{
     BackChannelLogoutConsumer, CredentialClass, DiscoveryCapabilities, DiscoveryState,
     FederationKeyResolver, FederationRuntime, FetchLogoutSender, IssuerRegistry, IssuerState,
@@ -359,6 +360,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         let metrics_sampler_inputs_captured = metrics_sampler_inputs(&config, &env);
         let webhook_inputs = webhook_delivery_inputs(&config, &env);
         let flow_target_inputs = flow_target_delivery_inputs(&config, &env);
+        let ssf_push_inputs = ssf_push_inputs(&config, &env);
         let message_delivery = message_delivery_inputs(&config, &env);
         let trait_migration = trait_migration_inputs(&config, &env);
         let offboarding = offboarding_inputs(&config, &env);
@@ -494,6 +496,14 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => spawn_flow_target_delivery_pools(inputs).await,
             None => Vec::new(),
         };
+        // Shared Signals push delivery (issue #143), behind its OWN switch for the reason
+        // every outbound consumer here is: `ssf.enabled` mounts the receiver-facing surface,
+        // so a deployment that sets it and nothing else must drain what that surface accepts.
+        // BOUND so the shutdown below can await it.
+        let ssf_push_pools = match ssf_push_inputs {
+            Some(inputs) => spawn_ssf_push_pools(inputs, server.base_url()).await,
+            None => Vec::new(),
+        };
         // The message delivery worker (issue #111), behind its own switch for the reason every
         // outbound consumer here is: it is a different subsystem and must not require another
         // one's configuration to run. BOUND so the shutdown below can await it.
@@ -599,6 +609,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             .into_iter()
             .chain(webhook_pools)
             .chain(flow_target_pools)
+            .chain(ssf_push_pools)
             .chain(message_delivery_pools)
             .chain(trait_migration_pools)
             .chain(offboarding_pools)
@@ -2476,6 +2487,49 @@ fn webhook_delivery_inputs(config: &Config, env: &Env) -> Option<WebhookDelivery
     Some(WebhookDeliveryInputs {
         webhooks: config.webhooks.clone(),
         outbox: config.outbox.clone(),
+        data_plane_dsn: config.database.url.expose().to_owned(),
+        control_dsn: select_control_dsn(config),
+        master: resolve_master_key(config),
+        env: env.clone(),
+    })
+}
+
+/// What the Shared Signals push worker needs (issue #143).
+struct SsfPushInputs {
+    /// The per-push HTTP budget and the receiver ceiling.
+    ssf: ironauth_config::SsfConfig,
+    /// The shared `[outbox]` tuning its pool is built from.
+    outbox: OutboxConfig,
+    /// The OIDC settings, for the issuer registry that SIGNS each SET.
+    oidc: OidcConfig,
+    /// The data-plane DSN the worker drains, reads streams on, and signs through.
+    data_plane_dsn: String,
+    /// The control-plane DSN it enumerates scopes on.
+    control_dsn: Option<String>,
+    /// Opens a receiver's push credential. Without it the worker does not start.
+    master: Option<Arc<ironauth_jose::MasterKey>>,
+    /// The environment seam.
+    env: Env,
+}
+
+/// Capture the Shared Signals push worker inputs from config (issue #143), or `None` when the
+/// surface is off.
+///
+/// ITS OWN SWITCH, and its own capture-and-spawn pair, for the reason the webhook worker has
+/// one rather than riding the OIDC logout switches. The first version of this registered the
+/// push consumer inside `spawn_backchannel_logout_pools`, which runs only when
+/// `oidc.backchannel_logout_enabled` is set -- so the real predicate was
+/// `oidc.enabled && oidc.backchannel_logout_enabled && ssf.enabled`, and the deployment an
+/// operator actually reaches by setting `ssf.enabled` alone mounted the receiver-facing surface,
+/// accepted streams, and drained nothing.
+fn ssf_push_inputs(config: &Config, env: &Env) -> Option<SsfPushInputs> {
+    if !config.ssf.enabled {
+        return None;
+    }
+    Some(SsfPushInputs {
+        ssf: config.ssf.clone(),
+        outbox: config.outbox.clone(),
+        oidc: config.oidc.clone(),
         data_plane_dsn: config.database.url.expose().to_owned(),
         control_dsn: select_control_dsn(config),
         master: resolve_master_key(config),
@@ -4508,6 +4562,101 @@ async fn spawn_webhook_delivery_pools(inputs: WebhookDeliveryInputs) -> Vec<Outb
         consumers = ?consumers.names(),
         pools = pools.len(),
         "webhook delivery started on the outbox consumer pools"
+    );
+    pools
+}
+
+/// Start the Shared Signals push worker (issue #143) on the generic outbox worker pool.
+///
+/// Its own spawn rather than a registration inside another subsystem's, for the reason
+/// [`ssf_push_inputs`] gives: riding another switch made the feature silently inert in the
+/// configuration an operator actually reaches.
+///
+/// Every early return is logged and starts NOTHING. The queue is durable, so a SET enqueued
+/// while no worker runs is delivered whenever one starts.
+async fn spawn_ssf_push_pools(inputs: SsfPushInputs, issuer_base: String) -> Vec<OutboxWorkerPool> {
+    let SsfPushInputs {
+        ssf,
+        outbox,
+        oidc,
+        data_plane_dsn,
+        control_dsn,
+        master,
+        env,
+    } = inputs;
+    let _ = ssf;
+
+    let Some(control_dsn) = control_dsn else {
+        tracing::error!(
+            "SSF push worker not started: no control-plane DSN to enumerate scopes (set \
+             admin.control_database_url, or run in dev_mode). The delivery queue is durable, so \
+             nothing is lost; enable the control plane to drain it."
+        );
+        return Vec::new();
+    };
+    // REFUSING TO START BEATS STARTING A WORKER THAT CANNOT OPEN A CREDENTIAL, the same
+    // reasoning the webhook worker records: without a master key every stream that names a
+    // bearer would burn its whole attempt budget and dead-letter, turning a missing
+    // configuration value into permanently discarded deliveries.
+    let Some(master) = master else {
+        tracing::error!(
+            "SSF push worker not started: database.master_key is unset, so a receiver's push \
+             credential cannot be opened. The queue is durable; set database.master_key to \
+             drain it."
+        );
+        return Vec::new();
+    };
+
+    let data_store = match Store::connect(&data_plane_dsn).await {
+        Ok(store) => store.with_master_key(Arc::clone(&master)),
+        Err(error) => {
+            tracing::error!(%error, "SSF push worker not started: data-plane connect failed");
+            return Vec::new();
+        }
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "SSF push worker not started: control-plane connect failed");
+            return Vec::new();
+        }
+    };
+
+    // THE SAME STORE-BACKED REGISTRY the mint, the JWKS and discovery read (issue #194), so a
+    // SET is signed by the key the environment publishes and never by a divergent one.
+    let registry = Arc::new(IssuerRegistry::store_backed(
+        issuer_base,
+        JwksCacheWindow::clamped(oidc.jwks_cache_max_age_secs),
+        data_store.clone(),
+    ));
+    let timeout = std::time::Duration::from_secs(oidc.backchannel_logout_request_timeout_secs);
+    let sender = match FetchSsfPushSender::with_timeout(timeout) {
+        Ok(sender) => sender,
+        Err(error) => {
+            tracing::error!(%error, "SSF push worker not started: fetcher setup failed");
+            return Vec::new();
+        }
+    };
+
+    let mut consumers = ConsumerRegistry::new();
+    if let Err(error) = consumers.register(Arc::new(SsfPushConsumer::new(
+        data_store.clone(),
+        registry,
+        master,
+        sender,
+    )) as Arc<dyn OutboxConsumer>)
+    {
+        tracing::error!(%error, "SSF push worker not started: duplicate consumer name");
+        return Vec::new();
+    }
+
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+    let observer = outbox_observer();
+    let pools = spawn_consumer_pools(&consumers, &data_store, &env, &outbox, &scopes, &observer);
+    tracing::info!(
+        consumers = ?consumers.names(),
+        pools = pools.len(),
+        "Shared Signals push delivery started on the outbox consumer pools"
     );
     pools
 }

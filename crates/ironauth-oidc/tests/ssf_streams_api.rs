@@ -46,14 +46,18 @@ fn status_path(harness: &Harness) -> String {
     format!("/t/{}/e/{}/ssf/status", scope.tenant(), scope.environment())
 }
 
-fn push_body() -> String {
+fn push_body_for(client: &ClientId) -> String {
     serde_json::json!({
         "delivery": {
             "method": "urn:ietf:rfc:8935",
             "endpoint_url": "https://receiver.example.com/events",
             // SET ON THE REQUEST so the response can be scanned for it. Without this the
             // "not echoed" assertion below passed against a string that was never sent.
-            "authorization_secret_name": "receiver-bearer",
+            //
+            // INSIDE `ssf::PUSH_SECRET_PREFIX`: a receiver may only name a credential in its
+            // own namespace, or it could have this deployment open the LDAP bind password and
+            // POST it to an address the receiver chose.
+            "authorization_secret_name": format!("ssf_push_{client}_bearer"),
         },
         "events_requested": ["https://schemas.openid.net/secevent/caep/event-type/session-revoked"],
         "aud": ["https://receiver.example.com"],
@@ -94,7 +98,14 @@ async fn a_receiver_creates_reads_and_deletes_its_own_stream() {
     let auth = basic(&client, &secret);
     let path = streams_path(&harness);
 
-    let (status, body) = send(&harness, "POST", &path, Some(&auth), Some(push_body())).await;
+    let (status, body) = send(
+        &harness,
+        "POST",
+        &path,
+        Some(&auth),
+        Some(push_body_for(&client)),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED, "create: {body}");
     let created: serde_json::Value = serde_json::from_str(&body).expect("json");
     let stream_id = created["stream_id"].as_str().expect("stream_id").to_owned();
@@ -111,7 +122,7 @@ async fn a_receiver_creates_reads_and_deletes_its_own_stream() {
     );
     // THE PUSH CREDENTIAL'S NAME IS NOT ECHOED BACK.
     assert!(
-        !body.contains("authorization_secret_name") && !body.contains("receiver-bearer"),
+        !body.contains("authorization_secret_name") && !body.contains("_bearer"),
         "the response repeats the credential the receiver supplied: {body}"
     );
 
@@ -159,7 +170,7 @@ async fn a_second_receiver_reaches_none_of_the_operations_over_http() {
         "POST",
         &path,
         Some(&owner_auth),
-        Some(push_body()),
+        Some(push_body_for(&owner)),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -239,7 +250,14 @@ async fn a_credential_for_another_environment_is_refused_at_this_path() {
         scope.tenant(),
         ironauth_store::EnvironmentId::generate(harness.state().env())
     );
-    let (status, body) = send(&harness, "POST", &elsewhere, Some(&auth), Some(push_body())).await;
+    let (status, body) = send(
+        &harness,
+        "POST",
+        &elsewhere,
+        Some(&auth),
+        Some(push_body_for(&client)),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,
@@ -253,7 +271,14 @@ async fn a_missing_or_public_credential_creates_nothing() {
     harness.enable_ssf(20);
     let path = streams_path(&harness);
 
-    let (status, _) = send(&harness, "POST", &path, None, Some(push_body())).await;
+    // The body is never validated on this path: authentication runs first, which is the
+    // property under test. A body naming no credential keeps that unambiguous.
+    let body = serde_json::json!({
+        "delivery": { "method": "urn:ietf:rfc:8935", "endpoint_url": "https://r.example.com/e" },
+        "aud": ["https://receiver.example.com"],
+    })
+    .to_string();
+    let (status, _) = send(&harness, "POST", &path, None, Some(body.clone())).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "no credential");
 
     // A public client presents a `client_id` and no secret. A `client_id` is not a secret, and
@@ -262,7 +287,7 @@ async fn a_missing_or_public_credential_creates_nothing() {
         .create_public_client_with_redirects("public", &[common::REDIRECT_URI])
         .await;
     let form = format!("Basic {}", STANDARD.encode(format!("{public}:")));
-    let (status, _) = send(&harness, "POST", &path, Some(&form), Some(push_body())).await;
+    let (status, _) = send(&harness, "POST", &path, Some(&form), Some(body)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "a public client");
 }
 
@@ -328,6 +353,20 @@ async fn the_delivery_object_is_validated_before_anything_is_written() {
             }),
         ),
         (
+            "a credential outside the receiver's own namespace",
+            serde_json::json!({
+                "delivery": {
+                    "method": "urn:ietf:rfc:8935",
+                    "endpoint_url": "https://r.example.com/e",
+                    // The LDAP bind password's namespace. Accepting this would let a receiver
+                    // have the delivery worker open that secret and POST it to an address the
+                    // same receiver supplied.
+                    "authorization_secret_name": "ldap_bind_corp",
+                },
+                "aud": ["https://receiver.example.com"],
+            }),
+        ),
+        (
             "a description longer than the column stores",
             serde_json::json!({
                 "delivery": { "method": "urn:ietf:rfc:8935", "endpoint_url": "https://r.example.com/e" },
@@ -368,7 +407,14 @@ async fn the_stream_ceiling_refuses_rather_than_evicting() {
 
     let mut ids = Vec::new();
     for _ in 0..2 {
-        let (status, body) = send(&harness, "POST", &path, Some(&auth), Some(push_body())).await;
+        let (status, body) = send(
+            &harness,
+            "POST",
+            &path,
+            Some(&auth),
+            Some(push_body_for(&client)),
+        )
+        .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         ids.push(
             serde_json::from_str::<serde_json::Value>(&body).expect("json")["stream_id"]
@@ -377,7 +423,14 @@ async fn the_stream_ceiling_refuses_rather_than_evicting() {
                 .to_owned(),
         );
     }
-    let (status, body) = send(&harness, "POST", &path, Some(&auth), Some(push_body())).await;
+    let (status, body) = send(
+        &harness,
+        "POST",
+        &path,
+        Some(&auth),
+        Some(push_body_for(&client)),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT, "the third: {body}");
 
     // THE TWO IT ALREADY HAD ARE STILL THERE. A ceiling that evicted would take away the
@@ -405,7 +458,14 @@ async fn a_paused_stream_reports_its_reason_and_can_be_resumed() {
         .await;
     let auth = basic(&client, &secret);
     let path = streams_path(&harness);
-    let (_, body) = send(&harness, "POST", &path, Some(&auth), Some(push_body())).await;
+    let (_, body) = send(
+        &harness,
+        "POST",
+        &path,
+        Some(&auth),
+        Some(push_body_for(&client)),
+    )
+    .await;
     let stream_id = serde_json::from_str::<serde_json::Value>(&body).expect("json")["stream_id"]
         .as_str()
         .expect("stream_id")
