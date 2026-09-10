@@ -35,8 +35,11 @@ done
 # helpers, and the first run of this gate duly demanded a checklist row for
 # `transmitter_metadata`. A gate that asks for documentation of a helper teaches its
 # reader to add noise rows, which is how a traceability table stops being read.
-defined="$(awk '/^#\[tokio::test\]/ { want = 1; next }
-                want && /^async fn / { sub(/^async fn /, ""); sub(/\(.*/, ""); print; want = 0 }' \
+defined="$(awk '/^[[:space:]]*#\[tokio::test/ { want = 1; next }
+                want && /^[[:space:]]*(pub )?async fn / {
+                    sub(/^[[:space:]]*(pub )?async fn /, ""); sub(/\(.*/, ""); print; want = 0
+                }
+                want && /^[[:space:]]*#\[/ { next }' \
     "$SUITE" | sort -u)"
 
 # The tests the checklist claims, taken from the backticked cells of the mapping table.
@@ -54,6 +57,33 @@ if [ -z "$claimed" ]; then
 fi
 
 status=0
+
+# A REQUIREMENT ROW MUST NAME A TEST. Without this, deleting the contents of a Covered-by
+# cell passes both comm checks -- the row claims nothing, so nothing is missing, and every
+# test is still claimed by some other row. An empty cell is the easiest way to make a
+# requirement look handled, so it is the one this gate has to catch first.
+#
+# Only rows of the COVERED table are checked: the not-satisfied and deployment-property
+# tables deliberately name no test, and demanding one there would force exactly the
+# pointing-at-nothing rows this gate exists to prevent.
+empty_cells="$(awk '/^\| Profile section \| Requirement \| Covered by \|/ { in_table = 1; next }
+                    in_table && /^\|[[:space:]]*---/ { next }
+                    in_table && !/^\|/ { in_table = 0 }
+                    in_table && /^\|/ {
+                        n = split($0, cell, "|")
+                        covered = cell[4]
+                        gsub(/[[:space:]]/, "", covered)
+                        if (covered == "") { print $0 }
+                    }' "$DOC")"
+if [ -n "$empty_cells" ]; then
+    status=1
+    echo "caep-interop-scan: a requirement row names no test:" >&2
+    echo "$empty_cells" | sed 's/^/    /' >&2
+    echo "" >&2
+    echo "    An empty Covered-by cell reads as handled and is checked by nothing. Name" >&2
+    echo "    the test, or move the row to the not-satisfied or deployment-property" >&2
+    echo "    table, where naming no test is the honest answer." >&2
+fi
 
 missing="$(comm -13 <(echo "$defined") <(echo "$claimed") || true)"
 if [ -n "$missing" ]; then

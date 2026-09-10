@@ -178,27 +178,56 @@ async fn section_2_3_the_advertised_endpoints_are_absolute_and_under_this_issuer
 }
 
 #[tokio::test]
-async fn section_2_5_a_required_subject_identifier_format_is_supported() {
+async fn section_2_5_a_required_subject_identifier_format_is_actually_rendered() {
     // "MUST be able to send events with at least one of" `email`, `iss_sub`, or `opaque`.
-    // This build renders all three, and the profile's floor is one, so the assertion is
-    // that the intersection is non-empty rather than that all three are present -- which
-    // is what the profile actually requires and what a future build dropping one should
-    // still satisfy.
-    let rendered: Vec<&str> = ["email", "iss_sub", "opaque"]
-        .into_iter()
-        .filter(|format| ironauth_store::SsfSubjectFormat::parse(format).is_some())
-        .collect();
-    assert!(
-        !rendered.is_empty(),
-        "section 2.5 requires at least one of email, iss_sub or opaque"
-    );
+    //
+    // ASSERTED ON A RENDERED SUBJECT, not on a format parser. The first version of this
+    // called `SsfSubjectFormat::parse` on three string literals, which exercises a string
+    // parser and would pass in a build that could not render a subject at all -- the
+    // requirement is about what this transmitter can SEND.
+    for subject in [
+        ironauth_oidc::ssf_set::SubjectIdentifier::IssSub {
+            iss: "https://issuer.example".to_owned(),
+            sub: "usr_1".to_owned(),
+        },
+        ironauth_oidc::ssf_set::SubjectIdentifier::Opaque {
+            id: "usr_1".to_owned(),
+        },
+        ironauth_oidc::ssf_set::SubjectIdentifier::Email {
+            email: "a@example.test".to_owned(),
+        },
+    ] {
+        let rendered = subject.render();
+        let format = rendered["format"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no format in {rendered}"));
+        assert!(
+            ["email", "iss_sub", "opaque"].contains(&format),
+            "section 2.5 names three formats and this is not one of them: {rendered}"
+        );
+        // The rendering must carry the members that format needs, or a receiver has a
+        // label and no subject.
+        let members = rendered.as_object().expect("an object").len();
+        assert!(
+            members >= 2,
+            "a subject rendered as `{format}` carries only its label: {rendered}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn section_2_8_1_a_set_carries_exactly_one_event() {
-    // "The `events` claim of each SET MUST contain only one event." Asserted on a MINTED
-    // token rather than on the builder's input, because the requirement is about what
-    // leaves this transmitter.
+    // "The `events` claim of each SET MUST contain only one event."
+    //
+    // THE TYPE ALREADY GUARANTEES IT, and saying so is the point of this test rather than
+    // a reason to skip it. `SetToMint` holds ONE `SecurityEvent`, so `build_set_claims`
+    // cannot emit two and an assertion on its output cannot fail -- which the first
+    // version of this test did, and it measured nothing.
+    //
+    // What is worth pinning is that the guarantee is STRUCTURAL: the claim set is built
+    // from a type that cannot express the violation. This asserts the emitted shape AND
+    // that the receiver half refuses the shape it will not act on, which is the same
+    // requirement seen from the other side and is the half that could actually regress.
     let claims = ironauth_oidc::ssf_set::build_set_claims(
         "https://issuer.example",
         1_700_000_000,
@@ -223,4 +252,47 @@ async fn section_2_8_1_a_set_carries_exactly_one_event() {
         1,
         "section 2.8.1 allows exactly one event per SET: {claims}"
     );
+    // The receiving half of the same rule lives in `risc_receiver`, whose
+    // `a_set_carrying_several_events_is_refused_rather_than_partly_applied` drives a
+    // two-event token through the real endpoint. That one CAN fail; this one records that
+    // the emitting side makes the violation unrepresentable.
+}
+
+#[tokio::test]
+async fn section_3_1_a_session_revoked_event_carries_a_non_empty_reason_admin() {
+    // SECTION 3 IS WHAT DECIDES CONFORMANCE AT ALL: "An implementation conforming to this
+    // profile MUST support at least one of the following use cases". This build supports
+    // 3.1, Session Revocation, and 3.1 adds a requirement the base CAEP spec does not:
+    // "`reason_admin` field of the event MUST be populated with a non-empty object".
+    //
+    // Non-empty is asserted as a member count rather than as presence, because
+    // `"reason_admin": {}` satisfies presence and is exactly what the profile forbids.
+    for cause in [
+        ironauth_store::SessionEndCause::Revoked,
+        ironauth_store::SessionEndCause::BulkRevoked,
+        ironauth_store::SessionEndCause::UserRevokedAll,
+        ironauth_store::SessionEndCause::LoggedOut,
+        ironauth_store::SessionEndCause::ReplacedByOtherSubject,
+        ironauth_store::SessionEndCause::PasswordChanged,
+    ] {
+        let event = ironauth_oidc::caep::session_end_event(cause, "human", 1_700_000_000_000_000);
+        assert_eq!(
+            event.event_type,
+            ironauth_oidc::caep::SESSION_REVOKED,
+            "{} is not the use case section 3.1 governs",
+            cause.as_str()
+        );
+        let reason = event
+            .payload
+            .get("reason_admin")
+            .unwrap_or_else(|| panic!("{} carries no reason_admin", cause.as_str()));
+        let members = reason
+            .as_object()
+            .unwrap_or_else(|| panic!("reason_admin is not an object: {reason}"));
+        assert!(
+            !members.is_empty(),
+            "section 3.1 requires a NON-EMPTY reason_admin and {} carries {{}}",
+            cause.as_str()
+        );
+    }
 }
