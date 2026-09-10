@@ -623,6 +623,18 @@ mod tests {
     /// must state rather than one they can omit.
     const PLANE_LOCAL_KEYS: &[(&str, Reach, &str)] = &[
         (
+            "ssf",
+            Reach::OnePlaneOrNoState,
+            "read once at boot by the OIDC plane's state builder (issue #143): \
+             `with_ssf(config.ssf.enabled, config.ssf.max_streams_per_client)` arms the Shared \
+             Signals stream-management surface and its discovery document, both of which hang \
+             off the per-environment issuer path the OIDC router owns.\n\n\
+             IT IS PUBLIC-PLANE ONLY. A receiver reaches these endpoints with an OAuth client \
+             credential, not an operator credential, so nothing under `/v1/tenants/...` serves \
+             them and the management plane's state has no field for them. Off is a uniform 404 \
+             on every `/ssf/` path, which is the shape `scim.enabled` gives its own surface.",
+        ),
+        (
             "ldap_sync",
             Reach::OnePlaneOrNoState,
             "consumed once at boot by `ldap_sweep_inputs` (issue #142) to build the directory \
