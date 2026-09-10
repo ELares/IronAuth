@@ -296,3 +296,65 @@ async fn section_3_1_a_session_revoked_event_carries_a_non_empty_reason_admin() 
         );
     }
 }
+
+#[tokio::test]
+async fn section_2_7_2_a_bearer_access_token_is_refused_today() {
+    // A TEST THAT PINS A NON-CONFORMANCE, deliberately.
+    //
+    // Section 2.7.2 requires the transmitter to accept OAuth 2.0 Bearer ACCESS TOKENS.
+    // These endpoints authenticate the receiver as an OAuth CLIENT instead, through
+    // `client_secret_basic`, so a conformant receiver presenting a Bearer token is
+    // refused. The checklist records that as not satisfied.
+    //
+    // A row saying "not satisfied" with no test is a claim that decays: someone adds
+    // bearer support and the document still says it is missing, or someone removes what
+    // little is there and nothing notices. This asserts the CURRENT behaviour, so closing
+    // the gap FAILS this test and forces the row to be updated in the same change. That
+    // is the only way a not-satisfied row stays honest.
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let scope = harness.scope();
+    let uri = format!(
+        "/t/{}/e/{}/ssf/streams",
+        scope.tenant(),
+        scope.environment()
+    );
+    let response = harness
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header(
+                    "authorization",
+                    "Bearer an-access-token-a-conformant-receiver-would-send",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "a Bearer access token is accepted, so section 2.7.2 may now be satisfied: \
+         update the checklist row and this test together"
+    );
+    // AND THE CHALLENGE NAMES BASIC, which is itself the evidence that this door is an
+    // RFC 6749 client-authentication door rather than an OAuth resource server. Section
+    // 2.7.2's last requirement is that errors follow RFC 6750 section 3.1, which wants a
+    // `Bearer` challenge.
+    let challenge = response
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        challenge.starts_with("Basic"),
+        "the challenge is no longer Basic ({challenge}), so the authorization model \
+         changed: re-assess section 2.7 in the checklist"
+    );
+}

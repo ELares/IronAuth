@@ -45,9 +45,14 @@ Recording these is the point of the document. A conformance checklist that lists
 rows it passes is a marketing page, and the reader it misleads is the operator deciding
 whether to enter an interop matrix.
 
-| Profile section | Requirement | Status |
-| --- | --- | --- |
-| 2.7.2 | Accept OAuth 2.0 Bearer access tokens in the HTTP `Authorization` header; do not accept them via query parameter; verify validity, integrity, expiration and revocation | **NOT SATISFIED.** The stream-management endpoints authenticate the RECEIVER as an OAuth CLIENT, through `client_secret_basic`, rather than accepting an access token issued to it. Nothing accepts a token via query parameter, so that half holds trivially, but the positive requirement does not: a conformant receiver arriving with a Bearer access token is refused. The discovery document is honest about it -- `authorization_schemes` advertises `token_endpoint_auth_methods_supported: ["client_secret_basic"]` -- so a receiver reading the metadata learns this before it fails, but advertising a narrower scheme is not the same as satisfying 2.7.2. Closing it means accepting a Bearer access token at the five stream endpoints and validating it, which is its own change. |
+Each row here names a test that pins the CURRENT behaviour, so closing the gap fails that
+test and forces the row to be updated in the same change. A not-satisfied row with no test
+decays: somebody adds the missing support and the document still says it is missing.
+
+| Profile section | Requirement | Status | Pinned by |
+| --- | --- | --- | --- |
+| 2.7.2 | Accept OAuth 2.0 Bearer access tokens in the HTTP `Authorization` header; do not accept them via query parameter; verify validity, integrity, expiration and revocation; return errors per RFC 6750 section 3.1 | **NOT SATISFIED.** The stream-management endpoints authenticate the RECEIVER as an OAuth CLIENT, through `client_secret_basic`, rather than accepting an access token issued to it. Nothing accepts a token via query parameter, so that half holds trivially, but the positive requirement does not: a conformant receiver arriving with a Bearer access token is refused. The discovery document is honest about it -- `authorization_schemes` advertises `token_endpoint_auth_methods_supported: ["client_secret_basic"]` -- so a receiver reading the metadata learns this before it fails, but advertising a narrower scheme is not the same as satisfying 2.7.2. The error format is wrong for the same reason: the 401 carries `WWW-Authenticate: Basic realm="ironauth"` and `invalid_client`, where 2.7.2 wants a `Bearer` challenge. Closing it means accepting and validating a Bearer access token at the five stream endpoints, which is its own change. | `section_2_7_2_a_bearer_access_token_is_refused_today` |
+| 2.7.3 | The authorization server issuing tokens to receivers supports the `ssf.manage` and `ssf.read` scopes | **NOT SATISFIED**, and it cannot be until 2.7.2 is: neither scope name appears anywhere in this repository, because nothing consumes an access token at these endpoints for a scope to gate. It is listed separately rather than folded into the row above so that closing 2.7.2 without defining the scopes does not silently look complete. | Not pinned: there is nothing to assert about a scope no code reads. Closing 2.7.2 makes this testable. |
 
 ## Requirements the profile states and this table does not yet cover
 
@@ -57,7 +62,8 @@ section absent from both lists has not been assessed. Naming that explicitly is 
 difference between a map with edges and a map that pretends to be complete.
 
 Assessed and covered: 2.3.1 through 2.3.7, 2.5, 2.8.1, 3.1. Assessed and not satisfied:
-2.7.2. Assessed and untestable here: 2.1, 2.6 (below). Everything else in the profile,
+2.7.2 and 2.7.3 -- which matters because issue #144's criterion 6 names "discovery, auth,
+mandatory events", and 2.7 IS the auth third. Assessed and untestable here: 2.1, 2.6 (below). Everything else in the profile,
 including the stream-control operations of 2.3.8.2 and the use cases of 3.2 and 3.3, is
 UNASSESSED.
 
