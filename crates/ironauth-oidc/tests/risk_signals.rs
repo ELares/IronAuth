@@ -242,12 +242,32 @@ async fn every_unauthenticated_or_stale_set_is_rejected_and_ingests_nothing() {
         "jti-wrong-aud",
     );
 
+    // 6. A SET whose ISSUANCE TIME is older than the source's freshness window, while its
+    //    `exp` is still comfortably in the future. This is the case `verify` alone does
+    //    NOT catch: the signature, `iss`, `aud` and `exp` are all impeccable, and only the
+    //    age of `iat` is wrong. Before the ingestion-side bound (issue #144 criterion 5)
+    //    this was accepted, which left a replay window as wide as whatever lifetime the
+    //    transmitter chose to stamp. The `jti` dedup does not close it: dedup stops the
+    //    same token arriving twice, not a hoarded batch of distinct old ones arriving now.
+    //
+    //    `source_config` takes `RiskSignalSource::default()`, so the window is 3600s; two
+    //    hours is unambiguously outside it while `exp` stays an hour ahead.
+    let stale_iat = signed_set(
+        &key,
+        SOURCE_ISS,
+        &audience,
+        now - 7_200,
+        now + 3_600,
+        "jti-stale-iat",
+    );
+
     for (label, set) in [
         ("unsigned", unsigned),
         ("wrong key", wrong_sig),
         ("unknown source", unknown),
         ("expired", expired),
         ("wrong audience", wrong_aud),
+        ("stale issuance time", stale_iat),
     ] {
         let (status, _headers, body) = harness.send(ingest_request(&path, set)).await;
         assert_eq!(

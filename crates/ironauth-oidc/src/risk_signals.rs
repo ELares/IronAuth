@@ -70,6 +70,16 @@ const MAX_SET_BYTES: usize = 16 * 1024;
 /// (an unknown source, a bad signature, a wrong algorithm, an expired SET, or a malformed
 /// claim all look identical), so the endpoint is no oracle. Distinct from the flag-off
 /// `404`, but it never leaks.
+/// Seconds since the Unix epoch, from the environment clock seam.
+///
+/// A local copy of the idiom `tokens.rs` and `backchannel.rs` each keep, rather than a
+/// shared helper: the conversion is three lines and the crate has not centralised it.
+fn epoch_secs(at: std::time::SystemTime) -> i64 {
+    at.duration_since(std::time::UNIX_EPOCH).map_or(0, |since| {
+        i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+    })
+}
+
 fn rejected() -> Response {
     (StatusCode::BAD_REQUEST, "risk signal rejected\n").into_response()
 }
@@ -171,6 +181,31 @@ pub(crate) async fn ingest(
     let Ok(verified) = verify(token, &policy, state.env().clock()) else {
         return rejected();
     };
+
+    // 3b. THE ISSUANCE-TIME BOUND, which the signature verification above does NOT apply.
+    //     `verify` enforces `exp` and `nbf` and tolerates clock skew on `iat`, but it puts
+    //     no ceiling on how OLD `iat` may be: a SET minted long ago with a generous `exp`
+    //     verifies perfectly. That is a replay window measured in whatever lifetime the
+    //     transmitter chose, and the `jti` dedup does not close it, because dedup only
+    //     stops the SAME token arriving twice, not a hoarded batch of distinct ones
+    //     arriving late.
+    //
+    //     The bound is the source's OWN `max_age_secs`, the same window the engine already
+    //     applies to `event_timestamp` when it reads a signal back. Reusing it rather than
+    //     adding a second knob is deliberate: a source whose signals stop meaning anything
+    //     after N seconds has no business delivering a token minted before then, and two
+    //     independently tuned windows would let a deployment set them inconsistently
+    //     without ever being told.
+    //
+    //     A SET with no `iat` at all is rejected rather than treated as fresh.
+    let now_secs = epoch_secs(state.now());
+    let Some(iat) = verified.claims().get("iat").and_then(Value::as_i64) else {
+        return rejected();
+    };
+    let max_age = i64::try_from(source.max_age_secs).unwrap_or(i64::MAX);
+    if now_secs.saturating_sub(iat) > max_age {
+        return rejected();
+    }
 
     // 4. Extract and validate the SET's signal claims (all read AFTER verification).
     let Some(signal) = parse_signal_claims(&verified) else {
