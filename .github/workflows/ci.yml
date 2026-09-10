@@ -1081,6 +1081,12 @@ jobs:
         run: scripts/discovery-scan.sh
       - name: rfc9700 scan (every OAuth endpoint bound to a conformance test)
         run: scripts/rfc9700-scan.sh
+      - name: CAEP interop profile traceability (issue #144 criterion 6)
+        # Every profile requirement in the checklist names a test that EXISTS, and every
+        # test in the profile suite is named by a requirement. Both directions, because a
+        # row pointing at a deleted test reads as covered while measuring nothing, and a
+        # test no requirement reaches is not traceable.
+        run: scripts/caep-interop-scan.sh
       - name: route audit (reference app calls only documented public endpoints)
         # The standalone TypeScript reference app (packages/reference-app) is a
         # pure client of the public flow API. This audit is the structural

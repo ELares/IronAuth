@@ -603,6 +603,14 @@ required-features = ["testing"]
 # flag-off 404, and every reject case (unknown source, wrong key, wrong algorithm, expired
 # SET, malformed claims) is a uniform refusal that ingests nothing; a re-delivery is an
 # idempotent no-op. Needs a real database (DATABASE_URL).
+# The CAEP Interoperability Profile as executable requirements (issue #144 criterion 6):
+# one test per normative transmitter requirement, each traceable from
+# docs/conformance/caep-interop-checklist.md and enforced by scripts/caep-interop-scan.sh.
+[[test]]
+name = "caep_interop_profile"
+path = "tests/caep_interop_profile.rs"
+required-features = ["testing"]
+
 # The Google Cross-Account Protection receiver (issue #144, criteria 4 and 5): a simulated
 # Google RISC SET through the real router, asserting the configured protections reach the
 # LINKED local user with an audit trail, and that a forged, replayed, wrong-audience,
