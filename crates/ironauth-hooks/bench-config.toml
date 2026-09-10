@@ -103,6 +103,18 @@ cold_p95_micros = 1000
 #
 # The bound did not move; the distance to it did. What decides whether the criterion holds is
 # the CI runner, not this machine.
+#
+# AND THE CI RUNNER IS MUCH CLOSER TO THE BOUND THAN THOSE FIGURES SUGGEST. The numbers above
+# are a dev machine; the first post-AOT measurement on the pinned class came back at
+# `warm_p95 = 91.204us`, which is 9% under this gate rather than the ~5x headroom a reader
+# would infer from 17us. That is recorded here because the margin is the thing a future
+# change has to respect, and reading it off the dev-machine figures would badly overestimate it.
+#
+# One consequence worth stating: with a baseline that close to the bound, the regression
+# check on warm is unreachable. The gate allows a baseline plus its tolerance, and
+# 91.204 * 1.5 is past 100, so the ABSOLUTE gate always fires first. The warm baseline
+# therefore records a figure rather than enforcing a delta, and it is the cold number where
+# the regression check does real work.
 warm_p95_micros = 100
 
 [target]

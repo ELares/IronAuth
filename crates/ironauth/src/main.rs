@@ -1626,15 +1626,15 @@ async fn build_oidc_plane(
         // CHECKED HERE, where the JOSE core is reachable and the operator is still
         // watching the log. See `unrecognised_risc_algorithms`.
         let unreadable = unrecognised_risc_algorithms(&config.risc_receiver);
-        if !unreadable.is_empty() {
+        if unreadable.is_empty() {
+            config.risc_receiver.clone()
+        } else {
             tracing::error!(
                 algorithms = ?unreadable,
                 "risc_receiver.algorithms names algorithms this build does not recognise; \
                  the receiver is left OFF rather than mounted refusing every token"
             );
             ironauth_config::RiscReceiverConfig::default()
-        } else {
-            config.risc_receiver.clone()
         }
     })
     .with_fedcm_enabled(surfaces.fedcm)
@@ -4615,7 +4615,7 @@ async fn spawn_webhook_delivery_pools(inputs: WebhookDeliveryInputs) -> Vec<Outb
 ///
 /// Two pools draining ONE consumer name is safe and is what the substrate is for. A claim
 /// takes a lease, so at most one worker holds a message at a time, and the explode is
-/// idempotent through `enqueue_all`, which skips an existing (consumer, idempotency_key)
+/// idempotent through `enqueue_all`, which skips an existing (consumer, `idempotency_key`)
 /// instead of raising. With both switches on the queue simply has two drainers.
 /// Refuse to serve with a RISC receiver whose algorithm allowlist this build cannot read
 /// (issue #144).

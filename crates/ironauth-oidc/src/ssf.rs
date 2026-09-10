@@ -716,38 +716,43 @@ fn read_only_mismatch(
             "{property} is supplied by the transmitter and cannot be changed"
         )))
     };
-    if let Some(aud) = &request.aud
-        && *aud != current.audience
-    {
-        return mismatched("aud");
+    // NESTED RATHER THAN LET-CHAINED. `if let ... && cond` is a let chain, stable only from
+    // Rust 1.88, and this workspace promises 1.85: the `msrv` lane compiles the shipped
+    // graph at that version and these six were failing it. The nesting is uglier and it is
+    // what the promised floor costs.
+    if let Some(aud) = &request.aud {
+        if *aud != current.audience {
+            return mismatched("aud");
+        }
     }
-    if let Some(format) = &request.format
-        && format.as_str() != current.subject_format.as_str()
-    {
-        return mismatched("format");
+    if let Some(format) = &request.format {
+        if format.as_str() != current.subject_format.as_str() {
+            return mismatched("format");
+        }
     }
-    if let Some(supported) = &request.events_supported
-        && supported
+    if let Some(supported) = &request.events_supported {
+        if supported
             .iter()
             .map(String::as_str)
             .ne(EVENTS_SUPPORTED.iter().copied())
-    {
-        return mismatched("events_supported");
+        {
+            return mismatched("events_supported");
+        }
     }
-    if let Some(delivered) = &request.events_delivered
-        && *delivered != current.events_delivered
-    {
-        return mismatched("events_delivered");
+    if let Some(delivered) = &request.events_delivered {
+        if *delivered != current.events_delivered {
+            return mismatched("events_delivered");
+        }
     }
-    if let Some(iss) = &request.iss
-        && iss.as_str() != state.issuers().issuer_for(&scope)
-    {
-        return mismatched("iss");
+    if let Some(iss) = &request.iss {
+        if iss.as_str() != state.issuers().issuer_for(&scope) {
+            return mismatched("iss");
+        }
     }
-    if let Some(interval) = request.min_verification_interval
-        && interval != state.ssf_min_verification_interval_secs()
-    {
-        return mismatched("min_verification_interval");
+    if let Some(interval) = request.min_verification_interval {
+        if interval != state.ssf_min_verification_interval_secs() {
+            return mismatched("min_verification_interval");
+        }
     }
     None
 }

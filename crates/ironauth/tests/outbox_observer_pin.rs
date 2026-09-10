@@ -2,9 +2,10 @@
 
 //! Every outbox pool in this binary reports through ONE observer constructor (issue #104).
 //!
-//! There are seven separate boot seams that spawn pools matching the spelling this scans for:
+//! There are eight separate boot seams that spawn pools matching the spelling this scans for:
 //! session ended and offboarding, back-channel logout, webhook delivery, trait migration, async
-//! flow-target delivery, message delivery, and the certificate pin worker. One more constructs
+//! flow-target delivery, message delivery, the certificate pin worker, and Shared Signals
+//! delivery. One more constructs
 //! the observer under a different binding name (the log-stream replay seam), which this
 //! exact-string scan cannot see and does not count.
 //! Each one used to build its own observer, and that is a wiring decision repeated per seam.
@@ -32,10 +33,16 @@ const MAIN_RS: &str = include_str!("../src/main.rs");
 /// header states.
 ///
 /// MOVED 4 -> 5 for async flow-target delivery (issue #112 criterion 2), 5 -> 6 for message
-/// delivery (issue #111), and 6 -> 7 for the certificate pin worker (issue #141). Each is a new
-/// seam rather than a relaxation: the count moves WITH a seam being added, which is exactly what
-/// the assertion below says to do.
-const POOL_SEAMS: usize = 7;
+/// delivery (issue #111), 6 -> 7 for the certificate pin worker (issue #141), and 7 -> 8 for
+/// Shared Signals delivery (issue #143). Each is a new seam rather than a relaxation: the count
+/// moves WITH a seam being added, which is exactly what the assertion below says to do.
+///
+/// THE 7 -> 8 MOVE WAS OWED AND NOT MADE. `spawn_ssf_push_pools` landed with the Shared Signals
+/// worker and took the shared observer correctly, which is the behaviour this file cares about;
+/// what it did not do is move this number, so the assertion has been failing on `main` ever
+/// since. That is the pin working -- it noticed a seam it had not been told about -- and the fix
+/// is the move, not a relaxation.
+const POOL_SEAMS: usize = 8;
 
 #[test]
 fn every_pool_seam_reports_through_the_shared_observer() {

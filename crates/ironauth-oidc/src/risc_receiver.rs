@@ -348,10 +348,12 @@ fn read_subject(
     transmitter: &str,
 ) -> Option<(String, String)> {
     // GOOGLE'S SHAPE FIRST: `events[type].subject` with `subject_type: "iss-sub"`.
-    if let Some(subject) = event_body.get("subject").and_then(Value::as_object)
-        && subject.get("subject_type").and_then(Value::as_str) == Some("iss-sub")
-    {
-        return issuer_and_subject(subject, transmitter);
+    // NESTED RATHER THAN LET-CHAINED: let chains are stable only from Rust 1.88 and this
+    // workspace promises 1.85.
+    if let Some(subject) = event_body.get("subject").and_then(Value::as_object) {
+        if subject.get("subject_type").and_then(Value::as_str) == Some("iss-sub") {
+            return issuer_and_subject(subject, transmitter);
+        }
     }
     // THE SSF 1.0 SHAPE: a top-level RFC 9493 `sub_id` with `format: "iss_sub"`.
     let sub_id = top_level?.as_object()?;
