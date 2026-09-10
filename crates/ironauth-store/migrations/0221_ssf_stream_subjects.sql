@@ -16,6 +16,14 @@
 -- key is a BLIND INDEX -- an HMAC under the per-tenant key, the shape 0154 uses for a message
 -- recipient -- and the seal carries the value itself.
 --
+-- BOUNDED PER STREAM, by `ssf.max_subjects_per_stream` rather than by a constant. A subject
+-- list is receiver-chosen storage the fan-out reads on every event, so an unbounded one is both
+-- unbounded rows and unbounded work per signal, and reaching the bound REFUSES rather than
+-- evicting: a receiver silently stopping being told about a subject it added is a delivery gap
+-- it cannot detect. It is configuration and not a constant for a reason that is about testing
+-- rather than deployment: a bound no test can approach without ten thousand inserts is a bound
+-- nothing drives, and the first version of this shipped exactly that.
+--
 -- ONE ROW PER (STREAM, SUBJECT), keyed on the blind index rather than the address. Adding a
 -- subject twice is the same row, which is what makes `add` idempotent: SSF has a transmitter
 -- answer a repeated add with the same success, not a conflict.
@@ -57,8 +65,21 @@ CREATE TABLE ssf_stream_subjects (
     PRIMARY KEY (tenant_id, environment_id, stream_id, subject_bidx),
 
     CONSTRAINT ssf_stream_subjects_bidx_nonempty CHECK (octet_length(subject_bidx) > 0),
+    -- A BOUND ON THE STORED BLOB, sized as 0217 sizes its own: the plaintext bound plus room
+    -- for the AEAD nonce and tag. `SsfStreamSubjectRepo::add` refuses a rendering over
+    -- `MAX_SUBJECT_BYTES` (1024) before sealing it, and a seal is the plaintext plus 28 bytes,
+    -- so this ceiling is that with slack rather than the same number.
+    --
+    -- THE TWO NUMBERS MUST NOT BE EQUAL, which was the first version's mistake: the surface
+    -- bounded the PLAINTEXT at 2048 while this bounded the CIPHERTEXT at 2048, so a rendering
+    -- of 2021 to 2048 bytes passed the door and violated this CHECK, answering 500 for a
+    -- request the endpoint had accepted.
+    --
+    -- THE FLOOR IS 29 AND NOT 1, because a seal cannot be shorter: twelve bytes of nonce,
+    -- sixteen of tag, and at least one of ciphertext. `BETWEEN 1 AND ...` is a bound satisfied
+    -- by values no correct writer can produce, which is no bound at all.
     CONSTRAINT ssf_stream_subjects_sealed_bounded
-        CHECK (octet_length(subject_sealed) BETWEEN 1 AND 2048),
+        CHECK (octet_length(subject_sealed) BETWEEN 29 AND 1280),
     -- The three formats this build renders, which `SsfSubjectFormat` also constrains. Here as
     -- well because a format the code cannot render is a row nothing can ever match.
     CONSTRAINT ssf_stream_subjects_format_known

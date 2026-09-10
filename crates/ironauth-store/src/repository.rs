@@ -328,7 +328,7 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
-    /// The SETs each Shared Signals stream owes its receiver (issue #143).
+    /// The subjects each Shared Signals stream has asked to be told about (issue #143).
     #[must_use]
     pub fn ssf_stream_subjects(&self) -> SsfStreamSubjectRepo<'a> {
         SsfStreamSubjectRepo {
@@ -82123,13 +82123,19 @@ pub struct SsfStreamSubject {
     pub added_at_unix_micros: i64,
 }
 
-/// The most subjects one stream may filter by.
+/// The longest rendered subject identifier this store will hold.
 ///
-/// A subject list is receiver-chosen storage that the fan-out reads on every event, so an
-/// unbounded one is both unbounded rows and unbounded work per signal. Reaching it REFUSES,
-/// which a receiver can see and act on, rather than evicting a subject it would then silently
-/// stop being told about.
-pub const MAX_STREAM_SUBJECTS: i64 = 10_000;
+/// AN RFC 9493 IDENTIFIER IS SMALL: an email address is capped at 254 bytes by RFC 5321, and an
+/// `iss_sub` is two URLs. A kilobyte is generous for every real one and still far below what
+/// the column can hold once sealed.
+///
+/// CHECKED HERE, WITH THE COLUMN, and not only at the surface. 0221's CHECK bounds the
+/// CIPHERTEXT, which is the plaintext plus the AEAD nonce and tag, so a bound applied only at
+/// the door can drift above what the column accepts. That is exactly what happened: the
+/// surface reused `MAX_ENDPOINT_BYTES` (2048, sized for a plaintext endpoint column) while the
+/// column capped the sealed blob at 2048, so a rendering of 2021 to 2048 bytes passed the door
+/// and violated the CHECK, answering 500 for a request the endpoint had accepted.
+pub const MAX_SUBJECT_BYTES: usize = 1024;
 
 /// The subjects each Shared Signals stream has asked to be told about (issue #143).
 ///
@@ -82149,13 +82155,21 @@ impl SsfStreamSubjectRepo<'_> {
     ///
     /// IDEMPOTENT, because SSF has a repeated add succeed rather than conflict: the row is keyed
     /// on the blind index, so adding the same subject twice is one row, and the second add
-    /// refreshes `verified`.
+    /// refreshes `verified`. A repeated add at the ceiling still succeeds, which is the case a
+    /// naive count conjunct gets wrong: it is not a new subject.
+    ///
+    /// THE CEILING IS A PARAMETER, supplied by `ssf.max_subjects_per_stream`, and not a
+    /// constant here. A constant is a bound no test can approach without inserting ten thousand
+    /// rows, which is how the first version of this shipped with a conjunct nothing drove:
+    /// deleting the `WHERE (SELECT count(*) ...) < $9` clause left the whole suite green.
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if the handle is out of scope; [`StoreError::QuotaExceeded`]
-    /// when the stream already holds [`MAX_STREAM_SUBJECTS`]; [`StoreError::Encryption`] if the
-    /// environment has no active DEK; [`StoreError::Database`] on a persistence failure.
+    /// [`StoreError::NotFound`] if the handle is out of scope; [`StoreError::Invalid`] if the
+    /// rendering is longer than [`MAX_SUBJECT_BYTES`], which the schema cannot check because it
+    /// bounds the ciphertext; [`StoreError::QuotaExceeded`] when the stream already holds
+    /// `ceiling` subjects; [`StoreError::Encryption`] if the environment has no active DEK;
+    /// [`StoreError::Database`] on a persistence failure.
     pub async fn add(
         &self,
         env: &Env,
@@ -82163,9 +82177,15 @@ impl SsfStreamSubjectRepo<'_> {
         format: SsfSubjectFormat,
         rendered: &str,
         verified: bool,
+        ceiling: u32,
     ) -> Result<(), StoreError> {
         if stream_id.scope() != self.scope {
             return Err(StoreError::NotFound);
+        }
+        // BEFORE THE SEAL, because after it the length is the ciphertext's, and the column
+        // bounds the ciphertext. See `MAX_SUBJECT_BYTES`.
+        if rendered.len() > MAX_SUBJECT_BYTES {
+            return Err(StoreError::Invalid);
         }
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let bidx = ssf_stream_subject_blind_index(master, self.scope, stream_id, rendered);
@@ -82201,7 +82221,7 @@ impl SsfStreamSubjectRepo<'_> {
         .bind(sealed.as_bytes())
         .bind(dek_version)
         .bind(verified)
-        .bind(MAX_STREAM_SUBJECTS)
+        .bind(i64::from(ceiling))
         .execute(&mut *tx)
         .await?;
         if inserted.rows_affected() == 0 {

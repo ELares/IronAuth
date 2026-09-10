@@ -232,6 +232,162 @@ async fn adding_the_same_subject_twice_is_one_row_and_refreshes_verified() {
     );
 }
 
+/// `verified` is RECORDED, not defaulted.
+///
+/// The column DEFAULTs to true, so a suite that only ever observes a `true` cannot tell the
+/// stored value from the default: hard-coding the bind to `true`, or dropping the request member
+/// entirely, would pass. This drives a `false` and reads it back, and then drives the OMITTED
+/// case, which section 8.1.4 says means true.
+#[tokio::test]
+async fn verified_is_stored_as_sent_and_defaults_to_true_only_when_omitted() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let stream = stream_for(&harness, &client).await;
+
+    let unverified = serde_json::json!({
+        "stream_id": stream.to_string(),
+        "subject": email("unverified@example.test"),
+        "verified": false,
+    })
+    .to_string();
+    let (status, text) = post(&harness, "/ssf/subjects/add", Some(&auth), unverified).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    let omitted = serde_json::json!({
+        "stream_id": stream.to_string(),
+        "subject": email("assumed@example.test"),
+    })
+    .to_string();
+    let (status, text) = post(&harness, "/ssf/subjects/add", Some(&auth), omitted).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    let stored = harness
+        .db()
+        .store()
+        .scoped(harness.scope())
+        .ssf_stream_subjects()
+        .list(&stream, 100)
+        .await
+        .expect("list");
+    let by_address: std::collections::HashMap<&str, bool> = stored
+        .iter()
+        .map(|subject| (subject.rendered.as_str(), subject.verified))
+        .collect();
+    let unverified_key = "{\"email\":\"unverified@example.test\",\"format\":\"email\"}";
+    let omitted_key = "{\"email\":\"assumed@example.test\",\"format\":\"email\"}";
+    assert_eq!(
+        by_address.get(unverified_key),
+        Some(&false),
+        "a subject the receiver said it had NOT verified was stored as verified: {stored:?}"
+    );
+    assert_eq!(
+        by_address.get(omitted_key),
+        Some(&true),
+        "an omitted verified was not treated as true"
+    );
+}
+
+/// Neither endpoint answers without a credential, and the answer carries a challenge.
+///
+/// The two conformance rows credit this suite with the credential fence and nothing drove it.
+/// It also pins the SHAPE: these endpoints answered the uniform not-found, which dropped the
+/// `WWW-Authenticate` header that tells a client how to authenticate and disagreed with the
+/// eight sibling SSF handlers.
+#[tokio::test]
+async fn neither_endpoint_answers_without_a_credential() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, _) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let stream = stream_for(&harness, &client).await;
+
+    for path in ["/ssf/subjects/add", "/ssf/subjects/remove"] {
+        let body = serde_json::json!({
+            "stream_id": stream.to_string(),
+            "subject": email("nobody@example.test"),
+        })
+        .to_string();
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/t/{}/e/{}{path}",
+                harness.scope().tenant(),
+                harness.scope().environment()
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("request builds");
+        let (status, headers, text) = harness.send(request).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} answered an uncredentialed request with something else: {text}"
+        );
+        assert!(
+            headers.get(header::WWW_AUTHENTICATE).is_some(),
+            "{path} refused without telling the client how to authenticate"
+        );
+    }
+    assert!(
+        subjects_of(&harness, &stream).await.is_empty(),
+        "an uncredentialed request wrote to the subject list"
+    );
+}
+
+/// A rendering longer than the store holds is a 400, not a 500.
+///
+/// The door bounded the PLAINTEXT at one number while the column bounded the CIPHERTEXT at the
+/// same number, and a seal is the plaintext plus twenty-eight bytes. So a rendering in the gap
+/// passed the door and violated the CHECK, answering 500 for a request the endpoint had
+/// accepted. Both sides read one constant now, and this is what would notice them drifting
+/// apart again.
+#[tokio::test]
+async fn a_subject_longer_than_the_store_holds_is_a_bad_request() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let stream = stream_for(&harness, &client).await;
+
+    // ONE BYTE OVER, computed from the constant rather than guessed, so an off-by-one in either
+    // direction is caught. The rendering is `{"email":"...","format":"email"}`.
+    let envelope = "{\"email\":\"\",\"format\":\"email\"}".len();
+    let over = "x".repeat(ironauth_store::MAX_SUBJECT_BYTES - envelope + 1);
+    let body = serde_json::json!({
+        "stream_id": stream.to_string(),
+        "subject": email(&over),
+    })
+    .to_string();
+    let (status, text) = post(&harness, "/ssf/subjects/add", Some(&auth), body).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an oversized subject was not a bad request: {text}"
+    );
+
+    // AND EXACTLY AT THE BOUND IS ACCEPTED, which is the half that catches a door tightened too
+    // far. If this 500s, the column cannot hold what the door admits.
+    let at_bound = "x".repeat(ironauth_store::MAX_SUBJECT_BYTES - envelope);
+    let body = serde_json::json!({
+        "stream_id": stream.to_string(),
+        "subject": email(&at_bound),
+    })
+    .to_string();
+    let (status, text) = post(&harness, "/ssf/subjects/add", Some(&auth), body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a subject exactly at the bound was refused or 500ed: {text}"
+    );
+}
+
 /// The same subject sent with its members in a different order is the SAME subject.
 ///
 /// The key is a blind index over the CANONICAL rendering, derived from the parsed identifier

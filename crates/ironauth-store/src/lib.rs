@@ -307,7 +307,7 @@ pub use repository::{
     InvitationState, IssueClientCredentials, IssueCode, IssuedChallenge, IssuedTokenRecord,
     JtiOutcome, LdapAbsencePolicy, LdapConnector, LdapConnectorRepo, LdapRunOutcome, LdapRunRecord,
     LdapRunRepo, LdapSnapshotMeta, LdapSnapshotRepo, LdapTlsMode, LoginMethod,
-    MANAGEMENT_LIST_HARD_CAP, MAX_HOOKS_PER_CLIENT, MAX_SET_JWS_BYTES, MAX_STREAM_SUBJECTS,
+    MANAGEMENT_LIST_HARD_CAP, MAX_HOOKS_PER_CLIENT, MAX_SET_JWS_BYTES, MAX_SUBJECT_BYTES,
     MEMBERSHIP_DELTA_CAP, ManagementCredentialRecord, ManagementCredentialRepo, ManagementStore,
     MembershipChange, MembershipPrincipal, MessageTemplateRecord, MigrationKind, MigrationProgress,
     MigrationRecordOutcome, MigrationRun, MigrationRunRepo, MigrationRunTallies, MigrationState,

@@ -1096,15 +1096,11 @@ pub async fn add_subject(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    let Some((stream, scope)) =
-        subject_request_target(&state, &headers, &tenant_id, &environment_id, &body).await
-    else {
-        return not_found();
-    };
-    let (stream, request) = match stream {
-        Ok(pair) => pair,
-        Err(response) => return *response,
-    };
+    let (stream, request, scope) =
+        match subject_request_target(&state, &headers, &tenant_id, &environment_id, &body).await {
+            Ok(target) => target,
+            Err(response) => return *response,
+        };
     let Some(subject) = crate::ssf_set::SubjectIdentifier::from_rendered(&request.subject) else {
         return invalid_request(
             "subject must be an RFC 9493 subject identifier in a format this transmitter \
@@ -1112,7 +1108,12 @@ pub async fn add_subject(
         );
     };
     let rendered = canonical_subject(&subject);
-    if rendered.len() > MAX_ENDPOINT_BYTES {
+    // THE STORE'S OWN BOUND, not a number chosen here. It used to be `MAX_ENDPOINT_BYTES`,
+    // which is sized for the plaintext endpoint column 0216 holds and is larger than what the
+    // sealed subject column accepts, so a rendering between the two bounds passed this check
+    // and then 500ed on the CHECK. Reading the store's constant is what keeps the door and the
+    // column from drifting apart again.
+    if rendered.len() > ironauth_store::MAX_SUBJECT_BYTES {
         return invalid_request("subject is longer than this transmitter stores");
     }
     match state
@@ -1125,6 +1126,7 @@ pub async fn add_subject(
             subject.format(),
             &rendered,
             request.verified.unwrap_or(true),
+            state.ssf_max_subjects_per_stream(),
         )
         .await
     {
@@ -1167,15 +1169,11 @@ pub async fn remove_subject(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    let Some((stream, scope)) =
-        subject_request_target(&state, &headers, &tenant_id, &environment_id, &body).await
-    else {
-        return not_found();
-    };
-    let (stream, request) = match stream {
-        Ok(pair) => pair,
-        Err(response) => return *response,
-    };
+    let (stream, request, scope) =
+        match subject_request_target(&state, &headers, &tenant_id, &environment_id, &body).await {
+            Ok(target) => target,
+            Err(response) => return *response,
+        };
     let Some(subject) = crate::ssf_set::SubjectIdentifier::from_rendered(&request.subject) else {
         return invalid_request(
             "subject must be an RFC 9493 subject identifier in a format this transmitter \
@@ -1206,27 +1204,36 @@ fn canonical_subject(subject: &crate::ssf_set::SubjectIdentifier) -> String {
 
 /// Authenticate, parse, and resolve the stream a subject request names.
 ///
-/// Returns `None` only when the CREDENTIAL fails, which the callers answer as the uniform
-/// not-found rather than a 401: an unauthenticated caller learns nothing about whether the
-/// surface is mounted.
+/// # A failed credential is a 401, like every other endpoint here
+///
+/// This answered the uniform not-found, and justified it with "an unauthenticated caller learns
+/// nothing about whether the surface is mounted". That reason was false in the same commit that
+/// wrote it: the UNAUTHENTICATED discovery document advertises both of these endpoints by URL,
+/// so there is nothing left to hide, and hiding it cost the `WWW-Authenticate` challenge that
+/// tells a client HOW to authenticate. The eight sibling SSF handlers all answer 401, and a
+/// surface where two endpoints disagree with the rest is one a receiver cannot write a single
+/// error path for.
+///
+/// The not-found is still what a stream the caller does not own gets, which is the fence that
+/// actually matters.
 async fn subject_request_target(
     state: &OidcState,
     headers: &HeaderMap,
     tenant_id: &str,
     environment_id: &str,
     body: &str,
-) -> Option<(Result<(SsfStream, SubjectRequest), Box<Response>>, Scope)> {
-    let (client, scope) = authenticated(state, headers, tenant_id, environment_id).await?;
+) -> Result<(SsfStream, SubjectRequest, Scope), Box<Response>> {
+    let Some((client, scope)) = authenticated(state, headers, tenant_id, environment_id).await
+    else {
+        return Err(Box::new(unauthorized()));
+    };
     let Ok(request) = serde_json::from_str::<SubjectRequest>(body) else {
-        return Some((
-            Err(Box::new(invalid_request(
-                "the request body must be a JSON object with a stream_id and a subject",
-            ))),
-            scope,
-        ));
+        return Err(Box::new(invalid_request(
+            "the request body must be a JSON object with a stream_id and a subject",
+        )));
     };
     let Ok(id) = SsfStreamId::parse_in_scope(&request.stream_id, &scope) else {
-        return Some((Err(Box::new(not_found())), scope));
+        return Err(Box::new(not_found()));
     };
     // THE RECEIVER FENCE, before the subject is even looked at: another receiver's stream and an
     // absent one are the same not-found, so neither endpoint can be used to learn which streams
@@ -1238,9 +1245,9 @@ async fn subject_request_target(
         .get_for_client(&id, &client)
         .await
     {
-        Ok(stream) => Some((Ok((stream, request)), scope)),
-        Err(StoreError::NotFound) => Some((Err(Box::new(not_found())), scope)),
-        Err(_) => Some((Err(Box::new(server_error())), scope)),
+        Ok(stream) => Ok((stream, request, scope)),
+        Err(StoreError::NotFound) => Err(Box::new(not_found())),
+        Err(_) => Err(Box::new(server_error())),
     }
 }
 
