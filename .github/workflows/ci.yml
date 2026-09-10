@@ -440,31 +440,31 @@ jobs:
       # is evidence, and the cost is one already-cached test binary.
       - name: webhook delivery (ironbus mode)
         run: cargo test -p ironauth-admin --features testing --test webhook_delivery
-      # Shared Signals delivery under the SAME broker (issue #143, criterion 7).
+      # SHARED SIGNALS IS NOT GIVEN A STEP HERE, and issue #143 criterion 7 is why it looked
+      # like it should have one:
       #
       # > The full suite passes with IronBus absent (Postgres-only) and with IronBus attached.
       #
-      # SSF PUSH RIDES THE OUTBOX. `spawn_ssf_push_pools` goes through `spawn_consumer_pools`,
-      # which resolves the backbone once and spawns every pool with it, so in a running process
-      # the bus wakes the SSF drain exactly as it wakes the webhook drain.
+      # A step running the SSF suites in this job was written and then removed, because it
+      # could not have shown what it claimed. `ironauth-oidc` has no `ironbus` feature to
+      # enable, so `cargo test -p ironauth-oidc --features testing` links NO IronBus code at
+      # all; the SSF suites read no `IRONBUS_ADDR`, drive `claim` and `handle` directly rather
+      # than spawning a pool, and never call `notify`. A green result would have meant only
+      # that a broker was running in the same job, which is not what "with IronBus attached"
+      # asks.
       #
-      # WHAT THIS STEP PROVES, AND WHAT IT DOES NOT. These suites drive `claim` and `handle`
-      # directly; none of them spawns a pool, so the broker does not wake anything here. What
-      # this shows is that an attached backbone does not CHANGE the SSF consumer, which is the
-      # half of criterion 7 about the suite passing in both modes. The wake path itself is
-      # `outbox_ironbus`'s subject, in the step above, and this step is not a second copy of it.
-      # Saying so matters because the obvious reading of a green broker-mode SSF job is that a
-      # bus-woken delivery was tested, and it was not.
+      # WHERE THE CRITERION IS ACTUALLY MET. Postgres-only is the `test` job, which runs every
+      # SSF suite with no broker. Attached is this lane, via the coupling that exists: SSF push
+      # is an outbox consumer, `spawn_ssf_push_pools` goes through `spawn_consumer_pools` which
+      # resolves the backbone once and spawns every pool with it, and the backbone decides only
+      # WHEN a drain runs, never what a consumer does. `outbox_ironbus` above is the test of
+      # that contract, and its own header says the same thing: durability, ordering and retries
+      # are the outbox's own and unchanged in either mode.
       #
-      # THE RECEIVER FIXTURE IS THE ONE WORTH RUNNING TWICE of the three. `ssf_push` substitutes
-      # a recording sender and asserts what the consumer handed it; the fixture bootstraps from
-      # discovery, fetches the advertised JWKS, verifies every SET against the published key,
-      # and drives an outage through the retry path. `ssf_poll` shares the queue and the seal
-      # with the push path, and the cost is one already-cached binary.
-      - name: shared signals delivery (ironbus mode)
-        run: >-
-          cargo test -p ironauth-oidc --features testing
-          --test ssf_receiver_conformance --test ssf_push --test ssf_poll
+      # Worth knowing while reading the webhook step above: it has the same property this one
+      # would have had. `ironauth-admin` has no `ironbus` feature either, and
+      # `webhook_delivery` reads no `IRONBUS_ADDR`, so it too links no IronBus code. That is
+      # issue #106's to decide on, not this issue's to quietly copy.
 
   msrv:
     name: msrv (1.85)

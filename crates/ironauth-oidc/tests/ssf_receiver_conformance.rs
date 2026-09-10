@@ -17,9 +17,14 @@
 //! # What that catches that a status code cannot
 //!
 //! A transmitter can answer 204, write a row, and still be unusable: signing with a key it does
-//! not publish, publishing a `jwks_uri` nothing serves, minting a token whose `aud` no receiver
-//! matches, or redelivering an event under a `jti` the receiver has already retired. Those are
-//! all green to a test that reads the store and all fatal to a receiver.
+//! not publish, publishing a `jwks_uri` nothing serves, or minting a token whose `aud` or `iss`
+//! no receiver matches. Those are all green to a test that reads the store and all fatal to a
+//! receiver, and each is caught here.
+//!
+//! WHAT IS NOT CLAIMED: this fixture recognises a REDELIVERY of one event, because it retires
+//! each `jti` it accepts, but no test here hands it two DIFFERENT events sharing a `jti`. The
+//! transmitter mints one per event from entropy, so producing that collision would mean
+//! mutating the minting side rather than exercising it.
 //!
 //! # What it deliberately is NOT
 //!
@@ -48,8 +53,8 @@ use ironauth_oidc::SendFailure;
 use ironauth_oidc::ssf_push::{PushOutcome, SsfPushConsumer, SsfPushSender};
 use ironauth_store::outbox::OutboxConsumer;
 use ironauth_store::{
-    ClientId, CorrelationId, NewSsfStream, SSF_PUSH_CONSUMER, SsfDelivery, SsfStreamId,
-    SsfStreamStatus, SsfSubjectFormat, StoreError,
+    ClientId, CorrelationId, FailureOutcome, NewSsfStream, RetryPolicy, SSF_PUSH_CONSUMER,
+    SsfDelivery, SsfStreamId, SsfStreamStatus, SsfSubjectFormat, StoreError,
 };
 
 const AUDIENCE: &str = "https://receiver.example.com";
@@ -73,8 +78,13 @@ enum Verdict {
 ///
 /// BOOTSTRAPPED FROM DISCOVERY, which is the part that makes it a receiver rather than a
 /// verifier: it reads `jwks_uri` out of the SSF configuration document, FETCHES that URL, and
-/// builds its key from the JWK members it finds. A transmitter that publishes a `jwks_uri`
-/// nothing serves, or signs with a key it does not publish, fails here and nowhere else.
+/// builds its key from the JWK members it finds.
+///
+/// NOT THE ONLY PLACE THE FETCH HAPPENS. `ssf_streams_api`'s discovery test already fetches
+/// the advertised `jwks_uri` and requires it to resolve, which is the fix for the defect that
+/// prompted it. What is new here is the SECOND half: the key that comes back is then used to
+/// verify an actual SET, so a transmitter that publishes a reachable JWKS and signs with a key
+/// missing from it is caught here and nowhere else.
 #[derive(Clone)]
 struct Receiver {
     issuer: String,
@@ -207,6 +217,19 @@ impl Receiver {
             .collect()
     }
 
+    /// Every `jti` this receiver was handed, in order, redeliveries included.
+    fn handled(&self) -> Vec<String> {
+        self.verdicts
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .filter_map(|verdict| match verdict {
+                Verdict::Accepted(jti) | Verdict::Duplicate(jti) => Some(jti.clone()),
+                Verdict::Refused(_) => None,
+            })
+            .collect()
+    }
+
     fn refusals(&self) -> Vec<String> {
         self.verdicts
             .lock()
@@ -223,6 +246,15 @@ impl Receiver {
 /// The receiver IS the push endpoint, so a delivery reaches the same validator a poll does.
 impl SsfPushSender for Receiver {
     async fn push(&self, _url: &str, _bearer: Option<&str>, set: &str) -> PushOutcome {
+        // VALIDATED FIRST, EVEN WHILE DOWN. An earlier version returned the 503 before
+        // looking at the token, so every refused attempt went unseen and the module header's
+        // claim that every SET here is validated was false. It also let an outage HIDE a
+        // transmitter that changed the token between attempts, because the test only ever
+        // saw the last one.
+        //
+        // A receiver failing for its own reasons has still RECEIVED the bytes, so recording
+        // them and then refusing is the more faithful model as well as the more testable one.
+        let verdict = self.accept(set);
         let mut outage = self.outage.lock().expect("not poisoned");
         if *outage > 0 {
             *outage -= 1;
@@ -231,7 +263,7 @@ impl SsfPushSender for Receiver {
             return PushOutcome::failed(Some(503), SendFailure::Status(503));
         }
         drop(outage);
-        match self.accept(set) {
+        match verdict {
             Verdict::Accepted(_) | Verdict::Duplicate(_) => PushOutcome::accepted(202),
             Verdict::Refused(_) => PushOutcome::failed(Some(400), SendFailure::Status(400)),
         }
@@ -361,15 +393,30 @@ async fn drain_push(harness: &Harness, receiver: &Receiver, rounds: usize) -> us
         }
         for message in &claimed {
             attempts += 1;
-            if consumer.handle(&env, scope, message).await.is_ok() {
-                harness
-                    .db()
-                    .store()
-                    .scoped(scope)
-                    .outbox()
-                    .complete(&env, message)
-                    .await
-                    .expect("complete");
+            let store = harness.db().store().clone();
+            let queue = store.scoped(scope);
+            let queue = queue.outbox();
+            match consumer.handle(&env, scope, message).await {
+                Ok(()) => {
+                    queue.complete(&env, message).await.expect("complete");
+                }
+                // THE FAILURE IS RECORDED, which an earlier version of this drain skipped.
+                // `fail` is where the attempt counter, the backoff and the dead-letter
+                // decision live, so a drain that only ever completed was re-claiming a
+                // message the queue did not know had failed: `retryable` and `permanent` had
+                // no observable difference, and the outage test wound back a backoff that
+                // had never been set.
+                Err(error) => {
+                    let outcome = queue
+                        .fail(&env, message, error.label(), RetryPolicy::default())
+                        .await
+                        .expect("record the failure");
+                    // A DEAD LETTER IS THE END. The caller has to be able to see it, or a
+                    // test asserting the event survived would loop instead of failing.
+                    if matches!(outcome, FailureOutcome::DeadLettered { .. }) {
+                        return attempts;
+                    }
+                }
             }
         }
     }
@@ -445,23 +492,23 @@ async fn a_receiver_outage_delays_delivery_and_loses_nothing() {
         StatusCode::NO_CONTENT
     );
 
-    // TIME IS WOUND BACK TO THE EPOCH RATHER THAN WAITED OUT. A retryable failure leaves the
-    // message with a backoff the worker would otherwise sleep through, and the claim stamps a
-    // visibility lease; clearing both is what a later wall clock would do. What is being proven
-    // is that the message SURVIVES the refusals, not how long the worker sleeps.
+    // TIME IS WOUND BACK RATHER THAN WAITED OUT. Each refusal records a real failure, which
+    // sets a backoff the worker would otherwise sleep through and releases the lease; clearing
+    // the gate is what a later wall clock would do. What is proven is that the message SURVIVES
+    // the refusals, not how long the worker sleeps.
     //
-    // `TIMESTAMPTZ 'epoch'` AND NOT `now()`, which is the detail that matters: `claim`
+    // `TIMESTAMPTZ 'epoch'` AND NOT `now()`, which is the detail worth recording: `claim`
     // compares `next_attempt_at` against the APPLICATION clock, not the database's, so a row
     // dated from `now()` sits in the future of a harness whose clock is not wall time and is
-    // never eligible. Measured: the first version used `now()` and the worker made exactly one
-    // attempt.
+    // never eligible again. Measured: the first version used `now()` and the worker made
+    // exactly one attempt.
     let mut attempts = drain_push(&harness, &receiver, 1).await;
     for _ in 0..3 {
         harness
             .db()
             .execute_owner_sql(
                 "UPDATE outbox_messages \
-                 SET next_attempt_at = TIMESTAMPTZ 'epoch', claimed_at = NULL \
+                 SET next_attempt_at = TIMESTAMPTZ 'epoch' \
                  WHERE completed_at IS NULL AND dead_lettered_at IS NULL",
             )
             .await;
@@ -472,18 +519,34 @@ async fn a_receiver_outage_delays_delivery_and_loses_nothing() {
         "the worker did not keep trying through the outage"
     );
     assert_eq!(
-        receiver.accepted().len(),
-        1,
-        "the event did not survive the outage: {:?}",
-        receiver.refusals()
-    );
-
-    // AND IT WAS REFUSED THREE TIMES FIRST, which is what makes the acceptance mean something:
-    // an assertion that one event arrived would pass against a receiver that was never down.
-    assert_eq!(
         *receiver.outage.lock().expect("not poisoned"),
         0,
-        "the outage was not exhausted, so fewer attempts were made than the test intends"
+        "the outage was not exhausted, so fewer attempts were made than this test intends"
+    );
+
+    // THE RECEIVER SAW ALL FOUR, because it validates before it decides whether it is up. That
+    // is what lets the next assertion be about IDENTITY rather than merely about arrival.
+    let handled = receiver.handled();
+    assert_eq!(
+        handled.len(),
+        4,
+        "the receiver did not see every delivery attempt: {handled:?}"
+    );
+
+    // AND ALL FOUR WERE THE SAME EVENT. This is the assertion the test's name promises and the
+    // one an "it arrived" check cannot make: a transmitter that minted a fresh `jti` per
+    // attempt would deliver something after the outage and still have lost the original, and
+    // the receiver would have no way to connect the two.
+    assert!(
+        handled.windows(2).all(|pair| pair[0] == pair[1]),
+        "the attempts carried different events, so the one queued before the outage was not \
+         the one delivered after it: {handled:?}"
+    );
+    assert_eq!(
+        receiver.accepted().len(),
+        1,
+        "the event did not survive the outage exactly once: {:?}",
+        receiver.refusals()
     );
 }
 
@@ -651,13 +714,20 @@ async fn a_paused_stream_delivers_on_resume_and_the_receiver_sees_one_event() {
     );
 }
 
-/// The receiver refuses a token this transmitter did not sign.
+/// The receiver refuses a SET whose signature does not check out.
 ///
-/// THE FIXTURE HAS TO BE ABLE TO SAY NO, or every assertion above is a tautology. This hands it
-/// a well-formed SET from a DIFFERENT environment: same shape, same claims, a key the
-/// advertised JWKS does not publish.
+/// THE FIXTURE HAS TO BE ABLE TO SAY NO, or every assertion above it is a tautology.
+///
+/// WHAT IT IS HANDED, precisely: the genuine token with one bit flipped in its SIGNATURE. The
+/// header and payload are untouched, so it names a `kid` the JWKS DOES publish and parses like
+/// any other SET; only the signature check can refuse it. That is the narrowest mutation that
+/// still reaches the verification, which is what makes it a control rather than a smoke test.
+///
+/// An earlier version of this comment described the same token three different and mutually
+/// contradictory ways: as coming from another environment, as naming an unpublished key, and
+/// as carrying "the signature of a different token". It is none of those.
 #[tokio::test]
-async fn the_fixture_refuses_a_set_from_another_transmitter() {
+async fn the_fixture_refuses_a_set_whose_signature_does_not_verify() {
     let mut harness = Harness::start_store_backed().await;
     harness.enable_ssf(20);
     let (client, secret) = harness
@@ -698,8 +768,8 @@ async fn the_fixture_refuses_a_set_from_another_transmitter() {
     // The real one is accepted, which is the control.
     assert!(matches!(receiver.accept(&genuine), Verdict::Accepted(_)));
 
-    // A FORGERY: the same header and payload with the signature of a different token. It is
-    // well formed and names a published kid, so only the signature check can refuse it.
+    // ONE BIT, in the signature. Well formed, and it names a published kid, so the only check
+    // that can refuse it is the signature.
     let mut parts = genuine.split('.');
     let head = parts.next().expect("header");
     let payload = parts.next().expect("payload");
