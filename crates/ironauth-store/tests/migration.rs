@@ -99,7 +99,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      LDAP connector optional groups, \
      LDAP sync snapshots, \
      LDAP sync runs, \
-     Shared Signals streams";
+     Shared Signals streams, \
+     Shared Signals stream SETs";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -730,7 +731,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        216,
+        217,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -773,7 +774,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176,
             177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193,
             194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210,
-            211, 212, 213, 214, 215, 216
+            211, 212, 213, 214, 215, 216, 217
         ]
     );
     let phase_of = |version: i64| async move {
@@ -8448,6 +8449,13 @@ async fn the_data_plane_can_delete_only_where_a_caller_deletes() {
         "scope_step_up_policies",
         "sms_country_allowlist",
         "sms_otp_codes",
+        // `SsfStreamSetRepo::acknowledge`: under RFC 8936 the ACK is the delete. A SET the
+        // receiver has confirmed is one the transmitter no longer owes, and what it contained
+        // is a security event about a subject -- not data to keep after delivery (issue #143).
+        //
+        // BEFORE `ssf_streams`, because this list is compared against a SORTED one and `_`
+        // sorts before `s`.
+        "ssf_stream_sets",
         // `ActingSsfStreamRepo::delete`: SSF 1.0 gives the RECEIVER a stream delete, and the
         // receiver reaches this environment on the data plane (issue #143).
         "ssf_streams",

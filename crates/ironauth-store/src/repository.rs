@@ -328,6 +328,15 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The SETs each Shared Signals stream owes its receiver (issue #143).
+    #[must_use]
+    pub fn ssf_stream_sets(&self) -> SsfStreamSetRepo<'a> {
+        SsfStreamSetRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// What the last completed sync pass saw in each directory (issue #142).
     #[must_use]
     pub fn ldap_sync_snapshots(&self) -> LdapSnapshotRepo<'a> {
@@ -61433,6 +61442,9 @@ const RECOVERY_CODE_BIDX_LABEL: &str = "ironauth.bidx.recovery-code.v1";
 /// The AAD label domain-separating a sealed recipient email on an `email_otp_codes` or
 /// `magic_link_tokens` row (issue #68) from every other envelope context, so a recipient
 /// address ciphertext never authenticates under another column's context.
+/// The AEAD label for a queued SET's sealed token (issue #143).
+const SSF_STREAM_SET_SEAL_LABEL: &str = "ironauth.ssf-stream-set.set-jws.v1";
+
 const EMAIL_FACTOR_RECIPIENT_SEAL_LABEL: &str = "ironauth.envelope.email-factor-recipient.v1";
 /// The AAD label domain-separating the recipient-email blind index on an
 /// `email_otp_codes` / `magic_link_tokens` row (issue #68) from every other keyed
@@ -62241,6 +62253,29 @@ pub fn contact_is_acceptable(display_name: &str, email: &str, category: &str) ->
 
 /// The associated data binding a sealed recipient email on an email-factor row (issue
 /// #68) to its scope and the DEK version that sealed it.
+/// The sealing context for one queued Security Event Token (issue #143): the label, the scope,
+/// the STREAM and the `jti`, and the DEK version.
+///
+/// THE WHOLE PRIMARY KEY IS BOUND IN, which is the point. `(tenant, environment, stream, jti)`
+/// identifies the row exactly, so a ciphertext copied out of one row and written into another
+/// fails to open rather than delivering one receiver's event under another receiver's stream.
+/// Binding only the scope would leave every row in an environment interchangeable.
+fn ssf_stream_set_seal_aad(
+    scope: Scope,
+    stream_id: &SsfStreamId,
+    jti: &str,
+    dek_version: i32,
+) -> Aad {
+    Aad::builder()
+        .text(SSF_STREAM_SET_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .text(&stream_id.to_string())
+        .text(jti)
+        .version(i64::from(dek_version))
+        .build()
+}
+
 fn email_factor_recipient_seal_aad(scope: Scope, dek_version: i32) -> Aad {
     Aad::builder()
         .text(EMAIL_FACTOR_RECIPIENT_SEAL_LABEL)
@@ -81963,6 +81998,233 @@ fn ssf_stream_from_row(row: &PgRow, scope: Scope) -> Result<SsfStream, StoreErro
     })
 }
 
+/// One Security Event Token a stream owes its receiver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedSet {
+    /// The `jti` the receiver acknowledges by.
+    pub jti: String,
+    /// The compact JWS, byte-identical to every earlier delivery of it.
+    pub set_jws: String,
+    /// When it was queued.
+    pub queued_at_unix_micros: i64,
+}
+
+/// The longest Security Event Token this store will hold for a receiver.
+///
+/// A SET carrying an event payload larger than this is a producer defect, and storing it would
+/// let one event fill a receiver's queue. Checked in [`SsfStreamSetRepo::queue`] rather than as a
+/// column constraint because the column holds ciphertext.
+pub const MAX_SET_JWS_BYTES: usize = 16_384;
+
+/// The SETs a stream owes, for RFC 8936 poll delivery.
+///
+/// # No receiver appears in this type
+///
+/// Every method takes a [`SsfStreamId`], and the SURFACE is what proves the caller owns that
+/// stream -- it resolves the stream through [`SsfStreamRepo::get_for_client`] first, which is
+/// fenced. Putting a second fence here would be a fence on a value the caller just proved, and
+/// leaving it out of the type is what stops it being mistaken for the one that matters.
+pub struct SsfStreamSetRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SsfStreamSetRepo<'_> {
+    /// Queue one SET for one stream, sealed under the environment's active DEK.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the handle is out of scope; [`StoreError::Invalid`] if the
+    /// token is longer than [`MAX_SET_JWS_BYTES`], which the schema cannot check because it
+    /// cannot see through the seal; [`StoreError::Conflict`] if this stream has already been
+    /// queued a SET with this `jti`, which for an at-least-once producer means the event is
+    /// already owed and must not be owed twice; [`StoreError::QuotaExceeded`] when the stream is
+    /// already holding `ceiling` unacknowledged SETs; [`StoreError::Encryption`] if the
+    /// environment has no active DEK; [`StoreError::Database`] on a persistence failure.
+    pub async fn queue(
+        &self,
+        env: &Env,
+        stream_id: &SsfStreamId,
+        jti: &str,
+        set_jws: &str,
+        ceiling: u32,
+    ) -> Result<(), StoreError> {
+        if stream_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // BEFORE THE SEAL, because after it the length is the ciphertext's. 0217 bounds the
+        // stored blob as a backstop; this is the bound on the token itself, and it lives here
+        // for the reason `StoreError::Invalid` documents: a `CHECK` cannot read a sealed value,
+        // so a rule about the plaintext has nowhere else to be true.
+        if set_jws.len() > MAX_SET_JWS_BYTES {
+            return Err(StoreError::Invalid);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let (dek_version, dek) = fetch_active_dek(&mut tx, self.scope, master).await?;
+        let sealed = dek.seal(
+            env.entropy(),
+            &ssf_stream_set_seal_aad(self.scope, stream_id, jti, dek_version),
+            set_jws.as_bytes(),
+        );
+        // THE CEILING IS A CONJUNCT OF THE INSERT, the shape `ssf_streams` uses for its own: a
+        // count taken first lets N concurrent producers all see the same under-limit total and
+        // all commit. A receiver that has stopped collecting stops being queued for rather
+        // than growing without bound, and the refusal is visible to the producer.
+        let inserted = sqlx::query(
+            "INSERT INTO ssf_stream_sets \
+             (tenant_id, environment_id, stream_id, jti, set_jws_sealed, pii_dek_version) \
+             SELECT $1, $2, $3, $4, $5, $6 \
+             WHERE (SELECT count(*) FROM ssf_stream_sets \
+                    WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3) < $7",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(stream_id.to_string())
+        .bind(jti)
+        .bind(sealed.as_bytes())
+        .bind(dek_version)
+        .bind(i64::from(ceiling))
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            if is_unique_violation(&error) {
+                StoreError::Conflict
+            } else {
+                StoreError::Database(error)
+            }
+        })?;
+        if inserted.rows_affected() == 0 {
+            return Err(StoreError::QuotaExceeded);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The oldest unacknowledged SETs this stream owes, up to `limit`.
+    ///
+    /// OLDEST FIRST, so a receiver draining a backlog reads its events in the order they
+    /// happened. Nothing is claimed or hidden: RFC 8936 redelivers an unacknowledged SET, so a
+    /// second poll before an acknowledgement returns the same tokens, byte for byte.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn owed(
+        &self,
+        stream_id: &SsfStreamId,
+        limit: i64,
+    ) -> Result<Vec<QueuedSet>, StoreError> {
+        if stream_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT jti, set_jws_sealed, pii_dek_version, \
+                    (EXTRACT(EPOCH FROM queued_at) * 1000000)::bigint AS queued_us \
+             FROM ssf_stream_sets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3 \
+             ORDER BY queued_at, jti LIMIT $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(stream_id.to_string())
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let jti: String = row.get("jti");
+            // PER ROW, BY THE VERSION THE ROW RECORDS, not by whatever is active now: a
+            // rotation between queueing and collection must not strand a backlog.
+            let dek_version: i32 = row.get("pii_dek_version");
+            let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+            let sealed: Vec<u8> = row.get("set_jws_sealed");
+            let plain = dek.open(
+                &ssf_stream_set_seal_aad(self.scope, stream_id, &jti, dek_version),
+                &Sealed::from_bytes(sealed)?,
+            )?;
+            out.push(QueuedSet {
+                set_jws: String::from_utf8(plain).map_err(|_| StoreError::Encryption)?,
+                jti,
+                queued_at_unix_micros: row.get("queued_us"),
+            });
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// How many SETs this stream still owes.
+    ///
+    /// What RFC 8936's `moreAvailable` is computed from, and what an operator reads to see a
+    /// receiver falling behind.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn owed_count(&self, stream_id: &SsfStreamId) -> Result<i64, StoreError> {
+        if stream_id.scope() != self.scope {
+            return Ok(0);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ssf_stream_sets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(stream_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Acknowledge SETs by `jti`, returning how many this stream actually owed.
+    ///
+    /// An acknowledgement of something never owed is not an error: RFC 8936 lets a receiver
+    /// repeat an `ack` it already sent, and a retry of a poll whose response was lost carries
+    /// exactly that. The COUNT is returned so a caller can see the difference without the
+    /// receiver being told it -- telling a receiver which of its acks matched would report on
+    /// state it does not otherwise see.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the handle is out of scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn acknowledge(
+        &self,
+        stream_id: &SsfStreamId,
+        jtis: &[String],
+    ) -> Result<u64, StoreError> {
+        if stream_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        if jtis.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // THE STREAM IS A CONJUNCT, so a receiver cannot acknowledge -- and therefore discard --
+        // a SET owed to a different stream by naming its `jti`. The `jti` is not a secret and a
+        // fan-out gives several streams the same one, so without this an ack would delete
+        // another receiver's undelivered event.
+        let deleted = sqlx::query(
+            "DELETE FROM ssf_stream_sets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3 \
+               AND jti = ANY($4)",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(stream_id.to_string())
+        .bind(jtis)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(deleted.rows_affected())
+    }
+}
+
 /// Reads over one scope's Shared Signals streams.
 ///
 /// # Every read takes the receiver
@@ -82289,6 +82551,24 @@ impl ActingSsfStreamRepo<'_> {
                 .await?;
                 if updated.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
+                }
+                // `disabled` RETAINS NOTHING, which 0216 states and which nothing enforced: a
+                // stream dropped to it kept everything it owed, so re-enabling replayed a
+                // backlog the receiver had been told was discarded -- and until then the rows
+                // sat at rest naming subjects. Dropped IN THE SAME TRANSACTION as the status,
+                // so the two can never disagree.
+                //
+                // `paused` keeps them, which is the whole difference between the two states.
+                if stored == SsfStreamStatus::Disabled.as_str() {
+                    sqlx::query(
+                        "DELETE FROM ssf_stream_sets \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3",
+                    )
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(id.to_string())
+                    .execute(&mut **tx)
+                    .await?;
                 }
                 Ok(())
             },

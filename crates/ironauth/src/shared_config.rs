@@ -626,9 +626,9 @@ mod tests {
             "ssf",
             Reach::OnePlaneOrNoState,
             "read at boot in two places, NEITHER of them the management plane (issue #143). \
-             The OIDC plane's state builder takes \
-             `with_ssf(config.ssf.enabled, config.ssf.max_streams_per_client)`, which arms the \
-             stream-management surface and its discovery document; and `ssf_push_inputs` reads \
+             The OIDC plane's state builder takes `with_ssf(&config.ssf)`, which arms the \
+             stream-management surface, its poll-delivery endpoint and its discovery document; \
+             and `ssf_push_inputs` reads \
              `config.ssf.enabled` to decide whether to start the RFC 8935 push worker, which \
              answers no request at all and owns its own store handles.\n\n\
              IT IS PUBLIC-PLANE ONLY. A receiver reaches these endpoints with an OAuth client \

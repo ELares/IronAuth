@@ -1159,6 +1159,7 @@ pub fn oidc_router(state: OidcState) -> Router {
                 ssf::STATUS_PATH,
                 get(ssf::read_status).post(ssf::update_status),
             )
+            .route(ssf::POLL_PATH, post(ssf::poll))
             .route(ssf::CONFIGURATION_PATH, get(ssf::configuration));
     }
 

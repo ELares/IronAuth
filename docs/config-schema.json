@@ -2769,6 +2769,13 @@
           "description": "Whether to serve the Shared Signals stream-management surface and its discovery\ndocument on the public plane. Off by default.\n\nOff is a uniform 404 on every `/ssf/` path AND on `/.well-known/ssf-configuration`,\nnot a 501 and not a document advertising nothing: a receiver probing a deployment that\nhas not enabled SSF learns that it does not implement it, which is true.",
           "type": "boolean"
         },
+        "max_owed_sets_per_stream": {
+          "default": 1000,
+          "description": "The most UNACKNOWLEDGED SETs one poll stream may hold.\n\nA poll receiver collects on its own schedule, so the transmitter holds what it owes\nuntil an acknowledgement. A receiver that stops collecting therefore accumulates, and\nthis is what stops that being unbounded: past it the queue REFUSES rather than evicting,\nbecause dropping the oldest events silently is the failure the whole subsystem exists to\nprevent, and a refusal is visible to the producer and to an operator.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "max_streams_per_client": {
           "default": 20,
           "description": "The most streams one receiver may hold in one environment.\n\nA stream is cheap to create and permanent until deleted, and each one multiplies the\nwork every emitted event costs, so an unbounded count is a client-chosen amount of\nserver work on every signal this environment produces. Reaching it REFUSES the create\nrather than evicting an existing stream: a receiver silently losing the stream it has\nbeen polling is a delivery gap it cannot detect, which is the failure this subsystem\nexists to prevent.",
@@ -3446,6 +3453,7 @@
       "$ref": "#/$defs/SsfConfig",
       "default": {
         "enabled": false,
+        "max_owed_sets_per_stream": 1000,
         "max_streams_per_client": 20
       },
       "description": "The Shared Signals transmitter (issue #143). OFF by default, so the default boot\nmounts no stream-management surface and serves no SSF discovery document."

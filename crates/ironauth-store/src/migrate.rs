@@ -1780,6 +1780,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0216_ssf_streams.sql"),
         },
+        Migration {
+            version: 217,
+            name: "ssf_stream_sets",
+            // EXPAND. A new table with no writer on any older binary: an old binary mounts no
+            // SSF surface, so nothing reads or writes it during a rolling upgrade.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0217_ssf_stream_sets.sql"),
+        },
     ]
 }
 

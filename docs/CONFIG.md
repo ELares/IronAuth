@@ -344,6 +344,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `server.shutdown_grace_secs` | integer | `25` | Maximum seconds to drain in-flight requests after a shutdown signal before the process exits regardless. Zero exits without draining. |
 | `ssf` | table | see fields | The Shared Signals transmitter (issue #143). OFF by default, so the default boot mounts no stream-management surface and serves no SSF discovery document. |
 | `ssf.enabled` | boolean | `false` | Whether to serve the Shared Signals stream-management surface and its discovery document on the public plane. Off by default. |
+| `ssf.max_owed_sets_per_stream` | integer | `1000` | The most UNACKNOWLEDGED SETs one poll stream may hold. |
 | `ssf.max_streams_per_client` | integer | `20` | The most streams one receiver may hold in one environment. |
 | `telemetry` | table | see fields | Observability settings: log format and trace export. |
 | `telemetry.log_format` | string | `"json"` | Structured-log output format for the process log stream. |
