@@ -625,10 +625,12 @@ mod tests {
         (
             "ssf",
             Reach::OnePlaneOrNoState,
-            "read once at boot by the OIDC plane's state builder (issue #143): \
-             `with_ssf(config.ssf.enabled, config.ssf.max_streams_per_client)` arms the Shared \
-             Signals stream-management surface and its discovery document, both of which hang \
-             off the per-environment issuer path the OIDC router owns.\n\n\
+            "read at boot in two places, NEITHER of them the management plane (issue #143). \
+             The OIDC plane's state builder takes \
+             `with_ssf(config.ssf.enabled, config.ssf.max_streams_per_client)`, which arms the \
+             stream-management surface and its discovery document; and `ssf_push_inputs` reads \
+             `config.ssf.enabled` to decide whether to start the RFC 8935 push worker, which \
+             answers no request at all and owns its own store handles.\n\n\
              IT IS PUBLIC-PLANE ONLY. A receiver reaches these endpoints with an OAuth client \
              credential, not an operator credential, so nothing under `/v1/tenants/...` serves \
              them and the management plane's state has no field for them. Off is a uniform 404 \

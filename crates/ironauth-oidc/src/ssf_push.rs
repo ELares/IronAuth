@@ -17,6 +17,10 @@
 //! log. That is also what makes at-least-once delivery safe to expose to a receiver -- the
 //! duplicate is detectable BY the receiver, which is the only place it can be.
 //!
+//! The TOKEN is not byte-identical across attempts, and the claim is not that it is: `iat` is
+//! stamped at each mint, so the JWS differs. What is stable is the `jti`, which is the handle a
+//! receiver dedups on, and that is the whole of what at-least-once requires.
+//!
 //! # The stream is re-read at delivery, not carried
 //!
 //! Only the `stream_id` travels. The endpoint, the audience, the credential name and the
@@ -27,10 +31,11 @@
 //!
 //! # What a receiver's answer means
 //!
-//! RFC 8935 section 2.2: a receiver that accepts a SET answers `202 Accepted` with an empty
-//! body. This treats any 2xx as accepted, because transmitters meet receivers that answer
-//! `200`, and refusing those would be refusing to interoperate over a distinction RFC 8935
-//! itself does not make load bearing.
+//! RFC 8935 section 2.2 is normative here: a receiver that accepts a SET SHALL respond with
+//! `202 Accepted` and an empty body. This transmitter nonetheless treats any 2xx as accepted,
+//! which is a DEVIATION and is named as one rather than dressed up as latitude the spec gives:
+//! receivers in the field answer `200`, and failing those would retry a SET the receiver
+//! already holds until it dead-lettered.
 //!
 //! A 4xx is the receiver saying the SET is wrong, which a retry cannot fix, so it is PERMANENT
 //! and the message dead-letters. A 5xx, a timeout, and a transport fault are the receiver being
@@ -166,9 +171,14 @@ pub trait SsfPushSender: Send + Sync {
     /// POST `set` to `url` as `application/secevent+jwt`.
     ///
     /// `bearer` is the plaintext credential the receiver asked to be presented, already
-    /// resolved, or `None` when the receiver relies on the SET's signature alone -- which
-    /// RFC 8935 permits and which is the honest default: the signature IS the authentication
-    /// and a bearer is at most a second gate.
+    /// resolved, or `None` when the receiver asked for none.
+    ///
+    /// The two authenticate DIFFERENT things, and an earlier version of this comment conflated
+    /// them. The SET's SIGNATURE authenticates the ISSUER of the event: it proves this
+    /// environment minted it, and a receiver checks it against the published JWKS. The BEARER
+    /// authenticates the TRANSMITTER to the receiver's endpoint, which is the separate question
+    /// of who may POST there at all. RFC 8935 leaves the second to the receiver; omitting it is
+    /// a choice the receiver makes, not a claim that the signature covers it.
     fn push(
         &self,
         url: &str,
@@ -314,9 +324,21 @@ impl<S: SsfPushSender> SsfPushConsumer<S> {
             Err(_) => return Err(ConsumerError::retryable("stream_read_failed")),
         };
 
-        // A PAUSED STREAM IS NOT A FAILURE, it is a receiver asking to be left alone. Retrying
-        // is exactly right: the schedule holds the event until the receiver resumes, which is
-        // what `paused` means as against `disabled`.
+        // A PAUSED STREAM IS NOT A FAILURE, it is a receiver asking to be left alone, so this
+        // retries rather than discarding.
+        //
+        // AND THE HOLD IS BOUNDED, which is worth stating because `paused` is documented as the
+        // state that RETAINS. A retryable failure spends one of a finite attempts budget: at
+        // the shipped defaults (`outbox.max_attempts = 14`, `retry_base_secs = 30`, capped by
+        // `OUTBOX_MAX_BACKOFF_SECS`) the thirteen backoffs span about 37 hours, after which the
+        // message dead-letters. Because the ordering key is the stream, only the HEAD of a
+        // paused stream's queue spends attempts, so a pause of length D silently loses roughly
+        // D/37h of its OLDEST events and delivers the rest on resume.
+        //
+        // That is a real gap and it is NOT closed here: durable retention across a long pause
+        // belongs with the store that RFC 8936 poll delivery needs anyway, and inventing a
+        // second one in the push consumer would be the wrong place for it. Tracked separately;
+        // this comment exists so the bound is known rather than discovered.
         if !stream.status.delivers() {
             if stream.status.retains() {
                 return Err(ConsumerError::retryable("stream_paused"));
@@ -358,7 +380,7 @@ impl<S: SsfPushSender> SsfPushConsumer<S> {
 
         let bearer = match secret_name {
             None => None,
-            Some(name) => Some(self.resolve_secret(scope, name).await?),
+            Some(name) => Some(self.resolve_secret(scope, &stream.client_id, name).await?),
         };
 
         let outcome = self
@@ -367,26 +389,29 @@ impl<S: SsfPushSender> SsfPushConsumer<S> {
             .await;
         match outcome.failure {
             None => Ok(()),
-            // A 4xx IS THE RECEIVER REJECTING THIS SET, which a retry cannot fix -- except 429,
-            // which asks for less rather than saying no. Everything else is the receiver being
-            // down, which is what the schedule is for.
-            Some(SendFailure::Status(status)) if (400..500).contains(&status) && status != 429 => {
-                Err(ConsumerError::permanent(
-                    SendFailure::Status(status).label(),
-                ))
-            }
+            Some(SendFailure::Status(status)) if permanent_status(status) => Err(
+                ConsumerError::permanent(SendFailure::Status(status).label()),
+            ),
             Some(failure) => Err(ConsumerError::retryable(failure.label())),
         }
     }
 
     /// Open the environment secret the receiver asked to be presented.
-    async fn resolve_secret(&self, scope: Scope, name: &str) -> Result<String, ConsumerError> {
+    async fn resolve_secret(
+        &self,
+        scope: Scope,
+        owner: &ironauth_store::ClientId,
+        name: &str,
+    ) -> Result<String, ConsumerError> {
         // THE FENCE AT THE READ, and this is the one that matters. The create door refuses a
-        // name outside `ssf::PUSH_SECRET_PREFIX`, but a row written before that rule existed,
+        // name outside the receiver's own namespace, but a row written before that rule existed,
         // or restored by a config import, never passed the door -- and this is the code that
-        // would open the secret and POST it to an address the receiver chose. PERMANENT rather
-        // than retryable: no amount of waiting makes a name legal.
-        if !name.starts_with(crate::ssf::PUSH_SECRET_PREFIX) {
+        // would open the secret and POST it to an address the receiver chose.
+        //
+        // IT COMPARES AGAINST THE STREAM'S OWN OWNER, not against a subsystem-wide prefix: a
+        // namespace every receiver shares stops none of them naming another's bearer. PERMANENT
+        // rather than retryable, because no amount of waiting makes a name legal.
+        if !name.starts_with(&crate::ssf::push_secret_prefix(owner)) {
             return Err(ConsumerError::permanent("push_secret_outside_namespace"));
         }
         let sealed = self
@@ -416,6 +441,20 @@ impl<S: SsfPushSender> OutboxConsumer for SsfPushConsumer<S> {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), ConsumerError>> + Send + 'a>> {
         Box::pin(self.deliver_one(env, scope, message))
     }
+}
+
+/// Whether a receiver's status means "this SET is wrong" rather than "come back later".
+///
+/// See the module header: RFC 8935 section 2.3 has a receiver answer `400` for an AUTHENTICATION
+/// failure and section 4 names that class transient, so treating every 4xx as final would
+/// discard a receiver's events over a rotated bearer.
+///
+/// `401` and `403` are the same fact under a different code, and `429` asks for less rather than
+/// saying no. A bare `400` is permanent HERE because [`PushOutcome`] carries only the status and
+/// not the receiver's `err` body -- a deliberate bound, stated rather than hidden: the transient
+/// `400` is the case this gets wrong, and reading that body is what would fix it.
+fn permanent_status(status: u16) -> bool {
+    !matches!(status, 401 | 403 | 429) && (400..500).contains(&status)
 }
 
 /// One required string off the message payload.

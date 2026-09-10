@@ -558,7 +558,7 @@ async fn a_named_credential_inside_the_namespace_is_presented_as_a_bearer() {
         .put(
             &env,
             &harness.db().master_key(),
-            "ssf_push_receiver",
+            &format!("ssf_push_{client}_receiver"),
             b"the-receivers-bearer",
             None,
         )
@@ -570,7 +570,7 @@ async fn a_named_credential_inside_the_namespace_is_presented_as_a_bearer() {
         &client,
         SsfDelivery::Push {
             endpoint_url: "https://receiver.example.com/events".to_owned(),
-            secret_name: Some("ssf_push_receiver".to_owned()),
+            secret_name: Some(format!("ssf_push_{client}_receiver")),
         },
     )
     .await;
@@ -585,4 +585,64 @@ async fn a_named_credential_inside_the_namespace_is_presented_as_a_bearer() {
     let sent = sender.sent();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].bearer.as_deref(), Some("the-receivers-bearer"));
+}
+
+#[tokio::test]
+async fn one_receiver_cannot_name_another_receivers_credential() {
+    // The escape an environment-wide `ssf_push_` prefix would NOT have closed. Receiver A names
+    // the secret receiver B registered, and without a per-receiver namespace this worker would
+    // open B's bearer and POST it to A's endpoint.
+    let harness = Harness::start_store_backed().await;
+    let scope = harness.scope();
+    let env = harness.state().env().clone();
+    let mine = harness
+        .create_confidential_client(ironauth_oidc::ClientAuthMethod::Basic)
+        .await
+        .0;
+    let theirs = harness
+        .create_confidential_client(ironauth_oidc::ClientAuthMethod::Basic)
+        .await
+        .0;
+    harness
+        .db()
+        .store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .environment_secrets()
+        .put(
+            &env,
+            &harness.db().master_key(),
+            &format!("ssf_push_{theirs}_receiver"),
+            b"the-other-receivers-bearer",
+            None,
+        )
+        .await
+        .expect("the other receiver's credential");
+
+    // MY stream, naming THEIR credential. Written through the store, because the door refuses
+    // it -- and the door is not the fence under test.
+    let stream = seed_stream(
+        &harness,
+        &mine,
+        SsfDelivery::Push {
+            endpoint_url: "https://mine.example.com/events".to_owned(),
+            secret_name: Some(format!("ssf_push_{theirs}_receiver")),
+        },
+    )
+    .await;
+    let store = harness.db().store().clone();
+    let message = queue_one(&store, &harness, &stream, "evt_cross").await;
+
+    let sender = RecordingSender::default();
+    let error = consumer(&harness, sender.clone())
+        .handle(&env, scope, &message)
+        .await
+        .expect_err("another receiver's credential must not be opened");
+    assert_eq!(error.label(), "push_secret_outside_namespace");
+    assert!(!error.is_retryable(), "{}", error.label());
+    assert!(
+        sender.sent().is_empty(),
+        "it POSTed to my endpoint carrying their bearer: {:?}",
+        sender.sent()
+    );
 }
