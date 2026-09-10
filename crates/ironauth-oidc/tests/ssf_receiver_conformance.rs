@@ -270,6 +270,42 @@ impl SsfPushSender for Receiver {
     }
 }
 
+async fn patch(harness: &Harness, uri: &str, auth: &str, body: String) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method("PATCH")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, auth)
+        .body(Body::from(body))
+        .expect("request builds");
+    let (status, _headers, text) = harness.send(request).await;
+    (status, text)
+}
+
+async fn get_with_auth(harness: &Harness, uri: &str, auth: &str) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(header::AUTHORIZATION, auth)
+        .body(Body::empty())
+        .expect("request builds");
+    let (status, _headers, text) = harness.send(request).await;
+    (status, text)
+}
+
+/// Read one stream as its receiver.
+async fn read_stream(
+    harness: &Harness,
+    auth: &str,
+    streams: &str,
+    stream_id: &str,
+) -> serde_json::Value {
+    let (status, text) =
+        get_with_auth(harness, &format!("{streams}?stream_id={stream_id}"), auth).await;
+    assert_eq!(status, StatusCode::OK, "read the stream: {text}");
+    serde_json::from_str(&text).expect("a stream object")
+}
+
 async fn get(harness: &Harness, uri: &str) -> (StatusCode, String) {
     let request = Request::builder()
         .method("GET")
@@ -421,6 +457,148 @@ async fn drain_push(harness: &Harness, receiver: &Receiver, rounds: usize) -> us
         }
     }
     attempts
+}
+
+/// The receiver provisions its own stream over HTTP: create, read, update, delete.
+///
+/// CRITERION 1 SAYS "STREAM CRUD ... EXERCISED BY AN IN-REPO RECEIVER CONFORMANCE FIXTURE",
+/// and the other tests here seed their stream through the STORE, which is a shortcut no
+/// receiver has. This one uses the endpoints, in the order a receiver would: create, read back
+/// what was created, change what SSF lets it change, and delete.
+///
+/// THE READ-BACK IS THE POINT of the first half. A create that answers 201 with a body it
+/// invented, while storing something else, is green to a test that only checks the response.
+#[tokio::test]
+async fn a_receiver_provisions_its_own_stream_over_http() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    provision_envelope(&harness, &harness.state().env().clone()).await;
+    let scope = harness.scope();
+    let streams = format!(
+        "/t/{}/e/{}/ssf/streams",
+        scope.tenant(),
+        scope.environment()
+    );
+
+    // CREATE
+    let (status, text) = post(
+        &harness,
+        &streams,
+        &auth,
+        serde_json::json!({
+            "delivery": { "method": "urn:ietf:rfc:8936" },
+            "events_requested": [],
+            "aud": [AUDIENCE],
+            "format": "iss_sub",
+            "description": "the receiver's own label",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    let created: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
+    let stream_id = created["stream_id"].as_str().expect("stream_id").to_owned();
+
+    // READ, and it must agree with what the create returned.
+    let (status, text) = get(&harness, &format!("{streams}?stream_id={stream_id}")).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "an uncredentialed read answered: {text}"
+    );
+    let read_back = read_stream(&harness, &auth, &streams, &stream_id).await;
+    assert_eq!(
+        read_back, created,
+        "the create returned a configuration the store does not hold"
+    );
+
+    // UPDATE, one receiver-supplied property, and the rest must survive it.
+    let (status, text) = patch(
+        &harness,
+        &streams,
+        &auth,
+        serde_json::json!({
+            "stream_id": stream_id,
+            "description": "renamed by its receiver",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let updated: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
+    assert_eq!(
+        updated["description"],
+        serde_json::json!("renamed by its receiver")
+    );
+    assert_eq!(
+        updated["delivery"], created["delivery"],
+        "an update naming only the description changed the delivery"
+    );
+
+    // AND IT IS DELIVERABLE AFTER THE ROUND TRIP, which is what makes CRUD worth testing from
+    // here rather than from a suite that only reads the store: a configuration surviving
+    // create-read-update and then unable to carry an event is still broken.
+    assert_provisioned_stream_delivers(&harness, &auth, &stream_id).await;
+
+    // DELETE, and it is gone for good.
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(format!("{streams}?stream_id={stream_id}"))
+        .header(header::AUTHORIZATION, &auth)
+        .body(Body::empty())
+        .expect("request builds");
+    let (status, _headers, text) = harness.send(request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+    let (status, text) =
+        get_with_auth(&harness, &format!("{streams}?stream_id={stream_id}"), &auth).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a deleted stream is still readable: {text}"
+    );
+}
+
+/// Ask for a verification event on a stream named by handle, collect it, and require a
+/// freshly bootstrapped receiver to accept it.
+async fn assert_provisioned_stream_delivers(harness: &Harness, auth: &str, stream_id: &str) {
+    let scope = harness.scope();
+    let id = SsfStreamId::parse_in_scope(stream_id, &scope).expect("the handle parses");
+    let receiver = Receiver::bootstrap(harness).await;
+    assert_eq!(
+        request_verification(harness, auth, &id).await,
+        StatusCode::NO_CONTENT
+    );
+    let (status, text) = post(
+        harness,
+        &format!(
+            "/t/{}/e/{}/ssf/poll/{stream_id}",
+            scope.tenant(),
+            scope.environment()
+        ),
+        auth,
+        r#"{"maxEvents":10,"returnImmediately":true}"#.to_owned(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let page: serde_json::Value = serde_json::from_str(&text).expect("a poll document");
+    let set = page["sets"]
+        .as_object()
+        .expect("sets")
+        .values()
+        .next()
+        .expect("one SET")
+        .as_str()
+        .expect("a compact JWS")
+        .to_owned();
+    assert!(
+        matches!(receiver.accept(&set), Verdict::Accepted(_)),
+        "the stream the receiver provisioned could not carry an event: {:?}",
+        receiver.refusals()
+    );
 }
 
 /// A push receiver bootstraps, is verified, and validates what arrives.
