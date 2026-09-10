@@ -27731,6 +27731,17 @@ pub enum TrustedDeviceRevokeReason {
     PasswordChange,
     /// An MFA factor removal/regeneration invalidated the device's trust (per policy).
     FactorChange,
+    /// An UPSTREAM identity provider reported the federated account compromised
+    /// (issue #144). Not an act by anyone inside this system, which is why it is its own
+    /// reason rather than `admin`: the reason column is read by a human deciding whether
+    /// a revocation was expected, and naming an operator who did nothing would mislead
+    /// exactly that reader.
+    ///
+    /// Revoking device trust is the STEP-UP half of the configured protection. A
+    /// remembered device is precisely what lets the next sign-in skip the strong factor,
+    /// so ending sessions while leaving trust in place would invite whoever holds the
+    /// upstream account back in with one password.
+    UpstreamCompromise,
 }
 
 impl TrustedDeviceRevokeReason {
@@ -27742,6 +27753,7 @@ impl TrustedDeviceRevokeReason {
             TrustedDeviceRevokeReason::Admin => "admin",
             TrustedDeviceRevokeReason::PasswordChange => "password_change",
             TrustedDeviceRevokeReason::FactorChange => "factor_change",
+            TrustedDeviceRevokeReason::UpstreamCompromise => "upstream_compromise",
         }
     }
 }
