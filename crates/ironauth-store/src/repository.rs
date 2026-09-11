@@ -49493,6 +49493,175 @@ impl<'a> ManagementStore<'a> {
         }
     }
 
+    /// The access-review export for one organization (issue #145 criterion 1).
+    ///
+    /// One row per PATH by which a member holds a role, which is what an access review is
+    /// for: "does this person hold admin" is answerable from any of them, and "what do I
+    /// withdraw so they stop holding it" is answerable only from all of them. A member who
+    /// holds NOTHING gets a row too; see [`AccessReviewRow`].
+    ///
+    /// # A loop over the resolver, not a join of its tables
+    ///
+    /// This calls the effective-grant resolvers once per member rather than answering the
+    /// same question in one statement of its own, and the extra queries buy the only property
+    /// that matters here: the export agrees with what the product does. Those resolvers
+    /// already carry the bounded ancestor walk, liveness on every table, the organization's
+    /// own lifecycle, and the DEFAULT role that has no row to join to. A second statement
+    /// would reproduce none of them on its first day and drift afterwards, and an auditor's
+    /// evidence quietly disagreeing with the tokens being issued is worse than none.
+    ///
+    /// # Both kinds of member
+    ///
+    /// People and service accounts are both organization members (migration 0124) and both
+    /// resolve through the same closure. A first version of this listed only people, so a
+    /// machine identity holding a role appeared nowhere in the evidence for the organization
+    /// it holds it in. `principal_kind` on each row says which.
+    ///
+    /// # Drained, not truncated
+    ///
+    /// Both member lists are paged through to the end with a keyset cursor and a short-page
+    /// terminator, the way `export_paged` drains identities. A first version took a `limit`
+    /// and passed it straight to one `list_for_org` call, which `MANAGEMENT_LIST_HARD_CAP`
+    /// clamps to 1000: an organization with more members than that produced a SHORTER
+    /// evidence file with no error, no flag, and no way to page. Worse, a caller could not
+    /// detect it, because rows and members are not 1:1 -- a member with four paths to a role
+    /// contributes four rows, so a short page cannot be inferred from the row count.
+    ///
+    /// The whole review is held in memory. That is the trade this makes and the identity
+    /// export does not: that one streams because a consumer takes it a record at a time,
+    /// while this one exists to become a file.
+    ///
+    /// # Deterministic, because a consumer pins it
+    ///
+    /// Members come back ordered by `(created_at, id)` within each kind, people before
+    /// machines, and each member's grants by `(slug, source, via_group_id)`. Two exports of
+    /// identical stored state are byte-identical, which is what a compliance pipeline
+    /// diffing quarter against quarter needs.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure. An EMPTY export means the
+    /// organization is outside this scope or has no members, and nothing else.
+    ///
+    /// A DISABLED OR SOFT-DELETED ORGANIZATION IS NOT EMPTY, which is worth stating because
+    /// an earlier version of this sentence said it was. Neither lifecycle write cascades to
+    /// `org_memberships`, so the members still list; the resolvers fence the organization's
+    /// own lifecycle, so each resolves to no grants; and a member with no grants is a `none`
+    /// row. Such an organization therefore exports one `none` row per member, and THAT is the
+    /// signal a reader should key on, not emptiness.
+    pub async fn access_review(
+        &self,
+        scope: Scope,
+        organization_id: &OrganizationId,
+        max_group_depth: u32,
+    ) -> Result<Vec<crate::access_review::AccessReviewRow>, StoreError> {
+        self.access_review_in_pages(
+            scope,
+            organization_id,
+            max_group_depth,
+            MANAGEMENT_LIST_HARD_CAP,
+        )
+        .await
+    }
+
+    /// [`Self::access_review`] with the page size the drain reads in.
+    ///
+    /// The public call uses `MANAGEMENT_LIST_HARD_CAP`. The listing statements clamp to
+    /// `MANAGEMENT_LIST_HARD_CAP + 1`, so the cap is a page they will always return in full,
+    /// which is what the short-page terminator below needs: a page shorter than the one asked
+    /// for has to mean the end, not a ceiling being applied. This exists
+    /// for two reasons: a caller under memory pressure can drain in smaller bites, and the
+    /// MULTI-PAGE path is otherwise untestable without seeding a thousand members. A drain
+    /// whose cursor advance and short-page terminator are never executed in a test is a loop
+    /// nobody has run, and this method is what lets three members and a page of two run it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::access_review`].
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: each drain takes the last record of a page it has just confirmed
+    /// non-empty, so the `expect` is unreachable by construction rather than by assumption.
+    pub async fn access_review_in_pages(
+        &self,
+        scope: Scope,
+        organization_id: &OrganizationId,
+        max_group_depth: u32,
+        page: i64,
+    ) -> Result<Vec<crate::access_review::AccessReviewRow>, StoreError> {
+        let memberships = self.org_memberships(scope);
+        let groups = self.org_groups(scope);
+        let organization = organization_id.to_string();
+        let page = page.clamp(1, MANAGEMENT_LIST_HARD_CAP);
+        let mut rows = Vec::new();
+
+        let mut after: Option<CursorPosition> = None;
+        loop {
+            let batch = memberships
+                .list_for_org(organization_id, page, after.as_ref())
+                .await?;
+            if batch.is_empty() {
+                break;
+            }
+            for membership in &batch {
+                let grants = groups
+                    .effective_role_grants(organization_id, &membership.user_id, max_group_depth)
+                    .await?;
+                rows.extend(crate::access_review::AccessReviewRow::from_grants(
+                    &organization,
+                    "user",
+                    &membership.id.to_string(),
+                    &membership.user_id.to_string(),
+                    &grants,
+                ));
+            }
+            if i64::try_from(batch.len()).unwrap_or(i64::MAX) < page {
+                break;
+            }
+            let last = batch.last().expect("a non-empty page has a last record");
+            after = Some(CursorPosition {
+                created_at_unix_micros: last.created_at_unix_micros,
+                id: last.id.to_string(),
+            });
+        }
+
+        let mut after: Option<CursorPosition> = None;
+        loop {
+            let batch = memberships
+                .list_service_accounts_for_org(organization_id, page, after.as_ref())
+                .await?;
+            if batch.is_empty() {
+                break;
+            }
+            for membership in &batch {
+                let grants = groups
+                    .effective_role_grants_for_service_account(
+                        organization_id,
+                        &membership.service_account_id,
+                        max_group_depth,
+                    )
+                    .await?;
+                rows.extend(crate::access_review::AccessReviewRow::from_grants(
+                    &organization,
+                    "service_account",
+                    &membership.id.to_string(),
+                    &membership.service_account_id.to_string(),
+                    &grants,
+                ));
+            }
+            if i64::try_from(batch.len()).unwrap_or(i64::MAX) < page {
+                break;
+            }
+            let last = batch.last().expect("a non-empty page has a last record");
+            after = Some(CursorPosition {
+                created_at_unix_micros: last.created_at_unix_micros,
+                id: last.id.to_string(),
+            });
+        }
+        Ok(rows)
+    }
+
     /// Project grants (issue #102): what a DELEGATED administrator of an organization
     /// may assign. Reads only; the write surface is audited and lives on the acting
     /// store.
@@ -51596,6 +51765,45 @@ impl OrgGroupRepo<'_> {
                 EFFECTIVE_ROLE_GRANTS_TAIL,
             )
             .await?;
+        self.decode_grants(&rows)
+    }
+
+    /// [`Self::effective_role_grants`] for a MACHINE member.
+    ///
+    /// The same closure, the same tail, the same decode: `run_effective` takes the principal
+    /// as a parameter precisely so a machine identity and a person resolve their roles the
+    /// same way, and `effective_roles_for_service_account` is the slugs-only sibling that
+    /// already relies on it. This one exists because the access-review export (issue #145
+    /// criterion 1) needs the PATHS and not just the set, and a review found the export was
+    /// listing people only -- a machine holding `billing.admin` appeared nowhere in the
+    /// evidence for the organization it holds it in.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::effective_role_grants`].
+    pub async fn effective_role_grants_for_service_account(
+        &self,
+        organization_id: &OrganizationId,
+        service_account_id: &ServiceAccountId,
+        max_group_depth: u32,
+    ) -> Result<Vec<EffectiveRoleGrant>, StoreError> {
+        let rows = self
+            .run_effective(
+                organization_id,
+                MembershipPrincipal::ServiceAccount(service_account_id),
+                max_group_depth,
+                EFFECTIVE_ROLE_GRANTS_TAIL,
+            )
+            .await?;
+        self.decode_grants(&rows)
+    }
+
+    /// One decode for both principals, so the two resolutions cannot drift on what a
+    /// projected `source` means.
+    fn decode_grants(
+        &self,
+        rows: &[sqlx::postgres::PgRow],
+    ) -> Result<Vec<EffectiveRoleGrant>, StoreError> {
         rows.iter()
             .map(|row| {
                 let slug = row.get::<String, _>("slug");
