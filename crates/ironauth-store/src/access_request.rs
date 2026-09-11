@@ -79,7 +79,11 @@ pub struct AccessGrantRequest {
     pub decided_by: Option<String>,
     /// When it was decided, in epoch micros.
     pub decided_at_micros: Option<i64>,
-    /// When the granted access ends, in epoch micros. Present exactly when approved.
+    /// When the granted access ends, in epoch micros.
+    ///
+    /// Present on an APPROVED row and kept on an EXPIRED one; absent on pending and
+    /// denied, neither of which ever granted. The `granted_until_iff_granted` CHECK is what
+    /// enforces that, not this sentence.
     pub granted_until_micros: Option<i64>,
     /// When it was raised, in epoch micros.
     pub created_at_micros: i64,
@@ -289,7 +293,7 @@ mod tests {
 
     #[test]
     fn an_approved_row_with_no_deadline_grants_nothing() {
-        // Refused by `access_grant_requests_granted_until_iff_approved`, so unreachable for
+        // Refused by `access_grant_requests_granted_until_iff_granted`, so unreachable for
         // a row this build wrote. Asserted because the alternative reading of a row it did
         // not write -- treating a missing deadline as unbounded -- is the standing access
         // this whole primitive exists to replace.

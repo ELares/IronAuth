@@ -202,6 +202,8 @@ pub fn to_jsonl(rows: &[AccessReviewRow]) -> String {
             "role_slug": row.role_slug,
             "source": row.source,
             "via_group_id": row.via_group_id,
+            "via_request_id": row.via_request_id,
+            "granted_until_unix_ms": row.granted_until_unix_ms,
         });
         out.push_str(&value.to_string());
         out.push('\n');
@@ -228,6 +230,13 @@ pub fn to_csv(rows: &[AccessReviewRow]) -> String {
             row.role_slug.as_str(),
             row.source,
             row.via_group_id.as_deref().unwrap_or(""),
+            row.via_request_id.as_deref().unwrap_or(""),
+            // EMPTY rather than `0` when absent: a consumer reading a deadline out of a
+            // row that never had one would schedule a revocation for a grant that does
+            // not exist, which is the same mistake the event payload avoids.
+            &row.granted_until_unix_ms
+                .map(|at| at.to_string())
+                .unwrap_or_default(),
         ];
         let encoded: Vec<String> = fields.iter().map(|field| csv_field(field)).collect();
         out.push_str(&encoded.join(","));

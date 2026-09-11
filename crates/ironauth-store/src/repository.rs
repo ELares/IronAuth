@@ -51891,6 +51891,33 @@ impl OrgGroupRepo<'_> {
         .await
     }
 
+    /// [`Self::effective_permissions`] PLUS the permissions of any live time-boxed role
+    /// (issue #145 criterion 4, EXPLORATORY).
+    ///
+    /// Paired with [`Self::effective_role_grants_at`] and always called beside it: a
+    /// response whose `roles` reported the elevation and whose `permissions` did not would
+    /// tell an operator the member holds a role and holds none of what that role carries.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::effective_permissions`].
+    pub async fn effective_permissions_at(
+        &self,
+        organization_id: &OrganizationId,
+        user_id: &UserId,
+        max_group_depth: u32,
+        now_micros: i64,
+    ) -> Result<BTreeSet<String>, StoreError> {
+        self.resolve_effective_at(
+            organization_id,
+            MembershipPrincipal::User(user_id),
+            max_group_depth,
+            EFFECTIVE_PERMISSION_SLUGS_TIME_BOXED_TAIL,
+            Some(now_micros),
+        )
+        .await
+    }
+
     /// The effective ROLE slugs a service account holds in one organization (issue #126).
     ///
     /// The exact sibling of [`Self::effective_permissions_for_service_account`], and of
@@ -51964,8 +51991,27 @@ impl OrgGroupRepo<'_> {
         max_group_depth: u32,
         tail: &'static str,
     ) -> Result<BTreeSet<String>, StoreError> {
+        self.resolve_effective_at(organization_id, principal, max_group_depth, tail, None)
+            .await
+    }
+
+    /// [`Self::resolve_effective`] for a tail that judges a deadline against `now_micros`.
+    async fn resolve_effective_at(
+        &self,
+        organization_id: &OrganizationId,
+        principal: MembershipPrincipal<'_>,
+        max_group_depth: u32,
+        tail: &'static str,
+        now_micros: Option<i64>,
+    ) -> Result<BTreeSet<String>, StoreError> {
         let rows = self
-            .run_effective(organization_id, principal, max_group_depth, tail)
+            .run_effective_at(
+                organization_id,
+                principal,
+                max_group_depth,
+                tail,
+                now_micros,
+            )
             .await?;
         // A BTreeSet rather than the Vec the ORDER BY already sorted: the SQL order
         // and the collection order must agree even if a future edit to either drifts,
@@ -53242,6 +53288,53 @@ const EFFECTIVE_PERMISSION_SLUGS_TAIL: &str = "SELECT DISTINCT p.slug AS slug \
                AND rp.organization_id = $3 AND rp.deleted_at IS NULL \
                AND rp.role_id IN (SELECT id FROM effective_roles) \
         ) \
+      ORDER BY p.slug";
+
+/// [`EFFECTIVE_PERMISSION_SLUGS_TAIL`] plus the permissions of any live TIME-BOXED role
+/// (issue #145 criterion 4, EXPLORATORY).
+///
+/// # Why this exists rather than a disjunct in the shared CTE
+///
+/// The obvious change is one more `OR` in `effective_roles` inside
+/// [`EFFECTIVE_CLOSURE_CTE`]. That CTE is shared by every tail INCLUDING the slugs-only
+/// `effective_roles` the token mint resolves through, so the disjunct would widen token
+/// issuance from an exploratory flag -- a decision this feature deliberately does not take.
+/// A parallel tail keeps the widening to the two reads that opt into it.
+///
+/// # Why it must exist at all
+///
+/// Without it one response contradicts itself: `roles` reports the elevation and
+/// `permissions` does not, so an operator reads that the member holds `billing-admin` and
+/// holds none of what `billing-admin` carries. Either answer alone is defensible; the two
+/// together are not.
+const EFFECTIVE_PERMISSION_SLUGS_TIME_BOXED_TAIL: &str = "SELECT DISTINCT p.slug AS slug \
+       FROM permissions p \
+      WHERE p.tenant_id = $1 AND p.environment_id = $2 \
+        AND p.kind = 'permission' AND p.deleted_at IS NULL \
+        AND (p.id IN ( \
+            SELECT rp.permission_id \
+              FROM org_role_permissions rp \
+             WHERE rp.tenant_id = $1 AND rp.environment_id = $2 \
+               AND rp.organization_id = $3 AND rp.deleted_at IS NULL \
+               AND rp.role_id IN (SELECT id FROM effective_roles) \
+        ) OR p.id IN ( \
+            SELECT rp.permission_id \
+              FROM org_role_permissions rp \
+              JOIN org_roles r ON r.id = rp.role_id \
+              JOIN access_grant_requests agr \
+                ON agr.role_slug = r.slug \
+               AND agr.tenant_id = r.tenant_id \
+               AND agr.environment_id = r.environment_id \
+               AND agr.organization_id = r.organization_id \
+             WHERE rp.tenant_id = $1 AND rp.environment_id = $2 \
+               AND rp.organization_id = $3 AND rp.deleted_at IS NULL \
+               AND r.deleted_at IS NULL \
+               AND agr.subject_id = $4 \
+               AND agr.state = 'approved' \
+               AND agr.granted_until > \
+                   (TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+               AND EXISTS (SELECT 1 FROM membership) \
+        )) \
       ORDER BY p.slug";
 
 /// The projection every group-member read selects from `org_group_members` (the two

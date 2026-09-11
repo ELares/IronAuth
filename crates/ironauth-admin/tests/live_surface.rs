@@ -732,7 +732,7 @@ impl Fixture {
                     // THE ROLE THIS FIXTURE ACTUALLY SEEDS. The raise refuses a slug the
                     // organization does not define, so naming an invented one here would
                     // make the fixture fail rather than the sweep measure anything.
-                    "subject_id": "usr_sweep",
+                    "subject_id": user,
                     "role_slug": "sweep",
                     "reason": "sweep fixture",
                 })
@@ -2995,7 +2995,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "POST",
             format!("{org_base}/access-requests"),
             &serde_json::json!({
-                "subject_id": "usr_sweep",
+                "subject_id": user,
                 "role_slug": "billing-admin",
                 "reason": "sweep",
             }),

@@ -4247,7 +4247,11 @@ export interface components {
             decided_by?: string | null;
             /**
              * Format: int64
-             * @description When the grant ends, in epoch milliseconds, or absent unless approved.
+             * @description When the grant ended or will end, in epoch milliseconds.
+             *
+             *     Present on an APPROVED row and on an EXPIRED one, absent on pending and denied.
+             *     An expired row keeps it deliberately: it is the only record of how long the member
+             *     actually held the role, which is the second question an auditor asks.
              */
             granted_until_unix_ms?: number | null;
             /**
@@ -22141,7 +22145,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The resolved roles, one entry per grant path, plus the resolved permission SET and the advisory budget verdict over it (issue #98). This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. A DISABLED organization mints nothing, so both are empty for every one of its members until it is re-enabled (the assignment lists still show the configuration). Not paginated and never truncated, whatever the budget says: an operator must always be able to see what a token will not carry */
+            /** @description The resolved roles, one entry per grant path, plus the resolved permission SET and the advisory budget verdict over it (issue #98). This is what the NEXT token issuance would carry, with one exception: when the exploratory access-request feature is acknowledged, a live time-boxed grant appears here (source `time_boxed`, with `via_request_id` and `granted_until_unix_ms`) and the mint does NOT carry it. Tokens already issued are NOT affected by a recent change. A DISABLED organization mints nothing, so both are empty for every one of its members until it is re-enabled (the assignment lists still show the configuration). Not paginated and never truncated, whatever the budget says: an operator must always be able to see what a token will not carry */
             200: {
                 headers: {
                     [name: string]: unknown;

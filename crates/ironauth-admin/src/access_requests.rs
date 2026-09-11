@@ -164,7 +164,11 @@ pub struct AccessRequestView {
     pub granting_now: bool,
     /// Who decided, or absent while pending.
     pub decided_by: Option<String>,
-    /// When the grant ends, in epoch milliseconds, or absent unless approved.
+    /// When the grant ended or will end, in epoch milliseconds.
+    ///
+    /// Present on an APPROVED row and on an EXPIRED one, absent on pending and denied.
+    /// An expired row keeps it deliberately: it is the only record of how long the member
+    /// actually held the role, which is the second question an auditor asks.
     pub granted_until_unix_ms: Option<i64>,
     /// When it was raised, in epoch milliseconds.
     pub created_at_unix_ms: i64,
@@ -207,6 +211,83 @@ fn armed(state: &AdminState) -> Result<(), ApiError> {
     // should not learn from us that this build has one: the answer is the same one an
     // unmounted route gives.
     Err(ApiError::NotFound)
+}
+
+/// Refuse a request whose subject or role would make the grant meaningless.
+///
+/// Split out for the crate's function-length bound, and the two checks belong together:
+/// each is the same shape, a field that is well formed and names nothing.
+async fn require_grantable(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    org_id: &ironauth_store::OrganizationId,
+    body: &RaiseAccessRequestBody,
+) -> Result<(), ApiError> {
+    // THE SUBJECT MUST BE A LIVE MEMBER of this organization.
+    //
+    // A grant for a non-member confers nothing -- the resolution closure seeds only on a
+    // live active membership, so the fourth arm yields no row for them -- and that is
+    // exactly why refusing it here matters: without this an approver agrees to an
+    // elevation, the request reads `approved` in every listing, and the subject's
+    // authorization is unchanged. Nobody downstream can tell the difference between that
+    // and a grant that worked.
+    //
+    // `for_user_in_org` checks the USER's tombstone as well as the membership's, so a
+    // request for somebody who has been deleted is refused with the rest.
+    let subject = ironauth_store::UserId::parse_in_scope(&body.subject_id, &scope)
+        .map_err(|_| ApiError::Unprocessable("subject_id is not a user id".into()))?;
+    if state
+        .store()
+        .management()
+        .org_memberships(scope)
+        .for_user_in_org(org_id, &subject)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .is_none()
+    {
+        return Err(ApiError::Unprocessable(
+            "the subject is not a live member of this organization, so a grant would \
+             confer nothing"
+                .into(),
+        ));
+    }
+
+    // PAGED THROUGH, not one page. An earlier version read `max_page_size` roles and
+    // refused anything past the boundary, so an organization with more roles than a page
+    // could not request its own later ones -- a refusal that reads exactly like a typo and
+    // is not one.
+    let mut cursor = None;
+    let mut defined = false;
+    loop {
+        let page = state
+            .store()
+            .scoped(scope)
+            .org_roles()
+            .list_for_org(org_id, i64::from(state.max_page_size()), cursor.as_ref())
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        if page.is_empty() {
+            break;
+        }
+        if page.iter().any(|role| role.slug == body.role_slug) {
+            defined = true;
+            break;
+        }
+        cursor = page.last().map(|role| ironauth_store::CursorPosition {
+            created_at_unix_micros: role.created_at_unix_micros,
+            id: role.id.to_string(),
+        });
+        if cursor.is_none() {
+            break;
+        }
+    }
+    if !defined {
+        return Err(ApiError::Unprocessable(format!(
+            "no role {} in this organization",
+            body.role_slug
+        )));
+    }
+    Ok(())
 }
 
 #[utoipa::path(
@@ -289,19 +370,7 @@ pub async fn raise_access_request(
     //
     // Checked at RAISE rather than at decide, so the typo is caught by the person who made
     // it rather than by the person asked to trust it.
-    let roles = state
-        .store()
-        .scoped(scope)
-        .org_roles()
-        .list_for_org(&org_id, i64::from(state.max_page_size()), None)
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    if !roles.iter().any(|role| role.slug == body.role_slug) {
-        return Err(ApiError::Unprocessable(format!(
-            "no role {} in this organization",
-            body.role_slug
-        )));
-    }
+    require_grantable(&state, scope, &org_id, &body).await?;
 
     let id = ironauth_store::AccessRequestId::generate(state.env(), &scope);
     let organization = org_id.to_string();

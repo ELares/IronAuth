@@ -41,10 +41,11 @@
 //!
 //! # The permission set, and the budget verdict beside it
 //!
-//! `permissions` is the WHOLE resolved set, un-paginated and un-capped, and it is the
-//! same store read the mint runs. It is a flat set rather than a per-role breakdown
-//! because that is the shape the token claim takes and this endpoint's contract is
-//! "what would the next token carry".
+//! `permissions` is the WHOLE resolved set, un-paginated and un-capped. It is a flat
+//! set rather than a per-role breakdown because that is the shape the token claim
+//! takes. It is the same store read the mint runs EXCEPT when the exploratory
+//! access-request feature is on, which adds a fourth arm here and not to the mint; see
+//! the section on that below.
 //!
 //! `permission_budget` reports what the budget would say about that set. It is
 //! ADVISORY and it refuses nothing: this endpoint is a read, and no endpoint anywhere
@@ -67,12 +68,26 @@
 //!
 //! # This is a READ of the CURRENT state, not of any issued token
 //!
-//! The set it returns is what the NEXT token issuance would carry. Tokens already
-//! issued are unaffected by a change made a moment ago: role changes take effect at
-//! the next issuance, and the exposure is bounded at one access token lifetime
-//! because the refresh grant re-resolves rather than replaying a frozen set. So a
-//! caller must not read this endpoint as "what the bearer of that user's current
-//! access token can do". `docs/THREAT-MODEL.md` states the same gap.
+//! The set it returns is what the NEXT token issuance would carry, WITH ONE EXCEPTION
+//! stated below. Tokens already issued are unaffected by a change made a moment ago:
+//! role changes take effect at the next issuance, and the exposure is bounded at one
+//! access token lifetime because the refresh grant re-resolves rather than replaying a
+//! frozen set. So a caller must not read this endpoint as "what the bearer of that
+//! user's current access token can do". `docs/THREAT-MODEL.md` states the same gap.
+//!
+//! # The exception: time-boxed grants (issue #145 criterion 4, EXPLORATORY)
+//!
+//! When the `access-request-approval` feature is acknowledged, this endpoint resolves
+//! through a tail carrying a fourth arm, and the mint does NOT. So a live time-boxed
+//! grant appears here and in the access-review export, and the next token issued for
+//! the same member does not carry it.
+//!
+//! That divergence is deliberate and it is the narrow one: widening the mint from an
+//! exploratory flag would change a live authorization decision for every deployment
+//! that switched the feature on to look at it. The honest reading of this endpoint
+//! with the feature on is "every role this member holds", of which the mint carries
+//! the assignment-based subset. The 200 description says the same thing rather than
+//! leaving a reader to infer it.
 //!
 //! # A DISABLED organization resolves to an empty set here, deliberately
 //!
@@ -464,7 +479,7 @@ pub struct EffectiveRolesView {
     ),
     security(("bearer" = [])),
     responses(
-        (status = 200, description = "The resolved roles, one entry per grant path, plus the resolved permission SET and the advisory budget verdict over it (issue #98). This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. A DISABLED organization mints nothing, so both are empty for every one of its members until it is re-enabled (the assignment lists still show the configuration). Not paginated and never truncated, whatever the budget says: an operator must always be able to see what a token will not carry", body = EffectiveRolesView),
+        (status = 200, description = "The resolved roles, one entry per grant path, plus the resolved permission SET and the advisory budget verdict over it (issue #98). This is what the NEXT token issuance would carry, with one exception: when the exploratory access-request feature is acknowledged, a live time-boxed grant appears here (source `time_boxed`, with `via_request_id` and `granted_until_unix_ms`) and the mint does NOT carry it. Tokens already issued are NOT affected by a recent change. A DISABLED organization mints nothing, so both are empty for every one of its members until it is re-enabled (the assignment lists still show the configuration). Not paginated and never truncated, whatever the budget says: an operator must always be able to see what a token will not carry", body = EffectiveRolesView),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Not found (the organization, or a membership that is not a live membership of it: uniform across absent, removed, another scope's, and another organization's)", body = ErrorBody)
@@ -535,12 +550,30 @@ pub async fn get_org_membership_effective_roles(
     // store fault is a 500 here for the reason the module docs give for roles, and one
     // step more sharply: an empty permission set is indistinguishable from a member who
     // legitimately holds nothing.
-    let permissions = state
-        .store()
-        .management()
-        .org_groups(scope)
-        .effective_permissions(&org_id, &membership.user_id, state.max_group_depth())
-        .await?;
+    // THROUGH THE SAME TAIL PAIR as the roles above, so one response cannot contradict
+    // itself. Reporting the elevation in `roles` while `permissions` omitted what that role
+    // carries would tell an operator the member holds `billing-admin` and holds none of
+    // what `billing-admin` is.
+    let permissions = if state.access_requests_enabled() {
+        state
+            .store()
+            .management()
+            .org_groups(scope)
+            .effective_permissions_at(
+                &org_id,
+                &membership.user_id,
+                state.max_group_depth(),
+                state.now_unix_micros(),
+            )
+            .await?
+    } else {
+        state
+            .store()
+            .management()
+            .org_groups(scope)
+            .effective_permissions(&org_id, &membership.user_id, state.max_group_depth())
+            .await?
+    };
 
     // MEMBERSHIP scoped, and the verdict says so on the wire: `permissions` above is
     // the whole resolved set, so this is the answer that predicts the next token.

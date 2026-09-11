@@ -515,7 +515,7 @@ impl Fixture {
             Self::seed_scim_push_link(h, tenant, environment, &scim_push_connection, key).await;
         let ldap_connector = Self::seed_ldap_connector(h, tenant, environment, &base, key).await;
 
-        let access_request = Self::seed_access_request(h, &base, key).await;
+        let access_request = Self::seed_access_request(h, &base, key, &user).await;
 
         let fixture = Self {
             base,
@@ -1457,7 +1457,7 @@ impl Fixture {
     /// can require the answer to NAME it in both passes. A read whose contract is "a
     /// decommissioned environment stays auditable" cannot be asserted by a status code: an
     /// empty page answers 200 too.
-    async fn seed_access_request(h: &Harness, base: &str, key: &str) -> String {
+    async fn seed_access_request(h: &Harness, base: &str, key: &str, subject: &str) -> String {
         seed_row(
             h,
             &format!("{base}/access-requests"),
@@ -1466,7 +1466,7 @@ impl Fixture {
                 // `billing.admin` is one of the two roles this fixture seeds above. The
                 // raise refuses a slug the organization does not define, so an invented
                 // one here would fail the fixture rather than exercise the sweep.
-                "subject_id": "usr_deleted_env",
+                "subject_id": subject,
                 "role_slug": "billing.admin",
                 "reason": "seeded while live",
             })
@@ -1500,7 +1500,7 @@ impl Fixture {
                 path: format!("{}/access-requests", self.base),
                 body: Some(
                     serde_json::json!({
-                        "subject_id": "usr_after_delete",
+                        "subject_id": self.member_user,
                         "role_slug": "billing.admin",
                         "reason": "after the delete",
                     })

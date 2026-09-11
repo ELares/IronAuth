@@ -158,8 +158,10 @@ CREATE POLICY access_grant_requests_scope ON access_grant_requests
 -- token-issuing path can ask whether a time-boxed grant is live, and writes
 -- nothing: an access request the data plane could approve would be one the
 -- holder of any client credential could approve.
--- COLUMN-SCOPED UPDATE, like 189 of the 225 UPDATE grants across these
--- migrations and unlike the blanket one this file first shipped with. Only the
+-- COLUMN-SCOPED UPDATE, which is the prevailing pattern across these migrations
+-- and not what this file first shipped with. An earlier version of this comment
+-- carried a hand-written ratio of column-scoped to total UPDATE grants; it was a
+-- number nothing recomputes and the next migration would have made it wrong. Only the
 -- four columns a decision or a sweep writes are writable; `requested_by`,
 -- `subject_id`, `role_slug`, `organization_id` and `reason` are fixed at
 -- INSERT and stay that way.

@@ -6139,7 +6139,7 @@ async fn a_write_only_credential_cannot_read_a_delivery_attestation() {
 ///
 /// The request is raised by the OPERATOR credential, so a restricted credential deciding
 /// it later is a different principal and the separation constraint is not what refuses.
-async fn seed_access_request(h: &Harness, base: &str) -> (String, String) {
+async fn seed_access_request(h: &Harness, base: &str) -> (String, String, String) {
     let (status, _, created) = h
         .post(
             &format!("{base}/organizations"),
@@ -6162,13 +6162,48 @@ async fn seed_access_request(h: &Harness, base: &str) -> (String, String) {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "seed role: {role}");
+    let role_id = serde_json::from_str::<Value>(&role).expect("json")["id"]
+        .as_str()
+        .expect("role id")
+        .to_owned();
+
+    // AND IT CARRIES A PERMISSION, so a response reporting the role without what it carries
+    // is distinguishable from one reporting both.
+    let (status, _, perm) = h
+        .post(
+            &format!("{base}/permissions"),
+            "ar-perm",
+            &serde_json::json!({ "slug": "invoices.write", "display_name": "Invoices" })
+                .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed permission: {perm}");
+    let permission_id = serde_json::from_str::<Value>(&perm).expect("json")["id"]
+        .as_str()
+        .expect("permission id")
+        .to_owned();
+    let (status, _, bound) = h
+        .post(
+            &format!("{base}/organizations/{org}/roles/{role_id}/permissions"),
+            "ar-perm-bind",
+            &serde_json::json!({ "permission_id": permission_id }).to_string(),
+        )
+        .await;
+    assert!(
+        status.is_success(),
+        "bind the permission to the role: {status} {bound}"
+    );
+
+    // A REAL LIVE MEMBER: the raise refuses a subject who is not one, because a grant for
+    // a non-member confers nothing and an approver cannot see that it did not.
+    let (subject, _membership) = seed_org_member(h, base, &org, "ar-seed").await;
 
     let (status, _, raised) = h
         .post(
             &format!("{base}/organizations/{org}/access-requests"),
             "ar-raise",
             &serde_json::json!({
-                "subject_id": "usr_subject",
+                "subject_id": subject,
                 "role_slug": "billing-admin",
                 "reason": "quarter close",
             })
@@ -6180,7 +6215,7 @@ async fn seed_access_request(h: &Harness, base: &str) -> (String, String) {
         .as_str()
         .expect("request id")
         .to_owned();
-    (org, id)
+    (org, id, subject)
 }
 
 /// Each of the three access-request operations demands the permission it is classified
@@ -6194,7 +6229,7 @@ async fn the_access_request_surface_splits_raising_and_deciding_from_reading() {
     let h = Harness::start_with_access_requests(50, true).await;
     let (tenant, environment) = h.create_tenant("acme", "ar-tenant").await;
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
-    let (org, request) = seed_access_request(&h, &base).await;
+    let (org, request, subject) = seed_access_request(&h, &base).await;
     let (key_id, secret) = mint_key(&h, &tenant, &environment, "ar-mint").await;
     let list = format!("{base}/organizations/{org}/access-requests");
     let decision = format!("{list}/{request}/decision");
@@ -6211,7 +6246,7 @@ async fn the_access_request_surface_splits_raising_and_deciding_from_reading() {
             "raise",
             list.clone(),
             serde_json::json!({
-                "subject_id": "usr_other",
+                "subject_id": subject,
                 "role_slug": "billing-admin",
                 "reason": "another ask",
             }),
@@ -6253,7 +6288,7 @@ async fn the_access_request_surface_splits_raising_and_deciding_from_reading() {
             &secret,
             "ar-raise-ok",
             &serde_json::json!({
-                "subject_id": "usr_other",
+                "subject_id": subject,
                 "role_slug": "billing-admin",
                 "reason": "under the write credential",
             })
@@ -6300,7 +6335,7 @@ async fn the_member_who_raised_a_request_cannot_approve_it_and_is_told_why() {
     let h = Harness::start_with_access_requests(50, true).await;
     let (tenant, environment) = h.create_tenant("acme", "ar-self").await;
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
-    let (org, request) = seed_access_request(&h, &base).await;
+    let (org, request, _subject) = seed_access_request(&h, &base).await;
     let decision = format!("{base}/organizations/{org}/access-requests/{request}/decision");
 
     // The OPERATOR raised it in `seed_access_request`, and this is the operator deciding.
@@ -6381,7 +6416,9 @@ async fn the_access_request_surface_is_invisible_until_the_feature_is_acknowledg
             &list,
             "ar-off-raise",
             &serde_json::json!({
-                "subject_id": "usr_subject",
+                // Any string: the gate refuses before the subject is looked at, which is
+                // the point -- a disarmed deployment must not even validate.
+                "subject_id": "usr_never_read",
                 "role_slug": "billing-admin",
                 "reason": "nope",
             })
@@ -6441,7 +6478,7 @@ async fn an_approval_must_carry_a_bounded_duration_and_a_denial_must_carry_none(
     let h = Harness::start_with_access_requests(50, true).await;
     let (tenant, environment) = h.create_tenant("acme", "ar-bounds").await;
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
-    let (org, request) = seed_access_request(&h, &base).await;
+    let (org, request, _subject) = seed_access_request(&h, &base).await;
     let decision = format!("{base}/organizations/{org}/access-requests/{request}/decision");
 
     for (label, payload, expected) in [
@@ -6548,7 +6585,7 @@ async fn two_credentials_of_one_operator_are_two_principals_and_the_rule_does_no
     let h = Harness::start_with_access_requests(50, true).await;
     let (tenant, environment) = h.create_tenant("acme", "ar-two-keys").await;
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
-    let (org, request) = seed_access_request(&h, &base).await;
+    let (org, request, _subject) = seed_access_request(&h, &base).await;
     let decision = format!("{base}/organizations/{org}/access-requests/{request}/decision");
 
     // THE OPERATOR RAISED IT, and deciding with the same credential is refused. This leg is
@@ -6632,7 +6669,7 @@ async fn a_request_for_a_role_this_organization_does_not_define_is_refused() {
     let h = Harness::start_with_access_requests(50, true).await;
     let (tenant, environment) = h.create_tenant("acme", "ar-role-tenant").await;
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
-    let (org, _request) = seed_access_request(&h, &base).await;
+    let (org, _request, subject) = seed_access_request(&h, &base).await;
     let list = format!("{base}/organizations/{org}/access-requests");
 
     let (status, _, body) = h
@@ -6640,7 +6677,7 @@ async fn a_request_for_a_role_this_organization_does_not_define_is_refused() {
             &list,
             "ar-typo",
             &serde_json::json!({
-                "subject_id": "usr_subject",
+                "subject_id": subject,
                 "role_slug": "billing-admni",
                 "reason": "a typo nobody would catch later",
             })
@@ -6665,7 +6702,7 @@ async fn a_request_for_a_role_this_organization_does_not_define_is_refused() {
             &list,
             "ar-real",
             &serde_json::json!({
-                "subject_id": "usr_subject",
+                "subject_id": subject,
                 "role_slug": "billing-admin",
                 "reason": "the same ask, spelled right",
             })
@@ -6705,7 +6742,7 @@ async fn a_request_in_one_organization_cannot_be_decided_through_another() {
     let h = Harness::start_with_access_requests(50, true).await;
     let (tenant, environment) = h.create_tenant("acme", "ar-cross-tenant").await;
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
-    let (mine, request) = seed_access_request(&h, &base).await;
+    let (mine, request, _subject) = seed_access_request(&h, &base).await;
 
     // A SECOND organization, with its own role so a request could legitimately exist here.
     let (status, _, created) = h
@@ -6766,33 +6803,10 @@ async fn an_approved_request_puts_the_role_in_the_members_effective_roles() {
     let h = Harness::start_with_access_requests(50, true).await;
     let (tenant, environment) = h.create_tenant("acme", "ar-effective").await;
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
-    let (org, _seeded) = seed_access_request(&h, &base).await;
+    let (org, _seeded, _subject) = seed_access_request(&h, &base).await;
 
-    // A MEMBER, so there is an effective-roles answer to change.
-    let (status, _, created) = h
-        .post(
-            &format!("{base}/users"),
-            "ar-eff-user",
-            &serde_json::json!({ "identifier": "asked-for@example.test" }).to_string(),
-        )
-        .await;
-    assert_eq!(status, StatusCode::CREATED, "seed user: {created}");
-    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
-        .as_str()
-        .expect("user id")
-        .to_owned();
-    let (status, _, created) = h
-        .post(
-            &format!("{base}/organizations/{org}/memberships"),
-            "ar-eff-member",
-            &serde_json::json!({ "user_id": user }).to_string(),
-        )
-        .await;
-    assert_eq!(status, StatusCode::CREATED, "seed membership: {created}");
-    let membership = serde_json::from_str::<Value>(&created).expect("json")["id"]
-        .as_str()
-        .expect("membership id")
-        .to_owned();
+    // A MEMBER and an approved grant for them, through the helpers the fence tests use.
+    let (user, membership) = seed_org_member(&h, &base, &org, "ar-eff").await;
     let effective = format!("{base}/organizations/{org}/memberships/{membership}/effective-roles");
 
     // THE CONTROL. Whatever the member holds by default, it is not through a request.
@@ -6803,43 +6817,7 @@ async fn an_approved_request_puts_the_role_in_the_members_effective_roles() {
         "nothing has been approved, so no path may be attributed to a request: {before}"
     );
 
-    // RAISE AND APPROVE, for THIS member, by a second principal.
-    let (status, _, raised) = h
-        .post(
-            &format!("{base}/organizations/{org}/access-requests"),
-            "ar-eff-raise",
-            &serde_json::json!({
-                "subject_id": user,
-                "role_slug": "billing-admin",
-                "reason": "quarter close",
-            })
-            .to_string(),
-        )
-        .await;
-    assert_eq!(status, StatusCode::CREATED, "{raised}");
-    let request = serde_json::from_str::<Value>(&raised).expect("json")["id"]
-        .as_str()
-        .expect("request id")
-        .to_owned();
-
-    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ar-eff-key").await;
-    restrict(
-        &h,
-        &tenant,
-        &environment,
-        &key_id,
-        &["management.write_organizations"],
-    )
-    .await;
-    let (status, _, decided) = h
-        .post_as(
-            &format!("{base}/organizations/{org}/access-requests/{request}/decision"),
-            &secret,
-            "ar-eff-decide",
-            &serde_json::json!({ "approve": true, "grant_secs": 3600 }).to_string(),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{decided}");
+    let request = approve_for(&h, &tenant, &environment, &base, &org, &user, "ar-eff").await;
 
     // AND THE ROLE IS NOW HELD, attributed to the request that granted it.
     let (status, _, after) = h.get(&effective).await;
@@ -6870,6 +6848,21 @@ async fn an_approved_request_puts_the_role_in_the_members_effective_roles() {
          past its own deadline: {after}"
     );
 
+    // AND THE RESPONSE AGREES WITH ITSELF. `permissions` resolves through the paired tail,
+    // so what the elevated role CARRIES is reported beside the role. An earlier version
+    // resolved roles through the time-boxed tail and permissions through the plain one, and
+    // one response said the member holds `billing-admin` and holds none of what it is.
+    let permissions: Vec<&str> = view["permissions"]
+        .as_array()
+        .expect("permissions")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        permissions.contains(&"invoices.write"),
+        "the elevated role's permission must be reported beside the role: {after}"
+    );
+
     // WHAT THIS TEST DOES NOT COVER, said rather than implied: that the grant STOPS at the
     // deadline. This harness runs on `Env::system()` and cannot advance a clock, so a
     // mutation making `grants_now` ignore the deadline entirely leaves this test green.
@@ -6898,11 +6891,11 @@ async fn disabling_the_organization_revokes_a_live_time_boxed_grant() {
     let h = Harness::start_with_access_requests(50, true).await;
     let (tenant, environment) = h.create_tenant("acme", "ar-disable").await;
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
-    let (org, _seeded) = seed_access_request(&h, &base).await;
+    let (org, _seeded, _subject) = seed_access_request(&h, &base).await;
     let (user, membership) = seed_org_member(&h, &base, &org, "disable").await;
     let effective = format!("{base}/organizations/{org}/memberships/{membership}/effective-roles");
 
-    approve_for(&h, &tenant, &environment, &base, &org, &user, "ar-disable").await;
+    let _request = approve_for(&h, &tenant, &environment, &base, &org, &user, "ar-disable").await;
 
     // LIVE FIRST, so the emptiness below is the disable and not a grant that never worked.
     let (_, _, before) = h.get(&effective).await;
@@ -6939,11 +6932,11 @@ async fn deleting_the_role_revokes_a_live_time_boxed_grant() {
     let h = Harness::start_with_access_requests(50, true).await;
     let (tenant, environment) = h.create_tenant("acme", "ar-delrole").await;
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
-    let (org, _seeded) = seed_access_request(&h, &base).await;
+    let (org, _seeded, _subject) = seed_access_request(&h, &base).await;
     let (user, membership) = seed_org_member(&h, &base, &org, "delrole").await;
     let effective = format!("{base}/organizations/{org}/memberships/{membership}/effective-roles");
 
-    approve_for(&h, &tenant, &environment, &base, &org, &user, "ar-delrole").await;
+    let _request = approve_for(&h, &tenant, &environment, &base, &org, &user, "ar-delrole").await;
     let (_, _, before) = h.get(&effective).await;
     assert!(before.contains("time_boxed"), "{before}");
 
@@ -7007,7 +7000,7 @@ async fn approve_for(
     org: &str,
     user: &str,
     key: &str,
-) {
+) -> String {
     let (status, _, raised) = h
         .post(
             &format!("{base}/organizations/{org}/access-requests"),
@@ -7043,4 +7036,90 @@ async fn approve_for(
         )
         .await;
     assert_eq!(status, StatusCode::OK, "approve: {decided}");
+    request
+}
+
+/// A request for somebody who is not a live member of the organization is refused
+/// (issue #145 criterion 4).
+///
+/// # Why refusing beats accepting it
+///
+/// A grant for a non-member confers nothing: the resolution closure seeds only on a live
+/// active membership, so the time-boxed arm yields no row for them. That is exactly why the
+/// refusal belongs at the raise. Accepted, an approver agrees to an elevation, the request
+/// reads `approved` in every listing and every audit row, and the subject's authorization
+/// is unchanged -- and nobody downstream can tell that apart from a grant that worked.
+///
+/// `for_user_in_org` checks the USER's tombstone as well as the membership's, so a request
+/// for a deleted person is refused with the rest.
+#[tokio::test]
+async fn a_request_for_somebody_who_is_not_a_member_is_refused() {
+    let h = Harness::start_with_access_requests(50, true).await;
+    let (tenant, environment) = h.create_tenant("acme", "ar-nonmember").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let (org, _request, subject) = seed_access_request(&h, &base).await;
+    let list = format!("{base}/organizations/{org}/access-requests");
+
+    // A REAL USER who is NOT a member of this organization.
+    let (status, _, created) = h
+        .post(
+            &format!("{base}/users"),
+            "ar-outsider",
+            &serde_json::json!({ "identifier": "outsider@example.test" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let outsider = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("user id")
+        .to_owned();
+
+    let (status, _, body) = h
+        .post(
+            &list,
+            "ar-outsider-raise",
+            &serde_json::json!({
+                "subject_id": outsider,
+                "role_slug": "billing-admin",
+                "reason": "they do not work here",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a request for a non-member was accepted, so an approver can agree to an \
+         elevation that confers nothing: {body}"
+    );
+    assert!(
+        body.contains("not a live member"),
+        "the refusal must say which of the two fields is wrong: {body}"
+    );
+
+    // AND THE MEMBER IS STILL ACCEPTED, so the refusal is the membership check and not the
+    // route refusing every raise.
+    let (status, _, body) = h
+        .post(
+            &list,
+            "ar-member-raise",
+            &serde_json::json!({
+                "subject_id": subject,
+                "role_slug": "billing-admin",
+                "reason": "they do",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // AND NOTHING WAS WRITTEN FOR THE OUTSIDER.
+    let subjects: Vec<String> = sqlx::query_scalar("SELECT subject_id FROM access_grant_requests")
+        .fetch_all(h.db().owner_pool())
+        .await
+        .expect("read the requests");
+    assert!(
+        !subjects.contains(&outsider),
+        "the refused request was stored anyway: {subjects:?}"
+    );
 }
