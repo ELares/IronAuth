@@ -329,6 +329,11 @@ name = "api_keys"
 path = "tests/api_keys.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "saml_connections"
+path = "tests/saml_connections.rs"
+required-features = ["testing"]
+
 # Needs a real database (DATABASE_URL).
 [[test]]
 name = "authzen"

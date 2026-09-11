@@ -102,6 +102,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "createOrganizationContact",
     "createPortalLink",
     "createProjectGrant",
+    "createSamlConnection",
     "createScimConnection",
     "createScimPushConnection",
     "createServiceAccountMembership",
@@ -308,6 +309,10 @@ const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
     (
         "createProjectGrant",
         include_str!("../src/project_grants.rs"),
+    ),
+    (
+        "createSamlConnection",
+        include_str!("../src/saml_connections.rs"),
     ),
     (
         "deleteOrganization",

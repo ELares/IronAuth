@@ -2931,6 +2931,17 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{org_base}/project-grants"),
             &serde_json::json!({ "client_id": client, "role_ids": [] }),
         ),
+        Case::json(
+            "saml_connections.createSamlConnection",
+            "POST",
+            format!("{org_base}/saml-connections"),
+            &serde_json::json!({
+                "display_name": "Okta Production",
+                "idp_entity_id": "http://www.okta.com/exk1live",
+                "idp_sso_url": "https://idp.example/sso",
+                "public_base_url": "https://auth.example",
+            }),
+        ),
         Case::empty(
             "project_grants.withdrawProjectGrant",
             "DELETE",

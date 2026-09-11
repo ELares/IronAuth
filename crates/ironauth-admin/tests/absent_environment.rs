@@ -1672,6 +1672,17 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
             body: Some("{\"client_id\":\"cli_absent\",\"role_ids\":[]}".to_owned()),
         },
         Case {
+            label: "saml_connections.createSamlConnection",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/saml-connections"),
+            body: Some(
+                "{\"display_name\":\"Okta\",\"idp_entity_id\":\"http://www.okta.com/exk\",\
+                 \"idp_sso_url\":\"https://idp.example/sso\",\
+                 \"public_base_url\":\"https://auth.example\"}"
+                    .to_owned(),
+            ),
+        },
+        Case {
             label: "project_grants.withdrawProjectGrant",
             method: "DELETE",
             path: format!("{base}/organizations/{org}/project-grants/pgt_absent"),

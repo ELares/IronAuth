@@ -5858,3 +5858,67 @@ async fn a_read_only_credential_can_list_scim_push_connections_and_cannot_change
          permission of its own: {body}"
     );
 }
+
+/// Creating an organization's SAML upstream requires `write_organizations`, and the refusal
+/// names it.
+///
+/// #140 criterion 1's granting path is a write that hands out the ability to AUTHENTICATE as
+/// a member of an organization, so which permission it demands is worth proving rather than
+/// classifying. `management_permissions.rs` records the classification and separately asserts
+/// the handler calls `require_permission`; nothing compares the two, and its own comment says
+/// it "cannot tell WHICH permission a handler demands, only that it demands one". A mutation
+/// downgrading this one to `Read` would pass every other pin.
+#[tokio::test]
+async fn a_read_only_credential_cannot_create_a_saml_connection() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-mint").await;
+
+    // The organization is created while the credential is still unrestricted: the fixture has
+    // to exist before the restriction the test is about applies.
+    let orgs = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+    let (status, _, body) = h
+        .post(
+            &orgs,
+            "ak-org",
+            &serde_json::json!({ "display_name": "Acme" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {body}");
+    let org = serde_json::from_str::<serde_json::Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let base = format!("{orgs}/{org}/saml-connections");
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    let (status, _, body) = h
+        .post_as(
+            &base,
+            &secret,
+            "ak-denied-saml",
+            &serde_json::json!({
+                "display_name": "Okta Production",
+                "idp_entity_id": "http://www.okta.com/exk1fake",
+                "idp_sso_url": "https://acme.okta.com/app/fake/sso/saml",
+                "public_base_url": "https://auth.example",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential created a SAML upstream, which is a way to authenticate as \
+         any member of the organization: {body}"
+    );
+    // NAMES THE SPECIFIC PERMISSION, which is what separates this from "some permission was
+    // demanded". A handler asking for `Read` answers 201 here; one asking for a different
+    // write names that one instead.
+    assert!(
+        body.contains("management.write_organizations"),
+        "the refusal does not name write_organizations, so the handler may demand a \
+         different permission than the classification records: {body}"
+    );
+}

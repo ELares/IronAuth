@@ -2562,6 +2562,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/saml-connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["createSamlConnection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections": {
         parameters: {
             query?: never;
@@ -5329,6 +5345,22 @@ export interface components {
              *     stored in plaintext.
              */
             value: string;
+        };
+        /** @description A SAML connection to create. */
+        CreateSamlConnectionRequest: {
+            /** @description The operator-facing label, as it appears in the portal and the console. */
+            display_name: string;
+            /** @description What the identity provider calls itself. An assertion's `Issuer` must equal this. */
+            idp_entity_id: string;
+            /** @description Where an `AuthnRequest` is sent. */
+            idp_sso_url: string;
+            /**
+             * @description The scheme and host this deployment is reached at, with no path.
+             *
+             *     The HOST only: IronAuth appends the ACS and metadata paths itself, because those are
+             *     its own routes and a caller cannot know the connection id in advance.
+             */
+            public_base_url: string;
         };
         /** @description What a create names. */
         CreateScimConnectionRequest: {
@@ -8198,6 +8230,21 @@ export interface components {
              * @description Evaluation priority.
              */
             priority: number;
+        };
+        /** @description A created SAML connection, including the two values to paste into a provider's console. */
+        SamlConnectionView: {
+            /** @description Where the provider posts its assertion. */
+            acs_url: string;
+            /** @description The operator-facing label. */
+            display_name: string;
+            /** @description The `smc_` identifier. */
+            id: string;
+            /** @description What the identity provider calls itself. */
+            idp_entity_id: string;
+            /** @description The organization whose people sign in through this provider. */
+            organization_id: string;
+            /** @description What this deployment calls itself to that provider. */
+            sp_entity_id: string;
         };
         /** @description The 201 of a create: the ONLY response that carries the token. */
         ScimConnectionCreated: {
@@ -22431,6 +22478,85 @@ export interface operations {
             };
             /** @description Not found (no such live mapping: absent, already detached, either half in another scope, a role of another organization, or a pair whose two halves are individually visible but do not belong together). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createSamlConnection: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required; replays return the original response */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateSamlConnectionRequest"];
+            };
+        };
+        responses: {
+            /** @description Created. The ACS URL and SP entity id are this deployment's own, derived from the new connection id */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SamlConnectionView"];
+                };
+            };
+            /** @description A field is missing, or the base URL is not an absolute http(s) origin */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope, or fresh privilege is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The organization is not a live row of this scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A live connection of this scope already announces that identity provider entity id */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

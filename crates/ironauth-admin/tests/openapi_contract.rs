@@ -123,6 +123,7 @@ fn operation_ids_are_the_stable_set() {
             "createPortalLink",
             "createProjectGrant",
             "createRoutingRule",
+            "createSamlConnection",
             "createScimConnection",
             "createScimPushConnection",
             "createServiceAccountApiKey",
@@ -780,6 +781,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/saml-connections",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}/rotate",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections",
@@ -944,7 +946,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        297,
+        298,
         "the documented route count is pinned"
     );
 

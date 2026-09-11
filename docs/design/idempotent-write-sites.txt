@@ -88,6 +88,7 @@ crates/ironauth-admin/src/project_grants.rs:create_project_grant:1
 crates/ironauth-admin/src/recovery_approvals.rs:decide:2
 crates/ironauth-admin/src/recovery_approvals.rs:resolve_scope:0
 crates/ironauth-admin/src/routing_rules.rs:create_routing_rule:1
+crates/ironauth-admin/src/saml_connections.rs:create_saml_connection:1
 crates/ironauth-admin/src/scim_connections.rs:create_scim_connection:1
 crates/ironauth-admin/src/scim_connections.rs:require_active_organization:0
 crates/ironauth-admin/src/scim_connections.rs:rotate_scim_connection_token:1

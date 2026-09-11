@@ -203,6 +203,10 @@ class Client:
         """createRoutingRule. POST /v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/routing-rules", query, body)
 
+    def create_saml_connection(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """createSamlConnection. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/saml-connections."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/saml-connections", query, body)
+
     def create_scim_connection(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """`POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-connections", query, body)
