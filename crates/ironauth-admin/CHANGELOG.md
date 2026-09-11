@@ -43,6 +43,23 @@ listing stale and never the access.
 Both writes announce: `access_request.raised` and `access_request.decided`, the
 second carrying `approved` and, on an approval only, `granted_until_unix_ms`.
 
+AN APPROVED GRANT IS A ROLE THE MEMBER HOLDS, so it appears in the effective-roles
+view and in the access-review export with `source: time_boxed`, the request in
+`via_request_id`, and its end in `granted_until_unix_ms`. It is resolved as a fourth
+arm of the same closure every other role path uses, so disabling the organization,
+deleting the role or ending the membership revokes it exactly as they revoke a direct
+assignment.
+
+CONTRACT CHANGE TO THE ACCESS-REVIEW EXPORT: it gains two APPENDED columns,
+`via_request_id` and `granted_until_unix_ms`. Existing columns keep their positions
+and meanings, so a consumer pinning by name or by position still reads what it read.
+Both are empty on every row unless this feature is acknowledged, but the CSV header
+carries them for every deployment.
+
+WHAT IT STILL DOES NOT DO: token issuance resolves its own claim and does not consult
+this, so a live grant is reported by the management surface and a minted token does
+not carry it. Widening the mint from an exploratory flag is a separate decision.
+
 EXPLORATORY means nothing consumes the grants yet. There is no delegation or
 escalation chain, no notification when a request is raised, and no way to revoke a
 grant before its deadline other than letting it expire.

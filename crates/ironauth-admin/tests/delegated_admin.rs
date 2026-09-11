@@ -6878,3 +6878,169 @@ async fn an_approved_request_puts_the_role_in_the_members_effective_roles() {
     // (`a_grant_stops_granting_at_its_deadline_and_the_sweep_records_it`), which reads the
     // grant before its deadline, after it, and after the sweep.
 }
+
+/// DISABLING the organization revokes a live time-boxed grant, like every other path
+/// (issue #145 criterion 4).
+///
+/// # The regression this exists to prevent
+///
+/// The first version of the time-boxed union appended live grants to the effective-roles
+/// answer in this handler, AFTER the store's closure had resolved. The closure seeds only
+/// on a live ACTIVE organization, so a disabled one resolves to the empty set; an appended
+/// grant inherited none of that and went on being reported. Disabling the organization is
+/// the coarsest revocation an operator has, and the console would have shown the elevation
+/// they had just revoked.
+///
+/// The union is now a fourth arm of the same query, so it answers to the same fences by
+/// construction rather than by anybody remembering.
+#[tokio::test]
+async fn disabling_the_organization_revokes_a_live_time_boxed_grant() {
+    let h = Harness::start_with_access_requests(50, true).await;
+    let (tenant, environment) = h.create_tenant("acme", "ar-disable").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let (org, _seeded) = seed_access_request(&h, &base).await;
+    let (user, membership) = seed_org_member(&h, &base, &org, "disable").await;
+    let effective = format!("{base}/organizations/{org}/memberships/{membership}/effective-roles");
+
+    approve_for(&h, &tenant, &environment, &base, &org, &user, "ar-disable").await;
+
+    // LIVE FIRST, so the emptiness below is the disable and not a grant that never worked.
+    let (_, _, before) = h.get(&effective).await;
+    assert!(
+        before.contains("time_boxed"),
+        "the grant must be held before the organization is disabled: {before}"
+    );
+
+    let (status, _, body) = h
+        .post(
+            &format!("{base}/organizations/{org}/disable"),
+            "ar-disable-org",
+            "",
+        )
+        .await;
+    assert!(
+        status.is_success(),
+        "disable the organization: {status} {body}"
+    );
+
+    let (status, _, after) = h.get(&effective).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert!(
+        !after.contains("time_boxed"),
+        "a DISABLED organization still reported a time-boxed elevation. Disabling is the \
+         coarsest revocation an operator has, and every other role path is already empty \
+         here: {after}"
+    );
+}
+
+/// Deleting the ROLE revokes the grant too, for the same structural reason.
+#[tokio::test]
+async fn deleting_the_role_revokes_a_live_time_boxed_grant() {
+    let h = Harness::start_with_access_requests(50, true).await;
+    let (tenant, environment) = h.create_tenant("acme", "ar-delrole").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let (org, _seeded) = seed_access_request(&h, &base).await;
+    let (user, membership) = seed_org_member(&h, &base, &org, "delrole").await;
+    let effective = format!("{base}/organizations/{org}/memberships/{membership}/effective-roles");
+
+    approve_for(&h, &tenant, &environment, &base, &org, &user, "ar-delrole").await;
+    let (_, _, before) = h.get(&effective).await;
+    assert!(before.contains("time_boxed"), "{before}");
+
+    // The role the grant names is deleted. `role_slug` is a bare string, so nothing in the
+    // request row notices; the arm's `r.deleted_at IS NULL` is what does.
+    let roles: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM org_roles WHERE slug = 'billing-admin' AND deleted_at IS NULL",
+    )
+    .fetch_all(h.db().owner_pool())
+    .await
+    .expect("read the role");
+    let role = roles.first().expect("the seeded role").clone();
+    let (status, _, body) = h
+        .delete(&format!("{base}/organizations/{org}/roles/{role}"))
+        .await;
+    assert!(status.is_success(), "delete the role: {status} {body}");
+
+    let (status, _, after) = h.get(&effective).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert!(
+        !after.contains("time_boxed"),
+        "a grant of a DELETED role was still reported as held: {after}"
+    );
+}
+
+/// Seed a user and a membership in `org`, returning both ids.
+async fn seed_org_member(h: &Harness, base: &str, org: &str, key: &str) -> (String, String) {
+    let (status, _, created) = h
+        .post(
+            &format!("{base}/users"),
+            &format!("{key}-user"),
+            &serde_json::json!({ "identifier": format!("{key}@example.test") }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed user: {created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("user id")
+        .to_owned();
+    let (status, _, created) = h
+        .post(
+            &format!("{base}/organizations/{org}/memberships"),
+            &format!("{key}-member"),
+            &serde_json::json!({ "user_id": user }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed membership: {created}");
+    let membership = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("membership id")
+        .to_owned();
+    (user, membership)
+}
+
+/// Raise and approve a one-hour grant of `billing-admin` for `user`, by a second principal.
+async fn approve_for(
+    h: &Harness,
+    tenant: &str,
+    environment: &str,
+    base: &str,
+    org: &str,
+    user: &str,
+    key: &str,
+) {
+    let (status, _, raised) = h
+        .post(
+            &format!("{base}/organizations/{org}/access-requests"),
+            &format!("{key}-raise"),
+            &serde_json::json!({
+                "subject_id": user,
+                "role_slug": "billing-admin",
+                "reason": "quarter close",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "raise: {raised}");
+    let request = serde_json::from_str::<Value>(&raised).expect("json")["id"]
+        .as_str()
+        .expect("request id")
+        .to_owned();
+    let (key_id, secret) = mint_key(h, tenant, environment, &format!("{key}-key")).await;
+    restrict(
+        h,
+        tenant,
+        environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, decided) = h
+        .post_as(
+            &format!("{base}/organizations/{org}/access-requests/{request}/decision"),
+            &secret,
+            &format!("{key}-decide"),
+            &serde_json::json!({ "approve": true, "grant_secs": 3600 }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "approve: {decided}");
+}

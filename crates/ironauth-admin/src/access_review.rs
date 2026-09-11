@@ -126,7 +126,19 @@ pub async fn export_organization_access_review(
     let rows = state
         .store()
         .management()
-        .access_review(scope, &org_id, state.max_group_depth())
+        .access_review(
+            scope,
+            &org_id,
+            state.max_group_depth(),
+            // THE INSTANT, only when the exploratory feature is acknowledged. An access
+            // review that omitted a role the member actually holds would answer its own
+            // question -- who has which role -- falsely, and a time-boxed elevation is
+            // exactly the row an auditor came to find. With the flag off this is the same
+            // export it was before the feature existed, save two always-empty columns.
+            state
+                .access_requests_enabled()
+                .then(|| state.now_unix_micros()),
+        )
         .await
         .map_err(|_| ApiError::Internal)?;
 

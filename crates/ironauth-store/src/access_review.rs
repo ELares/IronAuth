@@ -74,7 +74,8 @@ pub struct AccessReviewRow {
     pub subject_id: String,
     /// The role's immutable slug, or empty on a `none` row.
     pub role_slug: String,
-    /// Which kind of path this row records: `direct`, `group`, `default`, or `none`.
+    /// Which kind of path this row records: `direct`, `group`, `default`, `time_boxed`,
+    /// or `none`.
     pub source: &'static str,
     /// The group the role is inherited from, present only on a `group` row.
     ///
@@ -83,6 +84,19 @@ pub struct AccessReviewRow {
     /// that invented an id here would send a consumer looking for a row to withdraw that does
     /// not exist.
     pub via_group_id: Option<String>,
+    /// The access request the role is held through, present only on a `time_boxed` row
+    /// (issue #145 criterion 4, EXPLORATORY).
+    ///
+    /// Its OWN column rather than reusing `via_group_id`. The first version put the
+    /// `agr_...` id there, and a consumer reading a column named for a group would have
+    /// joined it against the group list and found nothing.
+    pub via_request_id: Option<String>,
+    /// When a `time_boxed` row stops granting, in epoch milliseconds.
+    ///
+    /// The only row kind that ends on its own. An auditor asking "and for how long" has no
+    /// other column to read it from, and a review that showed the elevation without its end
+    /// would report a standing grant.
+    pub granted_until_unix_ms: Option<i64>,
 }
 
 impl AccessReviewRow {
@@ -98,7 +112,11 @@ impl AccessReviewRow {
         subject_id: &str,
         grants: &[EffectiveRoleGrant],
     ) -> Vec<Self> {
-        let row = |role_slug: String, source: &'static str, via_group_id: Option<String>| Self {
+        let row = |role_slug: String,
+                   source: &'static str,
+                   via_group_id: Option<String>,
+                   via_request_id: Option<String>,
+                   granted_until_unix_ms: Option<i64>| Self {
             organization_id: organization_id.to_owned(),
             principal_kind,
             membership_id: membership_id.to_owned(),
@@ -106,25 +124,41 @@ impl AccessReviewRow {
             role_slug,
             source,
             via_group_id,
+            via_request_id,
+            granted_until_unix_ms,
         };
         if grants.is_empty() {
-            return vec![row(String::new(), "none", None)];
+            return vec![row(String::new(), "none", None, None, None)];
         }
         grants
             .iter()
             .map(|grant| {
-                let (source, via_group_id) = match &grant.source {
-                    EffectiveRoleSource::Direct => ("direct", None),
-                    EffectiveRoleSource::Group(group) => ("group", Some(group.to_string())),
-                    EffectiveRoleSource::Default => ("default", None),
-                    // The request id goes in the `via` column, which for a group holds the
-                    // group. Both answer the same question -- what would I change to take
-                    // this away -- and for a time-boxed grant the answer is the request.
-                    EffectiveRoleSource::TimeBoxed { request_id, .. } => {
-                        ("time_boxed", Some(request_id.clone()))
+                let (source, via_group_id, via_request_id, until) = match &grant.source {
+                    EffectiveRoleSource::Direct => ("direct", None, None, None),
+                    EffectiveRoleSource::Group(group) => {
+                        ("group", Some(group.to_string()), None, None)
                     }
+                    EffectiveRoleSource::Default => ("default", None, None, None),
+                    // The request goes in its OWN column, not in `via_group_id`: a consumer
+                    // reading a column named for a group would join an `agr_` id against
+                    // the group list and find nothing.
+                    EffectiveRoleSource::TimeBoxed {
+                        request_id,
+                        granted_until_micros,
+                    } => (
+                        "time_boxed",
+                        None,
+                        Some(request_id.clone()),
+                        Some(granted_until_micros / 1000),
+                    ),
                 };
-                row(grant.slug.clone(), source, via_group_id)
+                row(
+                    grant.slug.clone(),
+                    source,
+                    via_group_id,
+                    via_request_id,
+                    until,
+                )
             })
             .collect()
     }
@@ -135,7 +169,7 @@ impl AccessReviewRow {
 /// SHARED DELIBERATELY. Two lists would agree until somebody added a column to one, and a
 /// consumer pinning the CSV header against the JSONL keys is exactly what a versioned contract
 /// fixture does.
-pub const ACCESS_REVIEW_COLUMNS: [&str; 7] = [
+pub const ACCESS_REVIEW_COLUMNS: [&str; 9] = [
     "organization_id",
     "principal_kind",
     "membership_id",
@@ -143,6 +177,12 @@ pub const ACCESS_REVIEW_COLUMNS: [&str; 7] = [
     "role_slug",
     "source",
     "via_group_id",
+    // APPENDED, never inserted: a consumer pinning by position keeps every column it had,
+    // and one pinning by name is unaffected. Both are empty on every row unless the
+    // exploratory access-request feature is acknowledged, but the HEADER carries them for
+    // every deployment, which is the contract change this makes and the changelog states.
+    "via_request_id",
+    "granted_until_unix_ms",
 ];
 
 /// The rows as JSON Lines: one object per line, trailing newline after the last.
@@ -396,6 +436,8 @@ mod tests {
             role_slug: "admin".to_owned(),
             source,
             via_group_id: via.map(str::to_owned),
+            via_request_id: None,
+            granted_until_unix_ms: None,
         }
     }
 
@@ -466,6 +508,8 @@ mod tests {
             role_slug: "ad\nmin".to_owned(),
             source: "direct",
             via_group_id: None,
+            via_request_id: None,
+            granted_until_unix_ms: None,
         };
         let text = to_csv(&[nasty]);
         assert!(text.contains("\"org,1\""), "a comma must be quoted: {text}");
@@ -534,6 +578,8 @@ mod tests {
             role_slug: "ad\nmin".to_owned(),
             source: "direct",
             via_group_id: None,
+            via_request_id: None,
+            granted_until_unix_ms: None,
         };
         let consumed = parse_csv(&to_csv(std::slice::from_ref(&nasty))).expect("the CSV parses");
         assert_eq!(consumed.len(), 1, "the record split: {consumed:?}");

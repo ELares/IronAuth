@@ -507,43 +507,27 @@ pub async fn get_org_membership_effective_roles(
     // is exactly what a token would carry for it. The same seed requires the
     // ORGANIZATION to be live and active, so a disabled organization resolves to the
     // empty set here for the same reason and by the same code path the mint uses.
-    let mut grants = state
-        .store()
-        .management()
-        .org_groups(scope)
-        .effective_role_grants(&org_id, &membership.user_id, state.max_group_depth())
-        .await?;
-
-    // AND THE LIVE TIME-BOXED GRANTS (issue #145 criterion 4, EXPLORATORY).
-    //
-    // Without this the approval primitive RECORDS an elevation and confers nothing: a
-    // request approved five minutes ago changes no answer any surface gives, which is not
-    // what "grants time-boxed access" means. `live_roles_for_subject` narrows on the
-    // deadline in SQL and re-checks it in Rust, so a grant past its deadline contributes
-    // nothing here whether or not the sweeper has relabelled it.
-    //
-    // GATED, because an exploratory feature must not widen a live authorization picture
-    // for a deployment that has not acknowledged it. With the flag off this is the same
-    // list it was before the feature existed.
-    //
-    // WHAT THIS DOES NOT DO: the token-issuance path resolves its own claim through
-    // `effective_roles` and does not consult this. So a live grant is reported here and in
-    // the access-review export, and a token minted for the same member does not carry it.
-    // Widening the mint from an exploratory flag is a decision to take deliberately and
-    // separately, not a line to slip into this one.
-    if state.access_requests_enabled() {
-        let live = state
-            .store()
-            .scoped(scope)
-            .access_requests()
-            .live_grants_for_subject(
-                &org_id.to_string(),
-                &membership.user_id.to_string(),
+    // THROUGH THE TIME-BOXED TAIL when the exploratory feature is acknowledged, which is
+    // the SAME closure and the same three fences with a fourth arm, not a second query
+    // whose results are appended. An earlier version appended, and a disabled organization
+    // went on reporting the elevation because the append inherited none of the liveness
+    // the closure applies.
+    let groups = state.store().management();
+    let groups = groups.org_groups(scope);
+    let grants = if state.access_requests_enabled() {
+        groups
+            .effective_role_grants_at(
+                &org_id,
+                &membership.user_id,
+                state.max_group_depth(),
                 state.now_unix_micros(),
             )
-            .await?;
-        grants.extend(live);
-    }
+            .await?
+    } else {
+        groups
+            .effective_role_grants(&org_id, &membership.user_id, state.max_group_depth())
+            .await?
+    };
 
     // The permission set, through the SAME repository, the SAME (organization, user)
     // key, and the SAME depth bound as the roles above and as the mint (issue #98), so

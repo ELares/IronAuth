@@ -49755,12 +49755,14 @@ impl<'a> ManagementStore<'a> {
         scope: Scope,
         organization_id: &OrganizationId,
         max_group_depth: u32,
+        time_boxed_now_micros: Option<i64>,
     ) -> Result<Vec<crate::access_review::AccessReviewRow>, StoreError> {
         self.access_review_in_pages(
             scope,
             organization_id,
             max_group_depth,
             MANAGEMENT_LIST_HARD_CAP,
+            time_boxed_now_micros,
         )
         .await
     }
@@ -49790,6 +49792,7 @@ impl<'a> ManagementStore<'a> {
         organization_id: &OrganizationId,
         max_group_depth: u32,
         page: i64,
+        time_boxed_now_micros: Option<i64>,
     ) -> Result<Vec<crate::access_review::AccessReviewRow>, StoreError> {
         let memberships = self.org_memberships(scope);
         let groups = self.org_groups(scope);
@@ -49806,9 +49809,31 @@ impl<'a> ManagementStore<'a> {
                 break;
             }
             for membership in &batch {
-                let grants = groups
-                    .effective_role_grants(organization_id, &membership.user_id, max_group_depth)
-                    .await?;
+                // THROUGH THE TIME-BOXED TAIL when the caller passes an instant, so an
+                // elevation somebody approved appears in the evidence an auditor is handed.
+                // An export that omitted a role the member actually holds would answer its
+                // own question -- who has which role -- falsely.
+                let grants = match time_boxed_now_micros {
+                    Some(now) => {
+                        groups
+                            .effective_role_grants_at(
+                                organization_id,
+                                &membership.user_id,
+                                max_group_depth,
+                                now,
+                            )
+                            .await?
+                    }
+                    None => {
+                        groups
+                            .effective_role_grants(
+                                organization_id,
+                                &membership.user_id,
+                                max_group_depth,
+                            )
+                            .await?
+                    }
+                };
                 rows.extend(crate::access_review::AccessReviewRow::from_grants(
                     &organization,
                     "user",
@@ -52031,6 +52056,43 @@ impl OrgGroupRepo<'_> {
         self.decode_grants(&rows)
     }
 
+    /// [`Self::effective_role_grants`] PLUS any live time-boxed grant (issue #145
+    /// criterion 4, EXPLORATORY).
+    ///
+    /// `now_micros` is the instant the deadline is judged against, taken from the caller's
+    /// clock seam so a test can drive it.
+    ///
+    /// # Why this is a different TAIL and not a different caller
+    ///
+    /// Every fence the plain resolution applies -- a live ACTIVE organization, a live
+    /// ACTIVE membership, a role that is not deleted -- lives in the shared CTE and in each
+    /// arm's WHERE. A caller that resolved the plain grants and appended time-boxed ones
+    /// afterwards would inherit none of them: the first version of this feature did exactly
+    /// that, and a DISABLED organization went on reporting the elevation, which is the
+    /// coarsest revocation an operator has.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::effective_role_grants`].
+    pub async fn effective_role_grants_at(
+        &self,
+        organization_id: &OrganizationId,
+        user_id: &UserId,
+        max_group_depth: u32,
+        now_micros: i64,
+    ) -> Result<Vec<EffectiveRoleGrant>, StoreError> {
+        let rows = self
+            .run_effective_at(
+                organization_id,
+                MembershipPrincipal::User(user_id),
+                max_group_depth,
+                EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL,
+                Some(now_micros),
+            )
+            .await?;
+        self.decode_grants(&rows)
+    }
+
     /// [`Self::effective_role_grants`] for a MACHINE member.
     ///
     /// The same closure, the same tail, the same decode: `run_effective` takes the principal
@@ -52103,6 +52165,31 @@ impl OrgGroupRepo<'_> {
                             })?,
                         )
                     }
+                    // Only projected by `EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL`, so the
+                    // plain tail can never reach it. Both companions are required rather
+                    // than defaulted: a time-boxed grant whose deadline did not survive
+                    // the decode would be reported as held with no end, which is the
+                    // standing access the whole primitive exists to replace.
+                    "time_boxed" => {
+                        let request_id = row
+                            .get::<Option<String>, _>("via_request_id")
+                            .ok_or_else(|| {
+                                StoreError::Database(sqlx::Error::Decode(
+                                    "a time-boxed grant carries no request id".into(),
+                                ))
+                            })?;
+                        let granted_until_micros = row
+                            .get::<Option<i64>, _>("granted_until_micros")
+                            .ok_or_else(|| {
+                                StoreError::Database(sqlx::Error::Decode(
+                                    "a time-boxed grant carries no deadline".into(),
+                                ))
+                            })?;
+                        EffectiveRoleSource::TimeBoxed {
+                            request_id,
+                            granted_until_micros,
+                        }
+                    }
                     _ => {
                         return Err(StoreError::Database(sqlx::Error::Decode(
                             "an effective-role grant carries an unknown source".into(),
@@ -52130,6 +52217,22 @@ impl OrgGroupRepo<'_> {
         max_group_depth: u32,
         tail: &'static str,
     ) -> Result<Vec<PgRow>, StoreError> {
+        self.run_effective_at(organization_id, principal, max_group_depth, tail, None)
+            .await
+    }
+
+    /// [`Self::run_effective`], additionally binding `$6` for a tail that judges a deadline.
+    ///
+    /// `None` binds NULL, which no arm of the plain tail reads: the parameter exists so the
+    /// two tails share one binding order rather than drifting apart.
+    async fn run_effective_at(
+        &self,
+        organization_id: &OrganizationId,
+        principal: MembershipPrincipal<'_>,
+        max_group_depth: u32,
+        tail: &'static str,
+        now_micros: Option<i64>,
+    ) -> Result<Vec<PgRow>, StoreError> {
         if organization_id.scope() != self.scope || principal.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -52152,6 +52255,7 @@ impl OrgGroupRepo<'_> {
             .bind(organization_id.to_string())
             .bind(principal.id_string())
             .bind(walk_bound)
+            .bind(now_micros)
             .fetch_all(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -52877,6 +52981,75 @@ const EFFECTIVE_ROLE_GRANTS_TAIL: &str = "SELECT DISTINCT r.slug AS slug, \
       WHERE r.tenant_id = $1 AND r.environment_id = $2 \
         AND r.organization_id = $3 AND r.deleted_at IS NULL \
         AND r.is_default AND EXISTS (SELECT 1 FROM membership) \
+      ORDER BY slug, source, via_group_id NULLS FIRST";
+
+/// [`EFFECTIVE_ROLE_GRANTS_TAIL`] plus the TIME-BOXED arm (issue #145 criterion 4).
+///
+/// # Why a fourth arm here rather than a union in the caller
+///
+/// The first attempt appended live grants to the result in the management handler, and it
+/// bypassed every fence this CTE exists to apply. `EFFECTIVE_CLOSURE_CTE` seeds `membership`
+/// only for a LIVE ACTIVE membership of a LIVE ACTIVE organization, and each arm below
+/// additionally requires `r.deleted_at IS NULL`. A grant appended afterwards inherited none
+/// of that: a DISABLED organization still reported the elevation, which defeats the coarsest
+/// revocation an operator has, and a DELETED role kept being reported as held.
+///
+/// Written as an arm, the time-boxed grant answers to the same three fences as every other
+/// path by construction, and a later change to what "live membership" means reaches it
+/// without anybody remembering to.
+///
+/// `$6` is the instant to judge the deadline against. The bound is `>` so a grant does not
+/// survive its own deadline, matching
+/// [`crate::access_request::AccessGrantRequest::grants_now`], which the read path applies to
+/// the same rows.
+const EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL: &str = "SELECT DISTINCT r.slug AS slug, \
+            'direct'::text AS source, NULL::text AS via_group_id, \
+            NULL::text AS via_request_id, NULL::bigint AS granted_until_micros \
+       FROM org_roles r \
+       JOIN org_membership_roles mr ON mr.role_id = r.id \
+       JOIN membership mb ON mb.id = mr.membership_id \
+      WHERE r.tenant_id = $1 AND r.environment_id = $2 \
+        AND r.organization_id = $3 AND r.deleted_at IS NULL \
+        AND mr.tenant_id = $1 AND mr.environment_id = $2 \
+        AND mr.organization_id = $3 AND mr.deleted_at IS NULL \
+      UNION ALL \
+     SELECT DISTINCT r.slug AS slug, \
+            'group'::text AS source, gr.group_id AS via_group_id, \
+            NULL::text AS via_request_id, NULL::bigint AS granted_until_micros \
+       FROM org_roles r \
+       JOIN org_group_roles gr ON gr.role_id = r.id \
+      WHERE r.tenant_id = $1 AND r.environment_id = $2 \
+        AND r.organization_id = $3 AND r.deleted_at IS NULL \
+        AND gr.tenant_id = $1 AND gr.environment_id = $2 \
+        AND gr.organization_id = $3 AND gr.deleted_at IS NULL \
+        AND gr.group_id IN (SELECT id FROM closure) \
+      UNION ALL \
+     SELECT DISTINCT r.slug AS slug, \
+            'default'::text AS source, NULL::text AS via_group_id, \
+            NULL::text AS via_request_id, NULL::bigint AS granted_until_micros \
+       FROM org_roles r \
+      WHERE r.tenant_id = $1 AND r.environment_id = $2 \
+        AND r.organization_id = $3 AND r.deleted_at IS NULL \
+        AND r.is_default AND EXISTS (SELECT 1 FROM membership) \
+      UNION ALL \
+     SELECT DISTINCT r.slug AS slug, \
+            'time_boxed'::text AS source, NULL::text AS via_group_id, \
+            agr.id AS via_request_id, \
+            (EXTRACT(EPOCH FROM agr.granted_until) * 1000000)::bigint \
+                AS granted_until_micros \
+       FROM org_roles r \
+       JOIN access_grant_requests agr \
+         ON agr.role_slug = r.slug \
+        AND agr.tenant_id = r.tenant_id \
+        AND agr.environment_id = r.environment_id \
+        AND agr.organization_id = r.organization_id \
+      WHERE r.tenant_id = $1 AND r.environment_id = $2 \
+        AND r.organization_id = $3 AND r.deleted_at IS NULL \
+        AND agr.subject_id = $4 \
+        AND agr.state = 'approved' \
+        AND agr.granted_until > \
+            (TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+        AND EXISTS (SELECT 1 FROM membership) \
       ORDER BY slug, source, via_group_id NULLS FIRST";
 
 /// The projection [`OrgGroupRepo::effective_permissions`] runs over

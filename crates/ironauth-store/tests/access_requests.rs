@@ -541,9 +541,7 @@ async fn the_control_role_cannot_rewrite_who_asked() {
         .bind(value)
         .execute(db.control_pool())
         .await;
-        let message = refused
-            .map(|_| String::new())
-            .unwrap_or_else(|error| error.to_string());
+        let message = refused.map_or_else(|error| error.to_string(), |_| String::new());
         assert!(
             message.contains("permission denied"),
             "the control role rewrote {column} on a decided request. The audit answer to \
@@ -565,4 +563,283 @@ async fn the_control_role_cannot_rewrite_who_asked() {
     assert_eq!(after.subject_id, "usr_subject");
     assert_eq!(after.role_slug, "billing-admin");
     assert_eq!(after.reason, "quarter close");
+}
+
+/// Create the role, the user and the membership a time-boxed grant needs to resolve.
+///
+/// Split out for the crate's function-length bound. Returns the user, which is the key the
+/// effective-role closure is seeded on.
+async fn seed_member_with_role(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    org: &OrganizationId,
+) -> ironauth_store::UserId {
+    use ironauth_store::{
+        NewAdminUser, NewMembership, NewOrgRole, OrgMembershipId, OrgRoleId, UserState,
+    };
+
+    let store = db.control_store();
+    let role_id = OrgRoleId::generate(env, &scope);
+    store
+        .management()
+        .acting(actor(env), CorrelationId::generate(env))
+        .org_roles(scope)
+        .create(
+            env,
+            NewOrgRole {
+                id: &role_id,
+                organization_id: org,
+                slug: "billing-admin",
+                display_name: "Billing",
+                metadata: None,
+            },
+            now_micros(env),
+            None,
+        )
+        .await
+        .expect("create the role");
+
+    let user = store
+        .scoped(scope)
+        .acting(actor(env), CorrelationId::generate(env))
+        .users()
+        .admin_create(
+            env,
+            NewAdminUser {
+                id: None,
+                identifier: "elevated@example.test",
+                password_hash: None,
+                claims_json: None,
+                external_id: None,
+                state: UserState::Active,
+                foreign_password_hash: None,
+                foreign_password_algo: None,
+                traits: None,
+            },
+            now_micros(env),
+            None,
+        )
+        .await
+        .expect("create the user");
+
+    let membership_id = OrgMembershipId::generate(env, &scope);
+    store
+        .management()
+        .acting(actor(env), CorrelationId::generate(env))
+        .org_memberships(scope)
+        .create(
+            env,
+            NewMembership {
+                id: &membership_id,
+                organization_id: org,
+                user_id: &user,
+                metadata: None,
+            },
+            now_micros(env),
+            None,
+        )
+        .await
+        .expect("create the membership");
+    user
+}
+
+/// The time-boxed ARM stops granting at the deadline, judged in SQL
+/// (issue #145 criterion 4).
+///
+/// # Why this is not covered by the `grants_now` test above
+///
+/// That one drives the Rust read rule. This drives the SQL: the arm's
+/// `agr.granted_until > $6` is a second place the deadline is decided, and the two can
+/// disagree. Deleting the predicate from the arm leaves every HTTP test green, because the
+/// management harness runs on the system clock and cannot step past a one-hour grant.
+///
+/// Both bounds are half-open at the same instant, so a grant does not survive its own
+/// deadline in either.
+#[tokio::test]
+async fn the_time_boxed_arm_stops_granting_at_the_deadline() {
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0145_0006);
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope).await;
+    let store = db.control_store();
+
+    let user = seed_member_with_role(&db, &env, scope, &org).await;
+
+    // A one-hour grant for THIS user.
+    let id = AccessRequestId::generate(&env, &scope);
+    store
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .access_requests(scope)
+        .raise(
+            &env,
+            &id,
+            ironauth_store::NewAccessRequest {
+                organization_id: &org.to_string(),
+                subject_id: &user.to_string(),
+                role_slug: "billing-admin",
+                requested_by: "prn_asker",
+                reason: "quarter close",
+            },
+            None,
+        )
+        .await
+        .expect("raise");
+    let granted_at = now_micros(&env);
+    store
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .access_requests(scope)
+        .decide(
+            &env,
+            &id,
+            ironauth_store::AccessDecision {
+                approve: true,
+                decided_by: "prn_approver",
+                decided_at_micros: granted_at,
+                granted_until_micros: Some(granted_at + 3_600_000_000),
+            },
+            None,
+        )
+        .await
+        .expect("approve");
+
+    let held = || async {
+        store
+            .management()
+            .org_groups(scope)
+            .effective_role_grants_at(&org, &user, 8, now_micros(&env))
+            .await
+            .expect("resolve")
+            .into_iter()
+            .any(|grant| {
+                matches!(
+                    grant.source,
+                    ironauth_store::EffectiveRoleSource::TimeBoxed { .. }
+                )
+            })
+    };
+
+    clock.advance(std::time::Duration::from_secs(59 * 60));
+    assert!(held().await, "inside the window the arm grants");
+
+    clock.advance(std::time::Duration::from_secs(2 * 60));
+    assert!(
+        !held().await,
+        "past the deadline the ARM must stop granting. The Rust read rule stopping is not \
+         enough: this is a second place the deadline is decided, and a query that kept \
+         returning the row would hand an elevation to every caller that trusts the \
+         resolution rather than re-checking"
+    );
+}
+
+/// The ACCESS REVIEW carries a live time-boxed elevation, in its own columns
+/// (issue #145 criteria 1 and 4).
+///
+/// # Why the export is the place this matters most
+///
+/// The effective-roles endpoint answers one member at a time and somebody has to ask. The
+/// access review is the artifact handed to an auditor, and its question is "who has which
+/// role". A live elevation IS a role somebody has, so an export omitting it does not merely
+/// leave something out: it answers its own question falsely, and it is the one surface
+/// where nobody is looking for what is missing.
+///
+/// The first version of this feature had a `time_boxed` render arm that nothing could
+/// reach, because the export resolved through the plain closure.
+#[tokio::test]
+async fn the_access_review_export_carries_a_live_time_boxed_grant() {
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0145_0007);
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope).await;
+    let user = seed_member_with_role(&db, &env, scope, &org).await;
+    let store = db.control_store();
+
+    let id = AccessRequestId::generate(&env, &scope);
+    store
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .access_requests(scope)
+        .raise(
+            &env,
+            &id,
+            ironauth_store::NewAccessRequest {
+                organization_id: &org.to_string(),
+                subject_id: &user.to_string(),
+                role_slug: "billing-admin",
+                requested_by: "prn_asker",
+                reason: "quarter close",
+            },
+            None,
+        )
+        .await
+        .expect("raise");
+    let granted_at = now_micros(&env);
+    let until = granted_at + 3_600_000_000;
+    store
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .access_requests(scope)
+        .decide(
+            &env,
+            &id,
+            ironauth_store::AccessDecision {
+                approve: true,
+                decided_by: "prn_approver",
+                decided_at_micros: granted_at,
+                granted_until_micros: Some(until),
+            },
+            None,
+        )
+        .await
+        .expect("approve");
+
+    let review = |at: Option<i64>| async move {
+        store
+            .management()
+            .access_review(scope, &org, 8, at)
+            .await
+            .expect("export")
+    };
+
+    // WITHOUT THE INSTANT the export is what it always was: the feature is off for that
+    // caller and nothing about the evidence changes.
+    let plain = review(None).await;
+    assert!(
+        plain.iter().all(|row| row.source != "time_boxed"),
+        "an unacknowledged deployment's export must be unchanged: {plain:?}"
+    );
+
+    // WITH IT, the elevation is in the evidence, in its OWN columns.
+    let rows = review(Some(now_micros(&env))).await;
+    let elevated = rows
+        .iter()
+        .find(|row| row.source == "time_boxed")
+        .unwrap_or_else(|| panic!("the review omitted a role the member holds: {rows:?}"));
+    assert_eq!(elevated.role_slug, "billing-admin");
+    assert_eq!(elevated.subject_id, user.to_string());
+    assert_eq!(
+        elevated.via_request_id.as_deref(),
+        Some(id.to_string().as_str()),
+        "the request belongs in its own column: a consumer reading an `agr_` id out of \
+         `via_group_id` would join it against the group list and find nothing"
+    );
+    assert_eq!(
+        elevated.via_group_id, None,
+        "a time-boxed grant reaches nobody through a group"
+    );
+    assert_eq!(
+        elevated.granted_until_unix_ms,
+        Some(until / 1000),
+        "an auditor asking 'and for how long' has no other column to read"
+    );
+
+    // AND PAST THE DEADLINE IT IS GONE, so the evidence does not report a standing grant.
+    clock.advance(std::time::Duration::from_secs(3 * 3600));
+    let later = review(Some(now_micros(&env))).await;
+    assert!(
+        later.iter().all(|row| row.source != "time_boxed"),
+        "the export reported an elevation past its own deadline: {later:?}"
+    );
 }
