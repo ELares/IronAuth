@@ -13192,7 +13192,7 @@
             }
           },
           "422": {
-            "description": "The caller raised this request and may not decide it. Refused here in words, and by a CHECK constraint on every other path into the table",
+            "description": "This credential raised the request and may not decide it. Refused here in words and by a CHECK constraint on every other path into the table. The rule separates PRINCIPALS: one person holding two credentials can raise under one and decide under the other, and nothing here detects that",
             "content": {
               "application/json": {
                 "schema": {
@@ -32938,7 +32938,8 @@
         "enum": [
           "direct",
           "group",
-          "default"
+          "default",
+          "time_boxed"
         ]
       },
       "EffectiveRoleView": {
@@ -32949,6 +32950,14 @@
           "source"
         ],
         "properties": {
+          "granted_until_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When this path stops granting, in epoch milliseconds. Present exactly when `source`\nis `time_boxed`, because it is the only source that ends on its own.\n\nA consumer that caches this answer must not cache it past this instant: every other\nsource is held until a row changes, and this one is held until a clock passes."
+          },
           "slug": {
             "type": "string",
             "description": "The role's IMMUTABLE stable name. Slugs rather than ids because a slug is\nwhat an authorization decision keys on and what a token claim will carry: it\nis stable across a rename and across a promotion between environments.",
@@ -32965,6 +32974,14 @@
             ],
             "description": "The group that carries the grant (`grp_...`). Present exactly when `source`\nis `group`, and absent (rather than null) otherwise.",
             "example": "grp_..."
+          },
+          "via_request_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The access request that granted it (`agr_...`). Present exactly when `source` is\n`time_boxed`.",
+            "example": "agr_..."
           }
         }
       },

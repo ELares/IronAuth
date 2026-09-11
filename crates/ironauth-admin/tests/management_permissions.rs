@@ -155,18 +155,22 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // The ordered event feed and the usage export (issue #107). Both are environment-scoped
     // READS: the feed replays what already happened and the export folds it, so neither
     // grants sight of anything a `management.read` caller could not already list.
-    // The audit-retention report (issue #145 criterion 3). `Read`: it publishes the policy
-    // this deployment enforces, which a customer needs to answer an auditor, and discloses
-    // no audit CONTENT.
     // The EXPLORATORY access-request surface (issue #145 criterion 4). The two writes are
     // `WriteOrganizations` because both change what a member of an organization may do; the
     // listing is `Read`.
     //
-    // NOT a separate permission for the approver. The separation this primitive enforces is
-    // by IDENTITY, not by privilege: the approver must be a different person, and a
-    // credential holding a hypothetical `management.approve` would satisfy a permission
-    // split while one human held both. The refusal that matters compares the two principals
-    // and is a CHECK constraint.
+    // NO SEPARATE APPROVER PERMISSION, and the earlier version of this comment gave a
+    // reason that refuted itself. It said a `management.approve` permission "would satisfy
+    // a permission split while one human held both" -- which is true, and is EQUALLY true
+    // of the comparison chosen instead: `credential_ref()` is per-credential, so one human
+    // holding two management keys raises under one and decides under the other, and the
+    // CHECK constraint, the repository and the handler all pass.
+    //
+    // What this primitive separates is PRINCIPALS, not people, and that bound is stated
+    // wherever the rule is published and measured by
+    // `two_credentials_of_one_operator_are_two_principals_and_the_rule_does_not_see_it`.
+    // A permission split is absent because it would buy nothing the principal comparison
+    // does not already give, NOT because it would be weaker.
     (
         "raiseAccessRequest",
         ManagementPermission::WriteOrganizations,
@@ -176,6 +180,9 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         ManagementPermission::WriteOrganizations,
     ),
     ("listAccessRequests", ManagementPermission::Read),
+    // The audit-retention report (issue #145 criterion 3). `Read`: it publishes the policy
+    // this deployment enforces, which a customer needs to answer an auditor, and discloses
+    // no audit CONTENT.
     ("readAuditRetention", ManagementPermission::Read),
     // The delivery attestation (issue #145 criterion 3, other half). `Read`: it reports HOW
     // MANY audit events a log stream failed to deliver and the error the sink returned. It

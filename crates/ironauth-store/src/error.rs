@@ -468,7 +468,7 @@ impl fmt::Display for StoreError {
             StoreError::Migration(_) => f.write_str("migration error"),
             StoreError::IdempotencyConflict => f.write_str("idempotency-key conflict"),
             StoreError::SelfApproval => {
-                f.write_str("the requester of an access request may not decide it")
+                f.write_str("the principal that raised an access request may not decide it")
             }
             StoreError::Conflict => f.write_str("uniqueness conflict"),
             StoreError::InvalidRedirectUri => f.write_str("invalid redirect uri"),

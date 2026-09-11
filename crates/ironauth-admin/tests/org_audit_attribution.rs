@@ -195,10 +195,6 @@ const UNATTRIBUTED_CEILING: usize = 1;
 /// function and reads that function plus the same-file functions it calls, which is the
 /// granularity `org_confinement_surface.rs` already uses for the confinement fence.
 const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
-    // The organization contact writes (issue #141). Both attribute through
-    // `.in_organization(org_id)`: a contact is a person one CUSTOMER named, so an unattributed
-    // row would leave that customer's own log stream blind to somebody being added to -- or
-    // quietly taken off -- the list of who hears about their outages.
     // The EXPLORATORY access-request writes (issue #145 criterion 4). Both attribute
     // through `.in_organization(org_id)`, and this is a surface where an unattributed row
     // would be worst: the whole point of the primitive is that somebody can show an
@@ -212,6 +208,10 @@ const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
         "decideAccessRequest",
         include_str!("../src/access_requests.rs"),
     ),
+    // The organization contact writes (issue #141). Both attribute through
+    // `.in_organization(org_id)`: a contact is a person one CUSTOMER named, so an unattributed
+    // row would leave that customer's own log stream blind to somebody being added to -- or
+    // quietly taken off -- the list of who hears about their outages.
     (
         "createOrganizationContact",
         include_str!("../src/org_contacts.rs"),

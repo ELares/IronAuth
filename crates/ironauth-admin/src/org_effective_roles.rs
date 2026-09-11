@@ -134,6 +134,13 @@ pub enum EffectiveRoleSourceView {
     /// withdrawn for the WHOLE organization at once, by designating a different
     /// default role, clearing the designation, or deleting the role.
     Default,
+    /// Held through an APPROVED, still-live access request (issue #145 criterion 4,
+    /// EXPLORATORY). `via_request_id` names it and `granted_until_unix_ms` says when it
+    /// ends.
+    ///
+    /// The only source that expires. A consumer caching this entry the way it may cache
+    /// the other three would hold an elevation past its own deadline.
+    TimeBoxed,
 }
 
 /// One role a membership effectively holds, and the ONE path by which it holds it.
@@ -155,6 +162,18 @@ pub struct EffectiveRoleView {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "grp_...")]
     pub via_group_id: Option<String>,
+    /// The access request that granted it (`agr_...`). Present exactly when `source` is
+    /// `time_boxed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "agr_...")]
+    pub via_request_id: Option<String>,
+    /// When this path stops granting, in epoch milliseconds. Present exactly when `source`
+    /// is `time_boxed`, because it is the only source that ends on its own.
+    ///
+    /// A consumer that caches this answer must not cache it past this instant: every other
+    /// source is held until a row changes, and this one is held until a clock passes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub granted_until_unix_ms: Option<i64>,
 }
 
 impl EffectiveRoleView {
@@ -166,11 +185,15 @@ impl EffectiveRoleView {
                 slug: grant.slug,
                 source: EffectiveRoleSourceView::Direct,
                 via_group_id: None,
+                via_request_id: None,
+                granted_until_unix_ms: None,
             },
             EffectiveRoleSource::Group(group) => Self {
                 slug: grant.slug,
                 source: EffectiveRoleSourceView::Group,
                 via_group_id: Some(group.to_string()),
+                via_request_id: None,
+                granted_until_unix_ms: None,
             },
             // No `via_group_id`, and not because one is unknown: the organization's
             // default role reaches the member through no group and through no
@@ -179,6 +202,18 @@ impl EffectiveRoleView {
                 slug: grant.slug,
                 source: EffectiveRoleSourceView::Default,
                 via_group_id: None,
+                via_request_id: None,
+                granted_until_unix_ms: None,
+            },
+            EffectiveRoleSource::TimeBoxed {
+                request_id,
+                granted_until_micros,
+            } => Self {
+                slug: grant.slug,
+                source: EffectiveRoleSourceView::TimeBoxed,
+                via_group_id: None,
+                via_request_id: Some(request_id),
+                granted_until_unix_ms: Some(granted_until_micros / 1000),
             },
         }
     }
@@ -472,12 +507,43 @@ pub async fn get_org_membership_effective_roles(
     // is exactly what a token would carry for it. The same seed requires the
     // ORGANIZATION to be live and active, so a disabled organization resolves to the
     // empty set here for the same reason and by the same code path the mint uses.
-    let grants = state
+    let mut grants = state
         .store()
         .management()
         .org_groups(scope)
         .effective_role_grants(&org_id, &membership.user_id, state.max_group_depth())
         .await?;
+
+    // AND THE LIVE TIME-BOXED GRANTS (issue #145 criterion 4, EXPLORATORY).
+    //
+    // Without this the approval primitive RECORDS an elevation and confers nothing: a
+    // request approved five minutes ago changes no answer any surface gives, which is not
+    // what "grants time-boxed access" means. `live_roles_for_subject` narrows on the
+    // deadline in SQL and re-checks it in Rust, so a grant past its deadline contributes
+    // nothing here whether or not the sweeper has relabelled it.
+    //
+    // GATED, because an exploratory feature must not widen a live authorization picture
+    // for a deployment that has not acknowledged it. With the flag off this is the same
+    // list it was before the feature existed.
+    //
+    // WHAT THIS DOES NOT DO: the token-issuance path resolves its own claim through
+    // `effective_roles` and does not consult this. So a live grant is reported here and in
+    // the access-review export, and a token minted for the same member does not carry it.
+    // Widening the mint from an exploratory flag is a decision to take deliberately and
+    // separately, not a line to slip into this one.
+    if state.access_requests_enabled() {
+        let live = state
+            .store()
+            .scoped(scope)
+            .access_requests()
+            .live_grants_for_subject(
+                &org_id.to_string(),
+                &membership.user_id.to_string(),
+                state.now_unix_micros(),
+            )
+            .await?;
+        grants.extend(live);
+    }
 
     // The permission set, through the SAME repository, the SAME (organization, user)
     // key, and the SAME depth bound as the roles above and as the mint (issue #98), so

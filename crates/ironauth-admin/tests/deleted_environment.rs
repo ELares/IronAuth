@@ -437,26 +437,6 @@ impl Fixture {
     }
 
     /// Seed one environment with the entities above AND the relations between them.
-    /// A PENDING access request, seeded while the environment is LIVE, so the listing case
-    /// can require the answer to NAME it in both passes. A read whose contract is "a
-    /// decommissioned environment stays auditable" cannot be asserted by a status code: an
-    /// empty page answers 200 too.
-    async fn seed_access_request(h: &Harness, base: &str, key: &str) -> String {
-        seed_row(
-            h,
-            &format!("{base}/access-requests"),
-            &format!("{key}-access-request"),
-            &serde_json::json!({
-                "subject_id": "usr_deleted_env",
-                "role_slug": "billing-admin",
-                "reason": "seeded while live",
-            })
-            .to_string(),
-            "access request",
-        )
-        .await
-    }
-
     async fn seed(h: &Harness, tenant: &str, environment: &str, key: &str) -> Self {
         let env_base = format!("/v1/tenants/{tenant}/environments/{environment}");
         let [user, other_user, spare_user, permission, spare_permission] =
@@ -1473,6 +1453,29 @@ impl Fixture {
         ]
     }
 
+    /// A PENDING access request, seeded while the environment is LIVE, so the listing case
+    /// can require the answer to NAME it in both passes. A read whose contract is "a
+    /// decommissioned environment stays auditable" cannot be asserted by a status code: an
+    /// empty page answers 200 too.
+    async fn seed_access_request(h: &Harness, base: &str, key: &str) -> String {
+        seed_row(
+            h,
+            &format!("{base}/access-requests"),
+            &format!("{key}-access-request"),
+            &serde_json::json!({
+                // `billing.admin` is one of the two roles this fixture seeds above. The
+                // raise refuses a slug the organization does not define, so an invented
+                // one here would fail the fixture rather than exercise the sweep.
+                "subject_id": "usr_deleted_env",
+                "role_slug": "billing.admin",
+                "reason": "seeded while live",
+            })
+            .to_string(),
+            "access request",
+        )
+        .await
+    }
+
     /// The WRITES that create or amend.
     fn amending_write_cases(&self) -> Vec<Case> {
         let mut cases = self.amending_group_write_cases();
@@ -1480,6 +1483,63 @@ impl Fixture {
         cases.extend(self.agent_write_cases());
         cases.extend(self.access_request_cases());
         cases
+    }
+
+    /// The EXPLORATORY access-request cases, split out for the crate's function-length
+    /// bound rather than because they are a different KIND of case.
+    fn access_request_cases(&self) -> Vec<Case> {
+        vec![
+            // The EXPLORATORY access-request surface (issue #145 criterion 4). The two
+            // writes must refuse a decommissioned environment and the listing must keep
+            // answering: an elevation granted in an environment somebody retired is the
+            // write this fence exists for, and the record of the ones granted before it
+            // was retired is exactly what an auditor comes back for afterwards.
+            Case {
+                label: "access_requests.raiseAccessRequest",
+                method: "POST",
+                path: format!("{}/access-requests", self.base),
+                body: Some(
+                    serde_json::json!({
+                        "subject_id": "usr_after_delete",
+                        "role_slug": "billing.admin",
+                        "reason": "after the delete",
+                    })
+                    .to_string(),
+                ),
+                intent: Intent::Write,
+                live: StatusCode::CREATED,
+            },
+            // ITS LIVE ANSWER IS THE SEPARATION REFUSAL, not a decision. This fixture
+            // seeds every row through the one operator credential, so the principal
+            // deciding here is the principal who raised the request, and the rule refuses
+            // it. That is the surface working rather than the case being wrong, and the
+            // case still measures what this file is for: the handler resolves the
+            // environment BEFORE it reaches the decision, so a soft-deleted environment
+            // answers the uniform not-found and a live one answers 422. The two are
+            // distinguishable, which is the whole requirement.
+            //
+            // Pinning 200 instead would mean seeding the request under a second
+            // credential, which buys a prettier status and measures the same fence.
+            Case {
+                label: "access_requests.decideAccessRequest",
+                method: "POST",
+                path: format!(
+                    "{}/access-requests/{}/decision",
+                    self.base, self.access_request
+                ),
+                body: Some(serde_json::json!({ "approve": false }).to_string()),
+                intent: Intent::Write,
+                live: StatusCode::UNPROCESSABLE_ENTITY,
+            },
+            Case {
+                label: "access_requests.listAccessRequests",
+                method: "GET",
+                path: format!("{}/access-requests", self.base),
+                body: None,
+                intent: Intent::Read(vec![self.access_request.clone()]),
+                live: StatusCode::OK,
+            },
+        ]
     }
 
     /// The four AGENT writes (issues #130, #132).
@@ -1557,63 +1617,6 @@ impl Fixture {
     }
 
     /// The amending writes over the organization's GROUP forest.
-    /// The EXPLORATORY access-request cases, split out for the crate's function-length
-    /// bound rather than because they are a different KIND of case.
-    fn access_request_cases(&self) -> Vec<Case> {
-        vec![
-            // The EXPLORATORY access-request surface (issue #145 criterion 4). The two
-            // writes must refuse a decommissioned environment and the listing must keep
-            // answering: an elevation granted in an environment somebody retired is the
-            // write this fence exists for, and the record of the ones granted before it
-            // was retired is exactly what an auditor comes back for afterwards.
-            Case {
-                label: "access_requests.raiseAccessRequest",
-                method: "POST",
-                path: format!("{}/access-requests", self.base),
-                body: Some(
-                    serde_json::json!({
-                        "subject_id": "usr_after_delete",
-                        "role_slug": "billing-admin",
-                        "reason": "after the delete",
-                    })
-                    .to_string(),
-                ),
-                intent: Intent::Write,
-                live: StatusCode::CREATED,
-            },
-            // ITS LIVE ANSWER IS THE SEPARATION REFUSAL, not a decision. This fixture
-            // seeds every row through the one operator credential, so the principal
-            // deciding here is the principal who raised the request, and the rule refuses
-            // it. That is the surface working rather than the case being wrong, and the
-            // case still measures what this file is for: the handler resolves the
-            // environment BEFORE it reaches the decision, so a soft-deleted environment
-            // answers the uniform not-found and a live one answers 422. The two are
-            // distinguishable, which is the whole requirement.
-            //
-            // Pinning 200 instead would mean seeding the request under a second
-            // credential, which buys a prettier status and measures the same fence.
-            Case {
-                label: "access_requests.decideAccessRequest",
-                method: "POST",
-                path: format!(
-                    "{}/access-requests/{}/decision",
-                    self.base, self.access_request
-                ),
-                body: Some(serde_json::json!({ "approve": false }).to_string()),
-                intent: Intent::Write,
-                live: StatusCode::UNPROCESSABLE_ENTITY,
-            },
-            Case {
-                label: "access_requests.listAccessRequests",
-                method: "GET",
-                path: format!("{}/access-requests", self.base),
-                body: None,
-                intent: Intent::Read(vec![self.access_request.clone()]),
-                live: StatusCode::OK,
-            },
-        ]
-    }
-
     fn amending_group_write_cases(&self) -> Vec<Case> {
         let Self {
             base,

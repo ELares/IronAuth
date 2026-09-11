@@ -355,6 +355,8 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // grows fastest. The only switch is `outbox.reap_enabled`, which defaults ON.
         let retention_inputs = retention_sweeper_inputs(&config, &env);
         let audit_retention_inputs = audit_retention_inputs(&config, &env);
+        // CAPTURED BEFORE `config` MOVES into the server, like every sweeper above it.
+        let access_request_inputs = access_request_sweeper_inputs(&config, &env);
         let scim_push_inputs = scim_push_inputs(&config);
         let log_shipper_inputs = log_shipper_inputs(&config, &env);
         let metrics_sampler_inputs_captured = metrics_sampler_inputs(&config, &env);
@@ -577,6 +579,13 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => start_audit_retention_sweeper(inputs).await,
             None => None,
         };
+        // The EXPLORATORY access-request sweeper (issue #145 criterion 4). Started here
+        // rather than beside the reaper because it answers to a different switch: the
+        // experimental feature ladder, not `[audit_retention]`.
+        let access_request_sweeper = match access_request_inputs {
+            Some(inputs) => start_access_request_sweeper(inputs).await,
+            None => None,
+        };
         // AND TELL THE MANAGEMENT PLANE WHAT ACTUALLY HAPPENED. `is_some()` is the whole
         // verdict: the starter returns `None` for every way this can fail to run, and each
         // one of them has already logged its own reason.
@@ -677,6 +686,11 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             sweeper.shutdown().await;
         }
         if let Some(sweeper) = audit_retention_sweeper {
+            sweeper.shutdown().await;
+        }
+        // Stopped with the others. Nothing is lost by stopping mid-pass: every relabel is
+        // its own transaction and the rows this pass did not reach are still due next boot.
+        if let Some(sweeper) = access_request_sweeper {
             sweeper.shutdown().await;
         }
         // Stopped with the sweepers. Nothing is lost by stopping mid-tick: every pass
@@ -5313,6 +5327,103 @@ impl ScimPushObserver for TracingScimPushObserver {
     fn enumeration_failed(&self, error: &ironauth_store::StoreError) {
         tracing::warn!(?error, "outbound SCIM scope enumeration failed");
     }
+}
+
+/// Reports the access-request sweep (issue #145 criterion 4).
+struct TracingAccessRequestObserver;
+
+impl ironauth_store::access_request::AccessRequestObserver for TracingAccessRequestObserver {
+    fn pass_completed(&self, scope: ironauth_store::Scope, swept: u64) {
+        // SILENT ON ZERO, which is almost every pass: a line per scope per interval saying
+        // nothing happened is a log nobody reads, and this one only matters when it moves.
+        if swept > 0 {
+            tracing::info!(
+                tenant = %scope.tenant(),
+                environment = %scope.environment(),
+                swept,
+                "access-request sweep relabelled elapsed grants"
+            );
+        }
+    }
+
+    fn pass_failed(&self, scope: ironauth_store::Scope, error: &ironauth_store::StoreError) {
+        // WARN rather than ERROR: the access in this scope ended on its own deadline
+        // whatever this pass did, so what is stale is the listing and not the authorization.
+        tracing::warn!(
+            tenant = %scope.tenant(),
+            environment = %scope.environment(),
+            ?error,
+            "access-request sweep failed for one scope; its listing is stale, its access is not"
+        );
+    }
+
+    fn enumeration_failed(&self, error: &ironauth_store::StoreError) {
+        tracing::warn!(?error, "access-request sweep could not enumerate scopes");
+    }
+}
+
+/// Start the access-request sweeper (issue #145 criterion 4), or [`None`].
+///
+/// # The two conditions
+///
+/// The EXPLORATORY feature must be acknowledged, and there must be a control-plane DSN. The
+/// first is the same gate the routes take: a deployment that cannot raise a request has
+/// nothing to sweep. The second is what the sweep writes through.
+///
+/// Returning [`None`] is not a failure to report loudly, unlike the audit reaper's: a
+/// deployment with no sweeper still ends every grant on its deadline, because
+/// `AccessGrantRequest::grants_now` decides and no process is involved. What it loses is
+/// the relabelling, so its listings show grants that read `approved` and confer nothing.
+fn access_request_sweeper_inputs(config: &Config, env: &Env) -> Option<AccessRequestInputs> {
+    if !FeatureRegistry::builtin()
+        .is_enabled(config, ironauth_config::ACCESS_REQUEST_APPROVAL_FEATURE)
+    {
+        return None;
+    }
+    Some(AccessRequestInputs {
+        control_dsn: select_control_dsn(config)?,
+        env: env.clone(),
+    })
+}
+
+/// What [`start_access_request_sweeper`] needs, captured before `config` moves into the
+/// server.
+struct AccessRequestInputs {
+    control_dsn: String,
+    env: Env,
+}
+
+async fn start_access_request_sweeper(
+    inputs: AccessRequestInputs,
+) -> Option<ironauth_store::access_request::AccessRequestSweeper> {
+    let AccessRequestInputs { control_dsn, env } = inputs;
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "access-request sweeper NOT running: control-plane connect failed. Every \
+                 grant still ends on its deadline; only the listing will go stale"
+            );
+            return None;
+        }
+    };
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store.clone()));
+    let observer: Arc<dyn ironauth_store::access_request::AccessRequestObserver> =
+        Arc::new(TracingAccessRequestObserver);
+    let sweeper = ironauth_store::access_request::AccessRequestSweeper::spawn(
+        control_store,
+        env.clone(),
+        ironauth_admin::bootstrap_operator_actor(),
+        scopes,
+        observer,
+        // A minute. The sweep is bookkeeping, so a coarse interval costs a listing that is
+        // up to a minute stale and nothing else; a tight one would audit-write per pass
+        // across every scope for no gain.
+        std::time::Duration::from_secs(60),
+    );
+    tracing::info!("access-request sweeper running");
+    Some(sweeper)
 }
 
 /// Capture what the audit retention sweeper (issue #109) needs, or [`None`] when it is off.

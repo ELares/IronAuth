@@ -27,6 +27,13 @@ surfacing as a 500 tells nobody anything -- but only the constraint holds for a
 path nobody has written yet. The same migration refuses an approval that carries no
 deadline, which would be the standing access this replaces.
 
+IT SEPARATES PRINCIPALS, NOT PEOPLE. `requested_by` and `decided_by` hold a
+CREDENTIAL's actor id, and nothing binds two credentials to one human, so one
+person holding two management keys can raise under the first and decide under the
+second. Closing that needs an identity this system does not have. The bound is
+stated wherever the rule is published and measured by a test, so it is found as a
+limit rather than as a surprise.
+
 THE DEADLINE ENDS THE GRANT, not the sweeper. `granting_now` on the listing is the
 live answer and `state` is the recorded one, and they differ for an approved grant
 past its deadline that no sweep has yet relabelled. A sweeper is a process and

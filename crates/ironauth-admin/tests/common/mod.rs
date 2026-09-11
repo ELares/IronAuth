@@ -444,6 +444,27 @@ impl Harness {
     /// unrecognised type. `armed = false` leaves it off, which is its default, so a test can
     /// assert that a deployment which has not acknowledged the draft answers exactly as it did
     /// before the profile existed.
+    pub async fn start_with_agent_tool_profile(default_page_size: u32, armed: bool) -> Self {
+        let mut db = TestDatabase::start().await;
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds")
+            .with_agent_tool_profile_enabled(armed);
+        let router = management_router(install_hook_runtime(state));
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+            txt: None,
+        }
+    }
+
     /// Start a fresh database and router with the EXPLORATORY time-boxed access-request
     /// surface ARMED (issue #145 criterion 4), so its three endpoints answer instead of
     /// 404. `armed = false` leaves the feature off (its default), so a test can assert
@@ -460,27 +481,6 @@ impl Harness {
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds")
             .with_access_requests_enabled(armed);
-        let router = management_router(install_hook_runtime(state));
-        Self {
-            db,
-            router,
-            outbound_scope: None,
-            txt: None,
-        }
-    }
-
-    pub async fn start_with_agent_tool_profile(default_page_size: u32, armed: bool) -> Self {
-        let mut db = TestDatabase::start().await;
-        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
-        let config = AdminConfig {
-            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
-            max_page_size: 200,
-            default_page_size,
-            ..AdminConfig::default()
-        };
-        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
-            .expect("admin state builds")
-            .with_agent_tool_profile_enabled(armed);
         let router = management_router(install_hook_runtime(state));
         Self {
             db,

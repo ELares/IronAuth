@@ -49425,7 +49425,10 @@ pub struct NewOrgRolePermission<'a> {
 /// closure. The third is not an assignment at all and that is the point of it. A
 /// role that is unreachable by any of the three simply produces no
 /// [`EffectiveRoleGrant`] rather than a variant meaning "none".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// NOT `Copy` since issue #145 criterion 4: the time-boxed variant carries the request id
+// that granted it, and an id is a `String`. Dropping `Copy` is the cost of the variant
+// carrying enough to explain itself, which is the whole reason it is a variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectiveRoleSource {
     /// Granted straight to this membership (an `org_membership_roles` row). It
     /// survives every change to the group forest.
@@ -49448,6 +49451,23 @@ pub enum EffectiveRoleSource {
     /// different default or clearing the designation, for the WHOLE organization: it
     /// cannot be withdrawn from one member.
     Default,
+    /// Held through an APPROVED, still-live access request (issue #145 criterion 4,
+    /// EXPLORATORY): somebody asked, somebody else agreed, and the agreement ends.
+    ///
+    /// The only variant with an EXPIRY. The other three are held until a row is changed;
+    /// this one stops on a deadline nobody has to act on, which is the whole point of it
+    /// and the reason it cannot be folded into [`EffectiveRoleSource::Direct`]: a consumer
+    /// that treated it as a direct assignment would cache it, and a cached elevation
+    /// outlives its own deadline.
+    ///
+    /// Taking it away early is not possible today. The exploratory has no revoke: the
+    /// deadline is the only exit.
+    TimeBoxed {
+        /// The `agr_` request that granted it, so a reader can see who agreed and why.
+        request_id: String,
+        /// When it ends, in epoch micros.
+        granted_until_micros: i64,
+    },
 }
 
 /// ONE grant path in an effective-role resolution (issue #97): a role the
@@ -85542,12 +85562,12 @@ impl AccessRequestRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError`] on a persistence fault.
-    pub async fn live_roles_for_subject(
+    pub async fn live_grants_for_subject(
         &self,
         organization_id: &str,
         subject_id: &str,
         now_micros: i64,
-    ) -> Result<Vec<String>, StoreError> {
+    ) -> Result<Vec<EffectiveRoleGrant>, StoreError> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
         let rows = sqlx::query(&format!(
@@ -85569,7 +85589,19 @@ impl AccessRequestRepo<'_> {
             .iter()
             .filter_map(decode_access_request)
             .filter(|request| request.grants_now(now_micros))
-            .map(|request| request.role_slug)
+            .filter_map(|request| {
+                // The deadline is what makes this an `EffectiveRoleSource::TimeBoxed`
+                // rather than a bare slug, and `grants_now` above already refused a row
+                // without one, so this arm is unreachable for a row that got here.
+                let granted_until_micros = request.granted_until_micros?;
+                Some(EffectiveRoleGrant {
+                    slug: request.role_slug,
+                    source: EffectiveRoleSource::TimeBoxed {
+                        request_id: request.id,
+                        granted_until_micros,
+                    },
+                })
+            })
             .collect())
     }
 }
@@ -85578,8 +85610,13 @@ impl AccessRequestRepo<'_> {
 ///
 /// A struct for the reason [`NewAccessRequest`] gives, and for one more: `approve` and
 /// `granted_until_micros` are not independent. An approval IS a grant with an end and a
-/// denial grants nothing, so the two travel together and the constructor below refuses any
-/// other pairing before the database does.
+/// denial grants nothing, so the two travel together rather than arriving as two
+/// parameters a caller could pair wrongly.
+///
+/// The fields are public and there is NO constructor enforcing the pairing. What enforces
+/// it is [`ActingAccessRequestRepo::decide`], which refuses a mismatch before its
+/// statement runs, and the `granted_until_iff_granted` CHECK behind that. An earlier
+/// version of this comment claimed a constructor that never existed.
 #[derive(Debug, Clone, Copy)]
 pub struct AccessDecision<'a> {
     /// Whether to grant.
@@ -85742,9 +85779,14 @@ impl ActingAccessRequestRepo<'_> {
                     // interleaving hook the repository does not have. Removing the guard
                     // leaves the suite green. It is here because the window is real, not
                     // because something proves it is.
+                    // THE DEADLINE IS KEPT. An earlier version nulled it here, which
+                    // erased the only record of when the grant ended: a row recording a
+                    // three-hour elevation became indistinguishable from one recording
+                    // three weeks, and an auditor asking how long somebody held a role
+                    // could not answer from the row. The CHECK now requires an expired row
+                    // to carry it.
                     let done = sqlx::query(
-                        "UPDATE access_grant_requests SET state = 'expired', \
-                             granted_until = NULL \
+                        "UPDATE access_grant_requests SET state = 'expired' \
                          WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
                            AND state = 'approved'",
                     )
@@ -85780,10 +85822,16 @@ impl ActingAccessRequestRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] when the request does not exist in this scope or is no
-    /// longer pending; [`StoreError::Database`] on a persistence fault, INCLUDING the
-    /// constraint violation a self-approval raises. The management edge refuses that case
-    /// with a comprehensible 403 first; the constraint is what makes it impossible on
-    /// every other path.
+    /// longer pending; [`StoreError::SelfApproval`] when the deciding principal is the one
+    /// that raised it, refused HERE before the statement runs so the edge can answer in
+    /// words; [`StoreError::Database`] on a persistence fault, which is what the CHECK
+    /// constraint would surface as for any caller that reached the table without passing
+    /// this method.
+    ///
+    /// The comparison is between PRINCIPALS. One person holding two credentials raises
+    /// under one and decides under the other and this returns `Ok`: see the migration's
+    /// own note and
+    /// `two_credentials_of_one_operator_are_two_principals_and_the_rule_does_not_see_it`.
     pub async fn decide(
         &self,
         env: &Env,

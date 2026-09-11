@@ -729,8 +729,11 @@ impl Fixture {
                 &format!("{base}/organizations/{organization}/access-requests"),
                 "seed-access-request",
                 &serde_json::json!({
+                    // THE ROLE THIS FIXTURE ACTUALLY SEEDS. The raise refuses a slug the
+                    // organization does not define, so naming an invented one here would
+                    // make the fixture fail rather than the sweep measure anything.
                     "subject_id": "usr_sweep",
-                    "role_slug": "billing-admin",
+                    "role_slug": "sweep",
                     "reason": "sweep fixture",
                 })
                 .to_string(),
@@ -2983,11 +2986,10 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{org_base}/access-review"),
         ),
         // The EXPLORATORY access-request surface (issue #145 criterion 4). This harness
-        // does NOT arm the feature, so all three answer the uniform 404, which this sweep
-        // accepts: its subject is the server error a missing grant produces, and the
-        // disarmed answer is decided before any relation is touched. What the cases are
-        // here for is the completeness check -- an operation absent from this list is one
-        // nothing drives at all.
+        // DOES arm the feature -- `start_fully_armed` turns it on, and the fixture above
+        // proves it by seeding a request and asserting 201 -- so all three reach their
+        // relations and this sweep measures what it is for: the missing grant that turns a
+        // live surface into an opaque 500.
         Case::json(
             "access_requests.raiseAccessRequest",
             "POST",

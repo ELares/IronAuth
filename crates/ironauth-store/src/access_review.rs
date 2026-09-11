@@ -117,6 +117,12 @@ impl AccessReviewRow {
                     EffectiveRoleSource::Direct => ("direct", None),
                     EffectiveRoleSource::Group(group) => ("group", Some(group.to_string())),
                     EffectiveRoleSource::Default => ("default", None),
+                    // The request id goes in the `via` column, which for a group holds the
+                    // group. Both answer the same question -- what would I change to take
+                    // this away -- and for a time-boxed grant the answer is the request.
+                    EffectiveRoleSource::TimeBoxed { request_id, .. } => {
+                        ("time_boxed", Some(request_id.clone()))
+                    }
                 };
                 row(grant.slug.clone(), source, via_group_id)
             })

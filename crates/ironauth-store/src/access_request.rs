@@ -113,6 +113,119 @@ impl AccessGrantRequest {
     }
 }
 
+/// What a sweep pass reports.
+///
+/// A trait rather than a `tracing` call, because this crate takes no logging dependency and
+/// the sibling `AuditRetentionObserver` made the same choice for the same reason: a store
+/// that logged would decide the shape of an operator's logs from inside the data layer.
+pub trait AccessRequestObserver: Send + Sync {
+    /// A scope was swept. `swept` may be zero, which is the ordinary case.
+    fn pass_completed(&self, scope: crate::Scope, swept: u64);
+    /// One scope's pass failed. The others still run: the access in every scope has
+    /// already ended on its own deadline, so a failed pass is a stale listing.
+    fn pass_failed(&self, scope: crate::Scope, error: &crate::StoreError);
+    /// The scope enumeration itself failed, so no scope was swept this pass.
+    fn enumeration_failed(&self, error: &crate::StoreError);
+}
+
+/// The background pass that relabels elapsed grants (issue #145 criterion 4).
+///
+/// # What it is for, and what it is NOT for
+///
+/// It does not end access. [`AccessGrantRequest::grants_now`] already does, at the deadline,
+/// with no process involved. What this keeps current is the RECORD: the listing stops
+/// showing a grant that looks live, and an `access_request.expire` audit row marks when the
+/// system noticed.
+///
+/// So a deployment that never starts it is not insecure, it is only out of date, and a
+/// deployment whose pass is late is late about bookkeeping. That is the whole reason the
+/// deadline check lives in the read path rather than here.
+pub struct AccessRequestSweeper {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// How many grants one pass relabels per scope.
+///
+/// Bounded so a backlog cannot hold one scope's transaction open across an unbounded number
+/// of audited writes; the next pass takes the rest.
+const SWEEP_BATCH: i64 = 200;
+
+impl AccessRequestSweeper {
+    /// Spawn the sweeper. Returns immediately; it runs until
+    /// [`shutdown`](AccessRequestSweeper::shutdown) is awaited or it is dropped.
+    #[must_use]
+    pub fn spawn(
+        store: crate::Store,
+        env: ironauth_env::Env,
+        actor: crate::ActorRef,
+        scopes: std::sync::Arc<dyn crate::outbox::ScopeSource>,
+        observer: std::sync::Arc<dyn AccessRequestObserver>,
+        interval: std::time::Duration,
+    ) -> Self {
+        use std::sync::atomic::Ordering;
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_stop = std::sync::Arc::clone(&stop);
+        let handle = tokio::spawn(async move {
+            while !task_stop.load(Ordering::Relaxed) {
+                match scopes.scopes().await {
+                    Ok(resolved) => {
+                        for scope in resolved {
+                            // Checked BETWEEN scopes, so a shutdown is bounded by one
+                            // scope's bounded pass rather than by the whole sweep.
+                            if task_stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let now = crate::repository::epoch_micros(env.clock().now_utc());
+                            let outcome = store
+                                .management()
+                                .acting(actor, crate::CorrelationId::generate(&env))
+                                .access_requests(scope)
+                                .expire_elapsed(&env, now, SWEEP_BATCH)
+                                .await;
+                            match outcome {
+                                Ok(swept) => observer.pass_completed(scope, swept),
+                                // Reported rather than fatal: one scope failing must not
+                                // stop the others being swept, and the access in every
+                                // scope has already ended on its own deadline.
+                                Err(error) => observer.pass_failed(scope, &error),
+                            }
+                        }
+                    }
+                    Err(error) => observer.enumeration_failed(&error),
+                }
+                // Slept in short slices so shutdown does not wait out a whole interval.
+                let mut slept = std::time::Duration::ZERO;
+                while slept < interval && !task_stop.load(Ordering::Relaxed) {
+                    let slice =
+                        std::time::Duration::from_millis(200).min(interval.saturating_sub(slept));
+                    tokio::time::sleep(slice).await;
+                    slept += slice;
+                }
+            }
+        });
+        Self {
+            handle: Some(handle),
+            stop,
+        }
+    }
+
+    /// Stop the sweeper and wait for the in-flight pass to finish.
+    pub async fn shutdown(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for AccessRequestSweeper {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AccessGrantRequest, AccessRequestState};

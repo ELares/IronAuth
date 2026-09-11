@@ -238,7 +238,7 @@ async fn an_approval_without_a_deadline_is_refused_by_the_database() {
         .expect_err("an approval that grants for ever is the standing access this replaces")
         .to_string();
     assert!(
-        message.contains("access_grant_requests_granted_until_iff_approved"),
+        message.contains("access_grant_requests_granted_until_iff_granted"),
         "the refusal must come from the deadline constraint: {message}"
     );
 }
@@ -392,7 +392,7 @@ async fn a_grant_stops_granting_at_its_deadline_and_the_sweep_records_it() {
         store
             .scoped(scope)
             .access_requests()
-            .live_roles_for_subject(&org.to_string(), "usr_subject", now_micros(&env))
+            .live_grants_for_subject(&org.to_string(), "usr_subject", now_micros(&env))
             .await
             .expect("read live roles")
             .is_empty(),
@@ -404,9 +404,15 @@ async fn a_grant_stops_granting_at_its_deadline_and_the_sweep_records_it() {
     let swept = read().await;
     assert_eq!(swept.state, AccessRequestState::Expired);
     assert_eq!(
-        swept.granted_until_micros, None,
-        "an expired row is not approved, so the deadline constraint requires it to carry \
-         none: a lingering deadline on a non-granting row is a number nothing supports"
+        swept.granted_until_micros,
+        Some(until),
+        "the sweep must KEEP the deadline. Nulling it erases the only record of when the \
+         grant ended, and a row recording a one-hour elevation becomes indistinguishable \
+         from one recording a month"
+    );
+    assert!(
+        !swept.grants_now(now_micros(&env)),
+        "and keeping the deadline must not keep the access: the state decides too"
     );
     assert_eq!(
         sweep().await,
@@ -476,4 +482,87 @@ async fn every_swept_grant_leaves_an_audit_row_naming_it() {
         "each expiry must name the grant that ended. One row for the pass would tell an \
          auditor that something expired without saying what"
     );
+}
+
+/// WHO ASKED cannot be rewritten after the fact, and that is a GRANT property
+/// (issue #145 criterion 4).
+///
+/// # Why this is not a convention
+///
+/// The separation constraint compares `decided_by` to `requested_by` per statement, never
+/// retroactively. With a table-wide UPDATE grant the control role could rewrite
+/// `requested_by` on a decided row to a third string: the CHECK stays satisfied, the row
+/// still reads as though two parties were involved, and the audit answer to "who agreed to
+/// it" has been edited. Migration 0225 therefore grants UPDATE on four columns and not on
+/// the table, so the question is closed by Postgres rather than by nobody having tried.
+///
+/// Driven as `ironauth_control`, which is the role the management plane authenticates as.
+/// The owner connection is deliberately not used: it holds every privilege, so it would
+/// prove nothing about what the application's own role may do.
+#[tokio::test]
+async fn the_control_role_cannot_rewrite_who_asked() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope).await;
+    let id = raise(&db, &env, scope, &org, "prn_asker").await;
+
+    // THE CONTROL LEG FIRST: this role CAN decide, so the refusal below is the column list
+    // and not the role being unable to touch the table at all.
+    let now = now_micros(&env);
+    db.control_store()
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .access_requests(scope)
+        .decide(
+            &env,
+            &id,
+            ironauth_store::AccessDecision {
+                approve: true,
+                decided_by: "prn_approver",
+                decided_at_micros: now,
+                granted_until_micros: Some(now + 3_600_000_000),
+            },
+            None,
+        )
+        .await
+        .expect("the control role may decide");
+
+    for (column, value) in [
+        ("requested_by", "prn_somebody_else"),
+        ("subject_id", "usr_somebody_else"),
+        ("role_slug", "something-else"),
+        ("reason", "a different reason"),
+    ] {
+        let refused = sqlx::query(&format!(
+            "UPDATE access_grant_requests SET {column} = $2 WHERE id = $1"
+        ))
+        .bind(id.to_string())
+        .bind(value)
+        .execute(db.control_pool())
+        .await;
+        let message = refused
+            .map(|_| String::new())
+            .unwrap_or_else(|error| error.to_string());
+        assert!(
+            message.contains("permission denied"),
+            "the control role rewrote {column} on a decided request. The audit answer to \
+             'who agreed to this elevation' is then editable by any statement that role \
+             can issue: {message}"
+        );
+    }
+
+    // AND THE ROW IS AS IT WAS. Four refusals that changed something anyway would satisfy
+    // the assertions above.
+    let after = db
+        .control_store()
+        .scoped(scope)
+        .access_requests()
+        .get(&id.to_string())
+        .await
+        .expect("read it back");
+    assert_eq!(after.requested_by, "prn_asker");
+    assert_eq!(after.subject_id, "usr_subject");
+    assert_eq!(after.role_slug, "billing-admin");
+    assert_eq!(after.reason, "quarter close");
 }

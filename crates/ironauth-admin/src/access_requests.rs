@@ -19,6 +19,14 @@
 //! Only the third holds for a path nobody has written yet. The first two exist because a
 //! constraint violation surfacing as a 500 tells the person nothing.
 //!
+//! ALL THREE COMPARE PRINCIPALS, NOT PEOPLE. `credential_ref()` is a credential's actor id:
+//! a management key has one per key and a console session has a subject-derived human id,
+//! and nothing binds two credentials to one human. One person holding two management keys
+//! raises under the first and decides under the second, and all three layers pass because
+//! the strings genuinely differ. Closing that would need a credential-to-person binding
+//! this deployment does not have, so the bound is stated wherever the rule is published
+//! and measured by a test rather than left for somebody to discover.
+//!
 //! # Why the deadline is a DURATION on the decision
 //!
 //! The approver decides how long, not the requester, and they decide it as a duration
@@ -269,6 +277,32 @@ pub async fn raise_access_request(
         )));
     }
 
+    // THE ROLE MUST EXIST IN THIS ORGANIZATION, checked rather than assumed.
+    //
+    // The column's own comment says "a role that must exist in this organization" and
+    // nothing established it: `role_slug` is a bare text column with no foreign key, and
+    // there cannot be one, because a role is keyed by (organization, slug) and the slug
+    // alone does not identify a row. Without this a request could be raised for
+    // `billing-admni`, approved by a second principal who reads the same typo, and grant
+    // nothing at all -- an elevation that looks granted in every listing and every audit
+    // row and confers no access, which is the failure an approver cannot see.
+    //
+    // Checked at RAISE rather than at decide, so the typo is caught by the person who made
+    // it rather than by the person asked to trust it.
+    let roles = state
+        .store()
+        .scoped(scope)
+        .org_roles()
+        .list_for_org(&org_id, i64::from(state.max_page_size()), None)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    if !roles.iter().any(|role| role.slug == body.role_slug) {
+        return Err(ApiError::Unprocessable(format!(
+            "no role {} in this organization",
+            body.role_slug
+        )));
+    }
+
     let id = ironauth_store::AccessRequestId::generate(state.env(), &scope);
     let organization = org_id.to_string();
     let request_id = id.to_string();
@@ -392,7 +426,7 @@ pub async fn list_access_requests(
         (status = 400, description = "An approval carried no duration, a denial carried one, or the duration exceeds the ceiling", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 422, description = "The caller raised this request and may not decide it. Refused here in words, and by a CHECK constraint on every other path into the table", body = ErrorBody),
+        (status = 422, description = "This credential raised the request and may not decide it. Refused here in words and by a CHECK constraint on every other path into the table. The rule separates PRINCIPALS: one person holding two credentials can raise under one and decide under the other, and nothing here detects that", body = ErrorBody),
         (status = 404, description = "No such pending request in this organization, or the exploratory feature is not acknowledged", body = ErrorBody)
     )
 )]
@@ -503,7 +537,7 @@ pub async fn decide_access_request(
             // THE SENTENCE, rather than a constraint name in a 500. The database refuses
             // this too, on every path; here it is refused in words.
             ironauth_store::StoreError::SelfApproval => ApiError::Unprocessable(
-                "the member who raised an access request may not decide it".into(),
+                "the credential that raised an access request may not decide it".into(),
             ),
             ironauth_store::StoreError::NotFound => ApiError::NotFound,
             _ => ApiError::Internal,

@@ -62,6 +62,17 @@ pub fn bootstrap_operator_id() -> OperatorId {
     OperatorId::from_seed_bytes(BOOTSTRAP_SEED)
 }
 
+/// The ACTOR that same bootstrap identity audits as.
+///
+/// Exposed for the background sweeps, which write audited rows outside any request and so
+/// have no principal of their own. Derived from the same seed as the id above, so a row the
+/// sweeper wrote and a row the bootstrap operator wrote name one actor rather than two, and
+/// an auditor reading the trail sees the deployment acting rather than an invented identity.
+#[must_use]
+pub fn bootstrap_operator_actor() -> ActorRef {
+    ActorRef::service(ServiceId::from_seed_bytes(BOOTSTRAP_SEED))
+}
+
 /// The display name recorded for the bootstrap operator row.
 pub(crate) const BOOTSTRAP_OPERATOR_DISPLAY_NAME: &str = "IronAuth bootstrap operator";
 

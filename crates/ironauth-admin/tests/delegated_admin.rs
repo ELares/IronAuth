@@ -6153,6 +6153,16 @@ async fn seed_access_request(h: &Harness, base: &str) -> (String, String) {
         .expect("organization id")
         .to_owned();
 
+    // THE ROLE HAS TO EXIST: the raise refuses a slug this organization does not define.
+    let (status, _, role) = h
+        .post(
+            &format!("{base}/organizations/{org}/roles"),
+            "ar-role",
+            &serde_json::json!({ "slug": "billing-admin", "display_name": "Billing" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed role: {role}");
+
     let (status, _, raised) = h
         .post(
             &format!("{base}/organizations/{org}/access-requests"),
@@ -6226,8 +6236,9 @@ async fn the_access_request_surface_splits_raising_and_deciding_from_reading() {
         );
     }
 
-    // AND THE WRITE PERMISSION IS SUFFICIENT for both, so the refusals above are the
-    // permission split rather than the routes being closed to a restricted credential.
+    // AND THE WRITE PERMISSION IS SUFFICIENT FOR BOTH, driven at both rather than claimed
+    // for both: an earlier version of this comment said "for both" and exercised only the
+    // decision, so a raise demanding something stricter would have passed it.
     restrict(
         &h,
         &tenant,
@@ -6236,6 +6247,24 @@ async fn the_access_request_surface_splits_raising_and_deciding_from_reading() {
         &["management.write_organizations"],
     )
     .await;
+    let (status, _, body) = h
+        .post_as(
+            &list,
+            &secret,
+            "ar-raise-ok",
+            &serde_json::json!({
+                "subject_id": "usr_other",
+                "role_slug": "billing-admin",
+                "reason": "under the write credential",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a write-granted credential was refused the raise: {body}"
+    );
     let (status, _, body) = h
         .post_as(
             &decision,
@@ -6366,7 +6395,22 @@ async fn the_access_request_surface_is_invisible_until_the_feature_is_acknowledg
     );
     let (status, _, body) = h
         .post(
-            &format!("{list}/agr_whatever/decision"),
+            // A WELL-FORMED, IN-SCOPE id rather than `agr_whatever`. An unparseable id
+            // answers not-found before the gate is consulted, so this leg passed whether
+            // or not `armed()` ran: deleting the gate from `decide_access_request` left it
+            // green. Minted from this scope so the only thing that can refuse it is the
+            // gate, and no row exists for it because this harness cannot raise one.
+            &format!(
+                "{list}/{}/decision",
+                ironauth_store::AccessRequestId::generate(
+                    &ironauth_env::Env::system(),
+                    &ironauth_store::Scope::new(
+                        ironauth_store::TenantId::parse(&tenant).expect("tenant parses"),
+                        ironauth_store::EnvironmentId::parse(&environment)
+                            .expect("environment parses"),
+                    ),
+                )
+            ),
             "ar-off-decide",
             &serde_json::json!({ "approve": false }).to_string(),
         )
@@ -6481,4 +6525,356 @@ async fn an_approval_must_carry_a_bounded_duration_and_a_denial_must_carry_none(
         Value::Bool(true),
         "a grant made moments ago is live: {body}"
     );
+}
+
+/// THE BOUND, measured: the rule separates PRINCIPALS, and two credentials of one operator
+/// are two principals (issue #145 criterion 4).
+///
+/// # Why a test asserts the limitation rather than the strength
+///
+/// `requested_by` and `decided_by` hold `Principal::credential_ref()`, a CREDENTIAL's actor
+/// id. A management key gets one per key; a console session gets a subject-derived human
+/// id; nothing binds two credentials to one human. So the separation is between principals,
+/// and one person with two keys satisfies it.
+///
+/// An earlier comment in `management_permissions.rs` rejected a dedicated approver
+/// permission because "a credential holding a hypothetical `management.approve` would
+/// satisfy a permission split while one human held both" -- an objection that applies
+/// verbatim to the mechanism chosen instead. Writing that down as prose alone would leave
+/// the next reader to rediscover it from the code. This fails the moment the binding
+/// exists, which is exactly when the prose everywhere else would need revisiting.
+#[tokio::test]
+async fn two_credentials_of_one_operator_are_two_principals_and_the_rule_does_not_see_it() {
+    let h = Harness::start_with_access_requests(50, true).await;
+    let (tenant, environment) = h.create_tenant("acme", "ar-two-keys").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let (org, request) = seed_access_request(&h, &base).await;
+    let decision = format!("{base}/organizations/{org}/access-requests/{request}/decision");
+
+    // THE OPERATOR RAISED IT, and deciding with the same credential is refused. This leg is
+    // the control: without it, the acceptance below could be the rule not working at all.
+    let (status, _, body) = h
+        .post(
+            &decision,
+            "ar-two-same",
+            &serde_json::json!({ "approve": true, "grant_secs": 3600 }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // A SECOND CREDENTIAL MINTED BY THAT SAME OPERATOR IS ACCEPTED. The key is created
+    // through `h.post`, which is the operator credential, so there is exactly one actor in
+    // this test and it is on both sides of the elevation.
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ar-two-keys-mint").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, body) = h
+        .post_as(
+            &decision,
+            &secret,
+            "ar-two-second",
+            &serde_json::json!({ "approve": true, "grant_secs": 3600 }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the second credential was refused, so the rule sees PEOPLE rather than principals. \
+         That is stronger than everything this repository claims for it, and every sentence \
+         describing the rule as a principal comparison is now wrong: {body}"
+    );
+
+    // AND THE AUDIT TRAIL RECORDS TWO DIFFERENT DECIDERS, which is the part that matters to
+    // an auditor. The log will read as though a second party approved.
+    let deciders: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT decided_by FROM access_grant_requests WHERE id = $1")
+            .bind(&request)
+            .fetch_all(h.db().owner_pool())
+            .await
+            .expect("read the decider");
+    let decided_by = deciders
+        .first()
+        .and_then(Clone::clone)
+        .expect("the request was decided");
+    let (_, _, listed) = h
+        .get(&format!("{base}/organizations/{org}/access-requests"))
+        .await;
+    let requested_by =
+        serde_json::from_str::<Value>(&listed).expect("json")["items"][0]["requested_by"]
+            .as_str()
+            .expect("a requester")
+            .to_owned();
+    assert_ne!(
+        decided_by, requested_by,
+        "the two principals differ, which is why the constraint passed"
+    );
+}
+
+/// A request for a role this organization does not define is refused at the RAISE
+/// (issue #145 criterion 4).
+///
+/// # Why it matters that this is caught early
+///
+/// `role_slug` is a bare text column: a role is keyed by (organization, slug), so the slug
+/// alone identifies no row and no foreign key is possible. Without this check a request for
+/// `billing-admni` is raised, approved by a second principal who reads the same typo, and
+/// grants nothing at all: an elevation that appears granted in every listing and every
+/// audit row and confers no access. The approver is the one person who cannot see that, so
+/// the refusal belongs with the person who made the typo.
+#[tokio::test]
+async fn a_request_for_a_role_this_organization_does_not_define_is_refused() {
+    let h = Harness::start_with_access_requests(50, true).await;
+    let (tenant, environment) = h.create_tenant("acme", "ar-role-tenant").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let (org, _request) = seed_access_request(&h, &base).await;
+    let list = format!("{base}/organizations/{org}/access-requests");
+
+    let (status, _, body) = h
+        .post(
+            &list,
+            "ar-typo",
+            &serde_json::json!({
+                "subject_id": "usr_subject",
+                "role_slug": "billing-admni",
+                "reason": "a typo nobody would catch later",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a request naming a role that does not exist was accepted: {body}"
+    );
+    assert!(
+        body.contains("billing-admni"),
+        "the refusal must name the slug it could not find, or the requester cannot see \
+         which of their two fields is wrong: {body}"
+    );
+
+    // AND THE REAL SLUG IS ACCEPTED, so the refusal is the existence check and not the
+    // route refusing every raise.
+    let (status, _, body) = h
+        .post(
+            &list,
+            "ar-real",
+            &serde_json::json!({
+                "subject_id": "usr_subject",
+                "role_slug": "billing-admin",
+                "reason": "the same ask, spelled right",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // AND NOTHING WAS WRITTEN FOR THE TYPO. A refusal that stored the row anyway would
+    // leave an approver a request they cannot fulfil.
+    let slugs: Vec<String> =
+        sqlx::query_scalar("SELECT role_slug FROM access_grant_requests ORDER BY role_slug")
+            .fetch_all(h.db().owner_pool())
+            .await
+            .expect("read the requests");
+    assert!(
+        !slugs.iter().any(|slug| slug == "billing-admni"),
+        "the refused request was stored anyway: {slugs:?}"
+    );
+}
+
+/// A request belonging to a SIBLING organization cannot be decided by naming your own
+/// (issue #145 criterion 4).
+///
+/// # Why the organization segment is not decoration
+///
+/// `AccessRequestId` is scoped to (tenant, environment) and NOT to an organization, so the
+/// id alone parses under any organization in the environment. Without the explicit check
+/// the path's organization segment would be ignored and the id would be the whole
+/// authority: an operator addressing their own organization could decide an elevation in
+/// another one, and the audit row would be attributed to the organization they named
+/// rather than the one whose role changed.
+///
+/// Deleting that check left the whole suite green before this test existed.
+#[tokio::test]
+async fn a_request_in_one_organization_cannot_be_decided_through_another() {
+    let h = Harness::start_with_access_requests(50, true).await;
+    let (tenant, environment) = h.create_tenant("acme", "ar-cross-tenant").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let (mine, request) = seed_access_request(&h, &base).await;
+
+    // A SECOND organization, with its own role so a request could legitimately exist here.
+    let (status, _, created) = h
+        .post(
+            &format!("{base}/organizations"),
+            "ar-cross-org",
+            &serde_json::json!({ "display_name": "Siblings" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let theirs = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("organization id")
+        .to_owned();
+
+    // THE SIBLING'S PATH, THE FIRST ORGANIZATION'S REQUEST. The id parses in this scope, so
+    // only the explicit comparison can refuse it.
+    let (status, _, body) = h
+        .post(
+            &format!("{base}/organizations/{theirs}/access-requests/{request}/decision"),
+            "ar-cross-decide",
+            &serde_json::json!({ "approve": true, "grant_secs": 3600 }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an elevation in one organization was decided by addressing another: {body}"
+    );
+
+    // AND IT IS STILL PENDING IN ITS OWN ORGANIZATION. A 404 that decided the row anyway
+    // would satisfy the status assertion and be the whole defect.
+    let (status, _, listed) = h
+        .get(&format!("{base}/organizations/{mine}/access-requests"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let items = serde_json::from_str::<Value>(&listed).expect("json");
+    assert_eq!(items["items"][0]["state"], "pending", "{listed}");
+    assert!(items["items"][0]["decided_by"].is_null(), "{listed}");
+}
+
+/// An approved request actually GRANTS the role, and stops at its deadline
+/// (issue #145 criterion 4).
+///
+/// # Why this test is the criterion
+///
+/// The criterion says the flow "grants time-boxed access". Before this, an approved request
+/// was RECORDED and changed no answer any surface gave: `live_grants_for_subject` had no
+/// consumer outside its own test, so a request approved five minutes ago left the member's
+/// effective roles exactly as they were. The listing said `approved` and the authorization
+/// picture disagreed.
+///
+/// So this drives the surface that answers "what may this member do" and requires the role
+/// to appear, to be attributed to the request that granted it, and to carry the deadline a
+/// consumer must not cache past.
+#[tokio::test]
+async fn an_approved_request_puts_the_role_in_the_members_effective_roles() {
+    let h = Harness::start_with_access_requests(50, true).await;
+    let (tenant, environment) = h.create_tenant("acme", "ar-effective").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let (org, _seeded) = seed_access_request(&h, &base).await;
+
+    // A MEMBER, so there is an effective-roles answer to change.
+    let (status, _, created) = h
+        .post(
+            &format!("{base}/users"),
+            "ar-eff-user",
+            &serde_json::json!({ "identifier": "asked-for@example.test" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed user: {created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("user id")
+        .to_owned();
+    let (status, _, created) = h
+        .post(
+            &format!("{base}/organizations/{org}/memberships"),
+            "ar-eff-member",
+            &serde_json::json!({ "user_id": user }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed membership: {created}");
+    let membership = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("membership id")
+        .to_owned();
+    let effective = format!("{base}/organizations/{org}/memberships/{membership}/effective-roles");
+
+    // THE CONTROL. Whatever the member holds by default, it is not through a request.
+    let (status, _, before) = h.get(&effective).await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert!(
+        !before.contains("time_boxed"),
+        "nothing has been approved, so no path may be attributed to a request: {before}"
+    );
+
+    // RAISE AND APPROVE, for THIS member, by a second principal.
+    let (status, _, raised) = h
+        .post(
+            &format!("{base}/organizations/{org}/access-requests"),
+            "ar-eff-raise",
+            &serde_json::json!({
+                "subject_id": user,
+                "role_slug": "billing-admin",
+                "reason": "quarter close",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{raised}");
+    let request = serde_json::from_str::<Value>(&raised).expect("json")["id"]
+        .as_str()
+        .expect("request id")
+        .to_owned();
+
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ar-eff-key").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, decided) = h
+        .post_as(
+            &format!("{base}/organizations/{org}/access-requests/{request}/decision"),
+            &secret,
+            "ar-eff-decide",
+            &serde_json::json!({ "approve": true, "grant_secs": 3600 }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{decided}");
+
+    // AND THE ROLE IS NOW HELD, attributed to the request that granted it.
+    let (status, _, after) = h.get(&effective).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    let view: Value = serde_json::from_str(&after).expect("json");
+    let entry = view["roles"]
+        .as_array()
+        .expect("roles")
+        .iter()
+        .find(|role| role["source"] == "time_boxed")
+        .unwrap_or_else(|| {
+            panic!(
+                "an approved request granted nothing: the member's effective roles are \
+                 unchanged, so the primitive RECORDS an elevation and confers none: {after}"
+            )
+        });
+    assert_eq!(entry["slug"], "billing-admin", "{after}");
+    assert_eq!(
+        entry["via_request_id"], request,
+        "the path must name the request that granted it, which is what an operator would \
+         change to take it away: {after}"
+    );
+    assert!(
+        entry["granted_until_unix_ms"]
+            .as_i64()
+            .is_some_and(|at| at > 0),
+        "the only source that EXPIRES must publish when, or a consumer caches an elevation \
+         past its own deadline: {after}"
+    );
+
+    // WHAT THIS TEST DOES NOT COVER, said rather than implied: that the grant STOPS at the
+    // deadline. This harness runs on `Env::system()` and cannot advance a clock, so a
+    // mutation making `grants_now` ignore the deadline entirely leaves this test green.
+    // That property is measured where a clock can be driven, in
+    // `ironauth-store/tests/access_requests.rs`
+    // (`a_grant_stops_granting_at_its_deadline_and_the_sweep_records_it`), which reads the
+    // grant before its deadline, after it, and after the sweep.
 }

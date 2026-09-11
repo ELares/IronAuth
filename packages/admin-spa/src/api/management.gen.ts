@@ -5971,7 +5971,7 @@ export interface components {
          * @description How one role reaches a membership.
          * @enum {string}
          */
-        EffectiveRoleSourceView: "direct" | "group" | "default";
+        EffectiveRoleSourceView: "direct" | "group" | "default" | "time_boxed";
         /**
          * @description One role a membership effectively holds, and the ONE path by which it holds it.
          *
@@ -5979,6 +5979,15 @@ export interface components {
          *     carrying the same `slug`. The effective role SET is the distinct `slug` values.
          */
         EffectiveRoleView: {
+            /**
+             * Format: int64
+             * @description When this path stops granting, in epoch milliseconds. Present exactly when `source`
+             *     is `time_boxed`, because it is the only source that ends on its own.
+             *
+             *     A consumer that caches this answer must not cache it past this instant: every other
+             *     source is held until a row changes, and this one is held until a clock passes.
+             */
+            granted_until_unix_ms?: number | null;
             /**
              * @description The role's IMMUTABLE stable name. Slugs rather than ids because a slug is
              *     what an authorization decision keys on and what a token claim will carry: it
@@ -5997,6 +6006,12 @@ export interface components {
              * @example grp_...
              */
             via_group_id?: string | null;
+            /**
+             * @description The access request that granted it (`agr_...`). Present exactly when `source` is
+             *     `time_boxed`.
+             * @example agr_...
+             */
+            via_request_id?: string | null;
         };
         /** @description The resolved roles of one organization membership. */
         EffectiveRolesView: {
@@ -19556,7 +19571,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description The caller raised this request and may not decide it. Refused here in words, and by a CHECK constraint on every other path into the table */
+            /** @description This credential raised the request and may not decide it. Refused here in words and by a CHECK constraint on every other path into the table. The rule separates PRINCIPALS: one person holding two credentials can raise under one and decide under the other, and nothing here detects that */
             422: {
                 headers: {
                     [name: string]: unknown;
