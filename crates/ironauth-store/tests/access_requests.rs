@@ -261,3 +261,165 @@ async fn only_the_first_decision_lands() {
     assert_eq!(after.state, AccessRequestState::Denied);
     assert_eq!(after.decided_by.as_deref(), Some("prn_first"));
 }
+
+/// A grant ends ON SCHEDULE, and the sweep records that it ended (issue #145 criterion 4).
+///
+/// # Why the clock is driven rather than waited on
+///
+/// The criterion's verification section asks for clock-controlled expiry, and the reason
+/// is not just speed. A test that slept would be asserting that a duration elapsed, which
+/// is a property of the test runner; driving the seam asserts that the DEADLINE is what
+/// decides, which is the property of the code.
+///
+/// # Why both halves are asserted
+///
+/// The access ending and the record saying so are two different claims with two different
+/// failure modes. If only the sweep were checked, an implementation where relabelling is
+/// what revokes would pass, and it would leak access for as long as the sweeper was late
+/// or stopped. If only `grants_now` were checked, the listing could show a live-looking
+/// grant for ever.
+#[tokio::test]
+async fn a_grant_stops_granting_at_its_deadline_and_the_sweep_records_it() {
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0145_0004);
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope).await;
+    let id = raise(&db, &env, scope, &org, "prn_asker").await;
+
+    let granted_at = now_micros(&env);
+    let until = granted_at + 3_600_000_000;
+    let store = db.control_store();
+    store
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .access_requests(scope)
+        .decide(&env, &id, true, "prn_approver", granted_at, Some(until))
+        .await
+        .expect("approve");
+
+    let read = || async {
+        store
+            .scoped(scope)
+            .access_requests()
+            .get(&id.to_string())
+            .await
+            .expect("read it back")
+    };
+    let sweep = || async {
+        store
+            .management()
+            .acting(actor(&env), CorrelationId::generate(&env))
+            .access_requests(scope)
+            .expire_elapsed(&env, now_micros(&env), 100)
+            .await
+            .expect("sweep")
+    };
+
+    // INSIDE THE WINDOW: it grants, and a sweep must not touch it.
+    clock.advance(std::time::Duration::from_secs(59 * 60));
+    assert!(read().await.grants_now(now_micros(&env)));
+    assert_eq!(sweep().await, 0, "a live grant must survive a sweep");
+    assert_eq!(read().await.state, AccessRequestState::Approved);
+
+    // PAST THE DEADLINE, AND BEFORE ANY SWEEP. The row still says `approved` because
+    // nothing has relabelled it; the access is already gone. This is the assertion that
+    // separates "the deadline revokes" from "the sweeper revokes".
+    clock.advance(std::time::Duration::from_secs(2 * 60));
+    let elapsed = read().await;
+    assert_eq!(
+        elapsed.state,
+        AccessRequestState::Approved,
+        "nothing has swept yet, so the label is deliberately stale"
+    );
+    assert!(
+        !elapsed.grants_now(now_micros(&env)),
+        "the DEADLINE ends the grant. If this needed the sweeper to have run, every \
+         deployment whose sweeper is stopped, unconfigured or a tick behind would keep \
+         granting elevated access past its expiry"
+    );
+    assert!(
+        store
+            .scoped(scope)
+            .access_requests()
+            .live_roles_for_subject(&org.to_string(), "usr_subject", now_micros(&env))
+            .await
+            .expect("read live roles")
+            .is_empty(),
+        "and the query a token path would ask must agree with the row"
+    );
+
+    // NOW THE SWEEP, which changes the RECORD and not the access.
+    assert_eq!(sweep().await, 1, "the elapsed grant is swept exactly once");
+    let swept = read().await;
+    assert_eq!(swept.state, AccessRequestState::Expired);
+    assert_eq!(
+        swept.granted_until_micros, None,
+        "an expired row is not approved, so the deadline constraint requires it to carry \
+         none: a lingering deadline on a non-granting row is a number nothing supports"
+    );
+    assert_eq!(
+        sweep().await,
+        0,
+        "a second pass must find nothing: sweeping is idempotent, and a row counted twice \
+         would write a second `access_request.expire` for one expiry"
+    );
+}
+
+/// The sweep writes an audit row per expiry, so the trail shows the END of a grant.
+#[tokio::test]
+async fn every_swept_grant_leaves_an_audit_row_naming_it() {
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0145_0005);
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope).await;
+    let store = db.control_store();
+
+    // TWO grants, so "one audit row per expiry" is distinguishable from "one per sweep".
+    let mut ids = Vec::new();
+    for asker in ["prn_one", "prn_two"] {
+        let id = raise(&db, &env, scope, &org, asker).await;
+        store
+            .management()
+            .acting(actor(&env), CorrelationId::generate(&env))
+            .access_requests(scope)
+            .decide(
+                &env,
+                &id,
+                true,
+                "prn_approver",
+                now_micros(&env),
+                Some(now_micros(&env) + 60_000_000),
+            )
+            .await
+            .expect("approve");
+        ids.push(id.to_string());
+    }
+
+    clock.advance(std::time::Duration::from_secs(120));
+    let swept = store
+        .management()
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .access_requests(scope)
+        .expire_elapsed(&env, now_micros(&env), 100)
+        .await
+        .expect("sweep");
+    assert_eq!(swept, 2);
+
+    let targets: Vec<String> = sqlx::query_scalar(
+        "SELECT target_id FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action = 'access_request.expire' \
+         ORDER BY target_id",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the audit trail");
+
+    ids.sort();
+    assert_eq!(
+        targets, ids,
+        "each expiry must name the grant that ended. One row for the pass would tell an \
+         auditor that something expired without saying what"
+    );
+}

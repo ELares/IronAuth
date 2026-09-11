@@ -85641,6 +85641,109 @@ impl ActingAccessRequestRepo<'_> {
         .await
     }
 
+    /// Relabel every approved grant whose deadline has passed, auditing
+    /// `access_request.expire` for each.
+    ///
+    /// Returns how many were swept.
+    ///
+    /// # What this does NOT do
+    ///
+    /// It does not end access. Access already ended: `grants_now` answers no the instant
+    /// the deadline passes, whether or not this has run. A sweeper is a process and
+    /// processes do not run -- stopped, unconfigured, mid-restart, or simply a tick
+    /// behind -- so a design where the relabelling is what revokes would leak access for
+    /// exactly as long as the sweep was late.
+    ///
+    /// What it does is keep the RECORD honest: the listing says `expired` rather than
+    /// showing a grant that looks live, and an `access_request.expire` audit row marks
+    /// when the system noticed. An auditor reading the trail sees the end of the grant,
+    /// not just its beginning.
+    ///
+    /// # Why one row at a time
+    ///
+    /// Each relabel is an audited write, and `write_audited` writes the audit row in the
+    /// same transaction as the change. A bulk UPDATE would be one statement and one audit
+    /// row for an unbounded number of grants, which is the shape that loses the detail an
+    /// auditor came for.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault. A fault partway through leaves the rows
+    /// already swept swept: each is its own transaction, and the next pass takes the rest.
+    pub async fn expire_elapsed(
+        &self,
+        env: &Env,
+        now_micros: i64,
+        limit: i64,
+    ) -> Result<u64, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let due: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM access_grant_requests \
+             WHERE tenant_id = $1 AND environment_id = $2 AND state = 'approved' \
+               AND granted_until <= (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval) \
+             ORDER BY granted_until LIMIT $4",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(now_micros)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let mut swept = 0_u64;
+        for id in due {
+            let Ok(parsed) = crate::id::AccessRequestId::parse_in_scope(&id, &scope) else {
+                // A row whose id this build cannot parse in this scope is one it must not
+                // relabel: it cannot name the target of the audit row it would write.
+                continue;
+            };
+            let id_owned = id.clone();
+            let changed = write_audited(
+                AuditedWrite {
+                    store: self.store,
+                    scope,
+                    acting: &self.acting,
+                    env,
+                    action: Action::AccessRequestExpire,
+                    target: &parsed,
+                },
+                async move |tx| {
+                    // `AND state = 'approved'` again, because the SELECT above COMMITTED
+                    // before this loop began: between the two, an approver could have
+                    // decided this request or another replica's sweep could have taken
+                    // it. Either way this pass must not overwrite that.
+                    //
+                    // UNMEASURED, and deliberately named as such: no test in
+                    // `access_requests.rs` opens that window, because doing so needs an
+                    // interleaving hook the repository does not have. Removing the guard
+                    // leaves the suite green. It is here because the window is real, not
+                    // because something proves it is.
+                    let done = sqlx::query(
+                        "UPDATE access_grant_requests SET state = 'expired', \
+                             granted_until = NULL \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                           AND state = 'approved'",
+                    )
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(&id_owned)
+                    .execute(&mut **tx)
+                    .await?;
+                    Ok(done.rows_affected())
+                },
+                false,
+            )
+            .await?;
+            // COUNT WHAT CHANGED, not what was attempted. When the guard above declines a
+            // row this pass claimed, the caller is told nothing was swept, which is what
+            // happened.
+            swept += changed;
+        }
+        Ok(swept)
+    }
+
     /// Approve or deny a pending request, auditing `access_request.decide`.
     ///
     /// `granted_until_micros` is required for an approval and refused for a denial: an
