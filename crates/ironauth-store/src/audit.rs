@@ -569,6 +569,14 @@ pub enum Action {
     /// operator-safe `detail` records only how many identities were exported, targeted
     /// at the environment the export drained.
     UserExport,
+    /// An access review was exported for one organization: every member, every role, and
+    /// every path by which they hold it (issue #145 criterion 1).
+    ///
+    /// OBSERVABLE, NEVER OBSTRUCTED, for the reason `UserExport` carries. This one matters
+    /// more than it looks: the export is the ONLY management read that discloses which
+    /// machine identities are members of an organization, because the per-membership
+    /// effective-roles endpoint and the membership listing both filter `owner_kind = 'user'`.
+    AccessReviewExport,
     /// A new identity trait-schema VERSION was created in a (tenant, environment)
     /// registry (issue #53): an immutable candidate JSON Schema (draft 2020-12) the
     /// scope's future trait writes may validate against once it is activated.
@@ -1811,6 +1819,7 @@ impl Action {
             Action::InvitationResend => "invitation.resend",
             Action::UserTraitsUpdate => "user.traits.update",
             Action::UserExport => "user.export",
+            Action::AccessReviewExport => "access_review.export",
             Action::TraitSchemaCreate => "trait_schema.create",
             Action::TraitSchemaActivate => "trait_schema.activate",
             Action::TraitMigrationJobCreate => "trait_migration_job.create",

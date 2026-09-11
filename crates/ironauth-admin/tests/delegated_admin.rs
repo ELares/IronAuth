@@ -5866,16 +5866,13 @@ async fn a_read_only_credential_can_list_scim_push_connections_and_cannot_change
 /// a member of an organization, so which permission it demands is worth proving rather than
 /// classifying. `management_permissions.rs` records the classification and separately asserts
 /// the handler calls `require_permission`; nothing compares the two, and its own comment says
-/// it "cannot tell WHICH permission a handler demands, only that it demands one". A mutation
-/// downgrading this one to `Read` would pass every other pin.
+/// it "cannot tell WHICH permission a handler demands, only that it demands one".
 #[tokio::test]
 async fn a_read_only_credential_cannot_create_a_saml_connection() {
     let h = Harness::start(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
     let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-mint").await;
 
-    // The organization is created while the credential is still unrestricted: the fixture has
-    // to exist before the restriction the test is about applies.
     let orgs = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
     let (status, _, body) = h
         .post(
@@ -5913,12 +5910,64 @@ async fn a_read_only_credential_cannot_create_a_saml_connection() {
         "a read-only credential created a SAML upstream, which is a way to authenticate as \
          any member of the organization: {body}"
     );
-    // NAMES THE SPECIFIC PERMISSION, which is what separates this from "some permission was
-    // demanded". A handler asking for `Read` answers 201 here; one asking for a different
-    // write names that one instead.
     assert!(
         body.contains("management.write_organizations"),
         "the refusal does not name write_organizations, so the handler may demand a \
          different permission than the classification records: {body}"
+    );
+}
+
+/// Exporting an access review requires `read`, and the refusal names it.
+///
+/// #145 criterion 1's export is a bulk read of who-can-do-what inside a customer's
+/// organization, so which permission it demands is worth proving rather than classifying.
+#[tokio::test]
+async fn a_write_only_credential_cannot_export_an_access_review() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-mint").await;
+
+    let orgs = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+    let (status, _, body) = h
+        .post(
+            &orgs,
+            "ak-org",
+            &serde_json::json!({ "display_name": "Acme" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {body}");
+    let org = serde_json::from_str::<serde_json::Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let review = format!("{orgs}/{org}/access-review");
+
+    // THE CONTROL FIRST, while the credential still holds read: the export answers.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.get_as(&review, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-granted credential was refused the export it holds: {body}"
+    );
+
+    // A credential holding a WRITE but not read is refused, and names what it wanted.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&review, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the access review answered a credential without management.read: {body}"
+    );
+    assert!(
+        body.contains("management.read"),
+        "the refusal must name the permission it wanted: {body}"
     );
 }

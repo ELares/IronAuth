@@ -157,6 +157,11 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // grants sight of anything a `management.read` caller could not already list.
     ("readEventFeed", ManagementPermission::Read),
     ("exportUsage", ManagementPermission::Read),
+    // The access review (issue #145). `Read`, and unlike its neighbours above it is
+    // ORGANIZATION-scoped and does NOT merely restate what a `management.read` caller could
+    // already list: it is the only management read that discloses an organization's machine
+    // members, which is why it writes an audit row.
+    ("exportOrganizationAccessReview", ManagementPermission::Read),
     ("publishUsage", ManagementPermission::WriteConfig),
     ("createPermission", ManagementPermission::WriteOrganizations),
     ("updatePermission", ManagementPermission::WriteOrganizations),
@@ -893,6 +898,12 @@ const PERMISSION_PROVEN: &[&str] = &[
     // so neither a blanket refusal nor a missing gate would pass it.
     "readEventFeed",
     "exportUsage",
+    // Proven in `a_write_only_credential_cannot_export_an_access_review`, which drives a
+    // credential holding `write_organizations` but not `read` and asserts the refusal names
+    // `management.read`. Its own comment, not the event-feed one above: that test drives
+    // `/events` and `/usage` and never touches this route, so filing this entry under it
+    // would record a provenance that stays green with the real test deleted.
+    "exportOrganizationAccessReview",
     // Proven in `delegated_admin.rs::read_is_required_and_sufficient_for_message_status`, in
     // BOTH directions: a `write_config` credential gets 403 and a `read` one reaches the
     // handler (404 on an absent message), so neither a blanket refusal nor a missing gate
@@ -1080,12 +1091,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        237,
+        238,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        93,
+        94,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
