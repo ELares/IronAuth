@@ -182,28 +182,7 @@ pub async fn create_saml_connection(
 
     let request: CreateSamlConnectionRequest = parse_json(&body)?;
     let base = origin_of(&request.public_base_url)?;
-    for (field, value, limit) in [
-        (
-            "display_name",
-            &request.display_name,
-            MAX_DISPLAY_NAME_BYTES,
-        ),
-        (
-            "idp_entity_id",
-            &request.idp_entity_id,
-            MAX_IDP_ENTITY_ID_BYTES,
-        ),
-        ("idp_sso_url", &request.idp_sso_url, MAX_IDP_SSO_URL_BYTES),
-    ] {
-        if value.trim().is_empty() {
-            return Err(ApiError::BadRequest(format!("{field} must not be empty")));
-        }
-        if value.len() > limit {
-            return Err(ApiError::BadRequest(format!(
-                "{field} must be at most {limit} bytes"
-            )));
-        }
-    }
+    check_field_bounds(&request)?;
 
     let id = ironauth_store::SamlConnectionId::generate(state.env(), &scope);
     // DERIVED FROM THE ID JUST MINTED, which is why the caller cannot supply them: the paths
@@ -278,6 +257,37 @@ pub async fn create_saml_connection(
         Err(StoreError::NotFound) => Err(ApiError::NotFound),
         Err(_) => Err(ApiError::Internal),
     }
+}
+
+/// Refuse an empty or over-long text field before it reaches the column's CHECK.
+///
+/// Split out of the handler so that function stays inside the crate's line bound. The limits
+/// mirror migration 0196 exactly, so a caller's over-long value is a 400 naming the field
+/// rather than a 500 from a constraint they cannot see.
+fn check_field_bounds(request: &CreateSamlConnectionRequest) -> Result<(), ApiError> {
+    for (field, value, limit) in [
+        (
+            "display_name",
+            &request.display_name,
+            MAX_DISPLAY_NAME_BYTES,
+        ),
+        (
+            "idp_entity_id",
+            &request.idp_entity_id,
+            MAX_IDP_ENTITY_ID_BYTES,
+        ),
+        ("idp_sso_url", &request.idp_sso_url, MAX_IDP_SSO_URL_BYTES),
+    ] {
+        if value.trim().is_empty() {
+            return Err(ApiError::BadRequest(format!("{field} must not be empty")));
+        }
+        if value.len() > limit {
+            return Err(ApiError::BadRequest(format!(
+                "{field} must be at most {limit} bytes"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The scheme-and-host prefix of `raw`, with no trailing slash and no path.
