@@ -1840,6 +1840,17 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0223_risc_received_sets.sql"),
         },
+        Migration {
+            version: 224,
+            name: "log_stream_dead_letter_abandoned",
+            // EXPAND. A nullable column an older binary never reads and never writes: it
+            // marks replayed the rows this one marks abandoned, which is the behaviour
+            // being corrected rather than a behaviour this column breaks. During a rolling
+            // upgrade the two binaries disagree about what to record for a batch whose
+            // range retention already removed, and either answer leaves the row cleared.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0224_log_stream_dead_letter_abandoned.sql"),
+        },
     ]
 }
 

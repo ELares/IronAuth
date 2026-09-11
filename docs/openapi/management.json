@@ -11244,7 +11244,7 @@
         ],
         "responses": {
           "200": {
-            "description": "What this stream failed to deliver. `gap: false` with zero counts means nothing is outstanding",
+            "description": "What this stream failed to deliver. `gap: false` means nothing is known to be undelivered BY ANY ROUTE: no batch is outstanding or lost, no failure run is under way, the stream is active and this deployment is shipping",
             "content": {
               "application/json": {
                 "schema": {
@@ -11274,7 +11274,7 @@
             }
           },
           "404": {
-            "description": "No such log stream in this scope",
+            "description": "No such log stream in this scope, or one confined out of this credential's reach",
             "content": {
               "application/json": {
                 "schema": {
@@ -30038,7 +30038,7 @@
         "properties": {
           "enforced": {
             "type": "boolean",
-            "description": "Whether the reaper runs at all. When false, NOTHING is deleted and the per-stream\nwindows below are inert."
+            "description": "Whether the reaper started, AS OBSERVED AT BOOT. When false, NOTHING is deleted and\nthe per-stream windows below are inert.\n\nA snapshot, not a liveness probe. The boot path is the only place that can see\nwhether the sweeper started, and it speaks once; a reaper that starts and later\nstops deleting -- its connection dropped, its role revoked -- is not reported here.\nNarrowing that window would take a health signal the sweeper writes on each pass,\nwhich this does not have. The snapshot still closes the case it was added for, an\noperator who sets the flag and never wires the retention role, which is a permanent\nstate rather than a drifting one."
           },
           "streams": {
             "type": "array",
@@ -32412,32 +32412,70 @@
       },
       "DeliveryAttestationView": {
         "type": "object",
-        "description": "What one log stream failed to deliver.",
+        "description": "What one log stream failed to deliver.\n\n# Why this is more than a dead-letter count\n\nA dead letter is written only after a bounded run of REFUSED deliveries. Every other\nway a stream fails to deliver writes no row at all: shipping is off for the deployment\n(the default), the shipper could not start, the stream is deactivated, its sink type\nhas no implementation in this build, or a failure run is under way and has not reached\nthe threshold. In all of those the dead-letter table is empty and none of the trail has\narrived, so a report reading only that table would answer an auditor \"no gap\" for a\ndeployment exporting nothing. The counts below are exact for what was dead-lettered;\n`gap` additionally covers the states where there is nothing to count.",
         "required": [
           "stream_id",
           "gap",
+          "shipping",
+          "active",
+          "consecutive_failures",
           "undelivered_batches",
-          "undelivered_events"
+          "undelivered_events",
+          "permanently_lost_batches",
+          "permanently_lost_events"
         ],
         "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "Whether the stream itself is active. A deactivated stream delivers nothing."
+          },
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Delivery failures since the last success. Non-zero means a batch is being retried\nand the cursor has not moved past it."
+          },
           "earliest_undelivered_at_unix_ms": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int64",
-            "description": "When the earliest undelivered event occurred, in epoch milliseconds, or absent when\nthere is no gap."
+            "description": "When the earliest undelivered or lost RANGE begins, in epoch milliseconds, or\nabsent when there is neither.\n\nThe start of the range a failed pass read, which is a bound rather than the\ntimestamp of a particular delivered-or-not event: a stream carrying an event-type\nfilter may have skipped the first row in that range. It is the honest answer to\n\"from when is this trail incomplete\", and it errs early, which is the safe\ndirection for the question."
           },
           "gap": {
             "type": "boolean",
-            "description": "Whether anything is known to be undelivered."
+            "description": "Whether anything is known to be undelivered, by any of the routes above."
           },
           "last_error": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The error the most recent failure reported, or absent when there is no gap."
+            "description": "The most recent delivery error known for this stream: the LIVE failure reason while\na run is under way, and otherwise the error recorded against the most recently\nset-aside batch. Absent only when neither exists."
+          },
+          "last_success_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When this stream last delivered anything, in epoch milliseconds, or absent when it\nnever has."
+          },
+          "permanently_lost_batches": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many set-aside batches can NEVER be delivered, because audit retention removed\ntheir range before the replay reached it.",
+            "minimum": 0
+          },
+          "permanently_lost_events": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many audit events are permanently lost.",
+            "minimum": 0
+          },
+          "shipping": {
+            "type": "boolean",
+            "description": "Whether this deployment's shipper is running. When false NOTHING is being\ndelivered, whatever the counts say."
           },
           "stream_id": {
             "type": "string",
@@ -32446,7 +32484,7 @@
           "undelivered_batches": {
             "type": "integer",
             "format": "int32",
-            "description": "How many batches are outstanding.",
+            "description": "How many batches were set aside after refusal and are still awaiting replay.",
             "minimum": 0
           },
           "undelivered_events": {

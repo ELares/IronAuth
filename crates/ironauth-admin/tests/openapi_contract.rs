@@ -952,7 +952,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        300,
+        301,
         "the documented route count is pinned"
     );
 

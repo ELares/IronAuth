@@ -405,6 +405,16 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             .management
             .as_ref()
             .map(|state| state.audit_retention().running_handle());
+        // AND THE SAME FOR THE LOG SHIPPER, for the same reason and at the same point. The
+        // delivery attestation publishes whether a stream's events are reaching its sink,
+        // and `log_streams.shipping_enabled` is off by default: a deployment that never
+        // starts a shipper delivers nothing AND dead-letters nothing, so an attestation
+        // reading only the dead-letter table would report a complete trail for one that
+        // has exported none of it.
+        let log_shipper_running = planes
+            .management
+            .as_ref()
+            .map(|state| state.log_shipper().running_handle());
         let management = planes.management.map(|state| {
             tracing::info!("management API mounted on the management plane");
             ironauth_admin::management_router(state)
@@ -554,6 +564,15 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             },
             None => (None, Vec::new()),
         };
+        // THE SHIPPER VERDICT, told to the plane the same way and read back the same way.
+        if let Some(running) = &log_shipper_running {
+            running.store(log_shipper.is_some(), std::sync::atomic::Ordering::Relaxed);
+            if running.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!("management plane told: the log shipper IS running");
+            } else {
+                tracing::info!("management plane told: the log shipper is NOT running");
+            }
+        }
         let audit_retention_sweeper = match audit_retention_inputs {
             Some(inputs) => start_audit_retention_sweeper(inputs).await,
             None => None,

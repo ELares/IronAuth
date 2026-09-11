@@ -220,6 +220,13 @@ struct Inner {
     // `enforced` is what the boot path STARTED, not what the flag asked for.
     audit_retention: crate::audit_retention::AuditRetentionPolicy,
 
+    // Whether this deployment's log shipper is RUNNING (issue #145 criterion 3). The
+    // delivery attestation needs it: `log_streams.shipping_enabled` is off by default, and
+    // a stream nothing ships for delivers nothing and dead-letters nothing, so an
+    // attestation reading only dead letters would report a complete trail for a deployment
+    // that has exported none of it.
+    log_shipper: crate::audit_retention::LogShipperStatus,
+
     // The AuthZEN batch bound (issue #100), installed on the boot path from
     // `organizations.max_authzen_batch` and read by the batch evaluation handler.
     max_authzen_batch: u32,
@@ -399,6 +406,7 @@ impl AdminState {
                 // The shipped default, so a state built directly reports the policy a
                 // default deployment enforces rather than an invented one.
                 audit_retention: crate::audit_retention::AuditRetentionPolicy::default(),
+                log_shipper: crate::audit_retention::LogShipperStatus::default(),
                 max_authzen_batch,
                 usage_fold_limit: None,
                 outbox_visibility_timeout_secs: ironauth_config::OutboxConfig::default()
@@ -821,10 +829,16 @@ impl AdminState {
     ///
     /// `Arc::get_mut` returns [`None`] for a shared `Arc`, and this builder has no `else`:
     /// were anything to clone `inner` before the boot path calls this, the install would
-    /// vanish with no panic, no log and no compile error, and the endpoint would report the
-    /// shipped default -- `enforced: false`, both streams kept forever -- on a deployment
-    /// that is in fact deleting. That is the lie direction this whole surface exists to
-    /// prevent, so it is MEASURED rather than reasoned about:
+    /// vanish with no panic, no log and no compile error.
+    ///
+    /// What the endpoint would then publish is NOT simply the shipped default. `enforced`
+    /// no longer travels with the windows: it is read off a handle the boot path writes,
+    /// and the boot path takes that handle from whatever policy the plane ended up
+    /// holding. So a dropped install leaves the default WINDOWS -- both zero, reported as
+    /// kept forever -- beside whatever verdict the sweeper produced, which on a deployment
+    /// that is deleting reads "enforced, and nothing is ever removed". Two true-sounding
+    /// halves of a policy that does not exist, which is worse than either lie alone. So it
+    /// is MEASURED rather than reasoned about:
     /// `the_management_plane_reports_the_retention_policy_the_boot_path_installed` in the
     /// boot-wiring harness configures a non-default `[audit_retention]` and reads the policy
     /// back off the assembled plane. A no-opped install fails it.
@@ -843,6 +857,17 @@ impl AdminState {
     #[must_use]
     pub fn audit_retention(&self) -> &crate::audit_retention::AuditRetentionPolicy {
         &self.inner.audit_retention
+    }
+
+    /// Whether this deployment's log shipper is running (issue #145 criterion 3).
+    ///
+    /// Installed by `AdminState::new` rather than by a builder, because unlike the
+    /// retention policy there is nothing to configure: the boot path takes the handle and
+    /// stores the verdict into it, so the DEFAULT (not running) is the honest answer for
+    /// any plane nothing has spoken to yet.
+    #[must_use]
+    pub fn log_shipper(&self) -> &crate::audit_retention::LogShipperStatus {
+        &self.inner.log_shipper
     }
 
     /// The configured organization group nesting bound (issue #97), passed to every

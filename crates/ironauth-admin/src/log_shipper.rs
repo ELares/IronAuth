@@ -258,9 +258,13 @@ pub async fn replay_dead_letters(
             }
         }
         if events.is_empty() {
-            // Nothing left to send: retention removed the range. Mark it replayed rather
-            // than leaving an entry that can never clear.
-            scoped.log_streams().mark_replayed(env, &dead.id).await?;
+            // Nothing left to send: audit retention removed the range, so these events were
+            // never delivered and now cannot be. ABANDONED, not replayed. Marking it
+            // replayed clears the queue at the cost of the record -- "the sink has them
+            // now" and "nobody will ever have them" become the same row -- and the delivery
+            // attestation answers an auditor asking exactly which of those two happened.
+            // `outstanding_dead_letters` excludes both, so this stops blocking either way.
+            scoped.log_streams().mark_abandoned(env, &dead.id).await?;
             continue;
         }
         // A replay is signed over the DEAD LETTER's own position, not a fresh one: it is the

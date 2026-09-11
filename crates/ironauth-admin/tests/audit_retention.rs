@@ -136,26 +136,37 @@ async fn an_induced_delivery_failure_is_flagged_counted_and_dated() {
         .to_owned();
     let path = format!("{base}/log-streams/{stream}/attestation");
 
-    // THE CONTROL. Nothing has shipped and nothing has failed, so the honest answer is that
-    // nothing is outstanding, and the fields that only mean something during a gap are
-    // absent rather than zeroed.
+    // THE CONTROL, AND IT IS NOT "no gap". Nothing has shipped, because the test harness
+    // runs no log shipper, and that is exactly the state this report used to get wrong:
+    // no delivery is attempted, so nothing is refused, so nothing is dead-lettered, and a
+    // report reading only the dead-letter table would answer an auditor that the whole
+    // trail arrived. The honest answer is a gap with nothing to count.
     let (status, _, body) = h.get(&path).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let view: Value = serde_json::from_str(&body).expect("json");
     assert_eq!(
         view["gap"],
-        Value::Bool(false),
-        "a stream that has never failed must not report a gap: {body}"
+        Value::Bool(true),
+        "a deployment that ships nothing must not report a complete trail: {body}"
     );
-    assert_eq!(view["undelivered_batches"], 0, "{body}");
-    assert_eq!(view["undelivered_events"], 0, "{body}");
+    assert_eq!(
+        view["shipping"],
+        Value::Bool(false),
+        "the harness starts no shipper, so the plane must say so: {body}"
+    );
+    assert_eq!(
+        view["undelivered_batches"], 0,
+        "nothing has been set aside yet, so the gap above is NOT a count: {body}"
+    );
+    assert_eq!(view["permanently_lost_batches"], 0, "{body}");
+    assert_eq!(
+        view["active"],
+        Value::Bool(true),
+        "the stream was just created: {body}"
+    );
     assert!(
         view["earliest_undelivered_at_unix_ms"].is_null(),
-        "there is no earliest undelivered event when none is undelivered: {body}"
-    );
-    assert!(
-        view["last_error"].is_null(),
-        "a healthy stream must not publish an error it never received: {body}"
+        "nothing is set aside, so there is no earliest set-aside event: {body}"
     );
 
     // MORE THAN ONE AUDITABLE ROW, written AFTER the stream so they fall on its cursor.
@@ -175,8 +186,7 @@ async fn an_induced_delivery_failure_is_flagged_counted_and_dated() {
         assert_eq!(status, StatusCode::CREATED, "seed audited row: {body}");
     }
 
-    // INDUCE THE GAP. The stream carries the audit rows this test's own setup wrote, and the
-    // sink refuses them until the shipper sets the batch aside.
+    // INDUCE THE GAP. The sink refuses until the shipper sets the batch aside.
     let sink = std::sync::Arc::new(RefusingSink {
         largest_refused: std::sync::Mutex::new(0),
     });
@@ -212,15 +222,49 @@ async fn an_induced_delivery_failure_is_flagged_counted_and_dated() {
         "the attestation must account for every event the sink refused, not merely report \
          that something is outstanding. The sink saw {refused}: {body}"
     );
-    assert!(
-        view["earliest_undelivered_at_unix_ms"]
-            .as_i64()
-            .is_some_and(|at| at > 0),
-        "an auditor needs to know FROM WHEN the trail is incomplete: {body}"
+    assert_eq!(
+        view["permanently_lost_batches"], 0,
+        "the range is still in the audit log, so nothing is unrecoverable yet: {body}"
+    );
+
+    // THE DATE IS THE BATCH'S OWN START, read back out of the store.
+    //
+    // This compares the handler against its SOURCE, which settles the wiring question this
+    // level is for: did the right field reach the right key, in the right unit. That it is
+    // the EARLIEST of the batches rather than the latest, and that the unit is
+    // milliseconds rather than microseconds, are pinned independently and against neither
+    // the store nor the handler by `batches_are_summed_and_the_earliest_of_either_kind_is_dated`,
+    // which uses two batches of different sizes at different instants.
+    let stored = h
+        .store()
+        .scoped(scope)
+        .log_streams()
+        .outstanding_dead_letters(&stream)
+        .await
+        .expect("read the dead letter")
+        .first()
+        .map(|batch| batch.from.0)
+        .expect("a batch is outstanding");
+    assert_eq!(
+        view["earliest_undelivered_at_unix_ms"],
+        Value::from(stored / 1000),
+        "an auditor needs to know FROM WHEN the trail is incomplete, and it must be the \
+         instant the stored batch actually starts at: {body}"
     );
     assert_eq!(
         view["last_error"], "the sink is down",
         "the attestation must carry what the destination actually said, not a placeholder: \
          {body}"
+    );
+    // AND THE STREAM ITSELF IS NOT IN A FAILURE RUN, which is why `last_error` above had
+    // to come from the batch. Dead-lettering advances the cursor and records a SUCCESS, so
+    // a report reading only the stream's own health would answer "no error" here with a
+    // batch sitting undelivered. Asserted rather than assumed: if this ever stops being
+    // zero, the precedence above is being exercised the other way and the assertion on
+    // `last_error` would pass for the wrong reason.
+    assert_eq!(
+        view["consecutive_failures"], 0,
+        "dead-lettering clears the run, so the error above came from the set-aside batch \
+         and not from the stream: {body}"
     );
 }

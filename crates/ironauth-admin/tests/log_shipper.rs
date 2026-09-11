@@ -686,6 +686,101 @@ async fn a_refused_replay_leaves_the_dead_letter_outstanding() {
     );
 }
 
+/// A replay whose audit range retention already deleted marks the batch ABANDONED, not
+/// replayed (issue #145 criterion 3).
+///
+/// # The two outcomes this separates
+///
+/// `replay_dead_letters` re-reads each range out of `audit_log`. When the rows are gone
+/// there is nothing to send, and clearing the entry is right: an outstanding batch that
+/// can never clear would block the operator's queue forever. What was wrong was clearing
+/// it as `replayed_at`, which makes "the SIEM has these events now" and "nobody will ever
+/// have them" the same row.
+///
+/// The delivery attestation reads exactly that distinction. A permanently lost batch is
+/// the strongest possible yes to an auditor asking whether any of the audit trail went
+/// missing, and off `replayed_at` it answered no.
+#[tokio::test]
+async fn a_replay_of_a_range_retention_deleted_abandons_the_batch_rather_than_replaying_it() {
+    use ironauth_admin::log_shipper::{DEAD_LETTER_AFTER, replay_dead_letters};
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = configure(&db, &env, scope, StreamSource::Both, SinkType::Http, None).await;
+    seed_admin(&db, &env, scope, 2, "doomed").await;
+
+    let dead_sink = RecordingSink::new(SinkType::Http, false);
+    let failing: Vec<Arc<dyn LogSink>> = vec![dead_sink.clone()];
+    for _ in 0..DEAD_LETTER_AFTER {
+        ship_once(db.store(), &env, scope, &failing)
+            .await
+            .expect("ship");
+    }
+    let streams = db.store().scoped(scope);
+    assert_eq!(
+        streams
+            .log_streams()
+            .outstanding_dead_letters(&id)
+            .await
+            .expect("read")
+            .len(),
+        1,
+        "the batch is set aside before retention reaches it"
+    );
+
+    // RETENTION REMOVES THE RANGE. Deleted through the owner pool because the whole point
+    // is that the rows are gone from `audit_log`; which role removed them is the audit
+    // reaper's business and not this test's.
+    sqlx::query("DELETE FROM audit_log WHERE tenant_id = $1 AND environment_id = $2")
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("retention removes the range");
+
+    let healthy = RecordingSink::new(SinkType::Http, true);
+    let working: Vec<Arc<dyn LogSink>> = vec![healthy.clone()];
+    let count = replay_dead_letters(db.store(), &env, scope, &id, &working)
+        .await
+        .expect("replay runs");
+    assert_eq!(count, 0, "there was nothing left to deliver");
+    assert!(
+        healthy.events().is_empty(),
+        "nothing may be shipped for a range that no longer exists"
+    );
+
+    // IT STOPS BLOCKING, exactly as a replayed one does.
+    assert!(
+        streams
+            .log_streams()
+            .outstanding_dead_letters(&id)
+            .await
+            .expect("read")
+            .is_empty(),
+        "an abandoned batch must not sit in the queue forever"
+    );
+
+    // AND IT IS RECORDED AS LOST, which is the half that used to be thrown away. Without
+    // this assertion the test passes against the old code, which cleared the row too.
+    let lost = streams
+        .log_streams()
+        .abandoned_dead_letters(&id)
+        .await
+        .expect("read abandoned");
+    assert_eq!(
+        lost.len(),
+        1,
+        "the batch can never be delivered and must be remembered as such, not filed as a \
+         successful replay"
+    );
+    assert!(
+        lost[0].event_count >= 2,
+        "the count of events nobody will ever receive is the number an auditor needs: \
+         {lost:?}"
+    );
+}
+
 /// The metrics observation reports each stream's sink type, status and outstanding gap.
 ///
 /// Checked through `observe` rather than through the exporter, because what a wrong

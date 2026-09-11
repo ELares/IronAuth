@@ -47351,7 +47351,7 @@ impl LogStreamRepo<'_> {
                     (EXTRACT(EPOCH FROM to_occurred_at) * 1000000)::bigint AS to_micros \
              FROM log_stream_dead_letters \
              WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3 \
-               AND replayed_at IS NULL \
+               AND replayed_at IS NULL AND abandoned_at IS NULL \
              ORDER BY dead_lettered_at, id",
         )
         .bind(scope.tenant().to_string())
@@ -47473,6 +47473,84 @@ impl LogStreamRepo<'_> {
         tx.commit().await?;
         Ok(())
     }
+    /// Record that this batch can NEVER be delivered (issue #145 criterion 3).
+    ///
+    /// # Why this is not `mark_replayed`
+    ///
+    /// The replay re-reads each range out of `audit_log`. When audit retention has already
+    /// deleted the range there is nothing left to send, and marking the row replayed clears
+    /// the queue at the cost of the record: "the sink has them now" and "nobody will ever
+    /// have them" become the same row. The delivery attestation answers an auditor asking
+    /// whether any of the trail went missing, and a permanently lost batch is the strongest
+    /// possible yes, so the two outcomes are written down differently.
+    ///
+    /// `replayed_at` is left NULL and `outstanding_dead_letters` excludes both, so an
+    /// abandoned batch stops blocking exactly as a replayed one does.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn mark_abandoned(&self, env: &Env, id: &str) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let now = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "UPDATE log_stream_dead_letters SET abandoned_at = \
+                 (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The batches that can never be delivered, for the attestation.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault, and [`StoreError::NotFound`] when no such
+    /// stream exists in this scope.
+    pub async fn abandoned_dead_letters(
+        &self,
+        stream_id: &str,
+    ) -> Result<Vec<crate::log_stream::DeadLetter>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        if !stream_exists_in_tx(&mut tx, scope, stream_id).await? {
+            return Err(StoreError::NotFound);
+        }
+        let rows = sqlx::query(
+            "SELECT id, event_count, last_error, from_audit_id, to_audit_id, \
+                    (EXTRACT(EPOCH FROM from_occurred_at) * 1000000)::bigint AS from_micros, \
+                    (EXTRACT(EPOCH FROM to_occurred_at) * 1000000)::bigint AS to_micros \
+             FROM log_stream_dead_letters \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3 \
+               AND abandoned_at IS NOT NULL \
+             ORDER BY dead_lettered_at, id",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(stream_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::log_stream::DeadLetter {
+                id: row.get("id"),
+                from: (row.get("from_micros"), row.get("from_audit_id")),
+                to: (row.get("to_micros"), row.get("to_audit_id")),
+                event_count: row.get("event_count"),
+                last_error: row.get("last_error"),
+            })
+            .collect())
+    }
+
     /// Configure a new stream, returning its id.
     ///
     /// # Errors
@@ -47627,6 +47705,79 @@ impl LogStreamRepo<'_> {
             Some(row) => match row.get::<Option<String>, _>("organization_id") {
                 None => LogStreamOwnership::Environment,
                 Some(organization) => LogStreamOwnership::Organization(organization),
+            },
+        })
+    }
+
+    /// One stream by id, ACTIVE OR NOT (issue #145 criterion 3).
+    ///
+    /// # Why not `list_active`
+    ///
+    /// The shipper only ever wants streams it should advance, so `list_active` filters on
+    /// `active`. The delivery attestation wants the opposite: a DEACTIVATED stream delivers
+    /// nothing, which is precisely the state an auditor needs told, and reading it through
+    /// a filter that hides it would answer "no such stream" for a stream that exists and is
+    /// silently exporting nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault, and [`StoreError::NotFound`] when no such
+    /// stream exists in this scope or its stored source or sink type is not one this build
+    /// understands (a row a NEWER binary wrote, which this one cannot describe honestly).
+    pub async fn record(
+        &self,
+        stream_id: &str,
+    ) -> Result<crate::log_stream::LogStreamRecord, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT id, description, source, sink_type, sink_config, \
+                    credential_secret_name, signing_secret_name, event_type_filter, \
+                    active, organization_id, \
+                    cursor_audit_id, last_error, consecutive_failures, \
+                    (EXTRACT(EPOCH FROM cursor_occurred_at) * 1000000)::bigint \
+                        AS cursor_micros, \
+                    (EXTRACT(EPOCH FROM last_success_at) * 1000000)::bigint \
+                        AS last_success_micros, \
+                    (EXTRACT(EPOCH FROM last_error_at) * 1000000)::bigint \
+                        AS last_error_micros \
+             FROM log_streams \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(stream_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        let source: String = row.get("source");
+        let sink_type: String = row.get("sink_type");
+        let (Some(source), Some(sink_type)) = (
+            crate::log_stream::StreamSource::from_wire(&source),
+            crate::log_stream::SinkType::from_wire(&sink_type),
+        ) else {
+            return Err(StoreError::NotFound);
+        };
+        let cursor_micros: Option<i64> = row.get("cursor_micros");
+        let cursor_audit_id: Option<String> = row.get("cursor_audit_id");
+        Ok(crate::log_stream::LogStreamRecord {
+            id: row.get("id"),
+            description: row.get("description"),
+            source,
+            sink_type,
+            sink_config: row.get("sink_config"),
+            credential_secret_name: row.get("credential_secret_name"),
+            signing_secret_name: row.get("signing_secret_name"),
+            event_type_filter: row.get("event_type_filter"),
+            organization_id: row.get("organization_id"),
+            active: row.get("active"),
+            cursor: cursor_micros.zip(cursor_audit_id),
+            health: crate::log_stream::StreamHealth {
+                last_success_micros: row.get("last_success_micros"),
+                last_error_micros: row.get("last_error_micros"),
+                last_error: row.get("last_error"),
+                consecutive_failures: row.get("consecutive_failures"),
             },
         })
     }

@@ -4344,8 +4344,16 @@ export interface components {
         /** @description The deployment's audit-retention policy. */
         AuditRetentionView: {
             /**
-             * @description Whether the reaper runs at all. When false, NOTHING is deleted and the per-stream
-             *     windows below are inert.
+             * @description Whether the reaper started, AS OBSERVED AT BOOT. When false, NOTHING is deleted and
+             *     the per-stream windows below are inert.
+             *
+             *     A snapshot, not a liveness probe. The boot path is the only place that can see
+             *     whether the sweeper started, and it speaks once; a reaper that starts and later
+             *     stops deleting -- its connection dropped, its role revoked -- is not reported here.
+             *     Narrowing that window would take a health signal the sweeper writes on each pass,
+             *     which this does not have. The snapshot still closes the case it was added for, an
+             *     operator who sets the flag and never wires the retention role, which is a permanent
+             *     state rather than a drifting one.
              */
             enforced: boolean;
             /** @description One entry per audit stream. */
@@ -5744,23 +5752,76 @@ export interface components {
             /** @description The `webhook-id` the attempt carried, which is what a receiver deduplicated on. */
             webhook_id: string;
         };
-        /** @description What one log stream failed to deliver. */
+        /**
+         * @description What one log stream failed to deliver.
+         *
+         *     # Why this is more than a dead-letter count
+         *
+         *     A dead letter is written only after a bounded run of REFUSED deliveries. Every other
+         *     way a stream fails to deliver writes no row at all: shipping is off for the deployment
+         *     (the default), the shipper could not start, the stream is deactivated, its sink type
+         *     has no implementation in this build, or a failure run is under way and has not reached
+         *     the threshold. In all of those the dead-letter table is empty and none of the trail has
+         *     arrived, so a report reading only that table would answer an auditor "no gap" for a
+         *     deployment exporting nothing. The counts below are exact for what was dead-lettered;
+         *     `gap` additionally covers the states where there is nothing to count.
+         */
         DeliveryAttestationView: {
+            /** @description Whether the stream itself is active. A deactivated stream delivers nothing. */
+            active: boolean;
+            /**
+             * Format: int32
+             * @description Delivery failures since the last success. Non-zero means a batch is being retried
+             *     and the cursor has not moved past it.
+             */
+            consecutive_failures: number;
             /**
              * Format: int64
-             * @description When the earliest undelivered event occurred, in epoch milliseconds, or absent when
-             *     there is no gap.
+             * @description When the earliest undelivered or lost RANGE begins, in epoch milliseconds, or
+             *     absent when there is neither.
+             *
+             *     The start of the range a failed pass read, which is a bound rather than the
+             *     timestamp of a particular delivered-or-not event: a stream carrying an event-type
+             *     filter may have skipped the first row in that range. It is the honest answer to
+             *     "from when is this trail incomplete", and it errs early, which is the safe
+             *     direction for the question.
              */
             earliest_undelivered_at_unix_ms?: number | null;
-            /** @description Whether anything is known to be undelivered. */
+            /** @description Whether anything is known to be undelivered, by any of the routes above. */
             gap: boolean;
-            /** @description The error the most recent failure reported, or absent when there is no gap. */
+            /**
+             * @description The most recent delivery error known for this stream: the LIVE failure reason while
+             *     a run is under way, and otherwise the error recorded against the most recently
+             *     set-aside batch. Absent only when neither exists.
+             */
             last_error?: string | null;
+            /**
+             * Format: int64
+             * @description When this stream last delivered anything, in epoch milliseconds, or absent when it
+             *     never has.
+             */
+            last_success_at_unix_ms?: number | null;
+            /**
+             * Format: int32
+             * @description How many set-aside batches can NEVER be delivered, because audit retention removed
+             *     their range before the replay reached it.
+             */
+            permanently_lost_batches: number;
+            /**
+             * Format: int64
+             * @description How many audit events are permanently lost.
+             */
+            permanently_lost_events: number;
+            /**
+             * @description Whether this deployment's shipper is running. When false NOTHING is being
+             *     delivered, whatever the counts say.
+             */
+            shipping: boolean;
             /** @description The stream this attests to. */
             stream_id: string;
             /**
              * Format: int32
-             * @description How many batches are outstanding.
+             * @description How many batches were set aside after refusal and are still awaiting replay.
              */
             undelivered_batches: number;
             /**
@@ -18085,7 +18146,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description What this stream failed to deliver. `gap: false` with zero counts means nothing is outstanding */
+            /** @description What this stream failed to deliver. `gap: false` means nothing is known to be undelivered BY ANY ROUTE: no batch is outstanding or lost, no failure run is under way, the stream is active and this deployment is shipping */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -18112,7 +18173,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description No such log stream in this scope */
+            /** @description No such log stream in this scope, or one confined out of this credential's reach */
             404: {
                 headers: {
                     [name: string]: unknown;
