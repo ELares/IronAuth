@@ -212,7 +212,13 @@ struct Inner {
     // without asking their vendor. A BUILDER for the reason above: the setting already lives
     // in `[audit_retention]`, which both the sweeper and this plane read, and duplicating it
     // under `[admin]` would give one policy two operator-visible names that could disagree.
-    audit_retention: ironauth_config::AuditRetentionConfig,
+    //
+    // NOT the config struct. `AuditRetentionPolicy` is the DSN-free reduction of it, for the
+    // reason `PLANE_LOCAL_KEYS` records against `[audit_retention]`: the section carries the
+    // retention-role DSN, that role is the one granted DELETE on the audit tables, and a
+    // plane holding it would widen exactly the credential migration 0136 keeps narrow. Its
+    // `enforced` is what the boot path STARTED, not what the flag asked for.
+    audit_retention: crate::audit_retention::AuditRetentionPolicy,
 
     // The AuthZEN batch bound (issue #100), installed on the boot path from
     // `organizations.max_authzen_batch` and read by the batch evaluation handler.
@@ -392,7 +398,7 @@ impl AdminState {
                     .token_expiry_warning_secs,
                 // The shipped default, so a state built directly reports the policy a
                 // default deployment enforces rather than an invented one.
-                audit_retention: ironauth_config::AuditRetentionConfig::default(),
+                audit_retention: crate::audit_retention::AuditRetentionPolicy::default(),
                 max_authzen_batch,
                 usage_fold_limit: None,
                 outbox_visibility_timeout_secs: ironauth_config::OutboxConfig::default()
@@ -810,17 +816,32 @@ impl AdminState {
     }
 
     /// Install the audit-retention policy this deployment enforces (issue #145 criterion 3).
+    ///
+    /// # Why a dropped install would be silent, and what measures it
+    ///
+    /// `Arc::get_mut` returns [`None`] for a shared `Arc`, and this builder has no `else`:
+    /// were anything to clone `inner` before the boot path calls this, the install would
+    /// vanish with no panic, no log and no compile error, and the endpoint would report the
+    /// shipped default -- `enforced: false`, both streams kept forever -- on a deployment
+    /// that is in fact deleting. That is the lie direction this whole surface exists to
+    /// prevent, so it is MEASURED rather than reasoned about:
+    /// `the_management_plane_reports_the_retention_policy_the_boot_path_installed` in the
+    /// boot-wiring harness configures a non-default `[audit_retention]` and reads the policy
+    /// back off the assembled plane. A no-opped install fails it.
     #[must_use]
-    pub fn with_audit_retention(mut self, config: &ironauth_config::AuditRetentionConfig) -> Self {
+    pub fn with_audit_retention(
+        mut self,
+        policy: crate::audit_retention::AuditRetentionPolicy,
+    ) -> Self {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.audit_retention = config.clone();
+            inner.audit_retention = policy;
         }
         self
     }
 
     /// The audit-retention policy this deployment enforces (issue #145 criterion 3).
     #[must_use]
-    pub fn audit_retention(&self) -> &ironauth_config::AuditRetentionConfig {
+    pub fn audit_retention(&self) -> &crate::audit_retention::AuditRetentionPolicy {
         &self.inner.audit_retention
     }
 

@@ -935,6 +935,10 @@ class Client:
         """Read the ordered event feed (issue #107). GET /v1/tenants/{tenant_id}/environments/{environment_id}/events."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/events", query, None)
 
+    def read_log_stream_attestation(self, tenant_id: str, environment_id: str, stream_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """readLogStreamAttestation. GET /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/attestation."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/log-streams/{urllib.parse.quote(stream_id)}/attestation", query, None)
+
     def register_agent(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Register an agent inside an organization. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/agents", query, body)

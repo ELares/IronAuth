@@ -1563,6 +1563,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/attestation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["readLogStreamAttestation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters": {
         parameters: {
             query?: never;
@@ -5727,6 +5743,31 @@ export interface components {
             status_code?: number | null;
             /** @description The `webhook-id` the attempt carried, which is what a receiver deduplicated on. */
             webhook_id: string;
+        };
+        /** @description What one log stream failed to deliver. */
+        DeliveryAttestationView: {
+            /**
+             * Format: int64
+             * @description When the earliest undelivered event occurred, in epoch milliseconds, or absent when
+             *     there is no gap.
+             */
+            earliest_undelivered_at_unix_ms?: number | null;
+            /** @description Whether anything is known to be undelivered. */
+            gap: boolean;
+            /** @description The error the most recent failure reported, or absent when there is no gap. */
+            last_error?: string | null;
+            /** @description The stream this attests to. */
+            stream_id: string;
+            /**
+             * Format: int32
+             * @description How many batches are outstanding.
+             */
+            undelivered_batches: number;
+            /**
+             * Format: int64
+             * @description How many audit events those batches hold.
+             */
+            undelivered_events: number;
         };
         /**
          * @description The environment's operational warnings (issue #91), COMPUTED LIVE from the existing
@@ -13042,7 +13083,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description The environment is not a live row of this deployment */
+            /** @description No such tenant and environment pair under this operator. A soft-deleted environment still answers: the report describes the deployment, which outlives it */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -18018,6 +18059,60 @@ export interface operations {
                 };
             };
             /** @description The environment is absent or deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readLogStreamAttestation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The log stream identifier */
+                stream_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description What this stream failed to deliver. `gap: false` with zero counts means nothing is outstanding */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryAttestationView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such log stream in this scope */
             404: {
                 headers: {
                     [name: string]: unknown;

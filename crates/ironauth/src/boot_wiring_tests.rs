@@ -338,6 +338,10 @@ fn harness_config(db: &TestDatabase, ladder: LadderIntent) -> Config {
          endpoint = \"https://legacy.invalid/verify\"\n\
          [oidc.federation]\nenabled = true\n\
          [identifiers]\nuniqueness = \"org_scoped\"\n\
+         [audit_retention]\nenabled = true\n\
+         admin_action_retention_secs = 2592000\n\
+         authentication_retention_secs = 604800\n\
+         interval_secs = 900\n\
          [features]\n",
         app = db.app_url(),
         control = db.control_url(),
@@ -876,6 +880,70 @@ async fn the_scim_surface_does_not_assemble_when_its_flag_is_off() {
     assert!(
         boot_scim_plane(&fixture).await.is_none(),
         "scim.enabled = false must leave the plane unassembled, so nothing mounts"
+    );
+}
+
+#[tokio::test]
+async fn the_management_plane_reports_the_retention_policy_the_boot_path_installed() {
+    // THE INSTALL IS SILENTLY DROPPABLE. `with_audit_retention` writes through
+    // `Arc::get_mut` with no `else`, so if anything ever clones the state's inner `Arc`
+    // before the boot path calls it, the install vanishes with no panic, no log and no
+    // compile error. The endpoint would then report the shipped default -- nothing
+    // enforced, both streams kept forever -- on a deployment that is in fact deleting,
+    // which is the exact lie the audit-retention report exists to prevent. Nothing about
+    // the code would read wrong. So it is measured here.
+    //
+    // The fixture drives windows and an interval away from the defaults (all zero), so a
+    // plane that ignored the section and took `AuditRetentionPolicy::default()` fails
+    // rather than agreeing by accident.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let fixture = fixture(
+        &db,
+        &env,
+        LadderIntent {
+            signup_quarantine: true,
+            advanced_recovery: true,
+        },
+    );
+    let planes = boot_both_planes(&fixture).await;
+    let policy = planes.admin.audit_retention();
+
+    assert_eq!(
+        policy.admin_action_retention_secs, 2_592_000,
+        "the admin-action window the boot path installed must be the one configured"
+    );
+    assert_eq!(
+        policy.authentication_retention_secs, 604_800,
+        "the authentication window the boot path installed must be the one configured"
+    );
+    assert_eq!(
+        policy.sweep_interval_secs, 900,
+        "the sweep interval the boot path installed must be the one configured"
+    );
+    // AND THE TWO WINDOWS DIFFER FROM EACH OTHER, so the three assertions above cannot be
+    // satisfied by an install that wrote one number into every field.
+    assert_ne!(
+        policy.admin_action_retention_secs, policy.authentication_retention_secs,
+        "the fixture must configure distinguishable windows"
+    );
+
+    // AND `enforced` IS NOT THE CONFIG FLAG. The fixture sets `enabled = true` and no
+    // `database_url`, which is the canonical operator mistake: the boot path would log
+    // "audit retention NOT running" and start nothing. The ASSEMBLED plane must therefore
+    // not claim enforcement, and a regression to the obvious `enforced: config.enabled`
+    // fails right here.
+    //
+    // What this does NOT cover: `serve` stores the real verdict into the handle after the
+    // sweeper is attempted, and this harness stops at `assemble_planes`, so that store is
+    // not reached. What is asserted is the property the plane is responsible for on its
+    // own -- that it derives no enforcement claim from config -- which is where the defect
+    // this replaces actually lived.
+    assert!(
+        !policy.enforced(),
+        "the assembled plane claimed the audit trail is being pruned, but only the boot \
+         path can know that and it has not spoken yet. A plane reading `enabled` would \
+         report exactly this against a deployment that deletes nothing"
     );
 }
 

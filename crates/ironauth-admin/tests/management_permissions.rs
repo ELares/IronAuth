@@ -159,6 +159,11 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // this deployment enforces, which a customer needs to answer an auditor, and discloses
     // no audit CONTENT.
     ("readAuditRetention", ManagementPermission::Read),
+    // The delivery attestation (issue #145 criterion 3, other half). `Read`: it reports HOW
+    // MANY audit events a log stream failed to deliver and the error the sink returned. It
+    // never returns event CONTENT, so it discloses no more than the dead-letter list a
+    // `management.read` caller can already page through.
+    ("readLogStreamAttestation", ManagementPermission::Read),
     ("readEventFeed", ManagementPermission::Read),
     ("exportUsage", ManagementPermission::Read),
     // The access review (issue #145). `Read`, and unlike its neighbours above it is
@@ -904,6 +909,11 @@ const PERMISSION_PROVEN: &[&str] = &[
     // drives a `write_organizations` credential and asserts the refusal names
     // `management.read`. Its own comment: the event-feed test below never touches this route.
     "readAuditRetention",
+    // Proven in `a_write_only_credential_cannot_read_a_delivery_attestation`, which drives a
+    // `write_organizations` credential against a stream that EXISTS and asserts the refusal
+    // names `management.read`. The stream exists on purpose: against a missing one a 404
+    // would pass whether or not the permission gate ran at all.
+    "readLogStreamAttestation",
     "readEventFeed",
     "exportUsage",
     // Proven in `a_write_only_credential_cannot_export_an_access_review`, which drives a

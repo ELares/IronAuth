@@ -106,6 +106,10 @@ struct BootShape {
     control_dsn: bool,
     /// The `RUST_LOG` the child runs under. `debug` where a debug-level line is the subject.
     log_level: &'static str,
+    /// Whether `audit_retention.database_url` names the retention role. `enabled` is always
+    /// set; this is the OTHER condition, and the pair is what the management plane's
+    /// `enforced` must distinguish (issue #145 criterion 3).
+    audit_retention_dsn: bool,
 }
 
 /// Write the config the booted binary loads, returning its path.
@@ -124,13 +128,20 @@ fn write_config(db: &TestDatabase, shape: BootShape) -> std::path::PathBuf {
     } else {
         String::new()
     };
+    let retention = if shape.audit_retention_dsn {
+        format!("database_url = \"{}\"\n", db.audit_retention_url())
+    } else {
+        String::new()
+    };
     std::fs::write(
         &path,
         format!(
             "[database]\nurl = \"{}\"\n\n\
-             [admin]\n{control}\n\
+             [admin]\n{control}\
+             bootstrap_operator_token = \"serve-retention-operator\"\n\
              [server]\nbind = \"127.0.0.1:0\"\nmanagement_bind = \"127.0.0.1:0\"\n\n\
-             [outbox]\ncompleted_retention_secs = 3600\nreap_interval_secs = 1\n",
+             [outbox]\ncompleted_retention_secs = 3600\nreap_interval_secs = 1\n\n\
+             [audit_retention]\nenabled = true\n{retention}",
             db.app_url(),
         ),
     )
@@ -301,6 +312,7 @@ async fn the_serve_boot_path_reaps_the_retired_row_keeps_the_pending_one_and_rep
             // of every scope every hour, and it is what an operator turns on precisely when
             // asking "is the reaper running at all".
             log_level: "debug",
+            audit_retention_dsn: false,
         },
     );
 
@@ -358,6 +370,7 @@ async fn a_default_deployment_with_no_control_dsn_reaps_nothing_and_says_why() {
             // The refusal is at ERROR, so it is visible at the shipped default level. That
             // is deliberate and this test is what holds it there.
             log_level: "info",
+            audit_retention_dsn: false,
         },
     );
 
@@ -384,5 +397,122 @@ async fn a_default_deployment_with_no_control_dsn_reaps_nothing_and_says_why() {
         "with no control-plane DSN the sweeper cannot start, so both probe rows must \
          survive: a reap here would mean something is deleting outbox rows as a role \
          migration 0102 grants no DELETE"
+    );
+}
+
+/// The management plane is told the reaper is NOT running when it is not (issue #145
+/// criterion 3).
+///
+/// # Why this cannot be tested in process
+///
+/// `GET .../audit-retention` publishes `enforced`, and an auditor reads it as "this
+/// deployment prunes its audit trail on a fixed window". The plane cannot derive that: it
+/// is assembled at boot step one and the sweeper is attempted several steps later, so
+/// `serve` stores the verdict into a handle the plane holds. Every in-process harness stops
+/// at `assemble_planes` and never reaches that store -- replacing it with `store(true)`
+/// leaves `boot_wiring_tests` and the whole `ironauth-admin` suite green -- which is the
+/// same unmeasured-wiring shape this file's header describes for the outbox sweeper.
+///
+/// # What is asserted, and why it is the log rather than the endpoint
+///
+/// The fixture sets `[audit_retention] enabled = true` and never names a retention DSN,
+/// which is the canonical operator mistake and the state the defect this test exists for
+/// would misreport. `serve` logs the value it READ BACK out of the handle, so a store that
+/// wrote the wrong answer prints the other message here. Driving the endpoint instead would
+/// mean parsing a dynamic port out of the log, minting an operator credential and creating
+/// a tenant to address -- more moving parts for the same one bit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deployment_with_the_flag_on_and_no_retention_dsn_tells_the_plane_it_enforces_nothing() {
+    let db = TestDatabase::start().await;
+    let (config, mut serve) = boot_serve(
+        &db,
+        BootShape {
+            label: "retention-verdict",
+            control_dsn: true,
+            log_level: "info",
+            audit_retention_dsn: false,
+        },
+    );
+
+    let told = wait_for_log(
+        &serve,
+        "management plane told: the audit reaper is NOT running",
+        NO_REAP_WINDOW,
+    )
+    .await;
+    // NON-VACUITY, the same guard the sibling tests take: a process that crashed before
+    // reaching this point would also never log the verdict.
+    let running = serve.is_running();
+    let log = serve.output();
+    let _ = std::fs::remove_file(&config);
+
+    assert!(
+        running,
+        "the process must still be SERVING, otherwise a missing verdict is a statement \
+         about a crash. Its output:\n{log}"
+    );
+    assert!(
+        told,
+        "`enabled = true` with no retention DSN starts no reaper, so the plane must be \
+         told it enforces NOTHING. Telling it otherwise publishes to an auditor that this \
+         deployment prunes an audit trail it in fact keeps forever, and saying nothing at \
+         all leaves the endpoint reporting the shipped default. Its output:\n{log}"
+    );
+    // AND NOT BOTH. The two messages are logged from the same branch, so a build that
+    // emitted the other one as well would satisfy the needle above while telling an
+    // auditor the opposite.
+    assert!(
+        !log.contains("the audit reaper IS running"),
+        "the plane was told the reaper runs on a deployment that never started one. Its \
+         output:\n{log}"
+    );
+}
+
+/// And a deployment whose reaper DOES start is told so.
+///
+/// # Why the negative test above is not enough on its own
+///
+/// The handle's default is already "not enforcing", so DELETING the store outright leaves
+/// the negative test green: it asserts the value the plane would have held anyway. That
+/// mutant survived until this test existed. The pair is what makes either one mean
+/// something -- one deployment differing from the other in exactly one config line, the
+/// retention DSN, and the plane told a different thing about each.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deployment_whose_reaper_starts_tells_the_plane_it_enforces() {
+    let db = TestDatabase::start().await;
+    let (config, mut serve) = boot_serve(
+        &db,
+        BootShape {
+            label: "retention-verdict-armed",
+            control_dsn: true,
+            log_level: "info",
+            audit_retention_dsn: true,
+        },
+    );
+
+    let told = wait_for_log(
+        &serve,
+        "management plane told: the audit reaper IS running",
+        NO_REAP_WINDOW,
+    )
+    .await;
+    let running = serve.is_running();
+    let log = serve.output();
+    let _ = std::fs::remove_file(&config);
+
+    assert!(
+        running,
+        "the process must still be SERVING, otherwise a missing verdict is a statement \
+         about a crash. Its output:\n{log}"
+    );
+    assert!(
+        told,
+        "the reaper started, so the plane must be told it enforces. Told otherwise, the \
+         endpoint understates a deployment that IS deleting, which is the other direction \
+         of the same lie. Its output:\n{log}"
+    );
+    assert!(
+        !log.contains("the audit reaper is NOT running"),
+        "the plane was told both things. Its output:\n{log}"
     );
 }

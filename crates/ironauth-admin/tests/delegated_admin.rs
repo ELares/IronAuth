@@ -844,6 +844,36 @@ async fn confined_org_pair(
 }
 
 /// A stream body naming one organization.
+/// Drive BOTH per-stream reads and require the same answer from each.
+///
+/// The two are asserted together because they leak the same thing: how much of an
+/// organization's audit trail failed to reach its SIEM. Fencing one and not the other is
+/// exactly the state this file found `require_stream_in_reach` in.
+async fn assert_stream_reads(
+    h: &Harness,
+    secret: &str,
+    streams: &str,
+    stream: &str,
+    expected: StatusCode,
+) {
+    for (label, path) in [
+        (
+            "dead letter listing",
+            format!("{streams}/{stream}/dead-letters"),
+        ),
+        (
+            "delivery attestation",
+            format!("{streams}/{stream}/attestation"),
+        ),
+    ] {
+        let (status, _, body) = h.get_as(&path, secret).await;
+        assert_eq!(
+            status, expected,
+            "the {label} for stream {stream} answered {status}, wanted {expected}: {body}"
+        );
+    }
+}
+
 fn log_stream_body(organization: &str) -> String {
     serde_json::json!({
         "source": "admin_action",
@@ -1047,6 +1077,35 @@ async fn a_confined_credential_cannot_touch_a_sibling_organizations_stream() {
         StatusCode::NOT_FOUND,
         "a confined credential commanded a SIBLING organization's shipper to replay: {body}"
     );
+
+    // THE TWO READS, which this fence did not reach until issue #145 criterion 3 added the
+    // second of them. `require_stream_in_reach` names "the dead letter listing" in its own
+    // doc as an operation that needs it and was wired only into the delete and the replay
+    // above, so the documentation asserted a check that was not there.
+    //
+    // What leaks without it is not nothing: how many of a sibling organization's audit
+    // events failed to reach its SIEM, the audit-id range they span, and the error text
+    // that SIEM returned -- which routinely names the host.
+    assert_stream_reads(
+        &h,
+        &secret,
+        &streams,
+        &sibling_stream,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+
+    // AND ITS OWN STREAM STILL ANSWERS BOTH, so the refusals above are the confinement and
+    // not the routes being unreachable for a confined credential at all.
+    let (status, _, created) = h
+        .post_as(&streams, &secret, "lt-mine-2", &log_stream_body(mine))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "own stream: {created}");
+    let own_stream = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("stream id")
+        .to_owned();
+    assert_stream_reads(&h, &secret, &streams, &own_stream, StatusCode::OK).await;
 }
 
 /// A read-granted credential may not mint a portal link, and the refusal NAMES `write_config`.
@@ -6008,6 +6067,67 @@ async fn a_write_only_credential_cannot_read_the_audit_retention_policy() {
         status,
         StatusCode::FORBIDDEN,
         "the retention policy answered a credential without management.read: {body}"
+    );
+    assert!(
+        body.contains("management.read"),
+        "the refusal must name the permission it wanted: {body}"
+    );
+}
+
+/// Reading a DELIVERY ATTESTATION requires `read`, and the refusal names it.
+///
+/// # Why this drives a stream that EXISTS
+///
+/// The handler resolves the stream before it can report on it, so a missing one answers 404.
+/// A test that invented an id would see 404 whether the permission gate ran, ran wrong, or
+/// was never written, and would pass in all three cases. So the stream is created first,
+/// with the credential's full grants, and only then is the credential narrowed. The control
+/// leg below then distinguishes "refused because of the permission" from "refused because
+/// this credential cannot reach the route at all".
+#[tokio::test]
+async fn a_write_only_credential_cannot_read_a_delivery_attestation() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-mint").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+
+    let body = serde_json::json!({
+        "source": "admin_action",
+        "sink_type": "http",
+        "sink_config": { "url": "https://sink.example/ingest" },
+    })
+    .to_string();
+    let (status, _, created) = h
+        .post_as(&format!("{base}/log-streams"), &secret, "ls-att", &body)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed log stream: {created}");
+    let document: Value = serde_json::from_str(&created).expect("json");
+    let stream = document["id"].as_str().expect("stream id").to_owned();
+    let path = format!("{base}/log-streams/{stream}/attestation");
+
+    // THE CONTROL FIRST, while the credential still holds read.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-granted credential was refused an attestation it may read: {body}"
+    );
+
+    // A credential holding a WRITE but not read is refused, and names what it wanted.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the attestation answered a credential without management.read: {body}"
     );
     assert!(
         body.contains("management.read"),

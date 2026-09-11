@@ -180,6 +180,7 @@ use axum::middleware::from_fn;
 use axum::response::Response;
 use axum::routing::{delete, get, post, put};
 
+pub use audit_retention::AuditRetentionPolicy;
 pub use auth::{ManagementGrants, ManagementPermission, ManagementPersona, Principal};
 pub use backfill::{BackfillError, BackfillReport, backfill_signing_algorithms};
 pub use error::{ApiError, ErrorBody};
@@ -793,6 +794,10 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/audit-retention",
             get(audit_retention::read_audit_retention),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/attestation",
+            get(audit_retention::read_log_stream_attestation),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/events",

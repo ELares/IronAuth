@@ -3627,7 +3627,7 @@
             }
           },
           "404": {
-            "description": "The environment is not a live row of this deployment",
+            "description": "No such tenant and environment pair under this operator. A soft-deleted environment still answers: the report describes the deployment, which outlives it",
             "content": {
               "application/json": {
                 "schema": {
@@ -11191,6 +11191,90 @@
           },
           "404": {
             "description": "The environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/attestation": {
+      "get": {
+        "tags": [
+          "diagnostics"
+        ],
+        "operationId": "readLogStreamAttestation",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stream_id",
+            "in": "path",
+            "description": "The log stream identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "What this stream failed to deliver. `gap: false` with zero counts means nothing is outstanding",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryAttestationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such log stream in this scope",
             "content": {
               "application/json": {
                 "schema": {
@@ -32323,6 +32407,53 @@
           "webhook_id": {
             "type": "string",
             "description": "The `webhook-id` the attempt carried, which is what a receiver deduplicated on."
+          }
+        }
+      },
+      "DeliveryAttestationView": {
+        "type": "object",
+        "description": "What one log stream failed to deliver.",
+        "required": [
+          "stream_id",
+          "gap",
+          "undelivered_batches",
+          "undelivered_events"
+        ],
+        "properties": {
+          "earliest_undelivered_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the earliest undelivered event occurred, in epoch milliseconds, or absent when\nthere is no gap."
+          },
+          "gap": {
+            "type": "boolean",
+            "description": "Whether anything is known to be undelivered."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The error the most recent failure reported, or absent when there is no gap."
+          },
+          "stream_id": {
+            "type": "string",
+            "description": "The stream this attests to."
+          },
+          "undelivered_batches": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many batches are outstanding.",
+            "minimum": 0
+          },
+          "undelivered_events": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many audit events those batches hold.",
+            "minimum": 0
           }
         }
       },

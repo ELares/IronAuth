@@ -304,6 +304,7 @@ use crate::views::{
         crate::saml_connections::create_saml_connection,
         crate::access_review::export_organization_access_review,
         crate::audit_retention::read_audit_retention,
+        crate::audit_retention::read_log_stream_attestation,
         crate::project_grants::list_project_grants,
         crate::messages::get_message_status,
         crate::messages::resend_message,
