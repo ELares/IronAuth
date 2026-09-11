@@ -1851,6 +1851,16 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0224_log_stream_dead_letter_abandoned.sql"),
         },
+        Migration {
+            version: 225,
+            name: "access_grant_requests",
+            // EXPAND. A new table with no writer on any older binary: the surface that
+            // raises and decides these requests is behind an Experimental feature flag
+            // that an older binary does not register, so during a rolling upgrade the old
+            // one neither reads nor writes it.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0225_access_grant_requests.sql"),
+        },
     ]
 }
 
