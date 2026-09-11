@@ -156,6 +156,7 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // READS: the feed replays what already happened and the export folds it, so neither
     // grants sight of anything a `management.read` caller could not already list.
     ("readEventFeed", ManagementPermission::Read),
+    ("exportOrganizationAccessReview", ManagementPermission::Read),
     ("exportUsage", ManagementPermission::Read),
     ("publishUsage", ManagementPermission::WriteConfig),
     ("createPermission", ManagementPermission::WriteOrganizations),
@@ -892,6 +893,7 @@ const PERMISSION_PROVEN: &[&str] = &[
     // BOTH directions: a `write_config` credential is refused and a `read` one is allowed,
     // so neither a blanket refusal nor a missing gate would pass it.
     "readEventFeed",
+    "exportOrganizationAccessReview",
     "exportUsage",
     // Proven in `delegated_admin.rs::read_is_required_and_sufficient_for_message_status`, in
     // BOTH directions: a `write_config` credential gets 403 and a `read` one reaches the
@@ -1080,12 +1082,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        237,
+        238,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        93,
+        94,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

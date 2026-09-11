@@ -334,6 +334,11 @@ name = "saml_connections"
 path = "tests/saml_connections.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "access_review"
+path = "tests/access_review.rs"
+required-features = ["testing"]
+
 # Needs a real database (DATABASE_URL).
 [[test]]
 name = "authzen"

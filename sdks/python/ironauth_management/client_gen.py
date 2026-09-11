@@ -415,6 +415,10 @@ class Client:
         """Export every identity of an environment as newline-delimited import records. GET /v1/tenants/{tenant_id}/environments/{environment_id}/export."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/export", query, None)
 
+    def export_organization_access_review(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """exportOrganizationAccessReview. GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-review."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/access-review", query, None)
+
     def export_usage(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Export a tenant's usage (issue #107). GET /v1/tenants/{tenant_id}/environments/{environment_id}/usage."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/usage", query, None)

@@ -90,6 +90,7 @@ mod whoami;
 pub mod log_shipper;
 pub mod log_stream_signature;
 
+mod access_review;
 mod agents;
 pub mod certificate_expiry;
 pub mod certificate_notices;
@@ -595,6 +596,13 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/saml-connections",
             post(saml_connections::create_saml_connection),
+        )
+        // The organization's access review (issue #145 criterion 1): who holds which role and
+        // by which path, as the file a compliance pipeline diffs between quarters. A READ
+        // that writes one audit row; see the module header for why that is not a POST.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-review",
+            get(access_review::export_organization_access_review),
         )
         // One outbound message's delivery status (issue #111 criterion 1). A READ, which is
         // all the control plane holds on `messages`; the resend half writes and needs the data

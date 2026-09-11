@@ -18,6 +18,20 @@ pub fn json(status: StatusCode, body: String) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// An RFC 4180 CSV (`text/csv`) response with a pre-built body.
+///
+/// The charset is stated because the access review carries display-free identifiers and role
+/// slugs that may still be non-ASCII, and a spreadsheet that guesses the encoding is how an
+/// evidence file comes to contain replacement characters nobody notices until an auditor does.
+#[must_use]
+pub fn csv(status: StatusCode, body: String) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
+        .body(body.into())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 /// A `204 No Content` response, for a successful idempotent delete.
 #[must_use]
 pub fn no_content() -> Response {

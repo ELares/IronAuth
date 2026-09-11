@@ -49783,6 +49783,57 @@ impl<'a> ActingManagementStore<'a> {
         }
     }
 
+    /// Record that an access review of `organization_id` was exported (issue #145 criterion 1).
+    ///
+    /// OBSERVABLE, NEVER OBSTRUCTED, the rule the identity export (#58) already follows: this
+    /// is a bulk read of who-can-do-what inside a customer's organization, and a reviewer able
+    /// to take one without leaving a trace is a gap in exactly the evidence the export exists
+    /// to produce. It matters more here than for a listing, because the export is the ONLY
+    /// management read that discloses an organization's MACHINE members: the per-membership
+    /// effective-roles endpoint and the membership listing both filter `owner_kind = 'user'`.
+    ///
+    /// ONLY THE COUNT IS RECORDED, never the rows. An audit trail that became a second copy of
+    /// the entitlement data would spread the same material into a table with a different
+    /// retention rule.
+    ///
+    /// THE MUTATION IS A NO-OP, exactly as `UserRepo::record_export_audit` is: the read has
+    /// already happened and this exists to record that it did. `write_audited_detailed` is
+    /// still the right seam, because the audit row and its chain entry are what must commit.
+    ///
+    /// AND IT IS A GET THAT WRITES ONE ROW, which the soft-deleted-environment sweep knows
+    /// about by name. A keyed POST was tried instead and is worse: the replay store has no
+    /// content-type column, so a replayed CSV comes back labelled `application/json`, and it
+    /// would hold the WHOLE export in `idempotency_keys` -- a table with 24-hour retention,
+    /// no scope columns and no row-level security. That is precisely the second copy the
+    /// paragraph above refuses to put in the audit row, in a weaker place.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_access_review_audit(
+        &self,
+        env: &Env,
+        scope: Scope,
+        organization_id: &OrganizationId,
+        rows: usize,
+    ) -> Result<(), StoreError> {
+        let detail = format!("exported {rows} access-review rows");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AccessReviewExport,
+                target: organization_id,
+            },
+            async move |_tx| Ok(()),
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+
     /// The mutating environment repository under `tenant`.
     #[must_use]
     pub fn environments(
