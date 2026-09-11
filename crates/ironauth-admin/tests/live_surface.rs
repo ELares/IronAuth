@@ -2943,6 +2943,11 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             }),
         ),
         Case::empty(
+            "audit_retention.readAuditRetention",
+            "GET",
+            format!("{base}/audit-retention"),
+        ),
+        Case::empty(
             "access_review.exportOrganizationAccessReview",
             "GET",
             format!("{org_base}/access-review"),

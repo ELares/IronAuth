@@ -946,6 +946,9 @@ async fn build_admin_state(
             // data-plane writer lands it moves into the shared carrier, so the two planes
             // cannot then be handed different modes.
             let state = state.with_identifiers(&config.identifiers);
+            // The retention policy the sweeper enforces, so the management API reports the
+            // same numbers rather than a second copy that could disagree (issue #145).
+            let state = state.with_audit_retention(&config.audit_retention);
             // The outbox visibility lease (issue #104), so the queue-depth read can say
             // what "in flight" means. Installed HERE for the same reason `[identifiers]`
             // is: it reaches ONE plane. The data plane drains the queue and never reports

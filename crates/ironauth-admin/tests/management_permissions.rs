@@ -155,6 +155,10 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // The ordered event feed and the usage export (issue #107). Both are environment-scoped
     // READS: the feed replays what already happened and the export folds it, so neither
     // grants sight of anything a `management.read` caller could not already list.
+    // The audit-retention report (issue #145 criterion 3). `Read`: it publishes the policy
+    // this deployment enforces, which a customer needs to answer an auditor, and discloses
+    // no audit CONTENT.
+    ("readAuditRetention", ManagementPermission::Read),
     ("readEventFeed", ManagementPermission::Read),
     ("exportUsage", ManagementPermission::Read),
     // The access review (issue #145). `Read`, and unlike its neighbours above it is
@@ -896,6 +900,10 @@ const PERMISSION_PROVEN: &[&str] = &[
     // Proven in `read_is_required_and_sufficient_for_the_event_feed_and_usage_export`, in
     // BOTH directions: a `write_config` credential is refused and a `read` one is allowed,
     // so neither a blanket refusal nor a missing gate would pass it.
+    // Proven in `a_write_only_credential_cannot_read_the_audit_retention_policy`, which
+    // drives a `write_organizations` credential and asserts the refusal names
+    // `management.read`. Its own comment: the event-feed test below never touches this route.
+    "readAuditRetention",
     "readEventFeed",
     "exportUsage",
     // Proven in `a_write_only_credential_cannot_export_an_access_review`, which drives a
@@ -1091,12 +1099,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        238,
+        239,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        94,
+        95,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

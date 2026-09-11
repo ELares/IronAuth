@@ -207,6 +207,13 @@ struct Inner {
     // one setting two operator-visible names that could disagree.
     scim_token_expiry_warning_secs: u64,
 
+    // The audit-retention policy this deployment enforces (issue #145 criterion 3), reported
+    // by the management API so a customer can answer "how long do you keep our audit trail"
+    // without asking their vendor. A BUILDER for the reason above: the setting already lives
+    // in `[audit_retention]`, which both the sweeper and this plane read, and duplicating it
+    // under `[admin]` would give one policy two operator-visible names that could disagree.
+    audit_retention: ironauth_config::AuditRetentionConfig,
+
     // The AuthZEN batch bound (issue #100), installed on the boot path from
     // `organizations.max_authzen_batch` and read by the batch evaluation handler.
     max_authzen_batch: u32,
@@ -383,6 +390,9 @@ impl AdminState {
                 // same horizon a default deployment does rather than never warning.
                 scim_token_expiry_warning_secs: ironauth_config::ScimConfig::default()
                     .token_expiry_warning_secs,
+                // The shipped default, so a state built directly reports the policy a
+                // default deployment enforces rather than an invented one.
+                audit_retention: ironauth_config::AuditRetentionConfig::default(),
                 max_authzen_batch,
                 usage_fold_limit: None,
                 outbox_visibility_timeout_secs: ironauth_config::OutboxConfig::default()
@@ -797,6 +807,21 @@ impl AdminState {
     #[must_use]
     pub fn scim_token_expiry_warning_secs(&self) -> u64 {
         self.inner.scim_token_expiry_warning_secs
+    }
+
+    /// Install the audit-retention policy this deployment enforces (issue #145 criterion 3).
+    #[must_use]
+    pub fn with_audit_retention(mut self, config: &ironauth_config::AuditRetentionConfig) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.audit_retention = config.clone();
+        }
+        self
+    }
+
+    /// The audit-retention policy this deployment enforces (issue #145 criterion 3).
+    #[must_use]
+    pub fn audit_retention(&self) -> &ironauth_config::AuditRetentionConfig {
+        &self.inner.audit_retention
     }
 
     /// The configured organization group nesting bound (issue #97), passed to every

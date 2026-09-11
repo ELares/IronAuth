@@ -549,6 +549,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/audit-retention": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["readAuditRetention"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture": {
         parameters: {
             query?: never;
@@ -4308,6 +4324,21 @@ export interface components {
              * @example prm_...
              */
             permission_id: string;
+        };
+        /** @description The deployment's audit-retention policy. */
+        AuditRetentionView: {
+            /**
+             * @description Whether the reaper runs at all. When false, NOTHING is deleted and the per-stream
+             *     windows below are inert.
+             */
+            enforced: boolean;
+            /** @description One entry per audit stream. */
+            streams: components["schemas"]["StreamRetentionView"][];
+            /**
+             * Format: int64
+             * @description How often the sweep runs, in seconds, or absent when it does not run.
+             */
+            sweep_interval_secs?: number | null;
         };
         /** @description The authorize request. */
         AuthorizeImpersonationRequest: {
@@ -9424,6 +9455,18 @@ export interface components {
              */
             requires_approval?: boolean | null;
         };
+        /** @description One audit stream's retention. */
+        StreamRetentionView: {
+            /** @description Whether this stream is kept indefinitely. A configured window of zero means this. */
+            retained_forever: boolean;
+            /**
+             * Format: int64
+             * @description How long rows are kept, in seconds, or absent when the stream is kept forever.
+             */
+            retention_secs?: number | null;
+            /** @description The stream the window applies to: `admin_action` or `authentication`. */
+            stream: string;
+        };
         /** @description The identifier a mapping creation minted. */
         SubjectMappingCreated: {
             /** @description The `asm_` identifier. */
@@ -12948,6 +12991,58 @@ export interface operations {
                 };
             };
             /** @description Environment not found or malformed client id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readAuditRetention: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The retention this deployment enforces. `enforced: false` means nothing is deleted whatever the windows say, and a stream with `retained_forever` is kept indefinitely */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditRetentionView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is not a live row of this deployment */
             404: {
                 headers: {
                     [name: string]: unknown;

@@ -1604,6 +1604,13 @@ func (c *Client) PurgeTenant(tenant_id string, query url.Values) (*http.Response
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/purge", query, nil)
 }
 
+// ReadAuditRetention performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/audit-retention.
+//
+// readAuditRetention.
+func (c *Client) ReadAuditRetention(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/audit-retention", query, nil)
+}
+
 // ReadEventFeed performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/events.
 //
 // Read the ordered event feed (issue #107).

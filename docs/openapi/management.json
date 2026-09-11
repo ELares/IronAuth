@@ -3569,6 +3569,81 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/audit-retention": {
+      "get": {
+        "tags": [
+          "diagnostics"
+        ],
+        "operationId": "readAuditRetention",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The retention this deployment enforces. `enforced: false` means nothing is deleted whatever the windows say, and a stream with `retained_forever` is kept indefinitely",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditRetentionView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is not a live row of this deployment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture": {
       "put": {
         "tags": [
@@ -29869,6 +29944,36 @@
           }
         }
       },
+      "AuditRetentionView": {
+        "type": "object",
+        "description": "The deployment's audit-retention policy.",
+        "required": [
+          "enforced",
+          "streams"
+        ],
+        "properties": {
+          "enforced": {
+            "type": "boolean",
+            "description": "Whether the reaper runs at all. When false, NOTHING is deleted and the per-stream\nwindows below are inert."
+          },
+          "streams": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StreamRetentionView"
+            },
+            "description": "One entry per audit stream."
+          },
+          "sweep_interval_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How often the sweep runs, in seconds, or absent when it does not run.",
+            "minimum": 0
+          }
+        }
+      },
       "AuthorizeImpersonationRequest": {
         "type": "object",
         "description": "The authorize request.",
@@ -38050,6 +38155,33 @@
               "null"
             ],
             "description": "Whether exchanging for this credential is a SENSITIVE action that blocks on an\nout-of-band approval (issue #132, criterion 4).\n\nThe OPERATOR's decision, taken here because they are the one establishing the\nconnection and they are the one who knows what reaching it can do. It is deliberately\nnot the agent's: the gate used to run when the agent's exchange request named\n`authorization_details`, so a denied agent omitted the field and received the\ncredential anyway.\n\nABSENT MEANS LEAVE IT AS IT IS, which is not what the sibling `refresh` field does and\nis deliberate. This route is a PUT, so the natural reading is \"replace\"; but the\nnatural OPERATION is replacing an expired access token, and under replace-semantics\nthat turned the approval gate off on a sensitive connection without saying so. Sending\n`false` still makes a connection ordinary; on a first store, absent means the same as\n`false`."
+          }
+        }
+      },
+      "StreamRetentionView": {
+        "type": "object",
+        "description": "One audit stream's retention.",
+        "required": [
+          "stream",
+          "retained_forever"
+        ],
+        "properties": {
+          "retained_forever": {
+            "type": "boolean",
+            "description": "Whether this stream is kept indefinitely. A configured window of zero means this."
+          },
+          "retention_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How long rows are kept, in seconds, or absent when the stream is kept forever.",
+            "minimum": 0
+          },
+          "stream": {
+            "type": "string",
+            "description": "The stream the window applies to: `admin_action` or `authentication`."
           }
         }
       },

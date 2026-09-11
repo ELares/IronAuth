@@ -5971,3 +5971,46 @@ async fn a_write_only_credential_cannot_export_an_access_review() {
         "the refusal must name the permission it wanted: {body}"
     );
 }
+
+/// Reading the audit-retention policy requires `read`, and the refusal names it.
+///
+/// #145 criterion 3 publishes what this deployment keeps and for how long. It is the answer a
+/// customer gives an auditor, so which permission gates it is worth proving rather than
+/// classifying: `management_permissions.rs` records the classification and separately asserts
+/// the handler calls `require_permission`, and nothing compares the two.
+#[tokio::test]
+async fn a_write_only_credential_cannot_read_the_audit_retention_policy() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-mint").await;
+    let path = format!("/v1/tenants/{tenant}/environments/{environment}/audit-retention");
+
+    // THE CONTROL FIRST, while the credential still holds read.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-granted credential was refused the policy it may read: {body}"
+    );
+
+    // A credential holding a WRITE but not read is refused, and names what it wanted.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the retention policy answered a credential without management.read: {body}"
+    );
+    assert!(
+        body.contains("management.read"),
+        "the refusal must name the permission it wanted: {body}"
+    );
+}
