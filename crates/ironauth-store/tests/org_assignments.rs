@@ -3439,3 +3439,340 @@ async fn revoking_a_role_from_a_member_announces_the_membership() {
     ironauth_store::event_catalog::validate_event(&events[0])
         .expect("the envelope validates against the registry the fan-out enforces");
 }
+
+/// #145 criterion 1: the export records every PATH, not merely every role.
+///
+/// The two-path member is the case the criterion's "including derived-assignment sources"
+/// clause is about. An export that answered "alice holds admin" and stopped would satisfy a
+/// reviewer asking WHO HAS WHAT and mislead the one asking WHAT DO I WITHDRAW: revoke the
+/// direct grant, watch the role survive, and nothing in the file explains why.
+#[tokio::test]
+async fn the_access_review_records_every_path_by_which_a_member_holds_a_role() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Contoso").await;
+    let admin = create_role(&db, &env, scope, &org, "admin").await;
+    let (_user, membership) = create_member(&db, &env, scope, &org, "alice@contoso.test").await;
+
+    // The SAME role by two paths: granted to her directly, and to a group she is in.
+    grant_direct_role(&db, &env, scope, &org, &membership, &admin)
+        .await
+        .expect("grant the role directly");
+    let engineering = create_group(&db, &env, scope, &org, "engineering", None).await;
+    grant_group_role(&db, &env, scope, &org, &engineering, &admin)
+        .await
+        .expect("grant the role to the group");
+    bind_member(&db, &env, scope, &org, &engineering, &membership)
+        .await
+        .expect("put her in the group");
+
+    let rows = db
+        .control_store()
+        .management()
+        .access_review(scope, &org, DEFAULT_DEPTH)
+        .await
+        .expect("the access review");
+
+    let admin_rows: Vec<_> = rows.iter().filter(|r| r.role_slug == "admin").collect();
+    assert_eq!(
+        admin_rows.len(),
+        2,
+        "one row per path, and there are two: {rows:?}"
+    );
+    let direct = admin_rows
+        .iter()
+        .find(|r| r.source == "direct")
+        .expect("the direct path is missing");
+    assert_eq!(direct.via_group_id, None, "a direct grant names no group");
+    let derived = admin_rows
+        .iter()
+        .find(|r| r.source == "group")
+        .expect("the derived path is missing");
+    // NAMES THE GROUP IT CAME THROUGH, which is the withdrawable thing. A row saying only
+    // "derived" tells a reviewer to go hunting through every group in the organization.
+    assert_eq!(
+        derived.via_group_id.as_deref(),
+        Some(engineering.to_string().as_str()),
+        "the derived row must name the group the role came through: {derived:?}"
+    );
+    assert_eq!(derived.membership_id, membership.to_string());
+}
+
+/// #145 criterion 1, and the isolation every export owes: one organization's review is one
+/// organization's.
+#[tokio::test]
+async fn the_access_review_of_one_organization_names_no_other() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let mine = create_org(&db, &env, scope, "Contoso").await;
+    let theirs = create_org(&db, &env, scope, "Initech").await;
+
+    let my_role = create_role(&db, &env, scope, &mine, "admin").await;
+    let (_mu, my_member) = create_member(&db, &env, scope, &mine, "alice@contoso.test").await;
+    grant_direct_role(&db, &env, scope, &mine, &my_member, &my_role)
+        .await
+        .expect("grant mine");
+
+    let their_role = create_role(&db, &env, scope, &theirs, "admin").await;
+    let (_tu, their_member) = create_member(&db, &env, scope, &theirs, "bob@initech.test").await;
+    grant_direct_role(&db, &env, scope, &theirs, &their_member, &their_role)
+        .await
+        .expect("grant theirs");
+
+    let rows = db
+        .control_store()
+        .management()
+        .access_review(scope, &mine, DEFAULT_DEPTH)
+        .await
+        .expect("the access review");
+
+    // THE CONTROL FIRST: an empty export satisfies the absence below, and an organization
+    // with no assignments is a legitimate state of this API.
+    assert!(
+        rows.iter()
+            .any(|r| r.membership_id == my_member.to_string()),
+        "our own member is missing, so the absence below proves nothing: {rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.membership_id == their_member.to_string()),
+        "one organization's access review listed another's member: {rows:?}"
+    );
+    // THE ROLE SLUGS COLLIDE DELIBERATELY. Both organizations named a role `admin`, so a
+    // review keyed on the slug rather than on the organization would look correct here.
+    assert!(
+        rows.iter().all(|r| r.organization_id == mine.to_string()),
+        "every row must belong to the organization asked for: {rows:?}"
+    );
+}
+
+/// #145's verification asks for versioned contract fixtures a consumer can pin, and a fixture
+/// is worth nothing if the producer reorders itself between runs.
+#[tokio::test]
+async fn two_exports_of_identical_state_are_byte_identical() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Contoso").await;
+    let admin = create_role(&db, &env, scope, &org, "admin").await;
+    let auditor = create_role(&db, &env, scope, &org, "auditor").await;
+    let group = create_group(&db, &env, scope, &org, "engineering", None).await;
+    grant_group_role(&db, &env, scope, &org, &group, &auditor)
+        .await
+        .expect("grant to the group");
+
+    // SEVERAL MEMBERS, because a one-member export is ordered whatever the implementation
+    // does, and the ordering claim is about members as well as about each member's paths.
+    for who in ["alice", "bob", "carol"] {
+        let (_u, membership) =
+            create_member(&db, &env, scope, &org, &format!("{who}@contoso.test")).await;
+        grant_direct_role(&db, &env, scope, &org, &membership, &admin)
+            .await
+            .expect("grant directly");
+        bind_member(&db, &env, scope, &org, &group, &membership)
+            .await
+            .expect("bind to the group");
+    }
+
+    let management = db.control_store();
+    let first = management
+        .management()
+        .access_review(scope, &org, DEFAULT_DEPTH)
+        .await
+        .expect("first export");
+    let second = management
+        .management()
+        .access_review(scope, &org, DEFAULT_DEPTH)
+        .await
+        .expect("second export");
+
+    assert!(
+        first.len() >= 6,
+        "the corpus is too small to order: {first:?}"
+    );
+    assert_eq!(
+        ironauth_store::access_review::to_csv(&first),
+        ironauth_store::access_review::to_csv(&second),
+        "two exports of identical state differ, so a consumer cannot pin this file"
+    );
+    assert_eq!(
+        ironauth_store::access_review::to_jsonl(&first),
+        ironauth_store::access_review::to_jsonl(&second),
+        "the JSONL export is not stable either"
+    );
+}
+
+/// A machine member is a member. #145's export is "who has which role", and a first version
+/// of it listed people only.
+#[tokio::test]
+async fn the_access_review_lists_machine_members_beside_people() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Contoso").await;
+    let billing = create_role(&db, &env, scope, &org, "billing.admin").await;
+
+    let (_user, person) = create_member(&db, &env, scope, &org, "alice@contoso.test").await;
+    grant_direct_role(&db, &env, scope, &org, &person, &billing)
+        .await
+        .expect("grant the person");
+
+    let client = db
+        .store()
+        .scoped(scope)
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "a machine client")
+        .await
+        .expect("create the client");
+    let principal = db
+        .store()
+        .scoped(scope)
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .service_accounts()
+        .ensure(&env, &client)
+        .await
+        .expect("mint the service account");
+    let machine = db
+        .control_store()
+        .scoped(scope)
+        .acting(actor(&env), CorrelationId::generate(&env))
+        .org_memberships()
+        .create_for_service_account(
+            &env,
+            ironauth_store::NewServiceAccountMembership {
+                id: &OrgMembershipId::generate(&env, &scope),
+                organization_id: &org,
+                service_account_id: &principal,
+                metadata: None,
+            },
+            now_micros(&env),
+        )
+        .await
+        .expect("bind the machine into the organization");
+    grant_direct_role(&db, &env, scope, &org, &machine.id, &billing)
+        .await
+        .expect("grant the machine");
+
+    let rows = db
+        .control_store()
+        .management()
+        .access_review(scope, &org, DEFAULT_DEPTH)
+        .await
+        .expect("the access review");
+
+    // THE CONTROL FIRST: the person is there, so a missing machine is a missing machine and
+    // not an export that returned nothing.
+    assert!(
+        rows.iter()
+            .any(|r| r.principal_kind == "user" && r.membership_id == person.to_string()),
+        "the person is missing: {rows:?}"
+    );
+    let machine_row = rows
+        .iter()
+        .find(|r| r.membership_id == machine.id.to_string())
+        .expect("a machine holding billing.admin must appear in the evidence");
+    assert_eq!(machine_row.principal_kind, "service_account");
+    assert_eq!(machine_row.subject_id, principal.to_string());
+    assert_eq!(machine_row.role_slug, "billing.admin");
+    assert_eq!(machine_row.source, "direct");
+}
+
+/// A member who holds NOTHING is a finding, not an absence.
+#[tokio::test]
+async fn a_member_holding_no_role_is_reported_rather_than_omitted() {
+    // Omitting them made a person who holds nothing indistinguishable from a person who is
+    // not a member at all, which is a distinction an access review exists to draw.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Contoso").await;
+    let admin = create_role(&db, &env, scope, &org, "admin").await;
+
+    let (_hu, holder) = create_member(&db, &env, scope, &org, "alice@contoso.test").await;
+    grant_direct_role(&db, &env, scope, &org, &holder, &admin)
+        .await
+        .expect("grant the holder");
+    let (_nu, bare) = create_member(&db, &env, scope, &org, "bob@contoso.test").await;
+
+    let rows = db
+        .control_store()
+        .management()
+        .access_review(scope, &org, DEFAULT_DEPTH)
+        .await
+        .expect("the access review");
+
+    let bare_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r.membership_id == bare.to_string())
+        .collect();
+    assert_eq!(
+        bare_rows.len(),
+        1,
+        "a member with no grants gets exactly one row: {rows:?}"
+    );
+    assert_eq!(bare_rows[0].source, "none");
+    assert_eq!(bare_rows[0].role_slug, "");
+    assert_eq!(bare_rows[0].via_group_id, None);
+    // AND THE HOLDER IS UNAFFECTED, so "everyone holds nothing" is not how this passes.
+    assert!(
+        rows.iter()
+            .any(|r| r.membership_id == holder.to_string() && r.role_slug == "admin"),
+        "the holder's own row is gone: {rows:?}"
+    );
+}
+
+/// The drain crosses a page boundary, which the one-call version never did.
+#[tokio::test]
+async fn the_access_review_drains_past_the_first_page() {
+    // The first version passed the caller's limit straight to one listing call, which the
+    // store clamps to MANAGEMENT_LIST_HARD_CAP: an organization with more members than that
+    // produced a shorter evidence file with no error and no way to page. A caller could not
+    // even detect it, because rows and members are not 1:1.
+    //
+    // Seeding a thousand members to prove that would be absurd, so the page size is a
+    // parameter and this runs three members through a page of two: the cursor advance and
+    // the short-page terminator both execute.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope, "Contoso").await;
+    let admin = create_role(&db, &env, scope, &org, "admin").await;
+
+    let mut expected = Vec::new();
+    for who in ["alice", "bob", "carol"] {
+        let (_u, membership) =
+            create_member(&db, &env, scope, &org, &format!("{who}@contoso.test")).await;
+        grant_direct_role(&db, &env, scope, &org, &membership, &admin)
+            .await
+            .expect("grant");
+        expected.push(membership.to_string());
+    }
+
+    let one_page = db
+        .control_store()
+        .management()
+        .access_review(scope, &org, DEFAULT_DEPTH)
+        .await
+        .expect("the single-page review");
+    let paged = db
+        .control_store()
+        .management()
+        .access_review_in_pages(scope, &org, DEFAULT_DEPTH, 2)
+        .await
+        .expect("the paged review");
+
+    assert_eq!(
+        paged, one_page,
+        "draining in pages of two must produce the same review as one page of everything"
+    );
+    for membership in &expected {
+        assert!(
+            paged.iter().any(|r| &r.membership_id == membership),
+            "{membership} fell off the drain: {paged:?}"
+        );
+    }
+}
