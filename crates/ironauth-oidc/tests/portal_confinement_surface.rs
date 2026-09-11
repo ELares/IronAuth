@@ -72,6 +72,10 @@ const PANEL_COVERAGE: &[(&str, &str)] = &[
         "audit",
         "the_audit_page_shows_this_organizations_events_and_no_others",
     ),
+    (
+        "sso",
+        "an_sso_session_sees_only_its_own_organizations_connections",
+    ),
 ];
 
 /// The body of `surface_get`, which is the dispatch this file is about.

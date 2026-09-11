@@ -37969,6 +37969,46 @@ impl OrgConnectionRepo<'_> {
             .map(|row| org_connection_record_from_row(row, self.scope))
             .collect()
     }
+
+    /// ONE organization's upstream bindings, oldest first (issue #140 criterion 4).
+    ///
+    /// # Why this exists beside [`list_all`](Self::list_all)
+    ///
+    /// `list_all` answers an OPERATOR's question -- every binding in the environment -- and the
+    /// self-service portal must not ask it. A portal session is held by the customer's own IT
+    /// admin, so the page it renders is bounded by the organization the link was minted for,
+    /// and filtering an environment-wide read in Rust would put that boundary in the caller
+    /// where every future caller has to remember it. The predicate belongs in the statement.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the organization is out of this scope, which is the same
+    /// answer an absent organization gets; [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_organization(
+        &self,
+        organization_id: &OrganizationId,
+        limit: i64,
+    ) -> Result<Vec<OrgConnectionRecord>, StoreError> {
+        if organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ORG_CONNECTION_READ_COLUMNS} FROM org_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             ORDER BY created_at, id LIMIT $4"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| org_connection_record_from_row(row, self.scope))
+            .collect()
+    }
 }
 
 /// The read-only routing-rule repository (issue #77). Each selector lookup resolves at

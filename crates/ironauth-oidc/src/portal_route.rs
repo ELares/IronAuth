@@ -464,7 +464,10 @@ pub async fn surface_get(
     if intent == "audit" {
         return audit_surface(&state, &session, &filters).await;
     }
-    // THE OTHER INTENTS STILL RENDER THEIR PLACEHOLDER: `sso`, `domain-verification` and
+    if intent == "sso" {
+        return sso_surface(&state, &session).await;
+    }
+    // THE OTHER INTENTS STILL RENDER THEIR PLACEHOLDER: `domain-verification` and
     // `log-streams`, which land in later slices of #140. The fence has already refused an intent
     // this session does not carry, so what reaches here is a surface this deployment serves and
     // has not built yet.
@@ -1416,6 +1419,211 @@ async fn audit_surface(
     }
     body.push_str("</table>");
     crate::pages::secure_html(StatusCode::OK, body)
+}
+
+/// The single sign-on surface: the values a customer's identity provider asks for.
+///
+/// # Read-only in this slice, and useful on its own
+///
+/// #140's first criterion is an IT admin completing SSO setup with no vendor-side action, which
+/// needs a create path. What lands first is the half that create path would be useless without:
+/// the values a provider's console asks for, printed beside the connection each one belongs to,
+/// with the steps for the provider that connection actually names. An admin whose connection
+/// already exists can finish the entire upstream side from this page, which is where the
+/// vendor's onboarding support load actually sits.
+///
+/// # Two reads, because the two upstream kinds are named in different places
+///
+/// A SAML upstream is a `saml_connections` row that carries its own `organization_id`, and it
+/// is where `acs_url` and `sp_entity_id` live -- the two values this page exists to hand over.
+/// `certificate_renewal_surface` reads it the same way. An OIDC upstream is not a row of its
+/// own: it is an `org_connections` binding naming a connector, so that table is the only place
+/// an organization's OIDC upstream can be found.
+///
+/// Reading `org_connections` for BOTH would have been tidier and would have listed fewer SAML
+/// connections than the organization has, because a `saml_connections` row does not require a
+/// binding to exist. A page that omitted one would tell an admin a connection they can see on
+/// the renewal page is not there.
+async fn sso_surface(state: &OidcState, session: &PortalSession) -> Response {
+    let scoped = state.store().scoped(session.scope());
+    let saml = scoped
+        .saml_connections()
+        .list_for_org(session.organization(), PORTAL_LIST_LIMIT + 1, None)
+        .await;
+    let bindings = scoped
+        .org_connections()
+        .list_for_organization(session.organization(), PORTAL_LIST_LIMIT + 1)
+        .await;
+    // THE ORGANIZATION IS THE SESSION'S on both reads, so a failure is this deployment failing
+    // to read its own rows rather than an addressing mistake the holder could have made.
+    let (Ok(saml), Ok(bindings)) = (saml, bindings) else {
+        return PortalRefusal::Unavailable.into_response();
+    };
+    let connectors: Vec<&str> = bindings
+        .iter()
+        .filter_map(|binding| binding.connector_id.as_deref())
+        .collect();
+
+    let mut body = String::from(
+        "<!doctype html><meta charset=\"utf-8\"><title>Single sign-on</title>\
+         <h1>Single sign-on</h1>",
+    );
+    if saml.is_empty() && connectors.is_empty() {
+        // NOT A REFUSAL, for the reason the renewal surface gives: the link is fine, there is
+        // simply nothing configured yet, and a not-found would read as a broken link.
+        body.push_str(
+            "<p>This organization has no sign-on connection yet. Ask your vendor to create one, \
+             then come back here for the values your identity provider needs.</p>",
+        );
+        return crate::pages::secure_html(StatusCode::OK, body);
+    }
+
+    let limit = usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX);
+    if saml.len() > limit || connectors.len() > limit {
+        // SAID, NOT SWALLOWED, as on the renewal page: an admin who configures what they can
+        // see and believes they are finished is worse off than one told the list is cut.
+        let _ = write!(
+            body,
+            "<p>Showing the first {limit} of each kind. Ask your vendor about the rest.</p>"
+        );
+    }
+    for connection in saml.iter().take(limit) {
+        sso_saml_section(state, session, connection, &mut body);
+    }
+    for raw in connectors.iter().take(limit) {
+        sso_oidc_section(state, session, raw, &mut body).await;
+    }
+    crate::pages::secure_html(StatusCode::OK, body)
+}
+
+/// One SAML upstream: the two values its console asks for, and the guide for that provider.
+fn sso_saml_section(
+    state: &OidcState,
+    session: &PortalSession,
+    connection: &ironauth_store::SamlConnection,
+    body: &mut String,
+) {
+    let scope = session.scope();
+    // THE METADATA DOCUMENT IS THE SHORTEST PATH and the least error-prone, so it is offered
+    // LAST, after the two values it replaces: an admin whose provider can import it never has
+    // to transcribe them, and one whose provider cannot has already read them. The generic
+    // guide's wording depends on this order -- it says "instead of typing the two values
+    // above".
+    //
+    // AND IT IS OFFERED ONLY WHILE THE CONNECTION IS ON. `saml_metadata::metadata_get` reads
+    // through `find_active`, so the document 404s for a switched-off connection while
+    // `list_for_org` still lists it here. Printing the URL anyway would send an admin to
+    // paste an address that answers nothing, and the failure surfaces days later as "the
+    // import did not work" with this page as the evidence it should have.
+    let metadata_url = format!(
+        "{base}/t/{tenant}/e/{environment}/saml/metadata/{connection}",
+        base = state.issuer_base().trim_end_matches('/'),
+        tenant = scope.tenant(),
+        environment = scope.environment(),
+        connection = connection.id,
+    );
+    let _ = write!(
+        body,
+        "<h2>{name}</h2><p>Type: SAML</p>\
+         <p>Sign-on URL (ACS): <code>{acs}</code></p>\
+         <p>Audience (SP entity ID): <code>{audience}</code></p>",
+        name = escape_html(&connection.display_name),
+        acs = escape_html(&connection.acs_url),
+        audience = escape_html(&connection.sp_entity_id),
+    );
+    if connection.active {
+        let _ = write!(
+            body,
+            "<p>Metadata document: <code>{metadata}</code></p>",
+            metadata = escape_html(&metadata_url),
+        );
+    } else {
+        // THE TWO VALUES ABOVE STAY. They are stable properties of the connection and an
+        // admin can configure their side before the vendor switches it on; what they must not
+        // be given is an address that answers nothing and a guide that reads as if sign-in
+        // would work at the end of it.
+        body.push_str(
+            "<p><strong>This connection is switched off.</strong> Your vendor has to enable \
+             it before anyone can sign in through it, and its metadata document is not served \
+             while it is off.</p>",
+        );
+    }
+    render_guide(
+        body,
+        &crate::portal_guides::saml_guide_for(
+            &connection.idp_entity_id,
+            &connection.acs_url,
+            &connection.sp_entity_id,
+            connection.active.then_some(metadata_url.as_str()),
+        ),
+    );
+}
+
+/// One OIDC upstream: the redirect URI its console asks for, and the guide.
+async fn sso_oidc_section(
+    state: &OidcState,
+    session: &PortalSession,
+    raw_id: &str,
+    body: &mut String,
+) {
+    let scope = session.scope();
+    let scoped = state.store().scoped(scope);
+    let found = match scoped.connectors().parse_id(raw_id) {
+        Ok(id) => scoped.connectors().get(&id).await.ok(),
+        Err(_) => None,
+    };
+    let Some(connector) = found else {
+        body.push_str(
+            "<h2>An OpenID Connect connection this page could not read</h2>\
+             <p>Ask your vendor to check it.</p>",
+        );
+        return;
+    };
+
+    // DERIVED BY THE FUNCTION THE FLOW ITSELF USES, not composed here. A second spelling of
+    // this URL is how a page comes to print an address the callback route does not serve, and
+    // the admin would have no way to tell: the paste succeeds and the sign-in fails later.
+    let redirect_uri = crate::federation::federation_callback_url(
+        state,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        &connector.slug,
+    );
+    // THE PROTOCOL DECIDES BOTH THE LABEL AND THE STEPS. An OAuth2 connector (issue #74,
+    // GitHub) binds through this same table, and calling it OpenID Connect sends its admin
+    // looking for an issuer URL and an `openid` scope their provider does not have.
+    let protocol = crate::portal_guides::connector_protocol(&connector.definition_json);
+    let kind = match protocol.as_deref() {
+        Some("oauth2") => "OAuth 2.0",
+        Some("oidc") => "OpenID Connect",
+        _ => "single sign-on",
+    };
+    let _ = write!(
+        body,
+        "<h2>{name}</h2><p>Type: {kind}</p>\
+         <p>Redirect URI: <code>{redirect}</code></p>",
+        name = escape_html(&connector.slug),
+        kind = escape_html(kind),
+        redirect = escape_html(&redirect_uri),
+    );
+    render_guide(
+        body,
+        &crate::portal_guides::upstream_guide(protocol.as_deref(), &redirect_uri),
+    );
+}
+
+/// A guide rendered as a numbered list under the connection it belongs to.
+fn render_guide(body: &mut String, guide: &crate::portal_guides::SetupGuide) {
+    let _ = write!(
+        body,
+        "<h3>Setting this up in {provider}</h3><p>{where_to_go}</p><ol>",
+        provider = escape_html(guide.provider_name),
+        where_to_go = escape_html(guide.where_to_go),
+    );
+    for step in &guide.steps {
+        let _ = write!(body, "<li>{}</li>", escape_html(step));
+    }
+    body.push_str("</ol>");
 }
 
 /// How an actor is named on the audit page.
