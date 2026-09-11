@@ -33,6 +33,20 @@ pub enum StoreError {
     /// now-committed original response and replays it; the mutation did not run
     /// a second time. Returned only by the management-plane create paths.
     IdempotencyConflict,
+    /// The principal deciding an access request is the one who raised it (issue #145
+    /// criterion 4).
+    ///
+    /// Its own variant rather than [`NotFound`], and deliberately NOT an anti-oracle
+    /// concern: the caller already knows the request exists, because they raised it. What
+    /// they are being told is that this system will not let one person be both sides of
+    /// an elevation, which is a rule they need stated rather than hidden behind a 404
+    /// that reads like a bug.
+    ///
+    /// The repository raises this BEFORE the database does. The CHECK constraint
+    /// `access_grant_requests_decider_is_not_requester` is what makes self-approval
+    /// impossible on every path; this is what makes the answer comprehensible on the one
+    /// path a person is standing in front of.
+    SelfApproval,
     /// A create violated a uniqueness constraint that is NOT an anti-oracle
     /// concern: for example registering a bootstrap user whose login identifier
     /// already exists in the scope (issue #20). Distinct from [`NotFound`] because
@@ -417,6 +431,11 @@ impl StoreError {
             | StoreError::NoActiveTraitSchema
             | StoreError::JourneyInvalid(_)
             | StoreError::OrgGroupCycle
+            // A well-formed decision on a request the caller can already address,
+            // refused by a policy. Not `NotFound`, which would read as a bug to
+            // somebody looking at the request they raised; not internal, which it is
+            // plainly not.
+            | StoreError::SelfApproval
             | StoreError::OrgGroupDepthExceeded { .. }
             // The caller's cursor is the problem and only the caller can fix it, by
             // reconciling and resuming. Not Internal: nothing FAILED here, the request is
@@ -448,6 +467,9 @@ impl fmt::Display for StoreError {
             StoreError::Database(_) => f.write_str("database error"),
             StoreError::Migration(_) => f.write_str("migration error"),
             StoreError::IdempotencyConflict => f.write_str("idempotency-key conflict"),
+            StoreError::SelfApproval => {
+                f.write_str("the requester of an access request may not decide it")
+            }
             StoreError::Conflict => f.write_str("uniqueness conflict"),
             StoreError::InvalidRedirectUri => f.write_str("invalid redirect uri"),
             StoreError::GuardrailViolation(violation) => {
@@ -521,6 +543,7 @@ impl std::error::Error for StoreError {
             StoreError::NotFound
             | StoreError::RetentionGap
             | StoreError::IdempotencyConflict
+            | StoreError::SelfApproval
             | StoreError::Conflict
             | StoreError::Invalid
             | StoreError::InvalidRedirectUri

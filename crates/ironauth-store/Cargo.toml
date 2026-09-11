@@ -1075,6 +1075,11 @@ required-features = ["testing"]
 # the file above, because the subject is different: that one is about a link being spent exactly
 # once, this one is about what the resulting credential may reach and for how long.
 [[test]]
+name = "access_requests"
+path = "tests/access_requests.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "portal_sessions"
 path = "tests/portal_sessions.rs"
 required-features = ["testing"]

@@ -805,6 +805,17 @@ impl ScopedKind for LogStreamKind {
     const PREFIX: &'static str = "lgs";
 }
 
+/// Marker for a time-boxed access request (`agr_`), one row per ask (issue #145
+/// criterion 4).
+///
+/// A tenant-scoped resource: the id embeds its (tenant, environment), so a request raised
+/// in one environment cannot be decided by naming it in another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AccessRequestKind;
+impl ScopedKind for AccessRequestKind {
+    const PREFIX: &'static str = "agr";
+}
+
 /// Marker for a stored message template override (`mtp_`), one row per
 /// (level, organization, kind, locale) in an environment (issue #111).
 ///
@@ -2112,6 +2123,9 @@ pub type ConnectorId = ScopedId<ConnectorKind>;
 
 /// A configured SIEM log stream (issue #110).
 pub type LogStreamId = ScopedId<LogStreamKind>;
+
+/// A time-boxed access request (issue #145 criterion 4).
+pub type AccessRequestId = ScopedId<AccessRequestKind>;
 
 /// A stored message template override (issue #111).
 pub type MessageTemplateId = ScopedId<MessageTemplateKind>;

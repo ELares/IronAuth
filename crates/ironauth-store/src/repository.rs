@@ -840,6 +840,19 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// Time-boxed access requests (issue #145 criterion 4, EXPLORATORY).
+    ///
+    /// On the SCOPED store because the DATA plane reads them: a token-issuing path asks
+    /// whether a live grant exists. Migration 0225 grants the app role SELECT alone, so an
+    /// app role that was somehow induced to write could not approve its own request.
+    #[must_use]
+    pub fn access_requests(&self) -> AccessRequestRepo<'a> {
+        AccessRequestRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// SIEM log stream configuration (issue #110).
     #[must_use]
     pub fn log_streams(&self) -> LogStreamRepo<'a> {
@@ -50172,6 +50185,17 @@ impl<'a> ActingManagementStore<'a> {
         }
     }
 
+    /// The mutating access-request repository for `scope` (issue #145 criterion 4):
+    /// raise a request and decide one, each audited.
+    #[must_use]
+    pub fn access_requests(&self, scope: Scope) -> ActingAccessRequestRepo<'a> {
+        ActingAccessRequestRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
     /// The mutating organization-group repository for `scope` (issue #97): define a
     /// group in an organization (optionally under a parent), rename it, move it
     /// within the organization's group forest, and delete it, each audited.
@@ -85390,5 +85414,324 @@ mod envelope_label_tests {
                 );
             }
         }
+    }
+}
+
+/// What a new access request asks for (issue #145 criterion 4).
+///
+/// A struct rather than five string parameters, because four of them are `&str` and an
+/// argument list that long is one transposition away from filing a request against the
+/// wrong subject under the wrong role, which nothing downstream could detect.
+#[derive(Debug, Clone, Copy)]
+pub struct NewAccessRequest<'a> {
+    /// Whose roles are at stake.
+    pub organization_id: &'a str,
+    /// Who would receive the access. Not necessarily the requester.
+    pub subject_id: &'a str,
+    /// Which role.
+    pub role_slug: &'a str,
+    /// The asking principal, recorded so a later decision has something to be compared
+    /// against by `access_grant_requests_decider_is_not_requester`.
+    pub requested_by: &'a str,
+    /// Why, in the requester's words.
+    pub reason: &'a str,
+}
+
+/// Reading time-boxed access requests (issue #145 criterion 4, EXPLORATORY).
+pub struct AccessRequestRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+/// The columns every read below selects, in one place so the two decoders cannot drift.
+const ACCESS_REQUEST_COLUMNS: &str = "id, organization_id, subject_id, role_slug, \
+     requested_by, reason, state, decided_by, \
+     (EXTRACT(EPOCH FROM decided_at) * 1000000)::bigint AS decided_micros, \
+     (EXTRACT(EPOCH FROM granted_until) * 1000000)::bigint AS granted_until_micros, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_micros";
+
+/// Decode one row, or [`None`] for a state this build does not know.
+///
+/// A state a NEWER binary wrote cannot be classified by this one, and both guesses are
+/// wrong in a way that matters: `approved` would grant access after a rollback and
+/// `denied` would revoke it. Skipping the row is the only reading that invents nothing,
+/// and it errs toward no access.
+fn decode_access_request(
+    row: &sqlx::postgres::PgRow,
+) -> Option<crate::access_request::AccessGrantRequest> {
+    let state: String = row.get("state");
+    Some(crate::access_request::AccessGrantRequest {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        subject_id: row.get("subject_id"),
+        role_slug: row.get("role_slug"),
+        requested_by: row.get("requested_by"),
+        reason: row.get("reason"),
+        state: crate::access_request::AccessRequestState::from_wire(&state)?,
+        decided_by: row.get("decided_by"),
+        decided_at_micros: row.get("decided_micros"),
+        granted_until_micros: row.get("granted_until_micros"),
+        created_at_micros: row.get("created_micros"),
+    })
+}
+
+impl AccessRequestRepo<'_> {
+    /// Every request raised for one organization, newest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn list_for_organization(
+        &self,
+        organization_id: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::access_request::AccessGrantRequest>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ACCESS_REQUEST_COLUMNS} FROM access_grant_requests \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             ORDER BY created_at DESC, id DESC LIMIT $4"
+        ))
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(organization_id)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().filter_map(decode_access_request).collect())
+    }
+
+    /// One request by id, or [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault, and [`StoreError::NotFound`] when no such
+    /// request exists in this scope.
+    pub async fn get(
+        &self,
+        id: &str,
+    ) -> Result<crate::access_request::AccessGrantRequest, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ACCESS_REQUEST_COLUMNS} FROM access_grant_requests \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3"
+        ))
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.as_ref()
+            .and_then(decode_access_request)
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// The roles a subject holds through a LIVE time-boxed grant at `now_micros`.
+    ///
+    /// # Why the deadline is in the WHERE clause and checked again after
+    ///
+    /// The SQL narrows so the scan is small; `grants_now` decides. Both, because the two
+    /// answer to different failure modes: a query that forgot the deadline would return
+    /// elapsed grants, and a caller that trusted the state column would accept a row the
+    /// sweeper has not reached. See [`crate::access_request::AccessGrantRequest::grants_now`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn live_roles_for_subject(
+        &self,
+        organization_id: &str,
+        subject_id: &str,
+        now_micros: i64,
+    ) -> Result<Vec<String>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ACCESS_REQUEST_COLUMNS} FROM access_grant_requests \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+               AND subject_id = $4 AND state = 'approved' \
+               AND granted_until > (TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+             ORDER BY role_slug"
+        ))
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(organization_id)
+        .bind(subject_id)
+        .bind(now_micros)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .filter_map(decode_access_request)
+            .filter(|request| request.grants_now(now_micros))
+            .map(|request| request.role_slug)
+            .collect())
+    }
+}
+
+/// Raising and deciding access requests, each audited (issue #145 criterion 4).
+pub struct ActingAccessRequestRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    scope: Scope,
+}
+
+impl ActingAccessRequestRepo<'_> {
+    /// Raise a request for time-boxed access, auditing `access_request.raise`.
+    ///
+    /// `requested_by` is the asking principal, recorded so the separation constraint has
+    /// something to compare a later decision against.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault, including a nonexistent
+    /// organization and any field the CHECK constraints refuse (an empty reason or role),
+    /// both of which the management edge reports up front.
+    pub async fn raise(
+        &self,
+        env: &Env,
+        id: &crate::id::AccessRequestId,
+        spec: NewAccessRequest<'_>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id_owned = id.to_string();
+        let organization_id = spec.organization_id.to_owned();
+        let subject_id = spec.subject_id.to_owned();
+        let role_slug = spec.role_slug.to_owned();
+        let requested_by = spec.requested_by.to_owned();
+        let reason = spec.reason.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AccessRequestRaise,
+                target: id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO access_grant_requests \
+                         (id, tenant_id, environment_id, organization_id, subject_id, \
+                          role_slug, requested_by, reason, state) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')",
+                )
+                .bind(&id_owned)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&organization_id)
+                .bind(&subject_id)
+                .bind(&role_slug)
+                .bind(&requested_by)
+                .bind(&reason)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Approve or deny a pending request, auditing `access_request.decide`.
+    ///
+    /// `granted_until_micros` is required for an approval and refused for a denial: an
+    /// approval is exactly a grant with an end, and the database enforces the pairing.
+    ///
+    /// # Why the UPDATE names the state it expects
+    ///
+    /// `AND state = 'pending'` makes the decision idempotent-safe under a race: two
+    /// approvers pressing at once produce one decided row and one [`StoreError::NotFound`],
+    /// rather than the second silently overwriting the first's decision and deadline.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when the request does not exist in this scope or is no
+    /// longer pending; [`StoreError::Database`] on a persistence fault, INCLUDING the
+    /// constraint violation a self-approval raises. The management edge refuses that case
+    /// with a comprehensible 403 first; the constraint is what makes it impossible on
+    /// every other path.
+    pub async fn decide(
+        &self,
+        env: &Env,
+        id: &crate::id::AccessRequestId,
+        approve: bool,
+        decided_by: &str,
+        decided_at_micros: i64,
+        granted_until_micros: Option<i64>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        if approve != granted_until_micros.is_some() {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id_owned = id.to_string();
+        let decided_by = decided_by.to_owned();
+        let state = if approve { "approved" } else { "denied" };
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AccessRequestDecide,
+                target: id,
+            },
+            async move |tx| {
+                // THE COMPREHENSIBLE REFUSAL, taken inside the same transaction and with
+                // the row locked, so the answer cannot be overtaken between the read and
+                // the write. The CHECK constraint is what makes self-approval impossible;
+                // this is what makes it legible, and `FOR UPDATE` is what stops the two
+                // from disagreeing under a race.
+                let existing: Option<(String, String)> = sqlx::query_as(
+                    "SELECT requested_by, state FROM access_grant_requests \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 FOR UPDATE",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&id_owned)
+                .fetch_optional(&mut **tx)
+                .await?;
+                let Some((requested_by, _)) = existing else {
+                    return Err(StoreError::NotFound);
+                };
+                if requested_by == decided_by {
+                    return Err(StoreError::SelfApproval);
+                }
+                let done = sqlx::query(
+                    "UPDATE access_grant_requests SET state = $4, decided_by = $5, \
+                         decided_at = (TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval), \
+                         granted_until = CASE WHEN $7::bigint IS NULL THEN NULL ELSE \
+                             (TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) END \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                       AND state = 'pending'",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&id_owned)
+                .bind(state)
+                .bind(&decided_by)
+                .bind(decided_at_micros)
+                .bind(granted_until_micros)
+                .execute(&mut **tx)
+                .await?;
+                if done.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
     }
 }

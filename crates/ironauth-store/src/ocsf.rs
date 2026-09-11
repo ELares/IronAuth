@@ -221,6 +221,10 @@ const ACCESS_MANAGEMENT_DOMAINS: &[&str] = &[
     // is filed here rather than under entity management because the subject of the event is
     // the entitlement data itself: an auditor asking "who looked at our access model" is
     // asking a user-access-management question.
+    // An access request (issue #145 criterion 4) asks for a role and an approval grants it
+    // until a deadline. Both halves change who may do what, which is the question this
+    // class answers; the ENTITY being managed is the entitlement, not the requester.
+    "access_request",
     "access_review",
     "api_key",
     "ban",
