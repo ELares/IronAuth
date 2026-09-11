@@ -5765,6 +5765,15 @@ export interface components {
          *     arrived, so a report reading only that table would answer an auditor "no gap" for a
          *     deployment exporting nothing. The counts below are exact for what was dead-lettered;
          *     `gap` additionally covers the states where there is nothing to count.
+         *
+         *     # What it still cannot see
+         *
+         *     Every signal here is per stream or per process. A pass that dies BEFORE the per-stream
+         *     loop -- `list_active` itself erroring, say -- records nothing against any stream, so
+         *     every disjunct stays clear while no stream advances. Narrowing that needs a per-pass
+         *     health row, which the shipper does not write. The states this does cover are the
+         *     standing ones an auditor is asking about; the uncovered one is a process failing
+         *     loudly in its own logs.
          */
         DeliveryAttestationView: {
             /** @description Whether the stream itself is active. A deactivated stream delivers nothing. */
@@ -5797,24 +5806,41 @@ export interface components {
             last_error?: string | null;
             /**
              * Format: int64
-             * @description When this stream last delivered anything, in epoch milliseconds, or absent when it
-             *     never has.
+             * @description When this stream last completed a pass WITHOUT a delivery failure, in epoch
+             *     milliseconds, or absent when it never has.
+             *
+             *     Not "last delivered": `record_success` is also called for a pass whose window was
+             *     entirely filtered out, and on the pass that sets a batch aside. Both advance the
+             *     cursor without anything reaching the sink. It is a liveness signal for the pass,
+             *     and the counts beside it are the delivery signal.
              */
             last_success_at_unix_ms?: number | null;
             /**
              * Format: int32
-             * @description How many set-aside batches can NEVER be delivered, because audit retention removed
-             *     their range before the replay reached it.
+             * @description How many set-aside batches lost events to audit retention before a replay could
+             *     reach them. A batch counts here whether retention took the WHOLE range (nothing was
+             *     delivered) or only part of it (the survivors were).
              */
             permanently_lost_batches: number;
             /**
              * Format: int64
-             * @description How many audit events are permanently lost.
+             * @description How many audit events are permanently lost: removed from the audit log without ever
+             *     reaching the sink. Not the size of the batches above, which may have delivered some
+             *     of what they held.
              */
             permanently_lost_events: number;
             /**
-             * @description Whether this deployment's shipper is running. When false NOTHING is being
-             *     delivered, whatever the counts say.
+             * @description Whether the shipper was running in THIS PROCESS when it booted. When false nothing
+             *     is being delivered for this stream, whatever the counts say.
+             *
+             *     A snapshot and a per-process one, with the same two bounds as `enforced` on the
+             *     retention report. The boot path speaks once, so a shipper that starts and later
+             *     dies is not reported here; and in a split deployment where the management API and
+             *     the workers run as separate processes, this is the answer for the process serving
+             *     the request. Both would need a health signal each pass writes, which the shipper
+             *     does not have. What the snapshot does close is the state it was added for, a
+             *     deployment that never starts a shipper at all, which is the shipped default and is
+             *     permanent rather than drifting.
              */
             shipping: boolean;
             /** @description The stream this attests to. */

@@ -133,6 +133,25 @@ pub struct DeadLetter {
     pub last_error: String,
 }
 
+/// A batch whose events audit retention removed before any replay could deliver them.
+///
+/// Separate from [`DeadLetter`] because the number that matters is different: a dead letter
+/// carries how many events the failed pass HELD, and this carries how many of them nobody
+/// will ever receive. The two are equal only when the whole range was deleted, and reusing
+/// one field for both meanings is how a report ends up publishing a number it cannot
+/// support.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LostBatch {
+    /// The dead letter this loss was recorded against.
+    pub id: String,
+    /// Where the range starts: `(epoch micros, audit id)`.
+    pub from: (i64, String),
+    /// How many of the batch's events are unrecoverable.
+    pub lost_event_count: i32,
+    /// The error that set the batch aside in the first place.
+    pub last_error: String,
+}
+
 /// One configured stream.
 #[derive(Debug, Clone)]
 pub struct LogStreamRecord {

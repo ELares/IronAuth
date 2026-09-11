@@ -27,14 +27,52 @@ ALTER TABLE log_stream_dead_letters
     ADD COLUMN abandoned_at timestamptz;
 
 COMMENT ON COLUMN log_stream_dead_letters.abandoned_at IS
-    'When the replay found the audit range already deleted by retention, so these events can never be delivered. Mutually exclusive with replayed_at: one means the sink has them, the other means nobody ever will.';
+    'When the replay found NOTHING left of the audit range, so not one of these events can ever be delivered. Mutually exclusive with replayed_at, and the CHECK below enforces that rather than trusting this sentence.';
 
--- OUTSTANDING means neither. An abandoned batch is not awaiting delivery, so it
--- must not block or be retried; it is also not delivered, so it must not be
--- counted as such. The attestation reads it through its own query.
-CREATE INDEX log_stream_dead_letters_abandoned_idx
+-- PARTIAL LOSS IS THE COMMON SHAPE, and the column above cannot express it.
+--
+-- An age-based retention cutoff lands INSIDE a dead-lettered range as soon as the stream
+-- has been broken longer than the distance between the cutoff and the head of its
+-- backlog. The replay then assembles the survivors, ships them, and the batch is a
+-- successful replay by every test the row can apply -- while the events retention took
+-- are gone from the log and were never delivered. Recording only the all-or-nothing case
+-- would have left exactly the collapse this migration exists to prevent, for the case
+-- that actually happens.
+--
+-- So the count is stored rather than derived. `event_count` is how many events the failed
+-- pass had in hand; this is how many of them no replay will ever recover. Zero on every
+-- existing row and on every clean replay, which is the truth for both.
+ALTER TABLE log_stream_dead_letters
+    ADD COLUMN lost_event_count integer NOT NULL DEFAULT 0;
+
+COMMENT ON COLUMN log_stream_dead_letters.lost_event_count IS
+    'How many of this batch''s events audit retention removed before the replay reached them. Nonzero means they were never delivered and cannot be, whether or not the survivors were.';
+
+-- ENFORCED, not asserted. The comment above used to be the only thing saying these two are
+-- exclusive, and a row carrying both would be counted as delivered by one query and as
+-- permanently lost by the other.
+ALTER TABLE log_stream_dead_letters
+    ADD CONSTRAINT log_stream_dead_letters_terminal_state_is_one
+    CHECK (replayed_at IS NULL OR abandoned_at IS NULL);
+
+-- A batch cannot lose more events than it ever held, and an ABANDONED batch lost all of
+-- them: that is what abandonment means, so the two columns cannot drift apart.
+ALTER TABLE log_stream_dead_letters
+    ADD CONSTRAINT log_stream_dead_letters_lost_within_batch
+    CHECK (
+        lost_event_count >= 0
+        AND lost_event_count <= event_count
+        AND (abandoned_at IS NULL OR lost_event_count = event_count)
+    );
+
+-- OUTSTANDING means neither replayed nor abandoned. An abandoned batch is not awaiting
+-- delivery, so it must not block or be retried; it is also not delivered, so it must not
+-- be counted as such. The attestation reads the lost ones through their own query, which
+-- keys on the COUNT rather than on `abandoned_at`, because a partially lost batch is a
+-- replayed row.
+CREATE INDEX log_stream_dead_letters_lost_idx
     ON log_stream_dead_letters (tenant_id, environment_id, stream_id)
-    WHERE abandoned_at IS NOT NULL;
+    WHERE lost_event_count > 0;
 
 -- The data-plane role's UPDATE on this table is COLUMN-SCOPED, deliberately: 0140 granted
 -- `UPDATE (replayed_at)` and nothing else, so the shipper can clear an entry and cannot
@@ -45,4 +83,4 @@ CREATE INDEX log_stream_dead_letters_abandoned_idx
 --
 -- Granted alone rather than widening the grant to the table: the two timestamps are the
 -- only columns the data plane has any business writing.
-GRANT UPDATE (abandoned_at) ON log_stream_dead_letters TO ironauth_app;
+GRANT UPDATE (abandoned_at, lost_event_count) ON log_stream_dead_letters TO ironauth_app;

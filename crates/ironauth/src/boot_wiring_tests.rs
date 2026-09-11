@@ -888,10 +888,15 @@ async fn the_management_plane_reports_the_retention_policy_the_boot_path_install
     // THE INSTALL IS SILENTLY DROPPABLE. `with_audit_retention` writes through
     // `Arc::get_mut` with no `else`, so if anything ever clones the state's inner `Arc`
     // before the boot path calls it, the install vanishes with no panic, no log and no
-    // compile error. The endpoint would then report the shipped default -- nothing
-    // enforced, both streams kept forever -- on a deployment that is in fact deleting,
-    // which is the exact lie the audit-retention report exists to prevent. Nothing about
-    // the code would read wrong. So it is measured here.
+    // compile error.
+    //
+    // What the endpoint would then publish is not simply the shipped default. `enforced`
+    // does not travel with the windows: it is read off a handle the boot path writes, and
+    // the boot path takes that handle from whatever policy the plane ended up holding. So
+    // a dropped install pairs the default WINDOWS -- both zero, reported as kept forever
+    // -- with the real sweeper verdict, which on a deployment that is deleting reads
+    // "enforced, and nothing is ever removed": two true-sounding halves of a policy that
+    // does not exist. Nothing about the code would read wrong. So it is measured here.
     //
     // The fixture drives windows and an interval away from the defaults (all zero), so a
     // plane that ignored the section and took `AuditRetentionPolicy::default()` fails

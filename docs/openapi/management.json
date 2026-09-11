@@ -32412,7 +32412,7 @@
       },
       "DeliveryAttestationView": {
         "type": "object",
-        "description": "What one log stream failed to deliver.\n\n# Why this is more than a dead-letter count\n\nA dead letter is written only after a bounded run of REFUSED deliveries. Every other\nway a stream fails to deliver writes no row at all: shipping is off for the deployment\n(the default), the shipper could not start, the stream is deactivated, its sink type\nhas no implementation in this build, or a failure run is under way and has not reached\nthe threshold. In all of those the dead-letter table is empty and none of the trail has\narrived, so a report reading only that table would answer an auditor \"no gap\" for a\ndeployment exporting nothing. The counts below are exact for what was dead-lettered;\n`gap` additionally covers the states where there is nothing to count.",
+        "description": "What one log stream failed to deliver.\n\n# Why this is more than a dead-letter count\n\nA dead letter is written only after a bounded run of REFUSED deliveries. Every other\nway a stream fails to deliver writes no row at all: shipping is off for the deployment\n(the default), the shipper could not start, the stream is deactivated, its sink type\nhas no implementation in this build, or a failure run is under way and has not reached\nthe threshold. In all of those the dead-letter table is empty and none of the trail has\narrived, so a report reading only that table would answer an auditor \"no gap\" for a\ndeployment exporting nothing. The counts below are exact for what was dead-lettered;\n`gap` additionally covers the states where there is nothing to count.\n\n# What it still cannot see\n\nEvery signal here is per stream or per process. A pass that dies BEFORE the per-stream\nloop -- `list_active` itself erroring, say -- records nothing against any stream, so\nevery disjunct stays clear while no stream advances. Narrowing that needs a per-pass\nhealth row, which the shipper does not write. The states this does cover are the\nstanding ones an auditor is asking about; the uncovered one is a process failing\nloudly in its own logs.",
         "required": [
           "stream_id",
           "gap",
@@ -32459,23 +32459,23 @@
               "null"
             ],
             "format": "int64",
-            "description": "When this stream last delivered anything, in epoch milliseconds, or absent when it\nnever has."
+            "description": "When this stream last completed a pass WITHOUT a delivery failure, in epoch\nmilliseconds, or absent when it never has.\n\nNot \"last delivered\": `record_success` is also called for a pass whose window was\nentirely filtered out, and on the pass that sets a batch aside. Both advance the\ncursor without anything reaching the sink. It is a liveness signal for the pass,\nand the counts beside it are the delivery signal."
           },
           "permanently_lost_batches": {
             "type": "integer",
             "format": "int32",
-            "description": "How many set-aside batches can NEVER be delivered, because audit retention removed\ntheir range before the replay reached it.",
+            "description": "How many set-aside batches lost events to audit retention before a replay could\nreach them. A batch counts here whether retention took the WHOLE range (nothing was\ndelivered) or only part of it (the survivors were).",
             "minimum": 0
           },
           "permanently_lost_events": {
             "type": "integer",
             "format": "int64",
-            "description": "How many audit events are permanently lost.",
+            "description": "How many audit events are permanently lost: removed from the audit log without ever\nreaching the sink. Not the size of the batches above, which may have delivered some\nof what they held.",
             "minimum": 0
           },
           "shipping": {
             "type": "boolean",
-            "description": "Whether this deployment's shipper is running. When false NOTHING is being\ndelivered, whatever the counts say."
+            "description": "Whether the shipper was running in THIS PROCESS when it booted. When false nothing\nis being delivered for this stream, whatever the counts say.\n\nA snapshot and a per-process one, with the same two bounds as `enforced` on the\nretention report. The boot path speaks once, so a shipper that starts and later\ndies is not reported here; and in a split deployment where the management API and\nthe workers run as separate processes, this is the answer for the process serving\nthe request. Both would need a health signal each pass writes, which the shipper\ndoes not have. What the snapshot does close is the state it was added for, a\ndeployment that never starts a shipper at all, which is the shipped default and is\npermanent rather than drifting."
           },
           "stream_id": {
             "type": "string",

@@ -110,6 +110,11 @@ struct BootShape {
     /// set; this is the OTHER condition, and the pair is what the management plane's
     /// `enforced` must distinguish (issue #145 criterion 3).
     audit_retention_dsn: bool,
+    /// Whether `log_streams.shipping_enabled` is on. OFF is the shipped default, and it is
+    /// the state the delivery attestation's `shipping` must report: a deployment that never
+    /// starts a shipper delivers nothing AND dead-letters nothing, so an attestation told
+    /// otherwise reports a complete audit trail for one that has exported none of it.
+    log_shipping: bool,
 }
 
 /// Write the config the booted binary loads, returning its path.
@@ -133,6 +138,11 @@ fn write_config(db: &TestDatabase, shape: BootShape) -> std::path::PathBuf {
     } else {
         String::new()
     };
+    let shipping = if shape.log_shipping {
+        "\n[log_streams]\nshipping_enabled = true\n"
+    } else {
+        ""
+    };
     std::fs::write(
         &path,
         format!(
@@ -141,7 +151,7 @@ fn write_config(db: &TestDatabase, shape: BootShape) -> std::path::PathBuf {
              bootstrap_operator_token = \"serve-retention-operator\"\n\
              [server]\nbind = \"127.0.0.1:0\"\nmanagement_bind = \"127.0.0.1:0\"\n\n\
              [outbox]\ncompleted_retention_secs = 3600\nreap_interval_secs = 1\n\n\
-             [audit_retention]\nenabled = true\n{retention}",
+             [audit_retention]\nenabled = true\n{retention}{shipping}",
             db.app_url(),
         ),
     )
@@ -313,6 +323,7 @@ async fn the_serve_boot_path_reaps_the_retired_row_keeps_the_pending_one_and_rep
             // asking "is the reaper running at all".
             log_level: "debug",
             audit_retention_dsn: false,
+            log_shipping: false,
         },
     );
 
@@ -371,6 +382,7 @@ async fn a_default_deployment_with_no_control_dsn_reaps_nothing_and_says_why() {
             // is deliberate and this test is what holds it there.
             log_level: "info",
             audit_retention_dsn: false,
+            log_shipping: false,
         },
     );
 
@@ -431,6 +443,7 @@ async fn a_deployment_with_the_flag_on_and_no_retention_dsn_tells_the_plane_it_e
             control_dsn: true,
             log_level: "info",
             audit_retention_dsn: false,
+            log_shipping: false,
         },
     );
 
@@ -466,6 +479,18 @@ async fn a_deployment_with_the_flag_on_and_no_retention_dsn_tells_the_plane_it_e
         "the plane was told the reaper runs on a deployment that never started one. Its \
          output:\n{log}"
     );
+    // AND THE SHIPPER VERDICT, which reaches the plane the same way and gates the delivery
+    // attestation's `gap`. `log_streams.shipping_enabled` is off here, which is the shipped
+    // default: the deployment delivers nothing and dead-letters nothing, and an attestation
+    // told otherwise reports a complete audit trail for it.
+    assert!(
+        log.contains("management plane told: the log shipper is NOT running"),
+        "the plane must be told no shipper runs. Its output:\n{log}"
+    );
+    assert!(
+        !log.contains("the log shipper IS running"),
+        "the plane was told both things about the shipper. Its output:\n{log}"
+    );
 }
 
 /// And a deployment whose reaper DOES start is told so.
@@ -487,6 +512,7 @@ async fn a_deployment_whose_reaper_starts_tells_the_plane_it_enforces() {
             control_dsn: true,
             log_level: "info",
             audit_retention_dsn: true,
+            log_shipping: true,
         },
     );
 
@@ -514,5 +540,17 @@ async fn a_deployment_whose_reaper_starts_tells_the_plane_it_enforces() {
     assert!(
         !log.contains("the audit reaper is NOT running"),
         "the plane was told both things. Its output:\n{log}"
+    );
+    // AND THE SHIPPER, armed in this shape. The pair with the leg above is what makes
+    // either mean anything: the handle's default is "not running", so a boot path that
+    // never stored the verdict would satisfy the negative leg on its own.
+    assert!(
+        log.contains("management plane told: the log shipper IS running"),
+        "the shipper started, so the plane must be told so, or the attestation reports a \
+         gap on every stream of a healthy deployment. Its output:\n{log}"
+    );
+    assert!(
+        !log.contains("the log shipper is NOT running"),
+        "the plane was told both things about the shipper. Its output:\n{log}"
     );
 }

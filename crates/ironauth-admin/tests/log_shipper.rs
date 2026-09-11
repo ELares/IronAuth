@@ -106,6 +106,38 @@ async fn seed_admin(db: &TestDatabase, env: &Env, scope: Scope, count: usize, pr
     }
 }
 
+/// Delete `count` clients, writing `client.delete` audit rows.
+///
+/// A SECOND action, so a stream filtered to `client.create` has rows in its range that it
+/// does not carry. Without them a replay that ignores the filter assembles exactly the
+/// same list as one that applies it.
+async fn seed_admin_deletes(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    count: usize,
+    prefix: &str,
+) {
+    for index in 0..count {
+        let acting = db
+            .store()
+            .scoped(scope)
+            .acting(db.test_actor(env), CorrelationId::generate(env));
+        let id = acting
+            .clients()
+            .create(env, &format!("{prefix}-{index}"))
+            .await
+            .expect("create a client to delete");
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(env), CorrelationId::generate(env))
+            .clients()
+            .delete(env, &id)
+            .await
+            .expect("delete the client");
+    }
+}
+
 async fn configure(
     db: &TestDatabase,
     env: &Env,
@@ -765,9 +797,9 @@ async fn a_replay_of_a_range_retention_deleted_abandons_the_batch_rather_than_re
     // this assertion the test passes against the old code, which cleared the row too.
     let lost = streams
         .log_streams()
-        .abandoned_dead_letters(&id)
+        .lost_batches(&id)
         .await
-        .expect("read abandoned");
+        .expect("read lost");
     assert_eq!(
         lost.len(),
         1,
@@ -775,9 +807,138 @@ async fn a_replay_of_a_range_retention_deleted_abandons_the_batch_rather_than_re
          successful replay"
     );
     assert!(
-        lost[0].event_count >= 2,
+        lost[0].lost_event_count >= 2,
         "the count of events nobody will ever receive is the number an auditor needs: \
          {lost:?}"
+    );
+}
+
+/// A range retention deleted only PART of records the shortfall (issue #145 criterion 3).
+///
+/// # Why the all-or-nothing case is the rarer one
+///
+/// An age-based retention cutoff lands INSIDE a dead-lettered range as soon as the stream
+/// has been broken for longer than the distance between the cutoff and the head of its
+/// backlog. The replay then assembles the survivors, ships them, and every test the row
+/// can apply says "successful replay" -- while the events retention took were never
+/// delivered and no longer exist to deliver.
+///
+/// The first version of this feature keyed permanent loss on `events.is_empty()` alone,
+/// so this case reported `permanently_lost_events: 0` and, with the stream healthy, no gap
+/// at all.
+#[tokio::test]
+async fn a_replay_of_a_partially_pruned_range_records_what_it_could_not_recover() {
+    use ironauth_admin::log_shipper::{DEAD_LETTER_AFTER, replay_dead_letters};
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    // A FILTERED STREAM, so the loss arithmetic is measured over the same population the
+    // shipping pass counted. `ship_stream` applies `accepts` before counting; the replay
+    // did not, so for any stream carrying a filter it assembled a SUPERSET and the
+    // shortfall came out as zero. A stream with no filter cannot distinguish the two.
+    let id = configure(
+        &db,
+        &env,
+        scope,
+        StreamSource::Both,
+        SinkType::Http,
+        Some(vec!["client.create".to_string()]),
+    )
+    .await;
+    seed_admin(&db, &env, scope, 3, "half-doomed").await;
+    // AND ROWS THE FILTER EXCLUDES, interleaved in the same range. Without them the
+    // superset and the filtered set are the same list.
+    seed_admin_deletes(&db, &env, scope, 3, "excluded").await;
+
+    let dead_sink = RecordingSink::new(SinkType::Http, false);
+    let failing: Vec<Arc<dyn LogSink>> = vec![dead_sink.clone()];
+    for _ in 0..DEAD_LETTER_AFTER {
+        ship_once(db.store(), &env, scope, &failing)
+            .await
+            .expect("ship");
+    }
+    let streams = db.store().scoped(scope);
+    let outstanding = streams
+        .log_streams()
+        .outstanding_dead_letters(&id)
+        .await
+        .expect("read");
+    assert_eq!(outstanding.len(), 1, "one batch is set aside");
+    let held = outstanding[0].event_count;
+    // SIX ADMITTED, THREE EXCLUDED. `seed_admin_deletes` creates each client before
+    // deleting it, so the range holds six `client.create` rows (three from each helper)
+    // and three `client.delete` rows. The filter admits only the creates, which is what
+    // makes the excluded three load-bearing: a replay ignoring the filter assembles nine.
+    assert_eq!(
+        held, 6,
+        "the batch holds the rows the FILTER admits and not the ones it excludes: {held}"
+    );
+
+    // RETENTION TAKES ONE ROW. Exactly one, and of a kind the filter ADMITS, so the count
+    // lost (1) differs from the count that survived (2): a test where they matched would
+    // pass against an implementation reporting the survivors as the loss.
+    let removed = sqlx::query(
+        "WITH doomed AS (
+             SELECT id FROM audit_log
+             WHERE tenant_id = $1 AND environment_id = $2 AND action = 'client.create'
+             ORDER BY occurred_at, id LIMIT 1
+         )
+         DELETE FROM audit_log WHERE id IN (SELECT id FROM doomed)",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("retention removes part of the range")
+    .rows_affected();
+    let removed = i64::try_from(removed).expect("a small count");
+    assert_eq!(removed, 1, "exactly one admitted row is gone");
+
+    let healthy = RecordingSink::new(SinkType::Http, true);
+    let working: Vec<Arc<dyn LogSink>> = vec![healthy.clone()];
+    let delivered = replay_dead_letters(db.store(), &env, scope, &id, &working)
+        .await
+        .expect("replay runs");
+
+    // THE SURVIVORS DO SHIP. Without this the test would pass against an implementation
+    // that refused the whole batch, which loses MORE than the defect it is here to catch.
+    assert!(
+        delivered > 0,
+        "what survived must still reach the sink: {delivered}"
+    );
+    assert!(
+        streams
+            .log_streams()
+            .outstanding_dead_letters(&id)
+            .await
+            .expect("read")
+            .is_empty(),
+        "the batch is resolved either way and must not block"
+    );
+
+    // AND THE SHORTFALL IS RECORDED. This is the assertion the old code fails: it marked
+    // the row a clean replay, so `lost_batches` returned nothing at all.
+    let lost = streams
+        .log_streams()
+        .lost_batches(&id)
+        .await
+        .expect("read lost");
+    assert_eq!(
+        lost.len(),
+        1,
+        "a partially pruned batch lost events and must be remembered as having lost them"
+    );
+    assert_eq!(
+        i64::from(lost[0].lost_event_count),
+        removed,
+        "the count must be what retention actually removed, not the size of the batch and \
+         not the number that survived"
+    );
+    assert!(
+        i64::from(lost[0].lost_event_count) < i64::from(held),
+        "a PARTIAL loss: reporting the whole batch would overstate it as badly as \
+         reporting none understates it"
     );
 }
 

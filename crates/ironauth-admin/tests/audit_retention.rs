@@ -59,6 +59,61 @@ async fn a_default_deployment_reports_that_it_enforces_nothing() {
     }
 }
 
+/// The control leg: a gap with nothing counted, which is the honest answer before anything
+/// has failed on a deployment whose shipper never started.
+async fn assert_control_leg(h: &Harness, path: &str) {
+    // THE CONTROL, AND IT IS NOT "no gap". Nothing has shipped, because the test harness
+    // runs no log shipper, and that is exactly the state this report used to get wrong:
+    // no delivery is attempted, so nothing is refused, so nothing is dead-lettered, and a
+    // report reading only the dead-letter table would answer an auditor that the whole
+    // trail arrived. The honest answer is a gap with nothing to count.
+    let (status, _, body) = h.get(path).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let view: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        view["gap"],
+        Value::Bool(true),
+        "a deployment that ships nothing must not report a complete trail: {body}"
+    );
+    assert_eq!(
+        view["shipping"],
+        Value::Bool(false),
+        "the harness starts no shipper, so the plane must say so: {body}"
+    );
+    assert_eq!(
+        view["undelivered_batches"], 0,
+        "nothing has been set aside yet, so the gap above is NOT a count: {body}"
+    );
+    assert_eq!(view["permanently_lost_batches"], 0, "{body}");
+    assert_eq!(
+        view["active"],
+        Value::Bool(true),
+        "the stream was just created: {body}"
+    );
+    assert!(
+        view["earliest_undelivered_at_unix_ms"].is_null(),
+        "nothing is set aside, so there is no earliest set-aside event: {body}"
+    );
+}
+
+/// Write three audited rows, so a refused batch holds more events than there are batches.
+///
+/// Three, not one, and that is load-bearing. A mutant reporting the BATCH count where the
+/// event count belongs survived this test when the refused batch happened to hold exactly
+/// one event, because 1 == 1.
+async fn seed_auditable_rows(h: &Harness, base: &str) {
+    for index in 0..3 {
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/organizations"),
+                &format!("org-{index}"),
+                &serde_json::json!({ "display_name": format!("Gap {index}") }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed audited row: {body}");
+    }
+}
+
 /// A sink that refuses every batch and remembers how big the last one was.
 ///
 /// The size is the point: it is what the attestation's event count is compared against, and
@@ -101,10 +156,17 @@ impl ironauth_admin::log_shipper::LogSink for RefusingSink {
 /// that refuses until the shipper gives up on the batch, and the attestation is read before
 /// and after that happens.
 ///
-/// # Why the control leg comes first
+/// # Why the control leg comes first, and why it is not `gap: false`
 ///
-/// `gap: false` on a healthy stream is the assertion that the flag MEANS something. Without
-/// it a handler hard-coding `gap: true` would pass the interesting half of this test.
+/// The obvious control would be a healthy stream reporting no gap, and no test server can
+/// produce one: the harness builds its `AdminState` directly and never runs the boot path,
+/// so `shipping` is false for every one of them and a gap is the honest answer before
+/// anything has failed. That is the defect this route was rebuilt around rather than an
+/// inconvenience, so the control asserts it: a gap with `undelivered_batches: 0`, which a
+/// handler reading only the dead-letter table could not produce.
+///
+/// The `gap: false` side is covered where it is reachable, in the unit tests on
+/// `attestation_view`, which drive each disjunct independently.
 #[tokio::test]
 async fn an_induced_delivery_failure_is_flagged_counted_and_dated() {
     use ironauth_admin::log_shipper::{DEAD_LETTER_AFTER, ship_once};
@@ -136,55 +198,9 @@ async fn an_induced_delivery_failure_is_flagged_counted_and_dated() {
         .to_owned();
     let path = format!("{base}/log-streams/{stream}/attestation");
 
-    // THE CONTROL, AND IT IS NOT "no gap". Nothing has shipped, because the test harness
-    // runs no log shipper, and that is exactly the state this report used to get wrong:
-    // no delivery is attempted, so nothing is refused, so nothing is dead-lettered, and a
-    // report reading only the dead-letter table would answer an auditor that the whole
-    // trail arrived. The honest answer is a gap with nothing to count.
-    let (status, _, body) = h.get(&path).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let view: Value = serde_json::from_str(&body).expect("json");
-    assert_eq!(
-        view["gap"],
-        Value::Bool(true),
-        "a deployment that ships nothing must not report a complete trail: {body}"
-    );
-    assert_eq!(
-        view["shipping"],
-        Value::Bool(false),
-        "the harness starts no shipper, so the plane must say so: {body}"
-    );
-    assert_eq!(
-        view["undelivered_batches"], 0,
-        "nothing has been set aside yet, so the gap above is NOT a count: {body}"
-    );
-    assert_eq!(view["permanently_lost_batches"], 0, "{body}");
-    assert_eq!(
-        view["active"],
-        Value::Bool(true),
-        "the stream was just created: {body}"
-    );
-    assert!(
-        view["earliest_undelivered_at_unix_ms"].is_null(),
-        "nothing is set aside, so there is no earliest set-aside event: {body}"
-    );
+    assert_control_leg(&h, &path).await;
 
-    // MORE THAN ONE AUDITABLE ROW, written AFTER the stream so they fall on its cursor.
-    //
-    // Three, not one, and that is load-bearing. A mutant reporting `outstanding.len()` as
-    // the event count -- batches where events are meant -- survived this test when the
-    // refused batch happened to hold exactly one event, because 1 == 1. The counts have to
-    // differ for the assertion below to distinguish them.
-    for index in 0..3 {
-        let (status, _, body) = h
-            .post(
-                &format!("{base}/organizations"),
-                &format!("org-{index}"),
-                &serde_json::json!({ "display_name": format!("Gap {index}") }).to_string(),
-            )
-            .await;
-        assert_eq!(status, StatusCode::CREATED, "seed audited row: {body}");
-    }
+    seed_auditable_rows(&h, &base).await;
 
     // INDUCE THE GAP. The sink refuses until the shipper sets the batch aside.
     let sink = std::sync::Arc::new(RefusingSink {

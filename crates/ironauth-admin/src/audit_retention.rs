@@ -134,31 +134,57 @@ pub async fn read_audit_retention(
 /// arrived, so a report reading only that table would answer an auditor "no gap" for a
 /// deployment exporting nothing. The counts below are exact for what was dead-lettered;
 /// `gap` additionally covers the states where there is nothing to count.
+///
+/// # What it still cannot see
+///
+/// Every signal here is per stream or per process. A pass that dies BEFORE the per-stream
+/// loop -- `list_active` itself erroring, say -- records nothing against any stream, so
+/// every disjunct stays clear while no stream advances. Narrowing that needs a per-pass
+/// health row, which the shipper does not write. The states this does cover are the
+/// standing ones an auditor is asking about; the uncovered one is a process failing
+/// loudly in its own logs.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DeliveryAttestationView {
     /// The stream this attests to.
     pub stream_id: String,
     /// Whether anything is known to be undelivered, by any of the routes above.
     pub gap: bool,
-    /// Whether this deployment's shipper is running. When false NOTHING is being
-    /// delivered, whatever the counts say.
+    /// Whether the shipper was running in THIS PROCESS when it booted. When false nothing
+    /// is being delivered for this stream, whatever the counts say.
+    ///
+    /// A snapshot and a per-process one, with the same two bounds as `enforced` on the
+    /// retention report. The boot path speaks once, so a shipper that starts and later
+    /// dies is not reported here; and in a split deployment where the management API and
+    /// the workers run as separate processes, this is the answer for the process serving
+    /// the request. Both would need a health signal each pass writes, which the shipper
+    /// does not have. What the snapshot does close is the state it was added for, a
+    /// deployment that never starts a shipper at all, which is the shipped default and is
+    /// permanent rather than drifting.
     pub shipping: bool,
     /// Whether the stream itself is active. A deactivated stream delivers nothing.
     pub active: bool,
     /// Delivery failures since the last success. Non-zero means a batch is being retried
     /// and the cursor has not moved past it.
     pub consecutive_failures: i32,
-    /// When this stream last delivered anything, in epoch milliseconds, or absent when it
-    /// never has.
+    /// When this stream last completed a pass WITHOUT a delivery failure, in epoch
+    /// milliseconds, or absent when it never has.
+    ///
+    /// Not "last delivered": `record_success` is also called for a pass whose window was
+    /// entirely filtered out, and on the pass that sets a batch aside. Both advance the
+    /// cursor without anything reaching the sink. It is a liveness signal for the pass,
+    /// and the counts beside it are the delivery signal.
     pub last_success_at_unix_ms: Option<i64>,
     /// How many batches were set aside after refusal and are still awaiting replay.
     pub undelivered_batches: u32,
     /// How many audit events those batches hold.
     pub undelivered_events: u64,
-    /// How many set-aside batches can NEVER be delivered, because audit retention removed
-    /// their range before the replay reached it.
+    /// How many set-aside batches lost events to audit retention before a replay could
+    /// reach them. A batch counts here whether retention took the WHOLE range (nothing was
+    /// delivered) or only part of it (the survivors were).
     pub permanently_lost_batches: u32,
-    /// How many audit events are permanently lost.
+    /// How many audit events are permanently lost: removed from the audit log without ever
+    /// reaching the sink. Not the size of the batches above, which may have delivered some
+    /// of what they held.
     pub permanently_lost_events: u64,
     /// When the earliest undelivered or lost RANGE begins, in epoch milliseconds, or
     /// absent when there is neither.
@@ -175,13 +201,30 @@ pub struct DeliveryAttestationView {
     pub last_error: Option<String>,
 }
 
-/// Sum a batch list into (batches, events, earliest occurrence).
+/// Sum the OUTSTANDING batches into (batches, events, earliest occurrence).
 fn batch_totals(batches: &[ironauth_store::log_stream::DeadLetter]) -> (u32, u64, Option<i64>) {
     (
         u32::try_from(batches.len()).unwrap_or(u32::MAX),
         batches
             .iter()
             .map(|batch| u64::from(batch.event_count.unsigned_abs()))
+            .sum(),
+        batches.iter().map(|batch| batch.from.0).min(),
+    )
+}
+
+/// Sum the LOST batches the same way.
+///
+/// A separate function over a separate type rather than a generic one, because the field
+/// each sums means something different: a dead letter's `event_count` is how many events
+/// the failed pass held, and a lost batch's `lost_event_count` is how many of them nobody
+/// will ever receive. They are equal only when the whole range was deleted.
+fn lost_totals(batches: &[ironauth_store::log_stream::LostBatch]) -> (u32, u64, Option<i64>) {
+    (
+        u32::try_from(batches.len()).unwrap_or(u32::MAX),
+        batches
+            .iter()
+            .map(|batch| u64::from(batch.lost_event_count.unsigned_abs()))
             .sum(),
         batches.iter().map(|batch| batch.from.0).min(),
     )
@@ -229,10 +272,7 @@ pub async fn read_log_stream_attestation(
         .outstanding_dead_letters(&stream_id)
         .await
         .map_err(map_error)?;
-    let lost = streams
-        .abandoned_dead_letters(&stream_id)
-        .await
-        .map_err(map_error)?;
+    let lost = streams.lost_batches(&stream_id).await.map_err(map_error)?;
 
     let view = attestation_view(
         stream_id,
@@ -255,11 +295,11 @@ fn attestation_view(
     stream_id: String,
     record: &ironauth_store::log_stream::LogStreamRecord,
     outstanding: &[ironauth_store::log_stream::DeadLetter],
-    lost: &[ironauth_store::log_stream::DeadLetter],
+    lost: &[ironauth_store::log_stream::LostBatch],
     shipping: bool,
 ) -> DeliveryAttestationView {
     let (undelivered_batches, undelivered_events, earliest_outstanding) = batch_totals(outstanding);
-    let (permanently_lost_batches, permanently_lost_events, earliest_lost) = batch_totals(lost);
+    let (permanently_lost_batches, permanently_lost_events, earliest_lost) = lost_totals(lost);
     let failures = record.health.consecutive_failures;
     // EVERY ROUTE, not just the counted one. Each disjunct is a state in which events this
     // stream is meant to carry are not reaching the sink, and only the first two of them
@@ -302,8 +342,8 @@ fn attestation_view(
         last_error: record.health.last_error.clone().or_else(|| {
             outstanding
                 .last()
-                .or_else(|| lost.last())
                 .map(|batch| batch.last_error.clone())
+                .or_else(|| lost.last().map(|batch| batch.last_error.clone()))
         }),
     }
 }
@@ -551,6 +591,15 @@ mod tests {
         }
     }
 
+    fn lost(id: &str, from_micros: i64, lost_events: i32) -> ironauth_store::log_stream::LostBatch {
+        ironauth_store::log_stream::LostBatch {
+            id: id.to_owned(),
+            from: (from_micros, format!("aud_{id}_from")),
+            lost_event_count: lost_events,
+            last_error: format!("{id} refused"),
+        }
+    }
+
     fn batch(id: &str, from_micros: i64, events: i32) -> DeadLetter {
         DeadLetter {
             id: id.to_owned(),
@@ -680,7 +729,7 @@ mod tests {
         // distinguishable from `max` and from the batch count, and `min` from `first` and
         // from `max`. One of each would satisfy all of them at once.
         let outstanding = [batch("a", 50_000_000, 7), batch("b", 30_000_000, 5)];
-        let lost = [batch("c", 20_000_000, 2), batch("d", 40_000_000, 3)];
+        let lost = [lost("c", 20_000_000, 2), lost("d", 40_000_000, 3)];
         let view = attestation_view("lsm_1".to_owned(), &healthy(), &outstanding, &lost, true);
 
         assert_eq!(view.undelivered_batches, 2);
@@ -727,14 +776,41 @@ mod tests {
     }
 
     #[test]
+    fn an_outstanding_batch_alone_is_still_a_gap() {
+        // EACH DISJUNCT ALONE, because a test exercising two at once cannot tell which one
+        // carries it. Dropping `!outstanding.is_empty()` from the expression survived every
+        // other test in this module: the only case with outstanding batches also had lost
+        // ones, so `!lost.is_empty()` kept the answer right for the wrong reason.
+        //
+        // This is the ordinary case as well: a healthy, active stream on a shipping
+        // deployment whose sink refused one batch hard enough to set it aside.
+        let outstanding = [batch("a", 10_000_000, 3)];
+        let view = attestation_view("lsm_1".to_owned(), &healthy(), &outstanding, &[], true);
+        assert!(view.gap, "a batch is set aside and undelivered");
+        assert!(
+            view.shipping && view.active && view.consecutive_failures == 0,
+            "every OTHER route to a gap is clear, so the flag can only come from the \
+             outstanding batch"
+        );
+        assert_eq!(view.undelivered_batches, 1);
+        assert_eq!(view.undelivered_events, 3);
+        assert_eq!(view.permanently_lost_batches, 0);
+    }
+
+    #[test]
     fn a_permanently_lost_batch_alone_is_still_a_gap() {
         // A stream whose outstanding queue is EMPTY because every set-aside batch was
         // abandoned has delivered none of them, and `outstanding_dead_letters` excludes
         // abandoned rows precisely so they stop blocking. Reading only that list would
         // report the permanently lost events as no gap at all.
-        let lost = [batch("c", 20_000_000, 4)];
+        let lost = [lost("c", 20_000_000, 4)];
         let view = attestation_view("lsm_1".to_owned(), &healthy(), &[], &lost, true);
         assert!(view.gap, "these events can never be delivered");
+        assert!(
+            view.shipping && view.active && view.consecutive_failures == 0,
+            "every other route to a gap is clear, so the flag can only come from the lost \
+             batch"
+        );
         assert_eq!(view.undelivered_batches, 0);
         assert_eq!(view.permanently_lost_events, 4);
         assert_eq!(view.earliest_undelivered_at_unix_ms, Some(20_000));

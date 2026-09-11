@@ -47455,19 +47455,26 @@ impl LogStreamRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError`] on a persistence fault.
-    pub async fn mark_replayed(&self, env: &Env, id: &str) -> Result<(), StoreError> {
+    pub async fn mark_replayed(
+        &self,
+        env: &Env,
+        id: &str,
+        lost_event_count: i32,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         let now = epoch_micros(env.clock().now_utc());
         let mut tx = begin_scoped(self.store, scope).await?;
         sqlx::query(
             "UPDATE log_stream_dead_letters SET replayed_at = \
-                 (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+                 (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval), \
+                 lost_event_count = $5 \
              WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
         )
         .bind(scope.tenant().to_string())
         .bind(scope.environment().to_string())
         .bind(id)
         .bind(now)
+        .bind(lost_event_count)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -47494,9 +47501,13 @@ impl LogStreamRepo<'_> {
         let scope = self.scope;
         let now = epoch_micros(env.clock().now_utc());
         let mut tx = begin_scoped(self.store, scope).await?;
+        // `lost_event_count = event_count` is what abandonment MEANS, and the column is set
+        // from the row rather than from a caller's arithmetic so the two cannot drift. A
+        // CHECK in 0224 refuses the pair any other way.
         sqlx::query(
             "UPDATE log_stream_dead_letters SET abandoned_at = \
-                 (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+                 (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval), \
+                 lost_event_count = event_count \
              WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
         )
         .bind(scope.tenant().to_string())
@@ -47509,28 +47520,35 @@ impl LogStreamRepo<'_> {
         Ok(())
     }
 
-    /// The batches that can never be delivered, for the attestation.
+    /// The batches that lost events no replay can recover, for the attestation.
+    ///
+    /// # Why this keys on the COUNT and not on `abandoned_at`
+    ///
+    /// A batch retention deleted ENTIRELY is abandoned. A batch it deleted only part of is
+    /// a successful replay carrying a nonzero loss, and that is the common shape: an
+    /// age-based cutoff lands inside a dead-lettered range as soon as the stream has been
+    /// broken longer than the distance between the cutoff and the head of its backlog.
+    /// Selecting on `abandoned_at` would report the rarer case and miss the frequent one.
     ///
     /// # Errors
     ///
     /// [`StoreError`] on a persistence fault, and [`StoreError::NotFound`] when no such
     /// stream exists in this scope.
-    pub async fn abandoned_dead_letters(
+    pub async fn lost_batches(
         &self,
         stream_id: &str,
-    ) -> Result<Vec<crate::log_stream::DeadLetter>, StoreError> {
+    ) -> Result<Vec<crate::log_stream::LostBatch>, StoreError> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
         if !stream_exists_in_tx(&mut tx, scope, stream_id).await? {
             return Err(StoreError::NotFound);
         }
         let rows = sqlx::query(
-            "SELECT id, event_count, last_error, from_audit_id, to_audit_id, \
-                    (EXTRACT(EPOCH FROM from_occurred_at) * 1000000)::bigint AS from_micros, \
-                    (EXTRACT(EPOCH FROM to_occurred_at) * 1000000)::bigint AS to_micros \
+            "SELECT id, lost_event_count, last_error, from_audit_id, \
+                    (EXTRACT(EPOCH FROM from_occurred_at) * 1000000)::bigint AS from_micros \
              FROM log_stream_dead_letters \
              WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3 \
-               AND abandoned_at IS NOT NULL \
+               AND lost_event_count > 0 \
              ORDER BY dead_lettered_at, id",
         )
         .bind(scope.tenant().to_string())
@@ -47541,11 +47559,10 @@ impl LogStreamRepo<'_> {
         tx.commit().await?;
         Ok(rows
             .into_iter()
-            .map(|row| crate::log_stream::DeadLetter {
+            .map(|row| crate::log_stream::LostBatch {
                 id: row.get("id"),
                 from: (row.get("from_micros"), row.get("from_audit_id")),
-                to: (row.get("to_micros"), row.get("to_audit_id")),
-                event_count: row.get("event_count"),
+                lost_event_count: row.get("lost_event_count"),
                 last_error: row.get("last_error"),
             })
             .collect())

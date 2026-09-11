@@ -3176,7 +3176,7 @@ async fn the_listing_is_fenced_and_its_bound_is_real() {
     h.control_store()
         .scoped(scope)
         .log_streams()
-        .mark_replayed(&env, &outstanding[0].id)
+        .mark_replayed(&env, &outstanding[0].id, 0)
         .await
         .expect("retire one");
 
