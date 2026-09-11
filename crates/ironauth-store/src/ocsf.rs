@@ -217,6 +217,11 @@ const ACCOUNT_CHANGE_DOMAINS: &[&str] = &[
 
 /// The leading segments whose actions change WHO MAY DO WHAT (3005).
 const ACCESS_MANAGEMENT_DOMAINS: &[&str] = &[
+    // Exporting an access review (issue #145) is a bulk READ of who holds which role, and it
+    // is filed here rather than under entity management because the subject of the event is
+    // the entitlement data itself: an auditor asking "who looked at our access model" is
+    // asking a user-access-management question.
+    "access_review",
     "api_key",
     "ban",
     "client_admin_grant",

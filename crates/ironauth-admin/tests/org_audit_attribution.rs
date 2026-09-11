@@ -102,6 +102,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "createOrganizationContact",
     "createPortalLink",
     "createProjectGrant",
+    "exportOrganizationAccessReview",
     "createSamlConnection",
     "createScimConnection",
     "createScimPushConnection",
@@ -168,6 +169,14 @@ const ORG_ATTRIBUTED: &[&str] = &[
 ///
 /// It may still only rise THROUGH THIS CONSTANT, so a newly added organization-scoped write
 /// that forgets `.in_organization(..)` fails here exactly as before.
+/// Reads that WRITE an audit row, and therefore have an organization to attribute.
+///
+/// A GET is excluded from the denominator below because reads do not audit. These do: a bulk
+/// read of sensitive material is observable by rule (the identity export sets it, #145's
+/// access review follows it), and an audited read's row needs `audit_log.organization_id`
+/// for the same reason a write's does -- a per-organization stream selects on it.
+const AUDITED_READS: &[&str] = &["exportOrganizationAccessReview"];
+
 const UNATTRIBUTED_CEILING: usize = 1;
 
 /// Where each attributed operation's handler lives, so the claim can be CHECKED.
@@ -311,6 +320,10 @@ const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
         include_str!("../src/project_grants.rs"),
     ),
     (
+        "exportOrganizationAccessReview",
+        include_str!("../src/access_review.rs"),
+    ),
+    (
         "createSamlConnection",
         include_str!("../src/saml_connections.rs"),
     ),
@@ -358,11 +371,25 @@ fn org_scoped_operations() -> BTreeSet<String> {
         }
         let operations = item.as_object().expect("a path item is an object");
         for (method, operation) in operations {
-            // WRITES only. A read writes no audit row, so it has nothing to attribute and
-            // counting it inflates the gap with operations that can never close it. The
-            // first version of this counter included reads, which made a ceiling of zero
-            // unreachable and the number meaningless as a measure of progress.
-            if method.eq_ignore_ascii_case("get") {
+            // WRITES, PLUS THE READS THAT AUDIT. A read normally writes no audit row, so it
+            // has nothing to attribute and counting it inflates the gap with operations that
+            // can never close it -- the first version of this counter included every read,
+            // which made a ceiling of zero unreachable.
+            //
+            // "A read writes no audit row" stopped being true when #145 landed an audited
+            // export, and the exclusion would have hidden it: a GET that writes an audit row
+            // needs `.in_organization(..)` exactly as a write does, and nothing else in the
+            // tree pins that call. `AUDITED_READS` is the exception list, so such an
+            // operation enters the denominator and must appear in `ORG_ATTRIBUTED` with a
+            // source to check it against.
+            if method.eq_ignore_ascii_case("get")
+                && !AUDITED_READS.contains(
+                    &operation
+                        .get("operationId")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or_default(),
+                )
+            {
                 continue;
             }
             if let Some(id) = operation.get("operationId").and_then(|id| id.as_str()) {

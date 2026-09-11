@@ -2943,6 +2943,11 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             }),
         ),
         Case::empty(
+            "access_review.exportOrganizationAccessReview",
+            "GET",
+            format!("{org_base}/access-review"),
+        ),
+        Case::empty(
             "project_grants.withdrawProjectGrant",
             "DELETE",
             format!("{org_base}/project-grants/{project_grant}"),

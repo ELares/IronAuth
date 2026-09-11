@@ -708,6 +708,13 @@ func (c *Client) ExportIdentities(tenant_id string, environment_id string, query
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/export", query, nil)
 }
 
+// ExportOrganizationAccessReview performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-review.
+//
+// exportOrganizationAccessReview.
+func (c *Client) ExportOrganizationAccessReview(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/access-review", query, nil)
+}
+
 // ExportUsage performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/usage.
 //
 // Export a tenant's usage (issue #107).

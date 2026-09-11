@@ -1381,6 +1381,7 @@ impl Fixture {
             ..
         } = self;
         vec![
+            access_review_export_case(base, membership),
             Case {
                 label: "org_contacts.listOrganizationContacts",
                 method: "GET",
@@ -2061,7 +2062,14 @@ fn documented_write_exceptions() -> BTreeMap<&'static str, StatusCode> {
 /// these at zero and fails here.
 fn documented_write_row_effects() -> BTreeMap<String, i64> {
     BTreeMap::from([
-        ("audit_log".to_owned(), 1),
+        // TWO, not one. The revoke below is one; the other is the access-review export
+        // (issue #145), a READ that writes an audit row. This sweep requires
+        // organization-addressed reads to keep answering at a soft-deleted environment, and
+        // a bulk read of who-can-do-what has to stay OBSERVABLE wherever it answers -- an
+        // export an operator can take out of a decommissioned environment without a trace is
+        // the case the trail is most for. It writes no outbox row: the audit action is not
+        // an announced domain event.
+        ("audit_log".to_owned(), 2),
         ("outbox_messages".to_owned(), 1),
     ])
 }
@@ -2429,6 +2437,24 @@ fn saml_connection_body() -> String {
         "public_base_url": "https://auth.example",
     })
     .to_string()
+}
+
+/// The access-review export, as a sweep case.
+///
+/// A READ that writes one audit row. Reads keep answering at a soft-deleted environment, and
+/// the row it moves is recorded in [`documented_write_row_effects`]. Split out so its caller
+/// stays inside the line bound.
+fn access_review_export_case(base: &str, membership: &str) -> Case {
+    Case {
+        label: "access_review.exportOrganizationAccessReview",
+        method: "GET",
+        path: format!("{base}/access-review"),
+        body: None,
+        // The export names every member, so the seeded membership is the needle: an empty
+        // export satisfies a bare 200 and proves nothing about the rows.
+        intent: Intent::Read(vec![membership.to_owned()]),
+        live: StatusCode::OK,
+    }
 }
 
 fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
@@ -2979,7 +3005,7 @@ async fn a_soft_deleted_environments_organization_content_is_still_readable() {
 #[test]
 fn the_case_counts_are_pinned_where_they_can_be_measured() {
     const WRITES: usize = 46;
-    const READS: usize = 21;
+    const READS: usize = 22;
 
     let cases = replay_fixture_cases();
     let writes = cases
