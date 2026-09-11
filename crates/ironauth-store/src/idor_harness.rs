@@ -66,6 +66,54 @@
 //! scope into the row rather than filtering on it and so have no predicate to fence.
 //! `ironauth-store/tests/scim_connections.rs` covers the remaining SCIM operations the same
 //! way. Nothing is registered here for SCIM, and this section is why rather than an omission.
+//!
+//! THE PORTAL'S ORGANIZATION AXIS IS UNREGISTERABLE, and #140 criterion 3 asks for the portal
+//! by name ("IDOR harness extended to portal APIs"), so this says which half went where.
+//!
+//! A probe varies the TENANT and the ENVIRONMENT, because [`Scope`] carries nothing else and
+//! [`IsolationProbe::probe`] takes no other axis. The portal HAS that boundary and it is the
+//! first fence a request meets -- `portal_route`'s own header lists them as scope, then
+//! organization, then intent, `PortalLinkId::parse_in_scope` refuses a foreign link before
+//! redemption, and `PortalSessionRepo::authenticate` carries the `(tenant_id, environment_id)`
+//! predicate in SQL. Two tests in `ironauth-oidc/tests/portal_route.rs` measure it:
+//! `one_environments_link_cannot_be_redeemed_in_another` and
+//! `a_session_cookie_from_another_environment_is_inert`. So a portal probe registered here
+//! would exercise a REAL fence. It is simply not the fence criterion 3 is about.
+//!
+//! What cannot be expressed is the ORGANIZATION axis, which is the one that criterion asks
+//! for: a portal session and the organization it must not touch sit in ONE tenant and ONE
+//! environment and differ only by organization, and there is no argument on the trait that
+//! varies. A probe registered for the organization boundary would hold it fixed, pass, and
+//! report coverage of the thing it never varied.
+//!
+//! The surfaces are driven directly instead, over HTTP with a real session cookie, in
+//! `ironauth-oidc/tests/portal_route.rs`. Every panel that lists organization state has a read
+//! test that seeds a neighbouring organization and asserts both that the neighbour is absent
+//! AND that the caller's own row is present, the second because an empty page satisfies the
+//! first. The two routes that mutate an organization's configuration, the contact change and
+//! the certificate pin, have the same pair. Each was measured by removing the organization
+//! predicate it guards and confirming it turns red.
+//!
+//! AND THE INVENTORY IS REGISTERED rather than only written here, which is the part this
+//! module would otherwise have given up by not registering the portal. Line 38 above promises
+//! "the harness then covers that operation in CI automatically", and a paragraph of prose is
+//! not that. `ironauth-oidc/tests/portal_confinement_surface.rs` holds a written mapping from
+//! each panel to the test that fences it, and fails when a panel reading
+//! `session.organization()` has no row, when a named test stops existing, or when it can no
+//! longer read the dispatch it is scanning.
+//!
+//! It does NOT infer which tests are isolation tests, and the first version's attempt to is
+//! why. That version called a panel covered when some test seeded two organizations and
+//! mentioned it, and a review showed two panels passing on tests with no isolation content at
+//! all -- one seeding a single organization in each of two DEPLOYMENTS. A person names the
+//! test; this checks the naming is complete and still true. What it cannot see, it says.
+//!
+//! CONTACT REMOVAL NEEDED BOTH OF ITS PREDICATES REMOVED, and the exception is worth stating
+//! because the obvious reading of the sentence above is wrong for it. `remove_with_event`
+//! probes for the live row and then updates it, and each statement carries `organization_id`,
+//! so taking it off one leaves the other refusing and the test still passes. That is a doubled
+//! fence, not a vacuous test, and the test says so at its head so that a reader measuring one
+//! site at a time does not conclude the opposite.
 
 use std::future::Future;
 use std::pin::Pin;
