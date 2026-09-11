@@ -715,10 +715,16 @@ mod tests {
             Reach::OnePlaneOrNoState,
             "consumed once at boot to build the audit retention sweeper (issue #109), a \
              background task that owns its own two connections and answers no request. \
-             Neither plane state holds it: it deliberately runs on the retention role, \
-             which is the one role granted DELETE on the audit tables and granted INSERT \
-             on nothing, so handing it to a plane would widen exactly the credential \
-             migration 0136 exists to keep narrow.",
+             No plane state holds THIS STRUCT: it carries `database_url`, and the \
+             retention role that DSN names is the one role granted DELETE on the audit \
+             tables and granted INSERT on nothing, so handing the section to a plane \
+             would widen exactly the credential migration 0136 exists to keep narrow. \
+             The management plane does hold a DSN-FREE reduction of it \
+             (`ironauth_admin::audit_retention::AuditRetentionPolicy`: the two windows, \
+             the interval, and whether the sweeper started), because issue #145 criterion \
+             3 publishes the policy over the management API so a customer can answer an \
+             auditor. The reduction is the point: the report needs the numbers and the \
+             credential is not one of them.",
         ),
         (
             "dev_mode",

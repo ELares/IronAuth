@@ -92,6 +92,7 @@ pub mod log_stream_signature;
 
 mod access_review;
 mod agents;
+mod audit_retention;
 pub mod certificate_expiry;
 pub mod certificate_notices;
 pub mod certificate_pin_requests;
@@ -179,6 +180,7 @@ use axum::middleware::from_fn;
 use axum::response::Response;
 use axum::routing::{delete, get, post, put};
 
+pub use audit_retention::AuditRetentionPolicy;
 pub use auth::{ManagementGrants, ManagementPermission, ManagementPersona, Principal};
 pub use backfill::{BackfillError, BackfillReport, backfill_signing_algorithms};
 pub use error::{ApiError, ErrorBody};
@@ -787,6 +789,16 @@ pub fn management_router(state: AdminState) -> Router {
         // The ordered event feed (issue #107): the cursor-paginated READ surface over the
         // log, recommended over webhooks for data synchronisation. An aged-out cursor is a
         // 410 carrying the oldest cursor that still resolves, never an empty 200.
+        // What this deployment keeps, and for how long (issue #145 criterion 3). A customer
+        // answering an auditor should not have to email their vendor for it.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/audit-retention",
+            get(audit_retention::read_audit_retention),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/attestation",
+            get(audit_retention::read_log_stream_attestation),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/events",
             get(event_feed::read_event_feed),

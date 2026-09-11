@@ -1604,11 +1604,25 @@ func (c *Client) PurgeTenant(tenant_id string, query url.Values) (*http.Response
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/purge", query, nil)
 }
 
+// ReadAuditRetention performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/audit-retention.
+//
+// readAuditRetention.
+func (c *Client) ReadAuditRetention(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/audit-retention", query, nil)
+}
+
 // ReadEventFeed performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/events.
 //
 // Read the ordered event feed (issue #107).
 func (c *Client) ReadEventFeed(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/events", query, nil)
+}
+
+// ReadLogStreamAttestation performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/attestation.
+//
+// readLogStreamAttestation.
+func (c *Client) ReadLogStreamAttestation(tenant_id string, environment_id string, stream_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/log-streams/" + escape(stream_id) + "/attestation", query, nil)
 }
 
 // RegisterAgent performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents.

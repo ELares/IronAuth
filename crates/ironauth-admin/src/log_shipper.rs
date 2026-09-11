@@ -179,6 +179,60 @@ pub async fn ship_once(
     Ok(shipped)
 }
 
+/// Re-read one dead letter's range out of the audit log, as the failed pass saw it.
+///
+/// # Why the filter is applied here and not only when shipping
+///
+/// `event_count` was recorded AFTER `class_for_wire` and `accepts` in `ship_stream`. This
+/// walk used to apply neither, so it assembled a SUPERSET of what was set aside: the sink
+/// was handed events the stream is configured never to receive, and comparing this list's
+/// length against the recorded count -- which is how the shortfall is measured -- compared
+/// two different populations and undercounted the loss or missed it entirely.
+async fn reassemble(
+    scoped: &ironauth_store::ScopedStore<'_>,
+    stream: &LogStreamRecord,
+    dead: &ironauth_store::log_stream::DeadLetter,
+    scope: Scope,
+) -> Result<Vec<Value>, StoreError> {
+    let chain = scoped.audit_chain();
+    // Read from just BEFORE the range start, since `rows_after` is exclusive and the
+    // recorded range is inclusive at both ends.
+    let cursor = predecessor_of(&dead.from);
+    let mut events = Vec::new();
+    for audit_stream in ["admin_action", "authentication"] {
+        if !stream.source.carries(audit_stream) {
+            continue;
+        }
+        for row in chain
+            .rows_after(
+                audit_stream,
+                Some((cursor.0, cursor.1.as_str())),
+                // Synthetic: `predecessor_of` names no row, and the range this walks is one
+                // the dead letter already recorded. A retention gap is not a question this
+                // position can answer.
+                CursorOrigin::BoundedRange,
+                SHIP_BATCH,
+                stream.organization_id.as_deref(),
+            )
+            .await?
+        {
+            if (row.occurred_micros, row.audit_id.as_str()) > (dead.to.0, dead.to.1.as_str()) {
+                break;
+            }
+            let Some(class) = ocsf::class_for_wire(&row.action).map(|c| c.stream().as_str()) else {
+                continue;
+            };
+            if !stream.accepts(class, &row.action) {
+                continue;
+            }
+            if let Some(event) = render(&row, scope) {
+                events.push(event);
+            }
+        }
+    }
+    Ok(events)
+}
+
 /// Re-ship every outstanding dead letter for `stream_id`, marking each replayed only when
 /// the sink accepts it.
 ///
@@ -227,40 +281,34 @@ pub async fn replay_dead_letters(
         .outstanding_dead_letters(stream_id)
         .await?
     {
-        let chain = scoped.audit_chain();
-        // Read from just BEFORE the range start, since `rows_after` is exclusive and the
-        // recorded range is inclusive at both ends.
-        let cursor = predecessor_of(&dead.from);
-        let mut events = Vec::new();
-        for audit_stream in ["admin_action", "authentication"] {
-            if !stream.source.carries(audit_stream) {
-                continue;
-            }
-            for row in chain
-                .rows_after(
-                    audit_stream,
-                    Some((cursor.0, cursor.1.as_str())),
-                    // Synthetic: `predecessor_of` names no row, and the range this walks is
-                    // one the dead letter already recorded. A retention gap is not a
-                    // question this position can answer.
-                    CursorOrigin::BoundedRange,
-                    SHIP_BATCH,
-                    stream.organization_id.as_deref(),
-                )
-                .await?
-            {
-                if (row.occurred_micros, row.audit_id.as_str()) > (dead.to.0, dead.to.1.as_str()) {
-                    break;
-                }
-                if let Some(event) = render(&row, scope) {
-                    events.push(event);
-                }
-            }
-        }
+        let events = reassemble(&scoped, &stream, &dead, scope).await?;
+        // HOW MUCH OF THE BATCH SURVIVED, measured against what the failed pass held.
+        //
+        // The filter above makes this comparison sound: both populations are "rows in this
+        // range this stream carries", so a shortfall can only be rows that are no longer
+        // in `audit_log`, which means audit retention removed them. Saturating because a
+        // longer list is not a loss: a NEWER build could classify a row this one skipped
+        // when the batch was set aside.
+        let recorded = usize::try_from(dead.event_count).unwrap_or(0);
+        let lost = i32::try_from(recorded.saturating_sub(events.len())).unwrap_or(i32::MAX);
         if events.is_empty() {
-            // Nothing left to send: retention removed the range. Mark it replayed rather
-            // than leaving an entry that can never clear.
-            scoped.log_streams().mark_replayed(env, &dead.id).await?;
+            // Nothing left to send: audit retention removed the whole range, so these
+            // events were never delivered and now cannot be. ABANDONED, not replayed.
+            //
+            // "Retention removed them" is an inference from an empty assembly, and with
+            // the filter above applied it is sound for every case but one: an operator who
+            // NARROWS `event_type_filter` between the dead letter and the replay makes the
+            // surviving rows inadmissible, and this reads that as deletion. The direction
+            // is the safe one -- it reports a gap where the events still exist in the
+            // audit log rather than silence where they do not -- and separating the two
+            // would mean storing the filter alongside the range, which buys an accurate
+            // label for a case the operator created deliberately.
+            // Marking it replayed clears the queue at the cost of the record -- "the sink
+            // has them now" and "nobody will ever have them" become the same row -- and
+            // the delivery attestation answers an auditor asking exactly which of those
+            // two happened. `outstanding_dead_letters` excludes both, so this stops
+            // blocking either way.
+            scoped.log_streams().mark_abandoned(env, &dead.id).await?;
             continue;
         }
         // A replay is signed over the DEAD LETTER's own position, not a fresh one: it is the
@@ -292,7 +340,16 @@ pub async fn replay_dead_letters(
             .await,
             SinkOutcome::Accepted
         ) {
-            scoped.log_streams().mark_replayed(env, &dead.id).await?;
+            // REPLAYED, CARRYING WHAT IT COULD NOT RECOVER. A partially pruned range is
+            // the common shape rather than an edge: an age-based retention cutoff lands
+            // inside a dead-lettered range as soon as the stream has been broken longer
+            // than the distance between the cutoff and the head of its backlog. Recording
+            // it as a clean replay would report events that were never delivered and can
+            // never be recovered as delivered.
+            scoped
+                .log_streams()
+                .mark_replayed(env, &dead.id, lost)
+                .await?;
             replayed += u64::try_from(events.len()).unwrap_or(0);
         }
     }

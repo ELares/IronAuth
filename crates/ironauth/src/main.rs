@@ -392,6 +392,29 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // Mount the management API (issue #11) on the management plane. The state was
         // assembled above; mounting is all this adds, which is why the assembly is a
         // separate step the boot-wiring harness can observe.
+        // THE RETENTION VERDICT HANDLE, taken before the state moves into the router.
+        //
+        // The management plane publishes whether this deployment's audit reaper runs (issue
+        // #145 criterion 3), and only the boot path can answer: `enabled = true` with no
+        // retention DSN, no control DSN, or either connection refused starts nothing and
+        // logs "audit retention NOT running", with the flag true throughout. The sweeper is
+        // attempted several steps below, so the plane is handed a handle here and the
+        // verdict is stored into it once there is one -- which happens before `server.run`,
+        // so no request can observe the interim false.
+        let audit_retention_running = planes
+            .management
+            .as_ref()
+            .map(|state| state.audit_retention().running_handle());
+        // AND THE SAME FOR THE LOG SHIPPER, for the same reason and at the same point. The
+        // delivery attestation publishes whether a stream's events are reaching its sink,
+        // and `log_streams.shipping_enabled` is off by default: a deployment that never
+        // starts a shipper delivers nothing AND dead-letters nothing, so an attestation
+        // reading only the dead-letter table would report a complete trail for one that
+        // has exported none of it.
+        let log_shipper_running = planes
+            .management
+            .as_ref()
+            .map(|state| state.log_shipper().running_handle());
         let management = planes.management.map(|state| {
             tracing::info!("management API mounted on the management plane");
             ironauth_admin::management_router(state)
@@ -541,10 +564,39 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             },
             None => (None, Vec::new()),
         };
+        // THE SHIPPER VERDICT, told to the plane the same way and read back the same way.
+        if let Some(running) = &log_shipper_running {
+            running.store(log_shipper.is_some(), std::sync::atomic::Ordering::Relaxed);
+            if running.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!("management plane told: the log shipper IS running");
+            } else {
+                tracing::info!("management plane told: the log shipper is NOT running");
+            }
+        }
         let audit_retention_sweeper = match audit_retention_inputs {
             Some(inputs) => start_audit_retention_sweeper(inputs).await,
             None => None,
         };
+        // AND TELL THE MANAGEMENT PLANE WHAT ACTUALLY HAPPENED. `is_some()` is the whole
+        // verdict: the starter returns `None` for every way this can fail to run, and each
+        // one of them has already logged its own reason.
+        if let Some(running) = &audit_retention_running {
+            running.store(
+                audit_retention_sweeper.is_some(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            // READ BACK, not recomputed. This line is the only place the stored value is
+            // observable from outside the process -- the management plane is assembled
+            // before the sweeper is attempted, so no in-process assembly test can reach
+            // this store -- and logging the expression again instead of the handle would
+            // report the right answer next to a store that wrote the wrong one.
+            // `serve_retention_boot` boots the real binary and reads this line.
+            if running.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!("management plane told: the audit reaper IS running");
+            } else {
+                tracing::info!("management plane told: the audit reaper is NOT running");
+            }
+        }
         // THE OUTBOUND SCIM WORKER (issue #137). Started here rather than beside the SCIM
         // surface, because the two are opposite directions with independent switches: a
         // deployment that consumes SCIM should not have to emit it.
@@ -946,6 +998,11 @@ async fn build_admin_state(
             // data-plane writer lands it moves into the shared carrier, so the two planes
             // cannot then be handed different modes.
             let state = state.with_identifiers(&config.identifiers);
+            // The retention policy the sweeper enforces, so the management API reports the
+            // same numbers rather than a second copy that could disagree (issue #145).
+            let state = state.with_audit_retention(
+                ironauth_admin::AuditRetentionPolicy::from_config(&config.audit_retention),
+            );
             // The outbox visibility lease (issue #104), so the queue-depth read can say
             // what "in flight" means. Installed HERE for the same reason `[identifiers]`
             // is: it reaches ONE plane. The data plane drains the queue and never reports

@@ -556,7 +556,7 @@ pub async fn create_log_stream(
 ///
 /// THE UNIFORM NOT-FOUND, so a confined credential cannot learn which stream ids exist in the
 /// environment by comparing a 403 against a 404.
-async fn require_stream_in_reach(
+pub(crate) async fn require_stream_in_reach(
     state: &AdminState,
     principal: &Principal,
     scope: ironauth_store::Scope,
@@ -714,6 +714,20 @@ pub async fn list_log_stream_dead_letters(
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     principal.require_permission(ManagementPermission::Read)?;
+    // AND THE CONFINEMENT FENCE, which this handler did not call. `require_stream_in_reach`
+    // names "the dead letter listing" in its own doc as one of the operations that needs it,
+    // and was wired only into the delete and the replay -- so the documentation asserted a
+    // check that was not there. A confined credential naming a sibling organization's
+    // stream id could read its undelivered batch count, audit-id ranges and the error text
+    // its SIEM returned, which routinely names the host.
+    //
+    // NOT because the listing leaks the ids: `list_log_streams` narrows to the confined
+    // organization, and the test above this one proves it. The id is simply not a secret
+    // and was never the control. It is unguessable, and unguessable is not authorization:
+    // an id reaches a confined credential through a support ticket, a vendor console, a
+    // former grant, or a URL in a browser history, and this is the check that decides what
+    // it may then be spent on.
+    require_stream_in_reach(&state, &principal, scope, &stream_id).await?;
     let mut dead = state
         .store()
         .scoped(scope)

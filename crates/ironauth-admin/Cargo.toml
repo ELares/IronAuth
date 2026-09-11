@@ -339,6 +339,11 @@ name = "access_review"
 path = "tests/access_review.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "audit_retention"
+path = "tests/audit_retention.rs"
+required-features = ["testing"]
+
 # Needs a real database (DATABASE_URL).
 [[test]]
 name = "authzen"

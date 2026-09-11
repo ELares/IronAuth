@@ -927,9 +927,17 @@ class Client:
         """Terminally PURGE a grace tenant: crypto-shred it and erase what the grace period kept. POST /v1/tenants/{tenant_id}/purge."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/purge", query, None)
 
+    def read_audit_retention(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """readAuditRetention. GET /v1/tenants/{tenant_id}/environments/{environment_id}/audit-retention."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/audit-retention", query, None)
+
     def read_event_feed(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Read the ordered event feed (issue #107). GET /v1/tenants/{tenant_id}/environments/{environment_id}/events."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/events", query, None)
+
+    def read_log_stream_attestation(self, tenant_id: str, environment_id: str, stream_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """readLogStreamAttestation. GET /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/attestation."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/log-streams/{urllib.parse.quote(stream_id)}/attestation", query, None)
 
     def register_agent(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Register an agent inside an organization. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents."""

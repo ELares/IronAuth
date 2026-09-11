@@ -1738,6 +1738,14 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{base}/log-streams/{log_stream}/dead-letters"),
         ),
+        // Against the SEEDED stream, not an invented id: a 404 would pass this sweep
+        // whether or not the handler can reach `log_stream_dead_letters` at all, which is
+        // exactly the missing-grant defect this file exists to catch.
+        Case::empty(
+            "audit_retention.readLogStreamAttestation",
+            "GET",
+            format!("{base}/log-streams/{log_stream}/attestation"),
+        ),
         Case::empty(
             "log_streams.replayLogStreamDeadLetters",
             "POST",
@@ -2941,6 +2949,11 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
                 "idp_sso_url": "https://idp.example/sso",
                 "public_base_url": "https://auth.example",
             }),
+        ),
+        Case::empty(
+            "audit_retention.readAuditRetention",
+            "GET",
+            format!("{base}/audit-retention"),
         ),
         Case::empty(
             "access_review.exportOrganizationAccessReview",

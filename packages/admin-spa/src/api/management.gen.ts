@@ -549,6 +549,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/audit-retention": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["readAuditRetention"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture": {
         parameters: {
             query?: never;
@@ -1542,6 +1558,22 @@ export interface paths {
         post?: never;
         /** Remove a SIEM log stream. */
         delete: operations["deleteLogStream"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/attestation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["readLogStreamAttestation"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -4309,6 +4341,29 @@ export interface components {
              */
             permission_id: string;
         };
+        /** @description The deployment's audit-retention policy. */
+        AuditRetentionView: {
+            /**
+             * @description Whether the reaper started, AS OBSERVED AT BOOT. When false, NOTHING is deleted and
+             *     the per-stream windows below are inert.
+             *
+             *     A snapshot, not a liveness probe. The boot path is the only place that can see
+             *     whether the sweeper started, and it speaks once; a reaper that starts and later
+             *     stops deleting -- its connection dropped, its role revoked -- is not reported here.
+             *     Narrowing that window would take a health signal the sweeper writes on each pass,
+             *     which this does not have. The snapshot still closes the case it was added for, an
+             *     operator who sets the flag and never wires the retention role, which is a permanent
+             *     state rather than a drifting one.
+             */
+            enforced: boolean;
+            /** @description One entry per audit stream. */
+            streams: components["schemas"]["StreamRetentionView"][];
+            /**
+             * Format: int64
+             * @description How often the sweep runs, in seconds, or absent when it does not run.
+             */
+            sweep_interval_secs?: number | null;
+        };
         /** @description The authorize request. */
         AuthorizeImpersonationRequest: {
             /**
@@ -5696,6 +5751,110 @@ export interface components {
             status_code?: number | null;
             /** @description The `webhook-id` the attempt carried, which is what a receiver deduplicated on. */
             webhook_id: string;
+        };
+        /**
+         * @description What one log stream failed to deliver.
+         *
+         *     # Why this is more than a dead-letter count
+         *
+         *     A dead letter is written only after a bounded run of REFUSED deliveries. Every other
+         *     way a stream fails to deliver writes no row at all: shipping is off for the deployment
+         *     (the default), the shipper could not start, the stream is deactivated, its sink type
+         *     has no implementation in this build, or a failure run is under way and has not reached
+         *     the threshold. In all of those the dead-letter table is empty and none of the trail has
+         *     arrived, so a report reading only that table would answer an auditor "no gap" for a
+         *     deployment exporting nothing. The counts below are exact for what was dead-lettered;
+         *     `gap` additionally covers the states where there is nothing to count.
+         *
+         *     # What it still cannot see
+         *
+         *     Every signal here is per stream or per process. A pass that dies BEFORE the per-stream
+         *     loop -- `list_active` itself erroring, say -- records nothing against any stream, so
+         *     every disjunct stays clear while no stream advances. Narrowing that needs a per-pass
+         *     health row, which the shipper does not write. The states this does cover are the
+         *     standing ones an auditor is asking about; the uncovered one is a process failing
+         *     loudly in its own logs.
+         */
+        DeliveryAttestationView: {
+            /** @description Whether the stream itself is active. A deactivated stream delivers nothing. */
+            active: boolean;
+            /**
+             * Format: int32
+             * @description Delivery failures since the last success. Non-zero means a batch is being retried
+             *     and the cursor has not moved past it.
+             */
+            consecutive_failures: number;
+            /**
+             * Format: int64
+             * @description When the earliest undelivered or lost RANGE begins, in epoch milliseconds, or
+             *     absent when there is neither.
+             *
+             *     The start of the range a failed pass read, which is a bound rather than the
+             *     timestamp of a particular delivered-or-not event: a stream carrying an event-type
+             *     filter may have skipped the first row in that range. It is the honest answer to
+             *     "from when is this trail incomplete", and it errs early, which is the safe
+             *     direction for the question.
+             */
+            earliest_undelivered_at_unix_ms?: number | null;
+            /** @description Whether anything is known to be undelivered, by any of the routes above. */
+            gap: boolean;
+            /**
+             * @description The most recent delivery error known for this stream: the LIVE failure reason while
+             *     a run is under way, and otherwise the error recorded against the most recently
+             *     set-aside batch. Absent only when neither exists.
+             */
+            last_error?: string | null;
+            /**
+             * Format: int64
+             * @description When this stream last completed a pass WITHOUT a delivery failure, in epoch
+             *     milliseconds, or absent when it never has.
+             *
+             *     Not "last delivered": `record_success` is also called for a pass whose window was
+             *     entirely filtered out, and on the pass that sets a batch aside. Both advance the
+             *     cursor without anything reaching the sink. It is a liveness signal for the pass,
+             *     and the counts beside it are the delivery signal.
+             */
+            last_success_at_unix_ms?: number | null;
+            /**
+             * Format: int32
+             * @description How many set-aside batches lost events to audit retention before a replay could
+             *     reach them. A batch counts here whether retention took the WHOLE range (nothing was
+             *     delivered) or only part of it (the survivors were).
+             */
+            permanently_lost_batches: number;
+            /**
+             * Format: int64
+             * @description How many audit events are permanently lost: removed from the audit log without ever
+             *     reaching the sink. Not the size of the batches above, which may have delivered some
+             *     of what they held.
+             */
+            permanently_lost_events: number;
+            /**
+             * @description Whether the shipper was running in THIS PROCESS when it booted. When false nothing
+             *     is being delivered for this stream, whatever the counts say.
+             *
+             *     A snapshot and a per-process one, with the same two bounds as `enforced` on the
+             *     retention report. The boot path speaks once, so a shipper that starts and later
+             *     dies is not reported here; and in a split deployment where the management API and
+             *     the workers run as separate processes, this is the answer for the process serving
+             *     the request. Both would need a health signal each pass writes, which the shipper
+             *     does not have. What the snapshot does close is the state it was added for, a
+             *     deployment that never starts a shipper at all, which is the shipped default and is
+             *     permanent rather than drifting.
+             */
+            shipping: boolean;
+            /** @description The stream this attests to. */
+            stream_id: string;
+            /**
+             * Format: int32
+             * @description How many batches were set aside after refusal and are still awaiting replay.
+             */
+            undelivered_batches: number;
+            /**
+             * Format: int64
+             * @description How many audit events those batches hold.
+             */
+            undelivered_events: number;
         };
         /**
          * @description The environment's operational warnings (issue #91), COMPUTED LIVE from the existing
@@ -9424,6 +9583,18 @@ export interface components {
              */
             requires_approval?: boolean | null;
         };
+        /** @description One audit stream's retention. */
+        StreamRetentionView: {
+            /** @description Whether this stream is kept indefinitely. A configured window of zero means this. */
+            retained_forever: boolean;
+            /**
+             * Format: int64
+             * @description How long rows are kept, in seconds, or absent when the stream is kept forever.
+             */
+            retention_secs?: number | null;
+            /** @description The stream the window applies to: `admin_action` or `authentication`. */
+            stream: string;
+        };
         /** @description The identifier a mapping creation minted. */
         SubjectMappingCreated: {
             /** @description The `asm_` identifier. */
@@ -12948,6 +13119,58 @@ export interface operations {
                 };
             };
             /** @description Environment not found or malformed client id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readAuditRetention: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The retention this deployment enforces. `enforced: false` means nothing is deleted whatever the windows say, and a stream with `retained_forever` is kept indefinitely */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditRetentionView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such tenant and environment pair under this operator. A soft-deleted environment still answers: the report describes the deployment, which outlives it */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -17923,6 +18146,60 @@ export interface operations {
                 };
             };
             /** @description The environment is absent or deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readLogStreamAttestation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The log stream identifier */
+                stream_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description What this stream failed to deliver. `gap: false` means nothing is known to be undelivered BY ANY ROUTE: no batch is outstanding or lost, no failure run is under way, the stream is active and this deployment is shipping */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryAttestationView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such log stream in this scope, or one confined out of this credential's reach */
             404: {
                 headers: {
                     [name: string]: unknown;
