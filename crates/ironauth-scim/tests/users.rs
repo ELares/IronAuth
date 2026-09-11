@@ -19,6 +19,8 @@
 //!
 //! Needs a database.
 
+use std::time::{Duration, SystemTime};
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use ironauth_env::Env;
@@ -48,13 +50,18 @@ fn now_micros(env: &Env) -> i64 {
 struct Tenant {
     token: String,
     organization: OrganizationId,
+    /// The connection the token belongs to, so a test can rotate its credential.
+    connection: ScimConnectionId,
 }
 
 /// A SECOND connection into an organization that already has one.
 ///
-/// What a credential rotation produces: `scim_connections` grants UPDATE only on
-/// `(revoked_at, updated_at)`, so a token cannot be rotated in place and a rotation is a new
-/// row with a new id.
+/// NOT WHAT A ROTATION PRODUCES, though it was when this helper was written. Migration 0205
+/// (issue #140) moved the credential into its own `scim_connection_tokens` row, so
+/// `rotate_token` mints a second token against the SAME connection and the connection id does
+/// not change -- which is the whole point, because the id is what an identity provider has
+/// configured. What this seeds is a genuinely separate connection into one organization, the
+/// shape a customer running two identity providers has.
 async fn seed_connection_for(
     db: &TestDatabase,
     env: &Env,
@@ -73,7 +80,7 @@ async fn seed_connection_for(
             NewScimConnection {
                 id: &id,
                 organization_id: organization,
-                display_name: "rotated",
+                display_name: "second",
                 provider: "entra",
                 token_digest: &digest_of(&token),
                 expires_at_unix_micros: None,
@@ -117,6 +124,7 @@ async fn seed_org(db: &TestDatabase, env: &Env, scope: Scope, name: &str, secret
     Tenant {
         token,
         organization: org,
+        connection: id,
     }
 }
 
@@ -3049,14 +3057,18 @@ async fn a_create_and_a_patch_spelling_one_attribute_differently_write_one_attri
 
 /// A SECOND connection into the SAME organization sees what the first wrote.
 ///
-/// This is the half the per-connection key got wrong. `scim_connections` grants UPDATE only on
-/// `(revoked_at, updated_at)`, so a token rotation is necessarily a NEW connection row with a
-/// new id -- and keyed per connection, every attribute the old one wrote became unreadable
-/// through the surface. A review measured exactly that. An Okta-to-Entra cutover inside one
-/// organization is the same shape.
+/// This is the half the per-connection key got wrong, though the example it was argued from no
+/// longer holds. The original argument was that a token rotation is necessarily a NEW
+/// connection row with a new id, so keyed per connection every attribute the old one wrote
+/// became unreadable. Issue #140 moved tokens into `scim_connection_tokens`, and a rotation
+/// now keeps the connection's id, so rotation is no longer an example of this at all --
+/// `ScimEnterpriseRepo`'s own doc records the same retraction.
 ///
-/// An employee number is a fact the ORGANIZATION holds about the person, which is why the key
-/// is the organization and not the credential that happened to write it.
+/// WHAT THE TEST IS ABOUT SURVIVES IT, because the retracted half was only ever one way of
+/// reaching two connections. An Okta-to-Entra cutover inside one organization is two
+/// connections by construction, and so is a customer running one connection per identity
+/// provider. An employee number is a fact the ORGANIZATION holds about the person, which is
+/// why the key is the organization and not the credential that happened to write it.
 #[tokio::test]
 async fn a_second_connection_into_one_organization_sees_what_the_first_wrote() {
     let db = TestDatabase::start().await;
@@ -3087,8 +3099,10 @@ async fn a_second_connection_into_one_organization_sees_what_the_first_wrote() {
         .expect("id")
         .to_owned();
 
-    // THE ROTATION: a second connection into the SAME organization, as a credential rotation
-    // or a vendor cutover produces.
+    // A SECOND CONNECTION into the SAME organization, as a cutover between identity
+    // providers produces. NOT as a rotation produces: since migration 0205 a rotation mints a
+    // second token against the same connection and never a second connection, which is why
+    // this test's doc retracts that example.
     let second = seed_connection_for(&db, &env, scope, &first.organization, "s-second").await;
 
     let (status, seen) = call(
@@ -3107,7 +3121,7 @@ async fn a_second_connection_into_one_organization_sees_what_the_first_wrote() {
     assert_eq!(
         extension["employeeNumber"].as_str(),
         Some("701"),
-        "a rotated credential must still see its organization's attributes: {seen}"
+        "a second connection must still see its organization's attributes: {seen}"
     );
     assert_eq!(extension["department"].as_str(), Some("Tools"), "{seen}");
 
@@ -4923,4 +4937,117 @@ fn urlencoding(raw: &str) -> String {
         }
     }
     out
+}
+
+/// Issue #140 criterion 5 over the wire: the router reaches the overlap predicate with the
+/// right instant.
+///
+/// # The predicate is already proven, one layer down
+///
+/// `ironauth-store/tests/scim_connections.rs` has
+/// `both_tokens_authenticate_during_the_overlap_and_the_old_one_then_fails_closed`, which
+/// quotes the criterion and calls `ScimConnectionRepo::authenticate` on both sides of the
+/// horizon. Criterion 5 is closed by that test, and an earlier version of this comment claimed
+/// otherwise -- that the store suite proved only the rows, and that every store test would stay
+/// green if `authenticate` ignored `expires_at`. That is false, and the store test is the
+/// counterexample.
+///
+/// # What is left is the plumbing between them, and it is a real seam
+///
+/// The store test hands `authenticate` a `now` it chose. The server derives one from the clock
+/// and hands it over, and nothing measured that. Replace `now` at `server.rs`'s call with a
+/// constant and the store test still passes while every retired credential provisions forever;
+/// this test is what turns red. The same run also covers the digest the Authorization header
+/// is reduced to, which is the other value the store test is handed rather than deriving.
+///
+/// So this is not a second proof of the overlap. It is the proof that the door in front of it
+/// is wired to the clock.
+///
+/// # The clock is manual, because the interesting half is a lapse
+///
+/// Every other test in this file takes `Env::system()`. This one cannot: the property is that
+/// a credential stops working AFTER a duration, and the only honest way to reach that instant
+/// is to move time. `ScimState` is rebuilt from the passed environment on every call, so
+/// advancing between requests is exactly what a cutover looks like to the server.
+#[tokio::test]
+async fn a_superseded_scim_token_authenticates_until_the_overlap_lapses_and_then_fails_closed() {
+    const OVERLAP_SECS: i64 = 30 * 60;
+
+    let db = TestDatabase::start().await;
+    // A FIXED INSTANT, NOT THE REAL CLOCK. `invariant-lints`' `time-via-env` rule forbids a
+    // raw wall-clock read outside the clock seam, and it is right to here: a test whose
+    // whole subject is a deadline should not start from a time that differs every run. This
+    // is 2027-01-15, chosen only to be a plausible modern instant rather than 1970.
+    let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let (env, clock) = Env::deterministic(start, 140);
+    let scope = db.seed_scope(&env).await;
+    let tenant = seed_org(&db, &env, scope, "Contoso", "s3cret-old").await;
+
+    // The replacement, minted the way the management plane mints one: the SAME connection, a
+    // new secret, and only the digest stored. The connection id not changing is the point --
+    // it is what the customer already has configured in their identity provider.
+    let replacement = mint_token(&tenant.connection, "s3cret-new");
+    let rotated_at = now_micros(&env);
+    let horizon = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .rotate_token(
+            &env,
+            &tenant.connection,
+            &digest_of(&replacement),
+            OVERLAP_SECS,
+            rotated_at,
+        )
+        .await
+        .expect("rotate the credential")
+        .expect("a live connection reports a cutover horizon");
+    assert_eq!(
+        horizon,
+        rotated_at + OVERLAP_SECS * 1_000_000,
+        "the horizon reported to the operator is the one the window is measured against"
+    );
+
+    // INSIDE THE WINDOW, BOTH WORK, and this is the half the customer's uptime rests on. The
+    // token lives in a configuration a person edits by hand; if the old one died at the mint,
+    // provisioning would be down from then until the paste, on the system whose failure mode
+    // is employees not being deprovisioned.
+    for (label, token) in [
+        ("the superseded token", &tenant.token),
+        ("the replacement", &replacement),
+    ] {
+        let (status, body) = call(&db, &env, "GET", "/scim/v2/Users", Some(token), None).await;
+        assert_eq!(status, StatusCode::OK, "{label} inside the overlap: {body}");
+    }
+
+    // PAST IT, the old one fails closed.
+    clock.advance(Duration::from_secs(
+        u64::try_from(OVERLAP_SECS).expect("positive") + 1,
+    ));
+    let (status, body) = call(
+        &db,
+        &env,
+        "GET",
+        "/scim/v2/Users",
+        Some(&tenant.token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the superseded token went on provisioning after its overlap lapsed: {body}"
+    );
+
+    // AND THE CONTROL, in the same instant. Without it the refusal above is equally satisfied
+    // by a clock advance that broke authentication for everybody, which would prove nothing
+    // about the overlap.
+    let (status, body) = call(&db, &env, "GET", "/scim/v2/Users", Some(&replacement), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the replacement stopped working too, so the refusal above is not the overlap \
+         lapsing: {body}"
+    );
 }

@@ -177,7 +177,13 @@ fn user_resource(
 /// The Enterprise User attributes THIS ORGANIZATION holds for a person.
 ///
 /// Scoped to `auth.connection.organization_id`, which is what makes the read as private as the
-/// write and what lets a rotated credential still see what its predecessor wrote. No
+/// write and what lets a SECOND CONNECTION into the organization still see what the first
+/// wrote -- an Okta-to-Entra cutover, or a customer running one connection per identity
+/// provider. It used to say "a rotated credential" here, and migration 0205 made that false:
+/// a rotation now mints a second token against the SAME connection, so a rotated credential
+/// would see its predecessor's writes under a per-connection key too. `ScimEnterpriseRepo`
+/// records the same retraction; 0187's header carries the old wording and is checksum-frozen,
+/// so it cannot be corrected in place. No
 /// attribute-name filter is needed or wanted: the table holds only what a SCIM client sent,
 /// and it holds it per organization, so there is nothing of anybody else's in it to filter out.
 /// The trait storage this replaces needed such a filter and a review measured that nothing
