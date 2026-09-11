@@ -3278,6 +3278,10 @@ as a sentinel, so an absent one means absent.
     "organization_id": {
       "minLength": 1,
       "type": "string"
+    },
+    "slug": {
+      "minLength": 1,
+      "type": "string"
     }
   },
   "required": [

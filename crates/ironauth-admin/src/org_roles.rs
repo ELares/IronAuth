@@ -314,7 +314,14 @@ pub async fn create_org_role(
         response_status: 201,
         response_body: &body_string,
     };
-    let pending = org_role_event(&state, scope, &role_id, &org_id, "org_role.created");
+    let pending = org_role_event(
+        &state,
+        scope,
+        &role_id,
+        &org_id,
+        "org_role.created",
+        Some(&request.slug),
+    );
     let result = state
         .store()
         .management()
@@ -521,7 +528,7 @@ pub async fn update_org_role(
     // Built INSIDE the guard, so a PATCH that changes nothing announces nothing: there is no
     // write to announce, and a receiver told a role changed would refetch an identical row.
     if display_name.is_some() || request.metadata.is_some() {
-        let pending = org_role_event(&state, scope, &record.id, &org_id, "org_role.updated");
+        let pending = org_role_event(&state, scope, &record.id, &org_id, "org_role.updated", None);
         state
             .store()
             .management()
@@ -821,19 +828,27 @@ fn org_role_event(
     org_role_id: &ironauth_store::OrgRoleId,
     organization_id: &ironauth_store::OrganizationId,
     event_type: &str,
+    slug: Option<&str>,
 ) -> Option<crate::events::PendingEvent> {
     let id = format!("evt_{}", CorrelationId::generate(state.env()));
     let subject = org_role_id.to_string();
+    let mut payload = serde_json::json!({
+        "org_role_id": subject,
+        "organization_id": organization_id.to_string(),
+    });
+    // ONLY ON THE CREATE, because that is the only event whose schema carries it and the only
+    // one that needs to: the slug is immutable, so a consumer that recorded it at create
+    // never goes stale. See the catalog entry for why the property is optional.
+    if let Some(slug) = slug {
+        payload["slug"] = serde_json::Value::String(slug.to_owned());
+    }
     let envelope = ironauth_store::event_catalog::envelope(
         &id,
         event_type,
         &scope.tenant().to_string(),
         &scope.environment().to_string(),
         state.now_unix_micros() / 1000,
-        &serde_json::json!({
-            "org_role_id": subject,
-            "organization_id": organization_id.to_string(),
-        }),
+        &payload,
     )?;
     Some(crate::events::PendingEvent {
         id,

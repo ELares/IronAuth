@@ -2235,6 +2235,22 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // THE SLUG IS ON THIS EVENT and on no other, which is what makes the feed replayable.
+        // Every other `org_role.*` event names the role by ID; the slug is what a token claim
+        // carries and what the access-review export reports, so a consumer folding the feed
+        // could rebuild the whole assignment graph and still not know what any role IS.
+        // `permission.created` has carried its slug all along, which is what made the
+        // asymmetry look like an omission rather than a policy.
+        //
+        // OPTIONAL, NOT REQUIRED, deliberately. Adding a required property under an unchanged
+        // version is a breaking change: the catalog is validated on CONSUME, so during a
+        // rolling upgrade an old pod's three-field payload would be refused permanently by a
+        // new pod's consumer. Optional means an old envelope still validates and a new one
+        // carries the slug.
+        //
+        // ONE EVENT IS ENOUGH because the slug is IMMUTABLE: migration 0086 grants UPDATE on
+        // `(display_name, metadata, updated_at, deleted_at)` only, so no later event can
+        // change it and a consumer that recorded it at create never goes stale.
         "org_role.created",
         1,
         r#"{
@@ -2242,7 +2258,8 @@ const REGISTERED: &[(&str, u32, &str)] = &[
             "additionalProperties": false,
             "properties": {
                 "org_role_id": {"type": "string", "minLength": 1},
-                "organization_id": {"type": "string", "minLength": 1}
+                "organization_id": {"type": "string", "minLength": 1},
+                "slug": {"type": "string", "minLength": 1}
             },
             "required": ["org_role_id", "organization_id"]
         }"#,
