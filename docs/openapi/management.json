@@ -12900,6 +12900,315 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests": {
+      "get": {
+        "tags": [
+          "organizations"
+        ],
+        "operationId": "listAccessRequests",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This organization's access requests, newest first. `granting_now` is the live answer and `state` is the recorded one; they differ for an approved grant whose deadline has passed and which no sweep has yet relabelled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessRequestList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such live organization in this scope, or the exploratory feature is not acknowledged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "organizations"
+        ],
+        "operationId": "raiseAccessRequest",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RaiseAccessRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The request was raised and is awaiting a decision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessRequestView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A field is empty or too long",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such live organization in this scope, or the exploratory feature is not acknowledged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests/{request_id}/decision": {
+      "post": {
+        "tags": [
+          "organizations"
+        ],
+        "operationId": "decideAccessRequest",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "request_id",
+            "in": "path",
+            "description": "The access request identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecideAccessRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The decision was recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessRequestView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An approval carried no duration, a denial carried one, or the duration exceeds the ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such pending request in this organization, or the exploratory feature is not acknowledged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The caller raised this request and may not decide it. Refused here in words, and by a CHECK constraint on every other path into the table",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-review": {
       "get": {
         "tags": [
@@ -29775,6 +30084,96 @@
           }
         }
       },
+      "AccessRequestList": {
+        "type": "object",
+        "description": "A page of requests.",
+        "required": [
+          "items",
+          "truncated"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccessRequestView"
+            },
+            "description": "The requests, newest first."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Whether the listing was cut at its bound."
+          }
+        }
+      },
+      "AccessRequestView": {
+        "type": "object",
+        "description": "One request, as the API reports it.",
+        "required": [
+          "id",
+          "organization_id",
+          "subject_id",
+          "role_slug",
+          "requested_by",
+          "reason",
+          "state",
+          "granting_now",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was raised, in epoch milliseconds."
+          },
+          "decided_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who decided, or absent while pending."
+          },
+          "granted_until_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the grant ends, in epoch milliseconds, or absent unless approved."
+          },
+          "granting_now": {
+            "type": "boolean",
+            "description": "Whether the grant is live AT THE MOMENT OF THE READ.\n\nNot derivable from `state` by a reader: an approved grant past its deadline still\nreads `approved` until a sweep relabels it, and it grants nothing from the instant\nthe deadline passes. This field is the answer to \"may they act\", and `state` is the\nanswer to \"what happened\"."
+          },
+          "id": {
+            "type": "string",
+            "description": "The `agr_` identifier."
+          },
+          "organization_id": {
+            "type": "string",
+            "description": "Whose roles are at stake."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why."
+          },
+          "requested_by": {
+            "type": "string",
+            "description": "Who asked."
+          },
+          "role_slug": {
+            "type": "string",
+            "description": "Which role."
+          },
+          "state": {
+            "type": "string",
+            "description": "`pending`, `approved`, `denied` or `expired`."
+          },
+          "subject_id": {
+            "type": "string",
+            "description": "Who would receive the access."
+          }
+        }
+      },
       "AddIdentifierRequest": {
         "type": "object",
         "description": "Add a typed login identifier to a user.",
@@ -32320,6 +32719,28 @@
           "webhook_id": {
             "type": "string",
             "description": "The `webhook-id` this delivery carried, and will carry again if replayed. Stable\nacross every attempt and across a replay, which is what lets a receiver deduplicate."
+          }
+        }
+      },
+      "DecideAccessRequestBody": {
+        "type": "object",
+        "description": "What an approver decides.",
+        "required": [
+          "approve"
+        ],
+        "properties": {
+          "approve": {
+            "type": "boolean",
+            "description": "Whether to grant."
+          },
+          "grant_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How long the grant lasts, in seconds. Required for an approval and refused for a\ndenial: an approval IS a grant with an end.",
+            "minimum": 0
           }
         }
       },
@@ -35857,6 +36278,29 @@
             "type": "integer",
             "format": "int64",
             "description": "Messages whose retry backoff has not elapsed yet."
+          }
+        }
+      },
+      "RaiseAccessRequestBody": {
+        "type": "object",
+        "description": "What a member asks for.",
+        "required": [
+          "subject_id",
+          "role_slug",
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "Why, in the requester's words."
+          },
+          "role_slug": {
+            "type": "string",
+            "description": "Which organization role."
+          },
+          "subject_id": {
+            "type": "string",
+            "description": "Who would receive the access. Not necessarily the caller: a manager may ask on\nbehalf of somebody else."
           }
         }
       },

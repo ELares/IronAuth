@@ -158,6 +158,24 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // The audit-retention report (issue #145 criterion 3). `Read`: it publishes the policy
     // this deployment enforces, which a customer needs to answer an auditor, and discloses
     // no audit CONTENT.
+    // The EXPLORATORY access-request surface (issue #145 criterion 4). The two writes are
+    // `WriteOrganizations` because both change what a member of an organization may do; the
+    // listing is `Read`.
+    //
+    // NOT a separate permission for the approver. The separation this primitive enforces is
+    // by IDENTITY, not by privilege: the approver must be a different person, and a
+    // credential holding a hypothetical `management.approve` would satisfy a permission
+    // split while one human held both. The refusal that matters compares the two principals
+    // and is a CHECK constraint.
+    (
+        "raiseAccessRequest",
+        ManagementPermission::WriteOrganizations,
+    ),
+    (
+        "decideAccessRequest",
+        ManagementPermission::WriteOrganizations,
+    ),
+    ("listAccessRequests", ManagementPermission::Read),
     ("readAuditRetention", ManagementPermission::Read),
     // The delivery attestation (issue #145 criterion 3, other half). `Read`: it reports HOW
     // MANY audit events a log stream failed to deliver and the error the sink returned. It
@@ -908,6 +926,14 @@ const PERMISSION_PROVEN: &[&str] = &[
     // Proven in `a_write_only_credential_cannot_read_the_audit_retention_policy`, which
     // drives a `write_organizations` credential and asserts the refusal names
     // `management.read`. Its own comment: the event-feed test below never touches this route.
+    // All three proven in `the_access_request_surface_splits_raising_and_deciding_from_reading`,
+    // which drives BOTH directions at every route: a read credential is refused each write
+    // and a write credential is refused the read, with each refusal asserted to name the
+    // permission it wanted. The control legs run first, so neither refusal can be the
+    // route simply being closed to a restricted credential.
+    "raiseAccessRequest",
+    "decideAccessRequest",
+    "listAccessRequests",
     "readAuditRetention",
     // Proven in `a_write_only_credential_cannot_read_a_delivery_attestation`, which drives a
     // `write_organizations` credential against a stream that EXISTS and asserts the refusal
@@ -1109,12 +1135,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        240,
+        243,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        96,
+        99,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

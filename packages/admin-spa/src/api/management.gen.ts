@@ -1859,6 +1859,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listAccessRequests"];
+        put?: never;
+        post: operations["raiseAccessRequest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests/{request_id}/decision": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["decideAccessRequest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-review": {
         parameters: {
             query?: never;
@@ -4197,6 +4229,51 @@ export interface components {
              */
             reason: string;
         };
+        /** @description A page of requests. */
+        AccessRequestList: {
+            /** @description The requests, newest first. */
+            items: components["schemas"]["AccessRequestView"][];
+            /** @description Whether the listing was cut at its bound. */
+            truncated: boolean;
+        };
+        /** @description One request, as the API reports it. */
+        AccessRequestView: {
+            /**
+             * Format: int64
+             * @description When it was raised, in epoch milliseconds.
+             */
+            created_at_unix_ms: number;
+            /** @description Who decided, or absent while pending. */
+            decided_by?: string | null;
+            /**
+             * Format: int64
+             * @description When the grant ends, in epoch milliseconds, or absent unless approved.
+             */
+            granted_until_unix_ms?: number | null;
+            /**
+             * @description Whether the grant is live AT THE MOMENT OF THE READ.
+             *
+             *     Not derivable from `state` by a reader: an approved grant past its deadline still
+             *     reads `approved` until a sweep relabels it, and it grants nothing from the instant
+             *     the deadline passes. This field is the answer to "may they act", and `state` is the
+             *     answer to "what happened".
+             */
+            granting_now: boolean;
+            /** @description The `agr_` identifier. */
+            id: string;
+            /** @description Whose roles are at stake. */
+            organization_id: string;
+            /** @description Why. */
+            reason: string;
+            /** @description Who asked. */
+            requested_by: string;
+            /** @description Which role. */
+            role_slug: string;
+            /** @description `pending`, `approved`, `denied` or `expired`. */
+            state: string;
+            /** @description Who would receive the access. */
+            subject_id: string;
+        };
         /** @description Add a typed login identifier to a user. */
         AddIdentifierRequest: {
             /** @description The identifier kind: `email`, `username` or `phone`. */
@@ -5700,6 +5777,17 @@ export interface components {
              *     across every attempt and across a replay, which is what lets a receiver deduplicate.
              */
             webhook_id: string;
+        };
+        /** @description What an approver decides. */
+        DecideAccessRequestBody: {
+            /** @description Whether to grant. */
+            approve: boolean;
+            /**
+             * Format: int64
+             * @description How long the grant lasts, in seconds. Required for an approval and refused for a
+             *     denial: an approval IS a grant with an end.
+             */
+            grant_secs?: number | null;
         };
         /** @description The body deciding one held action (issue #132). */
         DecideVaultApprovalRequest: {
@@ -7947,6 +8035,18 @@ export interface components {
              * @description Messages whose retry backoff has not elapsed yet.
              */
             scheduled: number;
+        };
+        /** @description What a member asks for. */
+        RaiseAccessRequestBody: {
+            /** @description Why, in the requester's words. */
+            reason: string;
+            /** @description Which organization role. */
+            role_slug: string;
+            /**
+             * @description Who would receive the access. Not necessarily the caller: a manager may ask on
+             *     behalf of somebody else.
+             */
+            subject_id: string;
         };
         /** @description One identity that failed validation, with the fields that failed. */
         RecordFailureView: {
@@ -19259,6 +19359,205 @@ export interface operations {
             };
             /** @description Not found (absent, or already deactivated: a repeat delete). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listAccessRequests: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This organization's access requests, newest first. `granting_now` is the live answer and `state` is the recorded one; they differ for an approved grant whose deadline has passed and which no sweep has yet relabelled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessRequestList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such live organization in this scope, or the exploratory feature is not acknowledged */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    raiseAccessRequest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RaiseAccessRequestBody"];
+            };
+        };
+        responses: {
+            /** @description The request was raised and is awaiting a decision */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessRequestView"];
+                };
+            };
+            /** @description A field is empty or too long */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such live organization in this scope, or the exploratory feature is not acknowledged */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    decideAccessRequest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The access request identifier */
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DecideAccessRequestBody"];
+            };
+        };
+        responses: {
+            /** @description The decision was recorded */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessRequestView"];
+                };
+            };
+            /** @description An approval carried no duration, a denial carried one, or the duration exceeds the ceiling */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such pending request in this organization, or the exploratory feature is not acknowledged */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The caller raised this request and may not decide it. Refused here in words, and by a CHECK constraint on every other path into the table */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

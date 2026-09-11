@@ -421,6 +421,13 @@ func (c *Client) CreateWebhookEndpoint(tenant_id string, environment_id string, 
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/webhook-endpoints", query, body)
 }
 
+// DecideAccessRequest performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests/{request_id}/decision.
+//
+// decideAccessRequest.
+func (c *Client) DecideAccessRequest(tenant_id string, environment_id string, organization_id string, request_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/access-requests/" + escape(request_id) + "/decision", query, body)
+}
+
 // DecideAgentVaultApproval performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals/{approval_id}/decision.
 //
 // Decide one held action (issue #132, criterion 4).
@@ -1107,6 +1114,13 @@ func (c *Client) LinkUserExternalId(tenant_id string, environment_id string, use
 	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/users/" + escape(user_id) + "/external-id", query, body)
 }
 
+// ListAccessRequests performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests.
+//
+// listAccessRequests.
+func (c *Client) ListAccessRequests(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/access-requests", query, nil)
+}
+
 // ListAgentVaultApprovals performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals.
 //
 // The approvals awaiting a decision in this organization (issue #132, criterion 4).
@@ -1602,6 +1616,13 @@ func (c *Client) PublishUsage(tenant_id string, environment_id string, query url
 // Terminally PURGE a grace tenant: crypto-shred it and erase what the grace period kept.
 func (c *Client) PurgeTenant(tenant_id string, query url.Values) (*http.Response, error) {
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/purge", query, nil)
+}
+
+// RaiseAccessRequest performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests.
+//
+// raiseAccessRequest.
+func (c *Client) RaiseAccessRequest(tenant_id string, environment_id string, organization_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/access-requests", query, body)
 }
 
 // ReadAuditRetention performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/audit-retention.

@@ -39,6 +39,79 @@
   },
   "event_types": [
     {
+      "domain": "access_request",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "access_request_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "approved": {
+            "type": "boolean"
+          },
+          "granted_until_unix_ms": {
+            "type": "integer"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "role_slug": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "subject_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "access_request_id",
+          "organization_id",
+          "subject_id",
+          "role_slug",
+          "approved"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "access_request.decided"
+    },
+    {
+      "domain": "access_request",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "access_request_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "role_slug": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "subject_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "access_request_id",
+          "organization_id",
+          "subject_id",
+          "role_slug"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "access_request.raised"
+    },
+    {
       "domain": "admin_consent",
       "payload_schema": {
         "additionalProperties": false,

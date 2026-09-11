@@ -72,6 +72,7 @@ async fn raise(
                 requested_by,
                 reason: "quarter close",
             },
+            None,
         )
         .await
         .expect("raise the request");
@@ -145,7 +146,17 @@ async fn a_different_principal_may_approve_and_the_grant_carries_its_deadline() 
         .management()
         .acting(actor(&env), CorrelationId::generate(&env))
         .access_requests(scope)
-        .decide(&env, &id, true, "prn_approver", now, Some(until))
+        .decide(
+            &env,
+            &id,
+            ironauth_store::AccessDecision {
+                approve: true,
+                decided_by: "prn_approver",
+                decided_at_micros: now,
+                granted_until_micros: Some(until),
+            },
+            None,
+        )
         .await
         .expect("a different principal approves");
 
@@ -185,7 +196,17 @@ async fn the_repository_refuses_a_self_approval_as_a_not_found_rather_than_a_dat
         .management()
         .acting(actor(&env), CorrelationId::generate(&env))
         .access_requests(scope)
-        .decide(&env, &id, true, "prn_asker", now, Some(now + 1_000_000))
+        .decide(
+            &env,
+            &id,
+            ironauth_store::AccessDecision {
+                approve: true,
+                decided_by: "prn_asker",
+                decided_at_micros: now,
+                granted_until_micros: Some(now + 1_000_000),
+            },
+            None,
+        )
         .await;
 
     assert!(
@@ -238,13 +259,33 @@ async fn only_the_first_decision_lands() {
 
     acting
         .access_requests(scope)
-        .decide(&env, &id, false, "prn_first", now, None)
+        .decide(
+            &env,
+            &id,
+            ironauth_store::AccessDecision {
+                approve: false,
+                decided_by: "prn_first",
+                decided_at_micros: now,
+                granted_until_micros: None,
+            },
+            None,
+        )
         .await
         .expect("the first decision lands");
 
     let second = acting
         .access_requests(scope)
-        .decide(&env, &id, true, "prn_second", now, Some(now + 1_000_000))
+        .decide(
+            &env,
+            &id,
+            ironauth_store::AccessDecision {
+                approve: true,
+                decided_by: "prn_second",
+                decided_at_micros: now,
+                granted_until_micros: Some(now + 1_000_000),
+            },
+            None,
+        )
         .await;
     assert!(
         matches!(second, Err(StoreError::NotFound)),
@@ -293,7 +334,17 @@ async fn a_grant_stops_granting_at_its_deadline_and_the_sweep_records_it() {
         .management()
         .acting(actor(&env), CorrelationId::generate(&env))
         .access_requests(scope)
-        .decide(&env, &id, true, "prn_approver", granted_at, Some(until))
+        .decide(
+            &env,
+            &id,
+            ironauth_store::AccessDecision {
+                approve: true,
+                decided_by: "prn_approver",
+                decided_at_micros: granted_at,
+                granted_until_micros: Some(until),
+            },
+            None,
+        )
         .await
         .expect("approve");
 
@@ -385,10 +436,13 @@ async fn every_swept_grant_leaves_an_audit_row_naming_it() {
             .decide(
                 &env,
                 &id,
-                true,
-                "prn_approver",
-                now_micros(&env),
-                Some(now_micros(&env) + 60_000_000),
+                ironauth_store::AccessDecision {
+                    approve: true,
+                    decided_by: "prn_approver",
+                    decided_at_micros: now_micros(&env),
+                    granted_until_micros: Some(now_micros(&env) + 60_000_000),
+                },
+                None,
             )
             .await
             .expect("approve");

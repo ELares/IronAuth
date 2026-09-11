@@ -68,7 +68,20 @@ impl Harness {
             ..AdminConfig::default()
         };
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
-            .expect("admin state builds");
+            .expect("admin state builds")
+            // ARMED IN THE DEFAULT HARNESS (issue #145 criterion 4), unlike the other
+            // exploratory surfaces. The access-request routes are ORGANIZATION-ADDRESSED,
+            // so they land in the organization sweeps -- `deleted_environment`,
+            // `absent_environment`, `org_confinement_surface` -- and every one of those
+            // builds its fixture through `Harness::start`. With the feature off they
+            // answer the uniform 404 at a LIVE environment too, and those sweeps refuse to
+            // pass on it by name: a fence driven at a route that refuses everything
+            // measures nothing.
+            //
+            // The DISARMED behaviour keeps its own coverage in
+            // `the_access_request_surface_is_invisible_until_the_feature_is_acknowledged`,
+            // which builds through `start_with_access_requests(.., false)`.
+            .with_access_requests_enabled(true);
         let router = management_router(install_hook_runtime(state));
         Self {
             db,
@@ -431,6 +444,31 @@ impl Harness {
     /// unrecognised type. `armed = false` leaves it off, which is its default, so a test can
     /// assert that a deployment which has not acknowledged the draft answers exactly as it did
     /// before the profile existed.
+    /// Start a fresh database and router with the EXPLORATORY time-boxed access-request
+    /// surface ARMED (issue #145 criterion 4), so its three endpoints answer instead of
+    /// 404. `armed = false` leaves the feature off (its default), so a test can assert
+    /// that an unacknowledged deployment learns nothing about it.
+    pub async fn start_with_access_requests(default_page_size: u32, armed: bool) -> Self {
+        let mut db = TestDatabase::start().await;
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size: 200,
+            default_page_size,
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds")
+            .with_access_requests_enabled(armed);
+        let router = management_router(install_hook_runtime(state));
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+            txt: None,
+        }
+    }
+
     pub async fn start_with_agent_tool_profile(default_page_size: u32, armed: bool) -> Self {
         let mut db = TestDatabase::start().await;
         db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
@@ -703,6 +741,7 @@ impl Harness {
             .with_signing_registry(registry)
             .with_federation(federation)
             .with_signup_quarantine_enabled(true)
+            .with_access_requests_enabled(true)
             .with_advanced_recovery_enabled(true)
             // "Fully armed" includes a DNS resolver (issue #96). Without one the verify
             // endpoint answers 503 and the whole-surface sweep reads a deployment gap as

@@ -1055,6 +1055,13 @@ async fn build_admin_state(
                 &FeatureRegistry::builtin(),
                 config,
             ));
+            // The EXPLORATORY access-request surface (issue #145 criterion 4), resolved
+            // the same way and from the same ladder: enabled AND acknowledged at the
+            // exact shape version, or every one of its routes answers a uniform 404.
+            let state = state.with_access_requests_enabled(
+                FeatureRegistry::builtin()
+                    .is_enabled(config, ironauth_config::ACCESS_REQUEST_APPROVAL_FEATURE),
+            );
             Some(state)
         }
         Err(error) => {

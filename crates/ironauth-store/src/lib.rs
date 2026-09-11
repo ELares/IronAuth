@@ -253,7 +253,7 @@ pub use recovery::{
 };
 pub use redirect::{redirect_uri_is_registrable, redirect_uri_matches};
 pub use repository::{
-    AbuseRepo, AcceptedInvitation, AccessTokenResolution, AccountCredentialRepo,
+    AbuseRepo, AcceptedInvitation, AccessDecision, AccessTokenResolution, AccountCredentialRepo,
     AccountCredentialSummary, AccountLinkMethod, AccountLinkRecord, AccountLinkRepo,
     ActingAbuseRepo, ActingAccountCredentialRepo, ActingAccountLinkRepo,
     ActingAdminSudoElevationRepo, ActingAgentRepo, ActingAgentVaultApprovalRepo,

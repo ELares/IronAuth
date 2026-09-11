@@ -269,6 +269,14 @@ struct Inner {
     // review-queue endpoints outside the experimental ack gate. Off by default; when off
     // every signup-quarantine review-queue endpoint answers a uniform 404.
     signup_quarantine_enabled: bool,
+
+    // Whether the EXPLORATORY time-boxed access-request surface is armed (issue #145
+    // criterion 4). Resolved at boot from the strict feature ladder, so an operator cannot
+    // reach these routes from a plain config toggle without acknowledging the shape. When
+    // false (the default) every access-request endpoint answers a uniform 404, which is
+    // the same answer an unmounted route gives: an unacknowledged deployment learns
+    // nothing about what this build could do.
+    access_requests_enabled: bool,
     // The AuthZEN agent tool profile (issue #133, PROTOTYPE). Default false: an `agent`
     // subject is then refused exactly as any unrecognised type is, so the endpoint does not
     // reveal that the type has a meaning in this build.
@@ -416,6 +424,7 @@ impl AdminState {
                 sudo_mode_enabled: config.sudo_mode_enabled,
                 sudo_mode_window_secs: config.sudo_mode_window_secs,
                 signup_quarantine_enabled: false,
+                access_requests_enabled: false,
                 agent_tool_profile_enabled: false,
                 advanced_recovery_enabled: false,
                 admin_oidc_bridge: None,
@@ -722,6 +731,26 @@ impl AdminState {
     #[must_use]
     pub fn signup_quarantine_enabled(&self) -> bool {
         self.inner.signup_quarantine_enabled
+    }
+
+    /// Arm the EXPLORATORY time-boxed access-request surface (issue #145 criterion 4).
+    ///
+    /// A builder rather than an `AdminConfig` field, for the reason
+    /// [`AdminState::with_signup_quarantine_enabled`] gives: an operator must not be able
+    /// to arm an exploratory surface from a plain toggle and bypass the acknowledgment
+    /// gate. The boot path is the only non-test caller.
+    #[must_use]
+    pub fn with_access_requests_enabled(mut self, enabled: bool) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.access_requests_enabled = enabled;
+        }
+        self
+    }
+
+    /// Whether the exploratory access-request surface is armed (issue #145 criterion 4).
+    #[must_use]
+    pub fn access_requests_enabled(&self) -> bool {
+        self.inner.access_requests_enabled
     }
 
     /// Arm the experimental advanced-recovery-modes admin surface (issue #82, PR 3).

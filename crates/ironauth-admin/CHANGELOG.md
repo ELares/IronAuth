@@ -6,6 +6,40 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+### Time-boxed access requests, EXPLORATORY (issue #145 criterion 4)
+
+Shape `access-request-approval-1`. Three routes under an organization --
+`POST` and `GET` `.../organizations/{id}/access-requests`, and `POST
+.../access-requests/{id}/decision` -- behind the `access-request-approval`
+experimental feature. A deployment that has not acknowledged this shape gets the
+uniform not-found from all three and writes nothing.
+
+A member asks for an organization role with a reason, a DIFFERENT member approves,
+and the approval sets how long the grant lasts as a duration bounded at thirty days.
+The requester does not choose the deadline: that is half of what the approver is
+there to decide.
+
+SELF-APPROVAL IS REFUSED BY POSTGRES, not by a handler.
+`access_grant_requests_decider_is_not_requester` is checked on every INSERT and
+UPDATE from every connection including the owner's. The route answers 422 naming
+the rule and the repository raises its own error, because a constraint violation
+surfacing as a 500 tells nobody anything -- but only the constraint holds for a
+path nobody has written yet. The same migration refuses an approval that carries no
+deadline, which would be the standing access this replaces.
+
+THE DEADLINE ENDS THE GRANT, not the sweeper. `granting_now` on the listing is the
+live answer and `state` is the recorded one, and they differ for an approved grant
+past its deadline that no sweep has yet relabelled. A sweeper is a process and
+processes do not run; one that is stopped, unconfigured or a tick behind leaves the
+listing stale and never the access.
+
+Both writes announce: `access_request.raised` and `access_request.decided`, the
+second carrying `approved` and, on an approval only, `granted_until_unix_ms`.
+
+EXPLORATORY means nothing consumes the grants yet. There is no delegation or
+escalation chain, no notification when a request is raised, and no way to revoke a
+grant before its deadline other than letting it expire.
+
 ### SCIM provisioning connections on the management plane (issue #135)
 
 Three routes under an organization -- `POST`, `GET` and `DELETE`

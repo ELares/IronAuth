@@ -90,6 +90,7 @@ mod whoami;
 pub mod log_shipper;
 pub mod log_stream_signature;
 
+mod access_requests;
 mod access_review;
 mod agents;
 mod audit_retention;
@@ -791,6 +792,14 @@ pub fn management_router(state: AdminState) -> Router {
         // 410 carrying the oldest cursor that still resolves, never an empty 200.
         // What this deployment keeps, and for how long (issue #145 criterion 3). A customer
         // answering an auditor should not have to email their vendor for it.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests",
+            post(access_requests::raise_access_request).get(access_requests::list_access_requests),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests/{request_id}/decision",
+            post(access_requests::decide_access_request),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/audit-retention",
             get(audit_retention::read_audit_retention),

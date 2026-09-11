@@ -85574,6 +85574,25 @@ impl AccessRequestRepo<'_> {
     }
 }
 
+/// One approver's verdict (issue #145 criterion 4).
+///
+/// A struct for the reason [`NewAccessRequest`] gives, and for one more: `approve` and
+/// `granted_until_micros` are not independent. An approval IS a grant with an end and a
+/// denial grants nothing, so the two travel together and the constructor below refuses any
+/// other pairing before the database does.
+#[derive(Debug, Clone, Copy)]
+pub struct AccessDecision<'a> {
+    /// Whether to grant.
+    pub approve: bool,
+    /// The deciding principal. Compared against the requester by
+    /// `access_grant_requests_decider_is_not_requester`.
+    pub decided_by: &'a str,
+    /// When, in epoch micros.
+    pub decided_at_micros: i64,
+    /// When the grant ends, in epoch micros. Present exactly when `approve`.
+    pub granted_until_micros: Option<i64>,
+}
+
 /// Raising and deciding access requests, each audited (issue #145 criterion 4).
 pub struct ActingAccessRequestRepo<'a> {
     store: &'a Store,
@@ -85597,6 +85616,7 @@ impl ActingAccessRequestRepo<'_> {
         env: &Env,
         id: &crate::id::AccessRequestId,
         spec: NewAccessRequest<'_>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -85634,6 +85654,8 @@ impl ActingAccessRequestRepo<'_> {
                 .bind(&reason)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's transaction: a rolled-back request announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -85766,21 +85788,25 @@ impl ActingAccessRequestRepo<'_> {
         &self,
         env: &Env,
         id: &crate::id::AccessRequestId,
-        approve: bool,
-        decided_by: &str,
-        decided_at_micros: i64,
-        granted_until_micros: Option<i64>,
+        decision: AccessDecision<'_>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
-        if approve != granted_until_micros.is_some() {
+        if decision.approve != decision.granted_until_micros.is_some() {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
         let id_owned = id.to_string();
-        let decided_by = decided_by.to_owned();
-        let state = if approve { "approved" } else { "denied" };
+        let decided_by = decision.decided_by.to_owned();
+        let decided_at_micros = decision.decided_at_micros;
+        let granted_until_micros = decision.granted_until_micros;
+        let state = if decision.approve {
+            "approved"
+        } else {
+            "denied"
+        };
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -85831,6 +85857,9 @@ impl ActingAccessRequestRepo<'_> {
                 if done.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // AFTER the rows-affected guard, in the write's transaction: a decision
+                // that landed on nothing -- already decided, or gone -- announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

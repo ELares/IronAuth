@@ -251,6 +251,10 @@ class Client:
         """Register a delivery endpoint and mint its signing secret. POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/webhook-endpoints", query, body)
 
+    def decide_access_request(self, tenant_id: str, environment_id: str, organization_id: str, request_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """decideAccessRequest. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests/{request_id}/decision."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/access-requests/{urllib.parse.quote(request_id)}/decision", query, body)
+
     def decide_agent_vault_approval(self, tenant_id: str, environment_id: str, organization_id: str, approval_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Decide one held action (issue #132, criterion 4). POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals/{approval_id}/decision."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/agent-approvals/{urllib.parse.quote(approval_id)}/decision", query, body)
@@ -643,6 +647,10 @@ class Client:
         """Link an external id to a user. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/users/{urllib.parse.quote(user_id)}/external-id", query, body)
 
+    def list_access_requests(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """listAccessRequests. GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/access-requests", query, None)
+
     def list_agent_vault_approvals(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """The approvals awaiting a decision in this organization (issue #132, criterion 4). GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/agent-approvals", query, None)
@@ -926,6 +934,10 @@ class Client:
     def purge_tenant(self, tenant_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Terminally PURGE a grace tenant: crypto-shred it and erase what the grace period kept. POST /v1/tenants/{tenant_id}/purge."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/purge", query, None)
+
+    def raise_access_request(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """raiseAccessRequest. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/access-requests", query, body)
 
     def read_audit_retention(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """readAuditRetention. GET /v1/tenants/{tenant_id}/environments/{environment_id}/audit-retention."""
