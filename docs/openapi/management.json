@@ -18341,6 +18341,129 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/saml-connections": {
+      "post": {
+        "tags": [
+          "organizations"
+        ],
+        "operationId": "createSamlConnection",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSamlConnectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created. The ACS URL and SP entity id are this deployment's own, derived from the new connection id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SamlConnectionView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A field is missing, or the base URL is not an absolute http(s) origin",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope, or fresh privilege is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The organization is not a live row of this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A live connection of this scope already announces that identity provider entity id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections": {
       "get": {
         "tags": [
@@ -31411,6 +31534,34 @@
           }
         }
       },
+      "CreateSamlConnectionRequest": {
+        "type": "object",
+        "description": "A SAML connection to create.",
+        "required": [
+          "display_name",
+          "idp_entity_id",
+          "idp_sso_url",
+          "public_base_url"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label, as it appears in the portal and the console."
+          },
+          "idp_entity_id": {
+            "type": "string",
+            "description": "What the identity provider calls itself. An assertion's `Issuer` must equal this."
+          },
+          "idp_sso_url": {
+            "type": "string",
+            "description": "Where an `AuthnRequest` is sent."
+          },
+          "public_base_url": {
+            "type": "string",
+            "description": "The scheme and host this deployment is reached at, with no path.\n\nThe HOST only: IronAuth appends the ACS and metadata paths itself, because those are\nits own routes and a caller cannot know the connection id in advance."
+          }
+        }
+      },
       "CreateScimConnectionRequest": {
         "type": "object",
         "description": "What a create names.",
@@ -36121,6 +36272,44 @@
             "type": "integer",
             "format": "int32",
             "description": "Evaluation priority."
+          }
+        }
+      },
+      "SamlConnectionView": {
+        "type": "object",
+        "description": "A created SAML connection, including the two values to paste into a provider's console.",
+        "required": [
+          "id",
+          "organization_id",
+          "display_name",
+          "idp_entity_id",
+          "sp_entity_id",
+          "acs_url"
+        ],
+        "properties": {
+          "acs_url": {
+            "type": "string",
+            "description": "Where the provider posts its assertion."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label."
+          },
+          "id": {
+            "type": "string",
+            "description": "The `smc_` identifier."
+          },
+          "idp_entity_id": {
+            "type": "string",
+            "description": "What the identity provider calls itself."
+          },
+          "organization_id": {
+            "type": "string",
+            "description": "The organization whose people sign in through this provider."
+          },
+          "sp_entity_id": {
+            "type": "string",
+            "description": "What this deployment calls itself to that provider."
           }
         }
       },

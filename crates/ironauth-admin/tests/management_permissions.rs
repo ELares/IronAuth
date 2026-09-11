@@ -447,6 +447,14 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // deprovisions an organization's entire user population, so minting or revoking one is
     // `WriteCredentials` on the same argument as the organization API key it sits beside; the
     // listing never carries a token and is `Read`.
+    // An organization's SAML upstream (issue #140 criterion 1). `WriteOrganizations` because
+    // it is organization configuration, and NOT vendor-only: an organization's own delegated
+    // administrator configuring that organization's sign-on is the product. `resolve_live_org`
+    // bounds which organization a confined credential may name.
+    (
+        "createSamlConnection",
+        ManagementPermission::WriteOrganizations,
+    ),
     (
         "createScimConnection",
         ManagementPermission::WriteCredentials,
@@ -913,6 +921,7 @@ const PERMISSION_PROVEN: &[&str] = &[
     // NAMES write_credentials, then drives the LISTING with a `write_config` credential so the
     // read is checked in both directions too. Verified by mutation: downgrading either write to
     // `Read`, or deleting the listing's check, fails that test and passes every other pin.
+    "createSamlConnection",
     "createScimConnection",
     "listScimConnections",
     "revokeScimConnection",
@@ -1071,12 +1080,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        236,
+        237,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        92,
+        93,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

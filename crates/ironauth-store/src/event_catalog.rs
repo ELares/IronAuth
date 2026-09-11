@@ -2912,6 +2912,40 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A SAML upstream now EXISTS for an organization (issue #140 criterion 1). Until this
+        // event there was no way to create one at all outside tests, so nothing could announce
+        // it; the sign-in path has read `saml_connections` since #139 and the rows only ever
+        // arrived through a config restore.
+        //
+        // THE ENTITY IDS ARE ON IT AND THE ACS URL IS NOT. A subscriber's question is "which
+        // upstream did this customer just wire up", which the two entity ids answer: the
+        // identity provider's names the vendor, and this deployment's names which SP identity
+        // was handed out. The ACS URL is derivable from the deployment and the connection id
+        // and would put a routable endpoint on every subscriber's queue for no new information.
+        //
+        // NO SIGNING CERTIFICATE, for the reason `saml_certificate.expiry_announced` gives:
+        // trust material belongs behind the management API where scope and permission are
+        // checked, not in an outbox row.
+        "saml_connection.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "saml_connection_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "idp_entity_id": {"type": "string", "minLength": 1},
+                "sp_entity_id": {"type": "string", "minLength": 1}
+            },
+            "required": [
+                "saml_connection_id",
+                "organization_id",
+                "idp_entity_id",
+                "sp_entity_id"
+            ]
+        }"#,
+    ),
+    (
         // The id and the ORGANIZATION, because a SCIM connection provisions INTO exactly one
         // organization and a consumer routing on "who gained a provisioning credential"
         // cannot get that from the id. The PROVIDER too: a SIEM correlating a new connection

@@ -1550,6 +1550,22 @@ impl Fixture {
             // one LIVE grant per (client, organization) pair, so reusing `client` here
             // would answer 409 and the case would pin a conflict rather than a create.
             Case {
+                label: "saml_connections.createSamlConnection",
+                method: "POST",
+                path: format!("{}/saml-connections", self.base),
+                body: Some(
+                    serde_json::json!({
+                        "display_name": "Okta Production",
+                        "idp_entity_id": "http://www.okta.com/exk1fake",
+                        "idp_sso_url": "https://idp.example/sso",
+                        "public_base_url": "https://auth.example",
+                    })
+                    .to_string(),
+                ),
+                intent: Intent::Write,
+                live: StatusCode::CREATED,
+            },
+            Case {
                 label: "project_grants.createProjectGrant",
                 method: "POST",
                 path: format!("{}/project-grants", self.base),
@@ -2403,6 +2419,18 @@ async fn a_soft_deleted_environment_answers_a_write_exactly_as_an_absent_one_doe
 /// out of the document, subtracts what this list drives, and pins the remainder EXACTLY. The
 /// gap is a number in an assertion that fails when it moves, rather than a sentence claiming
 /// there is no gap.
+/// The create body the SAML upstream replay drives, kept out of [`keyed_writes`] so that
+/// function stays inside the line bound rather than growing one entry at a time.
+fn saml_connection_body() -> String {
+    serde_json::json!({
+        "display_name": "Replay Okta",
+        "idp_entity_id": "http://www.okta.com/exk1replay",
+        "idp_sso_url": "https://idp.example/sso",
+        "public_base_url": "https://auth.example",
+    })
+    .to_string()
+}
+
 fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
     let Fixture {
         base,
@@ -2423,6 +2451,11 @@ fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
             "org_roles.createOrgRole",
             format!("{base}/roles"),
             serde_json::json!({ "slug": "replay.role", "display_name": "Replay" }).to_string(),
+        ),
+        (
+            "saml_connections.createSamlConnection",
+            format!("{base}/saml-connections"),
+            saml_connection_body(),
         ),
         (
             "org_contacts.createOrganizationContact",
@@ -2945,7 +2978,7 @@ async fn a_soft_deleted_environments_organization_content_is_still_readable() {
 /// a change that moves them fails here rather than quietly making a paragraph wrong.
 #[test]
 fn the_case_counts_are_pinned_where_they_can_be_measured() {
-    const WRITES: usize = 45;
+    const WRITES: usize = 46;
     const READS: usize = 21;
 
     let cases = replay_fixture_cases();

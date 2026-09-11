@@ -147,6 +147,7 @@ mod resource_servers;
 mod resource_types;
 mod response;
 mod routing_rules;
+mod saml_connections;
 mod secrets;
 mod service_account_keys;
 mod session_token_templates;
@@ -587,6 +588,13 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants",
             post(project_grants::create_project_grant).get(project_grants::list_project_grants),
+        )
+        // The organization's SAML upstream (issue #140 criterion 1). The GRANTING PATH for a
+        // table the sign-in plane has read since #139 and nothing wrote: see the module
+        // header for why the caller supplies a host and never an ACS URL.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/saml-connections",
+            post(saml_connections::create_saml_connection),
         )
         // One outbound message's delivery status (issue #111 criterion 1). A READ, which is
         // all the control plane holds on `messages`; the resend half writes and needs the data

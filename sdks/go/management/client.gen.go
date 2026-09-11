@@ -337,6 +337,13 @@ func (c *Client) CreateRoutingRule(tenant_id string, environment_id string, quer
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/routing-rules", query, body)
 }
 
+// CreateSamlConnection performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/saml-connections.
+//
+// createSamlConnection.
+func (c *Client) CreateSamlConnection(tenant_id string, environment_id string, organization_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/saml-connections", query, body)
+}
+
 // CreateScimConnection performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections.
 //
 // `POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`.
