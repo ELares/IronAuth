@@ -38,15 +38,13 @@ use std::path::Path;
 /// member who holds nothing -- the row an access review exists to surface and the one most
 /// likely to be dropped by a writer that iterates grants.
 ///
-/// The last row's slug carries ALL FOUR characters RFC 4180 makes the writer quote: a comma, a
-/// quote, a CR and an LF. Two of them would have been enough to catch a writer that stopped
-/// quoting ENTIRELY, and nothing weaker: a writer that quoted on a comma and not on a bare CR
-/// would have produced a file that splits into two records in a reader that scans for line
-/// endings, and the earlier fixture could not have told the difference.
+/// The last FOUR rows carry one quoting trigger each: a comma, a quote, a CR, an LF. Each is
+/// alone in its slug on purpose -- see the comment beside them -- so that removing any single
+/// character from the writer's rule changes the file. A row carrying two triggers pins neither.
 ///
-/// No slug validator would accept that value, and it is in the fixture anyway. What is frozen
-/// here is the WRITER's contract, which is about bytes: the day a column carries free text --
-/// a display name, a reason, a metadata field -- the quoting has to already work, and a
+/// No slug validator would accept those values, and they are in the fixture anyway. What is
+/// frozen here is the WRITER's contract, which is about bytes: the day a column carries free
+/// text -- a display name, a reason, a metadata field -- the quoting has to already work, and a
 /// fixture that only ever held well-formed ids would not have been pinning it.
 fn fixture_rows() -> Vec<AccessReviewRow> {
     vec![
@@ -84,31 +82,20 @@ fn fixture_rows() -> Vec<AccessReviewRow> {
             None,
         ),
         row("user", "omb_dave", "usr_dave", "", "none", None, None, None),
-        row(
-            "user",
-            "omb_eve",
-            "usr_eve",
-            "ops,\"emergency\"",
-            "direct",
-            None,
-            None,
-            None,
-        ),
-        // A field whose ONLY quoting trigger is the record separator. Kept apart from eve's
-        // because a value carrying a comma AND a line break is quoted by the comma rule alone:
-        // measured, a writer narrowed to `[',', '"']` still produced the identical file while
-        // eve was the only crafted row, so the CR and LF halves of the rule were pinned by
-        // nothing. Split out, that same narrowing changes the bytes and this test says so.
-        row(
-            "user",
-            "omb_frank",
-            "usr_frank",
-            "ops\r\nsecond-line",
-            "direct",
-            None,
-            None,
-            None,
-        ),
+        // FOUR ROWS, ONE CHARACTER EACH, and the arithmetic is the whole reason.
+        //
+        // The first attempt put a comma and a quote in one slug; the second added a CR and an
+        // LF to a second slug. Both pinned a DISJUNCTION rather than a rule: drop `,` from the
+        // writer and eve's field is still quoted by its quote, drop `\r` and frank's is still
+        // quoted by its `\n`, so the bytes never moved and the mutant lived. Measured, twice.
+        //
+        // One trigger per row makes each character individually load-bearing: remove any one
+        // from `csv_field` and exactly one of these four rows stops being quoted, which changes
+        // the file and fails this test by name.
+        row("user", "omb_eve", "usr_eve", "ops,emergency", "direct", None, None, None),
+        row("user", "omb_frank", "usr_frank", "ops\"emergency", "direct", None, None, None),
+        row("user", "omb_grace", "usr_grace", "ops\rsecond", "direct", None, None, None),
+        row("user", "omb_heidi", "usr_heidi", "ops\nsecond", "direct", None, None, None),
     ]
 }
 
@@ -136,6 +123,14 @@ fn row(
     }
 }
 
+/// Whether this run is REWRITING the fixtures rather than checking them.
+///
+/// The readers consult it and return: a run that is rewriting the files is in no position to
+/// assert anything about their contents.
+fn regenerating() -> bool {
+    std::env::var("IRONAUTH_REGENERATE_FIXTURES").as_deref() == Ok("1")
+}
+
 fn fixture(name: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -157,17 +152,21 @@ fn fixture(name: &str) -> String {
 /// variable set would quietly retire a contract instead of versioning it. The variable is
 /// spelled out rather than defaulted for that reason.
 ///
-/// RUN IT SINGLE-THREADED: `IRONAUTH_REGENERATE_FIXTURES=1 cargo test -p ironauth-store
-/// --test access_review_fixture -- --test-threads=1`. The two writer tests rewrite the same
-/// files the two reader tests are reading, and in parallel a reader can observe a half-written
-/// file and report a failure that has nothing to do with the format. Observed, not predicted:
-/// the first regeneration of the four-character fixture reported two failures that vanished on
-/// the next ordinary run.
+/// WHILE REGENERATING, THE READERS STAND DOWN. The two writer tests rewrite the same files the
+/// two reader tests read, and nothing orders them: a reader observes a half-written file and
+/// reports a failure that has nothing to do with the format. Observed, not predicted -- the
+/// first regeneration reported two failures that vanished on the next ordinary run.
+///
+/// `--test-threads=1` does NOT fix it, which is what the first version of this note claimed:
+/// serialising the tests does not order them, so a reader still runs before both writers
+/// roughly half the time. The readers call [`regenerating`] and return instead, so a
+/// regeneration run only ever WRITES. Run it, then run the suite normally to verify -- and the
+/// second run is the one whose result means anything.
 fn pinned(name: &str, produced: &str, what: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name);
-    if std::env::var("IRONAUTH_REGENERATE_FIXTURES").as_deref() == Ok("1") {
+    if regenerating() {
         std::fs::write(&path, produced)
             .unwrap_or_else(|error| panic!("rewrite {}: {error}", path.display()));
         return;
@@ -206,6 +205,10 @@ fn the_pinned_jsonl_is_what_the_writer_emits() {
 /// difference between "the file parsed" and "the file says what it is for".
 #[test]
 fn a_consumer_reconstructs_who_has_which_role_from_the_pinned_files() {
+    if regenerating() {
+        // The writers are rewriting these files right now and nothing orders us against them.
+        return;
+    }
     for (name, parsed) in [
         (
             "csv",
@@ -259,8 +262,10 @@ fn a_consumer_reconstructs_who_has_which_role_from_the_pinned_files() {
                 "usr_carol (user) holds billing-admin by time_boxed via agr_quarterclose \
                  until 1767225600000"
                     .to_owned(),
-                "usr_eve (user) holds ops,\"emergency\" by direct".to_owned(),
-                "usr_frank (user) holds ops\r\nsecond-line by direct".to_owned(),
+                "usr_eve (user) holds ops,emergency by direct".to_owned(),
+                "usr_frank (user) holds ops\"emergency by direct".to_owned(),
+                "usr_grace (user) holds ops\rsecond by direct".to_owned(),
+                "usr_heidi (user) holds ops\nsecond by direct".to_owned(),
             ],
             "{name}: the reconstruction does not match what the fixture records"
         );
@@ -287,6 +292,10 @@ fn a_consumer_reconstructs_who_has_which_role_from_the_pinned_files() {
 /// defect a shared column list exists to prevent, and this is where it would show.
 #[test]
 fn the_two_pinned_files_are_one_review() {
+    if regenerating() {
+        // The writers are rewriting these files right now and nothing orders us against them.
+        return;
+    }
     let from_csv = parse_csv(&fixture("access-review-v1.csv")).expect("the pinned CSV parses");
     let from_jsonl =
         parse_jsonl(&fixture("access-review-v1.jsonl")).expect("the pinned JSONL parses");

@@ -6,6 +6,8 @@ org_fixture01,user,omb_bob,usr_bob,member,default,,,
 org_fixture01,user,omb_carol,usr_carol,billing-admin,time_boxed,,agr_quarterclose,1767225600000
 org_fixture01,service_account,omb_robot,sva_nightly,reports-reader,direct,,,
 org_fixture01,user,omb_dave,usr_dave,,none,,,
-org_fixture01,user,omb_eve,usr_eve,"ops,""emergency""",direct,,,
-org_fixture01,user,omb_frank,usr_frank,"ops
-second-line",direct,,,
+org_fixture01,user,omb_eve,usr_eve,"ops,emergency",direct,,,
+org_fixture01,user,omb_frank,usr_frank,"ops""emergency",direct,,,
+org_fixture01,user,omb_grace,usr_grace,"opssecond",direct,,,
+org_fixture01,user,omb_heidi,usr_heidi,"ops
+second",direct,,,

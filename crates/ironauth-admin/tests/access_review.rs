@@ -247,8 +247,10 @@ async fn a_compliance_consumer_reconstructs_who_has_which_role_from_a_real_expor
     // a USER can be the subject of an access request (`require_grantable` parses `subject_id`
     // as a `UserId`), so there is no time-boxed row for a machine member to miss. This
     // scenario seeds no machine member, so neither run below enters that loop; the
-    // `service_account` row is covered end to end by the pinned store fixture instead, and the
-    // route is driven with a real machine member in `live_surface`.
+    // `service_account` row is pinned only at the SERIALISATION layer, by the store fixture,
+    // which builds rows in process and touches neither a database nor this endpoint. No test
+    // here drives a machine member through the export; `live_surface` drives the route with a
+    // real machine member present but asserts on the status, not on the rows.
     //
     // WHAT THE SECOND RUN BUYS, stated exactly, because the first version of this comment
     // credited it with a measurement it does not make.
@@ -284,8 +286,9 @@ async fn a_compliance_consumer_reconstructs_who_has_which_role_from_a_real_expor
 /// Everything the review is OF: three roles, a default, a two-level group tree, three members,
 /// one direct assignment and one group membership.
 ///
-/// Returns `(finance group id, alice, bob, carol)` -- the membership ids, because the export
-/// keys rows on the membership rather than on the user.
+/// Returns a [`Fixture`] naming every id it minted: the two groups, the three memberships and
+/// the three users. Every one of them, because a row is compared between two runs by NAMING
+/// its ids, and an id the caller cannot name is an id the comparison cannot normalise.
 async fn seed_review_fixture(
     h: &Harness,
     tenant: &str,
@@ -521,7 +524,11 @@ fn normalise_rows(
                     // deleted. It is also a finding in its own right: the export is bounded by
                     // one organization, so every id in it should be one of ours.
                     assert!(
-                        !["org_", "omb_", "usr_", "sva_", "grp_", "orl_", "agr_"]
+                        // `rol_` and not `orl_`: `OrgRoleKind::PREFIX` is "rol", and the
+                        // first version of this list guarded against a prefix no id in this
+                        // codebase has ever carried -- so a leaked role id was exactly what it
+                        // would NOT have caught.
+                        !["org_", "omb_", "usr_", "sva_", "grp_", "rol_", "agr_"]
                             .iter()
                             .any(|prefix| stable.starts_with(prefix)),
                         "the export carried an id this scenario never created, in column \
