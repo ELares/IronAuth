@@ -58973,7 +58973,12 @@ impl ActingOrgGroupRepo<'_> {
         .await
     }
 
-    /// [`Self::create`], additionally emitting `org_group.created` (issue #108).
+    /// [`Self::create`], additionally emitting the events the caller hands it (issue #108).
+    ///
+    /// A SLICE rather than one event, because a group created under a parent has two things to
+    /// announce (issue #145 criterion 2): `org_group.created`, and an `org_group.reparented`
+    /// carrying the edge that the create event's closed schema cannot hold. Every element is
+    /// enqueued in the write's own transaction, so a create announces all of them or none.
     ///
     /// # Errors
     ///

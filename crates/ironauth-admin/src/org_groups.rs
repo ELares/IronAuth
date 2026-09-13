@@ -751,9 +751,12 @@ pub async fn delete_org_group(
 /// group is scoped to one organization and a receiver keeping a per-organization view cannot
 /// file the event without knowing which.
 ///
-/// `parent` is passed only by the reparent, and is OMITTED from the payload when the group
-/// becomes a ROOT -- mirroring the column, and matching the subscription payload's rule: no
-/// invented sentinel for "none".
+/// `parent` is passed by the reparent AND by the create, which emits an
+/// `org_group.reparented` of its own when the new group is nested (issue #145 criterion 2):
+/// `org_group.created` cannot carry the edge, its schema being closed, and a consumer that
+/// never learns it attaches every nested group to the root. It is OMITTED from the payload
+/// when the group becomes a ROOT -- mirroring the column, and matching the subscription
+/// payload's rule: no invented sentinel for "none".
 fn org_group_event(
     state: &AdminState,
     scope: ironauth_store::Scope,
