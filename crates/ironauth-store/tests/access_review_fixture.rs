@@ -18,8 +18,11 @@
 //! # Changing them
 //!
 //! A change to these files is a change to a published contract. ADDING a column is compatible
-//! and the file is regenerated (a consumer reading by name is unaffected, one reading by
-//! position keeps every column it had, which is why columns are appended and never inserted).
+//! and the file is regenerated: a consumer reading by NAME is unaffected in either format, and
+//! in the CSV one reading by POSITION keeps every column it had, which is why
+//! `ACCESS_REVIEW_COLUMNS` is appended to and never inserted into. That positional argument is
+//! CSV-only -- the JSONL writer emits its keys alphabetically, so a new column lands wherever
+//! the alphabet puts it and a JSONL consumer has no positions to keep.
 //! RENAMING, REORDERING or REMOVING one is not: that needs `access-review-v2` beside this file
 //! and both served, because the whole point of a pinned fixture is that a consumer's ingest
 //! does not break on a Tuesday.
@@ -28,6 +31,24 @@ use ironauth_store::access_review::{
     parse_csv, parse_jsonl, to_csv, to_jsonl, AccessReviewRow, ACCESS_REVIEW_COLUMNS,
 };
 use std::path::Path;
+
+/// A run that REWROTE the fixtures is not a run that checked them, and says so.
+///
+/// With `IRONAUTH_REGENERATE_FIXTURES=1` the writers overwrite and the readers stand down, so
+/// without this the whole target reports "4 passed" having asserted nothing about the format --
+/// a green that means the opposite of what a green usually means, and exactly the shape that
+/// lets a breaking change be regenerated into the contract and committed under a passing run.
+/// This FAILS on any regeneration run, so the only way to see this target pass is to run it
+/// without the variable.
+#[test]
+fn a_regeneration_run_is_not_a_verification() {
+    assert!(
+        !regenerating(),
+        "IRONAUTH_REGENERATE_FIXTURES=1 rewrote the pinned fixtures and nothing here checked \
+         them. Run the suite again without the variable, and treat THAT result as the contract \
+         test"
+    );
+}
 
 /// The rows the fixture files hold, in file order.
 ///
@@ -157,11 +178,17 @@ fn fixture(name: &str) -> String {
 /// reports a failure that has nothing to do with the format. Observed, not predicted -- the
 /// first regeneration reported two failures that vanished on the next ordinary run.
 ///
-/// `--test-threads=1` does NOT fix it, which is what the first version of this note claimed:
-/// serialising the tests does not order them, so a reader still runs before both writers
-/// roughly half the time. The readers call [`regenerating`] and return instead, so a
-/// regeneration run only ever WRITES. Run it, then run the suite normally to verify -- and the
-/// second run is the one whose result means anything.
+/// `--test-threads=1` does NOT fix it, which is what the first version of this note claimed --
+/// and "a reader still runs before both writers roughly half the time", which is what the
+/// SECOND version claimed, is wrong in the other direction. libtest orders by test NAME, so
+/// `a_consumer_reconstructs_who_has_which_role_from_the_pinned_files` sorts ahead of every
+/// `the_pinned_*` writer and runs first EVERY time. Serialising made the failure deterministic
+/// rather than removing it.
+///
+/// The readers call [`regenerating`] and return instead, so a regeneration run only ever
+/// WRITES. Run it, then run the suite normally -- the second run is the one whose result means
+/// anything, and `a_regeneration_run_is_not_a_verification` refuses to let the first be
+/// mistaken for it.
 fn pinned(name: &str, produced: &str, what: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")

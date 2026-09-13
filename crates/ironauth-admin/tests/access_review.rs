@@ -2,10 +2,17 @@
 
 //! The access-review export surface (issue #145 criterion 1).
 //!
-//! The rows are covered in `ironauth-store`. What is worth driving here is what the HTTP layer
-//! adds and could get wrong: that both formats are served with the content type a consumer
-//! keys on, that an unknown format is refused rather than silently defaulted, and that the
-//! export is bounded by the organization in the path.
+//! The rows' SERIALISATION is covered in `ironauth-store`, over rows handed to it in process.
+//! What is driven here is what only a served export can answer.
+//!
+//! Two different things, and the division used to be "rows there, HTTP concerns here":
+//!
+//!   * what the HTTP layer adds and could get wrong -- both formats served with the content
+//!     type a consumer keys on, an unknown format refused rather than silently defaulted, and
+//!     the export bounded by the organization in the path;
+//!   * and what the RESOLUTION could get wrong, which no in-process fixture can reach: whether
+//!     an export built over a real organization with a real group tree tells a consumer who
+//!     holds which role, including the roles held through no assignment row that names them.
 
 mod common;
 
@@ -286,9 +293,13 @@ async fn a_compliance_consumer_reconstructs_who_has_which_role_from_a_real_expor
 /// Everything the review is OF: three roles, a default, a two-level group tree, three members,
 /// one direct assignment and one group membership.
 ///
-/// Returns a [`Fixture`] naming every id it minted: the two groups, the three memberships and
-/// the three users. Every one of them, because a row is compared between two runs by NAMING
-/// its ids, and an id the caller cannot name is an id the comparison cannot normalise.
+/// Returns a [`Fixture`] naming every id that can REACH THE EXPORT: the two groups, the three
+/// memberships and the three users. A row is compared between two runs by naming its ids, and
+/// an id the caller cannot name is one the comparison cannot normalise.
+///
+/// The three ROLE ids it mints are deliberately not among them, and that is not an omission
+/// the next reader should close: the export carries a role SLUG and never a role id, so a
+/// `rol_` value appearing in it would be a defect rather than something to normalise away.
 async fn seed_review_fixture(
     h: &Harness,
     tenant: &str,
@@ -441,28 +452,15 @@ async fn review_scenario(h: Harness) -> Vec<Vec<(String, String)>> {
         paths
     };
 
-    assert_eq!(
-        describe(&alice),
-        vec![
-            "billing-admin by direct".to_owned(),
-            "member by default".to_owned(),
+    assert_grant_paths(&describe(&alice), &describe(&bob), &describe(&carol));
+
+    assert_subject_of_each_membership(
+        &from_csv,
+        &[
+            (&alice, &f.alice_user, "alice"),
+            (&bob, &f.bob_user, "bob"),
+            (&carol, &f.carol_user, "carol"),
         ],
-        "alice holds a direct grant and the organization default"
-    );
-    assert_eq!(
-        describe(&bob),
-        vec![
-            "member by default".to_owned(),
-            "reports-reader by group via finance".to_owned(),
-        ],
-        "bob holds the role through the group his own group DESCENDS from. An export that \
-         reported only assignment rows would show him holding nothing of the sort, while his \
-         token carries it"
-    );
-    assert_eq!(
-        describe(&carol),
-        vec!["member by default".to_owned()],
-        "carol was assigned nothing, so the default is all she holds"
     );
 
     // AND THE CONSUMER SEES EVERY MEMBER. A reconstruction over the people it happens to
@@ -498,6 +496,63 @@ async fn review_scenario(h: Harness) -> Vec<Vec<(String, String)>> {
     )
 }
 
+/// What each member holds, and by which path.
+///
+/// `bob` is the one the criterion is about: he is a member of `finance-ap` and the role is
+/// granted to its PARENT `finance`, so he holds it through the ancestor closure and through no
+/// assignment row that names him. An export reporting only assignment rows would show him
+/// holding nothing of the sort while his token carries it.
+fn assert_grant_paths(alice: &[String], bob: &[String], carol: &[String]) {
+    assert_eq!(
+        alice,
+        [
+            "billing-admin by direct".to_owned(),
+            "member by default".to_owned(),
+        ],
+        "alice holds a direct grant and the organization default"
+    );
+    assert_eq!(
+        bob,
+        [
+            "member by default".to_owned(),
+            "reports-reader by group via finance".to_owned(),
+        ],
+        "bob holds the role through the group his own group DESCENDS from"
+    );
+    assert_eq!(
+        carol,
+        ["member by default".to_owned()],
+        "carol was assigned nothing, so the default is all she holds"
+    );
+}
+
+/// Every row of a membership names that membership's OWN subject.
+///
+/// Nothing else in the scenario binds the two: the per-member assertions filter on
+/// `membership_id` and render the role, the source and the group, so an export that paired
+/// alice's membership with bob's user id satisfied all of them. An access review answers "WHO
+/// has which role", and the who is this column.
+fn assert_subject_of_each_membership(
+    rows: &[ironauth_store::access_review::ConsumedRow],
+    expected: &[(&str, &str, &str)],
+) {
+    for (membership, subject, who) in expected {
+        let subjects: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.fields.get("membership_id").map(String::as_str) == Some(*membership))
+            .filter_map(|row| row.fields.get("subject_id").map(String::as_str))
+            .collect();
+        assert!(
+            !subjects.is_empty(),
+            "{who} contributed no row at all, so the check below proves nothing"
+        );
+        assert!(
+            subjects.iter().all(|found| found == subject),
+            "a row for {who}'s membership named somebody else as the subject: {subjects:?}"
+        );
+    }
+}
+
 /// Replace every id this scenario minted with a stable name, so two runs can be compared.
 ///
 /// The first version of the two-run comparison returned the three `describe` vectors -- the
@@ -531,8 +586,13 @@ fn normalise_rows(
                         !["org_", "omb_", "usr_", "sva_", "grp_", "rol_", "agr_"]
                             .iter()
                             .any(|prefix| stable.starts_with(prefix)),
-                        "the export carried an id this scenario never created, in column \
-                         {column}: {value}"
+                        // NOT "an id this scenario never created": for `rol_` that would be
+                        // the opposite of the truth, since the scenario mints three role ids
+                        // and simply does not expect any of them to reach the export. What is
+                        // true of EVERY prefix listed is that the comparison cannot name it.
+                        "the export carried an id the comparison cannot name, in column \
+                         {column}: {value}. Either it belongs to another organization, or it \
+                         is a kind of id this export is not supposed to carry"
                     );
                     (column.clone(), stable)
                 })
