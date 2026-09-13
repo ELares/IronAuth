@@ -1531,6 +1531,22 @@ fn sso_saml_section(
         acs = escape_html(&connection.acs_url),
         audience = escape_html(&connection.sp_entity_id),
     );
+    // THE TEST FORM, on every connection whether or not it is switched on (issue #140
+    // criterion 6). An admin whose connection is off is exactly the one still setting it up,
+    // and telling them to come back later to find out why their response is refused is the
+    // conversation this page exists to prevent.
+    let _ = write!(
+        body,
+        "<form method=\"post\" action=\"{base}/t/{tenant}/e/{environment}/portal/s/sso/test\">\
+         <input type=\"hidden\" name=\"connection_id\" value=\"{connection}\">\
+         <p><label>Paste a SAMLResponse from your identity provider to find out what it would \
+         do here:<br><textarea name=\"saml_response\" rows=\"4\" cols=\"60\"></textarea></label></p>\
+         <p><button type=\"submit\">Test this connection</button></p></form>",
+        base = escape_html(state.issuer_base().trim_end_matches('/')),
+        tenant = escape_html(&scope.tenant().to_string()),
+        environment = escape_html(&scope.environment().to_string()),
+        connection = escape_html(&connection.id.to_string()),
+    );
     if connection.active {
         let _ = write!(
             body,
@@ -1958,4 +1974,220 @@ fn unavailable() -> Response {
                 <p>This did not work just now. Your link has not been used; try again.</p>"
         .to_owned();
     crate::pages::secure_html(StatusCode::SERVICE_UNAVAILABLE, body)
+}
+
+/// A connection test that could not be run, as a page.
+///
+/// SEPARATE FROM A DIAGNOSIS. These are problems with the REQUEST -- an id that is not a
+/// connection, a paste that is not base64 -- and answering them with a verdict about the
+/// connection would tell an operator their identity provider is broken when their clipboard is.
+fn test_refusal(reason: &str) -> Response {
+    crate::pages::secure_html(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>Connection test</title>\
+             <h1>Connection test</h1><p>{reason}.</p>",
+            reason = escape_html(reason)
+        ),
+    )
+}
+
+/// Turn a typed failure into the sentence that says what to change.
+///
+/// THE POINT OF THE WHOLE SURFACE (issue #140 criterion 6: "as actionable messages, not generic
+/// errors"). Each arm names WHERE the fix is -- this deployment's configuration, the identity
+/// provider's, or the document itself -- because an operator who is told "the signature did not
+/// verify" when they have pinned nothing goes and looks at their identity provider, which is
+/// fine, and stays there.
+///
+/// The two the criterion names by name are the first two. `NoTrustAnchor` is the setup step
+/// nobody did; `WrongAudience` is the one an identity provider gets wrong by default, because
+/// its own field for it is usually pre-filled with something else.
+fn diagnose(
+    error: &crate::saml_acs::AcsError,
+    connection: &ironauth_store::SamlConnection,
+) -> String {
+    use crate::saml_acs::AcsError;
+    use ironauth_saml::ConditionError;
+
+    match error {
+        AcsError::NoTrustAnchor => format!(
+            "<p><strong>No signing certificate is pinned for this connection.</strong> Until \
+             one is, every response your identity provider sends will be refused, however \
+             correct it is.</p><p>Export the signing certificate from your identity provider \
+             and ask your vendor to pin it against <code>{name}</code>.</p>",
+            name = escape_html(&connection.display_name)
+        ),
+        AcsError::AllCertificatesUnusable { pinned } => format!(
+            "<p><strong>This connection has {pinned} certificate(s) pinned and none of them \
+             can be read.</strong> That is a stored row this deployment should not be holding \
+             rather than anything you configured. Send this page to your vendor.</p>"
+        ),
+        AcsError::Condition(ConditionError::WrongAudience { found }) => format!(
+            "<p><strong>Your identity provider is sending the wrong audience.</strong></p>\
+             <p>It sent <code>{found}</code>. This connection expects <code>{expected}</code>.</p>\
+             <p>In your identity provider, set the audience (sometimes called the SP entity ID, \
+             or the Audience URI) to exactly the expected value above.</p>",
+            found = escape_html(found.as_deref().unwrap_or("nothing")),
+            // THE EXPECTED VALUE COMES FROM THE CONNECTION, not from the error. The variant
+            // carries only what the document said, which is right: what we expect is ours to
+            // know and the document has no business asserting it. Reading it from the row also
+            // means the sentence names the value an operator can go and copy.
+            expected = escape_html(&connection.sp_entity_id)
+        ),
+        AcsError::Condition(ConditionError::WrongIssuer { found }) => format!(
+            "<p><strong>The response came from a different identity provider.</strong></p>\
+             <p>It said it was <code>{found}</code>. This connection expects \
+             <code>{expected}</code>.</p><p>Either you pasted a response from another \
+             application, or the issuer (entity ID) configured here is not the one your \
+             identity provider uses.</p>",
+            found = escape_html(found.as_deref().unwrap_or("nothing")),
+            expected = escape_html(&connection.idp_entity_id)
+        ),
+        AcsError::Condition(ConditionError::Expired) => {
+            "<p><strong>This response has expired.</strong> That is expected for a document \
+             captured a while ago: SAML responses are valid for minutes. Capture a fresh one \
+             and paste that.</p><p>If it was captured seconds ago, the clock on your identity \
+             provider and the clock here disagree.</p>"
+                .to_owned()
+        }
+        // EVERYTHING PASSED. `examine` checks the signature, then the conditions, and only then
+        // whether the connection accepts a response it did not ask for -- so reaching this
+        // variant means the certificate, the issuer, the audience and the window all held.
+        //
+        // A PASTED DOCUMENT IS ALWAYS UNSOLICITED, because nothing here started the sign-in it
+        // answers. Reporting that as a failure would tell an operator whose setup is perfect to
+        // go and change something, which is the exact complaint #140 makes about generic
+        // errors. So it is the good news, with the one thing it cannot vouch for said plainly.
+        AcsError::UnsolicitedRefused => format!(
+            "<p><strong>The certificate, issuer, audience and validity window all check \
+             out.</strong></p><p>The one thing this test cannot check is the correlation: a \
+             pasted response answers no sign-in that this deployment started, and \
+             <code>{name}</code> is set to accept only responses to its own requests. That is \
+             the right setting and a real sign-in will carry what it needs.</p>",
+            name = escape_html(&connection.display_name)
+        ),
+        AcsError::Signature(_) => format!(
+            "<p><strong>The signature did not verify against the certificate pinned for this \
+             connection.</strong></p><p>The usual cause is a certificate that has been rotated \
+             at your identity provider and not re-pinned here. Export the current signing \
+             certificate from your identity provider and compare it with what is pinned \
+             against <code>{name}</code>.</p>",
+            name = escape_html(&connection.display_name)
+        ),
+        // EVERY OTHER VARIANT, and it is a real answer rather than a shrug: the ones that reach
+        // here are about the document's own shape, and the operator's next step is the same for
+        // all of them, which is to capture a fresh response rather than to change a setting.
+        other => format!(
+            "<p><strong>This response was refused.</strong> {detail}</p><p>Nothing in this \
+             connection's configuration explains it, so capture a fresh response and try \
+             again. If it keeps happening, send this page to your vendor.</p>",
+            detail = escape_html(&other.to_string())
+        ),
+    }
+}
+
+/// The pasted document a connection test diagnoses.
+#[derive(Debug, serde::Deserialize)]
+pub struct ConnectionTestForm {
+    /// Which SAML connection the response is supposed to be for.
+    pub connection_id: String,
+    /// The base64 `SAMLResponse` exactly as the identity provider produced it.
+    pub saml_response: String,
+}
+
+/// Diagnose a SAML response the operator pasted, and say what to fix (issue #140 criterion 6).
+///
+/// # Why a paste rather than a round trip
+///
+/// The typed reasons already exist. `saml_acs::examine` returns a variant per fixable cause --
+/// `NoTrustAnchor` for a certificate nobody pinned, `Condition(WrongAudience)` for an identity
+/// provider sending the wrong audience -- and `saml_route`'s own doc says of them: "THAT FLOW IS
+/// NOT BUILT ... today the variant reaches a Rust caller and nothing else". This is the flow.
+///
+/// The ACS cannot render those sentences. Its poster is anybody, and some of the variants quote
+/// THIS DEPLOYMENT'S configuration back. Here the poster holds a portal session for the
+/// organization that owns the connection, which makes them a reader entitled to their own
+/// configuration -- the condition `saml_route` names for exactly this surface.
+///
+/// # It spends nothing
+///
+/// `examine` is the stateless half: it verifies the signature and checks the conditions and
+/// never touches the store. So a test does not consume an outstanding request, does not record
+/// a replay, and cannot burn a real sign-in that happens to be in flight. An operator may paste
+/// the same document twice and get the same answer, which is what makes it a TEST rather than
+/// a login attempt with the result printed.
+pub async fn connection_test_post(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::Form(form): axum::Form<ConnectionTestForm>,
+) -> Response {
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return refused();
+    };
+    // THE SAME ORIGIN GUARD every portal POST takes. This one reads a connection's pinned
+    // certificates and reports on them, so a cross-origin post would let another site learn
+    // whether a given organization has finished its SSO setup.
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+    let session = match resolve_session(&state, scope, &headers).await {
+        Ok(session) => session,
+        Err(refusal) => return refusal.into_response(),
+    };
+    if let Err(refusal) = session.require_intent("sso") {
+        return refusal.into_response();
+    }
+
+    let read = state.store().scoped(scope);
+    let Ok(connection_id) =
+        ironauth_store::SamlConnectionId::parse_in_scope(&form.connection_id, &scope)
+    else {
+        return test_refusal("that is not a connection of this deployment");
+    };
+    let connection = match read.saml_connections().find_active(&connection_id).await {
+        Ok(Some(connection)) => connection,
+        Ok(None) => return test_refusal("no active connection with that id"),
+        Err(_) => return PortalRefusal::Unavailable.into_response(),
+    };
+    // THE ORGANIZATION FENCE, and it is the reason this is not simply a management route. A
+    // portal session is bound to ONE organization, and a connection id is guessable in the way
+    // every id is: without this, a link issued for one customer diagnoses another's connection
+    // and reports their audience and certificate count back.
+    if &connection.organization_id != session.organization() {
+        return test_refusal("no active connection with that id");
+    }
+    let Ok(certificates) = read.saml_connections().certificates(&connection_id).await else {
+        return PortalRefusal::Unavailable.into_response();
+    };
+
+    let decoded = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.decode(form.saml_response.trim())
+    };
+    let Ok(response) = decoded else {
+        return test_refusal(
+            "that does not look like a SAMLResponse. Paste the base64 value of the \
+             SAMLResponse form field, not the URL or the decoded XML",
+        );
+    };
+
+    let acs = crate::saml_acs::Acs {
+        connection: &connection,
+        certificates: &certificates,
+        now_unix_secs: crate::saml_route::unix_seconds_for_test(state.now()),
+        limits: &ironauth_saml::Limits::default(),
+    };
+    let verdict = match crate::saml_acs::examine(&acs, &response) {
+        Ok(_) => "<p>This response verifies against this connection. Signature, audience, \
+                  issuer and conditions all hold.</p>"
+            .to_owned(),
+        Err(error) => diagnose(&error, &connection),
+    };
+    let body = format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Connection test</title>\
+         <h1>Connection test</h1>{verdict}"
+    );
+    crate::pages::secure_html(StatusCode::OK, body)
 }

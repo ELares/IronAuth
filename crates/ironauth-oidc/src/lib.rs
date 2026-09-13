@@ -558,6 +558,13 @@ pub fn oidc_router(state: OidcState) -> Router {
             "/t/{tenant_id}/e/{environment_id}/portal/s/certificate-renewal/pin",
             post(portal_route::renewal_pin_post),
         )
+        // DIAGNOSING A PASTED SAML RESPONSE (issue #140 criterion 6). Its own path for the same
+        // reason the two above have one: the surface route stays a read, and the form that means
+        // to reach a diagnosis is the only thing that does.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/portal/s/sso/test",
+            post(portal_route::connection_test_post),
+        )
         .route(
             "/t/{tenant_id}/e/{environment_id}/portal/finish",
             post(portal_route::finish_post),

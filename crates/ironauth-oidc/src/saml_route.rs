@@ -142,6 +142,10 @@ const MAX_ENCODED_RESPONSE: usize = 512 * 1024;
 /// green. On a real clock the same mistake passes ~1.8e15 as a second count, which puts every
 /// window tens of millions of years in the future and refuses every genuine response as expired.
 /// The unit test below is where that is measured.
+pub(crate) fn unix_seconds_for_test(now: SystemTime) -> i64 {
+    unix_seconds(now)
+}
+
 fn unix_seconds(now: SystemTime) -> i64 {
     epoch_micros(now) / 1_000_000
 }
