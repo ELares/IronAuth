@@ -3384,6 +3384,56 @@ pub async fn scim_setup_post(
     crate::pages::secure_html(StatusCode::OK, body)
 }
 
+/// The stored, secret-free connector document for an admin's OIDC upstream.
+///
+/// # It goes through `ConnectorDefinition`, which is the point
+///
+/// The management API composes what it stores by parsing that type, VALIDATING it, and
+/// serialising `secret_free_json`. A hand-built object here would be a shape nothing checks: it
+/// would store, and fail later, at sign-in, as "the connection does not work" with no page able
+/// to say why. The first version of this function built one, and it was wrong -- the type
+/// refused its `client_secret` shape, which nothing would have noticed until a sign-in.
+///
+/// WHAT THE SIGN-IN PATH READS IS A THIRD TYPE, `ConnectorRuntimeConfig`, and going through
+/// `ConnectorDefinition` is what makes the stored document satisfy it: the projection is exactly
+/// what the management plane stores, and that is the document the runtime has always parsed.
+///
+/// # What it fixes, and what it leaves to the operator
+///
+/// Everything the admin supplied is in it. Everything that decides how much this deployment
+/// TRUSTS the upstream is left at the type's own defaults -- the capability matrix, the claim
+/// mapping, the quirks -- which is the same decision `oidc_upstream_setup` makes for the
+/// capability COLUMNS, and for the same reason: those are the operator's.
+///
+/// `None` means this deployment composed a document its own type refuses, which is a bug here
+/// rather than anything the admin typed.
+fn connector_definition(
+    slug: &str,
+    display_name: &str,
+    issuer: &str,
+    client_id: &str,
+) -> Option<String> {
+    // THE SECRET IS NOT IN IT. `secret_free_json` strips the field, and the portal seals the
+    // real value separately -- so the placeholder below never reaches storage and never reaches
+    // a queue. It is present only because the type requires the field to parse.
+    let document = serde_json::json!({
+        "connector_id": slug,
+        "display_name": display_name,
+        "protocol": "oidc",
+        "endpoints": { "issuer": issuer },
+        "scopes": ["openid", "email"],
+        "client_id": client_id,
+        "client_secret": "placeholder",
+    });
+    let definition: ironauth_connector::ConnectorDefinition =
+        serde_json::from_value(document).ok()?;
+    definition.validate().ok()?;
+    definition
+        .secret_free_json()
+        .ok()
+        .map(|value| value.to_string())
+}
+
 /// What to call a provider on a page a customer reads.
 ///
 /// THE STORED VALUE IS A SLUG and the constraint on the column keeps it to three, which is what
@@ -3561,15 +3611,18 @@ pub async fn oidc_setup_post(
         return PortalRefusal::Unavailable.into_response();
     };
 
-    let definition = serde_json::json!({
-        "connector_id": slug,
-        "display_name": display_name,
-        "protocol": "oidc",
-        "endpoints": { "issuer": issuer },
-        "scopes": ["openid", "email"],
-        "client_id": client_id,
-    })
-    .to_string();
+    // THROUGH THE RUNTIME'S OWN TYPE, not hand-serialised. What is stored has to be a document
+    // `ConnectorDefinition` can read, because that is what the federation flow parses at every
+    // sign-in -- and a hand-built object that the type later stops accepting produces a
+    // connector which exists, looks configured, and fails at sign-in with nothing on any page to
+    // explain it. The management API builds its stored document the same way, through
+    // `validate` and `secret_free_json`, so the two planes cannot disagree about the shape.
+    //
+    // A FAILURE HERE IS OURS, NOT THE ADMIN'S: every value they supplied has already been
+    // checked, so what is left is this deployment composing a document its own type refuses.
+    let Some(definition) = connector_definition(&slug, display_name, issuer, client_id) else {
+        return PortalRefusal::Unavailable.into_response();
+    };
     let binding_id = ironauth_store::OrgConnectionId::generate(state.env(), &scope);
     if queue_oidc_setup(
         &state,

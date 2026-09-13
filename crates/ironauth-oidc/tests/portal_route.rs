@@ -7585,3 +7585,95 @@ async fn the_token_page_names_the_provider_and_the_wait() {
         "and the sentence still has to read: {page}"
     );
 }
+
+#[tokio::test]
+async fn the_stored_definition_is_one_the_runtime_can_read() {
+    // A HAND-BUILT DOCUMENT IS A SHAPE NOTHING CHECKS. The federation flow parses
+    // `ConnectorDefinition` out of `definition_json` at every sign-in, so a connector stored
+    // with an object that type cannot read exists, looks configured on every page, and fails at
+    // sign-in with nothing able to say why. The management API composes what it stores through
+    // `validate` and `secret_free_json`; so does this.
+    //
+    // AND THE SECRET IS NOT IN IT, which is the other half: the portal seals the real value
+    // separately, and the placeholder the type requires to parse must not survive into storage.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "sso", "def-1", &org).await;
+
+    let (status, body) = submit_oidc_setup(
+        &harness,
+        &cookie,
+        "Acme Entra",
+        "https://login.example/acme",
+        "client-abc",
+        "super-secret-value",
+    )
+    .await;
+    assert_eq!(status, 303, "the setup: {body}");
+    apply_oidc_setups(&harness).await;
+
+    let scope = harness.scope();
+    let bindings = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .org_connections()
+        .list_for_organization(&org, 10)
+        .await
+        .expect("list");
+    let connector = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .connectors()
+        .parse_id(
+            bindings[0]
+                .connector_id
+                .as_deref()
+                .expect("the binding names a connector"),
+        )
+        .expect("parses");
+    let record = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .connectors()
+        .get(&connector)
+        .await
+        .expect("the connector exists");
+
+    // THE READ THE FEDERATION FLOW ACTUALLY MAKES, which is `ConnectorRuntimeConfig` and not
+    // `ConnectorDefinition`. The two are different types on purpose: the stored document is
+    // SECRET-FREE, so it cannot satisfy a type that requires `client_secret` -- and asserting
+    // against that type would have been asserting a contract nothing has.
+    let parsed: ironauth_connector::ConnectorRuntimeConfig =
+        serde_json::from_str(&record.definition_json)
+            .expect("the stored definition has to parse as the type the sign-in path reads");
+    assert_eq!(parsed.client_id, "client-abc");
+    // THE ISSUER LANDED IN THE DISCOVERY VARIANT, which is what an `endpoints: { issuer }`
+    // document means to this type -- and the variant is what decides whether the flow fetches
+    // a discovery document at all, so getting it wrong would produce a connector that parses
+    // and then does not sign anybody in.
+    assert!(
+        matches!(
+            &parsed.endpoints,
+            ironauth_connector::Endpoints::Discovery(endpoints)
+                if endpoints.issuer == "https://login.example/acme"
+        ),
+        "the issuer the admin typed has to reach the runtime's discovery endpoints: {:?}",
+        parsed.endpoints
+    );
+
+    // THE PLACEHOLDER MUST NOT HAVE SURVIVED. `secret_free_json` strips the field, and the real
+    // value lives sealed on the row rather than in this document.
+    assert!(
+        !record.definition_json.contains("placeholder"),
+        "the parse placeholder reached storage: {}",
+        record.definition_json
+    );
+    assert!(
+        !record.definition_json.contains("super-secret-value"),
+        "the admin's secret reached the stored definition: {}",
+        record.definition_json
+    );
+}
