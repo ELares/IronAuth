@@ -7779,3 +7779,233 @@ async fn the_guide_and_the_created_connection_agree_about_the_name_id() {
         "the guide still names the vendor-side action the criterion removes: {page}"
     );
 }
+
+#[tokio::test]
+async fn a_second_connection_to_the_same_provider_is_not_silently_discarded() {
+    // `saml_connections_one_per_idp` is `UNIQUE (tenant, environment, organization,
+    // idp_entity_id)`, and the consumer's Conflict arm assumed the conflict was always on the
+    // connection ID -- a redelivery. It is not: an admin who submits the form twice for one
+    // identity provider raises it on the IdP key, where the connection this row names was never
+    // written. Treating that as done pinned their certificate onto nothing, answered them 303,
+    // and raised no dead letter.
+    //
+    // THE TEST IS THE SECOND SUBMISSION, and what it asserts is that the WORKER refuses it --
+    // because the admin has already been told 303 and the only way anybody learns is the queue.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "sso", "conflict-1", &org).await;
+
+    for label in ["first", "second"] {
+        let (status, body) = submit_saml_setup(
+            &harness,
+            &cookie,
+            &format!("Acme Okta {label}"),
+            "https://idp.example/entity",
+            "https://idp.example/sso",
+            &pem_certificate(11),
+        )
+        .await;
+        assert_eq!(
+            status, 303,
+            "the {label} setup was refused at the form: {body}"
+        );
+    }
+
+    // THE FIRST APPLIES, THE SECOND DOES NOT, and the second is an ERROR rather than a no-op.
+    use ironauth_store::outbox::OutboxConsumer as _;
+    let env = Env::system();
+    let scope = harness.scope();
+    let consumer = ironauth_admin::saml_connection_setup::SamlConnectionSetupConsumer::new(
+        harness.db().control_store().clone(),
+    );
+    // ONE AT A TIME, because both rows share an ordering key -- the organization -- and the
+    // outbox hands out one per key so setups for one customer apply in the order they were
+    // made. Claiming ten returns one.
+    let mut outcomes = Vec::new();
+    for _ in 0..2 {
+        let claimed = harness
+            .db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::SAML_CONNECTION_SETUP_CONSUMER,
+                std::time::Duration::from_secs(30),
+                10,
+            )
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1, "one row per ordering key at a time");
+        let applied = consumer.handle(&env, scope, &claimed[0]).await.is_ok();
+        outcomes.push(applied);
+        // COMPLETED EITHER WAY, so the second row is reachable. A real worker would dead-letter
+        // the failure instead; what this test needs is to see both verdicts.
+        harness
+            .db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .complete(&env, &claimed[0])
+            .await
+            .expect("complete");
+    }
+    assert_eq!(
+        outcomes.iter().filter(|ok| **ok).count(),
+        1,
+        "exactly one of the two has to apply"
+    );
+    assert!(
+        outcomes.contains(&false),
+        "and the other has to FAIL, so an operator is told rather than the setup vanishing"
+    );
+
+    // AND ONE CONNECTION EXISTS, not two and not zero.
+    let created = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .saml_connections()
+        .list_for_org(&org, 10, None)
+        .await
+        .expect("list");
+    assert_eq!(created.len(), 1, "one connection per identity provider");
+}
+
+#[tokio::test]
+async fn two_organizations_naming_their_upstream_the_same_both_get_one() {
+    // `connectors_slug_idx` is UNIQUE on (tenant, environment, connector_slug) -- SCOPE-wide,
+    // not per-organization -- so a slug derived from the display name alone collides the moment
+    // two of a deployment's customers both call their upstream "Okta". The loser's create was
+    // then swallowed as "already exists" and the consumer went on to write an `org_connections`
+    // row pointing at a connector that was never inserted: nothing backs that column with a
+    // foreign key, so the insert SUCCEEDED and the admin's sign-in was never going to work,
+    // with no dead letter and no page able to say why.
+    //
+    // TWO ORGANIZATIONS, THE SAME NAME, and both must end up with a working upstream.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let first = seed_org(&harness, "Acme").await;
+    let second = seed_org(&harness, "Initech").await;
+
+    for (label, org) in [("one", &first), ("two", &second)] {
+        let cookie = open_session_in(&harness, "sso", &format!("slug-{label}"), org).await;
+        let (status, body) = submit_oidc_setup(
+            &harness,
+            &cookie,
+            // THE SAME DISPLAY NAME. One field, identical, which is the whole fixture.
+            "Okta",
+            "https://login.example/acme",
+            "client-abc",
+            "s3cr3t",
+        )
+        .await;
+        assert_eq!(status, 303, "organization {label}: {body}");
+    }
+    assert_eq!(apply_oidc_setups(&harness).await, 2, "both setups apply");
+
+    // BOTH BINDINGS NAME A CONNECTOR THAT EXISTS, which is the property the dangling write broke.
+    let scope = harness.scope();
+    for (label, org) in [("one", &first), ("two", &second)] {
+        let bindings = harness
+            .db()
+            .store()
+            .scoped(scope)
+            .org_connections()
+            .list_for_organization(org, 10)
+            .await
+            .expect("list");
+        assert_eq!(bindings.len(), 1, "organization {label} has one binding");
+        let raw = bindings[0]
+            .connector_id
+            .as_deref()
+            .expect("the binding names a connector");
+        let id = harness
+            .db()
+            .store()
+            .scoped(scope)
+            .connectors()
+            .parse_id(raw)
+            .expect("parses");
+        harness
+            .db()
+            .store()
+            .scoped(scope)
+            .connectors()
+            .get(&id)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("organization {label} is bound to a connector that does not exist: {error}")
+            });
+    }
+}
+
+#[tokio::test]
+async fn a_name_the_column_refuses_is_refused_at_the_form() {
+    // THE BOUND HAS TO BE THE COLUMN'S. `saml_connections_display_name_bounded` is
+    // `octet_length(display_name) <= 252`, and this surface checked 512 -- so a name between the
+    // two was accepted, answered 303, and then refused by the storage engine in a WORKER, where
+    // the only trace is a dead letter and the admin is told nothing.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "sso", "bound-1", &org).await;
+
+    let too_long = "x".repeat(253);
+    let (status, body) = submit_saml_setup(
+        &harness,
+        &cookie,
+        &too_long,
+        "https://idp.example/entity",
+        "https://idp.example/sso",
+        &pem_certificate(12),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a name the column refuses was accepted: {body}"
+    );
+    assert_eq!(
+        apply_saml_setups(&harness).await,
+        0,
+        "and nothing reached the queue to dead-letter"
+    );
+
+    // THE CONTROL, one octet shorter: the bound is the column's rather than a refusal of
+    // everything long.
+    let (status, body) = submit_saml_setup(
+        &harness,
+        &cookie,
+        &"x".repeat(252),
+        "https://idp.example/entity",
+        "https://idp.example/sso",
+        &pem_certificate(12),
+    )
+    .await;
+    assert_eq!(status, 303, "the longest name the column takes: {body}");
+    assert_eq!(apply_saml_setups(&harness).await, 1, "and it applies");
+}
+
+#[tokio::test]
+async fn an_issuer_the_definition_refuses_names_the_field() {
+    // THE HANDLER CHECKS `starts_with("https://")` and `ConnectorDefinition::validate` refuses a
+    // great deal more -- a query string, a fragment, an empty authority. Those failures were
+    // answered with the unavailable page, which blames this deployment for a value the reader
+    // typed and can fix, on the surface whose whole purpose is naming which field is wrong.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "sso", "issuer-1", &org).await;
+
+    for issuer in [
+        "https://login.example/acme?tenant=1",
+        "https://login.example/acme#fragment",
+        "https://",
+    ] {
+        let (status, body) =
+            submit_oidc_setup(&harness, &cookie, "Acme", issuer, "client-abc", "s").await;
+        assert_eq!(status, 400, "`{issuer}` was accepted: {body}");
+        assert!(
+            body.contains("issuer"),
+            "and the refusal has to name the field: {body}"
+        );
+    }
+    assert_eq!(apply_oidc_setups(&harness).await, 0, "nothing was queued");
+}

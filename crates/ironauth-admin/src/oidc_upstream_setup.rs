@@ -20,12 +20,32 @@
 //! through `create_presealed`. This worker never holds the plaintext and cannot: the AAD binds
 //! the ciphertext to a connector id, so nothing outside that scope opens it either.
 //!
-//! # Two writes, and the second is what makes the first useful
+//! # Two writes, and what the second one is actually for
 //!
-//! A connector nothing is bound to signs nobody in: an OIDC upstream reaches an organization
-//! through an `org_connections` row, which is why the portal's SSO page reads that table to find
-//! them at all. Creating the connector alone would leave an admin with a configuration that
-//! exists and does nothing, so the binding follows and a failure to write it is retried.
+//! An OIDC upstream reaches an ORGANIZATION through an `org_connections` row, which is why the
+//! portal's SSO page reads that table to find them at all. Creating the connector alone would
+//! leave an admin with a configuration that appears nowhere, so the binding follows and a
+//! failure to write it is retried.
+//!
+//! THE BINDING IS NOT A FENCE, and an earlier version of this paragraph said it was -- "a
+//! connector nothing is bound to signs nobody in". It is not true. `issue_upstream_authorize`
+//! loads a connector by its per-ENVIRONMENT slug and gates on `record.enabled` alone: it reads
+//! no organization, no `org_connections` row, and no session, and the route it serves is
+//! unauthenticated. So what makes a connector REACHABLE is `enabled`, and its reach is the
+//! environment.
+//!
+//! WHAT THAT MEANS FOR THIS PATH, said plainly because it is a widening. Before it, only an
+//! operator through the management API could create a reachable federation entry point; now a
+//! portal link holder can, for their own organization's upstream, and the object they create is
+//! addressable environment-wide by anyone who knows its slug.
+//!
+//! WHAT BOUNDS IT TODAY: the slug is not guessable. It carries the connector id's own entropy
+//! (see `portal_route::slugify_for`), so it cannot be enumerated or squatted, and the
+//! capabilities are fixed so nothing this upstream asserts is believed beyond identity.
+//!
+//! WHAT WOULD BOUND IT PROPERLY is making the binding the fence the sign-in path consults --
+//! a change to `federation.rs`, not to this file, and one that has to be made deliberately
+//! because it changes what every EXISTING connector reaches.
 
 use std::pin::Pin;
 
@@ -120,7 +140,34 @@ impl OidcUpstreamSetupConsumer {
             )
             .await
         {
-            Ok(()) | Err(StoreError::Conflict) => {}
+            Ok(()) => {}
+            // A CONFLICT IS TWO DIFFERENT THINGS, exactly as it is for the SAML sibling.
+            //
+            // A REDELIVERY raises it on the connector id, and the connector this row asked for
+            // exists, so the binding below proceeds.
+            //
+            // A SLUG COLLISION raises it on `connectors_slug_idx`, `UNIQUE (tenant,
+            // environment, connector_slug)` -- which is SCOPE-wide rather than per-organization.
+            // There the connector this row names was never written, and an earlier version of
+            // this arm went on to write an `org_connections` row pointing at it. Nothing backs
+            // that column with a foreign key, so the insert SUCCEEDED and left a binding to an
+            // id that does not exist: the admin got a 303, no dead letter was raised, and their
+            // sign-in was never going to work.
+            //
+            // THE SLUG CARRIES THE CONNECTOR'S OWN ID SUFFIX NOW, so a collision needs two
+            // submissions to mint the same id, which cannot happen. This arm is what makes that
+            // an assertion rather than an assumption.
+            Err(StoreError::Conflict) => {
+                match self.store.scoped(scope).connectors().get(&connector).await {
+                    Ok(_) => {}
+                    Err(StoreError::NotFound) => {
+                        return Err(ConsumerError::permanent("oidc_setup_slug_already_taken"));
+                    }
+                    Err(_) => {
+                        return Err(ConsumerError::retryable("oidc_setup_conflict_unreadable"));
+                    }
+                }
+            }
             // NOTHING TO CREATE IT AGAINST. An in-scope payload reaches this only when the scope
             // itself has gone, and the answer will be the same on every attempt.
             Err(StoreError::NotFound) => {
@@ -153,9 +200,13 @@ impl OidcUpstreamSetupConsumer {
             .await
         {
             Ok(()) | Err(StoreError::Conflict) => Ok(()),
-            // THE ORGANIZATION WENT AWAY between the connector landing and this, which leaves a
-            // connector bound to nothing. That is untidy and it is not a fault: there is no
-            // organization left to bind it to, and retrying cannot make one.
+            // THE IDS WENT OUT OF SCOPE, which for a payload parsed in scope means the scope
+            // itself has gone. `org_connections::create` checks nothing else -- there is no
+            // foreign key from `connector_id` and no organization read -- so this arm does NOT
+            // cover "the organization was deleted", which an earlier version claimed: that case
+            // writes the binding successfully and leaves it pointing at a row nobody will look
+            // for. Nothing here can prevent it; what prevents the WORSE version of it, a binding
+            // to a connector that was never written, is the conflict arm above.
             Err(StoreError::NotFound) => {
                 tracing::info!(
                     target: "ironauth.oidc_setup",
@@ -165,8 +216,8 @@ impl OidcUpstreamSetupConsumer {
                 Ok(())
             }
             // RETRYABLE, and this is the branch that matters: a connector nothing is bound to
-            // reaches no organization, so reporting the job done here would leave the admin a
-            // configuration that exists and signs nobody in.
+            // appears on no page, so reporting the job done here would leave the admin unable to
+            // see or test the upstream they just configured.
             Err(_) => Err(ConsumerError::retryable("oidc_setup_binding_failed")),
         }
     }

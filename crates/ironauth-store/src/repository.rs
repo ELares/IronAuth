@@ -37338,7 +37338,7 @@ pub struct PresealedConnector<'a> {
     pub slug: &'a str,
     /// The SECRET-FREE definition document.
     pub definition_json: &'a str,
-    /// The client secret, sealed by `ConnectorRepo::seal_client_secret` under this scope and
+    /// The client secret, sealed by `ActingActingConnectorRepo::seal_client_secret` under this scope and
     /// this connector's id.
     pub client_secret_sealed: &'a [u8],
     /// The DEK version the sealing used, which travels with the ciphertext because a rotation
@@ -37446,7 +37446,7 @@ impl ActingConnectorRepo<'_> {
     /// The portal's OIDC setup takes a client secret from an IT admin, and the portal serves on
     /// the data plane, which may not INSERT a connector. Between the two sits the outbox, and a
     /// plaintext upstream credential has no business on a durable, replicated, backed-up row --
-    /// so `ConnectorRepo::seal_client_secret` seals it before it is queued and this stores the
+    /// so `ActingActingConnectorRepo::seal_client_secret` seals it before it is queued and this stores the
     /// bytes verbatim.
     ///
     /// A `client_secret_sealed: Option<..>` on `NewConnector` would have expressed the same
@@ -37459,9 +37459,16 @@ impl ActingConnectorRepo<'_> {
     /// whatever DEK was active THEN, and the version travels with the ciphertext. A rotation
     /// between the two is not a problem: `open_client_secret` reads the version off the row.
     ///
-    /// It DOES still provision the scope's keys, because the caller's seal may have been the
-    /// first use in a scope that had none and failed -- and because a connector whose secret
-    /// cannot be opened later is worse than one that was refused now.
+    /// IT STILL PROVISIONS THE SCOPE'S KEYS, and an earlier version of this paragraph gave a
+    /// reason that cannot happen: "the caller's seal may have been the first use in a scope that
+    /// had none and failed". A seal that failed produced no ciphertext, so no row reaches this
+    /// function at all.
+    ///
+    /// The reason it has is narrower. This is the same call `create` makes before it seals, and
+    /// leaving it out would make the two paths differ in a way nothing here needs -- a scope
+    /// whose keys were DESTROYED between the seal and this write, which is a real operator
+    /// action, would then get a connector written against keys that no longer exist. Provisioning
+    /// is idempotent and costs one read when they are already there.
     ///
     /// # Errors
     ///

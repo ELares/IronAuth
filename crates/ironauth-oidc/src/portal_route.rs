@@ -3097,11 +3097,14 @@ pub async fn saml_setup_post(
         return setup_refusal("every field is required");
     }
     // BOUNDED, because these become columns and the form is reachable by whoever holds a link.
-    if display_name.len() > SETUP_FIELD_MAX
-        || idp_entity_id.len() > SETUP_FIELD_MAX
-        || idp_sso_url.len() > SETUP_FIELD_MAX
-    {
-        return setup_refusal("one of those values is longer than this deployment will store");
+    if display_name.len() > SETUP_NAME_MAX {
+        return setup_refusal("that name is longer than this deployment will store");
+    }
+    if idp_entity_id.len() > SETUP_URI_MAX || idp_sso_url.len() > SETUP_URI_MAX {
+        return setup_refusal(
+            "that entity ID or sign-on URL is longer than this deployment \
+                              will store",
+        );
     }
     // THE SIGN-ON URL IS SOMEWHERE THIS DEPLOYMENT WILL SEND A BROWSER, so it has to be an
     // absolute HTTPS URL. A relative value, or an http one, would be a redirect off this origin
@@ -3151,12 +3154,26 @@ pub async fn saml_setup_post(
         .into_response()
 }
 
-/// The longest value this surface will put in a column.
+/// The longest DISPLAY NAME this surface accepts, which is the column's own bound.
 ///
-/// An entity ID is a URI and a display name is a label; both run to tens of characters in
-/// practice. This is roughly an order of magnitude of headroom and still small enough that a
-/// link holder cannot use the form to store anything substantial.
-const SETUP_FIELD_MAX: usize = 512;
+/// # It is the column's, not a number of its own
+///
+/// `saml_connections_display_name_bounded` is `octet_length(display_name) <= 252`. A looser
+/// check here accepts a value the storage engine refuses, and because the write happens in a
+/// WORKER the refusal lands in a dead letter -- so the admin is answered 303, told nothing, and
+/// their connection never appears. An earlier version of this constant was 512, which is exactly
+/// that shape: twice what the column takes.
+///
+/// OCTETS, NOT CHARACTERS, because that is what the constraint counts: a name of 252 accented
+/// characters is over 252 bytes and the column refuses it.
+const SETUP_NAME_MAX: usize = 252;
+
+/// The longest URI-shaped value this surface accepts.
+///
+/// The columns bound `idp_entity_id` at 1024 octets and `idp_sso_url` at 2048; this is the
+/// tighter of the two applied to both, because a value between them would be accepted for one
+/// field and rejected for the other by the same form.
+const SETUP_URI_MAX: usize = 1024;
 
 /// Queue the connection for the control plane to create.
 ///
@@ -3205,6 +3222,13 @@ async fn queue_saml_setup(
                 // is written this way because the key is the thing this row is ABOUT, and a
                 // reader should not have to work out whether two submissions can collide --
                 // they cannot, and the sentence above is why that is deliberate.
+                //
+                // WHAT A DOUBLE-SUBMIT ACTUALLY PRODUCES is not two connections either, and the
+                // sentence above overstated it: the second create hits
+                // `saml_connections_one_per_idp` -- one connection per identity provider per
+                // organization -- and the consumer now dead-letters that rather than silently
+                // discarding it. So the admin gets one connection and an operator gets told
+                // about the other, which is the outcome the constraint exists to produce.
                 idempotency_key: &id.to_string(),
                 // THE ORGANIZATION, so two setups for one customer are applied in the order
                 // they were made and setups for different customers never wait on each other.
@@ -3331,7 +3355,7 @@ pub async fn scim_setup_post(
     if display_name.is_empty() {
         return setup_refusal("the connection needs a name");
     }
-    if display_name.len() > SETUP_FIELD_MAX {
+    if display_name.len() > SETUP_NAME_MAX {
         return setup_refusal("that name is longer than this deployment will store");
     }
     // THE PROVIDER IS A CLOSED SET, checked HERE rather than left to the column's CHECK
@@ -3608,10 +3632,12 @@ pub async fn oidc_setup_post(
     if display_name.is_empty() || issuer.is_empty() || client_id.is_empty() {
         return setup_refusal("every field except the secret is required");
     }
-    if display_name.len() > SETUP_FIELD_MAX
-        || issuer.len() > SETUP_FIELD_MAX
-        || client_id.len() > SETUP_FIELD_MAX
-        || client_secret.len() > SETUP_FIELD_MAX
+    if display_name.len() > SETUP_NAME_MAX {
+        return setup_refusal("that name is longer than this deployment will store");
+    }
+    if issuer.len() > SETUP_URI_MAX
+        || client_id.len() > SETUP_URI_MAX
+        || client_secret.len() > SETUP_URI_MAX
     {
         return setup_refusal("one of those values is longer than this deployment will store");
     }
@@ -3622,12 +3648,23 @@ pub async fn oidc_setup_post(
     }
     // THE SLUG IS AN OPERATOR-VISIBLE IDENTIFIER and it goes in URLs, so it is derived from the
     // name rather than taken raw: a display name is prose and a slug is not.
-    let slug = slugify(display_name);
-    if slug.is_empty() {
+    if slugify(display_name).is_empty() {
         return setup_refusal("that name has no letters or digits to make an identifier from");
     }
-
     let connector_id = ironauth_store::ConnectorId::generate(state.env(), &scope);
+    // AND IT CARRIES THE CONNECTOR'S OWN ID, which is what makes it unique and unguessable.
+    //
+    // `connectors_slug_idx` is UNIQUE on (tenant, environment, connector_slug) -- SCOPE-wide,
+    // not per-organization. A slug derived from the display name alone therefore collides the
+    // moment two of a deployment's customers both call their upstream "Okta", and the loser's
+    // whole setup is silently discarded. It also lets whoever submits first squat any name in
+    // the shared environment.
+    //
+    // THE ENTROPY MATTERS FOR A SECOND REASON. `issue_upstream_authorize` resolves a connector
+    // by this slug and gates on `enabled` alone -- no organization, no binding, no session, on
+    // an unauthenticated route -- so a guessable slug is an addressable federation entry point.
+    // The suffix makes it neither enumerable nor squattable.
+    let slug = slugify_for(display_name, &connector_id);
     let read = state.store().scoped(scope);
     // SEALED BEFORE ANYTHING IS QUEUED. A failure here is this deployment's -- no platform key,
     // or a scope with no data-encryption key yet -- and never the admin's, so it answers with
@@ -3655,10 +3692,17 @@ pub async fn oidc_setup_post(
     // explain it. The management API builds its stored document the same way, through
     // `validate` and `secret_free_json`, so the two planes cannot disagree about the shape.
     //
-    // A FAILURE HERE IS OURS, NOT THE ADMIN'S: every value they supplied has already been
-    // checked, so what is left is this deployment composing a document its own type refuses.
+    // AND A FAILURE HERE IS USUALLY THE ADMIN'S ISSUER, which an earlier version of this
+    // comment denied -- it said "every value they supplied has already been checked", and the
+    // check above is a `starts_with("https://")` while `validate` refuses a great deal more: a
+    // query string, a fragment, an empty authority. Answering those with the unavailable page
+    // would blame this deployment for a value the reader typed and can fix, on the surface that
+    // exists to tell them which field is wrong.
     let Some(definition) = connector_definition(&slug, display_name, issuer, client_id) else {
-        return PortalRefusal::Unavailable.into_response();
+        return setup_refusal(
+            "this deployment cannot use that issuer. It has to be a plain https:// address with \
+             no query string and no fragment",
+        );
     };
     let binding_id = ironauth_store::OrgConnectionId::generate(state.env(), &scope);
     if queue_oidc_setup(
@@ -3696,6 +3740,26 @@ pub async fn oidc_setup_post(
 /// LOWERCASE ASCII ALPHANUMERICS AND HYPHENS, with runs collapsed and the ends trimmed. The slug
 /// is unique per scope and appears in operator tooling, so what it must not be is the admin's
 /// prose: a name with a slash or a space in it would make a value that reads as a path.
+fn slugify_for(name: &str, id: &ironauth_store::ConnectorId) -> String {
+    let base = slugify(name);
+    // THE LAST TWELVE CHARACTERS of the id, which are its entropy rather than its prefix. Twelve
+    // base64url characters is seventy-two bits, which is not guessable and is short enough that
+    // the slug still reads as the name an operator gave it.
+    let printed = id.to_string();
+    let suffix: String = printed
+        .chars()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .flat_map(char::to_lowercase)
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    format!("{base}-{suffix}")
+}
+
+/// The slug body derived from a display name, before the id suffix.
 fn slugify(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for character in name.chars() {

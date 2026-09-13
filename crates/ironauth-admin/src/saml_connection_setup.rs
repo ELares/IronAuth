@@ -133,10 +133,40 @@ impl SamlConnectionSetupConsumer {
             )
             .await
         {
-            // CREATED, or ALREADY THERE. The outbox is at-least-once, so a redelivery after a
-            // successful create is ordinary; the conflict it raises means the connection this
-            // row asked for exists, which is what was wanted.
-            Ok(()) | Err(StoreError::Conflict) => {}
+            Ok(()) => {}
+            // A CONFLICT IS TWO DIFFERENT THINGS AND THEY NEED OPPOSITE ANSWERS, which an
+            // earlier version of this arm got wrong by assuming the first.
+            //
+            // A REDELIVERY raises it on the connection ID, and the connection this row asked
+            // for exists -- which is what was wanted, so the pin below proceeds.
+            //
+            // A SECOND CONNECTION TO THE SAME IDENTITY PROVIDER raises it on
+            // `saml_connections_one_per_idp`, `UNIQUE (tenant, environment, organization,
+            // idp_entity_id)`. There the row this asked for does NOT exist and never will: the
+            // admin's whole setup is gone, they were answered 303, and treating it as done
+            // pinned their certificate onto somebody else's connection or onto nothing. It has
+            // to dead-letter, which is the only way an operator learns to tell them.
+            //
+            // WHICH ONE IT IS, BY READING. The store does not distinguish them and the two are
+            // told apart by one fact: does the connection this row names exist?
+            Err(StoreError::Conflict) => {
+                match self
+                    .store
+                    .scoped(scope)
+                    .saml_connections()
+                    .find_in_org(&organization, &connection)
+                    .await
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        return Err(ConsumerError::permanent(
+                            "setup_conflicts_with_an_existing_connection_to_that_provider",
+                        ));
+                    }
+                    // THE READ ITSELF FAILED, which says nothing about which conflict this was.
+                    Err(_) => return Err(ConsumerError::retryable("setup_conflict_unreadable")),
+                }
+            }
             Err(_) => return Err(ConsumerError::retryable("setup_create_failed")),
         }
 
