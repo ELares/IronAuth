@@ -1569,6 +1569,13 @@ required-features = ["testing"]
 name = "attestation_client_auth"
 path = "tests/attestation_client_auth.rs"
 
+# Posture predicates over signed MDM claims (issue #145 criterion 5, EXPLORATORY). No database
+# and no `testing` feature: the module verifies a signature, checks an age and evaluates a
+# predicate, so the whole surface is reachable from a key and a clock.
+[[test]]
+name = "device_posture"
+path = "tests/device_posture.rs"
+
 # The prototype AT THE TOKEN ENDPOINT (issue #133): the default posture, the registered-method
 # enforcement in both directions, the two-methods refusal, and the deliberate absence from
 # discovery. Over a real database.
