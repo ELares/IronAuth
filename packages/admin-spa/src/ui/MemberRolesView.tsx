@@ -270,13 +270,19 @@ function budgetWithholdingReason(budget: PermissionBudgetView): string | null {
 // that arm quietly claimed the organization default role was a direct grant, which
 // sends an operator looking for a withdrawal row that does not exist and cannot be
 // removed. It shipped that way for the rest of the issue precisely because nothing
-// made the widening visible. Keyed on the union, a fifth variant (issue #103
-// entitlements is the next candidate, see the `kind` field on `PermissionView`) is a
-// compile error naming the missing property instead of a wrong sentence.
+// made the widening visible. Keyed on the union, a further variant is a compile
+// error naming the missing property instead of a wrong sentence.
+//
+// That is not a prediction any more: issue #145 criterion 4 widened the union with
+// `time_boxed`, and `tsc` refused the build naming exactly this object. Note what
+// the compile error could NOT say, and what the ternary would also have got wrong:
+// this variant needs two fields the other three do not (the deadline and the
+// request), so the label alone is an incomplete row. The test below pins both.
 const PROVENANCE_LABELS: Record<EffectiveRoleSourceView, string> = {
   direct: "granted directly",
   group: "through a group",
   default: "the default role of the organization",
+  time_boxed: "through an approved access request, until",
 };
 
 function MembershipRoleRow({
@@ -389,6 +395,21 @@ function EffectiveRolesPanel({
                       <code class="resource-id">
                         {entry.via_group_id ?? "group not stated"}
                       </code>
+                    ) : null}
+                    {entry.source === "time_boxed" ? (
+                      <span>
+                        <code class="resource-id">
+                          {entry.granted_until_unix_ms === undefined ||
+                          entry.granted_until_unix_ms === null
+                            ? "deadline not stated"
+                            : new Date(
+                                entry.granted_until_unix_ms,
+                              ).toISOString()}
+                        </code>
+                        <code class="resource-id">
+                          {entry.via_request_id ?? "request not stated"}
+                        </code>
+                      </span>
                     ) : null}
                   </li>
                 ))}

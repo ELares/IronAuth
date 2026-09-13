@@ -4,11 +4,18 @@
 //!
 //! # What the caller gets
 //!
-//! One row per PATH by which a member holds a role -- direct, through a named group, or the
-//! organization's default -- plus one `none` row for a member who holds nothing. Both member
-//! kinds are covered: a service account is an organization member and resolves through the
-//! same closure, so an export of "who has which role" that listed only people would leave a
-//! machine identity off the evidence.
+//! One row per PATH by which a member holds a role -- direct, through a named group, the
+//! organization's default, or (when the exploratory access-request feature is acknowledged)
+//! a live approved time-boxed grant -- plus one `none` row for a member who holds nothing.
+//! Both member kinds are covered: a service account is an organization member and resolves
+//! through the same closure, so an export of "who has which role" that listed only people
+//! would leave a machine identity off the evidence.
+//!
+//! The `source` column is the authority on that list and it carries five values; this
+//! sentence is a summary of it and not a second definition. A consumer pinning an enum
+//! should pin [`ironauth_store::AccessReviewRow::source`], because a fourth grant path
+//! arrived here after this file shipped and an enumeration written out in prose is the
+//! thing that did not notice.
 //!
 //! The rows come from `ManagementStore::access_review`, which loops the effective-grant
 //! resolvers rather than writing a second SQL answer to the same question. That module's
@@ -86,7 +93,7 @@ pub struct AccessReviewQuery {
     ),
     security(("bearer" = [])),
     responses(
-        (status = 200, description = "One row per path by which a member holds a role. `application/x-ndjson` by default, `text/csv; charset=utf-8` when format=csv", body = String, content_type = "application/x-ndjson"),
+        (status = 200, description = "One row per path by which a member holds a role: `direct`, `group`, `default`, `time_boxed`, or the single `none` row for a member who holds nothing. `application/x-ndjson` by default, `text/csv; charset=utf-8` when format=csv. NINE columns, in this order: organization_id, principal_kind, membership_id, subject_id, role_slug, source, via_group_id, via_request_id, granted_until_unix_ms. The last two are empty on every row unless the exploratory access-request feature is acknowledged, and the header carries them for every deployment either way, so a consumer pinning by position keeps the seven columns it had", body = String, content_type = "application/x-ndjson"),
         (status = 400, description = "An unknown format was asked for", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
@@ -126,7 +133,19 @@ pub async fn export_organization_access_review(
     let rows = state
         .store()
         .management()
-        .access_review(scope, &org_id, state.max_group_depth())
+        .access_review(
+            scope,
+            &org_id,
+            state.max_group_depth(),
+            // THE INSTANT, only when the exploratory feature is acknowledged. An access
+            // review that omitted a role the member actually holds would answer its own
+            // question -- who has which role -- falsely, and a time-boxed elevation is
+            // exactly the row an auditor came to find. With the flag off this is the same
+            // export it was before the feature existed, save two always-empty columns.
+            state
+                .access_requests_enabled()
+                .then(|| state.now_unix_micros()),
+        )
         .await
         .map_err(|_| ApiError::Internal)?;
 

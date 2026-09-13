@@ -149,6 +149,15 @@ pub const TRANSACTION_TOKENS_FEATURE: &str = "transaction-tokens";
 /// draft bump has to invalidate every acknowledgment in the wild.
 pub const TRANSACTION_TOKENS_VERSION: &str = "draft-ietf-oauth-transaction-tokens-09";
 
+/// The time-boxed access-request primitive (issue #145 criterion 4, EXPLORATORY).
+pub const ACCESS_REQUEST_APPROVAL_FEATURE: &str = "access-request-approval";
+
+/// The shape acknowledged by an operator enabling [`ACCESS_REQUEST_APPROVAL_FEATURE`].
+///
+/// Bumped when the request or decision wire shape changes, which re-arms the ack gate so
+/// an upgrade cannot silently start accepting a different contract.
+pub const ACCESS_REQUEST_APPROVAL_VERSION: &str = "access-request-approval-1";
+
 /// The registry name of the `AuthZEN` agent tool-authorization profile (issue #133,
 /// exploratory bet 5).
 ///
@@ -433,6 +442,25 @@ impl FeatureRegistry {
         ));
     }
 
+    /// Registers the time-boxed access-request primitive (issue #145 criterion 4,
+    /// EXPLORATORY).
+    pub fn register_access_request_approval(&mut self) {
+        self.register(Feature::experimental(
+            ACCESS_REQUEST_APPROVAL_FEATURE,
+            "Time-boxed access requests (issue #145): a member asks for an organization \
+             role, a DIFFERENT member approves, and the grant ends at a deadline the \
+             approval sets. Separation of duties is a CHECK constraint rather than a \
+             handler comparison, so self-approval is refused on every path into the table \
+             including the owner connection. EXPLORATORY: it stores and reports grants and \
+             nothing consumes them yet, there is no delegation or escalation chain, no \
+             notification when a request is raised, and the sweeper that relabels elapsed \
+             grants is a record-keeper rather than the thing that revokes -- the deadline \
+             is, so a stopped sweeper leaves the listing stale and never the access.",
+            ACCESS_REQUEST_APPROVAL_VERSION,
+            "crates/ironauth-admin/CHANGELOG.md",
+        ));
+    }
+
     /// Registers the `AuthZEN` agent tool-authorization profile (issue #133, PROTOTYPE).
     pub fn register_authzen_agent_profile(&mut self) {
         self.register(Feature::experimental(
@@ -492,6 +520,7 @@ impl FeatureRegistry {
         registry.register_advanced_recovery();
         registry.register_first_party_challenge();
         registry.register_wasm_hooks();
+        registry.register_access_request_approval();
         registry
     }
 

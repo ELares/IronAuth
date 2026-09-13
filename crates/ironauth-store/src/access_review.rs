@@ -74,7 +74,8 @@ pub struct AccessReviewRow {
     pub subject_id: String,
     /// The role's immutable slug, or empty on a `none` row.
     pub role_slug: String,
-    /// Which kind of path this row records: `direct`, `group`, `default`, or `none`.
+    /// Which kind of path this row records: `direct`, `group`, `default`, `time_boxed`,
+    /// or `none`.
     pub source: &'static str,
     /// The group the role is inherited from, present only on a `group` row.
     ///
@@ -83,6 +84,19 @@ pub struct AccessReviewRow {
     /// that invented an id here would send a consumer looking for a row to withdraw that does
     /// not exist.
     pub via_group_id: Option<String>,
+    /// The access request the role is held through, present only on a `time_boxed` row
+    /// (issue #145 criterion 4, EXPLORATORY).
+    ///
+    /// Its OWN column rather than reusing `via_group_id`. The first version put the
+    /// `agr_...` id there, and a consumer reading a column named for a group would have
+    /// joined it against the group list and found nothing.
+    pub via_request_id: Option<String>,
+    /// When a `time_boxed` row stops granting, in epoch milliseconds.
+    ///
+    /// The only row kind that ends on its own. An auditor asking "and for how long" has no
+    /// other column to read it from, and a review that showed the elevation without its end
+    /// would report a standing grant.
+    pub granted_until_unix_ms: Option<i64>,
 }
 
 impl AccessReviewRow {
@@ -98,7 +112,11 @@ impl AccessReviewRow {
         subject_id: &str,
         grants: &[EffectiveRoleGrant],
     ) -> Vec<Self> {
-        let row = |role_slug: String, source: &'static str, via_group_id: Option<String>| Self {
+        let row = |role_slug: String,
+                   source: &'static str,
+                   via_group_id: Option<String>,
+                   via_request_id: Option<String>,
+                   granted_until_unix_ms: Option<i64>| Self {
             organization_id: organization_id.to_owned(),
             principal_kind,
             membership_id: membership_id.to_owned(),
@@ -106,19 +124,41 @@ impl AccessReviewRow {
             role_slug,
             source,
             via_group_id,
+            via_request_id,
+            granted_until_unix_ms,
         };
         if grants.is_empty() {
-            return vec![row(String::new(), "none", None)];
+            return vec![row(String::new(), "none", None, None, None)];
         }
         grants
             .iter()
             .map(|grant| {
-                let (source, via_group_id) = match &grant.source {
-                    EffectiveRoleSource::Direct => ("direct", None),
-                    EffectiveRoleSource::Group(group) => ("group", Some(group.to_string())),
-                    EffectiveRoleSource::Default => ("default", None),
+                let (source, via_group_id, via_request_id, until) = match &grant.source {
+                    EffectiveRoleSource::Direct => ("direct", None, None, None),
+                    EffectiveRoleSource::Group(group) => {
+                        ("group", Some(group.to_string()), None, None)
+                    }
+                    EffectiveRoleSource::Default => ("default", None, None, None),
+                    // The request goes in its OWN column, not in `via_group_id`: a consumer
+                    // reading a column named for a group would join an `agr_` id against
+                    // the group list and find nothing.
+                    EffectiveRoleSource::TimeBoxed {
+                        request_id,
+                        granted_until_micros,
+                    } => (
+                        "time_boxed",
+                        None,
+                        Some(request_id.clone()),
+                        Some(granted_until_micros / 1000),
+                    ),
                 };
-                row(grant.slug.clone(), source, via_group_id)
+                row(
+                    grant.slug.clone(),
+                    source,
+                    via_group_id,
+                    via_request_id,
+                    until,
+                )
             })
             .collect()
     }
@@ -129,7 +169,7 @@ impl AccessReviewRow {
 /// SHARED DELIBERATELY. Two lists would agree until somebody added a column to one, and a
 /// consumer pinning the CSV header against the JSONL keys is exactly what a versioned contract
 /// fixture does.
-pub const ACCESS_REVIEW_COLUMNS: [&str; 7] = [
+pub const ACCESS_REVIEW_COLUMNS: [&str; 9] = [
     "organization_id",
     "principal_kind",
     "membership_id",
@@ -137,6 +177,12 @@ pub const ACCESS_REVIEW_COLUMNS: [&str; 7] = [
     "role_slug",
     "source",
     "via_group_id",
+    // APPENDED, never inserted: a consumer pinning by position keeps every column it had,
+    // and one pinning by name is unaffected. Both are empty on every row unless the
+    // exploratory access-request feature is acknowledged, but the HEADER carries them for
+    // every deployment, which is the contract change this makes and the changelog states.
+    "via_request_id",
+    "granted_until_unix_ms",
 ];
 
 /// The rows as JSON Lines: one object per line, trailing newline after the last.
@@ -156,6 +202,8 @@ pub fn to_jsonl(rows: &[AccessReviewRow]) -> String {
             "role_slug": row.role_slug,
             "source": row.source,
             "via_group_id": row.via_group_id,
+            "via_request_id": row.via_request_id,
+            "granted_until_unix_ms": row.granted_until_unix_ms,
         });
         out.push_str(&value.to_string());
         out.push('\n');
@@ -182,6 +230,13 @@ pub fn to_csv(rows: &[AccessReviewRow]) -> String {
             row.role_slug.as_str(),
             row.source,
             row.via_group_id.as_deref().unwrap_or(""),
+            row.via_request_id.as_deref().unwrap_or(""),
+            // EMPTY rather than `0` when absent: a consumer reading a deadline out of a
+            // row that never had one would schedule a revocation for a grant that does
+            // not exist, which is the same mistake the event payload avoids.
+            &row.granted_until_unix_ms
+                .map(|at| at.to_string())
+                .unwrap_or_default(),
         ];
         let encoded: Vec<String> = fields.iter().map(|field| csv_field(field)).collect();
         out.push_str(&encoded.join(","));
@@ -381,6 +436,21 @@ pub fn parse_jsonl(text: &str) -> Result<Vec<ConsumedRow>, String> {
 mod tests {
     use super::*;
 
+    /// A row of the fourth source, with DISTINCT non-empty values in both new columns.
+    ///
+    /// Distinct on purpose: every other fixture leaves `via_request_id` and
+    /// `granted_until_unix_ms` as `None`, so both render as the empty string and swapping the
+    /// two entries in `to_csv`'s field list is invisible to the whole suite. Two values that
+    /// cannot be mistaken for each other -- an `agr_` id and an integer -- make the positional
+    /// mapping of the two appended columns measurable.
+    fn time_boxed_row(request: &str, granted_until_unix_ms: i64) -> AccessReviewRow {
+        AccessReviewRow {
+            via_request_id: Some(request.to_owned()),
+            granted_until_unix_ms: Some(granted_until_unix_ms),
+            ..row("time_boxed", None)
+        }
+    }
+
     fn row(source: &'static str, via: Option<&str>) -> AccessReviewRow {
         AccessReviewRow {
             organization_id: "org_1".to_owned(),
@@ -390,6 +460,8 @@ mod tests {
             role_slug: "admin".to_owned(),
             source,
             via_group_id: via.map(str::to_owned),
+            via_request_id: None,
+            granted_until_unix_ms: None,
         }
     }
 
@@ -460,6 +532,8 @@ mod tests {
             role_slug: "ad\nmin".to_owned(),
             source: "direct",
             via_group_id: None,
+            via_request_id: None,
+            granted_until_unix_ms: None,
         };
         let text = to_csv(&[nasty]);
         assert!(text.contains("\"org,1\""), "a comma must be quoted: {text}");
@@ -498,6 +572,7 @@ mod tests {
             row("direct", None),
             row("group", Some("grp_9")),
             row("default", None),
+            time_boxed_row("agr_9", 1_767_225_600_000),
         ];
         let from_csv = parse_csv(&to_csv(&rows)).expect("the CSV parses");
         let from_jsonl = parse_jsonl(&to_jsonl(&rows)).expect("the JSONL parses");
@@ -505,13 +580,49 @@ mod tests {
             from_csv, from_jsonl,
             "the two exports of one review do not describe the same thing"
         );
-        assert_eq!(from_csv.len(), 3, "one consumed row per exported row");
+        assert_eq!(from_csv.len(), 4, "one consumed row per exported row");
         assert_eq!(
             from_csv[1].fields.get("via_group_id").map(String::as_str),
             Some("grp_9"),
             "the consumer must reach the withdrawable group by name: {:?}",
             from_csv[1]
         );
+        // WHICH COLUMN each value lands in, which the equality above cannot see: the JSONL
+        // writer is key-based and the CSV writer is position-based, so a swapped pair in the
+        // CSV field list makes the two formats DISAGREE and the comparison catches it -- but
+        // only if the two values differ. Named separately so a failure says which column.
+        assert_eq!(
+            from_csv[3].fields.get("via_request_id").map(String::as_str),
+            Some("agr_9"),
+            "the request id landed in the wrong column: {:?}",
+            from_csv[3]
+        );
+        assert_eq!(
+            from_csv[3]
+                .fields
+                .get("granted_until_unix_ms")
+                .map(String::as_str),
+            Some("1767225600000"),
+            "the deadline landed in the wrong column: {:?}",
+            from_csv[3]
+        );
+        // And the three OTHER sources leave both empty, which is what makes the pair above a
+        // measurement of this row rather than of the header.
+        for (index, consumed) in from_csv.iter().take(3).enumerate() {
+            assert_eq!(
+                consumed.fields.get("via_request_id").map(String::as_str),
+                Some(""),
+                "row {index} is not time-boxed and must name no request"
+            );
+            assert_eq!(
+                consumed
+                    .fields
+                    .get("granted_until_unix_ms")
+                    .map(String::as_str),
+                Some(""),
+                "row {index} is not time-boxed and must carry no deadline"
+            );
+        }
     }
 
     #[test]
@@ -528,6 +639,8 @@ mod tests {
             role_slug: "ad\nmin".to_owned(),
             source: "direct",
             via_group_id: None,
+            via_request_id: None,
+            granted_until_unix_ms: None,
         };
         let consumed = parse_csv(&to_csv(std::slice::from_ref(&nasty))).expect("the CSV parses");
         assert_eq!(consumed.len(), 1, "the record split: {consumed:?}");
@@ -567,35 +680,74 @@ mod tests {
         );
     }
 
+    /// One legal record whose THIRD field is `body`, with as many fields as the header has
+    /// columns however many that becomes.
+    ///
+    /// The arity is DERIVED rather than written out, and that is the whole reason this helper
+    /// exists. The refusal tests below were first written with seven fields spelled out; when
+    /// this commit appended two columns, `parse_csv` began refusing every one of those fixtures
+    /// on arity before it ever reached the byte rule under test, and all six assertions passed
+    /// for a reason that had nothing to do with what they claim to measure. A helper keyed on
+    /// `ACCESS_REVIEW_COLUMNS` cannot drift that way again.
+    fn one_record_whose_third_field_is(body: &str) -> String {
+        let header = ACCESS_REVIEW_COLUMNS.join(",");
+        let mut fields: Vec<String> = vec![String::new(); ACCESS_REVIEW_COLUMNS.len()];
+        fields[0] = "org_1".to_string();
+        fields[1] = "user".to_string();
+        fields[2] = body.to_string();
+        fields[3] = "usr_1".to_string();
+        fields[4] = "admin".to_string();
+        fields[5] = "direct".to_string();
+        format!("{header}\r\n{}\r\n", fields.join(","))
+    }
+
+    #[test]
+    fn the_fixture_the_refusal_tests_mutate_is_itself_accepted() {
+        // THE CONTROL, and the reason it is a test of its own rather than a line inside each
+        // case below. Every refusal assertion is of the form `is_err()`, which a fixture that
+        // is malformed for some OTHER reason satisfies just as well. This pins that the only
+        // thing wrong with each fixture below is the byte the case is named for: strip that
+        // byte and the record parses, so a refusal is attributable to the rule under test.
+        let clean = one_record_whose_third_field_is("omb_1");
+        let rows = parse_csv(&clean).expect("the unmutated fixture has to parse");
+        assert_eq!(rows.len(), 1, "the control fixture is one record");
+        assert_eq!(
+            rows[0].fields.get("membership_id").map(String::as_str),
+            Some("omb_1"),
+            "the mutated field is the one the cases below reach"
+        );
+    }
+
     #[test]
     fn the_reader_refuses_what_a_writer_that_stopped_quoting_would_emit() {
         // THE POINT OF A SECOND IMPLEMENTATION, and the previous reader failed it for three
         // of the four characters: it accepted a bare quote and a bare CR as data, so a writer
         // that had stopped quoting them round-tripped byte-identical and the mutation lived.
         //
-        // Each case below is a line the writer could never legally produce.
-        let header = ACCESS_REVIEW_COLUMNS.join(",");
-
-        let bare_quote = format!("{header}\r\norg_1,user,omb\"1,usr_1,admin,direct,\r\n");
+        // Each case below is a line the writer could never legally produce, and differs from
+        // the control fixture in exactly one byte.
+        let bare_quote = one_record_whose_third_field_is("omb\"1");
         assert!(
             parse_csv(&bare_quote).is_err(),
             "a bare quote in an unquoted field has to be refused, not read as data"
         );
 
-        let bare_cr = format!("{header}\r\norg_1,user,omb\r1,usr_1,admin,direct,\r\n");
+        let bare_cr = one_record_whose_third_field_is("omb\r1");
         assert!(
             parse_csv(&bare_cr).is_err(),
             "a bare carriage return has to be refused, not read as data"
         );
 
         // The comma and the LF are caught by ARITY rather than by a byte rule: each splits the
-        // record, and the field count stops agreeing with the header.
-        let bare_comma = format!("{header}\r\norg,1,user,omb_1,usr_1,admin,direct,\r\n");
+        // record, and the field count stops agreeing with the header. Stated because it means
+        // these two, unlike the pair above, would still pass against a reader with no byte
+        // rules at all -- they measure the arity check, which is a different guarantee.
+        let bare_comma = one_record_whose_third_field_is("omb,1");
         assert!(
             parse_csv(&bare_comma).is_err(),
             "an unquoted comma adds a field and has to be refused"
         );
-        let bare_lf = format!("{header}\r\norg_1,user,omb\n1,usr_1,admin,direct,\r\n");
+        let bare_lf = one_record_whose_third_field_is("omb\n1");
         assert!(
             parse_csv(&bare_lf).is_err(),
             "an unquoted newline splits the record and has to be refused"
@@ -608,10 +760,13 @@ mod tests {
         // the quoted flag without recording that the field HAD been quoted let the unquoted
         // branch keep appending to the same buffer, so `"abc"def` came back as `abcdef` --
         // a value no writer could produce, silently concatenated and handed to the consumer.
-        let header = ACCESS_REVIEW_COLUMNS.join(",");
+        //
+        // Both cases keep the control's arity, so `is_err()` can only be the closing-quote
+        // rule: absorbing the trailing text would yield one field and one record, which the
+        // control proves parses.
         for bad in [
-            format!("{header}\r\n\"org\"junk,user,omb_1,usr_1,admin,direct,\r\n"),
-            format!("{header}\r\n\"\"xyz,user,omb_1,usr_1,admin,direct,\r\n"),
+            one_record_whose_third_field_is("\"omb\"junk"),
+            one_record_whose_third_field_is("\"\"xyz"),
         ] {
             assert!(
                 parse_csv(&bad).is_err(),

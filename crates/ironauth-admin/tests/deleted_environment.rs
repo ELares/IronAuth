@@ -339,6 +339,7 @@ struct Fixture {
     /// Seeded unattached: the target of every fresh assignment, so an assign case is a
     /// 201 rather than a 409 against what the seed already did.
     spare_role: String,
+    access_request: String,
     group: String,
     child_group: String,
     /// Seeded on the `technical` category: the target of the contact removal case. A second
@@ -514,6 +515,8 @@ impl Fixture {
             Self::seed_scim_push_link(h, tenant, environment, &scim_push_connection, key).await;
         let ldap_connector = Self::seed_ldap_connector(h, tenant, environment, &base, key).await;
 
+        let access_request = Self::seed_access_request(h, &base, key, &user).await;
+
         let fixture = Self {
             base,
             scim_push_resource,
@@ -521,6 +524,7 @@ impl Fixture {
             org,
             role,
             spare_role,
+            access_request,
             group,
             child_group,
             contact,
@@ -1449,12 +1453,93 @@ impl Fixture {
         ]
     }
 
+    /// A PENDING access request, seeded while the environment is LIVE, so the listing case
+    /// can require the answer to NAME it in both passes. A read whose contract is "a
+    /// decommissioned environment stays auditable" cannot be asserted by a status code: an
+    /// empty page answers 200 too.
+    async fn seed_access_request(h: &Harness, base: &str, key: &str, subject: &str) -> String {
+        seed_row(
+            h,
+            &format!("{base}/access-requests"),
+            &format!("{key}-access-request"),
+            &serde_json::json!({
+                // `billing.admin` is one of the two roles this fixture seeds above. The
+                // raise refuses a slug the organization does not define, so an invented
+                // one here would fail the fixture rather than exercise the sweep.
+                "subject_id": subject,
+                "role_slug": "billing.admin",
+                "reason": "seeded while live",
+            })
+            .to_string(),
+            "access request",
+        )
+        .await
+    }
+
     /// The WRITES that create or amend.
     fn amending_write_cases(&self) -> Vec<Case> {
         let mut cases = self.amending_group_write_cases();
         cases.extend(self.amending_role_write_cases());
         cases.extend(self.agent_write_cases());
+        cases.extend(self.access_request_cases());
         cases
+    }
+
+    /// The EXPLORATORY access-request cases, split out for the crate's function-length
+    /// bound rather than because they are a different KIND of case.
+    fn access_request_cases(&self) -> Vec<Case> {
+        vec![
+            // The EXPLORATORY access-request surface (issue #145 criterion 4). The two
+            // writes must refuse a decommissioned environment and the listing must keep
+            // answering: an elevation granted in an environment somebody retired is the
+            // write this fence exists for, and the record of the ones granted before it
+            // was retired is exactly what an auditor comes back for afterwards.
+            Case {
+                label: "access_requests.raiseAccessRequest",
+                method: "POST",
+                path: format!("{}/access-requests", self.base),
+                body: Some(
+                    serde_json::json!({
+                        "subject_id": self.member_user,
+                        "role_slug": "billing.admin",
+                        "reason": "after the delete",
+                    })
+                    .to_string(),
+                ),
+                intent: Intent::Write,
+                live: StatusCode::CREATED,
+            },
+            // ITS LIVE ANSWER IS THE SEPARATION REFUSAL, not a decision. This fixture
+            // seeds every row through the one operator credential, so the principal
+            // deciding here is the principal who raised the request, and the rule refuses
+            // it. That is the surface working rather than the case being wrong, and the
+            // case still measures what this file is for: the handler resolves the
+            // environment BEFORE it reaches the decision, so a soft-deleted environment
+            // answers the uniform not-found and a live one answers 422. The two are
+            // distinguishable, which is the whole requirement.
+            //
+            // Pinning 200 instead would mean seeding the request under a second
+            // credential, which buys a prettier status and measures the same fence.
+            Case {
+                label: "access_requests.decideAccessRequest",
+                method: "POST",
+                path: format!(
+                    "{}/access-requests/{}/decision",
+                    self.base, self.access_request
+                ),
+                body: Some(serde_json::json!({ "approve": false }).to_string()),
+                intent: Intent::Write,
+                live: StatusCode::UNPROCESSABLE_ENTITY,
+            },
+            Case {
+                label: "access_requests.listAccessRequests",
+                method: "GET",
+                path: format!("{}/access-requests", self.base),
+                body: None,
+                intent: Intent::Read(vec![self.access_request.clone()]),
+                live: StatusCode::OK,
+            },
+        ]
     }
 
     /// The four AGENT writes (issues #130, #132).
@@ -1931,6 +2016,7 @@ fn every_documented_organization_operation_is_driven_by_a_case() {
         org: "org_x".to_owned(),
         role: "rol_x".to_owned(),
         spare_role: "rol_y".to_owned(),
+        access_request: "agr_x".to_owned(),
         group: "grp_x".to_owned(),
         child_group: "grp_y".to_owned(),
         contact: "oct_x".to_owned(),
@@ -2735,6 +2821,7 @@ fn replay_fixture() -> Fixture {
         org: "org_x".to_owned(),
         role: "rol_x".to_owned(),
         spare_role: "rol_y".to_owned(),
+        access_request: "agr_x".to_owned(),
         group: "grp_x".to_owned(),
         child_group: "grp_y".to_owned(),
         contact: "oct_x".to_owned(),
@@ -3004,8 +3091,8 @@ async fn a_soft_deleted_environments_organization_content_is_still_readable() {
 /// a change that moves them fails here rather than quietly making a paragraph wrong.
 #[test]
 fn the_case_counts_are_pinned_where_they_can_be_measured() {
-    const WRITES: usize = 46;
-    const READS: usize = 22;
+    const WRITES: usize = 48;
+    const READS: usize = 23;
 
     let cases = replay_fixture_cases();
     let writes = cases

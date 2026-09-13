@@ -87,6 +87,10 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
         include_str!("../src/org_role_permissions.rs"),
     ),
     ("org_roles.rs", include_str!("../src/org_roles.rs")),
+    (
+        "access_requests.rs",
+        include_str!("../src/access_requests.rs"),
+    ),
     ("access_review.rs", include_str!("../src/access_review.rs")),
     ("organizations.rs", include_str!("../src/organizations.rs")),
     ("portal_links.rs", include_str!("../src/portal_links.rs")),
@@ -116,7 +120,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
 /// being absent from `ADMIN_SOURCES` entirely. Two numbers that are supposed to agree are
 /// worth nothing while nothing compares them, so the agreement is now asserted below
 /// rather than only claimed here.
-const ORG_ADDRESSED_OPERATIONS: usize = 68;
+const ORG_ADDRESSED_OPERATIONS: usize = 71;
 
 /// Operations that name their organization in the REQUEST BODY rather than the path.
 ///

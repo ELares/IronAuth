@@ -3470,7 +3470,7 @@ async fn the_access_review_records_every_path_by_which_a_member_holds_a_role() {
     let rows = db
         .control_store()
         .management()
-        .access_review(scope, &org, DEFAULT_DEPTH)
+        .access_review(scope, &org, DEFAULT_DEPTH, None)
         .await
         .expect("the access review");
 
@@ -3524,7 +3524,7 @@ async fn the_access_review_of_one_organization_names_no_other() {
     let rows = db
         .control_store()
         .management()
-        .access_review(scope, &mine, DEFAULT_DEPTH)
+        .access_review(scope, &mine, DEFAULT_DEPTH, None)
         .await
         .expect("the access review");
 
@@ -3580,12 +3580,12 @@ async fn two_exports_of_identical_state_are_byte_identical() {
     let management = db.control_store();
     let first = management
         .management()
-        .access_review(scope, &org, DEFAULT_DEPTH)
+        .access_review(scope, &org, DEFAULT_DEPTH, None)
         .await
         .expect("first export");
     let second = management
         .management()
-        .access_review(scope, &org, DEFAULT_DEPTH)
+        .access_review(scope, &org, DEFAULT_DEPTH, None)
         .await
         .expect("second export");
 
@@ -3660,7 +3660,7 @@ async fn the_access_review_lists_machine_members_beside_people() {
     let rows = db
         .control_store()
         .management()
-        .access_review(scope, &org, DEFAULT_DEPTH)
+        .access_review(scope, &org, DEFAULT_DEPTH, None)
         .await
         .expect("the access review");
 
@@ -3701,7 +3701,7 @@ async fn a_member_holding_no_role_is_reported_rather_than_omitted() {
     let rows = db
         .control_store()
         .management()
-        .access_review(scope, &org, DEFAULT_DEPTH)
+        .access_review(scope, &org, DEFAULT_DEPTH, None)
         .await
         .expect("the access review");
 
@@ -3755,13 +3755,13 @@ async fn the_access_review_drains_past_the_first_page() {
     let one_page = db
         .control_store()
         .management()
-        .access_review(scope, &org, DEFAULT_DEPTH)
+        .access_review(scope, &org, DEFAULT_DEPTH, None)
         .await
         .expect("the single-page review");
     let paged = db
         .control_store()
         .management()
-        .access_review_in_pages(scope, &org, DEFAULT_DEPTH, 2)
+        .access_review_in_pages(scope, &org, DEFAULT_DEPTH, 2, None)
         .await
         .expect("the paged review");
 

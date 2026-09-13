@@ -1859,6 +1859,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listAccessRequests"];
+        put?: never;
+        post: operations["raiseAccessRequest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests/{request_id}/decision": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["decideAccessRequest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-review": {
         parameters: {
             query?: never;
@@ -4197,6 +4229,55 @@ export interface components {
              */
             reason: string;
         };
+        /** @description A page of requests. */
+        AccessRequestList: {
+            /** @description The requests, newest first. */
+            items: components["schemas"]["AccessRequestView"][];
+            /** @description Whether the listing was cut at its bound. */
+            truncated: boolean;
+        };
+        /** @description One request, as the API reports it. */
+        AccessRequestView: {
+            /**
+             * Format: int64
+             * @description When it was raised, in epoch milliseconds.
+             */
+            created_at_unix_ms: number;
+            /** @description Who decided, or absent while pending. */
+            decided_by?: string | null;
+            /**
+             * Format: int64
+             * @description When the grant ended or will end, in epoch milliseconds.
+             *
+             *     Present on an APPROVED row and on an EXPIRED one, absent on pending and denied.
+             *     An expired row keeps it deliberately: it is the only record of how long the member
+             *     actually held the role, which is the second question an auditor asks.
+             */
+            granted_until_unix_ms?: number | null;
+            /**
+             * @description Whether the grant is live AT THE MOMENT OF THE READ.
+             *
+             *     Not derivable from `state` by a reader: an approved grant past its deadline still
+             *     reads `approved` until a sweep relabels it, and it grants nothing from the instant
+             *     the deadline passes. This field is the answer to "may they act", and `state` is the
+             *     answer to "what happened".
+             */
+            granting_now: boolean;
+            /** @description The `agr_` identifier. */
+            id: string;
+            /** @description Whose roles are at stake. */
+            organization_id: string;
+            /** @description Why. */
+            reason: string;
+            /** @description Who asked. */
+            requested_by: string;
+            /** @description Which role. */
+            role_slug: string;
+            /** @description `pending`, `approved`, `denied` or `expired`. */
+            state: string;
+            /** @description Who would receive the access. */
+            subject_id: string;
+        };
         /** @description Add a typed login identifier to a user. */
         AddIdentifierRequest: {
             /** @description The identifier kind: `email`, `username` or `phone`. */
@@ -5701,6 +5782,17 @@ export interface components {
              */
             webhook_id: string;
         };
+        /** @description What an approver decides. */
+        DecideAccessRequestBody: {
+            /** @description Whether to grant. */
+            approve: boolean;
+            /**
+             * Format: int64
+             * @description How long the grant lasts, in seconds. Required for an approval and refused for a
+             *     denial: an approval IS a grant with an end.
+             */
+            grant_secs?: number | null;
+        };
         /** @description The body deciding one held action (issue #132). */
         DecideVaultApprovalRequest: {
             /** @description `true` to approve, `false` to deny. Both are decisions and both are terminal. */
@@ -5883,7 +5975,7 @@ export interface components {
          * @description How one role reaches a membership.
          * @enum {string}
          */
-        EffectiveRoleSourceView: "direct" | "group" | "default";
+        EffectiveRoleSourceView: "direct" | "group" | "default" | "time_boxed";
         /**
          * @description One role a membership effectively holds, and the ONE path by which it holds it.
          *
@@ -5892,6 +5984,15 @@ export interface components {
          */
         EffectiveRoleView: {
             /**
+             * Format: int64
+             * @description When this path stops granting, in epoch milliseconds. Present exactly when `source`
+             *     is `time_boxed`, because it is the only source that ends on its own.
+             *
+             *     A consumer that caches this answer must not cache it past this instant: every other
+             *     source is held until a row changes, and this one is held until a clock passes.
+             */
+            granted_until_unix_ms?: number | null;
+            /**
              * @description The role's IMMUTABLE stable name. Slugs rather than ids because a slug is
              *     what an authorization decision keys on and what a token claim will carry: it
              *     is stable across a rename and across a promotion between environments.
@@ -5899,8 +6000,13 @@ export interface components {
              */
             slug: string;
             /**
-             * @description Whether this path is a direct grant, an inherited one, or the organization's
-             *     default role.
+             * @description WHICH path this is: a direct grant, an inherited one, the organization's default
+             *     role, or a live approved time-boxed grant.
+             *
+             *     See [`EffectiveRoleSourceView`] for what each one means and for which of them
+             *     carries `via_group_id`, `via_request_id` and `granted_until_unix_ms`. The variants
+             *     are the authority; this line is a summary, and the last time it was written out as
+             *     a closed list of three it went on saying three after a fourth arrived.
              */
             source: components["schemas"]["EffectiveRoleSourceView"];
             /**
@@ -5909,16 +6015,30 @@ export interface components {
              * @example grp_...
              */
             via_group_id?: string | null;
+            /**
+             * @description The access request that granted it (`agr_...`). Present exactly when `source` is
+             *     `time_boxed`.
+             * @example agr_...
+             */
+            via_request_id?: string | null;
         };
         /** @description The resolved roles of one organization membership. */
         EffectiveRolesView: {
             /**
-             * @description What the budget would say about `permissions` at the next issuance. Advisory;
-             *     see [`PermissionBudgetView`], in particular for which half of the budget it
-             *     evaluates.
+             * @description What the budget would say at the next issuance, about the permissions that
+             *     issuance will carry. Advisory; see [`PermissionBudgetView`], in particular for
+             *     which half of the budget it evaluates.
              *
-             *     This is the MEMBERSHIP-scoped verdict and the authoritative one, because this
-             *     set is what a token claim would carry. It always carries `scope: "membership"`.
+             *     COUNTED OVER THE MINTED SET, which is `permissions` above except when the
+             *     exploratory access-request feature is acknowledged: that widens the field with
+             *     live time-boxed grants and does not widen the mint, so a verdict counted over the
+             *     field would predict a token nobody will be issued. With the feature off the two
+             *     sets are the same and `permission_count` equals `permissions.len()`; with it on,
+             *     `permission_count` can be the smaller number, and that is the only supported way
+             *     for them to differ.
+             *
+             *     This is the MEMBERSHIP-scoped verdict and the authoritative one, because the set
+             *     it counts is what a token claim would carry. It always carries `scope: "membership"`.
              *     The attach 201's `role_permission_budget` carries `scope: "role"` and counts a
              *     DIFFERENT set, which bounds this one in NEITHER direction; the type docs name
              *     the three mechanisms.
@@ -7655,7 +7775,11 @@ export interface components {
          *         [`PermissionBudgetScope::Membership`]: every role the member holds directly,
          *         through the group ancestor closure, and by the organization's default role,
          *         unioned and deduplicated. That is the set a token claim would carry, so it is
-         *         the authoritative verdict.
+         *         the authoritative verdict. It is counted over the MINTED set, which is the
+         *         `permissions` field beside it except when the exploratory access-request feature
+         *         is on -- then the field additionally reports live time-boxed grants, which no
+         *         token carries, and counting them would make this verdict describe a token that
+         *         does not exist.
          *       * `OrgRolePermissionView::role_permission_budget`, on the attach 201, carries
          *         [`PermissionBudgetScope::Role`]: one role's OWN live mappings. It is there
          *         because the write is where an operator's attention is at the moment they cross
@@ -7947,6 +8071,29 @@ export interface components {
              * @description Messages whose retry backoff has not elapsed yet.
              */
             scheduled: number;
+        };
+        /** @description What a member asks for. */
+        RaiseAccessRequestBody: {
+            /** @description Why, in the requester's words. */
+            reason: string;
+            /**
+             * @description Which organization role.
+             *
+             *     Must be a role THIS organization defines, checked at raise for the same reason:
+             *     `role_slug` is matched by name at resolution time, so a typo is approved and grants
+             *     nothing. A slug this organization does not define answers 422.
+             */
+            role_slug: string;
+            /**
+             * @description Who would receive the access (`usr_...`). Not necessarily the caller: a manager may
+             *     ask on behalf of somebody else.
+             *
+             *     Must be a user id of this scope AND a live member of this organization, both checked
+             *     at raise: a grant to a non-member confers nothing, so it would be approved and change
+             *     nothing. Either failure answers 422 naming which one it was.
+             * @example usr_...
+             */
+            subject_id: string;
         };
         /** @description One identity that failed validation, with the fields that failed. */
         RecordFailureView: {
@@ -19268,6 +19415,223 @@ export interface operations {
             };
         };
     };
+    listAccessRequests: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This organization's access requests, newest first. `granting_now` is the live answer and `state` is the recorded one; they differ for an approved grant whose deadline has passed and which no sweep has yet relabelled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessRequestList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such live organization in this scope, or the exploratory feature is not acknowledged */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    raiseAccessRequest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RaiseAccessRequestBody"];
+            };
+        };
+        responses: {
+            /** @description The request was raised and is awaiting a decision */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessRequestView"];
+                };
+            };
+            /** @description A field is empty or too long */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such live organization in this scope, or the exploratory feature is not acknowledged */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The organization is disabled, so it resolves no roles for any member and an approved grant would confer nothing until it is re-enabled */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The request would be approved and confer nothing: `subject_id` is not a user id of this scope, or names somebody who is not a live member of this organization, or `role_slug` names no role this organization defines. Checked at RAISE so a typo is caught by the person who made it rather than by the person asked to trust it */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    decideAccessRequest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The access request identifier */
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DecideAccessRequestBody"];
+            };
+        };
+        responses: {
+            /** @description The decision was recorded */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessRequestView"];
+                };
+            };
+            /** @description An approval carried no duration, a denial carried one, or the duration exceeds the ceiling */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such pending request in this organization, or the exploratory feature is not acknowledged */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description This credential raised the request and may not decide it. Refused here in words and by a CHECK constraint on every other path into the table. The rule separates PRINCIPALS: one person holding two credentials can raise under one and decide under the other, and nothing here detects that */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     exportOrganizationAccessReview: {
         parameters: {
             query?: {
@@ -19287,7 +19651,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description One row per path by which a member holds a role. `application/x-ndjson` by default, `text/csv; charset=utf-8` when format=csv */
+            /** @description One row per path by which a member holds a role: `direct`, `group`, `default`, `time_boxed`, or the single `none` row for a member who holds nothing. `application/x-ndjson` by default, `text/csv; charset=utf-8` when format=csv. NINE columns, in this order: organization_id, principal_kind, membership_id, subject_id, role_slug, source, via_group_id, via_request_id, granted_until_unix_ms. The last two are empty on every row unless the exploratory access-request feature is acknowledged, and the header carries them for every deployment either way, so a consumer pinning by position keeps the seven columns it had */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -21827,7 +22191,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The resolved roles, one entry per grant path, plus the resolved permission SET and the advisory budget verdict over it (issue #98). This is what the NEXT token issuance would carry; tokens already issued are NOT affected by a recent change. A DISABLED organization mints nothing, so both are empty for every one of its members until it is re-enabled (the assignment lists still show the configuration). Not paginated and never truncated, whatever the budget says: an operator must always be able to see what a token will not carry */
+            /** @description The resolved roles, one entry per grant path, plus the resolved permission SET and the advisory budget verdict over it (issue #98). This is what the NEXT token issuance would carry, with one exception: when the exploratory access-request feature is acknowledged, a live time-boxed grant appears here (source `time_boxed`, with `via_request_id` and `granted_until_unix_ms`) and the mint does NOT carry it. Tokens already issued are NOT affected by a recent change. A DISABLED organization mints nothing, so both are empty for every one of its members until it is re-enabled (the assignment lists still show the configuration). Not paginated and never truncated, whatever the budget says: an operator must always be able to see what a token will not carry */
             200: {
                 headers: {
                     [name: string]: unknown;

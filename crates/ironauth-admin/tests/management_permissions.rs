@@ -155,6 +155,31 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // The ordered event feed and the usage export (issue #107). Both are environment-scoped
     // READS: the feed replays what already happened and the export folds it, so neither
     // grants sight of anything a `management.read` caller could not already list.
+    // The EXPLORATORY access-request surface (issue #145 criterion 4). The two writes are
+    // `WriteOrganizations` because both change what a member of an organization may do; the
+    // listing is `Read`.
+    //
+    // NO SEPARATE APPROVER PERMISSION, and the earlier version of this comment gave a
+    // reason that refuted itself. It said a `management.approve` permission "would satisfy
+    // a permission split while one human held both" -- which is true, and is EQUALLY true
+    // of the comparison chosen instead: `credential_ref()` is per-credential, so one human
+    // holding two management keys raises under one and decides under the other, and the
+    // CHECK constraint, the repository and the handler all pass.
+    //
+    // What this primitive separates is PRINCIPALS, not people, and that bound is stated
+    // wherever the rule is published and measured by
+    // `two_credentials_of_one_operator_are_two_principals_and_the_rule_does_not_see_it`.
+    // A permission split is absent because it would buy nothing the principal comparison
+    // does not already give, NOT because it would be weaker.
+    (
+        "raiseAccessRequest",
+        ManagementPermission::WriteOrganizations,
+    ),
+    (
+        "decideAccessRequest",
+        ManagementPermission::WriteOrganizations,
+    ),
+    ("listAccessRequests", ManagementPermission::Read),
     // The audit-retention report (issue #145 criterion 3). `Read`: it publishes the policy
     // this deployment enforces, which a customer needs to answer an auditor, and discloses
     // no audit CONTENT.
@@ -908,6 +933,14 @@ const PERMISSION_PROVEN: &[&str] = &[
     // Proven in `a_write_only_credential_cannot_read_the_audit_retention_policy`, which
     // drives a `write_organizations` credential and asserts the refusal names
     // `management.read`. Its own comment: the event-feed test below never touches this route.
+    // All three proven in `the_access_request_surface_splits_raising_and_deciding_from_reading`,
+    // which drives BOTH directions at every route: a read credential is refused each write
+    // and a write credential is refused the read, with each refusal asserted to name the
+    // permission it wanted. The control legs run first, so neither refusal can be the
+    // route simply being closed to a restricted credential.
+    "raiseAccessRequest",
+    "decideAccessRequest",
+    "listAccessRequests",
     "readAuditRetention",
     // Proven in `a_write_only_credential_cannot_read_a_delivery_attestation`, which drives a
     // `write_organizations` credential against a stream that EXISTS and asserts the refusal
@@ -1109,12 +1142,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        240,
+        243,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        96,
+        99,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

@@ -135,6 +135,7 @@ fn operation_ids_are_the_stable_set() {
             "createUser",
             "createUserPersonalAccessToken",
             "createWebhookEndpoint",
+            "decideAccessRequest",
             "decideAgentVaultApproval",
             "deleteBrand",
             "deleteBrandFavicon",
@@ -233,6 +234,7 @@ fn operation_ids_are_the_stable_set() {
             "grantTokenHookSecret",
             "liftBan",
             "linkUserExternalId",
+            "listAccessRequests",
             "listAgentVaultApprovals",
             "listAgents",
             "listBans",
@@ -304,6 +306,7 @@ fn operation_ids_are_the_stable_set() {
             "probePasswordHashing",
             "publishUsage",
             "purgeTenant",
+            "raiseAccessRequest",
             "readAuditRetention",
             "readEventFeed",
             "readLogStreamAttestation",
@@ -670,6 +673,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-review",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents",
@@ -771,6 +775,8 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/abandon",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/migration/verify-credential",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests/{request_id}/decision",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals/{approval_id}/decision",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
@@ -952,7 +958,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        301,
+        304,
         "the documented route count is pinned"
     );
 

@@ -90,6 +90,7 @@ fn handler_body_and_callees(source: &str, operation: &str) -> Option<String> {
 /// #706 shipped the column and the seam; this list is where adoption becomes visible.
 const ORG_ATTRIBUTED: &[&str] = &[
     "addOrgGroupMember",
+    "decideAccessRequest",
     "assignOrgGroupRole",
     "assignOrgMembershipRole",
     "assignOrgRolePermission",
@@ -98,6 +99,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "createMembership",
     "createOrgGroup",
     "createOrgRole",
+    "raiseAccessRequest",
     "createOrganizationApiKey",
     "createOrganizationContact",
     "createPortalLink",
@@ -193,6 +195,19 @@ const UNATTRIBUTED_CEILING: usize = 1;
 /// function and reads that function plus the same-file functions it calls, which is the
 /// granularity `org_confinement_surface.rs` already uses for the confinement fence.
 const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
+    // The EXPLORATORY access-request writes (issue #145 criterion 4). Both attribute
+    // through `.in_organization(org_id)`, and this is a surface where an unattributed row
+    // would be worst: the whole point of the primitive is that somebody can show an
+    // auditor who elevated whom and for how long, and a per-organization stream blind to
+    // it would carry the organization's every other change and not its elevations.
+    (
+        "raiseAccessRequest",
+        include_str!("../src/access_requests.rs"),
+    ),
+    (
+        "decideAccessRequest",
+        include_str!("../src/access_requests.rs"),
+    ),
     // The organization contact writes (issue #141). Both attribute through
     // `.in_organization(org_id)`: a contact is a person one CUSTOMER named, so an unattributed
     // row would leave that customer's own log stream blind to somebody being added to -- or

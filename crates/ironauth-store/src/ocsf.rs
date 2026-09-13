@@ -217,6 +217,10 @@ const ACCOUNT_CHANGE_DOMAINS: &[&str] = &[
 
 /// The leading segments whose actions change WHO MAY DO WHAT (3005).
 const ACCESS_MANAGEMENT_DOMAINS: &[&str] = &[
+    // An access request (issue #145 criterion 4) asks for a role and an approval grants it
+    // until a deadline. Both halves change who may do what, which is the question this
+    // class answers; the ENTITY being managed is the entitlement, not the requester.
+    "access_request",
     // Exporting an access review (issue #145) is a bulk READ of who holds which role, and it
     // is filed here rather than under entity management because the subject of the event is
     // the entitlement data itself: an auditor asking "who looked at our access model" is

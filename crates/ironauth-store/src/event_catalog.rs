@@ -2037,6 +2037,51 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // THE ELEVATION, announced (issue #145 criterion 4). An integrator watching this
+        // stream is usually watching it to know who can do what, and a time-boxed grant
+        // is a change to that which no other type carries.
+        //
+        // The DECISION is a separate type from the request rather than a state field on
+        // one, because they are different events for a consumer: a raise is something to
+        // route to an approver, and a decision is something to act on. A consumer wanting
+        // only the second would otherwise have to receive every raise and filter.
+        "access_request.raised",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "access_request_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "subject_id": {"type": "string", "minLength": 1},
+                "role_slug": {"type": "string", "minLength": 1}
+            },
+            "required": ["access_request_id", "organization_id", "subject_id", "role_slug"]
+        }"#,
+    ),
+    (
+        // `granted_until_unix_ms` is ABSENT on a denial rather than zero or null: a
+        // consumer reading a deadline out of a refusal would schedule a revocation for a
+        // grant that never existed. `approved` says which happened.
+        "access_request.decided",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "access_request_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "subject_id": {"type": "string", "minLength": 1},
+                "role_slug": {"type": "string", "minLength": 1},
+                "approved": {"type": "boolean"},
+                "granted_until_unix_ms": {"type": "integer"}
+            },
+            "required": [
+                "access_request_id", "organization_id", "subject_id", "role_slug", "approved"
+            ]
+        }"#,
+    ),
+    (
         "org_group.created",
         1,
         r#"{

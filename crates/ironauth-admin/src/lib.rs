@@ -90,6 +90,7 @@ mod whoami;
 pub mod log_shipper;
 pub mod log_stream_signature;
 
+mod access_requests;
 mod access_review;
 mod agents;
 mod audit_retention;
@@ -197,7 +198,10 @@ pub use input::require_permission_slug;
 pub use openapi::{management_openapi, openapi_json};
 pub use pagination::ListQuery;
 pub use provision::{DayOneSigningKeys, ProvisionError};
-pub use state::{AdminOidcBridge, AdminState, StateError, bootstrap_operator_id, uniqueness_mode};
+pub use state::{
+    AdminOidcBridge, AdminState, StateError, bootstrap_operator_actor, bootstrap_operator_id,
+    uniqueness_mode,
+};
 
 /// Build the management API router.
 ///
@@ -789,6 +793,18 @@ pub fn management_router(state: AdminState) -> Router {
         // The ordered event feed (issue #107): the cursor-paginated READ surface over the
         // log, recommended over webhooks for data synchronisation. An aged-out cursor is a
         // 410 carrying the oldest cursor that still resolves, never an empty 200.
+        // Time-boxed access requests (issue #145 criterion 4, EXPLORATORY). Mounted
+        // unconditionally and gated INSIDE the handlers: an unacknowledged deployment must
+        // answer the same uniform not-found an unmounted route gives, and a router that
+        // varied its shape by feature would make the two distinguishable by a 405.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests",
+            post(access_requests::raise_access_request).get(access_requests::list_access_requests),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/access-requests/{request_id}/decision",
+            post(access_requests::decide_access_request),
+        )
         // What this deployment keeps, and for how long (issue #145 criterion 3). A customer
         // answering an auditor should not have to email their vendor for it.
         .route(

@@ -1039,6 +1039,36 @@ describe("the roles of one member", () => {
     );
   });
 
+  it("names the deadline and the request on a time-boxed grant", async () => {
+    // The fourth source (issue #145 criterion 4) is the only one that ENDS on
+    // its own, so the two answers an operator needs beyond the slug are when it
+    // stops and which request authorized it. A row that said only "through an
+    // approved access request" would send them to the request list to find out
+    // whether the elevation is still live.
+    const { root } = open(
+      { items: [] },
+      effective([
+        {
+          slug: "billing.admin",
+          source: "time_boxed",
+          via_request_id: "agr_a",
+          granted_until_unix_ms: 1_767_225_600_000,
+        },
+      ]),
+    );
+    await flush();
+
+    const rows = rowsOf(root, "Effective role grant paths");
+    expect(rows.length).toBe(1);
+    expect(rows[0].textContent).toContain("billing.admin");
+    expect(rows[0].textContent).toContain("through an approved access request");
+    expect(rows[0].textContent).toContain("2026-01-01T00:00:00.000Z");
+    expect(rows[0].textContent).toContain("agr_a");
+    // Not the group affordance: a time-boxed grant reaches nobody through a group,
+    // and an operator sent looking for one finds nothing to withdraw.
+    expect(rows[0].textContent).not.toContain("group not stated");
+  });
+
   it("says so plainly when a member resolves no roles at all", async () => {
     const { root } = open({ items: [] }, effective([]));
     await flush();

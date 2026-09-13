@@ -840,6 +840,19 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// Time-boxed access requests (issue #145 criterion 4, EXPLORATORY).
+    ///
+    /// On the SCOPED store because the DATA plane reads them: a token-issuing path asks
+    /// whether a live grant exists. Migration 0225 grants the app role SELECT alone, so an
+    /// app role that was somehow induced to write could not approve its own request.
+    #[must_use]
+    pub fn access_requests(&self) -> AccessRequestRepo<'a> {
+        AccessRequestRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// SIEM log stream configuration (issue #110).
     #[must_use]
     pub fn log_streams(&self) -> LogStreamRepo<'a> {
@@ -49412,7 +49425,10 @@ pub struct NewOrgRolePermission<'a> {
 /// closure. The third is not an assignment at all and that is the point of it. A
 /// role that is unreachable by any of the three simply produces no
 /// [`EffectiveRoleGrant`] rather than a variant meaning "none".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// NOT `Copy` since issue #145 criterion 4: the time-boxed variant carries the request id
+// that granted it, and an id is a `String`. Dropping `Copy` is the cost of the variant
+// carrying enough to explain itself, which is the whole reason it is a variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectiveRoleSource {
     /// Granted straight to this membership (an `org_membership_roles` row). It
     /// survives every change to the group forest.
@@ -49435,6 +49451,23 @@ pub enum EffectiveRoleSource {
     /// different default or clearing the designation, for the WHOLE organization: it
     /// cannot be withdrawn from one member.
     Default,
+    /// Held through an APPROVED, still-live access request (issue #145 criterion 4,
+    /// EXPLORATORY): somebody asked, somebody else agreed, and the agreement ends.
+    ///
+    /// The only variant with an EXPIRY. The other three are held until a row is changed;
+    /// this one stops on a deadline nobody has to act on, which is the whole point of it
+    /// and the reason it cannot be folded into [`EffectiveRoleSource::Direct`]: a consumer
+    /// that treated it as a direct assignment would cache it, and a cached elevation
+    /// outlives its own deadline.
+    ///
+    /// Taking it away early is not possible today. The exploratory has no revoke: the
+    /// deadline is the only exit.
+    TimeBoxed {
+        /// The `agr_` request that granted it, so a reader can see who agreed and why.
+        request_id: String,
+        /// When it ends, in epoch micros.
+        granted_until_micros: i64,
+    },
 }
 
 /// ONE grant path in an effective-role resolution (issue #97): a role the
@@ -49722,12 +49755,14 @@ impl<'a> ManagementStore<'a> {
         scope: Scope,
         organization_id: &OrganizationId,
         max_group_depth: u32,
+        time_boxed_now_micros: Option<i64>,
     ) -> Result<Vec<crate::access_review::AccessReviewRow>, StoreError> {
         self.access_review_in_pages(
             scope,
             organization_id,
             max_group_depth,
             MANAGEMENT_LIST_HARD_CAP,
+            time_boxed_now_micros,
         )
         .await
     }
@@ -49757,6 +49792,7 @@ impl<'a> ManagementStore<'a> {
         organization_id: &OrganizationId,
         max_group_depth: u32,
         page: i64,
+        time_boxed_now_micros: Option<i64>,
     ) -> Result<Vec<crate::access_review::AccessReviewRow>, StoreError> {
         let memberships = self.org_memberships(scope);
         let groups = self.org_groups(scope);
@@ -49773,9 +49809,31 @@ impl<'a> ManagementStore<'a> {
                 break;
             }
             for membership in &batch {
-                let grants = groups
-                    .effective_role_grants(organization_id, &membership.user_id, max_group_depth)
-                    .await?;
+                // THROUGH THE TIME-BOXED TAIL when the caller passes an instant, so an
+                // elevation somebody approved appears in the evidence an auditor is handed.
+                // An export that omitted a role the member actually holds would answer its
+                // own question -- who has which role -- falsely.
+                let grants = match time_boxed_now_micros {
+                    Some(now) => {
+                        groups
+                            .effective_role_grants_at(
+                                organization_id,
+                                &membership.user_id,
+                                max_group_depth,
+                                now,
+                            )
+                            .await?
+                    }
+                    None => {
+                        groups
+                            .effective_role_grants(
+                                organization_id,
+                                &membership.user_id,
+                                max_group_depth,
+                            )
+                            .await?
+                    }
+                };
                 rows.extend(crate::access_review::AccessReviewRow::from_grants(
                     &organization,
                     "user",
@@ -50166,6 +50224,17 @@ impl<'a> ActingManagementStore<'a> {
     #[must_use]
     pub fn org_auth_policies(&self, scope: Scope) -> ActingOrgAuthPolicyRepo<'a> {
         ActingOrgAuthPolicyRepo {
+            store: self.store,
+            acting: self.acting,
+            scope,
+        }
+    }
+
+    /// The mutating access-request repository for `scope` (issue #145 criterion 4):
+    /// raise a request and decide one, each audited.
+    #[must_use]
+    pub fn access_requests(&self, scope: Scope) -> ActingAccessRequestRepo<'a> {
+        ActingAccessRequestRepo {
             store: self.store,
             acting: self.acting,
             scope,
@@ -51822,6 +51891,33 @@ impl OrgGroupRepo<'_> {
         .await
     }
 
+    /// [`Self::effective_permissions`] PLUS the permissions of any live time-boxed role
+    /// (issue #145 criterion 4, EXPLORATORY).
+    ///
+    /// Paired with [`Self::effective_role_grants_at`] and always called beside it: a
+    /// response whose `roles` reported the elevation and whose `permissions` did not would
+    /// tell an operator the member holds a role and holds none of what that role carries.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::effective_permissions`].
+    pub async fn effective_permissions_at(
+        &self,
+        organization_id: &OrganizationId,
+        user_id: &UserId,
+        max_group_depth: u32,
+        now_micros: i64,
+    ) -> Result<BTreeSet<String>, StoreError> {
+        self.resolve_effective_at(
+            organization_id,
+            MembershipPrincipal::User(user_id),
+            max_group_depth,
+            EFFECTIVE_PERMISSION_SLUGS_TIME_BOXED_TAIL,
+            Some(now_micros),
+        )
+        .await
+    }
+
     /// The effective ROLE slugs a service account holds in one organization (issue #126).
     ///
     /// The exact sibling of [`Self::effective_permissions_for_service_account`], and of
@@ -51895,8 +51991,27 @@ impl OrgGroupRepo<'_> {
         max_group_depth: u32,
         tail: &'static str,
     ) -> Result<BTreeSet<String>, StoreError> {
+        self.resolve_effective_at(organization_id, principal, max_group_depth, tail, None)
+            .await
+    }
+
+    /// [`Self::resolve_effective`] for a tail that judges a deadline against `now_micros`.
+    async fn resolve_effective_at(
+        &self,
+        organization_id: &OrganizationId,
+        principal: MembershipPrincipal<'_>,
+        max_group_depth: u32,
+        tail: &'static str,
+        now_micros: Option<i64>,
+    ) -> Result<BTreeSet<String>, StoreError> {
         let rows = self
-            .run_effective(organization_id, principal, max_group_depth, tail)
+            .run_effective_at(
+                organization_id,
+                principal,
+                max_group_depth,
+                tail,
+                now_micros,
+            )
             .await?;
         // A BTreeSet rather than the Vec the ORDER BY already sorted: the SQL order
         // and the collection order must agree even if a future edit to either drifts,
@@ -51987,6 +52102,43 @@ impl OrgGroupRepo<'_> {
         self.decode_grants(&rows)
     }
 
+    /// [`Self::effective_role_grants`] PLUS any live time-boxed grant (issue #145
+    /// criterion 4, EXPLORATORY).
+    ///
+    /// `now_micros` is the instant the deadline is judged against, taken from the caller's
+    /// clock seam so a test can drive it.
+    ///
+    /// # Why this is a different TAIL and not a different caller
+    ///
+    /// Every fence the plain resolution applies -- a live ACTIVE organization, a live
+    /// ACTIVE membership, a role that is not deleted -- lives in the shared CTE and in each
+    /// arm's WHERE. A caller that resolved the plain grants and appended time-boxed ones
+    /// afterwards would inherit none of them: the first version of this feature did exactly
+    /// that, and a DISABLED organization went on reporting the elevation, which is the
+    /// coarsest revocation an operator has.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::effective_role_grants`].
+    pub async fn effective_role_grants_at(
+        &self,
+        organization_id: &OrganizationId,
+        user_id: &UserId,
+        max_group_depth: u32,
+        now_micros: i64,
+    ) -> Result<Vec<EffectiveRoleGrant>, StoreError> {
+        let rows = self
+            .run_effective_at(
+                organization_id,
+                MembershipPrincipal::User(user_id),
+                max_group_depth,
+                EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL,
+                Some(now_micros),
+            )
+            .await?;
+        self.decode_grants(&rows)
+    }
+
     /// [`Self::effective_role_grants`] for a MACHINE member.
     ///
     /// The same closure, the same tail, the same decode: `run_effective` takes the principal
@@ -52059,6 +52211,31 @@ impl OrgGroupRepo<'_> {
                             })?,
                         )
                     }
+                    // Only projected by `EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL`, so the
+                    // plain tail can never reach it. Both companions are required rather
+                    // than defaulted: a time-boxed grant whose deadline did not survive
+                    // the decode would be reported as held with no end, which is the
+                    // standing access the whole primitive exists to replace.
+                    "time_boxed" => {
+                        let request_id = row
+                            .get::<Option<String>, _>("via_request_id")
+                            .ok_or_else(|| {
+                                StoreError::Database(sqlx::Error::Decode(
+                                    "a time-boxed grant carries no request id".into(),
+                                ))
+                            })?;
+                        let granted_until_micros = row
+                            .get::<Option<i64>, _>("granted_until_micros")
+                            .ok_or_else(|| {
+                                StoreError::Database(sqlx::Error::Decode(
+                                    "a time-boxed grant carries no deadline".into(),
+                                ))
+                            })?;
+                        EffectiveRoleSource::TimeBoxed {
+                            request_id,
+                            granted_until_micros,
+                        }
+                    }
                     _ => {
                         return Err(StoreError::Database(sqlx::Error::Decode(
                             "an effective-role grant carries an unknown source".into(),
@@ -52086,6 +52263,22 @@ impl OrgGroupRepo<'_> {
         max_group_depth: u32,
         tail: &'static str,
     ) -> Result<Vec<PgRow>, StoreError> {
+        self.run_effective_at(organization_id, principal, max_group_depth, tail, None)
+            .await
+    }
+
+    /// [`Self::run_effective`], additionally binding `$6` for a tail that judges a deadline.
+    ///
+    /// `None` binds NULL, which no arm of the plain tail reads: the parameter exists so the
+    /// two tails share one binding order rather than drifting apart.
+    async fn run_effective_at(
+        &self,
+        organization_id: &OrganizationId,
+        principal: MembershipPrincipal<'_>,
+        max_group_depth: u32,
+        tail: &'static str,
+        now_micros: Option<i64>,
+    ) -> Result<Vec<PgRow>, StoreError> {
         if organization_id.scope() != self.scope || principal.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -52108,6 +52301,7 @@ impl OrgGroupRepo<'_> {
             .bind(organization_id.to_string())
             .bind(principal.id_string())
             .bind(walk_bound)
+            .bind(now_micros)
             .fetch_all(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -52835,6 +53029,116 @@ const EFFECTIVE_ROLE_GRANTS_TAIL: &str = "SELECT DISTINCT r.slug AS slug, \
         AND r.is_default AND EXISTS (SELECT 1 FROM membership) \
       ORDER BY slug, source, via_group_id NULLS FIRST";
 
+/// [`EFFECTIVE_ROLE_GRANTS_TAIL`] plus the TIME-BOXED arm (issue #145 criterion 4).
+///
+/// # Why a fourth arm here rather than a union in the caller
+///
+/// The first attempt appended live grants to the result in the management handler, and it
+/// bypassed every fence this CTE exists to apply. `EFFECTIVE_CLOSURE_CTE` seeds `membership`
+/// only for a LIVE ACTIVE membership of a LIVE ACTIVE organization, and each arm below
+/// additionally requires `r.deleted_at IS NULL`. A grant appended afterwards inherited none
+/// of that: a DISABLED organization still reported the elevation, which defeats the coarsest
+/// revocation an operator has, and a DELETED role kept being reported as held.
+///
+/// Written as an arm, the time-boxed grant answers to the same three fences as every other
+/// path by construction, and a later change to what "live membership" means reaches it
+/// without anybody remembering to.
+///
+/// `$6` is the instant to judge the deadline against. The bound is `>` so a grant does not
+/// survive its own deadline, matching
+/// [`crate::access_request::AccessGrantRequest::grants_now`], which the read path applies to
+/// the same rows.
+///
+/// # The sort key carries a FOURTH column, and why the inherited three stopped working
+///
+/// [`EFFECTIVE_ROLE_GRANTS_TAIL`] documents `(slug, source, via_group_id)` as a TOTAL
+/// order -- no two rows share all three -- and both the `roles` array and the
+/// access-review export publish byte-stability on the strength of it. That premise does
+/// not survive this arm. It emits one row per approved request, so two live approved
+/// requests for one `(subject, role_slug)` produce two rows agreeing on the slug, on
+/// `'time_boxed'`, and on a NULL `via_group_id`, differing only in columns the inherited
+/// key does not mention. `SELECT DISTINCT` does not collapse them: the ids differ, which
+/// is the point of keeping both. Nothing in migration 0225 forbids the pair, and raising
+/// an extension before the first grant lapses is the ordinary way to reach it.
+///
+/// So the key ends on `via_request_id`, which is unique per row by primary key and makes
+/// the order total again.
+///
+/// IT IS AN EQUIVALENT MUTANT TODAY, and saying so is better than leaving the next reader
+/// to find out, exactly as the `source` conjunct above records. Removing it was measured:
+/// `two_live_grants_for_one_role_are_two_rows_in_a_stable_order` plants eight overlapping
+/// grants in DESCENDING id order and still passes without the conjunct. The reason is a
+/// plan detail and not a property of the statement: each arm carries `SELECT DISTINCT`
+/// over a column list that INCLUDES `via_request_id`, so the de-duplication already sorts
+/// on it and hands the outer sort an input that is in id order. Nothing makes the planner
+/// keep doing that -- a hash-based `DISTINCT`, a different row count, or a version that
+/// re-orders the `UNION ALL` inputs all break it.
+///
+/// So what the conjunct buys is a GUARANTEE rather than a currently observable value: the
+/// `roles` array and the access-review export both publish byte-stability, and without it
+/// that holds by luck. A compliance pipeline diffing one quarter against the next reports
+/// a change nobody made on the day the luck runs out. Keep it, and do not read the
+/// surviving mutation as evidence that it does nothing.
+///
+/// # Two overlapping grants are TWO rows, deliberately
+///
+/// Collapsing them to the one that expires last would restore the cost bound this arm
+/// breaks (see the un-paginated section in `crates/ironauth-admin/src/org_effective_roles.rs`)
+/// and it would be wrong for the same reason collapsing a role held directly AND through a
+/// group is wrong: each row is a path that has to be revoked separately, and an operator
+/// shown one of two live approvals revokes it, watches the elevation survive, and has no
+/// row to tell them why.
+const EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL: &str = "SELECT DISTINCT r.slug AS slug, \
+            'direct'::text AS source, NULL::text AS via_group_id, \
+            NULL::text AS via_request_id, NULL::bigint AS granted_until_micros \
+       FROM org_roles r \
+       JOIN org_membership_roles mr ON mr.role_id = r.id \
+       JOIN membership mb ON mb.id = mr.membership_id \
+      WHERE r.tenant_id = $1 AND r.environment_id = $2 \
+        AND r.organization_id = $3 AND r.deleted_at IS NULL \
+        AND mr.tenant_id = $1 AND mr.environment_id = $2 \
+        AND mr.organization_id = $3 AND mr.deleted_at IS NULL \
+      UNION ALL \
+     SELECT DISTINCT r.slug AS slug, \
+            'group'::text AS source, gr.group_id AS via_group_id, \
+            NULL::text AS via_request_id, NULL::bigint AS granted_until_micros \
+       FROM org_roles r \
+       JOIN org_group_roles gr ON gr.role_id = r.id \
+      WHERE r.tenant_id = $1 AND r.environment_id = $2 \
+        AND r.organization_id = $3 AND r.deleted_at IS NULL \
+        AND gr.tenant_id = $1 AND gr.environment_id = $2 \
+        AND gr.organization_id = $3 AND gr.deleted_at IS NULL \
+        AND gr.group_id IN (SELECT id FROM closure) \
+      UNION ALL \
+     SELECT DISTINCT r.slug AS slug, \
+            'default'::text AS source, NULL::text AS via_group_id, \
+            NULL::text AS via_request_id, NULL::bigint AS granted_until_micros \
+       FROM org_roles r \
+      WHERE r.tenant_id = $1 AND r.environment_id = $2 \
+        AND r.organization_id = $3 AND r.deleted_at IS NULL \
+        AND r.is_default AND EXISTS (SELECT 1 FROM membership) \
+      UNION ALL \
+     SELECT DISTINCT r.slug AS slug, \
+            'time_boxed'::text AS source, NULL::text AS via_group_id, \
+            agr.id AS via_request_id, \
+            (EXTRACT(EPOCH FROM agr.granted_until) * 1000000)::bigint \
+                AS granted_until_micros \
+       FROM org_roles r \
+       JOIN access_grant_requests agr \
+         ON agr.role_slug = r.slug \
+        AND agr.tenant_id = r.tenant_id \
+        AND agr.environment_id = r.environment_id \
+        AND agr.organization_id = r.organization_id \
+      WHERE r.tenant_id = $1 AND r.environment_id = $2 \
+        AND r.organization_id = $3 AND r.deleted_at IS NULL \
+        AND agr.subject_id = $4 \
+        AND agr.state = 'approved' \
+        AND agr.granted_until > \
+            (TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+        AND EXISTS (SELECT 1 FROM membership) \
+      ORDER BY slug, source, via_group_id NULLS FIRST, \
+               via_request_id NULLS FIRST";
+
 /// The projection [`OrgGroupRepo::effective_permissions`] runs over
 /// [`EFFECTIVE_CLOSURE_CTE`] (issue #98): the slugs of every LIVE permission carried
 /// by any LIVE role of the `effective_roles` arm.
@@ -53025,6 +53329,70 @@ const EFFECTIVE_PERMISSION_SLUGS_TAIL: &str = "SELECT DISTINCT p.slug AS slug \
                AND rp.organization_id = $3 AND rp.deleted_at IS NULL \
                AND rp.role_id IN (SELECT id FROM effective_roles) \
         ) \
+      ORDER BY p.slug";
+
+/// [`EFFECTIVE_PERMISSION_SLUGS_TAIL`] plus the permissions of any live TIME-BOXED role
+/// (issue #145 criterion 4, EXPLORATORY).
+///
+/// # Why this exists rather than a disjunct in the shared CTE
+///
+/// The obvious change is one more `OR` in `effective_roles` inside
+/// [`EFFECTIVE_CLOSURE_CTE`]. That CTE is shared by every tail INCLUDING the slugs-only
+/// `effective_roles` the token mint resolves through, so the disjunct would widen token
+/// issuance from an exploratory flag -- a decision this feature deliberately does not take.
+/// A parallel tail keeps the widening to the two reads that opt into it.
+///
+/// # Why it must exist at all
+///
+/// Without it one response contradicts itself: `roles` reports the elevation and
+/// `permissions` does not, so an operator reads that the member holds `billing-admin` and
+/// holds none of what `billing-admin` carries. Either answer alone is defensible; the two
+/// together are not.
+///
+/// # Why the second disjunct repeats $1/$2/$3 on BOTH `r` and `agr`
+///
+/// It reaches `org_roles` directly rather than through `effective_roles`, so it is the
+/// only projection over this closure that does not inherit the CTE's fence. The first
+/// version fenced `r` on `r.deleted_at IS NULL` alone and bound `agr` to `r.tenant_id`,
+/// `r.environment_id` and `r.organization_id`, which makes WHICH organization's approved
+/// requests count a property of the role row rather than of the bound scope. Migration
+/// 0092 names that exact gap as a non-guarantee: the `role_id` foreign key does not prove
+/// the role belongs to this organization or even to this environment, so same-organization
+/// containment is an APPLICATION invariant, and RLS fences `(tenant, environment)` and
+/// nothing finer. One `org_role_permissions` row of organization A pointing at a role of
+/// organization B is a shape the schema admits, and under the first version a member of A
+/// with an approved request for B's role slug resolved B's permission slugs on A's read.
+/// Spelled against $1/$2/$3, the corrupt row reaches nothing, which is what the plain
+/// disjunct beside it has always done by going through `effective_roles`.
+const EFFECTIVE_PERMISSION_SLUGS_TIME_BOXED_TAIL: &str = "SELECT DISTINCT p.slug AS slug \
+       FROM permissions p \
+      WHERE p.tenant_id = $1 AND p.environment_id = $2 \
+        AND p.kind = 'permission' AND p.deleted_at IS NULL \
+        AND (p.id IN ( \
+            SELECT rp.permission_id \
+              FROM org_role_permissions rp \
+             WHERE rp.tenant_id = $1 AND rp.environment_id = $2 \
+               AND rp.organization_id = $3 AND rp.deleted_at IS NULL \
+               AND rp.role_id IN (SELECT id FROM effective_roles) \
+        ) OR p.id IN ( \
+            SELECT rp.permission_id \
+              FROM org_role_permissions rp \
+              JOIN org_roles r ON r.id = rp.role_id \
+              JOIN access_grant_requests agr \
+                ON agr.role_slug = r.slug \
+               AND agr.tenant_id = $1 \
+               AND agr.environment_id = $2 \
+               AND agr.organization_id = $3 \
+             WHERE rp.tenant_id = $1 AND rp.environment_id = $2 \
+               AND rp.organization_id = $3 AND rp.deleted_at IS NULL \
+               AND r.tenant_id = $1 AND r.environment_id = $2 \
+               AND r.organization_id = $3 AND r.deleted_at IS NULL \
+               AND agr.subject_id = $4 \
+               AND agr.state = 'approved' \
+               AND agr.granted_until > \
+                   (TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+               AND EXISTS (SELECT 1 FROM membership) \
+        )) \
       ORDER BY p.slug";
 
 /// The projection every group-member read selects from `org_group_members` (the two
@@ -85390,5 +85758,585 @@ mod envelope_label_tests {
                 );
             }
         }
+    }
+}
+
+/// What a new access request asks for (issue #145 criterion 4).
+///
+/// A struct rather than five string parameters, because four of them are `&str` and an
+/// argument list that long is one transposition away from filing a request against the
+/// wrong subject under the wrong role, which nothing downstream could detect.
+#[derive(Debug, Clone, Copy)]
+pub struct NewAccessRequest<'a> {
+    /// Whose roles are at stake.
+    pub organization_id: &'a str,
+    /// Who would receive the access. Not necessarily the requester.
+    pub subject_id: &'a str,
+    /// Which role.
+    pub role_slug: &'a str,
+    /// The asking principal, recorded so a later decision has something to be compared
+    /// against by `access_grant_requests_decider_is_not_requester`.
+    pub requested_by: &'a str,
+    /// Why, in the requester's words.
+    pub reason: &'a str,
+}
+
+/// Reading time-boxed access requests (issue #145 criterion 4, EXPLORATORY).
+pub struct AccessRequestRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+/// The columns every read below selects, in one place so the two decoders cannot drift.
+const ACCESS_REQUEST_COLUMNS: &str = "id, organization_id, subject_id, role_slug, \
+     requested_by, reason, state, decided_by, \
+     (EXTRACT(EPOCH FROM decided_at) * 1000000)::bigint AS decided_micros, \
+     (EXTRACT(EPOCH FROM granted_until) * 1000000)::bigint AS granted_until_micros, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_micros";
+
+/// Decode one row, or [`None`] for a state this build does not know.
+///
+/// A state a NEWER binary wrote cannot be classified by this one, and both guesses are
+/// wrong in a way that matters: `approved` would grant access after a rollback and
+/// `denied` would revoke it. Skipping the row is the only reading that invents nothing,
+/// and it errs toward no access.
+fn decode_access_request(
+    row: &sqlx::postgres::PgRow,
+) -> Option<crate::access_request::AccessGrantRequest> {
+    let state: String = row.get("state");
+    Some(crate::access_request::AccessGrantRequest {
+        id: row.get("id"),
+        organization_id: row.get("organization_id"),
+        subject_id: row.get("subject_id"),
+        role_slug: row.get("role_slug"),
+        requested_by: row.get("requested_by"),
+        reason: row.get("reason"),
+        state: crate::access_request::AccessRequestState::from_wire(&state)?,
+        decided_by: row.get("decided_by"),
+        decided_at_micros: row.get("decided_micros"),
+        granted_until_micros: row.get("granted_until_micros"),
+        created_at_micros: row.get("created_micros"),
+    })
+}
+
+impl AccessRequestRepo<'_> {
+    /// Every request raised for one organization, newest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn list_for_organization(
+        &self,
+        organization_id: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::access_request::AccessGrantRequest>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ACCESS_REQUEST_COLUMNS} FROM access_grant_requests \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             ORDER BY created_at DESC, id DESC LIMIT $4"
+        ))
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(organization_id)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().filter_map(decode_access_request).collect())
+    }
+
+    /// One request by id, or [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault, and [`StoreError::NotFound`] when no such
+    /// request exists in this scope.
+    pub async fn get(
+        &self,
+        id: &str,
+    ) -> Result<crate::access_request::AccessGrantRequest, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ACCESS_REQUEST_COLUMNS} FROM access_grant_requests \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3"
+        ))
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.as_ref()
+            .and_then(decode_access_request)
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// The roles a subject holds through a LIVE time-boxed grant at `now_micros`.
+    ///
+    /// # Why the deadline is in the WHERE clause and checked again after
+    ///
+    /// The SQL narrows so the scan is small; `grants_now` decides. Both, because the two
+    /// answer to different failure modes: a query that forgot the deadline would return
+    /// elapsed grants, and a caller that trusted the state column would accept a row the
+    /// sweeper has not reached. See [`crate::access_request::AccessGrantRequest::grants_now`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn live_grants_for_subject(
+        &self,
+        organization_id: &str,
+        subject_id: &str,
+        now_micros: i64,
+    ) -> Result<Vec<EffectiveRoleGrant>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ACCESS_REQUEST_COLUMNS} FROM access_grant_requests \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+               AND subject_id = $4 AND state = 'approved' \
+               AND granted_until > (TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+             ORDER BY role_slug"
+        ))
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(organization_id)
+        .bind(subject_id)
+        .bind(now_micros)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .filter_map(decode_access_request)
+            .filter(|request| request.grants_now(now_micros))
+            .filter_map(|request| {
+                // The deadline is what makes this an `EffectiveRoleSource::TimeBoxed`
+                // rather than a bare slug, and `grants_now` above already refused a row
+                // without one, so this arm is unreachable for a row that got here.
+                let granted_until_micros = request.granted_until_micros?;
+                Some(EffectiveRoleGrant {
+                    slug: request.role_slug,
+                    source: EffectiveRoleSource::TimeBoxed {
+                        request_id: request.id,
+                        granted_until_micros,
+                    },
+                })
+            })
+            .collect())
+    }
+}
+
+/// One approver's verdict (issue #145 criterion 4).
+///
+/// A struct for the reason [`NewAccessRequest`] gives, and for one more: `approve` and
+/// `granted_until_micros` are not independent. An approval IS a grant with an end and a
+/// denial grants nothing, so the two travel together rather than arriving as two
+/// parameters a caller could pair wrongly.
+///
+/// The fields are public and there is NO constructor enforcing the pairing. What enforces
+/// it is [`ActingAccessRequestRepo::decide`], which refuses a mismatch before its
+/// statement runs, and the `granted_until_iff_granted` CHECK behind that. An earlier
+/// version of this comment claimed a constructor that never existed.
+#[derive(Debug, Clone, Copy)]
+pub struct AccessDecision<'a> {
+    /// Whether to grant.
+    pub approve: bool,
+    /// The deciding principal. Compared against the requester by
+    /// `access_grant_requests_decider_is_not_requester`.
+    pub decided_by: &'a str,
+    /// When, in epoch micros.
+    pub decided_at_micros: i64,
+    /// When the grant ends, in epoch micros. Present exactly when `approve`.
+    pub granted_until_micros: Option<i64>,
+}
+
+/// Raising and deciding access requests, each audited (issue #145 criterion 4).
+pub struct ActingAccessRequestRepo<'a> {
+    store: &'a Store,
+    acting: ActingContext,
+    scope: Scope,
+}
+
+impl ActingAccessRequestRepo<'_> {
+    /// Raise a request for time-boxed access, auditing `access_request.raise`.
+    ///
+    /// `requested_by` is the asking principal, recorded so the separation constraint has
+    /// something to compare a later decision against.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault, including a nonexistent
+    /// organization and any field the CHECK constraints refuse (an empty reason or role),
+    /// both of which the management edge reports up front.
+    pub async fn raise(
+        &self,
+        env: &Env,
+        id: &crate::id::AccessRequestId,
+        spec: NewAccessRequest<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id_owned = id.to_string();
+        let organization_id = spec.organization_id.to_owned();
+        let subject_id = spec.subject_id.to_owned();
+        let role_slug = spec.role_slug.to_owned();
+        let requested_by = spec.requested_by.to_owned();
+        let reason = spec.reason.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AccessRequestRaise,
+                target: id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO access_grant_requests \
+                         (id, tenant_id, environment_id, organization_id, subject_id, \
+                          role_slug, requested_by, reason, state) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')",
+                )
+                .bind(&id_owned)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&organization_id)
+                .bind(&subject_id)
+                .bind(&role_slug)
+                .bind(&requested_by)
+                .bind(&reason)
+                .execute(&mut **tx)
+                .await?;
+                // In the write's transaction: a rolled-back request announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Relabel every approved grant whose deadline has passed, auditing
+    /// `access_request.expire` for each.
+    ///
+    /// Returns how many were swept.
+    ///
+    /// # What this does NOT do
+    ///
+    /// It does not end access. Access already ended: `grants_now` answers no the instant
+    /// the deadline passes, whether or not this has run. A sweeper is a process and
+    /// processes do not run -- stopped, unconfigured, mid-restart, or simply a tick
+    /// behind -- so a design where the relabelling is what revokes would leak access for
+    /// exactly as long as the sweep was late.
+    ///
+    /// What it does is keep the RECORD honest: the listing says `expired` rather than
+    /// showing a grant that looks live, and an `access_request.expire` audit row marks
+    /// when the system noticed. An auditor reading the trail sees the end of the grant,
+    /// not just its beginning.
+    ///
+    /// # Why one row at a time
+    ///
+    /// Each relabel is an audited write, and `write_audited` writes the audit row in the
+    /// same transaction as the change. A bulk UPDATE would be one statement and one audit
+    /// row for an unbounded number of grants, which is the shape that loses the detail an
+    /// auditor came for.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault. A fault partway through leaves the rows
+    /// already swept swept: each is its own transaction, and the next pass takes the rest.
+    pub async fn expire_elapsed(
+        &self,
+        env: &Env,
+        now_micros: i64,
+        limit: i64,
+    ) -> Result<u64, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let due: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM access_grant_requests \
+             WHERE tenant_id = $1 AND environment_id = $2 AND state = 'approved' \
+               AND granted_until <= (TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval) \
+             ORDER BY granted_until LIMIT $4",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(now_micros)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let mut swept = 0_u64;
+        for id in due {
+            let Ok(parsed) = crate::id::AccessRequestId::parse_in_scope(&id, &scope) else {
+                // A row whose id this build cannot parse in this scope is one it must not
+                // relabel: it cannot name the target of the audit row it would write.
+                continue;
+            };
+            let id_owned = id.clone();
+            let changed = write_audited(
+                AuditedWrite {
+                    store: self.store,
+                    scope,
+                    acting: &self.acting,
+                    env,
+                    action: Action::AccessRequestExpire,
+                    target: &parsed,
+                },
+                async move |tx| {
+                    // `AND state = 'approved'` again, because the SELECT above COMMITTED
+                    // before this loop began: between the two, an approver could have
+                    // decided this request or another replica's sweep could have taken
+                    // it. Either way this pass must not overwrite that.
+                    //
+                    // UNMEASURED, and deliberately named as such: no test in
+                    // `access_requests.rs` opens that window, because doing so needs an
+                    // interleaving hook the repository does not have. Removing the guard
+                    // leaves the suite green. It is here because the window is real, not
+                    // because something proves it is.
+                    // THE DEADLINE IS KEPT. An earlier version nulled it here, which
+                    // erased the only record of when the grant ended: a row recording a
+                    // three-hour elevation became indistinguishable from one recording
+                    // three weeks, and an auditor asking how long somebody held a role
+                    // could not answer from the row. The CHECK now requires an expired row
+                    // to carry it.
+                    let done = sqlx::query(
+                        "UPDATE access_grant_requests SET state = 'expired' \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                           AND state = 'approved'",
+                    )
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(&id_owned)
+                    .execute(&mut **tx)
+                    .await?;
+                    Ok(done.rows_affected())
+                },
+                false,
+            )
+            .await?;
+            // COUNT WHAT CHANGED, not what was attempted. When the guard above declines a
+            // row this pass claimed, the caller is told nothing was swept, which is what
+            // happened.
+            swept += changed;
+        }
+        Ok(swept)
+    }
+
+    /// Approve or deny a pending request, auditing `access_request.decide`.
+    ///
+    /// `granted_until_micros` is required for an approval and refused for a denial: an
+    /// approval is exactly a grant with an end, and the database enforces the pairing.
+    ///
+    /// # Why the UPDATE names the state it expects
+    ///
+    /// `AND state = 'pending'` makes the decision idempotent-safe under a race: two
+    /// approvers pressing at once produce one decided row and one [`StoreError::NotFound`],
+    /// rather than the second silently overwriting the first's decision and deadline.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when the request does not exist in this scope or is no
+    /// longer pending; [`StoreError::SelfApproval`] when the deciding principal is the one
+    /// that raised it, refused HERE before the statement runs so the edge can answer in
+    /// words; [`StoreError::Database`] on a persistence fault, which is what the CHECK
+    /// constraint would surface as for any caller that reached the table without passing
+    /// this method.
+    ///
+    /// The comparison is between PRINCIPALS. One person holding two credentials raises
+    /// under one and decides under the other and this returns `Ok`: see the migration's
+    /// own note and
+    /// `two_credentials_of_one_operator_are_two_principals_and_the_rule_does_not_see_it`.
+    pub async fn decide(
+        &self,
+        env: &Env,
+        id: &crate::id::AccessRequestId,
+        decision: AccessDecision<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        if decision.approve != decision.granted_until_micros.is_some() {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id_owned = id.to_string();
+        let decided_by = decision.decided_by.to_owned();
+        let decided_at_micros = decision.decided_at_micros;
+        let granted_until_micros = decision.granted_until_micros;
+        let state = if decision.approve {
+            "approved"
+        } else {
+            "denied"
+        };
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AccessRequestDecide,
+                target: id,
+            },
+            async move |tx| {
+                // THE COMPREHENSIBLE REFUSAL, taken inside the same transaction and with
+                // the row locked, so the answer cannot be overtaken between the read and
+                // the write. The CHECK constraint is what makes self-approval impossible;
+                // this is what makes it legible, and `FOR UPDATE` is what stops the two
+                // from disagreeing under a race.
+                let existing: Option<(String, String)> = sqlx::query_as(
+                    "SELECT requested_by, state FROM access_grant_requests \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 FOR UPDATE",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&id_owned)
+                .fetch_optional(&mut **tx)
+                .await?;
+                let Some((requested_by, _)) = existing else {
+                    return Err(StoreError::NotFound);
+                };
+                if requested_by == decided_by {
+                    return Err(StoreError::SelfApproval);
+                }
+                let done = sqlx::query(
+                    "UPDATE access_grant_requests SET state = $4, decided_by = $5, \
+                         decided_at = (TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval), \
+                         granted_until = CASE WHEN $7::bigint IS NULL THEN NULL ELSE \
+                             (TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) END \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                       AND state = 'pending'",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&id_owned)
+                .bind(state)
+                .bind(&decided_by)
+                .bind(decided_at_micros)
+                .bind(granted_until_micros)
+                .execute(&mut **tx)
+                .await?;
+                if done.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                // AFTER the rows-affected guard, in the write's transaction: a decision
+                // that landed on nothing -- already decided, or gone -- announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod effective_tail_drift_tests {
+    use super::{
+        EFFECTIVE_PERMISSION_SLUGS_TAIL, EFFECTIVE_PERMISSION_SLUGS_TIME_BOXED_TAIL,
+        EFFECTIVE_ROLE_GRANTS_TAIL, EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL,
+    };
+
+    /// Collapse SQL whitespace so the comparison is about the statement, not its layout.
+    fn flat(sql: &str) -> String {
+        sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The time-boxed grants tail's first three arms are the plain tail's three arms
+    /// (issue #145 criterion 4).
+    ///
+    /// # Why a test and not a comment
+    ///
+    /// The time-boxed tail COPIES the direct, group and default arms so it can add a fourth
+    /// beside them, and the plain tail's own documentation says why two resolutions of the
+    /// same question must not drift: a caller reading one and a caller reading the other
+    /// would disagree about who holds what. A copy is exactly how that drift starts, and a
+    /// comment saying "keep these in sync" is a request rather than a guarantee.
+    ///
+    /// So the two are compared here, modulo the two columns the copy adds. Editing either
+    /// arm without the other fails this, which is the moment to decide whether the change
+    /// belongs in both.
+    #[test]
+    fn the_time_boxed_grants_tail_repeats_the_plain_arms_exactly() {
+        let plain = flat(EFFECTIVE_ROLE_GRANTS_TAIL);
+        let timed = flat(EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL).replace(
+            ", NULL::text AS via_request_id, NULL::bigint AS granted_until_micros",
+            "",
+        );
+
+        let plain_arms = plain
+            .split_once(" ORDER BY ")
+            .expect("the plain tail ends in an ORDER BY")
+            .0
+            .to_owned();
+        let timed_arms = timed
+            .split_once(" UNION ALL SELECT DISTINCT r.slug AS slug, 'time_boxed'")
+            .expect("the time-boxed tail carries a fourth arm")
+            .0
+            .to_owned();
+
+        assert_eq!(
+            plain_arms, timed_arms,
+            "the two role resolutions have drifted. One of them now answers a different \
+             question than the other, and which one a caller gets depends only on whether \
+             the exploratory feature is on"
+        );
+
+        // AND THE FOURTH ARM IS REALLY THERE, so the split above cannot pass by finding
+        // nothing and comparing a whole string against itself.
+        assert!(
+            flat(EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL).contains("'time_boxed'::text AS source"),
+            "the time-boxed tail must carry the arm it exists for"
+        );
+    }
+
+    /// The same, for the permissions pair.
+    ///
+    /// Its first disjunct is the plain tail's whole predicate, with a second added beside it.
+    #[test]
+    fn the_time_boxed_permissions_tail_repeats_the_plain_predicate() {
+        let plain = flat(EFFECTIVE_PERMISSION_SLUGS_TAIL);
+        let timed = flat(EFFECTIVE_PERMISSION_SLUGS_TIME_BOXED_TAIL);
+
+        // EXTRACTED AND COMPARED, not `contains`. A containment check passes when the copy
+        // ADDS something after the predicate it is supposed to repeat, which is most of
+        // the ways a copy drifts: a mutation appending `AND true` to the time-boxed
+        // disjunct survived exactly that.
+        let plain_predicate = plain
+            .split_once("AND p.id IN ( ")
+            .expect("the plain tail selects on a permission-id predicate")
+            .1
+            .rsplit_once(" ) ORDER BY")
+            .expect("the plain tail ends in an ORDER BY")
+            .0
+            .to_owned();
+        let timed_first = timed
+            .split_once("AND (p.id IN ( ")
+            .expect("the time-boxed tail opens with the same predicate")
+            .1
+            .split_once(" ) OR p.id IN (")
+            .expect("the time-boxed tail carries a second disjunct")
+            .0
+            .to_owned();
+        assert_eq!(
+            plain_predicate, timed_first,
+            "the time-boxed permissions tail must resolve the assignment-based permissions \
+             EXACTLY as the plain one does, or turning the exploratory feature on would \
+             change what a member holds through paths that have nothing to do with it"
+        );
+        assert!(
+            timed.contains("JOIN access_grant_requests agr"),
+            "and it must carry the disjunct it exists for"
+        );
     }
 }

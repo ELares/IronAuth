@@ -1071,6 +1071,15 @@ name = "portal_links"
 path = "tests/portal_links.rs"
 required-features = ["testing"]
 
+# The time-boxed access-request primitive (issue #145 criterion 4). Its own target because what
+# it drives is the DATABASE's constraints rather than a repository's behaviour: the separation of
+# duties and the deadline pairing are CHECKs, and the tests present statements the owner
+# connection would otherwise be allowed to run.
+[[test]]
+name = "access_requests"
+path = "tests/access_requests.rs"
+required-features = ["testing"]
+
 # The portal SESSION a redeemed link opens (issue #140). Its own target rather than more cases in
 # the file above, because the subject is different: that one is about a link being spent exactly
 # once, this one is about what the resulting credential may reach and for how long.

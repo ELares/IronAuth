@@ -1683,6 +1683,22 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
             ),
         },
         Case {
+            label: "access_requests.raiseAccessRequest",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/access-requests"),
+            body: Some(
+                "{\"subject_id\":\"usr_absent\",\"role_slug\":\"billing-admin\",\
+                 \"reason\":\"absent\"}"
+                    .to_owned(),
+            ),
+        },
+        Case {
+            label: "access_requests.decideAccessRequest",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/access-requests/agr_absent/decision"),
+            body: Some("{\"approve\":false}".to_owned()),
+        },
+        Case {
             label: "project_grants.withdrawProjectGrant",
             method: "DELETE",
             path: format!("{base}/organizations/{org}/project-grants/pgt_absent"),

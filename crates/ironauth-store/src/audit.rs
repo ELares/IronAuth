@@ -278,6 +278,12 @@ pub enum Action {
     /// and a position in the organization's group forest; who is IN it and what it
     /// grants are later PRs of the same issue.
     OrganizationGroupCreate,
+    /// A member asked for time-boxed access to a role (issue #145 criterion 4).
+    AccessRequestRaise,
+    /// A DIFFERENT member approved or denied it (issue #145 criterion 4).
+    AccessRequestDecide,
+    /// An approved grant reached its deadline and was swept (issue #145 criterion 4).
+    AccessRequestExpire,
     /// An organization group's MUTABLE fields were changed (issue #97): its
     /// display name, its metadata, or both. The group's `slug` (the stable name)
     /// is immutable by GRANT and its PARENT is changed only under the separate
@@ -1775,6 +1781,9 @@ impl Action {
             Action::OrganizationRoleCreate => "organization.role.create",
             Action::OrganizationRoleUpdate => "organization.role.update",
             Action::OrganizationRoleDelete => "organization.role.delete",
+            Action::AccessRequestRaise => "access_request.raise",
+            Action::AccessRequestDecide => "access_request.decide",
+            Action::AccessRequestExpire => "access_request.expire",
             Action::OrganizationGroupCreate => "organization.group.create",
             Action::OrganizationGroupUpdate => "organization.group.update",
             Action::OrganizationGroupDelete => "organization.group.delete",

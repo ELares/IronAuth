@@ -370,6 +370,7 @@ struct Fixture {
     key: String,
     membership: String,
     organization: String,
+    access_request: String,
     permission: String,
     resource_server: String,
     role: String,
@@ -718,6 +719,28 @@ impl Fixture {
             .await;
         assert_eq!(status, StatusCode::CREATED, "seed log stream: {body}");
         let log_stream = field(&body, "/id", "seed log stream");
+
+        // A live PENDING access request, so the decision case addresses a REAL row. A
+        // synthetic id like `agr_sweep` does not decode as a scoped id, so the handler
+        // answers the uniform not-found at a LIVE environment too and driving it at a
+        // soft-deleted one would measure nothing about the fence.
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/organizations/{organization}/access-requests"),
+                "seed-access-request",
+                &serde_json::json!({
+                    // THE ROLE THIS FIXTURE ACTUALLY SEEDS. The raise refuses a slug the
+                    // organization does not define, so naming an invented one here would
+                    // make the fixture fail rather than the sweep measure anything.
+                    "subject_id": user,
+                    "role_slug": "sweep",
+                    "reason": "sweep fixture",
+                })
+                .to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed access request: {body}");
+        let access_request = field(&body, "/id", "seed access request");
 
         // A live flow target, so the DELETE case addresses a REAL row. A synthetic id like
         // `ftg_absent` does not decode as a scoped id, so the handler answers the uniform
@@ -1432,6 +1455,7 @@ impl Fixture {
             client,
             connector,
             log_stream,
+            access_request,
             flow_target,
             webhook_endpoint,
             external_issuer,
@@ -1495,6 +1519,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         pat,
         connector,
         log_stream,
+        access_request,
         flow_target,
         webhook_endpoint,
         external_issuer,
@@ -2960,6 +2985,32 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{org_base}/access-review"),
         ),
+        // The EXPLORATORY access-request surface (issue #145 criterion 4). This harness
+        // DOES arm the feature -- `start_fully_armed` turns it on, and the fixture above
+        // proves it by seeding a request and asserting 201 -- so all three reach their
+        // relations and this sweep measures what it is for: the missing grant that turns a
+        // live surface into an opaque 500.
+        Case::json(
+            "access_requests.raiseAccessRequest",
+            "POST",
+            format!("{org_base}/access-requests"),
+            &serde_json::json!({
+                "subject_id": user,
+                "role_slug": "billing-admin",
+                "reason": "sweep",
+            }),
+        ),
+        Case::empty(
+            "access_requests.listAccessRequests",
+            "GET",
+            format!("{org_base}/access-requests"),
+        ),
+        Case::json(
+            "access_requests.decideAccessRequest",
+            "POST",
+            format!("{org_base}/access-requests/{access_request}/decision"),
+            &serde_json::json!({ "approve": false }),
+        ),
         Case::empty(
             "project_grants.withdrawProjectGrant",
             "DELETE",
@@ -3410,6 +3461,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         service_account: "sva_0".to_owned(),
         agent: "agp_0".to_owned(),
         approval: "ava_0".to_owned(),
+        access_request: "agr_0".to_owned(),
         sa_api_key: "akey_0".to_owned(),
         pat: "akey_1".to_owned(),
         org_connection: "ocn_0".to_owned(),
