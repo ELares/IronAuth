@@ -16,9 +16,16 @@
 //! access-review export for the same organization.
 //!
 //! The comparison is a SET EQUALITY over four of the export's nine columns -- the membership,
-//! the role slug, the source and the group -- and not a row-for-row comparison of the file: the
-//! remaining five are the organization, the principal kind, the subject and the two time-boxed
-//! columns, which say who a row is ABOUT rather than what it grants.
+//! the role slug, the source and the group -- and not a row-for-row comparison of the file.
+//!
+//! Three of the five it leaves out say who a row is ABOUT rather than what it grants: the
+//! organization is fixed by the request, the principal kind by the member, and the subject is
+//! asserted separately in the criterion-1 test. The other two are `via_request_id` and
+//! `granted_until_unix_ms`, and they are left out for a different and weaker reason: the fold
+//! could produce both -- `access_request.decided` carries the request id and the deadline -- and
+//! comparing them would pin that a time-boxed row names the RIGHT approval rather than merely
+//! some approval. That is coverage this test does not have, rather than a column that means
+//! nothing here.
 //!
 //! ONE LOOKUP COMES FROM THE MANAGEMENT API AND NOT FROM THE FEED, and pretending otherwise is
 //! what sank the first attempt at this (PR #1222, closed). It was two until the group tree
@@ -135,20 +142,26 @@ impl Replay {
     /// and its tombstone, the membership's, the user's, the role's, the group's, and each of
     /// the three assignment tables.
     ///
-    /// THE FIXTURE REACHES ALL BUT TWO OF THEM, and both exceptions are named rather than
-    /// glossed, because an arm nothing drives is an arm whose mutant survives and a reader is
-    /// owed the reason.
+    /// WHAT THE FIXTURE DOES NOT DRIVE, listed rather than counted, because every previous
+    /// version of this paragraph got the count wrong and an arm nothing drives is an arm whose
+    /// mutant survives:
     ///
     ///   * `organization.deleted`. A deleted organization cannot be exported at all --
     ///     `resolve_live_org` answers not-found -- so there is no second side to compare a fold
-    ///     against. The arm is kept for a consumer that folds more than one organization.
+    ///     against. Kept for a consumer that folds more than one organization.
     ///   * `user.deprovisioned`. Reaching it means driving the SCIM `DELETE /scim/v2/Users/{id}`
-    ///     path, which needs a provisioning connection and its own credential, and that is a
-    ///     SCIM fixture rather than an entitlement one. The arm is here because the fold was
-    ///     WRONG without it, which is a stronger reason than coverage: see its own comment.
+    ///     path, which needs a provisioning connection and its own credential: a SCIM fixture
+    ///     rather than an entitlement one. It is here because the fold was WRONG without it,
+    ///     which is a stronger reason than coverage; see its own comment.
+    ///   * `organization.default_role_cleared`. The fixture sets a default and never clears it.
+    ///   * `organization.service_account_added` / `_removed`. No machine member here; the
+    ///     export's own coverage of them is the pinned store fixture.
+    ///   * The REPARENT-TO-ROOT branch of `org_group.reparented` (a `None` parent), and an
+    ///     ancestor group being deleted out from under a descendant's member. Both are reachable
+    ///     in principle and neither is driven.
     ///
-    /// The deadline on a time-boxed grant is a third thing this scenario cannot reach, for a
-    /// different reason -- it would have to wait for one -- and
+    /// The deadline on a time-boxed grant is a separate case: the scenario cannot reach it
+    /// because it would have to WAIT for one, so
     /// `an_expired_time_boxed_grant_resolves_to_nothing` measures it directly instead.
     ///
     /// `user.deactivated` and `user.state_changed` are deliberately NOT handled: they move
@@ -487,12 +500,16 @@ async fn member_with_user(
 /// `pages_read` is returned so the caller can refuse a run that did not actually page.
 const PAGE: usize = 5;
 
-async fn fold_feed(h: &Harness, tenant: &str, environment: &str, sentinel: &str) -> (Replay, usize) {
+async fn fold_feed(
+    h: &Harness,
+    tenant: &str,
+    environment: &str,
+    settled: impl Fn(&Replay) -> bool,
+) -> (Replay, usize) {
     let feed = format!("/v1/tenants/{tenant}/environments/{environment}/events");
     for _ in 0..100 {
         let mut replay = Replay::default();
         let mut cursor: Option<String> = None;
-        let mut saw_sentinel = false;
         let mut pages_read = 0_usize;
         loop {
             let url = match &cursor {
@@ -510,9 +527,6 @@ async fn fold_feed(h: &Harness, tenant: &str, environment: &str, sentinel: &str)
             for item in &events {
                 let envelope = &item["payload"];
                 let kind = envelope["type"].as_str().unwrap_or_default();
-                if kind == sentinel {
-                    saw_sentinel = true;
-                }
                 replay.apply(kind, &envelope["payload"]);
             }
             // The feed documents `next_cursor` as always present ("Present even when `events`
@@ -525,12 +539,15 @@ async fn fold_feed(h: &Harness, tenant: &str, environment: &str, sentinel: &str)
                 break;
             }
         }
-        if saw_sentinel {
+        if settled(&replay) {
             return (replay, pages_read);
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    panic!("the feed never carried {sentinel}, so the fold would be reading a truncated history");
+    panic!(
+        "the feed never settled: the fold never reached the state the caller is waiting for, \
+         so every assertion after this would be reading a truncated history"
+    );
 }
 
 /// The role CATALOGUE, read from the management API.
@@ -941,9 +958,14 @@ async fn seed_catalogue(h: &Harness, org_base: &str) -> (String, String, String,
 
 /// Take the organization apart in the ways the resolver honours and the feed announces.
 ///
-/// SIX removals, each drawn on a different subject so that no two mask each other: a withdrawn
-/// direct grant, a deleted role, a removed membership, a deleted group, a soft-deleted user, a
-/// member taken out of a group, and a role taken off a group. Each drops rows from the export
+/// SEVEN removals. Most are drawn on a DIFFERENT subject so that no two mask each other, which
+/// is a rule this fixture learned the hard way -- twice -- and does not follow perfectly: alice
+/// appears in two of them (her `reports-reader` is withdrawn and her `billing-admin` survives),
+/// and dave in two (his membership goes and so does the group he was in). The ones that matter
+/// have their own person: erin for the group deletion, frank for the user soft-delete, henry for
+/// the group-member removal, ida for the group-role unassign. The list is: a withdrawn direct
+/// grant, a deleted role, a removed membership, a deleted group, a soft-deleted user, a member
+/// taken out of a group, and a role taken off a group. Each drops rows from the export
 /// through a fence at some level, and each is a way for a fold to go on reporting access that
 /// no longer exists. Separate from the build so the build reads as a working organization and
 /// this reads as what happens to it.
@@ -1014,6 +1036,7 @@ async fn disturb(h: &Harness, org_base: &str, doomed: &Doomed<'_>) {
 
 /// Every id the scenario mints, so the assertions can name what they are talking about.
 struct Fixture {
+    ops: String,
     henry: String,
     ida: String,
     /// A second organization, disabled after it was working.
@@ -1032,7 +1055,7 @@ struct Fixture {
     dave: String,
 }
 
-/// Build the organization, then take it apart again in the four ways the export honours and a
+/// Build the organization, then take it apart again in the ways the export honours and a
 /// naive fold does not.
 async fn seed_and_disturb(h: &Harness, base: &str, org: &str) -> Fixture {
     let org_base = format!("{base}/organizations/{org}");
@@ -1085,6 +1108,7 @@ async fn seed_and_disturb(h: &Harness, base: &str, org: &str) -> Fixture {
     .await;
 
     Fixture {
+        ops,
         henry,
         ida,
         elsewhere,
@@ -1133,6 +1157,16 @@ async fn assert_the_disabled_organization_is_empty_on_both_sides(
     // deleted role.
     let mut all_slugs = slugs.clone();
     all_slugs.extend(api_role_slugs(h, &elsewhere_base).await);
+    // AND THE MERGE ACTUALLY HAPPENED. Without this assertion the line above is itself
+    // unprotected: delete it and the second organization's role has no slug, `push` bails, the
+    // emptiness below holds for the wrong reason, and the whole disable check goes vacuous
+    // again -- which is the exact defect that line was added to fix. A guard whose own removal
+    // is unmeasured is not a guard.
+    assert!(
+        all_slugs.values().any(|slug| slug == "staff"),
+        "the second organization's role catalogue was not merged in, so the emptiness below \
+         would be a missing slug rather than the disable"
+    );
     let rebuilt_elsewhere = replay.resolve(&f.elsewhere, &all_slugs, now_unix_ms);
     assert!(
         rebuilt_elsewhere.is_empty(),
@@ -1166,6 +1200,14 @@ async fn assert_the_disabled_organization_is_empty_on_both_sides(
         "the fold never saw the second organization's default role, so the emptiness above is \
          ignorance rather than the disable"
     );
+    assert!(
+        replay
+            .roles
+            .values()
+            .any(|owner| *owner == f.elsewhere),
+        "the fold never saw the second organization's ROLE, which is the third ingredient a \
+         grant needs: without it the emptiness is ignorance whatever the other two say"
+    );
 
 }
 
@@ -1183,7 +1225,7 @@ fn assert_every_removal_landed(rebuilt: &BTreeSet<GrantPath>, f: &Fixture) {
             .collect::<BTreeSet<_>>()
     };
     // AND THE DIVERGENCES ACTUALLY HAPPENED. Every assertion above is satisfied by a fixture
-    // in which none of the four removals landed, which is precisely how the first attempt at
+    // in which none of the removals landed, which is precisely how the first attempt at
     // this passed while proving nothing.
     assert!(
         !slugs_of(&f.alice).contains("reports-reader"),
@@ -1324,9 +1366,37 @@ async fn the_snapshot_folded_from_the_feed_matches_what_the_resolver_reports() {
     );
 
     // THE FOLD, waiting for the last of those to reach the feed.
-    // The SENTINEL is the last thing `disturb` does, so seeing it means the whole scenario has
-    // reached the feed.
-    let (replay, pages_read) = fold_feed(&h, &tenant, &environment, "user.deleted").await;
+    // WAIT FOR THE EFFECT, not for an event type, and the difference is a bug this had.
+    //
+    // The wait used to name `user.deleted` and the comment said it was "the last thing
+    // `disturb` does". Round 2 appended two more removals after it and left both the sentinel
+    // and the sentence alone. That is not a stale comment, it is a race: the feed gates every
+    // row on a CLUSTER-wide `pg_snapshot_xmin`, and its own docs say it "serves settled rows
+    // that sit ABOVE an unsettled one" -- so a lower-xmin `user.deleted` can pass the gate
+    // while the two events after it are still withheld. The fold would return, the export
+    // would already show both removals applied, and the comparison would fail for a reason
+    // that is not a defect. Exactly the construction flakiness #1222 died of.
+    //
+    // A predicate over the FOLDED STATE cannot go stale that way: it names the effect of the
+    // last write rather than the shape of it, so appending another removal makes this wait
+    // wrong in a way that FAILS rather than one that races.
+    //
+    // ITS MUTANTS SURVIVE ON A QUIET MACHINE, measured: replacing this whole predicate with
+    // `true` -- no wait at all -- leaves both tests green here, and so does dropping either
+    // half of it. That is not evidence the wait does nothing. It is the same machine
+    // dependence the paragraph in `fold_feed` records: one reviewer measured a single-shot
+    // read in this crate failing 5 of 12 runs and another could not reproduce it at all, 8 of
+    // 8 green. A guard against a watermark held down by whatever else is open on the cluster
+    // cannot be killed by a mutation on an idle one. Keep it.
+    let settled = |replay: &Replay| {
+        !replay
+            .group_roles
+            .contains(&(f.ops.clone(), f.billing.clone()))
+            && !replay
+                .group_members
+                .contains(&(f.finance.clone(), f.henry.clone()))
+    };
+    let (replay, pages_read) = fold_feed(&h, &tenant, &environment, settled).await;
     assert!(
         pages_read > 1,
         "the fold read the whole feed in {pages_read} page(s), so nothing here exercised the \
@@ -1372,10 +1442,11 @@ async fn the_snapshot_folded_from_the_feed_matches_what_the_resolver_reports() {
         );
     }
     let slugs = api_role_slugs(&h, &org_base).await;
-    // THE INSTANT the fold judges deadlines against, taken once. The export resolves against
-    // the server's clock a moment earlier, so a grant whose deadline fell between the two
-    // would make the two sides disagree for a reason that is not a defect; the fixture's grant
-    // runs for an hour, so the window is not one this test can land in.
+    // THE INSTANT the fold judges deadlines against, taken once and taken HERE -- which is
+    // AFTER the feed has been folded and BEFORE the export is read, so it sits between the two.
+    // A grant whose deadline fell inside that window would make the two sides disagree for a
+    // reason that is not a defect, in either direction. The fixture's grant runs for an hour,
+    // so the window is not one this test can land in.
     let now_unix_ms = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
