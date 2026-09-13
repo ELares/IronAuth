@@ -588,12 +588,17 @@ fn connection_rows<'a>(
             // dies on this date while the fresh one carries on, so an outage warning there would
             // be a false alarm at the exact moment a successful cutover guaranteed otherwise.
             //
-            // THE CONNECTION'S OWN EXPIRY IS CLEARED BY NOTHING. No path in this system writes
-            // `scim_connections.expires_at`: migration 0183 grants the control role
-            // `UPDATE (revoked_at, updated_at)` and no more, and rotating mints a token with no
-            // horizon while leaving that column exactly where it was. So "renew before" there
-            // names a remedy the customer can perform forever without moving the date, and on it
-            // provisioning stops for good. That one has to say so, and say what actually helps.
+            // THE CONNECTION'S OWN EXPIRY IS CLEARED BY NOTHING. `create` is the only path that
+            // WRITES `scim_connections.expires_at` and nothing UPDATES it: migration 0183 grants
+            // the control role `UPDATE (revoked_at, updated_at)` and no more, and rotating mints
+            // a token with no horizon while leaving that column exactly where it was. So "renew
+            // before" there names a remedy the customer can perform forever without moving the
+            // date, and on it provisioning stops for good. That one has to say so, and say what
+            // actually helps.
+            //
+            // (An earlier version of this sentence said "no path in this system WRITES" it,
+            // which is false -- the create path does, which is how a connection comes to carry
+            // one at all. What the argument needs is that nothing MOVES it, and that is true.)
             if connection.expires_at_unix_micros == Some(deadline) {
                 format!("Provisioning stops {when}: ask your vendor to replace this connection")
             } else if connection.credential_expiring_soon(now, lead) {

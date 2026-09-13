@@ -16,6 +16,16 @@ uniform not-found a spent token gets.
 provisioning state as JSON, for a vendor to render inside its own application
 instead of sending its customer to a hosted page.
 
+THE BEARER IS THE SESSION, which is the cost of reusing the credential
+rather than minting a second one. Anything that can send an HTTP request
+with that value as a COOKIE reaches every other portal route the session's
+intent allows, including the mutating ones. That changes nothing for a
+vendor's backend, which already held the session; it changes the FRONT END,
+where a value that was `HttpOnly` is now in script. Mint a link per intent
+and hand a widget only the one it needs. Closing it properly needs a
+distinct read-only credential, which is a store change and is why this
+surface is exploratory.
+
 The SSO widget reads BOTH tables the hosted page reads -- a SAML upstream is a
 `saml_connections` row and the other kind is an `org_connections` binding -- and
 each connector row carries its own PROTOCOL, because that binding covers OIDC

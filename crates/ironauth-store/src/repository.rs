@@ -38043,6 +38043,54 @@ impl OrgConnectionRepo<'_> {
             .map(|row| org_connection_record_from_row(row, self.scope))
             .collect()
     }
+
+    /// One PAGE of an organization's CONNECTOR bindings, oldest first (issue #145 criterion 6).
+    ///
+    /// # Why the kind belongs in the statement rather than in the caller
+    ///
+    /// `org_connections` holds bindings of two kinds -- one names a connector, the other a SAML
+    /// connection -- and [`Self::list_for_organization`] returns both. A caller that wants only
+    /// one kind and filters the result in Rust is filtering what the `LIMIT` already chose, so
+    /// the rows it wanted can be crowded out by rows it was always going to discard: an
+    /// organization with twenty-one SAML bindings and one connector gets a page with no
+    /// connector in it, and no way to know one was dropped.
+    ///
+    /// THE PORTAL WIDGET SHIPPED EXACTLY THAT and then shipped a Rust-side filter that did not
+    /// fix it, because the bound it moved was the `take` and not this. The predicate is here now,
+    /// so the limit and the filter are one decision and `limit + 1` means what every other
+    /// bounded read in this file means: ask for one more than you will show, and the extra row
+    /// is the truncation.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the organization is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_connector_bindings(
+        &self,
+        organization_id: &OrganizationId,
+        limit: i64,
+    ) -> Result<Vec<OrgConnectionRecord>, StoreError> {
+        if organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {ORG_CONNECTION_READ_COLUMNS} FROM org_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+               AND connector_id IS NOT NULL \
+             ORDER BY created_at, id LIMIT $4"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| org_connection_record_from_row(row, self.scope))
+            .collect()
+    }
 }
 
 /// The read-only routing-rule repository (issue #77). Each selector lookup resolves at

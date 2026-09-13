@@ -5402,6 +5402,10 @@ async fn the_token_check_is_absent_where_nothing_can_authenticate() {
 /// of either kind, and the widget drops the ones with no connector -- so these are what a bound
 /// applied before the filter spends itself on.
 async fn saml_binding_for(harness: &Harness, organization: &OrganizationId, index: usize) {
+    // A DISTINCT `created_at` PER ROW. Every binding fixture here used the same literal, so
+    // `ORDER BY created_at, id` fell entirely to `id` -- which is random -- and any test whose
+    // result depended on which rows a `LIMIT` returned was a coin flip. The index makes the
+    // order total and the test deterministic.
     let env = Env::system();
     let scope = harness.scope();
     let connection = saml_connection_from(
@@ -5423,7 +5427,7 @@ async fn saml_binding_for(harness: &Harness, organization: &OrganizationId, inde
         .create(
             &env,
             &ironauth_store::OrgConnectionId::generate(&env, &scope),
-            1_000_000,
+            1_000_000 + i64::try_from(index).unwrap_or(0),
             ironauth_store::NewOrgConnection {
                 organization_id: organization,
                 upstream: ironauth_store::OrgConnectionUpstream::Saml(&connection),
@@ -6205,7 +6209,11 @@ async fn a_connector_upstream_is_not_crowded_out_by_saml_bindings() {
     // is the defect the whole second read was added to fix, reintroduced by the ordering.
     let harness = Harness::start_store_backed_with_widgets(true).await;
     let org = seed_org(&harness, "Acme").await;
-    for index in 0..21 {
+    // MORE SAML BINDINGS THAN THE BOUND, and the connector binding created LAST so it is the
+    // one an over-early limit discards. Both halves matter: with twenty or fewer the whole set
+    // fits inside `LIMIT 21` and any ordering passes, which is why the first version of this
+    // test proved nothing and passed against the unfixed code.
+    for index in 0..25 {
         saml_binding_for(&harness, &org, index).await;
     }
     upstream_with_protocol(&harness, &org, "acme-entra", "oidc").await;
@@ -6218,6 +6226,13 @@ async fn a_connector_upstream_is_not_crowded_out_by_saml_bindings() {
         payload["items"]["connectors"].as_array().map(Vec::len),
         Some(1),
         "the connector upstream has to survive the SAML bindings in front of it: {body}"
+    );
+    // AND THE SAML HALF REPORTS ITS OWN TRUNCATION, which is the other thing this fixture has
+    // enough rows to express: twenty-five connections, twenty shown.
+    assert_eq!(
+        payload["truncated"].as_bool(),
+        Some(true),
+        "twenty-five SAML connections have to report as cut: {body}"
     );
 }
 
@@ -6290,7 +6305,9 @@ async fn a_widget_refusal_is_readable_from_the_host_origin() {
     };
     assert_eq!(allowed(&ok_headers).as_deref(), Some("*"), "the control");
 
-    // EVERY REFUSAL `widget_session` PRODUCES, since a host has to tell them from a dead network.
+    // THREE OF THE FOUR STATES `widget_session` REFUSES ON -- an absent bearer, an unknown one,
+    // and the wrong intent below. The fourth is a malformed SCOPE in the path, which is driven
+    // separately because it needs a different URL rather than a different token.
     for (label, token) in [("no bearer", None), ("an invented bearer", Some("nope"))] {
         let (status, headers, body) = widget_get(&harness, "sso", token).await;
         assert_eq!(status, 404, "{label}: {body}");
@@ -6309,5 +6326,25 @@ async fn a_widget_refusal_is_readable_from_the_host_origin() {
         allowed(&headers).as_deref(),
         Some("*"),
         "a host cannot read the intent refusal"
+    );
+
+    // AND THE FOURTH: a path whose scope does not parse, which `widget_session` refuses before
+    // it looks at the bearer at all. A host app that builds its URL from a stale tenant id sees
+    // this one, so it has to be readable too.
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri("/t/not-a-tenant/e/not-an-environment/portal/w/sso")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {bearer}"),
+        )
+        .body(axum::body::Body::empty())
+        .expect("request builds");
+    let (status, headers, body) = harness.send(request).await;
+    assert_eq!(status, 404, "a malformed scope: {body}");
+    assert_eq!(
+        allowed(&headers).as_deref(),
+        Some("*"),
+        "a host cannot read the malformed-scope refusal"
     );
 }

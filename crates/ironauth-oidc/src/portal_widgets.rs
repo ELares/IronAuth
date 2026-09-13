@@ -33,6 +33,29 @@
 //! minting path for the same credential is a second place for its TTL, its single-use rule and
 //! its intent to be decided, and those are the properties the portal link exists to carry.
 //!
+//! # THE TOKEN IS THE SESSION, and a vendor has to treat it as one
+//!
+//! This is the cost of reusing the credential rather than minting a second, and it is stated
+//! here rather than left for somebody to discover. The bearer a host holds is the same value the
+//! `__Host-` cookie carries. Anything that can send an HTTP request with that value as a COOKIE
+//! -- a server, a script, anything not a browser tab -- reaches every other portal route the
+//! session's intent allows, INCLUDING the mutating ones: an `sso` widget token can drive the
+//! SAML setup form, and a `scim` one can mint a provisioning credential.
+//!
+//! WHAT THAT CHANGES AND WHAT IT DOES NOT. It changes nothing about the vendor's BACKEND, which
+//! redeemed the link and already held the session. It changes the vendor's FRONT END: a value
+//! that was `HttpOnly` and unreadable by script is now in script, so a cross-site scripting bug
+//! on the vendor's own page exfiltrates a working portal session instead of nothing.
+//!
+//! SO: mint a link per intent and hand a widget only the one it needs, which is what the intent
+//! fence is for and which bounds this to the surface that widget shows. And know that the
+//! bearer is a credential, not an identifier.
+//!
+//! CLOSING IT PROPERLY NEEDS A DISTINCT CREDENTIAL -- a read-only token derived from the session
+//! and resolvable on its own -- which is a store change rather than a wording one, and which
+//! this exploratory does not make. It is recorded here as the reason this surface is exploratory
+//! rather than as an oversight.
+//!
 //! # READ ONLY
 //!
 //! Every route here is a GET that reads rows and serialises them. A widget that could write
@@ -60,10 +83,12 @@ pub struct SsoConnectionView {
     pub id: String,
     /// What the customer called it.
     pub display_name: String,
-    /// Whether sign-in through it is switched on.
+    /// Whether sign-in through this connection is switched on.
     ///
-    /// THE ONE FACT A STATUS WIDGET EXISTS FOR. A connection can be fully configured and still
-    /// sign nobody in, and that is invisible from every other field.
+    /// A FACT A STATUS WIDGET EXISTS FOR, and not the only one: a connection can be switched on
+    /// and still sign nobody in, because it has no certificate pinned. The two travel together
+    /// here for that reason -- `pinned_certificates: 0` beside `active: true` is a connection
+    /// that will refuse every response its provider sends.
     pub active: bool,
     /// The identity provider this connection trusts.
     pub idp_entity_id: String,
@@ -129,11 +154,16 @@ pub struct ConnectorUpstreamView {
     /// guide on this value, and without it a host app cannot write a true sentence about an
     /// OAuth 2.0 upstream at all.
     pub protocol: Option<String>,
-    /// Whether sign-in through this binding is switched on.
+    /// Whether sign-in through this upstream is switched on: BOTH switches, combined.
     ///
-    /// THE ONE FACT A STATUS WIDGET EXISTS FOR, and the SAML view beside it has carried it all
-    /// along: a binding can be fully configured and reach nobody, and that is invisible from
-    /// every other field. A switched-off upstream rendered identically to a working one.
+    /// TWO ROWS DECIDE IT and either alone is a half-truth: the BINDING carries an `enabled`,
+    /// and so does the CONNECTOR, and disabling the connector stops every organization bound to
+    /// it. An earlier version reported the binding's only, so an operator who switched a
+    /// connector off left every widget reading it saying "sign-in is on".
+    ///
+    /// A CONNECTOR THIS DEPLOYMENT CANNOT READ IS FALSE TOO. A binding naming a row that is gone
+    /// signs nobody in, and the row is still reported -- with `slug: null` -- because dropping
+    /// it would tell the organization it has one fewer upstream than it has.
     pub enabled: bool,
 }
 
@@ -218,9 +248,15 @@ pub struct ScimWidgetItems {
     pub base_url: Option<String>,
     /// Whether this deployment serves inbound provisioning at all.
     ///
-    /// SEPARATE FROM THE URL BEING NULL, because a host needs to say WHICH: "ask your vendor to
-    /// enable provisioning" and "we could not read your configuration" are different sentences,
-    /// and a null with no flag beside it cannot tell them apart.
+    /// IT CANNOT DISAGREE WITH `base_url` BEING NULL, and an earlier version of this sentence
+    /// claimed it could -- it named "we could not read your configuration" as a second state the
+    /// pair distinguishes, and no path here produces one: a failure to read answers the uniform
+    /// refusal instead, and the two fields come from the same flag.
+    ///
+    /// IT IS HERE ANYWAY, because a host reading a null has to know WHY without being told to
+    /// infer it, and because the day this surface gains a second reason for a missing URL, the
+    /// flag is where that reason goes. A host that branches on it today is correct and will stay
+    /// correct; one that branches on the null alone would have to change.
     pub surface_served: bool,
     /// The connections.
     pub connections: Vec<ScimConnectionView>,
@@ -301,26 +337,23 @@ pub async fn sso_widget(
     // is a row of its own, a connector-based one is an `org_connections` binding, and neither
     // table sees the other's. A widget that read one reported an organization federating the
     // other way as having nothing configured.
+    // THE FILTER IS IN THE STATEMENT, which is the only place it can be. An earlier version
+    // asked for every binding and filtered in Rust, and called that "the filter runs before the
+    // bound" -- it does not: the bound that matters is the SQL `LIMIT`, and it had already
+    // chosen which rows came back. So an organization with more SAML bindings than the limit
+    // still got `connectors: []`, and worse, the truncation flag was computed AFTER the discard
+    // and so reported `false` about rows that had been dropped.
     let Ok(bindings) = read
         .org_connections()
-        .list_for_organization(session.organization(), WIDGET_LIMIT + 1)
+        .list_connector_bindings(session.organization(), WIDGET_LIMIT + 1)
         .await
     else {
         return cors_refusal(PortalRefusal::Unavailable);
     };
-    // THE FILTER RUNS BEFORE THE BOUND, and the order was wrong: `list_for_organization` returns
-    // every binding, including the SAML ones, which name no connector and are dropped below. So
-    // an organization with twenty SAML bindings and one connector filled the page with rows that
-    // were then discarded and answered `connectors: []` -- reporting a configured upstream as
-    // absent, which is the defect this whole read was added to fix.
-    let named: Vec<&ironauth_store::OrgConnectionRecord> = bindings
-        .iter()
-        .filter(|binding| binding.connector_id.is_some())
-        .collect();
     let limit = usize::try_from(WIDGET_LIMIT).unwrap_or(usize::MAX);
-    let truncated = truncated || named.len() > limit;
+    let truncated = truncated || bindings.len() > limit;
     let mut connectors = Vec::new();
-    for binding in named.into_iter().take(limit) {
+    for binding in bindings.iter().take(limit) {
         let Some(raw) = binding.connector_id.as_deref() else {
             continue;
         };
@@ -335,13 +368,18 @@ pub async fn sso_widget(
         connectors.push(ConnectorUpstreamView {
             connector_id: raw.to_owned(),
             slug: found.as_ref().map(|connector| connector.slug.clone()),
+            // BOTH SWITCHES, because sign-in needs both and either alone is a half-truth. An
+            // earlier version reported only the BINDING's, so a connector an operator had
+            // disabled -- which stops every organization bound to it -- still rendered as "sign
+            // in is on". A connector this deployment cannot read at all is `false` too: a
+            // binding naming a row that is gone signs nobody in either.
+            enabled: binding.enabled && found.as_ref().is_some_and(|connector| connector.enabled),
             // FROM THE DEFINITION, through the same function the hosted page uses to choose its
             // heading and its guide. A second reading of that document is how a page comes to
             // call an upstream something the runtime does not.
             protocol: found.as_ref().and_then(|connector| {
                 crate::portal_guides::connector_protocol(&connector.definition_json)
             }),
-            enabled: binding.enabled,
         });
     }
 
