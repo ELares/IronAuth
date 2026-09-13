@@ -7417,3 +7417,154 @@ async fn a_cross_site_oidc_setup_is_refused() {
     assert_eq!(status, 403, "a cross-site setup was served: {body}");
     assert_eq!(apply_oidc_setups(&harness).await, 0, "and queued nothing");
 }
+
+#[tokio::test]
+async fn one_it_admin_configures_sso_and_provisioning_end_to_end_with_no_vendor_action() {
+    // #140 CRITERION 1, AS THE ONE SCRIPTED SCENARIO IT ASKS FOR.
+    //
+    // The three journeys beside this each prove one protocol in isolation, which is what makes
+    // a failure attributable. This one is the criterion's own sentence, run as written: an IT
+    // admin completes SSO -- SAML AND OIDC -- plus SCIM setup, through portal links, and nothing
+    // at the vendor happens in between.
+    //
+    // TWO LINKS, NOT ONE, and that is the intent fence rather than a gap: a link is scoped to
+    // one intent on purpose, so the person configuring provisioning need not be handed the
+    // ability to change sign-on. The vendor mints them; that is the act the link IS.
+    //
+    // EACH STEP ENDS IN THE THING THAT WORKS, never in a row: a response the admin's own key
+    // signed is accepted, the secret they typed opens back out, and the token they were shown
+    // authenticates.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let scope = harness.scope();
+    let env = Env::system();
+
+    // ---- 1. SSO, the SAML half ---------------------------------------------------------
+    let sso = open_session_in(&harness, "sso", "e2e-sso", &org).await;
+    let key = XmlTestKey::generate();
+    let der = ironauth_saml::test_util::certificate_carrying(&key.public_point());
+    let pem = {
+        use base64::Engine as _;
+        let body = base64::engine::general_purpose::STANDARD.encode(&der);
+        format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n")
+    };
+    let (status, body) = submit_saml_setup(
+        &harness,
+        &sso,
+        "Acme Okta",
+        "https://idp.example/entity",
+        "https://idp.example/sso",
+        &pem,
+    )
+    .await;
+    assert_eq!(status, 303, "the SAML setup: {body}");
+
+    // ---- 2. SSO, the OIDC half, through the SAME link ------------------------------------
+    let (status, body) = submit_oidc_setup(
+        &harness,
+        &sso,
+        "Acme Entra",
+        "https://login.example/acme",
+        "client-abc",
+        "super-secret-value",
+    )
+    .await;
+    assert_eq!(status, 303, "the OIDC setup: {body}");
+
+    // ---- 3. Provisioning, through a link for that intent ---------------------------------
+    let scim = open_session_in(&harness, "scim", "e2e-scim", &org).await;
+    let (status, shown) = submit_scim_setup(&harness, &scim, "Acme Okta SCIM", "okta").await;
+    assert_eq!(status, 200, "the provisioning setup: {shown}");
+    let token = token_from(&shown);
+
+    // ---- the workers run, which is the only thing that happens between ---------------------
+    assert_eq!(apply_saml_setups(&harness).await, 1, "one SAML setup");
+    assert_eq!(apply_oidc_setups(&harness).await, 1, "one OIDC setup");
+    assert_eq!(
+        apply_scim_setups(&harness).await,
+        1,
+        "one provisioning setup"
+    );
+
+    // ---- and every one of the three now WORKS ---------------------------------------------
+
+    // SAML: a response the admin's own key signed, addressed with the connection's own stored
+    // values, through the same `examine` a real sign-in runs.
+    let saml = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .saml_connections()
+        .list_for_org(&org, 10, None)
+        .await
+        .expect("list");
+    assert_eq!(saml.len(), 1, "the SAML connection exists");
+    let response = response_for(&key, &saml[0]);
+    let (status, verdict) =
+        test_connection(&harness, &sso, &saml[0].id, &base64_of(&response)).await;
+    assert_eq!(status, 200, "the connection test: {verdict}");
+    assert!(
+        verdict.contains("all check out"),
+        "the SAML connection has to accept its own provider's response: {verdict}"
+    );
+
+    // OIDC: the secret the admin typed, back out through the read the federation flow makes.
+    let bindings = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .org_connections()
+        .list_for_organization(&org, 10)
+        .await
+        .expect("list the bindings");
+    assert_eq!(bindings.len(), 1, "the OIDC upstream is bound");
+    let connector = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .connectors()
+        .parse_id(
+            bindings[0]
+                .connector_id
+                .as_deref()
+                .expect("the binding names a connector"),
+        )
+        .expect("parses");
+    let opened = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .connectors()
+        .open_client_secret(&connector)
+        .await
+        .expect("the sealed secret opens");
+    assert_eq!(opened, b"super-secret-value".to_vec());
+
+    // SCIM: the token the admin was shown, through the read every provisioning request makes.
+    let resolved = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .scim_connections()
+        .authenticate(
+            &ironauth_store::scim_token_digest(&token),
+            now_micros(&harness),
+        )
+        .await
+        .expect("authenticate")
+        .expect("the token the admin was shown has to authenticate");
+    assert_eq!(resolved.display_name, "Acme Okta SCIM");
+    assert_eq!(&resolved.organization_id, &org);
+
+    // ---- and the pages hand over what the admin needs next ---------------------------------
+    let page = sso_surface_page(&harness, &sso).await;
+    assert!(
+        page.contains(&saml[0].acs_url),
+        "the reply URL the provider needs: {page}"
+    );
+    assert!(
+        page.contains("acme-entra"),
+        "and the OIDC upstream, listed: {page}"
+    );
+    let _ = env;
+}
