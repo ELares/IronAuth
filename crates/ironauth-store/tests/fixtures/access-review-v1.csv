@@ -1,0 +1,9 @@
+organization_id,principal_kind,membership_id,subject_id,role_slug,source,via_group_id,via_request_id,granted_until_unix_ms
+org_fixture01,user,omb_alice,usr_alice,billing-admin,direct,,,
+org_fixture01,user,omb_alice,usr_alice,member,default,,,
+org_fixture01,user,omb_bob,usr_bob,reports-reader,group,grp_finance,,
+org_fixture01,user,omb_bob,usr_bob,member,default,,,
+org_fixture01,user,omb_carol,usr_carol,billing-admin,time_boxed,,agr_quarterclose,1767225600000
+org_fixture01,service_account,omb_robot,sva_nightly,reports-reader,direct,,,
+org_fixture01,user,omb_dave,usr_dave,,none,,,
+org_fixture01,user,omb_eve,usr_eve,"ops,""emergency""",direct,,,
