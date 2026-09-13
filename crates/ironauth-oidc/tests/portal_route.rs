@@ -7547,3 +7547,41 @@ async fn one_it_admin_configures_sso_and_provisioning_end_to_end_with_no_vendor_
     );
     let _ = env;
 }
+
+#[tokio::test]
+async fn the_token_page_names_the_provider_and_the_wait() {
+    // TWO SENTENCES A CUSTOMER READS, both of which were wrong in their own way.
+    //
+    // THE SLUG IS NOT A NAME. "Paste these two values into generic" is not a sentence, and the
+    // page is read by somebody looking at their provider's console.
+    //
+    // AND THE CONNECTION DOES NOT EXIST YET. The token is minted and shown before the consumer
+    // runs, so an admin who pastes it immediately gets a 401 -- and if the job dead-letters they
+    // hold a credential for a connection that never appears, with nothing anywhere to say so.
+    // The page has to name the wait and what it means if it does not end.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "scim", "label-1", &org).await;
+
+    let (status, page) = submit_scim_setup(&harness, &cookie, "Acme Okta", "okta").await;
+    assert_eq!(status, 200, "the setup: {page}");
+    assert!(
+        page.contains("into Okta"),
+        "a provider with a name is called by it: {page}"
+    );
+    assert!(
+        page.contains("being created"),
+        "and the wait has to be named: {page}"
+    );
+
+    // THE THIRD SLUG IS NOT A PRODUCT, so the sentence has to work without one.
+    let (_, page) = submit_scim_setup(&harness, &cookie, "Acme Other", "generic").await;
+    assert!(
+        !page.contains("into generic"),
+        "the stored slug reached a customer's page: {page}"
+    );
+    assert!(
+        page.contains("your identity provider"),
+        "and the sentence still has to read: {page}"
+    );
+}

@@ -3360,8 +3360,13 @@ pub async fn scim_setup_post(
          <p><strong>Copy the token now.</strong> It is shown once and this deployment keeps no \
          copy of it. If you lose it, ask your vendor to rotate the token, which gives you a new \
          one and an overlap to paste it in.</p>\
+         <p>The connection itself is being created and appears on the provisioning page in a \
+         moment. If it has not after a few minutes, tell your vendor: the token you are holding \
+         cannot work until it does.</p>\
          <p><a href=\"{surface}\">Back to provisioning</a></p>",
-        provider = escape_html(provider),
+        // THE PROVIDER'S NAME, not its stored slug: "Paste these two values into generic" is
+        // not a sentence, and the page is read by somebody looking at their provider's console.
+        provider = escape_html(provider_label(provider)),
         base = escape_html(&scim_base),
         token = escape_html(&token),
         surface = escape_html(&format!(
@@ -3372,6 +3377,21 @@ pub async fn scim_setup_post(
         )),
     );
     crate::pages::secure_html(StatusCode::OK, body)
+}
+
+/// What to call a provider on a page a customer reads.
+///
+/// THE STORED VALUE IS A SLUG and the constraint on the column keeps it to three, which is what
+/// makes this a total function rather than a lookup that can miss. Printing the slug would put
+/// "Paste these two values into generic" in front of somebody who is looking at their provider's
+/// console.
+fn provider_label(provider: &str) -> &str {
+    match provider {
+        "okta" => "Okta",
+        "entra" => "Microsoft Entra",
+        // THE THIRD IS NOT A PRODUCT NAME, so the sentence has to work without one.
+        _ => "your identity provider",
+    }
 }
 
 /// A provisioning bearer token for a connection: `{scim_id}.{secret}`.
