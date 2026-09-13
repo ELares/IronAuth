@@ -16,6 +16,13 @@ uniform not-found a spent token gets.
 provisioning state as JSON, for a vendor to render inside its own application
 instead of sending its customer to a hosted page.
 
+The SSO widget reads BOTH tables the hosted page reads -- a SAML upstream is a
+`saml_connections` row and the other kind is an `org_connections` binding -- and
+each connector row carries its own PROTOCOL, because that binding covers OIDC
+and OAuth 2.0 alike. The provisioning widget carries the two facts a SETUP flow
+needs beside the connections: where a client connects, and whether this
+deployment serves that endpoint at all.
+
 BEARER ONLY, and that is the design rather than a convenience. Every other
 portal route authenticates with the `__Host-` session cookie, which a browser
 attaches by itself; a widget is fetched by code on the vendor's own origin, so a

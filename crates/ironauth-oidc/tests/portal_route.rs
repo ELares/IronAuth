@@ -5395,6 +5395,113 @@ async fn the_token_check_is_absent_where_nothing_can_authenticate() {
 // THE WIDGET SURFACE (issue #145 criterion 6), and the host app that renders it.
 // ---------------------------------------------------------------------------------------------
 
+/// A SAML connection bound through `org_connections`, which is a binding that names NO
+/// connector.
+///
+/// THE POPULATION THAT CROWDED THE OTHER ONE OUT. `list_for_organization` returns every binding
+/// of either kind, and the widget drops the ones with no connector -- so these are what a bound
+/// applied before the filter spends itself on.
+async fn saml_binding_for(harness: &Harness, organization: &OrganizationId, index: usize) {
+    let env = Env::system();
+    let scope = harness.scope();
+    let connection = saml_connection_from(
+        harness,
+        organization,
+        &format!("bound-saml-{index}"),
+        &format!("https://idp-{index}.example/entity"),
+    )
+    .await;
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .org_connections()
+        .create(
+            &env,
+            &ironauth_store::OrgConnectionId::generate(&env, &scope),
+            1_000_000,
+            ironauth_store::NewOrgConnection {
+                organization_id: organization,
+                upstream: ironauth_store::OrgConnectionUpstream::Saml(&connection),
+                overlay_min_acr: None,
+                max_age_secs: None,
+                overlay_min_class: None,
+                capture_upstream_tokens: false,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("bind the SAML connection to the organization");
+}
+
+/// As [`upstream_with_protocol`], choosing whether the BINDING is switched on.
+///
+/// ONE FIELD APART, which is what lets the pair below attribute a rendering difference to the
+/// switch rather than to anything else about the upstream.
+async fn upstream_enabled(
+    harness: &Harness,
+    organization: &OrganizationId,
+    slug: &str,
+    enabled: bool,
+) {
+    let env = Env::system();
+    let scope = harness.scope();
+    let control = harness.db().control_store();
+    let actor = || ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env));
+    let connector_id = ironauth_store::ConnectorId::generate(&env, &scope);
+    let definition = format!(
+        r#"{{"connector_id":"{slug}","display_name":"Upstream","protocol":"oidc","endpoints":{{"issuer":"https://upstream.example"}},"scopes":["openid","email"],"client_id":"upstream-client"}}"#
+    );
+    control
+        .scoped(scope)
+        .acting(actor(), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &connector_id,
+            1_000_000,
+            ironauth_store::NewConnector {
+                slug,
+                definition_json: &definition,
+                client_secret: b"upstream-secret",
+                capabilities: ironauth_store::ConnectorCapabilities {
+                    refresh: false,
+                    groups: false,
+                    logout_propagation: false,
+                    email_verified_trust: "untrusted",
+                },
+                enabled: true,
+            },
+            None,
+        )
+        .await
+        .expect("create the connector");
+    control
+        .scoped(scope)
+        .acting(actor(), CorrelationId::generate(&env))
+        .org_connections()
+        .create(
+            &env,
+            &ironauth_store::OrgConnectionId::generate(&env, &scope),
+            1_000_000,
+            ironauth_store::NewOrgConnection {
+                organization_id: organization,
+                upstream: ironauth_store::OrgConnectionUpstream::Connector(&connector_id),
+                overlay_min_acr: None,
+                max_age_secs: None,
+                overlay_min_class: None,
+                capture_upstream_tokens: false,
+                enabled,
+            },
+        )
+        .await
+        .expect("bind the connector to the organization");
+}
+
 /// The vendor's backend, doing what a vendor's backend does to get a widget token.
 ///
 /// It mints a portal link through the control plane and REDEEMS IT ITSELF, reading the session
@@ -5476,6 +5583,20 @@ fn host_app_render(payload: &serde_json::Value) -> String {
             .collect(),
         _ => Vec::new(),
     };
+    // THE SETUP FACTS, which a status list cannot express and which criterion 6 names: where the
+    // provisioning client connects, and whether this deployment serves that endpoint at all.
+    match (
+        payload["items"]["surface_served"].as_bool(),
+        payload["items"]["base_url"].as_str(),
+    ) {
+        (Some(true), Some(base)) => {
+            let _ = write!(page, "<p class=\"base\">Connect to {base}</p>");
+        }
+        (Some(false), _) => page.push_str(
+            "<p class=\"base\">This deployment does not serve provisioning. Ask your vendor.</p>",
+        ),
+        _ => {}
+    }
     for item in rows {
         page.push_str("<div class=\"row\">");
         let _ = write!(
@@ -5489,6 +5610,19 @@ fn host_app_render(payload: &serde_json::Value) -> String {
                 .or_else(|| item["connector_id"].as_str())
                 .unwrap_or("?")
         );
+        // A CONNECTOR-BASED UPSTREAM, which is not necessarily OpenID Connect: the host says
+        // what the row says, because "OIDC" printed over an OAuth 2.0 connector sends an admin
+        // looking for an issuer URL their provider does not have.
+        if let Some(protocol) = item["protocol"].as_str() {
+            let _ = write!(page, "<span class=\"protocol\">{protocol}</span>");
+        }
+        if item["connector_id"].as_str().is_some() {
+            page.push_str(match item["enabled"].as_bool() {
+                Some(true) => "<span class=\"state\">Sign-in is on</span>",
+                Some(false) => "<span class=\"state\">Sign-in is off</span>",
+                None => "",
+            });
+        }
         if let Some(active) = item["active"].as_bool() {
             page.push_str(if active {
                 "<span class=\"state\">Sign-in is on</span>"
@@ -5927,6 +6061,39 @@ async fn a_revoked_connection_is_not_rendered_as_working() {
         !page.contains("Provisioning is working"),
         "and it must not read as working anywhere on the page: {page}"
     );
+
+    // THE OTHER HALF OF THE EXPRESSION. `revoked || no_live_credential()` has two disjuncts and
+    // the revocation above exercises one; deleting the other left this test green. A connection
+    // whose TOKENS are gone while the connection itself is live is the second broken state, and
+    // it is the one `no_live_credential` was written for.
+    let other = seed_org(&harness, "Initech").await;
+    let lapsed_id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let lapsed = connect_with_id(
+        &harness,
+        &other,
+        "Initech Okta",
+        "okta",
+        &lapsed_id,
+        &token_for(&lapsed_id, "s3cr3t"),
+        // AN EXPIRY ALREADY PASSED, which is what leaves a live connection with no usable
+        // credential: `authenticate` refuses on the token's horizon and the row stays unrevoked.
+        Some(now_micros(&harness) - 1_000_000),
+    )
+    .await;
+    let _ = lapsed;
+    let other_bearer = widget_token(&harness, "scim", "w-8b", &other).await;
+    let (_, _, body) = widget_get(&harness, "scim", Some(&other_bearer)).await;
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        payload["items"]["connections"][0]["revoked"].as_bool(),
+        Some(false),
+        "this one is NOT revoked, which is what makes it the other disjunct: {body}"
+    );
+    let page = host_app_render(&payload);
+    assert!(
+        page.contains("Provisioning has stopped"),
+        "a live connection with no usable credential has stopped too: {page}"
+    );
 }
 
 #[tokio::test]
@@ -5949,7 +6116,7 @@ async fn an_organization_whose_sign_on_is_oidc_is_not_reported_as_having_none() 
         "this organization has no SAML connection: {body}"
     );
     assert_eq!(
-        payload["items"]["oidc"].as_array().map(Vec::len),
+        payload["items"]["connectors"].as_array().map(Vec::len),
         Some(1),
         "and exactly one OIDC upstream, which the widget has to report: {body}"
     );
@@ -5957,5 +6124,190 @@ async fn an_organization_whose_sign_on_is_oidc_is_not_reported_as_having_none() 
     assert!(
         page.contains("acme-entra"),
         "the host app has to be able to render it: {page}"
+    );
+}
+
+#[tokio::test]
+async fn an_oauth2_upstream_is_not_published_as_openid_connect() {
+    // `OrgConnectionUpstream::Connector` is documented as "a `cnr_` OIDC OR OAUTH 2.0
+    // connector", and `sso_oidc_section` branches on the protocol with the reason spelled out:
+    // calling an OAuth 2.0 connector OpenID Connect "sends its admin looking for an issuer URL
+    // and an `openid` scope their provider does not have". The hosted page carries a regression
+    // test forbidding exactly that label; the widget re-introduced it on the JSON surface, under
+    // a field name a host could not even contradict because the protocol was not in the payload.
+    //
+    // ONE STRING VARIES between this and the OIDC test beside it.
+    let harness = Harness::start_store_backed_with_widgets(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    upstream_with_protocol(&harness, &org, "acme-github", "oauth2").await;
+    let bearer = widget_token(&harness, "sso", "w-10", &org).await;
+
+    let (status, _, body) = widget_get(&harness, "sso", Some(&bearer)).await;
+    assert_eq!(status, 200, "the widget: {body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let rows = payload["items"]["connectors"]
+        .as_array()
+        .expect("the connector upstreams are a list");
+    assert_eq!(rows.len(), 1, "the upstream is reported: {body}");
+    assert_eq!(
+        rows[0]["protocol"].as_str(),
+        Some("oauth2"),
+        "the row has to carry what its connector actually declares: {body}"
+    );
+    // AND THE HOST CAN SAY SO, which is the property the payload exists for.
+    let page = host_app_render(&payload);
+    assert!(
+        page.contains("oauth2"),
+        "a host app has to be able to name the protocol: {page}"
+    );
+    assert!(
+        !page.contains("OpenID Connect"),
+        "and must not be forced into the wrong one: {page}"
+    );
+}
+
+#[tokio::test]
+async fn a_switched_off_upstream_does_not_render_as_a_working_one() {
+    // THE ONE FACT A STATUS WIDGET EXISTS FOR. The SAML view has carried `active` all along; the
+    // connector view carried nothing, so a binding an operator had switched off rendered exactly
+    // like one signing people in.
+    let harness = Harness::start_store_backed_with_widgets(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    // THE CONTROL, in its own organization: an upstream that IS on renders as on, so the
+    // assertion below is the switch rather than a host that says "off" about everything.
+    upstream_enabled(&harness, &org, "acme-on", true).await;
+    let bearer = widget_token(&harness, "sso", "w-11", &org).await;
+    let (_, _, before) = widget_get(&harness, "sso", Some(&bearer)).await;
+    let page = host_app_render(&serde_json::from_str(&before).expect("json"));
+    assert!(page.contains("Sign-in is on"), "the control: {page}");
+
+    let off_org = seed_org(&harness, "Initech").await;
+    upstream_enabled(&harness, &off_org, "initech-off", false).await;
+    let off_bearer = widget_token(&harness, "sso", "w-11b", &off_org).await;
+    let (_, _, after) = widget_get(&harness, "sso", Some(&off_bearer)).await;
+    let page = host_app_render(&serde_json::from_str(&after).expect("json"));
+    assert!(
+        page.contains("Sign-in is off"),
+        "a switched-off upstream must not read as working: {page}"
+    );
+    assert!(
+        !page.contains("Sign-in is on"),
+        "and must not read as working anywhere on the page: {page}"
+    );
+}
+
+#[tokio::test]
+async fn a_connector_upstream_is_not_crowded_out_by_saml_bindings() {
+    // THE BOUND WAS APPLIED BEFORE THE FILTER. `list_for_organization` returns every binding,
+    // including the SAML ones, which name no connector and are dropped -- so an organization
+    // with twenty SAML bindings and one connector filled the page with rows that were then
+    // discarded and answered `connectors: []`, reporting a configured upstream as absent. That
+    // is the defect the whole second read was added to fix, reintroduced by the ordering.
+    let harness = Harness::start_store_backed_with_widgets(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    for index in 0..21 {
+        saml_binding_for(&harness, &org, index).await;
+    }
+    upstream_with_protocol(&harness, &org, "acme-entra", "oidc").await;
+    let bearer = widget_token(&harness, "sso", "w-12", &org).await;
+
+    let (status, _, body) = widget_get(&harness, "sso", Some(&bearer)).await;
+    assert_eq!(status, 200, "the widget: {body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        payload["items"]["connectors"].as_array().map(Vec::len),
+        Some(1),
+        "the connector upstream has to survive the SAML bindings in front of it: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_provisioning_widget_carries_what_a_setup_flow_renders() {
+    // CRITERION 6 NAMES A SCIM-SETUP FLOW, not a SCIM-status one. A list of existing connections
+    // is a status panel; what a host renders to somebody SETTING provisioning up is where their
+    // provisioning client connects -- and whether this deployment serves that endpoint at all.
+    //
+    // THE URL IS PRINTED ONLY WHERE IT IS SERVED, exactly as the hosted page prints it: an admin
+    // sent to configure their provider against an endpoint answering a uniform 404 discovers it
+    // days later as "provisioning never started", with this page as the evidence it should have.
+    let harness = Harness::start_store_backed_with_widgets(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let bearer = widget_token(&harness, "scim", "w-13", &org).await;
+
+    let (status, _, body) = widget_get(&harness, "scim", Some(&bearer)).await;
+    assert_eq!(status, 200, "the widget: {body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(payload["items"]["surface_served"].as_bool(), Some(true));
+    assert!(
+        payload["items"]["base_url"]
+            .as_str()
+            .is_some_and(|base| base.ends_with("/scim/v2")),
+        "a setup flow needs the base URL: {body}"
+    );
+    let page = host_app_render(&payload);
+    assert!(
+        page.contains("Connect to"),
+        "and a host app has to be able to render it: {page}"
+    );
+
+    // THE OTHER DEPLOYMENT, where the endpoint is not served. One fact varies.
+    let off = Harness::start_store_backed_with_widgets_and_scim(true, false).await;
+    let org = seed_org(&off, "Acme").await;
+    let bearer = widget_token(&off, "scim", "w-14", &org).await;
+    let (_, _, body) = widget_get(&off, "scim", Some(&bearer)).await;
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(payload["items"]["surface_served"].as_bool(), Some(false));
+    assert!(
+        payload["items"]["base_url"].is_null(),
+        "a URL that answers nothing must not be printed: {body}"
+    );
+    let page = host_app_render(&payload);
+    assert!(
+        page.contains("does not serve provisioning"),
+        "and the host has to be able to say WHICH: {page}"
+    );
+}
+
+#[tokio::test]
+async fn a_widget_refusal_is_readable_from_the_host_origin() {
+    // A PREFLIGHT THAT SUCCEEDS AND A REFUSAL A HOST CANNOT READ is worse than neither. Before
+    // the preflight nothing reached these routes from a browser at all; with it, the fetch
+    // happens, gets its answer, and the answer had no `Access-Control-Allow-Origin` -- so the
+    // browser refused to expose it and the host saw an opaque error indistinguishable from the
+    // network being down.
+    let harness = Harness::start_store_backed_with_widgets(true).await;
+
+    // THE CONTROL: the success path carries the header.
+    let org = seed_org(&harness, "Acme").await;
+    let bearer = widget_token(&harness, "sso", "w-15", &org).await;
+    let (status, ok_headers, _) = widget_get(&harness, "sso", Some(&bearer)).await;
+    assert_eq!(status, 200);
+    let allowed = |headers: &axum::http::HeaderMap| {
+        headers
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(allowed(&ok_headers).as_deref(), Some("*"), "the control");
+
+    // EVERY REFUSAL `widget_session` PRODUCES, since a host has to tell them from a dead network.
+    for (label, token) in [("no bearer", None), ("an invented bearer", Some("nope"))] {
+        let (status, headers, body) = widget_get(&harness, "sso", token).await;
+        assert_eq!(status, 404, "{label}: {body}");
+        assert_eq!(
+            allowed(&headers).as_deref(),
+            Some("*"),
+            "a host cannot read the refusal for {label}"
+        );
+    }
+
+    // AND THE WRONG INTENT, which is the refusal a host is likeliest to hit in normal use.
+    let scim = widget_token(&harness, "scim", "w-16", &org).await;
+    let (status, headers, body) = widget_get(&harness, "sso", Some(&scim)).await;
+    assert_eq!(status, 404, "the intent fence: {body}");
+    assert_eq!(
+        allowed(&headers).as_deref(),
+        Some("*"),
+        "a host cannot read the intent refusal"
     );
 }

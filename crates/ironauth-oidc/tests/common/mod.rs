@@ -706,9 +706,24 @@ impl Harness {
     /// A store-backed harness serving the EXPLORATORY portal widgets (issue #145 criterion 6).
     ///
     /// OFF by default on `OidcState`, like every exploratory surface, so a test that wants the
-    /// routes to exist has to say so -- and the flag-off test says so by NOT calling this.
+    /// routes to exist has to say so. The flag-off test calls this with `false` rather than
+    /// building a plain harness, which is the point: it needs a deployment that is IDENTICAL
+    /// except for the flag, so what it measures is the flag rather than a router that never
+    /// mounted the routes at all.
     pub async fn start_store_backed_with_widgets(enabled: bool) -> Self {
-        let harness = Self::start_store_backed_with_scim_surface(true).await;
+        Self::start_store_backed_with_widgets_and_scim(enabled, true).await
+    }
+
+    /// [`Self::start_store_backed_with_widgets`], choosing whether this deployment also SERVES
+    /// inbound provisioning.
+    ///
+    /// The two are independent settings and the provisioning widget reads both: what it prints
+    /// as a base URL is a claim about an endpoint the other flag decides the existence of.
+    pub async fn start_store_backed_with_widgets_and_scim(
+        enabled: bool,
+        scim_surface: bool,
+    ) -> Self {
+        let harness = Self::start_store_backed_with_scim_surface(scim_surface).await;
         let state = harness.state.clone().with_portal_widgets_enabled(enabled);
         Self {
             router: oidc_router(state.clone()),
