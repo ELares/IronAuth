@@ -34,6 +34,17 @@ allowlist_entries() {
 # untraced; see #774
 ironauth-oidc/mds3_sync
 
+# Device-posture predicates (issue #145 criterion 5, EXPLORATORY). Callerless BY DESIGN and
+# that is the criterion's own wording: it asks for an evaluator over signed MDM claims, and
+# #145 puts "productionizing the exploratories" out of scope in as many words. Wiring it into
+# an authorization decision is the thing that is deliberately not done, so the module has no
+# data-plane caller and must not acquire one until the feature graduates.
+#
+# The day it does, this entry goes INERT and the scan will refuse it -- which is the check
+# that makes this exemption a claim somebody rechecks rather than one nobody does. Remove the
+# entry then; do not reword it.
+ironauth-oidc/device_posture
+
 # `ironauth-store/token_customize` was allowlisted here as a contract landed before either
 # transport bound to it. #1005 bound one: `token_hook::PAYLOAD_VERSION` is now an alias of
 # `TOKEN_CUSTOMIZE_VERSION`, so the module has a real caller and the entry went INERT --

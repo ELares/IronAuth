@@ -226,8 +226,7 @@ impl Replay {
                 let user = field("user_id");
                 let organization = field("organization_id");
                 self.memberships.retain(|membership, owner| {
-                    *owner != organization
-                        || self.membership_subject.get(membership) != Some(&user)
+                    *owner != organization || self.membership_subject.get(membership) != Some(&user)
                 });
             }
             "organization.default_role_set" => {
@@ -456,12 +455,7 @@ async fn member(h: &Harness, base: &str, org: &str, handle: &str) -> String {
 }
 
 /// The same, returning `(user id, membership id)` for a caller that needs the subject.
-async fn member_with_user(
-    h: &Harness,
-    base: &str,
-    org: &str,
-    handle: &str,
-) -> (String, String) {
+async fn member_with_user(h: &Harness, base: &str, org: &str, handle: &str) -> (String, String) {
     let user = create(
         h,
         &format!("{base}/users"),
@@ -883,14 +877,20 @@ async fn seed_and_disable_a_second_org(h: &Harness, base: &str) -> (String, bool
     let (status, _, body) = h
         .post(&format!("{org_base}/disable"), "er2-disable", "")
         .await;
-    assert!(status.is_success(), "disable the second org: {status} {body}");
+    assert!(
+        status.is_success(),
+        "disable the second org: {status} {body}"
+    );
     (org, was_live)
 }
 
 /// The roles, the default role and the group tree, before anybody is a member of anything.
 ///
 /// Returns `(billing, reports, doomed_role, finance, finance_ap, doomed_group)`.
-async fn seed_catalogue(h: &Harness, org_base: &str) -> (String, String, String, String, String, String) {
+async fn seed_catalogue(
+    h: &Harness,
+    org_base: &str,
+) -> (String, String, String, String, String, String) {
     // ROLES, one of which will be deleted out from under a live assignment.
     let billing = create(
         h,
@@ -953,7 +953,14 @@ async fn seed_catalogue(h: &Harness, org_base: &str) -> (String, String, String,
     )
     .await;
 
-    (billing, reports, doomed_role, finance, finance_ap, doomed_group)
+    (
+        billing,
+        reports,
+        doomed_role,
+        finance,
+        finance_ap,
+        doomed_group,
+    )
 }
 
 /// Take the organization apart in the ways the resolver honours and the feed announces.
@@ -1031,7 +1038,6 @@ async fn disturb(h: &Harness, org_base: &str, doomed: &Doomed<'_>) {
         .delete(&format!("{org_base}/groups/{ops}/roles/{billing}"))
         .await;
     assert!(status.is_success(), "unassign the group's role: {body}");
-
 }
 
 /// Every id the scenario mints, so the assertions can name what they are talking about.
@@ -1201,14 +1207,10 @@ async fn assert_the_disabled_organization_is_empty_on_both_sides(
          ignorance rather than the disable"
     );
     assert!(
-        replay
-            .roles
-            .values()
-            .any(|owner| *owner == f.elsewhere),
+        replay.roles.values().any(|owner| *owner == f.elsewhere),
         "the fold never saw the second organization's ROLE, which is the third ingredient a \
          grant needs: without it the emptiness is ignorance whatever the other two say"
     );
-
 }
 
 /// Every removal actually reached the snapshot.
@@ -1275,8 +1277,7 @@ fn assert_every_removal_landed(rebuilt: &BTreeSet<GrantPath>, f: &Fixture) {
          fold without that arm keeps reporting access the product already revoked"
     );
     assert!(
-        slugs_of(&f.erin).contains("member")
-            && !slugs_of(&f.erin).contains("billing-admin"),
+        slugs_of(&f.erin).contains("member") && !slugs_of(&f.erin).contains("billing-admin"),
         "erin was only ever in the DELETED group, so she should keep the default and lose the \
          role that group held"
     );
@@ -1296,13 +1297,16 @@ fn assert_every_removal_landed(rebuilt: &BTreeSet<GrantPath>, f: &Fixture) {
 #[test]
 fn an_expired_time_boxed_grant_resolves_to_nothing() {
     let mut replay = Replay::default();
-    replay.memberships.insert("omb_1".to_owned(), "org_1".to_owned());
+    replay
+        .memberships
+        .insert("omb_1".to_owned(), "org_1".to_owned());
     replay
         .membership_subject
         .insert("omb_1".to_owned(), "usr_1".to_owned());
     replay.roles.insert("rol_1".to_owned(), "org_1".to_owned());
-    let slugs: BTreeMap<String, String> =
-        [("rol_1".to_owned(), "billing-admin".to_owned())].into_iter().collect();
+    let slugs: BTreeMap<String, String> = [("rol_1".to_owned(), "billing-admin".to_owned())]
+        .into_iter()
+        .collect();
 
     let grant = |granted_until_unix_ms| TimeBoxed {
         organization: "org_1".to_owned(),
@@ -1464,7 +1468,8 @@ async fn the_snapshot_folded_from_the_feed_matches_what_the_resolver_reports() {
         "the export reported no grant at all, so the comparison below proves nothing"
     );
     assert_eq!(
-        rebuilt, exported,
+        rebuilt,
+        exported,
         "the snapshot folded from the feed disagrees with the resolver.\n\
          only in the fold (access reported that nobody has): {:?}\n\
          only in the export (access the fold missed): {:?}",
@@ -1473,7 +1478,12 @@ async fn the_snapshot_folded_from_the_feed_matches_what_the_resolver_reports() {
     );
 
     assert_the_disabled_organization_is_empty_on_both_sides(
-        &h, &base, &f, &replay, &slugs, now_unix_ms,
+        &h,
+        &base,
+        &f,
+        &replay,
+        &slugs,
+        now_unix_ms,
     )
     .await;
 

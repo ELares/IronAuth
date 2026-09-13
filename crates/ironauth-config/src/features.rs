@@ -158,6 +158,16 @@ pub const ACCESS_REQUEST_APPROVAL_FEATURE: &str = "access-request-approval";
 /// an upgrade cannot silently start accepting a different contract.
 pub const ACCESS_REQUEST_APPROVAL_VERSION: &str = "access-request-approval-1";
 
+/// Device-posture policy predicates (issue #145 criterion 5, EXPLORATORY).
+pub const DEVICE_POSTURE_FEATURE: &str = "device-posture-policy-hooks";
+
+/// The shape acknowledged by an operator enabling [`DEVICE_POSTURE_FEATURE`].
+///
+/// A counter rather than a draft revision: what an operator acknowledges here is IronAuth's
+/// OWN signal schema and predicate vocabulary, not somebody else's wire format. No standard
+/// dictates what a device-posture assertion carries, so what may break is our decision.
+pub const DEVICE_POSTURE_VERSION: &str = "0.1.0-exp.1";
+
 /// The registry name of the `AuthZEN` agent tool-authorization profile (issue #133,
 /// exploratory bet 5).
 ///
@@ -461,6 +471,26 @@ impl FeatureRegistry {
         ));
     }
 
+    /// Registers device-posture policy predicates (issue #145 criterion 5, EXPLORATORY).
+    pub fn register_device_posture(&mut self) {
+        self.register(Feature::experimental(
+            DEVICE_POSTURE_FEATURE,
+            "Device-posture policy predicates (issue #145): a CEL predicate over SIGNED \
+             posture signals an MDM or EDR service asserts about a device -- managed, \
+             encrypted, patched, and the endpoint agent's state. Agentless: the device runs \
+             none of our code and never reports about itself, so every property that matters \
+             is a property of the MDM's signature. Freshness is enforced SEPARATELY from \
+             expiry, because an MDM can mint a week-long assertion over a scan that ran on \
+             Monday and every signature check still passes on Friday. EXPLORATORY: it \
+             evaluates a predicate and returns a verdict, and NOTHING in the data plane calls \
+             it -- no grant is refused, no session ended, no token withheld. The signal \
+             schema, the claim names and the predicate vocabulary are all expected to move \
+             before anything depends on them.",
+            DEVICE_POSTURE_VERSION,
+            "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+    }
+
     /// Registers the `AuthZEN` agent tool-authorization profile (issue #133, PROTOTYPE).
     pub fn register_authzen_agent_profile(&mut self) {
         self.register(Feature::experimental(
@@ -521,6 +551,7 @@ impl FeatureRegistry {
         registry.register_first_party_challenge();
         registry.register_wasm_hooks();
         registry.register_access_request_approval();
+        registry.register_device_posture();
         registry
     }
 

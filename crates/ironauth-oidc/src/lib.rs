@@ -326,6 +326,11 @@ pub mod token_hook {
         runtime.unreachable()
     }
 }
+/// Policy predicates over signed device-posture claims (issue #145 criterion 5, EXPLORATORY).
+///
+/// `pub` because the criterion asks for an evaluator and nothing in the data plane calls it
+/// yet: a module nothing reaches and nothing can name is not a surface an operator can try.
+pub mod device_posture;
 mod tokens;
 mod totp;
 mod trusted_device;

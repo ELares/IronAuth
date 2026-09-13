@@ -333,7 +333,9 @@ pub async fn create_org_group(
         )
     });
     // Borrowed into one slice before the call, because both `PendingEvent`s have to outlive it.
-    let created_event = pending.as_ref().map(crate::events::PendingEvent::domain_event);
+    let created_event = pending
+        .as_ref()
+        .map(crate::events::PendingEvent::domain_event);
     let parent_event = pending_parent
         .as_ref()
         .map(crate::events::PendingEvent::domain_event);
