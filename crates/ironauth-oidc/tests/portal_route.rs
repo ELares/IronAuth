@@ -12,6 +12,7 @@ mod common;
 
 use common::Harness;
 use ironauth_env::Env;
+use ironauth_jose::xmldsig::test_util::XmlTestKey;
 use ironauth_store::{CorrelationId, NewPortalLink, OrganizationId, PortalLinkId};
 
 /// SHA-256 of a bearer value, which is what the row stores.
@@ -655,6 +656,47 @@ async fn connect_with_provider(
         .await
         .expect("create the connection");
     id
+}
+
+/// As [`connect_with_provider`], with the connection id supplied by the caller.
+///
+/// THE CALLER NEEDS THE ID FIRST, because a real provisioning token is `{scim_id}.{secret}` and
+/// the digest stored here has to be the digest of that whole string. Generating the id inside
+/// would leave a fixture that can store a digest but cannot state the token it came from.
+async fn connect_with_id(
+    harness: &Harness,
+    organization: &OrganizationId,
+    display_name: &str,
+    provider: &str,
+    id: &ironauth_store::ScimConnectionId,
+    token: &str,
+    expires_at_unix_micros: Option<i64>,
+) -> ironauth_store::ScimConnectionId {
+    let env = Env::system();
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .create(
+            &env,
+            ironauth_store::NewScimConnection {
+                id,
+                organization_id: organization,
+                display_name,
+                provider,
+                token_digest: &hex_digest(token),
+                expires_at_unix_micros,
+            },
+            None,
+        )
+        .await
+        .expect("create the connection");
+    *id
 }
 
 /// The harness clock in epoch microseconds, which is the unit every deadline here is in.
@@ -4093,4 +4135,1259 @@ async fn a_switched_off_saml_connection_says_so_and_offers_no_metadata_url() {
         section.contains("https://ironauth.example/saml/acs"),
         "the ACS URL is a stable property and should still be handed over: {section}"
     );
+}
+
+/// Pin the REAL public point of `key`, so a response it signs actually verifies.
+///
+/// The `pin` helper above seeds a synthetic point, which is right for the pages that only
+/// render certificate rows and wrong here: this file's other fixtures never ask a signature to
+/// hold, and a diagnosis about the audience is only reachable once one does.
+async fn pin_certificate_for(
+    harness: &Harness,
+    connection: &ironauth_store::SamlConnectionId,
+    key: &XmlTestKey,
+) {
+    let env = Env::system();
+    let scope = harness.scope();
+    let id = ironauth_store::SamlCertificateId::generate(&env, &scope);
+    // THE HARNESS CLOCK, and NOT for the reason `pin` gives -- that rationale was copied here
+    // and does not hold on this path. `pin` seeds rows for the certificate LISTING, which reads
+    // these columns and dates them; `saml_acs` never reads either of them, so the verification
+    // this fixture feeds would hold with any pair at all. They are written against the harness
+    // clock so the row is coherent with the rest of the fixture rather than because anything
+    // under test consults it, and a reviewer should not read a dependency into them.
+    let now = i64::try_from(
+        harness
+            .env()
+            .clock()
+            .now_utc()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_micros(),
+    )
+    .expect("in range");
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .saml_connections()
+        .pin_certificate(
+            &env,
+            ironauth_store::NewSamlCertificate {
+                id: &id,
+                connection_id: connection,
+                key_kind: ironauth_store::SamlKeyKind::EcdsaP256,
+                public_key: &key.public_point(),
+                rsa_exponent: None,
+                certificate_der: &[0x30, 0x82, 0x01],
+                fingerprint_sha256: &[0x11; 32],
+                not_before_unix_micros: now - 3_600_000_000,
+                not_after_unix_micros: now + 3_600_000_000,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("pin the signing certificate");
+}
+
+/// Base64 the document the way an identity provider's form field carries it.
+fn base64_of(xml: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(xml.as_bytes())
+}
+
+/// A signed SAML response whose audience is whatever the caller names.
+///
+/// ONE FIELD VARIES between the fixtures below, which is the discipline `saml_acs.rs` already
+/// keeps for the same reason: a negative that differs in two ways cannot say which one the
+/// diagnosis is about, and a test-connection page whose message is right for the wrong reason
+/// is worse than a generic error, because an operator acts on it.
+fn response_with_audience(key: &XmlTestKey, audience: &str) -> String {
+    let children = format!(
+        "<saml:Issuer>https://idp.example/entity</saml:Issuer>\
+         <saml:Subject><saml:NameID \
+         Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\">\
+         ada@globex.example</saml:NameID>\
+         <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
+         <saml:SubjectConfirmationData Recipient=\"https://ironauth.example/saml/acs\" \
+         NotOnOrAfter=\"1970-01-01T00:02:00Z\"/></saml:SubjectConfirmation></saml:Subject>\
+         <saml:Conditions NotBefore=\"1969-12-31T23:58:00Z\" \
+         NotOnOrAfter=\"1970-01-01T00:02:00Z\">\
+         <saml:AudienceRestriction><saml:Audience>{audience}</saml:Audience>\
+         </saml:AudienceRestriction></saml:Conditions>\
+         <saml:AttributeStatement><saml:Attribute Name=\"email\">\
+         <saml:AttributeValue>ada@globex.example</saml:AttributeValue></saml:Attribute>\
+         </saml:AttributeStatement>"
+    );
+    ironauth_saml::test_util::signed_response_with(key, "_a1", &children)
+}
+
+/// The same signed response, with the `Recipient` in its bearer confirmation varied.
+///
+/// ONE FIELD APART from [`response_with_audience`]'s passing form, for the reason that function
+/// states: a negative differing in two ways cannot say which one the diagnosis is about.
+fn response_with_recipient(key: &XmlTestKey, recipient: &str) -> String {
+    let children = format!(
+        "<saml:Issuer>https://idp.example/entity</saml:Issuer>\
+         <saml:Subject><saml:NameID \
+         Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\">\
+         ada@globex.example</saml:NameID>\
+         <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
+         <saml:SubjectConfirmationData Recipient=\"{recipient}\" \
+         NotOnOrAfter=\"1970-01-01T00:02:00Z\"/></saml:SubjectConfirmation></saml:Subject>\
+         <saml:Conditions NotBefore=\"1969-12-31T23:58:00Z\" \
+         NotOnOrAfter=\"1970-01-01T00:02:00Z\">\
+         <saml:AudienceRestriction>\
+         <saml:Audience>https://ironauth.example/saml/metadata</saml:Audience>\
+         </saml:AudienceRestriction></saml:Conditions>\
+         <saml:AttributeStatement><saml:Attribute Name=\"email\">\
+         <saml:AttributeValue>ada@globex.example</saml:AttributeValue></saml:Attribute>\
+         </saml:AttributeStatement>"
+    );
+    ironauth_saml::test_util::signed_response_with(key, "_a1", &children)
+}
+
+/// Post a pasted response to the connection test and return the page.
+async fn test_connection(
+    harness: &Harness,
+    cookie: &str,
+    connection: &ironauth_store::SamlConnectionId,
+    response_b64: &str,
+) -> (axum::http::StatusCode, String) {
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/sso/test",
+        scope.tenant(),
+        scope.environment()
+    );
+    let form = format!(
+        "connection_id={}&saml_response={}",
+        urlencoding(&connection.to_string()),
+        urlencoding(response_b64),
+    );
+    post_form_from_with_cookie(harness, &path, &form, "same-origin", cookie).await
+}
+
+/// Percent-encode a form value.
+fn urlencoding(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_unpinned_certificate_is_named_as_the_setup_step_it_is() {
+    // #140 criterion 6, the first of the three failures it names by name. `saml_route`'s own
+    // doc says of these variants: "THAT FLOW IS NOT BUILT ... today the variant reaches a Rust
+    // caller and nothing else". This is the flow, and this is the variant that matters most to
+    // an admin still setting up: they have pinned nothing, and the generic answer -- "the
+    // signature did not verify" -- sends them to their identity provider, where everything is
+    // fine, and leaves them there.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let connection =
+        saml_connection_from(&harness, &org, "acme-okta", "https://idp.example/entity").await;
+    let cookie = open_session_in(&harness, "sso", "tok-t1", &org).await;
+
+    // ANY BYTES, deliberately: with nothing pinned there is no key to check a signature
+    // against, so `examine` answers before it reads the document. A fixture that bothered to
+    // sign would be measuring the same branch while implying the signature mattered.
+    let (status, body) = test_connection(&harness, &cookie, &connection, "bm90LXhtbA==").await;
+
+    assert_eq!(status, 200, "the diagnosis page: {body}");
+    assert!(
+        body.contains("No signing certificate is pinned"),
+        "an admin who has pinned nothing must be told that, not that a signature failed: {body}"
+    );
+    assert!(
+        !body.contains("signature did not verify"),
+        "the generic answer sends them to the wrong system: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_audience_names_what_was_sent_and_what_is_expected() {
+    // The second failure #140 names, and the one an identity provider gets wrong by default:
+    // its own field for the audience is usually pre-filled with something else entirely.
+    //
+    // The message has to carry BOTH values. "Wrong audience" alone leaves an admin comparing
+    // two strings they cannot both see, and the whole complaint the criterion makes about
+    // generic errors is that they do not say what to change.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let connection =
+        saml_connection_from(&harness, &org, "acme-okta", "https://idp.example/entity").await;
+    let key = XmlTestKey::generate();
+    pin_certificate_for(&harness, &connection, &key).await;
+    let cookie = open_session_in(&harness, "sso", "tok-t2", &org).await;
+
+    let wrong = response_with_audience(&key, "https://someone-elses-app.example/saml");
+    let (status, body) = test_connection(&harness, &cookie, &connection, &base64_of(&wrong)).await;
+
+    assert_eq!(status, 200, "the diagnosis page: {body}");
+    assert!(
+        body.contains("wrong audience"),
+        "the diagnosis has to name the failure: {body}"
+    );
+    assert!(
+        body.contains("https://someone-elses-app.example/saml"),
+        "it has to say what the identity provider actually sent: {body}"
+    );
+    assert!(
+        body.contains("https://ironauth.example/saml/metadata"),
+        "and what this connection expects, which is the value they go and paste: {body}"
+    );
+}
+
+#[tokio::test]
+async fn one_organizations_session_cannot_diagnose_anothers_connection() {
+    // The confinement every portal surface keeps, on the one route that reads another
+    // organization's trust material. Without it a link issued for one customer reports back
+    // another's audience and how many certificates they have pinned.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let mine = seed_org(&harness, "Acme").await;
+    let theirs = seed_org(&harness, "Globex").await;
+    let ours =
+        saml_connection_from(&harness, &mine, "acme-okta", "https://idp.example/entity").await;
+    let theirs_connection = saml_connection_from(
+        &harness,
+        &theirs,
+        "globex-entra",
+        "https://other.example/entity",
+    )
+    .await;
+    let cookie = open_session_in(&harness, "sso", "tok-t4", &mine).await;
+
+    // THE CONTROL FIRST: this session can diagnose its OWN connection, so the refusal below is
+    // the fence rather than a route that refuses everybody.
+    let (status, body) = test_connection(&harness, &cookie, &ours, "bm90LXhtbA==").await;
+    assert_eq!(status, 200, "the session's own connection: {body}");
+
+    let (status, body) =
+        test_connection(&harness, &cookie, &theirs_connection, "bm90LXhtbA==").await;
+    assert_eq!(
+        status, 400,
+        "one customer's portal diagnosed ANOTHER customer's connection: {body}"
+    );
+    assert!(
+        !body.contains("globex"),
+        "and it must not name them either: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_cross_site_connection_test_is_refused() {
+    // The CSRF guard every portal POST takes. This one reports whether an organization has
+    // finished its SSO setup, which another site has no business learning.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let connection =
+        saml_connection_from(&harness, &org, "acme-okta", "https://idp.example/entity").await;
+    let cookie = open_session_in(&harness, "sso", "tok-t5", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/sso/test",
+        scope.tenant(),
+        scope.environment()
+    );
+    let form = format!(
+        "connection_id={}&saml_response=bm90LXhtbA%3D%3D",
+        urlencoding(&connection.to_string())
+    );
+    let (status, body) =
+        post_form_from_with_cookie(&harness, &path, &form, "cross-site", &cookie).await;
+    assert_eq!(status, 403, "a cross-site diagnosis was served: {body}");
+}
+
+/// A connection that accepts a response it did not ask for, so `examine` runs to the end.
+///
+/// IT DIFFERS FROM `saml_connection_from` IN ONE FIELD `examine` READS, and that is the property
+/// the pair below rests on. Every value the verification consults -- the issuer, the audience,
+/// the skew, the maximum age, the name ID format, the encryption requirement, and the pinned
+/// certificate -- is identical; `allow_unsolicited` is the only one that is not.
+///
+/// IT LIVES IN ANOTHER ORGANIZATION, because `saml_connections` is unique on
+/// `(tenant, environment, organization, idp_entity_id)` and keeping the issuer equal is worth
+/// more than keeping the organization equal: the issuer is a value `examine` compares and the
+/// organization is not one it can see. `display_name` differs too, and reaches only the sentence
+/// `diagnose` prints, never a decision.
+async fn unsolicited_connection_from(
+    harness: &Harness,
+    organization: &OrganizationId,
+    display_name: &str,
+    idp_entity_id: &str,
+) -> ironauth_store::SamlConnectionId {
+    let env = Env::system();
+    let scope = harness.scope();
+    let id = ironauth_store::SamlConnectionId::generate(&env, &scope);
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .saml_connections()
+        .create(
+            &env,
+            ironauth_store::NewSamlConnection {
+                id: &id,
+                organization_id: organization,
+                display_name,
+                idp_entity_id,
+                idp_sso_url: "https://idp.example/sso",
+                sp_entity_id: "https://ironauth.example/saml/metadata",
+                acs_url: "https://ironauth.example/saml/acs",
+                allow_unsolicited: true,
+                clock_skew_secs: 30,
+                max_assertion_age_secs: 300,
+                nameid_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+                attribute_mapping: &serde_json::json!({}),
+                require_encrypted_assertion: false,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create the connection");
+    id
+}
+
+#[tokio::test]
+async fn a_response_that_passes_every_check_says_so_and_the_unsolicited_one_does_not() {
+    // TWO GOOD-NEWS SENTENCES, AND THE DIFFERENCE BETWEEN THEM IS THE FINDING.
+    //
+    // `examine` refuses an unsolicited response BEFORE it reaches the connection's remaining
+    // controls: the encryption requirement, the name ID format, and the attribute statement are
+    // all checked AFTER that point. An earlier version of this page called the unsolicited
+    // refusal "the certificate, issuer, audience and validity window all check out" and then
+    // named the correlation as "the one thing this test cannot check" -- which was false, and
+    // false in the direction that matters: a connection configured to require encryption refuses
+    // every real sign-in, and this page would have called it healthy.
+    //
+    // ONE FIXTURE FIELD SEPARATES THE TWO RUNS, so the difference in the answer is attributable.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let key = XmlTestKey::generate();
+    let right = base64_of(&response_with_audience(
+        &key,
+        "https://ironauth.example/saml/metadata",
+    ));
+
+    let solicited_only =
+        saml_connection_from(&harness, &org, "acme-okta", "https://idp.example/entity").await;
+    pin_certificate_for(&harness, &solicited_only, &key).await;
+    let cookie = open_session_in(&harness, "sso", "tok-t3", &org).await;
+    let (status, narrow) = test_connection(&harness, &cookie, &solicited_only, &right).await;
+    assert_eq!(status, 200, "the diagnosis page: {narrow}");
+    assert!(
+        narrow.contains("all check out"),
+        "a response that passes every check this connection reaches must be reported as \
+         passing: {narrow}"
+    );
+    assert!(
+        !narrow.contains("was refused"),
+        "and it must not read as a failure: {narrow}"
+    );
+    // THE LIMIT IS STATED. This is the assertion that would have failed against the sentence
+    // this test replaced.
+    assert!(
+        narrow.contains("does not vouch for what comes after"),
+        "the page must say what it did NOT reach, or an operator reads it as finished: {narrow}"
+    );
+
+    // THE SAME ISSUER, in another organization, with the same key pinned: see the helper's doc
+    // for why the organization is the thing that gives way rather than the issuer.
+    let other_org = seed_org(&harness, "Globex").await;
+    let accepts_unsolicited = unsolicited_connection_from(
+        &harness,
+        &other_org,
+        "globex-okta",
+        "https://idp.example/entity",
+    )
+    .await;
+    pin_certificate_for(&harness, &accepts_unsolicited, &key).await;
+    let other_cookie = open_session_in(&harness, "sso", "tok-t3b", &other_org).await;
+    let (status, full) =
+        test_connection(&harness, &other_cookie, &accepts_unsolicited, &right).await;
+    assert_eq!(status, 200, "the diagnosis page: {full}");
+    // THE `Ok` BRANCH, which nothing reached before: every earlier fixture stopped at the
+    // correlation, so the strongest sentence on the page was unmeasured.
+    assert!(
+        full.contains("passes every check this deployment makes on the document itself"),
+        "a response that reaches the end of `examine` must be reported as doing so: {full}"
+    );
+    assert!(
+        !full.contains("does not vouch for what comes after"),
+        "and it must not carry the narrower page's caveat: {full}"
+    );
+    // THE CORRELATION SENTENCE IS READ FROM THE COLUMN. This connection really does accept
+    // unsolicited responses, and the page says so BECAUSE the column says so rather than because
+    // reaching this branch implies it -- which it does not; see the sibling test below.
+    assert!(
+        full.contains("accepts a response it did not ask for"),
+        "the page must report the connection's own setting: {full}"
+    );
+    // AND THE STATE HALF IS EXCLUDED ON BOTH BRANCHES. `examine` is stateless: a real sign-in
+    // also has to spend an outstanding request, which a pasted document cannot.
+    assert!(
+        full.contains("NOT checked here"),
+        "the page must not imply a real sign-in would succeed: {full}"
+    );
+}
+
+#[tokio::test]
+async fn an_unsigned_assertion_is_not_blamed_on_the_certificate() {
+    // The third shape of "right for the wrong reason". `AcsError::Signature` wraps five distinct
+    // `VerifyError` variants, and an earlier version of `diagnose` printed the same
+    // certificate-rotation sentence for all five -- so an identity provider with assertion
+    // signing switched OFF, which is one of the two commonest real misconfigurations here, sent
+    // its administrator to rotate and re-pin a certificate that was perfectly correct.
+    //
+    // A CERTIFICATE IS PINNED, deliberately: without one the answer is `NoTrustAnchor` and this
+    // would be measuring the unpinned test again.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let connection =
+        saml_connection_from(&harness, &org, "acme-okta", "https://idp.example/entity").await;
+    let key = XmlTestKey::generate();
+    pin_certificate_for(&harness, &connection, &key).await;
+    let cookie = open_session_in(&harness, "sso", "tok-t6", &org).await;
+
+    // AN UNSIGNED DOCUMENT, and the comment that used to sit here claimed it differed from the
+    // signed fixtures in one field. It does not: `signed_response_with` builds a subject, a
+    // conditions block and an attribute statement that this one has none of. What the fixture
+    // establishes is narrower and is all this test needs -- a document with NO signature over
+    // its assertion, against a connection that HAS a certificate pinned, so the answer is a
+    // signature verdict rather than `NoTrustAnchor`.
+    let unsigned = "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" \
+         xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"_r1\" Version=\"2.0\" \
+         IssueInstant=\"1970-01-01T00:00:00Z\">\
+         <saml:Issuer>https://idp.example/entity</saml:Issuer>\
+         <saml:Assertion ID=\"_a1\" Version=\"2.0\" IssueInstant=\"1970-01-01T00:00:00Z\">\
+         <saml:Issuer>https://idp.example/entity</saml:Issuer></saml:Assertion></samlp:Response>";
+    let (status, body) =
+        test_connection(&harness, &cookie, &connection, &base64_of(unsigned)).await;
+
+    assert_eq!(status, 200, "the diagnosis page: {body}");
+    assert!(
+        body.contains("could not find exactly one signature"),
+        "the page has to name what it observed: {body}"
+    );
+    // AND IT MUST NOT NAME A CAUSE IT CANNOT SEE. `SignatureMissing` has seven producers, so
+    // "assertion signing is off" -- what this arm said before -- is one of them presented as the
+    // diagnosis. A provider signing BOTH elements reaches the same variant.
+    assert!(
+        body.contains("not a certificate problem"),
+        "and say what it is not, since that is where the wrong remedy lives: {body}"
+    );
+    assert!(
+        !body.contains("rotated at your identity provider"),
+        "and must not send an operator to re-pin a certificate that is correct: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_line_wrapped_response_is_read_the_way_the_acs_reads_it() {
+    // WHAT AN IDENTITY PROVIDER ACTUALLY EMITS. The `SAMLResponse` field is wrapped, and the
+    // first version of this route called `.trim()` and decoded -- so the normal shape came back
+    // as "that does not look like a SAMLResponse" from the one page whose job is telling an
+    // operator what a real sign-in would do, while the ACS beside it accepted the same bytes.
+    //
+    // THE TEST IS THE SAME DOCUMENT TWICE, wrapped and not, and the two answers must agree.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let connection =
+        saml_connection_from(&harness, &org, "acme-okta", "https://idp.example/entity").await;
+    let key = XmlTestKey::generate();
+    pin_certificate_for(&harness, &connection, &key).await;
+    let cookie = open_session_in(&harness, "sso", "tok-t7", &org).await;
+
+    let packed = base64_of(&response_with_audience(
+        &key,
+        "https://ironauth.example/saml/metadata",
+    ));
+    let wrapped = packed
+        .as_bytes()
+        .chunks(64)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    assert!(wrapped.contains("\r\n"), "the fixture must actually wrap");
+
+    let (status, from_wrapped) = test_connection(&harness, &cookie, &connection, &wrapped).await;
+    assert_eq!(status, 200, "the diagnosis page: {from_wrapped}");
+    let (_, from_packed) = test_connection(&harness, &cookie, &connection, &packed).await;
+    assert_eq!(
+        from_wrapped, from_packed,
+        "wrapping the field changed the answer"
+    );
+    assert!(
+        !from_wrapped.contains("does not look like a SAMLResponse"),
+        "the shape every identity provider emits was refused: {from_wrapped}"
+    );
+}
+
+#[tokio::test]
+async fn a_switched_off_connection_is_diagnosed_and_told_it_is_switched_off() {
+    // THE ADMIN THE FORM IS RENDERED FOR. The test form appears on every connection whether or
+    // not sign-in through it is switched on, because the admin whose connection is off is
+    // exactly the one still setting it up. The first version of the handler resolved with
+    // `find_active`, so that admin posted the form and got "no active connection with that id"
+    // -- the SAME sentence the organization fence returns, which reads as "that connection is
+    // not yours" and says nothing about the one fact that would have helped.
+    //
+    // BOTH HALVES ARE ASSERTED: the document is still examined, so they can get their audience
+    // and their certificate right before their vendor throws the switch, AND the page says
+    // plainly that nobody can sign in yet, so a clean verdict is not read as "you are finished".
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let connection =
+        saml_connection_from(&harness, &org, "acme-okta", "https://idp.example/entity").await;
+    let key = XmlTestKey::generate();
+    pin_certificate_for(&harness, &connection, &key).await;
+    let env = Env::system();
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .saml_connections()
+        .set_active(&env, &connection, false, None)
+        .await
+        .expect("switch the connection off");
+    let cookie = open_session_in(&harness, "sso", "tok-t8", &org).await;
+
+    let wrong = response_with_audience(&key, "https://someone-elses-app.example/saml");
+    let (status, body) = test_connection(&harness, &cookie, &connection, &base64_of(&wrong)).await;
+
+    assert_eq!(
+        status, 200,
+        "a connection being off is not a bad request: {body}"
+    );
+    assert!(
+        body.contains("switched off"),
+        "the page must say sign-in is not on yet: {body}"
+    );
+    assert!(
+        body.contains("wrong audience"),
+        "and it must still diagnose the document, which is why they are here: {body}"
+    );
+    assert!(
+        !body.contains("no connection with that id"),
+        "the refusal that reads as 'not yours' must not be what they get: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_reply_url_names_both_addresses() {
+    // A THIRD ARM THAT WAS REACHING THE CATCH-ALL. Splitting `diagnose` made the compiler name
+    // four `ConditionError` variants the old `other =>` arm was swallowing, and this is the one
+    // an operator hits most: `Recipient` is the reply URL they pasted into their provider, and
+    // the catch-all told them "nothing in this connection's configuration explains it" about a
+    // value this very page prints two paragraphs higher.
+    //
+    // ONE FIELD VARIES from the passing fixture: the `Recipient` in the subject confirmation.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let connection =
+        saml_connection_from(&harness, &org, "acme-okta", "https://idp.example/entity").await;
+    let key = XmlTestKey::generate();
+    pin_certificate_for(&harness, &connection, &key).await;
+    let cookie = open_session_in(&harness, "sso", "tok-t9", &org).await;
+
+    let misdirected = response_with_recipient(&key, "https://someone-elses-app.example/acs");
+    let (status, body) =
+        test_connection(&harness, &cookie, &connection, &base64_of(&misdirected)).await;
+
+    assert_eq!(status, 200, "the diagnosis page: {body}");
+    assert!(
+        body.contains("wrong address"),
+        "the diagnosis has to name the failure: {body}"
+    );
+    assert!(
+        body.contains("https://someone-elses-app.example/acs"),
+        "it has to say where the provider is sending it: {body}"
+    );
+    assert!(
+        body.contains("https://ironauth.example/saml/acs"),
+        "and where it should be sending it, which is the value they go and paste: {body}"
+    );
+    assert!(
+        !body.contains("Send this page to your vendor"),
+        "this is the customer's own to fix and must not be routed to support: {body}"
+    );
+}
+
+/// A signed response that ANSWERS a request, so it carries an `InResponseTo`.
+///
+/// ONE THING VARIES from [`response_with_audience`]'s passing form: the
+/// `SubjectConfirmationData` gains that attribute. Everything else -- issuer, audience,
+/// recipient, window, name ID, attribute statement -- is byte for byte the same.
+fn response_answering(key: &XmlTestKey, in_response_to: &str) -> String {
+    let children = format!(
+        "<saml:Issuer>https://idp.example/entity</saml:Issuer>\
+         <saml:Subject><saml:NameID \
+         Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\">\
+         ada@globex.example</saml:NameID>\
+         <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
+         <saml:SubjectConfirmationData InResponseTo=\"{in_response_to}\" \
+         Recipient=\"https://ironauth.example/saml/acs\" \
+         NotOnOrAfter=\"1970-01-01T00:02:00Z\"/></saml:SubjectConfirmation></saml:Subject>\
+         <saml:Conditions NotBefore=\"1969-12-31T23:58:00Z\" \
+         NotOnOrAfter=\"1970-01-01T00:02:00Z\">\
+         <saml:AudienceRestriction>\
+         <saml:Audience>https://ironauth.example/saml/metadata</saml:Audience>\
+         </saml:AudienceRestriction></saml:Conditions>\
+         <saml:AttributeStatement><saml:Attribute Name=\"email\">\
+         <saml:AttributeValue>ada@globex.example</saml:AttributeValue></saml:Attribute>\
+         </saml:AttributeStatement>"
+    );
+    ironauth_saml::test_util::signed_response_with(key, "_a1", &children)
+}
+
+#[tokio::test]
+async fn a_captured_response_reaches_the_end_without_being_told_the_connection_is_unsolicited() {
+    // THE BRANCH NOTHING REACHED, and the false sentence it used to print.
+    //
+    // `examine` refuses an unsolicited response only when the document carries NO
+    // `InResponseTo`. A response captured from a real sign-in -- the commonest thing an operator
+    // has to paste, because it is what their own browser posted -- carries one, so it sails past
+    // that guard on a connection whose `allow_unsolicited` is FALSE. The page then printed "this
+    // connection accepts a response it did not ask for", which is the opposite of this
+    // connection's setting, and "reaches the end of the same path a real sign-in takes", which
+    // is the half `examine` does not reach at all.
+    //
+    // THE FIXTURE IS THE DEFAULT CONNECTION, deliberately: `allow_unsolicited` is false, as
+    // migration 0196 defaults it and as every real deployment leaves it.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let connection =
+        saml_connection_from(&harness, &org, "acme-okta", "https://idp.example/entity").await;
+    let key = XmlTestKey::generate();
+    pin_certificate_for(&harness, &connection, &key).await;
+    let cookie = open_session_in(&harness, "sso", "tok-t10", &org).await;
+
+    let answering = response_answering(&key, "_req-that-was-issued");
+    let (status, body) =
+        test_connection(&harness, &cookie, &connection, &base64_of(&answering)).await;
+
+    assert_eq!(status, 200, "the diagnosis page: {body}");
+    assert!(
+        body.contains("passes every check this deployment makes on the document itself"),
+        "a document that reaches the end of `examine` is reported as doing so: {body}"
+    );
+    // THE SENTENCE THAT WAS FALSE.
+    assert!(
+        !body.contains("accepts a response it did not ask for"),
+        "a connection that accepts ONLY solicited responses was told it accepts any: {body}"
+    );
+    assert!(
+        body.contains("accepts only responses to its own requests"),
+        "the page has to report this connection's actual setting: {body}"
+    );
+    // AND THE SECOND FALSE SENTENCE: a real sign-in with these bytes would additionally have to
+    // spend an outstanding request, and this document names one that is long gone.
+    assert!(
+        body.contains("NOT checked here"),
+        "the page must not imply a real sign-in would succeed: {body}"
+    );
+}
+
+/// Post a pasted provisioning token to the token check and return the page.
+async fn check_token(
+    harness: &Harness,
+    cookie: &str,
+    connection: &ironauth_store::ScimConnectionId,
+    token: &str,
+) -> (axum::http::StatusCode, String) {
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim/test",
+        scope.tenant(),
+        scope.environment()
+    );
+    let form = format!(
+        "connection_id={}&token={}",
+        urlencoding(&connection.to_string()),
+        urlencoding(token),
+    );
+    post_form_from_with_cookie(harness, &path, &form, "same-origin", cookie).await
+}
+
+/// The token a real mint would hand the customer for this connection: `{scim_id}.{secret}`.
+///
+/// THE ID HALF IS NOT DECORATION. `ironauth-scim`'s `authenticate` reads the scope out of it
+/// before any query runs, and the portal check compares it to the connection the form names
+/// before any read at all. A fixture that invented an unshaped token would exercise neither.
+fn token_for(connection: &ironauth_store::ScimConnectionId, secret: &str) -> String {
+    format!("{connection}.{secret}")
+}
+
+#[tokio::test]
+async fn the_current_token_is_reported_as_working_and_as_unused() {
+    // #140 criterion 6's third named failure, the bad token, and the state that makes it worth
+    // having: a token that authenticates and that nothing has ever presented.
+    //
+    // THE ACTIVITY LINE IS THE POINT. "This token authenticates" on its own reads as
+    // "provisioning is fine", and during a rotation that reading is what ends when the overlap
+    // does. The connection was created by this binary, so an absent stamp genuinely means
+    // nothing has used it -- see `observed_since`.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let id = ironauth_store::ScimConnectionId::generate(&Env::system(), &harness.scope());
+    let token = token_for(&id, "s3cr3t");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &token, None).await;
+    let cookie = open_session_in(&harness, "scim", "tok-s1", &org).await;
+
+    let (status, body) = check_token(&harness, &cookie, &connection, &token).await;
+
+    assert_eq!(status, 200, "the check page: {body}");
+    assert!(
+        body.contains("authenticates against this connection"),
+        "a working token has to be reported as working: {body}"
+    );
+    assert!(
+        body.contains("No request has ever arrived"),
+        "and a working token nobody has used is the finding, not a detail: {body}"
+    );
+    // THE PASTED SECRET IS A LIVE CREDENTIAL. A page that quoted it back would put it in a
+    // browser history, a screenshot, and every proxy in between.
+    assert!(
+        !body.contains("s3cr3t"),
+        "the pasted token was echoed into the page: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_bound_names_which_bound_is_missing() {
+    // THE VARIANT CARRIES THE ATTRIBUTE and the arm used to throw it away, printing one sentence
+    // for four producers. Here `Conditions/@NotBefore` is absent while `NotOnOrAfter` is
+    // present, and the sentence that got discarded sent the operator to switch on a condition
+    // their document already had.
+    //
+    // ONE ATTRIBUTE VARIES from the passing fixture.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let connection =
+        saml_connection_from(&harness, &org, "acme-okta", "https://idp.example/entity").await;
+    let key = XmlTestKey::generate();
+    pin_certificate_for(&harness, &connection, &key).await;
+    let cookie = open_session_in(&harness, "sso", "tok-t11", &org).await;
+
+    let children = "<saml:Issuer>https://idp.example/entity</saml:Issuer>\
+         <saml:Subject><saml:NameID \
+         Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\">\
+         ada@globex.example</saml:NameID>\
+         <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
+         <saml:SubjectConfirmationData Recipient=\"https://ironauth.example/saml/acs\" \
+         NotOnOrAfter=\"1970-01-01T00:02:00Z\"/></saml:SubjectConfirmation></saml:Subject>\
+         <saml:Conditions NotOnOrAfter=\"1970-01-01T00:02:00Z\">\
+         <saml:AudienceRestriction>\
+         <saml:Audience>https://ironauth.example/saml/metadata</saml:Audience>\
+         </saml:AudienceRestriction></saml:Conditions>";
+    let missing = ironauth_saml::test_util::signed_response_with(&key, "_a1", children);
+    let (status, body) =
+        test_connection(&harness, &cookie, &connection, &base64_of(&missing)).await;
+
+    assert_eq!(status, 200, "the diagnosis page: {body}");
+    assert!(
+        body.contains("Conditions/@NotBefore"),
+        "the page has to name the bound that is actually absent: {body}"
+    );
+    // THE SENTENCE THAT WAS WRONG: `NotOnOrAfter` IS in this document.
+    assert!(
+        !body.contains("switch on the assertion lifetime"),
+        "it must not send an operator to enable something already there: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_previous_token_is_named_as_the_previous_one() {
+    // THE ROTATION'S OWN FAILURE MODE, and the one the status column beside this cannot see. An
+    // admin who has not finished their cutover is presenting the old token, which still works --
+    // so every other signal on the page says healthy right up to the end of the overlap.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let old = token_for(&id, "old-one");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &old, None).await;
+    let new = token_for(&id, "new-one");
+    let now = now_micros(&harness);
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .rotate_token(&env, &connection, &hex_digest(&new), 3600, now)
+        .await
+        .expect("rotate")
+        .expect("the connection exists");
+    let cookie = open_session_in(&harness, "scim", "tok-s2", &org).await;
+
+    let (status, body) = check_token(&harness, &cookie, &connection, &old).await;
+    assert_eq!(status, 200, "the check page: {body}");
+    assert!(
+        body.contains("PREVIOUS token"),
+        "the superseded token has to be named as superseded: {body}"
+    );
+    assert!(
+        body.contains("still works"),
+        "and it does still work, which is what an overlap is for: {body}"
+    );
+
+    // THE CONTROL: the token that replaced it is reported as the live one, so the sentence above
+    // is about WHICH token and not about this connection being in a rotated state.
+    let (_, fresh) = check_token(&harness, &cookie, &connection, &new).await;
+    assert!(
+        fresh.contains("authenticates against this connection"),
+        "the new token is the live one: {fresh}"
+    );
+    assert!(
+        !fresh.contains("PREVIOUS token"),
+        "and must not be reported as the old one: {fresh}"
+    );
+}
+
+#[tokio::test]
+async fn a_lapsed_token_says_when_it_stopped_rather_than_that_it_is_unknown() {
+    // AFTER THE OVERLAP the old token is refused by `authenticate` and the customer's
+    // provisioning has stopped. "This is not a token of this connection" would be true of a
+    // truncated paste and is the wrong instruction here: what they need is the date, because it
+    // tells them the cutover they started is the thing that is finished.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let old = token_for(&id, "old-one");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &old, None).await;
+    let new = token_for(&id, "new-one");
+    let now = now_micros(&harness);
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        // A WINDOW THAT HAS ALREADY CLOSED, which the harness clock makes expressible: the
+        // overlap is one second and the page is read after it.
+        .rotate_token(&env, &connection, &hex_digest(&new), 0, now - 2_000_000)
+        .await
+        .expect("rotate")
+        .expect("the connection exists");
+    let cookie = open_session_in(&harness, "scim", "tok-s3", &org).await;
+
+    let (status, body) = check_token(&harness, &cookie, &connection, &old).await;
+    assert_eq!(status, 200, "the check page: {body}");
+    assert!(
+        body.contains("stopped working on"),
+        "a lapsed token has to say when it lapsed: {body}"
+    );
+    assert!(
+        !body.contains("not a token of this connection"),
+        "and must not be confused with a value that was never one: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_token_of_another_connection_is_refused_without_a_lookup() {
+    // THE CROSS-CONNECTION FENCE, which is a string comparison rather than a query: the token
+    // names its own connection in its id half, so a value minted for a neighbour is refused here
+    // BEFORE anything is read. That is what stops this surface confirming that a given
+    // connection id exists somewhere else in the deployment.
+    //
+    // BOTH CONNECTIONS ARE THIS ORGANIZATION'S, so what is measured is the token-to-connection
+    // binding and not the organization fence, which has its own test below.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let mine = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let other = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let my_token = token_for(&mine, "s3cr3t");
+    let other_token = token_for(&other, "s3cr3t");
+    let mine = connect_with_id(
+        &harness,
+        &org,
+        "Okta Production",
+        "okta",
+        &mine,
+        &my_token,
+        None,
+    )
+    .await;
+    let _other = connect_with_id(
+        &harness,
+        &org,
+        "Entra Staging",
+        "entra",
+        &other,
+        &other_token,
+        None,
+    )
+    .await;
+    let cookie = open_session_in(&harness, "scim", "tok-s4", &org).await;
+
+    // THE CONTROL FIRST: this connection recognises its own token, so the refusal below is the
+    // binding rather than a page that refuses everything.
+    let (_, own) = check_token(&harness, &cookie, &mine, &my_token).await;
+    assert!(
+        own.contains("authenticates against this connection"),
+        "the control: {own}"
+    );
+
+    let (status, body) = check_token(&harness, &cookie, &mine, &other_token).await;
+    assert_eq!(status, 200, "the check page: {body}");
+    assert!(
+        body.contains("belongs to a different connection"),
+        "a token minted for another connection has to be named as one: {body}"
+    );
+    assert!(
+        !body.contains("authenticates"),
+        "and must not be reported as working here: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_token_is_not_confused_with_a_revoked_one() {
+    // THE COMMONEST PASTE ERROR, and the one the page has to keep separate from every lifecycle
+    // answer: a value that was never a token of this connection is fixed by copying again, and a
+    // revoked one is fixed by going to get the current one.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let token = token_for(&id, "s3cr3tttt");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &token, None).await;
+    let cookie = open_session_in(&harness, "scim", "tok-s5", &org).await;
+
+    // THE RIGHT CONNECTION, THE WRONG SECRET: the id half still names this connection, so this
+    // reaches the store read rather than the string comparison in front of it.
+    let truncated = token_for(&id, "s3cr3t");
+    let (status, body) = check_token(&harness, &cookie, &connection, &truncated).await;
+    assert_eq!(status, 200, "the check page: {body}");
+    assert!(
+        body.contains("not a token of this connection"),
+        "an unrecognised value has to be named as one: {body}"
+    );
+    assert!(
+        body.contains("truncated"),
+        "and the commonest cause is worth naming: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_connection_outranks_anything_about_the_token() {
+    // ORDER, WHICH IS THE ORDER THE REMEDIES COME IN. A revoked connection authenticates nothing
+    // whatever token is presented, so reporting the token as fine would send the reader back to
+    // their identity provider to look for a fault that is not there.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let token = token_for(&id, "s3cr3t");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &token, None).await;
+    let cookie = open_session_in(&harness, "scim", "tok-s6", &org).await;
+
+    // THE CONTROL FIRST, on the same token: before the revocation it reads as working, so the
+    // sentence below is the revocation and not the token.
+    let (_, before) = check_token(&harness, &cookie, &connection, &token).await;
+    assert!(
+        before.contains("authenticates against this connection"),
+        "the control: {before}"
+    );
+
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .revoke(&env, &connection, now_micros(&harness))
+        .await
+        .expect("revoke the connection");
+
+    let (status, body) = check_token(&harness, &cookie, &connection, &token).await;
+    assert_eq!(status, 200, "the check page: {body}");
+    assert!(
+        body.contains("has been revoked"),
+        "the connection's own state has to be reported first: {body}"
+    );
+    assert!(
+        !body.contains("authenticates against this connection"),
+        "and a token of a revoked connection must not read as working: {body}"
+    );
+}
+
+#[tokio::test]
+async fn one_organizations_session_cannot_check_a_token_against_anothers_connection() {
+    // #140 criterion 3 on this route. Without the organization predicate a link issued for one
+    // customer would confirm the existence of a neighbour's connection, and -- with a token they
+    // happened to hold -- its lifecycle dates as well.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let mine = seed_org(&harness, "Acme").await;
+    let theirs = seed_org(&harness, "Globex").await;
+    let env = Env::system();
+    let my_id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let their_id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let my_token = token_for(&my_id, "mine");
+    let their_token = token_for(&their_id, "theirs");
+    let my_connection = connect_with_id(
+        &harness,
+        &mine,
+        "Okta Production",
+        "okta",
+        &my_id,
+        &my_token,
+        None,
+    )
+    .await;
+    let their_connection = connect_with_id(
+        &harness,
+        &theirs,
+        "Entra Staging",
+        "entra",
+        &their_id,
+        &their_token,
+        None,
+    )
+    .await;
+    let cookie = open_session_in(&harness, "scim", "tok-s7", &mine).await;
+
+    // THE CONTROL: this session checks its OWN connection, so the refusal below is the fence.
+    let (status, own) = check_token(&harness, &cookie, &my_connection, &my_token).await;
+    assert_eq!(status, 200, "the session's own connection: {own}");
+
+    let (status, body) = check_token(&harness, &cookie, &their_connection, &their_token).await;
+    assert_eq!(
+        status, 400,
+        "one customer's portal checked a token against ANOTHER customer's connection: {body}"
+    );
+    assert!(
+        !body.contains("Entra Staging"),
+        "and it must not name them either: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_cross_site_token_check_is_refused() {
+    // The CSRF guard every portal POST takes. A cross-origin post here would let another site
+    // test tokens it holds against this customer's connection and read the answer.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let token = token_for(&id, "s3cr3t");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &token, None).await;
+    let cookie = open_session_in(&harness, "scim", "tok-s8", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim/test",
+        scope.tenant(),
+        scope.environment()
+    );
+    let form = format!(
+        "connection_id={}&token={}",
+        urlencoding(&connection.to_string()),
+        urlencoding(&token),
+    );
+    let (status, body) =
+        post_form_from_with_cookie(&harness, &path, &form, "cross-site", &cookie).await;
+    assert_eq!(status, 403, "a cross-site token check was served: {body}");
+}
+
+#[tokio::test]
+async fn an_sso_session_cannot_reach_the_token_check() {
+    // THE INTENT FENCE, which every portal surface keeps and which a new POST is exactly the
+    // place to forget. A link minted for `sso` reaches a connection's trust material; it has no
+    // business reading provisioning credentials' lifecycle.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let token = token_for(&id, "s3cr3t");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &token, None).await;
+
+    // THE CONTROL: a `scim` session checks the same token on the same connection and is served.
+    let scim_cookie = open_session_in(&harness, "scim", "tok-s9", &org).await;
+    let (status, served) = check_token(&harness, &scim_cookie, &connection, &token).await;
+    assert_eq!(status, 200, "the control: {served}");
+
+    let sso_cookie = open_session_in(&harness, "sso", "tok-s10", &org).await;
+    let (status, body) = check_token(&harness, &sso_cookie, &connection, &token).await;
+    assert_eq!(
+        status, 404,
+        "an sso session reached the token check: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_first_token_bounded_by_its_connection_is_not_called_the_previous_one() {
+    // ROUND 3's HIGH FINDING. `create` copies the CONNECTION's expiry onto the very first token
+    // row, so a horizon on a token row is not evidence of a rotation -- and the arm that assumed
+    // it was told the holder of a connection's ONLY token that it was "the PREVIOUS token" and
+    // to go and copy a current one that does not exist. `rotate_token` refuses a lapsed
+    // connection, so the remedy they would then ask for is one this product answers with a
+    // not-found.
+    //
+    // THE STATUS COLUMN ON THE SAME PAGE said the opposite about the same date, which is how a
+    // page comes to give two contradictory instructions.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let token = token_for(&id, "s3cr3t");
+    // A FUTURE EXPIRY, which is the only kind the management API will store, so this is the
+    // reachable state rather than a contrived one.
+    let expires = now_micros(&harness) + 30 * 24 * 60 * 60 * 1_000_000;
+    let connection = connect_with_id(
+        &harness,
+        &org,
+        "Okta Production",
+        "okta",
+        &id,
+        &token,
+        Some(expires),
+    )
+    .await;
+    let cookie = open_session_in(&harness, "scim", "tok-s11", &org).await;
+
+    let (status, body) = check_token(&harness, &cookie, &connection, &token).await;
+    assert_eq!(status, 200, "the check page: {body}");
+    assert!(
+        !body.contains("PREVIOUS token"),
+        "a connection's only token was called the previous one: {body}"
+    );
+    assert!(
+        !body.contains("Copy the current token"),
+        "and its holder was sent to copy a token that does not exist: {body}"
+    );
+    assert!(
+        body.contains("Nothing has replaced it"),
+        "the page has to say the date is the connection's own: {body}"
+    );
+    assert!(
+        body.contains("replace this connection"),
+        "and name the remedy that exists, which is the one the status column names: {body}"
+    );
+
+    // THE CONTROL, on the same connection: rotate, and the OLD token is now genuinely the
+    // previous one. One fact changes -- a newer token exists -- and the sentence changes with
+    // it, which is what makes the assertion above about supersession rather than about expiry.
+    let new = token_for(&id, "new-one");
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .rotate_token(
+            &env,
+            &connection,
+            &hex_digest(&new),
+            3600,
+            now_micros(&harness),
+        )
+        .await
+        .expect("rotate")
+        .expect("the connection exists");
+
+    let (_, after) = check_token(&harness, &cookie, &connection, &token).await;
+    assert!(
+        after.contains("PREVIOUS token"),
+        "once something HAS replaced it, that is what it is: {after}"
+    );
+}
+
+#[tokio::test]
+async fn the_token_check_is_absent_where_nothing_can_authenticate() {
+    // A DEPLOYMENT THAT DOES NOT SERVE `/scim/v2` answers every provisioning request with a
+    // uniform 404, so no token authenticates anything however healthy its row is. The check
+    // would have said "this token authenticates against this connection" -- a sentence about a
+    // credential table, true of the row and false of everything the reader came to find out.
+    // They would go away satisfied and nothing would ever call.
+    //
+    // BOTH HALVES: the form is not offered, AND the route refuses, because a form not being
+    // rendered is not a fence.
+    let harness = Harness::start_store_backed_with_scim_surface(false).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let token = token_for(&id, "s3cr3t");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &token, None).await;
+    let cookie = open_session_in(&harness, "scim", "tok-s12", &org).await;
+
+    let scope = harness.scope();
+    let surface = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, _, page) = harness.get_with_cookie(&surface, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {page}");
+    assert!(
+        !page.contains("Check a token"),
+        "a check that cannot mean anything was offered: {page}"
+    );
+
+    let (status, body) = check_token(&harness, &cookie, &connection, &token).await;
+    assert_eq!(
+        status, 404,
+        "the route answered on a deployment serving no SCIM: {body}"
+    );
+
+    // THE CONTROL: the same fixture with the surface on serves both.
+    let live = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&live, "Acme").await;
+    let id = ironauth_store::ScimConnectionId::generate(&env, &live.scope());
+    let token = token_for(&id, "s3cr3t");
+    let connection =
+        connect_with_id(&live, &org, "Okta Production", "okta", &id, &token, None).await;
+    let cookie = open_session_in(&live, "scim", "tok-s13", &org).await;
+    let scope = live.scope();
+    let surface = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (_, _, page) = live.get_with_cookie(&surface, Some(&cookie)).await;
+    assert!(page.contains("Check a token"), "the control: {page}");
+    let (status, body) = check_token(&live, &cookie, &connection, &token).await;
+    assert_eq!(status, 200, "the control: {body}");
 }

@@ -16,14 +16,18 @@
 //! constructs exactly that.
 //!
 //! NOT EVERY SCIM OPERATION, and the partition is worth stating exactly rather than implying.
-//! Ten operations across the four SCIM repositories take an identifier and fence on it. SEVEN
-//! are driven here. The other THREE -- `ScimConnectionRepo::exists_in_organization`,
-//! `ScimExternalIdRepo::bind` and `::resolve` -- are driven the same way in
-//! `ironauth-store/tests/scim_connections.rs`, which ALSO drives a foreign
-//! `list_for_organization`. That last one is covered in both places, which is why seven plus
-//! what the other file drives does not add to ten: a review counted it as an eighth operation
-//! and the arithmetic only balanced by cancelling against an operation the sentence had
-//! forgotten.
+//! TWELVE operations across the four SCIM repositories take an identifier and fence on it. SEVEN
+//! are driven here. The other FIVE -- `ScimConnectionRepo::exists_in_organization`,
+//! `::find_in_organization`, `::standing_of`, `ScimExternalIdRepo::bind` and `::resolve` -- are
+//! driven the same way in `ironauth-store/tests/scim_connections.rs`, which ALSO drives a
+//! foreign `list_for_organization`. That last one is covered in both places, which is why seven
+//! plus what the other file drives does not add to twelve: a review counted it as an eighth
+//! operation and the arithmetic only balanced by cancelling against an operation the sentence
+//! had forgotten.
+//!
+//! THE COUNT MOVES WHEN AN OPERATION LANDS, which is the whole reason it is written down. Issue
+//! #140 criterion 6 added `find_in_organization` and `standing_of`, both of which take an
+//! identifier and fence on it, and the sentence above said ten for a while after they existed.
 //!
 //! Two of the seven -- `ScimActivationRepo::set_active` and `::active_elsewhere` -- were covered
 //! NOWHERE until a review deleted both their scope guards and watched 193 tests pass.

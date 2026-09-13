@@ -21,7 +21,6 @@ ironauth-env = { path = "../ironauth-env", version = "0.1.0" }
 axum = { workspace = true, features = ["json", "query"] }
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 
 [dev-dependencies]
 ironauth-store = { path = "../ironauth-store", version = "0.1.0", features = ["testing"] }
