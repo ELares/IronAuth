@@ -119,10 +119,19 @@ const LIST_LIMIT: i64 = 200;
 /// What a member asks for.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RaiseAccessRequestBody {
-    /// Who would receive the access. Not necessarily the caller: a manager may ask on
-    /// behalf of somebody else.
+    /// Who would receive the access (`usr_...`). Not necessarily the caller: a manager may
+    /// ask on behalf of somebody else.
+    ///
+    /// Must be a user id of this scope AND a live member of this organization, both checked
+    /// at raise: a grant to a non-member confers nothing, so it would be approved and change
+    /// nothing. Either failure answers 422 naming which one it was.
+    #[schema(example = "usr_...")]
     pub subject_id: String,
     /// Which organization role.
+    ///
+    /// Must be a role THIS organization defines, checked at raise for the same reason:
+    /// `role_slug` is matched by name at resolution time, so a typo is approved and grants
+    /// nothing. A slug this organization does not define answers 422.
     pub role_slug: String,
     /// Why, in the requester's words.
     pub reason: String,
@@ -213,16 +222,65 @@ fn armed(state: &AdminState) -> Result<(), ApiError> {
     Err(ApiError::NotFound)
 }
 
-/// Refuse a request whose subject or role would make the grant meaningless.
+/// Refuse a request that would be approved and then confer nothing.
 ///
-/// Split out for the crate's function-length bound, and the two checks belong together:
-/// each is the same shape, a field that is well formed and names nothing.
+/// Split out for the crate's function-length bound, and the three checks belong together
+/// because they answer ONE question and are each a different way to get the same wrong
+/// answer: the organization does not resolve roles at all, the subject is not somebody the
+/// closure seeds on, or the role is not one this organization defines. Each leaves an
+/// approver agreeing to an elevation that every listing and every audit row reports as
+/// granted and that moves nobody's authorization.
+///
+/// They are also, deliberately, the checks that can be made STATICALLY at raise time. What
+/// cannot: the organization may be disabled, the membership ended, or the role deleted
+/// between the raise and the decision, and between the decision and the deadline. The
+/// resolution fences handle all of those -- a grant stops granting the moment any of the
+/// three stops holding -- so this function is about telling the PERSON, not about the
+/// security property, which does not depend on it.
+///
+/// # Errors
+///
+/// [`ApiError::Conflict`] when the organization is disabled; [`ApiError::Unprocessable`]
+/// when `subject_id` is not a user id of this scope, when the subject is not a live member,
+/// or when the organization defines no such role.
 async fn require_grantable(
     state: &AdminState,
     scope: ironauth_store::Scope,
     org_id: &ironauth_store::OrganizationId,
     body: &RaiseAccessRequestBody,
 ) -> Result<(), ApiError> {
+    // THE ORGANIZATION MUST BE ACTIVE, and this is the first of the three checks because
+    // it is the coarsest.
+    //
+    // `resolve_live_org` fences on `deleted_at` and says nothing about `state`: migration
+    // 0084 is explicit that a DISABLED organization still exists and is still readable. But
+    // `EFFECTIVE_CLOSURE_CTE` seeds `membership` only under `o.state = 'active'`, so a
+    // disabled organization resolves to nothing for every one of its members -- it is the
+    // coarsest revocation an operator has, and the one this PR's previous round was about.
+    // Without this check the whole flow completes against a disabled organization: the
+    // request is raised, a second principal approves it, every listing and every audit row
+    // reads `approved`, and the subject's authorization does not move. That is precisely
+    // the outcome the two checks below exist to prevent, reached by a third route.
+    //
+    // CONFLICT rather than 422, following `require_active_organization` in
+    // `scim_connections.rs`: the body is not the problem, the organization's state is, and
+    // re-enabling it makes the identical request succeed.
+    if state
+        .store()
+        .management()
+        .organizations(scope)
+        .get(org_id)
+        .await?
+        .state
+        != ironauth_store::OrganizationState::Active
+    {
+        return Err(ApiError::Conflict(
+            "organization_disabled: a disabled organization resolves no roles for any of \
+             its members, so an approved grant would confer nothing until it is re-enabled"
+                .to_owned(),
+        ));
+    }
+
     // THE SUBJECT MUST BE A LIVE MEMBER of this organization.
     //
     // A grant for a non-member confers nothing -- the resolution closure seeds only on a
@@ -307,7 +365,9 @@ async fn require_grantable(
         (status = 400, description = "A field is empty or too long", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "No such live organization in this scope, or the exploratory feature is not acknowledged", body = ErrorBody)
+        (status = 404, description = "No such live organization in this scope, or the exploratory feature is not acknowledged", body = ErrorBody),
+        (status = 409, description = "The organization is disabled, so it resolves no roles for any member and an approved grant would confer nothing until it is re-enabled", body = ErrorBody),
+        (status = 422, description = "The request would be approved and confer nothing: `subject_id` is not a user id of this scope, or names somebody who is not a live member of this organization, or `role_slug` names no role this organization defines. Checked at RAISE so a typo is caught by the person who made it rather than by the person asked to trust it", body = ErrorBody)
     )
 )]
 pub async fn raise_access_request(

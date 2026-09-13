@@ -6926,6 +6926,158 @@ async fn disabling_the_organization_revokes_a_live_time_boxed_grant() {
     );
 }
 
+/// The budget verdict counts what the MINT will carry, not what the read reports
+/// (issue #145 criterion 4, with issue #98's budget).
+///
+/// # The number and the sentence beside it
+///
+/// `permission_budget` is documented as the answer that predicts the next token: `overflow`
+/// means "the next token will carry NO permissions claim", and an operator acts on it by
+/// detaching permissions. The time-boxed tail deliberately widens this endpoint's
+/// `permissions` and deliberately does NOT widen the mint, so counting the reported set
+/// would make the verdict describe a token nobody will be issued -- telling an operator to
+/// go fix a claim that was never in trouble.
+///
+/// Asserted as an exact count rather than through a configured threshold, so the test does
+/// not depend on where the budget is tuned: this member's minted set is EMPTY (they hold no
+/// role by assignment, by group or by default) while the reported set carries what the
+/// time-boxed role confers. A verdict computed over the reported set would say one.
+#[tokio::test]
+async fn the_budget_counts_the_minted_permissions_and_not_the_time_boxed_ones() {
+    let h = Harness::start_with_access_requests(50, true).await;
+    let (tenant, environment) = h.create_tenant("acme", "ar-budget").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let (org, _seeded, _subject) = seed_access_request(&h, &base).await;
+    let (user, membership) = seed_org_member(&h, &base, &org, "budget").await;
+    let effective = format!("{base}/organizations/{org}/memberships/{membership}/effective-roles");
+
+    // BEFORE THE GRANT: this member holds nothing by any path, so both numbers are zero and
+    // the two sets are the same one. Without this the assertion below could not tell a
+    // verdict counted over the right set from one that is simply always zero.
+    let (status, _, before) = h.get(&effective).await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    let before: Value = serde_json::from_str(&before).expect("json");
+    assert_eq!(
+        before["permissions"].as_array().expect("permissions").len(),
+        0,
+        "the fixture member must start with nothing: {before}"
+    );
+    assert_eq!(
+        before["permission_budget"]["permission_count"], 0,
+        "and the verdict must agree with it: {before}"
+    );
+
+    let _request = approve_for(&h, &tenant, &environment, &base, &org, &user, "ar-budget").await;
+
+    let (status, _, after) = h.get(&effective).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    let body: Value = serde_json::from_str(&after).expect("json");
+
+    // THE READ WIDENED: the elevation and what it carries are both reported, which is the
+    // whole point of the paired tails.
+    assert!(
+        after.contains("time_boxed"),
+        "the grant has to be live for this test to measure anything: {after}"
+    );
+    let reported = body["permissions"].as_array().expect("permissions");
+    assert_eq!(
+        reported.len(),
+        1,
+        "the time-boxed role's permission has to be reported: {after}"
+    );
+    assert_eq!(reported[0], "invoices.write", "{after}");
+
+    // THE VERDICT DID NOT: the mint resolves this member through the plain closure, which
+    // yields nothing, so the count that predicts the next token is still zero.
+    assert_eq!(
+        body["permission_budget"]["permission_count"], 0,
+        "the budget counted the time-boxed permission. It is documented as what the NEXT \
+         TOKEN carries, the mint does not resolve time-boxed grants, and an `overflow` \
+         raised this way sends an operator to detach permissions to repair a claim that \
+         was never over budget: {after}"
+    );
+    assert_eq!(
+        body["permission_budget"]["scope"], "membership",
+        "and it is still the membership-scoped verdict: {after}"
+    );
+}
+
+/// A raise into a DISABLED organization is refused, rather than approved and inert
+/// (issue #145 criterion 4).
+///
+/// # The third route to the outcome the other two checks exist to stop
+///
+/// `require_grantable` already refuses a non-member and an undefined role, on the grounds
+/// that an approver would otherwise agree to an elevation which every listing and every
+/// audit row reports as granted and which moves nobody's authorization. A disabled
+/// organization produces exactly that outcome and was the one case not checked:
+/// `resolve_live_org` fences on `deleted_at` and migration 0084 is explicit that a disabled
+/// organization still exists and is still readable, while the resolution closure seeds
+/// `membership` only under `o.state = 'active'`.
+///
+/// It is also the sharpest case, because it is the coarsest revocation an operator has --
+/// the one `disabling_the_organization_revokes_a_live_time_boxed_grant` proves works at the
+/// read. Accepting a raise against it means an incident responder disables an organization
+/// and the approval queue keeps handing out elevations for it.
+#[tokio::test]
+async fn a_raise_into_a_disabled_organization_is_refused_and_says_why() {
+    let h = Harness::start_with_access_requests(50, true).await;
+    let (tenant, environment) = h.create_tenant("acme", "ar-disraise").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let (org, _seeded, subject) = seed_access_request(&h, &base).await;
+
+    // THE SAME BODY SUCCEEDS FIRST, so the refusal below is the disable and not the fixture.
+    let body = serde_json::json!({
+        "subject_id": subject,
+        "role_slug": "billing-admin",
+        "reason": "quarter close",
+    })
+    .to_string();
+    let (status, _, accepted) = h
+        .post(
+            &format!("{base}/organizations/{org}/access-requests"),
+            "ar-disraise-before",
+            &body,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the control raise has to succeed: {accepted}"
+    );
+
+    let (status, _, disabled) = h
+        .post(
+            &format!("{base}/organizations/{org}/disable"),
+            "ar-disraise-org",
+            "",
+        )
+        .await;
+    assert!(
+        status.is_success(),
+        "disable the organization: {status} {disabled}"
+    );
+
+    let (status, _, refused) = h
+        .post(
+            &format!("{base}/organizations/{org}/access-requests"),
+            "ar-disraise-after",
+            &body,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a raise into a disabled organization has to be refused: an approval would be \
+         recorded, read as granted everywhere, and confer nothing: {refused}"
+    );
+    assert!(
+        refused.contains("organization_disabled"),
+        "the refusal has to name the cause, because the fix is to re-enable the \
+         organization and nothing else about the request is wrong: {refused}"
+    );
+}
+
 /// Deleting the ROLE revokes the grant too, for the same structural reason.
 #[tokio::test]
 async fn deleting_the_role_revokes_a_live_time_boxed_grant() {

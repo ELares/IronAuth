@@ -53048,6 +53048,46 @@ const EFFECTIVE_ROLE_GRANTS_TAIL: &str = "SELECT DISTINCT r.slug AS slug, \
 /// survive its own deadline, matching
 /// [`crate::access_request::AccessGrantRequest::grants_now`], which the read path applies to
 /// the same rows.
+///
+/// # The sort key carries a FOURTH column, and why the inherited three stopped working
+///
+/// [`EFFECTIVE_ROLE_GRANTS_TAIL`] documents `(slug, source, via_group_id)` as a TOTAL
+/// order -- no two rows share all three -- and both the `roles` array and the
+/// access-review export publish byte-stability on the strength of it. That premise does
+/// not survive this arm. It emits one row per approved request, so two live approved
+/// requests for one `(subject, role_slug)` produce two rows agreeing on the slug, on
+/// `'time_boxed'`, and on a NULL `via_group_id`, differing only in columns the inherited
+/// key does not mention. `SELECT DISTINCT` does not collapse them: the ids differ, which
+/// is the point of keeping both. Nothing in migration 0225 forbids the pair, and raising
+/// an extension before the first grant lapses is the ordinary way to reach it.
+///
+/// So the key ends on `via_request_id`, which is unique per row by primary key and makes
+/// the order total again.
+///
+/// IT IS AN EQUIVALENT MUTANT TODAY, and saying so is better than leaving the next reader
+/// to find out, exactly as the `source` conjunct above records. Removing it was measured:
+/// `two_live_grants_for_one_role_are_two_rows_in_a_stable_order` plants eight overlapping
+/// grants in DESCENDING id order and still passes without the conjunct. The reason is a
+/// plan detail and not a property of the statement: each arm carries `SELECT DISTINCT`
+/// over a column list that INCLUDES `via_request_id`, so the de-duplication already sorts
+/// on it and hands the outer sort an input that is in id order. Nothing makes the planner
+/// keep doing that -- a hash-based `DISTINCT`, a different row count, or a version that
+/// re-orders the `UNION ALL` inputs all break it.
+///
+/// So what the conjunct buys is a GUARANTEE rather than a currently observable value: the
+/// `roles` array and the access-review export both publish byte-stability, and without it
+/// that holds by luck. A compliance pipeline diffing one quarter against the next reports
+/// a change nobody made on the day the luck runs out. Keep it, and do not read the
+/// surviving mutation as evidence that it does nothing.
+///
+/// # Two overlapping grants are TWO rows, deliberately
+///
+/// Collapsing them to the one that expires last would restore the cost bound this arm
+/// breaks (see the un-paginated section in `crates/ironauth-admin/src/org_effective_roles.rs`)
+/// and it would be wrong for the same reason collapsing a role held directly AND through a
+/// group is wrong: each row is a path that has to be revoked separately, and an operator
+/// shown one of two live approvals revokes it, watches the elevation survive, and has no
+/// row to tell them why.
 const EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL: &str = "SELECT DISTINCT r.slug AS slug, \
             'direct'::text AS source, NULL::text AS via_group_id, \
             NULL::text AS via_request_id, NULL::bigint AS granted_until_micros \
@@ -53096,7 +53136,8 @@ const EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL: &str = "SELECT DISTINCT r.slug AS s
         AND agr.granted_until > \
             (TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
         AND EXISTS (SELECT 1 FROM membership) \
-      ORDER BY slug, source, via_group_id NULLS FIRST";
+      ORDER BY slug, source, via_group_id NULLS FIRST, \
+               via_request_id NULLS FIRST";
 
 /// The projection [`OrgGroupRepo::effective_permissions`] runs over
 /// [`EFFECTIVE_CLOSURE_CTE`] (issue #98): the slugs of every LIVE permission carried
@@ -53307,6 +53348,22 @@ const EFFECTIVE_PERMISSION_SLUGS_TAIL: &str = "SELECT DISTINCT p.slug AS slug \
 /// `permissions` does not, so an operator reads that the member holds `billing-admin` and
 /// holds none of what `billing-admin` carries. Either answer alone is defensible; the two
 /// together are not.
+///
+/// # Why the second disjunct repeats $1/$2/$3 on BOTH `r` and `agr`
+///
+/// It reaches `org_roles` directly rather than through `effective_roles`, so it is the
+/// only projection over this closure that does not inherit the CTE's fence. The first
+/// version fenced `r` on `r.deleted_at IS NULL` alone and bound `agr` to `r.tenant_id`,
+/// `r.environment_id` and `r.organization_id`, which makes WHICH organization's approved
+/// requests count a property of the role row rather than of the bound scope. Migration
+/// 0092 names that exact gap as a non-guarantee: the `role_id` foreign key does not prove
+/// the role belongs to this organization or even to this environment, so same-organization
+/// containment is an APPLICATION invariant, and RLS fences `(tenant, environment)` and
+/// nothing finer. One `org_role_permissions` row of organization A pointing at a role of
+/// organization B is a shape the schema admits, and under the first version a member of A
+/// with an approved request for B's role slug resolved B's permission slugs on A's read.
+/// Spelled against $1/$2/$3, the corrupt row reaches nothing, which is what the plain
+/// disjunct beside it has always done by going through `effective_roles`.
 const EFFECTIVE_PERMISSION_SLUGS_TIME_BOXED_TAIL: &str = "SELECT DISTINCT p.slug AS slug \
        FROM permissions p \
       WHERE p.tenant_id = $1 AND p.environment_id = $2 \
@@ -53323,12 +53380,13 @@ const EFFECTIVE_PERMISSION_SLUGS_TIME_BOXED_TAIL: &str = "SELECT DISTINCT p.slug
               JOIN org_roles r ON r.id = rp.role_id \
               JOIN access_grant_requests agr \
                 ON agr.role_slug = r.slug \
-               AND agr.tenant_id = r.tenant_id \
-               AND agr.environment_id = r.environment_id \
-               AND agr.organization_id = r.organization_id \
+               AND agr.tenant_id = $1 \
+               AND agr.environment_id = $2 \
+               AND agr.organization_id = $3 \
              WHERE rp.tenant_id = $1 AND rp.environment_id = $2 \
                AND rp.organization_id = $3 AND rp.deleted_at IS NULL \
-               AND r.deleted_at IS NULL \
+               AND r.tenant_id = $1 AND r.environment_id = $2 \
+               AND r.organization_id = $3 AND r.deleted_at IS NULL \
                AND agr.subject_id = $4 \
                AND agr.state = 'approved' \
                AND agr.granted_until > \
@@ -86179,5 +86237,106 @@ impl ActingAccessRequestRepo<'_> {
             false,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod effective_tail_drift_tests {
+    use super::{
+        EFFECTIVE_PERMISSION_SLUGS_TAIL, EFFECTIVE_PERMISSION_SLUGS_TIME_BOXED_TAIL,
+        EFFECTIVE_ROLE_GRANTS_TAIL, EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL,
+    };
+
+    /// Collapse SQL whitespace so the comparison is about the statement, not its layout.
+    fn flat(sql: &str) -> String {
+        sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The time-boxed grants tail's first three arms are the plain tail's three arms
+    /// (issue #145 criterion 4).
+    ///
+    /// # Why a test and not a comment
+    ///
+    /// The time-boxed tail COPIES the direct, group and default arms so it can add a fourth
+    /// beside them, and the plain tail's own documentation says why two resolutions of the
+    /// same question must not drift: a caller reading one and a caller reading the other
+    /// would disagree about who holds what. A copy is exactly how that drift starts, and a
+    /// comment saying "keep these in sync" is a request rather than a guarantee.
+    ///
+    /// So the two are compared here, modulo the two columns the copy adds. Editing either
+    /// arm without the other fails this, which is the moment to decide whether the change
+    /// belongs in both.
+    #[test]
+    fn the_time_boxed_grants_tail_repeats_the_plain_arms_exactly() {
+        let plain = flat(EFFECTIVE_ROLE_GRANTS_TAIL);
+        let timed = flat(EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL).replace(
+            ", NULL::text AS via_request_id, NULL::bigint AS granted_until_micros",
+            "",
+        );
+
+        let plain_arms = plain
+            .split_once(" ORDER BY ")
+            .expect("the plain tail ends in an ORDER BY")
+            .0
+            .to_owned();
+        let timed_arms = timed
+            .split_once(" UNION ALL SELECT DISTINCT r.slug AS slug, 'time_boxed'")
+            .expect("the time-boxed tail carries a fourth arm")
+            .0
+            .to_owned();
+
+        assert_eq!(
+            plain_arms, timed_arms,
+            "the two role resolutions have drifted. One of them now answers a different \
+             question than the other, and which one a caller gets depends only on whether \
+             the exploratory feature is on"
+        );
+
+        // AND THE FOURTH ARM IS REALLY THERE, so the split above cannot pass by finding
+        // nothing and comparing a whole string against itself.
+        assert!(
+            flat(EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL).contains("'time_boxed'::text AS source"),
+            "the time-boxed tail must carry the arm it exists for"
+        );
+    }
+
+    /// The same, for the permissions pair.
+    ///
+    /// Its first disjunct is the plain tail's whole predicate, with a second added beside it.
+    #[test]
+    fn the_time_boxed_permissions_tail_repeats_the_plain_predicate() {
+        let plain = flat(EFFECTIVE_PERMISSION_SLUGS_TAIL);
+        let timed = flat(EFFECTIVE_PERMISSION_SLUGS_TIME_BOXED_TAIL);
+
+        // EXTRACTED AND COMPARED, not `contains`. A containment check passes when the copy
+        // ADDS something after the predicate it is supposed to repeat, which is most of
+        // the ways a copy drifts: a mutation appending `AND true` to the time-boxed
+        // disjunct survived exactly that.
+        let plain_predicate = plain
+            .split_once("AND p.id IN ( ")
+            .expect("the plain tail selects on a permission-id predicate")
+            .1
+            .rsplit_once(" ) ORDER BY")
+            .expect("the plain tail ends in an ORDER BY")
+            .0
+            .to_owned();
+        let timed_first = timed
+            .split_once("AND (p.id IN ( ")
+            .expect("the time-boxed tail opens with the same predicate")
+            .1
+            .split_once(" ) OR p.id IN (")
+            .expect("the time-boxed tail carries a second disjunct")
+            .0
+            .to_owned();
+        assert_eq!(
+            plain_predicate, timed_first,
+            "the time-boxed permissions tail must resolve the assignment-based permissions \
+             EXACTLY as the plain one does, or turning the exploratory feature on would \
+             change what a member holds through paths that have nothing to do with it"
+        );
+        assert!(
+            timed.contains("JOIN access_grant_requests agr"),
+            "and it must carry the disjunct it exists for"
+        );
     }
 }

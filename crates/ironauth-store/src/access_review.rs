@@ -436,6 +436,21 @@ pub fn parse_jsonl(text: &str) -> Result<Vec<ConsumedRow>, String> {
 mod tests {
     use super::*;
 
+    /// A row of the fourth source, with DISTINCT non-empty values in both new columns.
+    ///
+    /// Distinct on purpose: every other fixture leaves `via_request_id` and
+    /// `granted_until_unix_ms` as `None`, so both render as the empty string and swapping the
+    /// two entries in `to_csv`'s field list is invisible to the whole suite. Two values that
+    /// cannot be mistaken for each other -- an `agr_` id and an integer -- make the positional
+    /// mapping of the two appended columns measurable.
+    fn time_boxed_row(request: &str, granted_until_unix_ms: i64) -> AccessReviewRow {
+        AccessReviewRow {
+            via_request_id: Some(request.to_owned()),
+            granted_until_unix_ms: Some(granted_until_unix_ms),
+            ..row("time_boxed", None)
+        }
+    }
+
     fn row(source: &'static str, via: Option<&str>) -> AccessReviewRow {
         AccessReviewRow {
             organization_id: "org_1".to_owned(),
@@ -557,6 +572,7 @@ mod tests {
             row("direct", None),
             row("group", Some("grp_9")),
             row("default", None),
+            time_boxed_row("agr_9", 1_767_225_600_000),
         ];
         let from_csv = parse_csv(&to_csv(&rows)).expect("the CSV parses");
         let from_jsonl = parse_jsonl(&to_jsonl(&rows)).expect("the JSONL parses");
@@ -564,13 +580,49 @@ mod tests {
             from_csv, from_jsonl,
             "the two exports of one review do not describe the same thing"
         );
-        assert_eq!(from_csv.len(), 3, "one consumed row per exported row");
+        assert_eq!(from_csv.len(), 4, "one consumed row per exported row");
         assert_eq!(
             from_csv[1].fields.get("via_group_id").map(String::as_str),
             Some("grp_9"),
             "the consumer must reach the withdrawable group by name: {:?}",
             from_csv[1]
         );
+        // WHICH COLUMN each value lands in, which the equality above cannot see: the JSONL
+        // writer is key-based and the CSV writer is position-based, so a swapped pair in the
+        // CSV field list makes the two formats DISAGREE and the comparison catches it -- but
+        // only if the two values differ. Named separately so a failure says which column.
+        assert_eq!(
+            from_csv[3].fields.get("via_request_id").map(String::as_str),
+            Some("agr_9"),
+            "the request id landed in the wrong column: {:?}",
+            from_csv[3]
+        );
+        assert_eq!(
+            from_csv[3]
+                .fields
+                .get("granted_until_unix_ms")
+                .map(String::as_str),
+            Some("1767225600000"),
+            "the deadline landed in the wrong column: {:?}",
+            from_csv[3]
+        );
+        // And the three OTHER sources leave both empty, which is what makes the pair above a
+        // measurement of this row rather than of the header.
+        for (index, consumed) in from_csv.iter().take(3).enumerate() {
+            assert_eq!(
+                consumed.fields.get("via_request_id").map(String::as_str),
+                Some(""),
+                "row {index} is not time-boxed and must name no request"
+            );
+            assert_eq!(
+                consumed
+                    .fields
+                    .get("granted_until_unix_ms")
+                    .map(String::as_str),
+                Some(""),
+                "row {index} is not time-boxed and must carry no deadline"
+            );
+        }
     }
 
     #[test]
@@ -628,35 +680,74 @@ mod tests {
         );
     }
 
+    /// One legal record whose THIRD field is `body`, with as many fields as the header has
+    /// columns however many that becomes.
+    ///
+    /// The arity is DERIVED rather than written out, and that is the whole reason this helper
+    /// exists. The refusal tests below were first written with seven fields spelled out; when
+    /// this commit appended two columns, `parse_csv` began refusing every one of those fixtures
+    /// on arity before it ever reached the byte rule under test, and all six assertions passed
+    /// for a reason that had nothing to do with what they claim to measure. A helper keyed on
+    /// `ACCESS_REVIEW_COLUMNS` cannot drift that way again.
+    fn one_record_whose_third_field_is(body: &str) -> String {
+        let header = ACCESS_REVIEW_COLUMNS.join(",");
+        let mut fields: Vec<String> = vec![String::new(); ACCESS_REVIEW_COLUMNS.len()];
+        fields[0] = "org_1".to_string();
+        fields[1] = "user".to_string();
+        fields[2] = body.to_string();
+        fields[3] = "usr_1".to_string();
+        fields[4] = "admin".to_string();
+        fields[5] = "direct".to_string();
+        format!("{header}\r\n{}\r\n", fields.join(","))
+    }
+
+    #[test]
+    fn the_fixture_the_refusal_tests_mutate_is_itself_accepted() {
+        // THE CONTROL, and the reason it is a test of its own rather than a line inside each
+        // case below. Every refusal assertion is of the form `is_err()`, which a fixture that
+        // is malformed for some OTHER reason satisfies just as well. This pins that the only
+        // thing wrong with each fixture below is the byte the case is named for: strip that
+        // byte and the record parses, so a refusal is attributable to the rule under test.
+        let clean = one_record_whose_third_field_is("omb_1");
+        let rows = parse_csv(&clean).expect("the unmutated fixture has to parse");
+        assert_eq!(rows.len(), 1, "the control fixture is one record");
+        assert_eq!(
+            rows[0].fields.get("membership_id").map(String::as_str),
+            Some("omb_1"),
+            "the mutated field is the one the cases below reach"
+        );
+    }
+
     #[test]
     fn the_reader_refuses_what_a_writer_that_stopped_quoting_would_emit() {
         // THE POINT OF A SECOND IMPLEMENTATION, and the previous reader failed it for three
         // of the four characters: it accepted a bare quote and a bare CR as data, so a writer
         // that had stopped quoting them round-tripped byte-identical and the mutation lived.
         //
-        // Each case below is a line the writer could never legally produce.
-        let header = ACCESS_REVIEW_COLUMNS.join(",");
-
-        let bare_quote = format!("{header}\r\norg_1,user,omb\"1,usr_1,admin,direct,\r\n");
+        // Each case below is a line the writer could never legally produce, and differs from
+        // the control fixture in exactly one byte.
+        let bare_quote = one_record_whose_third_field_is("omb\"1");
         assert!(
             parse_csv(&bare_quote).is_err(),
             "a bare quote in an unquoted field has to be refused, not read as data"
         );
 
-        let bare_cr = format!("{header}\r\norg_1,user,omb\r1,usr_1,admin,direct,\r\n");
+        let bare_cr = one_record_whose_third_field_is("omb\r1");
         assert!(
             parse_csv(&bare_cr).is_err(),
             "a bare carriage return has to be refused, not read as data"
         );
 
         // The comma and the LF are caught by ARITY rather than by a byte rule: each splits the
-        // record, and the field count stops agreeing with the header.
-        let bare_comma = format!("{header}\r\norg,1,user,omb_1,usr_1,admin,direct,\r\n");
+        // record, and the field count stops agreeing with the header. Stated because it means
+        // these two, unlike the pair above, would still pass against a reader with no byte
+        // rules at all -- they measure the arity check, which is a different guarantee.
+        let bare_comma = one_record_whose_third_field_is("omb,1");
         assert!(
             parse_csv(&bare_comma).is_err(),
             "an unquoted comma adds a field and has to be refused"
         );
-        let bare_lf = format!("{header}\r\norg_1,user,omb\n1,usr_1,admin,direct,\r\n");
+        let bare_lf = one_record_whose_third_field_is("omb\n1");
         assert!(
             parse_csv(&bare_lf).is_err(),
             "an unquoted newline splits the record and has to be refused"
@@ -669,10 +760,13 @@ mod tests {
         // the quoted flag without recording that the field HAD been quoted let the unquoted
         // branch keep appending to the same buffer, so `"abc"def` came back as `abcdef` --
         // a value no writer could produce, silently concatenated and handed to the consumer.
-        let header = ACCESS_REVIEW_COLUMNS.join(",");
+        //
+        // Both cases keep the control's arity, so `is_err()` can only be the closing-quote
+        // rule: absorbing the trailing text would yield one field and one record, which the
+        // control proves parses.
         for bad in [
-            format!("{header}\r\n\"org\"junk,user,omb_1,usr_1,admin,direct,\r\n"),
-            format!("{header}\r\n\"\"xyz,user,omb_1,usr_1,admin,direct,\r\n"),
+            one_record_whose_third_field_is("\"omb\"junk"),
+            one_record_whose_third_field_is("\"\"xyz"),
         ] {
             assert!(
                 parse_csv(&bad).is_err(),

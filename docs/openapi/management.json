@@ -13077,6 +13077,26 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "The organization is disabled, so it resolves no roles for any member and an approved grant would confer nothing until it is re-enabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The request would be approved and confer nothing: `subject_id` is not a user id of this scope, or names somebody who is not a live member of this organization, or `role_slug` names no role this organization defines. Checked at RAISE so a typo is caught by the person who made it rather than by the person asked to trust it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -13255,7 +13275,7 @@
         ],
         "responses": {
           "200": {
-            "description": "One row per path by which a member holds a role. `application/x-ndjson` by default, `text/csv; charset=utf-8` when format=csv",
+            "description": "One row per path by which a member holds a role: `direct`, `group`, `default`, `time_boxed`, or the single `none` row for a member who holds nothing. `application/x-ndjson` by default, `text/csv; charset=utf-8` when format=csv. NINE columns, in this order: organization_id, principal_kind, membership_id, subject_id, role_slug, source, via_group_id, via_request_id, granted_until_unix_ms. The last two are empty on every row unless the exploratory access-request feature is acknowledged, and the header carries them for every deployment either way, so a consumer pinning by position keeps the seven columns it had",
             "content": {
               "application/x-ndjson": {
                 "schema": {
@@ -32965,7 +32985,7 @@
           },
           "source": {
             "$ref": "#/components/schemas/EffectiveRoleSourceView",
-            "description": "Whether this path is a direct grant, an inherited one, or the organization's\ndefault role."
+            "description": "WHICH path this is: a direct grant, an inherited one, the organization's default\nrole, or a live approved time-boxed grant.\n\nSee [`EffectiveRoleSourceView`] for what each one means and for which of them\ncarries `via_group_id`, `via_request_id` and `granted_until_unix_ms`. The variants\nare the authority; this line is a summary, and the last time it was written out as\na closed list of three it went on saying three after a fourth arrived."
           },
           "via_group_id": {
             "type": [
@@ -32996,7 +33016,7 @@
         "properties": {
           "permission_budget": {
             "$ref": "#/components/schemas/PermissionBudgetView",
-            "description": "What the budget would say about `permissions` at the next issuance. Advisory;\nsee [`PermissionBudgetView`], in particular for which half of the budget it\nevaluates.\n\nThis is the MEMBERSHIP-scoped verdict and the authoritative one, because this\nset is what a token claim would carry. It always carries `scope: \"membership\"`.\nThe attach 201's `role_permission_budget` carries `scope: \"role\"` and counts a\nDIFFERENT set, which bounds this one in NEITHER direction; the type docs name\nthe three mechanisms."
+            "description": "What the budget would say at the next issuance, about the permissions that\nissuance will carry. Advisory; see [`PermissionBudgetView`], in particular for\nwhich half of the budget it evaluates.\n\nCOUNTED OVER THE MINTED SET, which is `permissions` above except when the\nexploratory access-request feature is acknowledged: that widens the field with\nlive time-boxed grants and does not widen the mint, so a verdict counted over the\nfield would predict a token nobody will be issued. With the feature off the two\nsets are the same and `permission_count` equals `permissions.len()`; with it on,\n`permission_count` can be the smaller number, and that is the only supported way\nfor them to differ.\n\nThis is the MEMBERSHIP-scoped verdict and the authoritative one, because the set\nit counts is what a token claim would carry. It always carries `scope: \"membership\"`.\nThe attach 201's `role_permission_budget` carries `scope: \"role\"` and counts a\nDIFFERENT set, which bounds this one in NEITHER direction; the type docs name\nthe three mechanisms."
           },
           "permissions": {
             "type": "array",
@@ -35959,7 +35979,7 @@
       },
       "PermissionBudgetView": {
         "type": "object",
-        "description": "What the permission budget would say about ONE set of permissions (issue #98).\nADVISORY ONLY.\n\nNothing here refuses a write and no number here is a cap on what may be STORED. It\nreports what a token issuance would carry, in the same units the `[token_claims]`\nconfiguration is written in.\n\n# WHICH set, said by the object itself\n\nThis type is the budget ARITHMETIC plus the NAME OF THE SET it ran over. It is\ncarried by two fields on two different endpoints, over two DIFFERENT sets, and\n[`Self::scope`] states which one on every instance (issue #425):\n\n  * [`EffectiveRolesView::permission_budget`] carries\n    [`PermissionBudgetScope::Membership`]: every role the member holds directly,\n    through the group ancestor closure, and by the organization's default role,\n    unioned and deduplicated. That is the set a token claim would carry, so it is\n    the authoritative verdict.\n  * `OrgRolePermissionView::role_permission_budget`, on the attach 201, carries\n    [`PermissionBudgetScope::Role`]: one role's OWN live mappings. It is there\n    because the write is where an operator's attention is at the moment they cross\n    a threshold.\n\n# The two verdicts bound each other in NEITHER direction\n\nThe role figure is not an upper bound on the membership figure and not a lower\nbound on it either. It is a different set, and an earlier draft of this document\nclaimed a lower bound, which is why the refuting mechanisms are named rather than\nsummarized:\n\n  * A DEAD PERMISSION ENDPOINT. The role count filters the MAPPING'S `deleted_at`\n    and nothing else, while the membership resolution additionally requires the\n    permission ROW to be live. Neither a role nor a permission cascades to the\n    mapping table, so a soft-deleted permission leaves its mapping counted here and\n    resolved nowhere. Measured: an attach reported 3 with `budget_exceeded` while\n    the same membership read 1 with no overflow at all.\n  * The ORGANIZATION LIFECYCLE. This plane deliberately keeps a DISABLED\n    organization writable, while the resolution closure seeds only on an ACTIVE\n    one. Measured: an attach reported 2 and overflowing while the same membership\n    read 0, with no roles and no permissions.\n  * STALENESS, in EITHER direction. The role figure is a SNAPSHOT taken at the\n    write that reported it: a concurrent attach on the same role leaves it SHORT\n    and a concurrent detach leaves it LONG, and an Idempotency-Key REPLAY\n    faithfully reproduces the original snapshot by design, so a byte-identical 201\n    can report a count the role no longer has. Measured: a replay reported 2 and\n    `approaching` against a live count of 1.\n\nSo a membership can be over budget while the role verdict reads fine, AND the role\nverdict can name an overflow no membership will ever see.\n`an_attach_within_the_role_budget_can_still_be_a_membership_over_it` drives the\nfirst direction and pins both answers at once. What CANNOT disagree is the\nvocabulary: both carriers evaluate through [`PermissionBudgetView::evaluate`] and\ntake every wire string from\n[`ironauth_config::PermissionOverflow::permissions_status`], which is also where\nthe mint takes it from.\n\n# The one thing this does NOT answer, said plainly\n\nThe budget has TWO bounds, an element count and a compact-token BYTE size, and\nthis view evaluates only the first. `approaching` and `overflow` are the ELEMENT\nverdict. The byte verdict is not withheld out of caution, it is genuinely not\ncomputable here: an exact compact-token size needs the environment's signing key\n(for the protected header and the signature width) and the whole rest of the\nexchange (the audience set, the granted scope, any `cnf` binding), none of which\nexists on a management read of a membership. The alternative would be an ESTIMATE,\nand an estimated byte verdict is a lie in exactly the direction that matters: it\nwould tell an operator a set fits when the mint will withhold it. So the byte\nBOUNDS are reported as the configured numbers, for context, and the byte VERDICT\nbelongs to the mint, which measures rather than estimates and puts\n`permissions_status` on the token when it withholds.",
+        "description": "What the permission budget would say about ONE set of permissions (issue #98).\nADVISORY ONLY.\n\nNothing here refuses a write and no number here is a cap on what may be STORED. It\nreports what a token issuance would carry, in the same units the `[token_claims]`\nconfiguration is written in.\n\n# WHICH set, said by the object itself\n\nThis type is the budget ARITHMETIC plus the NAME OF THE SET it ran over. It is\ncarried by two fields on two different endpoints, over two DIFFERENT sets, and\n[`Self::scope`] states which one on every instance (issue #425):\n\n  * [`EffectiveRolesView::permission_budget`] carries\n    [`PermissionBudgetScope::Membership`]: every role the member holds directly,\n    through the group ancestor closure, and by the organization's default role,\n    unioned and deduplicated. That is the set a token claim would carry, so it is\n    the authoritative verdict. It is counted over the MINTED set, which is the\n    `permissions` field beside it except when the exploratory access-request feature\n    is on -- then the field additionally reports live time-boxed grants, which no\n    token carries, and counting them would make this verdict describe a token that\n    does not exist.\n  * `OrgRolePermissionView::role_permission_budget`, on the attach 201, carries\n    [`PermissionBudgetScope::Role`]: one role's OWN live mappings. It is there\n    because the write is where an operator's attention is at the moment they cross\n    a threshold.\n\n# The two verdicts bound each other in NEITHER direction\n\nThe role figure is not an upper bound on the membership figure and not a lower\nbound on it either. It is a different set, and an earlier draft of this document\nclaimed a lower bound, which is why the refuting mechanisms are named rather than\nsummarized:\n\n  * A DEAD PERMISSION ENDPOINT. The role count filters the MAPPING'S `deleted_at`\n    and nothing else, while the membership resolution additionally requires the\n    permission ROW to be live. Neither a role nor a permission cascades to the\n    mapping table, so a soft-deleted permission leaves its mapping counted here and\n    resolved nowhere. Measured: an attach reported 3 with `budget_exceeded` while\n    the same membership read 1 with no overflow at all.\n  * The ORGANIZATION LIFECYCLE. This plane deliberately keeps a DISABLED\n    organization writable, while the resolution closure seeds only on an ACTIVE\n    one. Measured: an attach reported 2 and overflowing while the same membership\n    read 0, with no roles and no permissions.\n  * STALENESS, in EITHER direction. The role figure is a SNAPSHOT taken at the\n    write that reported it: a concurrent attach on the same role leaves it SHORT\n    and a concurrent detach leaves it LONG, and an Idempotency-Key REPLAY\n    faithfully reproduces the original snapshot by design, so a byte-identical 201\n    can report a count the role no longer has. Measured: a replay reported 2 and\n    `approaching` against a live count of 1.\n\nSo a membership can be over budget while the role verdict reads fine, AND the role\nverdict can name an overflow no membership will ever see.\n`an_attach_within_the_role_budget_can_still_be_a_membership_over_it` drives the\nfirst direction and pins both answers at once. What CANNOT disagree is the\nvocabulary: both carriers evaluate through [`PermissionBudgetView::evaluate`] and\ntake every wire string from\n[`ironauth_config::PermissionOverflow::permissions_status`], which is also where\nthe mint takes it from.\n\n# The one thing this does NOT answer, said plainly\n\nThe budget has TWO bounds, an element count and a compact-token BYTE size, and\nthis view evaluates only the first. `approaching` and `overflow` are the ELEMENT\nverdict. The byte verdict is not withheld out of caution, it is genuinely not\ncomputable here: an exact compact-token size needs the environment's signing key\n(for the protected header and the signature width) and the whole rest of the\nexchange (the audience set, the granted scope, any `cnf` binding), none of which\nexists on a management read of a membership. The alternative would be an ESTIMATE,\nand an estimated byte verdict is a lie in exactly the direction that matters: it\nwould tell an operator a set fits when the mint will withhold it. So the byte\nBOUNDS are reported as the configured numbers, for context, and the byte VERDICT\nbelongs to the mint, which measures rather than estimates and puts\n`permissions_status` on the token when it withholds.",
         "required": [
           "scope",
           "permission_count",
@@ -36313,11 +36333,12 @@
           },
           "role_slug": {
             "type": "string",
-            "description": "Which organization role."
+            "description": "Which organization role.\n\nMust be a role THIS organization defines, checked at raise for the same reason:\n`role_slug` is matched by name at resolution time, so a typo is approved and grants\nnothing. A slug this organization does not define answers 422."
           },
           "subject_id": {
             "type": "string",
-            "description": "Who would receive the access. Not necessarily the caller: a manager may ask on\nbehalf of somebody else."
+            "description": "Who would receive the access (`usr_...`). Not necessarily the caller: a manager may\nask on behalf of somebody else.\n\nMust be a user id of this scope AND a live member of this organization, both checked\nat raise: a grant to a non-member confers nothing, so it would be approved and change\nnothing. Either failure answers 422 naming which one it was.",
+            "example": "usr_..."
           }
         }
       },

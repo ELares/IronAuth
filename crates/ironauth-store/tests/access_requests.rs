@@ -734,6 +734,338 @@ async fn the_time_boxed_arm_stops_granting_at_the_deadline() {
     );
 }
 
+/// TWO overlapping live grants are TWO rows, in an order that does not move
+/// (issue #145 criterion 4).
+///
+/// # What this pins that the arm's other tests do not
+///
+/// [`EFFECTIVE_ROLE_GRANTS_TAIL`]'s sort key is documented as a TOTAL order -- no two rows
+/// share `(slug, source, via_group_id)` -- and both the `roles` array and the access-review
+/// export publish byte-stability on the strength of it. The fourth arm emits one row per
+/// approved REQUEST, so two live approvals for one `(subject, role)` agree on all three and
+/// the inherited key leaves them tied. Nothing in migration 0225 forbids the pair, and
+/// raising an extension before the first lapses is the ordinary way to reach it.
+///
+/// So this asserts both halves: that every row survives (collapsing them would show an
+/// operator one of several approvals to revoke) and that the answer comes back in request-id
+/// order, repeatedly.
+///
+/// WHAT IT DOES NOT ESTABLISH, measured rather than assumed: removing `via_request_id` from
+/// the tail's `ORDER BY` leaves this test green. The grants are minted here and inserted in
+/// DESCENDING id order precisely so that sorted order is not insertion order, and it still
+/// passes, because each arm's `SELECT DISTINCT` covers a column list that includes
+/// `via_request_id` and so already hands the outer sort an id-ordered input. That is a plan
+/// detail, not a property of the statement. The conjunct is a guarantee this test cannot
+/// currently observe; the constant's own docs say the same thing, and neither should be
+/// deleted on the strength of the surviving mutation.
+#[tokio::test]
+async fn two_live_grants_for_one_role_are_two_rows_in_a_stable_order() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0145_0009);
+    let scope = db.seed_scope(&env).await;
+    let org = create_org(&db, &env, scope).await;
+    let user = seed_member_with_role(&db, &env, scope, &org).await;
+    let store = db.control_store();
+
+    // Two approvals for the SAME role: the short one and the extension raised before it
+    // lapses. Both live at the instant read below.
+    //
+    // INSERTED IN DESCENDING ID ORDER, deliberately. The ids are minted here rather than by
+    // the store, so the test can make creation order the REVERSE of sort order. Inserted
+    // ascending, the rows come back sorted whether or not the sort key mentions them --
+    // Postgres hands back a small `UNION ALL` in the order it built it -- and the assertion
+    // would pass against a query with no fourth sort column at all. Reversed, the sorted
+    // answer is one the plan does not produce by accident.
+    let mut minted: Vec<_> = (0..8)
+        .map(|_| AccessRequestId::generate(&env, &scope))
+        .collect();
+    minted.sort_by_key(ToString::to_string);
+    let request_ids: Vec<String> = minted.iter().map(ToString::to_string).collect();
+    for (index, id) in minted.iter().rev().enumerate() {
+        let hours = 1_i64 + i64::try_from(index).expect("small") * 24;
+        store
+            .management()
+            .acting(actor(&env), CorrelationId::generate(&env))
+            .access_requests(scope)
+            .raise(
+                &env,
+                id,
+                ironauth_store::NewAccessRequest {
+                    organization_id: &org.to_string(),
+                    subject_id: &user.to_string(),
+                    role_slug: "billing-admin",
+                    requested_by: "prn_asker",
+                    reason: "quarter close",
+                },
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("raise {index}: {error}"));
+        let at = now_micros(&env);
+        store
+            .management()
+            .acting(actor(&env), CorrelationId::generate(&env))
+            .access_requests(scope)
+            .decide(
+                &env,
+                id,
+                ironauth_store::AccessDecision {
+                    approve: true,
+                    decided_by: "prn_approver",
+                    decided_at_micros: at,
+                    granted_until_micros: Some(at + hours * 3_600_000_000),
+                },
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("approve {index}: {error}"));
+    }
+
+    let read = || async {
+        store
+            .management()
+            .org_groups(scope)
+            .effective_role_grants_at(&org, &user, 8, now_micros(&env))
+            .await
+            .expect("resolve")
+            .into_iter()
+            .filter_map(|grant| match grant.source {
+                ironauth_store::EffectiveRoleSource::TimeBoxed { request_id, .. } => {
+                    Some(request_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let first = read().await;
+    assert_eq!(
+        first.len(),
+        minted.len(),
+        "both live approvals have to appear. One row for two approvals shows an operator a \
+         single grant to revoke, they revoke it, and the elevation survives by the approval \
+         that was hidden: {first:?}"
+    );
+    assert_eq!(
+        first, request_ids,
+        "the rows must come back ordered by request id, which is what makes the sort key \
+         total again: {first:?}"
+    );
+
+    // REPEATED, because the claim is about two reads of unchanged state and one read cannot
+    // establish it.
+    for round in 0..4 {
+        assert_eq!(
+            read().await,
+            first,
+            "read {round} disagreed with the first about the order of two tied rows, so the \
+             byte-stability the export publishes does not hold"
+        );
+    }
+}
+
+/// Give `elsewhere` a role of the SAME slug carrying a permission of its own, then plant an
+/// `org_role_permissions` row addressed to `here` whose `role_id` points at it.
+///
+/// Planted with SQL through the owner pool because no repository method will write this row:
+/// the containment migration 0092 names as an APPLICATION invariant is enforced by the write
+/// path's own lookup, which is exactly why a READ cannot assume nobody bypassed it.
+async fn plant_foreign_role_mapping(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    here: &OrganizationId,
+    elsewhere: &OrganizationId,
+) {
+    use ironauth_store::{
+        NewOrgRole, NewPermission, OrgRoleId, OrgRolePermissionId, PermissionId,
+    };
+
+    let store = db.control_store();
+    let foreign_role = OrgRoleId::generate(env, &scope);
+    store
+        .management()
+        .acting(actor(env), CorrelationId::generate(env))
+        .org_roles(scope)
+        .create(
+            env,
+            NewOrgRole {
+                id: &foreign_role,
+                organization_id: elsewhere,
+                slug: "billing-admin",
+                display_name: "Billing, over there",
+                metadata: None,
+            },
+            now_micros(env),
+            None,
+        )
+        .await
+        .expect("create the sibling's role");
+
+    let permission = PermissionId::generate(env, &scope);
+    store
+        .management()
+        .acting(actor(env), CorrelationId::generate(env))
+        .permissions(scope)
+        .create(
+            env,
+            NewPermission {
+                id: &permission,
+                slug: "billing.write.elsewhere",
+                display_name: "Somebody else's billing",
+                metadata: None,
+            },
+            now_micros(env),
+            None,
+        )
+        .await
+        .expect("create the sibling's permission");
+
+    sqlx::query(
+        "INSERT INTO org_role_permissions \
+         (id, tenant_id, environment_id, organization_id, role_id, permission_id, \
+          created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, now(), now())",
+    )
+    .bind(OrgRolePermissionId::generate(env, &scope).to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(here.to_string())
+    .bind(foreign_role.to_string())
+    .bind(permission.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("plant the cross-organization mapping");
+}
+
+/// A role row belonging to ANOTHER organization cannot carry its permissions into this
+/// organization's answer, even reached through the time-boxed disjunct
+/// (issue #145 criterion 4).
+///
+/// # Why a corrupt row is the right fixture
+///
+/// Migration 0092 states this as a named non-guarantee: `org_role_permissions.role_id` has a
+/// foreign key to `org_roles` and that key does NOT prove the role belongs to this
+/// organization or even to this environment, so same-organization containment is an
+/// APPLICATION invariant that every read repeats. RLS fences `(tenant, environment)` and
+/// nothing finer, so the organization predicate is the only thing keeping one organization's
+/// mapping out of a sibling's queries inside one environment.
+///
+/// The first version of the time-boxed permissions disjunct did not repeat it: it fenced
+/// `org_roles` on `deleted_at` alone and bound the access request to the ROLE's scope columns
+/// rather than to the bound one, so which organization's approved requests counted was
+/// decided by a row whose organization had never been checked. The plain disjunct beside it
+/// was immune, because it reaches roles only through the fenced closure.
+///
+/// Planted with SQL through the owner pool on purpose: no repository method will write this
+/// row, which is exactly why the read cannot assume nobody did.
+#[tokio::test]
+async fn a_foreign_role_mapping_cannot_reach_this_organizations_permissions() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0145_0010);
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+
+    // TWO organizations of ONE environment, which is the containment RLS does not provide.
+    let here = create_org(&db, &env, scope).await;
+    let elsewhere = create_org(&db, &env, scope).await;
+    let user = seed_member_with_role(&db, &env, scope, &here).await;
+
+    plant_foreign_role_mapping(&db, &env, scope, &here, &elsewhere).await;
+
+    // An approved live grant for the slug, raised in a NAMED organization. The store's
+    // `raise` does not check membership -- that is the handler's job -- so a request may
+    // exist in an organization the subject does not belong to, which is the state the first
+    // case below needs and a thing an operator can reach by raising before a membership is
+    // removed.
+    let approve_in = |organization: String| {
+        let store = store.clone();
+        let env = &env;
+        async move {
+            let id = AccessRequestId::generate(env, &scope);
+            store
+                .management()
+                .acting(actor(env), CorrelationId::generate(env))
+                .access_requests(scope)
+                .raise(
+                    env,
+                    &id,
+                    ironauth_store::NewAccessRequest {
+                        organization_id: &organization,
+                        subject_id: &user.to_string(),
+                        role_slug: "billing-admin",
+                        requested_by: "prn_asker",
+                        reason: "quarter close",
+                    },
+                    None,
+                )
+                .await
+                .expect("raise");
+            let at = now_micros(env);
+            store
+                .management()
+                .acting(actor(env), CorrelationId::generate(env))
+                .access_requests(scope)
+                .decide(
+                    env,
+                    &id,
+                    ironauth_store::AccessDecision {
+                        approve: true,
+                        decided_by: "prn_approver",
+                        decided_at_micros: at,
+                        granted_until_micros: Some(at + 3_600_000_000),
+                    },
+                    None,
+                )
+                .await
+                .expect("approve");
+        }
+    };
+
+    let leaked = || async {
+        store
+            .management()
+            .org_groups(scope)
+            .effective_permissions_at(&here, &user, 8, now_micros(&env))
+            .await
+            .expect("resolve the permissions")
+            .into_iter()
+            .any(|slug| slug == "billing.write.elsewhere")
+    };
+
+    // CASE A: the grant is recorded in the SIBLING organization.
+    //
+    // This is what the ACCESS REQUEST's own fence has to stop. Bound to the role row's
+    // scope columns rather than to $1/$2/$3, the predicate reads "an approved request in
+    // whatever organization this role belongs to", and the role belongs to the sibling --
+    // so a grant nobody in this organization ever approved decides this organization's
+    // answer.
+    approve_in(elsewhere.to_string()).await;
+    assert!(
+        !leaked().await,
+        "an approved request recorded in ANOTHER organization granted a permission here. \
+         The access-request fence has to name the bound scope, not the scope of a role row \
+         that was never checked"
+    );
+
+    // CASE B: the grant is recorded in THIS organization, for the same slug.
+    //
+    // A separate failure with a separate fence. Here the request is legitimate and it is
+    // the ROLE that is foreign: the corrupt mapping row is addressed to this organization
+    // while its `role_id` points at the sibling's row, so a disjunct that fences `r` on
+    // `deleted_at` alone resolves the sibling's permissions through this organization's own
+    // approved grant. The two cases fail independently, which is why neither fence is
+    // redundant.
+    approve_in(here.to_string()).await;
+    assert!(
+        !leaked().await,
+        "a permission mapped through ANOTHER organization's role reached this \
+         organization's answer. The time-boxed disjunct is the one projection over this \
+         closure that does not inherit the CTE's fence, so it is the one that has to spell \
+         the organization predicate on the role itself"
+    );
+}
+
 /// The ACCESS REVIEW carries a live time-boxed elevation, in its own columns
 /// (issue #145 criteria 1 and 4).
 ///

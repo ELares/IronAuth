@@ -6000,8 +6000,13 @@ export interface components {
              */
             slug: string;
             /**
-             * @description Whether this path is a direct grant, an inherited one, or the organization's
-             *     default role.
+             * @description WHICH path this is: a direct grant, an inherited one, the organization's default
+             *     role, or a live approved time-boxed grant.
+             *
+             *     See [`EffectiveRoleSourceView`] for what each one means and for which of them
+             *     carries `via_group_id`, `via_request_id` and `granted_until_unix_ms`. The variants
+             *     are the authority; this line is a summary, and the last time it was written out as
+             *     a closed list of three it went on saying three after a fourth arrived.
              */
             source: components["schemas"]["EffectiveRoleSourceView"];
             /**
@@ -6020,12 +6025,20 @@ export interface components {
         /** @description The resolved roles of one organization membership. */
         EffectiveRolesView: {
             /**
-             * @description What the budget would say about `permissions` at the next issuance. Advisory;
-             *     see [`PermissionBudgetView`], in particular for which half of the budget it
-             *     evaluates.
+             * @description What the budget would say at the next issuance, about the permissions that
+             *     issuance will carry. Advisory; see [`PermissionBudgetView`], in particular for
+             *     which half of the budget it evaluates.
              *
-             *     This is the MEMBERSHIP-scoped verdict and the authoritative one, because this
-             *     set is what a token claim would carry. It always carries `scope: "membership"`.
+             *     COUNTED OVER THE MINTED SET, which is `permissions` above except when the
+             *     exploratory access-request feature is acknowledged: that widens the field with
+             *     live time-boxed grants and does not widen the mint, so a verdict counted over the
+             *     field would predict a token nobody will be issued. With the feature off the two
+             *     sets are the same and `permission_count` equals `permissions.len()`; with it on,
+             *     `permission_count` can be the smaller number, and that is the only supported way
+             *     for them to differ.
+             *
+             *     This is the MEMBERSHIP-scoped verdict and the authoritative one, because the set
+             *     it counts is what a token claim would carry. It always carries `scope: "membership"`.
              *     The attach 201's `role_permission_budget` carries `scope: "role"` and counts a
              *     DIFFERENT set, which bounds this one in NEITHER direction; the type docs name
              *     the three mechanisms.
@@ -7762,7 +7775,11 @@ export interface components {
          *         [`PermissionBudgetScope::Membership`]: every role the member holds directly,
          *         through the group ancestor closure, and by the organization's default role,
          *         unioned and deduplicated. That is the set a token claim would carry, so it is
-         *         the authoritative verdict.
+         *         the authoritative verdict. It is counted over the MINTED set, which is the
+         *         `permissions` field beside it except when the exploratory access-request feature
+         *         is on -- then the field additionally reports live time-boxed grants, which no
+         *         token carries, and counting them would make this verdict describe a token that
+         *         does not exist.
          *       * `OrgRolePermissionView::role_permission_budget`, on the attach 201, carries
          *         [`PermissionBudgetScope::Role`]: one role's OWN live mappings. It is there
          *         because the write is where an operator's attention is at the moment they cross
@@ -8059,11 +8076,22 @@ export interface components {
         RaiseAccessRequestBody: {
             /** @description Why, in the requester's words. */
             reason: string;
-            /** @description Which organization role. */
+            /**
+             * @description Which organization role.
+             *
+             *     Must be a role THIS organization defines, checked at raise for the same reason:
+             *     `role_slug` is matched by name at resolution time, so a typo is approved and grants
+             *     nothing. A slug this organization does not define answers 422.
+             */
             role_slug: string;
             /**
-             * @description Who would receive the access. Not necessarily the caller: a manager may ask on
-             *     behalf of somebody else.
+             * @description Who would receive the access (`usr_...`). Not necessarily the caller: a manager may
+             *     ask on behalf of somebody else.
+             *
+             *     Must be a user id of this scope AND a live member of this organization, both checked
+             *     at raise: a grant to a non-member confers nothing, so it would be approved and change
+             *     nothing. Either failure answers 422 naming which one it was.
+             * @example usr_...
              */
             subject_id: string;
         };
@@ -19506,6 +19534,24 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
+            /** @description The organization is disabled, so it resolves no roles for any member and an approved grant would confer nothing until it is re-enabled */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The request would be approved and confer nothing: `subject_id` is not a user id of this scope, or names somebody who is not a live member of this organization, or `role_slug` names no role this organization defines. Checked at RAISE so a typo is caught by the person who made it rather than by the person asked to trust it */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
         };
     };
     decideAccessRequest: {
@@ -19605,7 +19651,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description One row per path by which a member holds a role. `application/x-ndjson` by default, `text/csv; charset=utf-8` when format=csv */
+            /** @description One row per path by which a member holds a role: `direct`, `group`, `default`, `time_boxed`, or the single `none` row for a member who holds nothing. `application/x-ndjson` by default, `text/csv; charset=utf-8` when format=csv. NINE columns, in this order: organization_id, principal_kind, membership_id, subject_id, role_slug, source, via_group_id, via_request_id, granted_until_unix_ms. The last two are empty on every row unless the exploratory access-request feature is acknowledged, and the header carries them for every deployment either way, so a consumer pinning by position keeps the seven columns it had */
             200: {
                 headers: {
                     [name: string]: unknown;

@@ -47,10 +47,12 @@
 //! access-request feature is on, which adds a fourth arm here and not to the mint; see
 //! the section on that below.
 //!
-//! `permission_budget` reports what the budget would say about that set. It is
-//! ADVISORY and it refuses nothing: this endpoint is a read, and no endpoint anywhere
-//! in issue #98 answers 4xx or 5xx for a count or a size reason. Read
-//! [`PermissionBudgetView`] for the one thing it deliberately does NOT answer.
+//! `permission_budget` reports what the budget would say about the set the NEXT TOKEN
+//! will carry, which is that same set except with the exploratory flag on, where it is
+//! the part of it the mint resolves. It is ADVISORY and it refuses nothing: this
+//! endpoint is a read, and no endpoint anywhere in issue #98 answers 4xx or 5xx for a
+//! count or a size reason. Read [`PermissionBudgetView`] for the one thing it
+//! deliberately does NOT answer.
 //!
 //! # Un-paginated, and why that is safe
 //!
@@ -65,6 +67,19 @@
 //! may define as many roles and groups as it likes. Cursoring a set whose whole
 //! value is that it is complete would also make the common consumer (render this
 //! member's roles) into a paging loop for no benefit.
+//!
+//! WITH THE EXPLORATORY FLAG ON, that paragraph acquires a term it does not bound.
+//! The fourth arm emits one row per live APPROVED access request, not one per role, and
+//! nothing in migration 0225 forbids two live approved grants for one `(subject, role)`:
+//! raising an extension before the first lapses is the ordinary way to reach that, and
+//! the rows are deliberately not collapsed (each is a separate approval an operator has
+//! to revoke separately). So the term is bounded by how many requests approvers have
+//! approved for this one member in this one organization and by nothing else. It is a
+//! real limit of the flag rather than a sentence to soften: an organization that runs a
+//! high volume of short elevations grows this response, and deciding what should bound
+//! it -- a cap at approval, superseding an overlapping grant, or paging this endpoint --
+//! is part of what turning the exploratory flag on is for. Stated here because the
+//! paragraph above would otherwise read as covering it.
 //!
 //! # This is a READ of the CURRENT state, not of any issued token
 //!
@@ -169,8 +184,13 @@ pub struct EffectiveRoleView {
     /// is stable across a rename and across a promotion between environments.
     #[schema(example = "billing.admin")]
     pub slug: String,
-    /// Whether this path is a direct grant, an inherited one, or the organization's
-    /// default role.
+    /// WHICH path this is: a direct grant, an inherited one, the organization's default
+    /// role, or a live approved time-boxed grant.
+    ///
+    /// See [`EffectiveRoleSourceView`] for what each one means and for which of them
+    /// carries `via_group_id`, `via_request_id` and `granted_until_unix_ms`. The variants
+    /// are the authority; this line is a summary, and the last time it was written out as
+    /// a closed list of three it went on saying three after a fourth arrived.
     pub source: EffectiveRoleSourceView,
     /// The group that carries the grant (`grp_...`). Present exactly when `source`
     /// is `group`, and absent (rather than null) otherwise.
@@ -256,8 +276,14 @@ pub enum PermissionBudgetScope {
     /// directly, everything inherited through the group ancestor closure, and the
     /// organization's default role, unioned and deduplicated.
     ///
-    /// What the effective-roles READ reports, and the only verdict that predicts what
-    /// a token claim will carry.
+    /// The only verdict that predicts what a token claim will carry, and it is counted
+    /// over the set the MINT resolves.
+    ///
+    /// That is the same set the effective-roles read reports, with one exception: when
+    /// the exploratory access-request feature is acknowledged the read also reports live
+    /// time-boxed grants and the mint does not, so the verdict is counted over the
+    /// reported set MINUS those. It has to be, because the only thing this verdict says
+    /// is what the next issuance will do.
     Membership,
 }
 
@@ -278,7 +304,11 @@ pub enum PermissionBudgetScope {
 ///     [`PermissionBudgetScope::Membership`]: every role the member holds directly,
 ///     through the group ancestor closure, and by the organization's default role,
 ///     unioned and deduplicated. That is the set a token claim would carry, so it is
-///     the authoritative verdict.
+///     the authoritative verdict. It is counted over the MINTED set, which is the
+///     `permissions` field beside it except when the exploratory access-request feature
+///     is on -- then the field additionally reports live time-boxed grants, which no
+///     token carries, and counting them would make this verdict describe a token that
+///     does not exist.
 ///   * `OrgRolePermissionView::role_permission_budget`, on the attach 201, carries
 ///     [`PermissionBudgetScope::Role`]: one role's OWN live mappings. It is there
 ///     because the write is where an operator's attention is at the moment they cross
@@ -452,12 +482,20 @@ pub struct EffectiveRolesView {
     /// so the one surface that could show them is the one surface that must never
     /// shorten the answer.
     pub permissions: Vec<String>,
-    /// What the budget would say about `permissions` at the next issuance. Advisory;
-    /// see [`PermissionBudgetView`], in particular for which half of the budget it
-    /// evaluates.
+    /// What the budget would say at the next issuance, about the permissions that
+    /// issuance will carry. Advisory; see [`PermissionBudgetView`], in particular for
+    /// which half of the budget it evaluates.
     ///
-    /// This is the MEMBERSHIP-scoped verdict and the authoritative one, because this
-    /// set is what a token claim would carry. It always carries `scope: "membership"`.
+    /// COUNTED OVER THE MINTED SET, which is `permissions` above except when the
+    /// exploratory access-request feature is acknowledged: that widens the field with
+    /// live time-boxed grants and does not widen the mint, so a verdict counted over the
+    /// field would predict a token nobody will be issued. With the feature off the two
+    /// sets are the same and `permission_count` equals `permissions.len()`; with it on,
+    /// `permission_count` can be the smaller number, and that is the only supported way
+    /// for them to differ.
+    ///
+    /// This is the MEMBERSHIP-scoped verdict and the authoritative one, because the set
+    /// it counts is what a token claim would carry. It always carries `scope: "membership"`.
     /// The attach 201's `role_permission_budget` carries `scope: "role"` and counts a
     /// DIFFERENT set, which bounds this one in NEITHER direction; the type docs name
     /// the three mechanisms.
@@ -529,13 +567,36 @@ pub async fn get_org_membership_effective_roles(
     // the closure applies.
     let groups = state.store().management();
     let groups = groups.org_groups(scope);
+    // ONE clock sample for BOTH reads below, and the single `let` is the whole mechanism.
+    // `AdminState::now_unix_micros` reads the live clock on every call, and the two reads
+    // are two statements in two transactions with a round trip between them. Sampling
+    // twice put a grant whose deadline falls in that window on the near side of one
+    // judgement and the far side of the other, which is exactly the self-contradicting
+    // response the paired tails exist to make impossible: `roles` naming `billing-admin`
+    // beside a `permissions` set carrying none of it. The export does the same thing
+    // (`access_review_in_pages` samples once and threads it through every member).
+    //
+    // Sampled unconditionally rather than inside the `if`: the value is unused when the
+    // flag is off, and a reader comparing the two branches should not have to work out
+    // whether the sampling moved.
+    //
+    // NOT COVERED BY A TEST, and worth saying rather than leaving to be assumed. The defect
+    // is a race -- it needs the deadline to fall between two samples microseconds apart --
+    // and reproducing it needs a clock that advances per call, which this harness cannot
+    // install: the same clock stamps the fixture's own approval, so the grant would expire
+    // before the read it is meant to straddle. What IS measured is the half underneath:
+    // `the_time_boxed_arm_stops_granting_at_the_deadline` proves each tail judges the
+    // deadline against the instant it is handed, so passing one value to both is what makes
+    // them agree. The single `let` is the whole guarantee; re-deriving it at the second call
+    // site would restore the defect silently.
+    let now_micros = state.now_unix_micros();
     let grants = if state.access_requests_enabled() {
         groups
             .effective_role_grants_at(
                 &org_id,
                 &membership.user_id,
                 state.max_group_depth(),
-                state.now_unix_micros(),
+                now_micros,
             )
             .await?
     } else {
@@ -554,6 +615,22 @@ pub async fn get_org_membership_effective_roles(
     // itself. Reporting the elevation in `roles` while `permissions` omitted what that role
     // carries would tell an operator the member holds `billing-admin` and holds none of
     // what `billing-admin` is.
+    // The set the MINT resolves, always read and read the same way whatever the flag says.
+    // With the flag off it is also the set reported; with the flag on it is the subset of
+    // the reported set that a token claim will carry, and the budget verdict below is
+    // computed over THIS one for that reason.
+    //
+    // COSTS A SECOND QUERY when the flag is on, and that is the price of a verdict that
+    // means what it says. The alternative -- subtracting the time-boxed roles' permissions
+    // from the widened set in process -- would recompute in Rust what the plain tail already
+    // answers in SQL, and the two would drift the first time either changed. With the flag
+    // off there is no second query: the widened read is the one that is skipped.
+    let minted_permissions = state
+        .store()
+        .management()
+        .org_groups(scope)
+        .effective_permissions(&org_id, &membership.user_id, state.max_group_depth())
+        .await?;
     let permissions = if state.access_requests_enabled() {
         state
             .store()
@@ -563,24 +640,27 @@ pub async fn get_org_membership_effective_roles(
                 &org_id,
                 &membership.user_id,
                 state.max_group_depth(),
-                state.now_unix_micros(),
+                now_micros,
             )
             .await?
     } else {
-        state
-            .store()
-            .management()
-            .org_groups(scope)
-            .effective_permissions(&org_id, &membership.user_id, state.max_group_depth())
-            .await?
+        minted_permissions.clone()
     };
 
-    // MEMBERSHIP scoped, and the verdict says so on the wire: `permissions` above is
-    // the whole resolved set, so this is the answer that predicts the next token.
+    // MEMBERSHIP scoped, and counted over `minted_permissions` rather than over the
+    // `permissions` reported beside it. The two are the same set unless the exploratory
+    // flag is on, and when it is, the difference is the whole reason this line reads the
+    // way it does: the widened tail resolves time-boxed grants and the mint does not, so
+    // counting the reported set would make the verdict describe permissions the next token
+    // will not carry. `overflow` is documented to mean "the next token will carry NO
+    // permissions claim"; computed over the wider set it would assert that of a membership
+    // whose minted set is comfortably inside the budget, and an operator would go looking
+    // for permissions to detach to fix a token that was never in trouble. The verdict
+    // predicts the mint, so it counts what the mint resolves.
     let permission_budget = PermissionBudgetView::evaluate(
         PermissionBudgetScope::Membership,
         state.token_claims(),
-        permissions.len(),
+        minted_permissions.len(),
     );
     let view = EffectiveRolesView {
         roles: grants
