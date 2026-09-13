@@ -7,11 +7,19 @@
 //!
 //! # How these are built, and why each negative varies ONE thing
 //!
-//! Every denial below starts from the SAME claim the allow case uses and changes exactly one
-//! property of it: the signing key, the issuer, the `iat`, the signature's presence, a signal.
-//! A negative that differs in two ways cannot say which one the module refused it for, and a
-//! posture gate that denies for the wrong reason is indistinguishable from one that works
-//! until the day the reason matters.
+//! Most denials below start from the SAME claim the allow case uses and change exactly one
+//! property of it: the key material, the key identifier, the issuer, the audience, the `iat`,
+//! one signal. A negative that differs in two ways cannot say which one the module refused it
+//! for, and a posture gate that denies for the wrong reason is indistinguishable from one that
+//! works until the day the reason matters.
+//!
+//! MOST, not all, and the exceptions are worth naming because the first version of this
+//! paragraph said "every" and was wrong about six of them. The unsigned case rebuilds the
+//! token by hand rather than varying a field. The predicate cases vary the POLICY instead of
+//! the claim. The malformed cases remove or add a member of the signals object. None of those
+//! can be expressed as one changed field of a signed claim, and pretending otherwise was how
+//! `a_claim_signed_by_another_key_is_denied` came to vary two properties and measure neither:
+//! it was refused at key SELECTION, and no signature was ever checked.
 //!
 //! The allow case comes FIRST for the same reason: every `Deny` assertion here is satisfied by
 //! a module that denies everything.
@@ -35,7 +43,17 @@ const STRICT: &str =
     "device.managed && device.encrypted && device.patched && device.edr == 'healthy'";
 
 fn key(seed: u8) -> SigningKey {
-    SigningKey::ed25519_from_seed(Some(format!("mdm-{seed}")), &[seed; 32]).expect("an ed25519 key")
+    keyed(&format!("mdm-{seed}"), seed)
+}
+
+/// A key with the `kid` and the MATERIAL chosen separately.
+///
+/// The two are decoupled because tying them made a negative vary two dimensions at once:
+/// `key(2)` differs from `key(1)` in both, so jose refused it at key SELECTION -- `UnknownKid`,
+/// before any signature was checked -- and the test that claimed to measure a forgery measured
+/// a lookup. `SignatureInvalid` was produced by nothing in this file.
+fn keyed(kid: &str, seed: u8) -> SigningKey {
+    SigningKey::ed25519_from_seed(Some(kid.to_owned()), &[seed; 32]).expect("an ed25519 key")
 }
 
 fn policy(signer: &SigningKey, predicate: &str) -> PosturePolicy {
@@ -132,11 +150,29 @@ fn an_unsigned_claim_is_denied() {
 #[test]
 fn a_claim_signed_by_another_key_is_denied() {
     let clock = clock();
+    // THE SAME `kid`, DIFFERENT MATERIAL. That is what makes this a forgery rather than a
+    // lookup failure: the token names the key the policy trusts, so verification proceeds to
+    // the signature and refuses it there. Signed by `key(2)` instead, this test passed without
+    // any signature ever being checked.
+    let forger = keyed("mdm-1", 2);
+    let token = signed(&forger, &claims(MDM, now_secs(&clock), &healthy()));
+    assert_eq!(
+        policy(&key(1), STRICT).evaluate(Some(&token), &clock),
+        PostureVerdict::Deny(DenyReason::Unverifiable),
+        "only the key MATERIAL differs from the allow case"
+    );
+}
+
+#[test]
+fn a_claim_naming_a_key_the_policy_does_not_hold_is_denied() {
+    let clock = clock();
+    // The lookup failure, kept as its own case now that it is no longer standing in for the
+    // forgery above. An MDM rotating to a key this deployment has not been given lands here.
     let token = signed(&key(2), &claims(MDM, now_secs(&clock), &healthy()));
     assert_eq!(
         policy(&key(1), STRICT).evaluate(Some(&token), &clock),
         PostureVerdict::Deny(DenyReason::Unverifiable),
-        "only the signing key differs from the allow case"
+        "only the key IDENTIFIER differs from the allow case"
     );
 }
 
@@ -199,21 +235,17 @@ fn a_claim_with_no_issued_at_is_denied_rather_than_treated_as_fresh() {
     let mut body = claims(MDM, now_secs(&clock), &healthy());
     body.as_object_mut().expect("an object").remove("iat");
     let token = signed(&signer, &body);
-    // TWO INDEPENDENT GUARDS refuse this, and the assertion tolerates either because the
-    // behaviour is what matters: `require_iat` on the policy makes `verify` refuse it, and
-    // `DenyReason::NoIssuedAt` refuses it if the flag is ever relaxed.
+    // ONE GUARD, and naming it is the point. The first version had two -- `require_iat` on the
+    // policy and a `NoIssuedAt` arm in the module -- and a reviewer measured what that cost:
+    // each made the other unmeasurable. Dropping `require_iat` failed nothing, because the arm
+    // caught the same claim; and the arm was UNREACHABLE, so mutating it to an allow also
+    // failed nothing. Two guards for one fact, neither pinned.
     //
-    // MEASURED, and worth stating rather than leaving to be discovered: turning `require_iat`
-    // off does NOT fail any test here, because the module's own check catches the same claim.
-    // The flag is kept anyway -- the module should not depend on a policy setting for a fact
-    // it can establish itself, and vice versa -- so its mutant is equivalent BY DESIGN rather
-    // than by an oversight. Tightening this assertion to name which layer refused would pin an
-    // internal division of labour instead of a guarantee.
-    assert!(
-        matches!(
-            policy(&signer, STRICT).evaluate(Some(&token), &clock),
-            PostureVerdict::Deny(DenyReason::Unverifiable | DenyReason::NoIssuedAt)
-        ),
+    // So `require_iat` is the guard, the arm is gone, and this asserts the reason it produces.
+    // Dropping the flag now fails here.
+    assert_eq!(
+        policy(&signer, STRICT).evaluate(Some(&token), &clock),
+        PostureVerdict::Deny(DenyReason::Unverifiable),
         "a claim whose age cannot be decided must not be treated as fresh"
     );
 }
@@ -258,7 +290,8 @@ fn a_silent_agent_is_distinguishable_from_an_absent_one() {
         assert_eq!(
             tolerant.evaluate(Some(&token), &clock),
             expected,
-            "a tolerant predicate should separate {state:?} from the others"
+            "a tolerant predicate admits healthy AND silent and refuses absent; it does not \
+             separate the first two, which is the point of it being tolerant: {state:?}"
         );
     }
     // And the STRICT predicate keeps them apart the other way.
@@ -406,12 +439,18 @@ fn a_claim_minted_for_another_audience_is_denied() {
 #[test]
 fn an_expensive_predicate_is_refused_at_build_rather_than_at_evaluation() {
     let signer = key(1);
-    // THE COST BUDGET, the other named guarantee with no negative. A posture predicate reads a
-    // handful of booleans off one flat object; anything that has to iterate is doing something
-    // this surface is not for. Refusing at BUILD means an operator hears about it when they
-    // write the policy rather than on the request that needed it.
-    let expensive = "[1,2,3].all(a, [1,2,3].all(b, [1,2,3].all(c, \
-                     [1,2,3].all(d, [1,2,3].all(e, a + b + c + d + e > 0)))))";
+    // THE COST BUDGET, and the expression is chosen to pin THIS budget rather than any budget.
+    //
+    // The first version used a five-deep comprehension estimating 262 billion, which is over
+    // every plausible ceiling: measured, raising `PREDICATE_BUDGET` from 1_000 all the way to
+    // the crate's own default of 1_000_000_000 left the whole suite green, and the first value
+    // that failed was 262_144_000_000. The test named the module's budget and pinned the range
+    // [1, 262_143_999_999].
+    //
+    // A TWO-DEEP comprehension estimates 4_096: over 1_000, and far under the crate default.
+    // So this now fails if the module's budget is relaxed to the default, which is the only
+    // change anybody is likely to make.
+    let expensive = "[device.managed].all(x, [device.encrypted].all(y, x && y))";
     assert!(
         matches!(
             PosturePolicy::new(
@@ -427,6 +466,11 @@ fn an_expensive_predicate_is_refused_at_build_rather_than_at_evaluation() {
         "an expression past the budget has to be refused where it is written"
     );
     // AND AN ORDINARY PREDICATE IS NOT, so the budget is a ceiling rather than a wall.
+    //
+    // Worth being exact about what the ceiling bites on: `estimate_parsed_cost` returns 1 for
+    // any comprehension-free expression, so no flat predicate over these signals can ever
+    // exceed it at any budget. The budget constrains ITERATION depth and nothing else, and a
+    // single-level comprehension still fits. The module comment used to imply more than that.
     assert!(
         PosturePolicy::new(
             MDM,
@@ -465,4 +509,20 @@ fn a_freshness_bound_of_zero_is_refused_at_build() {
 fn base64_url(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+#[test]
+fn signals_do_not_decode_from_a_positional_array() {
+    // A reviewer found this: serde's derived `Deserialize` for a struct ACCEPTS a JSON array,
+    // matching fields by POSITION. If that holds here then field ORDER is part of the wire
+    // contract -- reordering two booleans in the struct silently reinterprets every array-form
+    // claim, and `[true,true,false,"healthy"]` means something different after a refactor that
+    // touched no serialisation code at all.
+    let from_array: Result<PostureSignals, _> =
+        serde_json::from_str(r#"[true,true,true,"healthy"]"#);
+    assert!(
+        from_array.is_err(),
+        "a posture claim has to be an OBJECT: decoding an array by position makes field order \
+         a contract nobody wrote down"
+    );
 }

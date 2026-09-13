@@ -54,10 +54,14 @@ const SIGNALS_CLAIM: &str = "device_posture";
 
 /// The cost ceiling a posture predicate compiles under.
 ///
-/// Deliberately small. A posture expression reads a handful of booleans off one flat object;
-/// it has no collections to iterate and no reason to. An expression that cannot fit here is
-/// doing something this surface is not for, and refusing it at COMPILE time means an operator
-/// hears about it when they configure it rather than on the request that needed it.
+/// Deliberately small, and precise about what "small" reaches. `estimate_parsed_cost` returns
+/// 1 for any comprehension-free expression, so this constrains ITERATION DEPTH and nothing
+/// else: no flat predicate over these signals can exceed it at any budget, and a single-level
+/// comprehension still fits. What it refuses is the nested kind, which a posture expression
+/// reading a handful of booleans off one flat object has no reason to contain.
+///
+/// Refusing at COMPILE time means an operator hears about it when they configure the policy
+/// rather than on the request that needed it.
 const PREDICATE_BUDGET: u64 = 1_000;
 
 /// The typed signals a posture claim carries.
@@ -69,7 +73,7 @@ const PREDICATE_BUDGET: u64 = 1_000;
 /// field is ignored and a MISSING one is a decode failure rather than a silent `false` -- and
 /// a silent `false` in a posture signal is a policy that denies for the wrong reason, which is
 /// as bad as one that allows for the wrong reason.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PostureSignals {
     /// Whether the device is enrolled in management.
     pub managed: bool,
@@ -79,6 +83,50 @@ pub struct PostureSignals {
     pub patched: bool,
     /// The endpoint-detection agent's state, as the MDM reports it.
     pub edr: EdrState,
+}
+
+/// The derived shape, reachable only through the object check in [`PostureSignals`]'s own
+/// `Deserialize`.
+/// UNKNOWN FIELDS ARE IGNORED, deliberately: an MDM adds fields on its own schedule, and a
+/// decode that turned fatal on each one would break a deployment the day its vendor shipped a
+/// new signal. What the schema fixes is which fields we READ, not which the vendor may send.
+#[derive(Deserialize)]
+struct SignalsFields {
+    managed: bool,
+    encrypted: bool,
+    patched: bool,
+    edr: EdrState,
+}
+
+/// AN OBJECT, NEVER A POSITIONAL ARRAY, and this exists because the derive accepts both.
+///
+/// `serde`'s derived `Deserialize` for a struct matches a JSON ARRAY by POSITION, so
+/// `[true,true,true,"healthy"]` decodes exactly as the object form does. That makes FIELD ORDER
+/// part of the wire contract without anybody writing it down: swapping `encrypted` and
+/// `patched` in the declaration above -- a refactor that touches no serialisation code and
+/// reads as cosmetic -- silently reinterprets every array-form claim, and a device reported as
+/// encrypted-but-unpatched becomes patched-but-unencrypted.
+///
+/// A posture assertion is an object in every MDM that emits one, so nothing is lost by
+/// refusing the array. What is gained is that the field NAMES are the contract, which is what
+/// the struct exists to say.
+impl<'de> Deserialize<'de> for PostureSignals {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if !value.is_object() {
+            return Err(serde::de::Error::custom(
+                "device posture signals must be a JSON object, not an array or a scalar",
+            ));
+        }
+        let fields: SignalsFields =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            managed: fields.managed,
+            encrypted: fields.encrypted,
+            patched: fields.patched,
+            edr: fields.edr,
+        })
+    }
 }
 
 /// What the EDR agent is doing, as the MDM reports it.
@@ -127,13 +175,16 @@ pub enum DenyReason {
     ///
     /// THIS MODULE collapses them, not `ironauth-jose`: its `VerifyError` carries a `reason()`
     /// for exactly this, and the first version of this comment blamed the wrong layer. What is
-    /// discarded here is discarded on purpose -- the verdict a caller acts on should not vary
-    /// with which way a forgery was malformed -- but an operator who needs the detail can have
-    /// it, and a deployment that wants it in a log should take it from the error rather than
-    /// from this enum.
+    /// discarded here is discarded on purpose: the verdict a caller acts on should not vary
+    /// with which way a forgery was malformed.
+    ///
+    /// It is discarded for good, though, and the first version of this said otherwise. No
+    /// caller of [`PosturePolicy::evaluate`] can recover the detail, because the `VerifyError`
+    /// never leaves this function. A deployment that wants it in a log needs this module to
+    /// carry it out, which is a change to this signature rather than something an operator can
+    /// reach today.
     Unverifiable,
-    /// It verified and carried no `iat`, so its age cannot be decided.
-    NoIssuedAt,
+
     /// It verified and the observation is older than the configured bound.
     Stale {
         /// How old the observation was, in seconds.
@@ -165,8 +216,8 @@ pub enum PolicyBuildError {
     /// exactly backwards. The bound is inclusive (`age > max_age` denies), so a `max_age` of
     /// zero ALLOWS a claim whose `iat` is this second and denies one a second older. That is a
     /// freshness policy an operator cannot have meant: it reads as "the strictest possible"
-    /// and behaves as a race against the clock's own resolution. A NEGATIVE bound is worse
-    /// still, denying everything including a claim minted now.
+    /// and behaves as a race against the clock's own resolution. A NEGATIVE bound denies every
+    /// claim whose `iat` is not in the future, which is every honest one.
     ///
     /// Refused at build either way, because a policy whose behaviour nobody would choose is
     /// better refused where it is written than obeyed where it is used.
@@ -238,9 +289,13 @@ impl PosturePolicy {
         let Ok(verified) = verify(token, &self.verification, clock) else {
             return PostureVerdict::Deny(DenyReason::Unverifiable);
         };
-        let Some(issued_at) = verified.claims().issued_at() else {
-            return PostureVerdict::Deny(DenyReason::NoIssuedAt);
-        };
+        // `require_iat` on the policy means `verify` has already refused a claim without one,
+        // so this cannot be `None` -- and an `expect` here would be a panic on a path no input
+        // reaches. A reviewer measured the alternative: an explicit `NoIssuedAt` deny arm was
+        // UNREACHABLE, and mutating it to an allow passed the whole suite, because nothing can
+        // drive it. Two guards for one fact left the second one unmeasurable; one guard, at
+        // the policy, is the one that fires.
+        let issued_at = verified.claims().issued_at().unwrap_or(i64::MIN);
 
         // FRESHNESS, the half `verify` does not do. Measured from the same clock the
         // verification used, so a deployment with a skewed clock is wrong in one direction
@@ -263,9 +318,17 @@ impl PosturePolicy {
         let Ok(signals) = serde_json::from_value::<PostureSignals>(raw.clone()) else {
             return PostureVerdict::Deny(DenyReason::Malformed);
         };
-        let Ok(bound) = serde_json::to_value(&signals) else {
-            return PostureVerdict::Deny(DenyReason::Malformed);
-        };
+        // INFALLIBLE, so no deny arm: `PostureSignals` is three booleans and a unit enum, and
+        // `to_value` fails only on a custom `Serialize` that errors or a non-string map key.
+        // The arm that used to be here was dead, and its mutant to an allow survived the whole
+        // suite for that reason -- a deny nothing can reach is not a guard, it is a comment
+        // that compiles.
+        let bound = serde_json::json!({
+            "managed": signals.managed,
+            "encrypted": signals.encrypted,
+            "patched": signals.patched,
+            "edr": signals.edr,
+        });
 
         match self.predicate.evaluate(&[("device", &bound)]) {
             Ok(serde_json::Value::Bool(true)) => PostureVerdict::Allow,
