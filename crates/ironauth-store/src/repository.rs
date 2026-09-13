@@ -22610,6 +22610,37 @@ pub const CERTIFICATE_PIN_REQUEST_CONSUMER: &str = "saml_certificate.pin_request
 /// is decided when that link is issued, which is where a commercial decision belongs.
 pub const SAML_CONNECTION_SETUP_CONSUMER: &str = "saml_connection.setup_request";
 
+/// The consumer that CREATES a provisioning connection an IT admin configured from the portal
+/// (issue #140 criterion 1).
+///
+/// # Why the portal cannot simply write it
+///
+/// 0183 grants `scim_connections` INSERT to `ironauth_control` alone; `ironauth_app` -- the role
+/// the portal serves on -- holds SELECT. The same split [`CERTIFICATE_PIN_REQUEST_CONSUMER`] and
+/// [`SAML_CONNECTION_SETUP_CONSUMER`] describe, and the same answer.
+///
+/// # ONLY THE DIGEST TRAVELS, and that is the whole design of this one
+///
+/// A provisioning token is a bearer credential. Queuing one would put a live credential in a
+/// durable row that every replica reads and that survives in backups long after the connection
+/// it belongs to -- the pin request beside this carefully notes that the DER it carries is
+/// public material for exactly this reason.
+///
+/// So the PORTAL mints the token, from the same entropy source every other credential in this
+/// deployment is minted from, shows it to the admin who asked for it, and enqueues only its
+/// SHA-256. The plaintext exists in one HTTP response and nowhere else. Nothing has to travel
+/// back from the worker, which is what a scheme minting it there would need: a second store, a
+/// second read, and a window in which a freshly minted credential sits somewhere waiting to be
+/// collected.
+///
+/// # What that costs, stated plainly
+///
+/// The admin sees the token ONCE. There is no second chance to read it, because this deployment
+/// keeps no copy -- rotation is the remedy, and it is the same remedy an operator has. That is
+/// the ordinary contract for a bearer credential and it is the reason the page says so beside
+/// the value rather than after it.
+pub const SCIM_CONNECTION_SETUP_CONSUMER: &str = "scim_connection.setup_request";
+
 /// The consumer that APPLIES a contact change made from the portal (issue #141 criterion 3).
 ///
 /// # Why the portal cannot simply write it

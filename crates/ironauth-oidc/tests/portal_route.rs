@@ -6464,12 +6464,29 @@ fn response_for(key: &XmlTestKey, connection: &ironauth_store::SamlConnection) -
     ironauth_saml::test_util::signed_response_with(key, "_a1", &children)
 }
 
+/// The portal's SSO surface path for this harness.
+fn sso_surface_path(harness: &Harness) -> String {
+    let scope = harness.scope();
+    format!(
+        "/t/{}/e/{}/portal/s/sso",
+        scope.tenant(),
+        scope.environment()
+    )
+}
+
+/// The SSO surface as a session holder sees it, asserting only that it was served.
+async fn sso_surface_page(harness: &Harness, cookie: &str) -> String {
+    let path = sso_surface_path(harness);
+    let (status, _, page) = harness.get_with_cookie(&path, Some(cookie)).await;
+    assert_eq!(status, 200, "the sso surface: {page}");
+    page
+}
+
 #[tokio::test]
 async fn an_admin_sets_up_saml_from_the_portal_and_a_response_then_verifies() {
-    // #140 CRITERION 1, THE SAML HALF, AS A SCRIPTED JOURNEY. Nothing the vendor does appears
-    // between the link being minted and sign-in working except switching the connection on --
-    // which the page says is theirs, because whether a customer's users may sign in is a
-    // commercial decision and not a portal link holder's to make.
+    // #140 CRITERION 1, THE SAML HALF, AS A SCRIPTED JOURNEY. NOTHING the vendor does appears
+    // between the link being minted and sign-in working, which is what "zero vendor-side
+    // actions" means.
     //
     // THE LAST STEP IS THE ONE THAT MATTERS. Asserting a row exists would measure that a form
     // wrote a database. What a customer asked for is that a response their identity provider
@@ -6481,13 +6498,8 @@ async fn an_admin_sets_up_saml_from_the_portal_and_a_response_then_verifies() {
 
     // THE PAGE OFFERS THE FORM before anything exists, which is the state an admin arrives in.
     let scope = harness.scope();
-    let surface = format!(
-        "/t/{}/e/{}/portal/s/sso",
-        scope.tenant(),
-        scope.environment()
-    );
-    let (status, _, page) = harness.get_with_cookie(&surface, Some(&cookie)).await;
-    assert_eq!(status, 200, "the sso surface: {page}");
+    let surface = sso_surface_path(&harness);
+    let page = sso_surface_page(&harness, &cookie).await;
     assert!(
         page.contains("Add a SAML connection"),
         "an admin with nothing configured needs a form, not an empty page: {page}"
@@ -6786,4 +6798,299 @@ async fn a_cross_site_setup_is_refused() {
         post_form_from_with_cookie(&harness, &path, &form, "cross-site", &cookie).await;
     assert_eq!(status, 403, "a cross-site setup was served: {body}");
     assert_eq!(apply_saml_setups(&harness).await, 0, "and queued nothing");
+}
+
+/// Drain the provisioning setup queue through the CONTROL-plane consumer, as the worker does.
+async fn apply_scim_setups(harness: &Harness) -> usize {
+    use ironauth_store::outbox::OutboxConsumer as _;
+
+    let scope = harness.scope();
+    let env = Env::system();
+    let consumer = ironauth_admin::scim_connection_setup::ScimConnectionSetupConsumer::new(
+        harness.db().control_store().clone(),
+    );
+    let mut applied = 0;
+    loop {
+        let claimed = harness
+            .db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::SCIM_CONNECTION_SETUP_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        if claimed.is_empty() {
+            return applied;
+        }
+        for message in &claimed {
+            consumer
+                .handle(&env, scope, message)
+                .await
+                .expect("the setup applies");
+            harness
+                .db()
+                .store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, message)
+                .await
+                .expect("complete");
+            applied += 1;
+        }
+    }
+}
+
+/// Submit the provisioning setup form the way the page renders it.
+async fn submit_scim_setup(
+    harness: &Harness,
+    cookie: &str,
+    display_name: &str,
+    provider: &str,
+) -> (axum::http::StatusCode, String) {
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim/connections",
+        scope.tenant(),
+        scope.environment()
+    );
+    let form = format!(
+        "display_name={}&provider={}",
+        urlencode(display_name),
+        urlencode(provider),
+    );
+    post_form_from_with_cookie(harness, &path, &form, "same-origin", cookie).await
+}
+
+/// The token out of the one page that ever shows it.
+fn token_from(page: &str) -> String {
+    let at = page
+        .find("Token: <code>")
+        .unwrap_or_else(|| panic!("no token on the page: {page}"));
+    let rest = &page[at + "Token: <code>".len()..];
+    let end = rest.find("</code>").expect("the token is closed");
+    rest[..end].to_owned()
+}
+
+#[tokio::test]
+async fn an_admin_sets_up_provisioning_and_the_token_they_were_shown_authenticates() {
+    // #140 CRITERION 1, THE PROVISIONING HALF, AS A SCRIPTED JOURNEY.
+    //
+    // THE LAST STEP IS THE ONE THAT MATTERS, exactly as on the SAML side: asserting a row exists
+    // would measure that a form wrote a database. What the customer asked for is that the token
+    // they were handed WORKS, so the journey ends by presenting it to the same
+    // `ScimConnectionRepo::authenticate` every provisioning request goes through.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "scim", "scimsetup-1", &org).await;
+
+    let scope = harness.scope();
+    let surface = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, _, page) = harness.get_with_cookie(&surface, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning surface: {page}");
+    assert!(
+        page.contains("Add a provisioning connection"),
+        "an admin with nothing configured needs a form: {page}"
+    );
+
+    let (status, shown) = submit_scim_setup(&harness, &cookie, "Acme Okta", "okta").await;
+    assert_eq!(status, 200, "the setup was refused: {shown}");
+    let token = token_from(&shown);
+    assert!(
+        shown.contains("shown once"),
+        "an admin has to be told there is no second chance: {shown}"
+    );
+    assert!(
+        shown.contains("/scim/v2"),
+        "and given the base URL they need beside it: {shown}"
+    );
+
+    // THE PLAINTEXT IS NOWHERE BUT THAT RESPONSE, which is the claim the whole minting design
+    // rests on. The queue row is durable, replicated and backed up; if the token were on it,
+    // every replica would hold a live provisioning credential.
+    let queued = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_store::SCIM_CONNECTION_SETUP_CONSUMER,
+            std::time::Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(queued.len(), 1, "one setup queued");
+    let payload = queued[0].payload.to_string();
+    assert!(
+        !payload.contains(&token),
+        "the plaintext token reached a durable queue row: {payload}"
+    );
+    assert!(
+        payload.contains(&ironauth_store::scim_token_digest(&token)),
+        "and its digest has to be what travels instead: {payload}"
+    );
+    // APPLIED FROM THE MESSAGE ALREADY IN HAND, because claiming it above took it: the drain
+    // helper would find nothing and report zero, which would read as "no setup was queued".
+    {
+        use ironauth_store::outbox::OutboxConsumer as _;
+        let consumer = ironauth_admin::scim_connection_setup::ScimConnectionSetupConsumer::new(
+            harness.db().control_store().clone(),
+        );
+        consumer
+            .handle(&Env::system(), scope, &queued[0])
+            .await
+            .expect("the setup applies");
+        harness
+            .db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .complete(&Env::system(), &queued[0])
+            .await
+            .expect("complete");
+    }
+
+    // THE JOURNEY'S END. The token the admin was shown, through the read every provisioning
+    // request makes.
+    let resolved = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .scim_connections()
+        .authenticate(
+            &ironauth_store::scim_token_digest(&token),
+            now_micros(&harness),
+        )
+        .await
+        .expect("authenticate");
+    let resolved = resolved.expect("the token the admin was shown has to authenticate");
+    assert_eq!(resolved.display_name, "Acme Okta");
+    assert_eq!(&resolved.organization_id, &org, "and as their organization");
+    // AND THE TOKEN NAMES THE CONNECTION IT AUTHENTICATES AS, which is what lets
+    // `ironauth-scim` read a scope out of it before any query runs.
+    assert!(
+        token.starts_with(&format!("{}.", resolved.id)),
+        "the token has to name its own connection: {token}"
+    );
+
+    // NO HORIZON, which is the one decision this form makes for the admin and the one worth
+    // asserting: a connection created with an expiry cannot be rotated once it passes, so a
+    // portal form setting one would hand over a credential with a one-way date and no remedy.
+    assert!(
+        resolved.expires_at_unix_micros.is_none(),
+        "a portal-created connection must not carry a one-way expiry"
+    );
+}
+
+#[tokio::test]
+async fn provisioning_setup_is_absent_where_the_surface_is_not_served() {
+    // A CREDENTIAL FOR AN ENDPOINT THAT ANSWERS NOTHING. With `scim.enabled` off this deployment
+    // answers `/scim/v2` with a uniform 404, so a token minted here could never be used -- and
+    // the page would have handed it over with instructions saying it could.
+    let harness = Harness::start_store_backed_with_scim_surface(false).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "scim", "scimsetup-2", &org).await;
+
+    let scope = harness.scope();
+    let surface = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (_, _, page) = harness.get_with_cookie(&surface, Some(&cookie)).await;
+    assert!(
+        !page.contains("Add a provisioning connection"),
+        "a form minting a credential that cannot work was offered: {page}"
+    );
+
+    let (status, body) = submit_scim_setup(&harness, &cookie, "Acme", "okta").await;
+    assert_eq!(status, 404, "the route minted a token anyway: {body}");
+    assert_eq!(apply_scim_setups(&harness).await, 0, "and queued nothing");
+}
+
+#[tokio::test]
+async fn a_provisioning_setup_names_what_is_wrong() {
+    // THE PROVIDER IS A CLOSED SET and the column's CHECK constraint would refuse an unknown one
+    // -- in the WORKER, where the admin is not looking and the only trace is a dead letter. It
+    // is also what the setup guides key on, so a value outside the set is a connection with no
+    // guide.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "scim", "scimsetup-3", &org).await;
+
+    let (status, body) = submit_scim_setup(&harness, &cookie, "Acme", "pied-piper").await;
+    assert_eq!(status, 400, "an unknown provider was accepted: {body}");
+    assert!(
+        body.contains("Okta"),
+        "and it has to say what is allowed: {body}"
+    );
+
+    let (status, body) = submit_scim_setup(&harness, &cookie, "   ", "okta").await;
+    assert_eq!(status, 400, "a blank name was accepted: {body}");
+
+    assert_eq!(
+        apply_scim_setups(&harness).await,
+        0,
+        "a refused form still queued a job"
+    );
+}
+
+#[tokio::test]
+async fn an_sso_session_cannot_mint_a_provisioning_token() {
+    // THE INTENT FENCE on a route that mints a bearer credential, which is the strongest reason
+    // any portal route has to keep one.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+
+    // THE CONTROL: a `scim` session mints one.
+    let scim = open_session_in(&harness, "scim", "scimsetup-4", &org).await;
+    let (status, body) = submit_scim_setup(&harness, &scim, "Acme", "okta").await;
+    assert_eq!(status, 200, "the control: {body}");
+
+    let sso = open_session_in(&harness, "sso", "scimsetup-5", &org).await;
+    let (status, body) = submit_scim_setup(&harness, &sso, "Acme", "okta").await;
+    assert_eq!(
+        status, 404,
+        "an sso session minted a provisioning token: {body}"
+    );
+    assert_eq!(
+        apply_scim_setups(&harness).await,
+        1,
+        "only the control's setup should have been queued"
+    );
+}
+
+#[tokio::test]
+async fn a_cross_site_provisioning_setup_is_refused() {
+    // The CSRF guard, on the route with the most to lose: a cross-origin post would mint a
+    // provisioning credential and render it into a page another site asked for.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "scim", "scimsetup-6", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim/connections",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = post_form_from_with_cookie(
+        &harness,
+        &path,
+        "display_name=Acme&provider=okta",
+        "cross-site",
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, 403, "a cross-site setup was served: {body}");
+    assert_eq!(apply_scim_setups(&harness).await, 0, "and queued nothing");
 }

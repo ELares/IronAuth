@@ -152,6 +152,7 @@ mod response;
 mod routing_rules;
 pub mod saml_connection_setup;
 mod saml_connections;
+pub mod scim_connection_setup;
 mod secrets;
 mod service_account_keys;
 mod session_token_templates;

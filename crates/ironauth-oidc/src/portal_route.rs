@@ -877,6 +877,30 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
     // regardless would send an IT admin to configure their identity provider against an endpoint
     // that answers nothing, and the failure would surface days later as "provisioning never
     // started" with the portal's own instructions as evidence that it should have.
+    // THE CREATE FORM, offered only where the endpoint is served, for the same reason the base
+    // URL beside it is: a connection minted for a deployment that answers `/scim/v2` with a
+    // uniform 404 is a credential that cannot work, handed over with a page saying it can.
+    let create = if state.scim_surface_enabled() {
+        format!(
+            "<h2>Add a provisioning connection</h2>\
+             <form method=\"post\" \
+             action=\"{base}/t/{tenant}/e/{environment}/portal/s/scim/connections\">\
+             <p><label>A name for this connection<br>\
+             <input name=\"display_name\" size=\"40\" required></label></p>\
+             <p><label>Which provider<br><select name=\"provider\">\
+             <option value=\"okta\">Okta</option>\
+             <option value=\"entra\">Microsoft Entra</option>\
+             <option value=\"generic\">Another provider</option>\
+             </select></label></p>\
+             <p><button type=\"submit\">Add this connection</button></p></form>\
+             <p>The next page shows your token once. Have somewhere to paste it.</p>",
+            base = escape_html(state.issuer_base().trim_end_matches('/')),
+            tenant = escape_html(&session.scope().tenant().to_string()),
+            environment = escape_html(&session.scope().environment().to_string()),
+        )
+    } else {
+        String::new()
+    };
     let endpoint = if state.scim_surface_enabled() {
         format!(
             "<h2>Where your provisioning client connects</h2><p><code>{base}</code></p>",
@@ -896,10 +920,11 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
          <table><thead><tr><th>Name</th><th>Provider</th><th>Status</th><th>Activity</th>\
          </tr></thead>\
          <tbody>{rows}</tbody></table>\
-         {checks}{guides}",
+         {create}{checks}{guides}",
         organization = escape_html(&session.organization().to_string()),
         endpoint = endpoint,
         rows = rows,
+        create = create,
         checks = token_check_forms(state, &connections),
         guides = guides,
     );
@@ -3209,4 +3234,182 @@ fn setup_refusal(reason: &str) -> Response {
             reason = escape_html(reason)
         ),
     )
+}
+
+/// What an IT admin fills in to set up provisioning from the portal (#140 criterion 1).
+#[derive(Debug, serde::Deserialize)]
+pub struct ScimSetupForm {
+    /// What the customer wants to call this connection.
+    pub display_name: String,
+    /// Which provider it is: the guides and the status column key on this.
+    pub provider: String,
+}
+
+/// `POST /t/{tenant}/e/{environment}/portal/s/scim/connections`: set up provisioning.
+///
+/// # The token is minted HERE and shown ONCE
+///
+/// The admin needs a bearer token to paste into their identity provider, and this is the only
+/// moment this deployment can give it to them: nothing keeps a copy, because
+/// `scim_connections` holds a DIGEST and that is the whole point of holding a digest.
+///
+/// MINTED IN THE PORTAL RATHER THAN IN THE WORKER, which decides everything else about this
+/// handler. A worker that minted it would have to hand it back -- a second store, a second
+/// read, and a window in which a live credential sits somewhere waiting to be collected -- and
+/// the queue row would carry the plaintext, which is a durable row every replica reads and
+/// which outlives the connection in backups. Minting here means only the SHA-256 travels, and
+/// the plaintext exists in exactly one HTTP response.
+///
+/// THE TOKEN NAMES ITS OWN CONNECTION, `{scim_id}.{secret}`, so the id has to be minted here
+/// too and carried on the row. `ironauth-scim`'s `authenticate` reads the scope out of that
+/// first half before any query runs.
+///
+/// # It is queued, not written
+///
+/// 0183 grants `scim_connections` INSERT to `ironauth_control` alone. `queue_saml_setup` beside
+/// this makes the same argument at more length.
+///
+/// # The page says the token is not repeatable
+///
+/// Beside the value rather than after it, because an admin who scrolls past and comes back has
+/// no second chance: rotation is the remedy, and it is the same remedy an operator has.
+pub async fn scim_setup_post(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::Form(form): axum::Form<ScimSetupForm>,
+) -> Response {
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return refused();
+    };
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+    let session = match resolve_session(&state, scope, &headers).await {
+        Ok(session) => session,
+        Err(refusal) => return refusal.into_response(),
+    };
+    if let Err(refusal) = session.require_intent("scim") {
+        return refusal.into_response();
+    }
+    // AND THE SURFACE MUST BE SERVED, exactly as the token check requires. Minting a credential
+    // for an endpoint this deployment answers with a uniform 404 would hand an admin something
+    // that cannot work and tell them they are finished.
+    if !state.scim_surface_enabled() {
+        return PortalRefusal::NotFound.into_response();
+    }
+
+    let display_name = form.display_name.trim();
+    if display_name.is_empty() {
+        return setup_refusal("the connection needs a name");
+    }
+    if display_name.len() > SETUP_FIELD_MAX {
+        return setup_refusal("that name is longer than this deployment will store");
+    }
+    // THE PROVIDER IS A CLOSED SET, checked HERE rather than left to the column's CHECK
+    // constraint. The constraint would refuse it in the worker, where the admin is not looking
+    // and the only trace is a dead letter -- and the set is what the setup guides key on, so a
+    // value outside it is a connection with no guide.
+    let provider = form.provider.trim();
+    if !matches!(provider, "okta" | "entra" | "generic") {
+        return setup_refusal("choose one of Okta, Entra, or generic");
+    }
+
+    let id = ironauth_store::ScimConnectionId::generate(state.env(), &scope);
+    let token = mint_scim_token(&state, &id);
+    let digest = ironauth_store::scim_token_digest(&token);
+    if queue_scim_setup(&state, &session, &id, display_name, provider, &digest)
+        .await
+        .is_err()
+    {
+        return PortalRefusal::Unavailable.into_response();
+    }
+
+    // THE ONE PAGE THE TOKEN APPEARS ON. Not a redirect: a 303 back to the surface would lose
+    // the only copy of a credential this deployment cannot produce again.
+    let scim_base = format!("{}/scim/v2", state.issuer_base());
+    let body = format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Provisioning set up</title>\
+         <h1>Provisioning set up</h1>\
+         <p>Paste these two values into {provider}:</p>\
+         <p>Base URL: <code>{base}</code></p>\
+         <p>Token: <code>{token}</code></p>\
+         <p><strong>Copy the token now.</strong> It is shown once and this deployment keeps no \
+         copy of it. If you lose it, ask your vendor to rotate the token, which gives you a new \
+         one and an overlap to paste it in.</p>\
+         <p><a href=\"{surface}\">Back to provisioning</a></p>",
+        provider = escape_html(provider),
+        base = escape_html(&scim_base),
+        token = escape_html(&token),
+        surface = escape_html(&format!(
+            "{}/t/{}/e/{}/portal/s/scim",
+            state.issuer_base().trim_end_matches('/'),
+            scope.tenant(),
+            scope.environment()
+        )),
+    );
+    crate::pages::secure_html(StatusCode::OK, body)
+}
+
+/// A provisioning bearer token for a connection: `{scim_id}.{secret}`.
+///
+/// # The shape is not decoration
+///
+/// `ironauth-scim`'s `authenticate` splits on the full stop and decodes the first half to a
+/// SCOPE before any query runs, so a token without it is refused before it is looked up. The
+/// portal's own token check compares that half to the connection a reader names. Minting
+/// anything else here would produce a credential this deployment refuses.
+///
+/// THE SECRET IS THE SAME WIDTH every other bearer credential in this deployment uses, from the
+/// same entropy source, because a provisioning token is a standing credential for an identity
+/// provider that will present it thousands of times.
+fn mint_scim_token(state: &OidcState, id: &ironauth_store::ScimConnectionId) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let mut bytes = [0_u8; 32];
+    state.env().entropy().fill_bytes(&mut bytes);
+    format!("{id}.{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Queue the connection for the control plane to create.
+///
+/// # Only the digest
+///
+/// The plaintext token is never written here, and the row this enqueues is durable, replicated
+/// and backed up. A digest is not a credential: it is what `scim_connections` already stores and
+/// what `authenticate` already compares against.
+async fn queue_scim_setup(
+    state: &OidcState,
+    session: &PortalSession,
+    id: &ironauth_store::ScimConnectionId,
+    display_name: &str,
+    provider: &str,
+    token_digest: &str,
+) -> Result<(), ironauth_store::StoreError> {
+    state
+        .store()
+        .scoped(session.scope())
+        .outbox()
+        .enqueue_once(
+            state.env(),
+            &ironauth_store::NewOutboxMessage {
+                consumer: ironauth_store::SCIM_CONNECTION_SETUP_CONSUMER,
+                // THE CONNECTION ID, unique per submission, for the reason `queue_saml_setup`
+                // gives. Here there is a second reason and it is stronger: the admin has ALREADY
+                // been shown a token naming this id, so collapsing two submissions onto one row
+                // would leave one of the two tokens they hold referring to nothing.
+                idempotency_key: &id.to_string(),
+                ordering_key: &session.organization().to_string(),
+                payload: serde_json::json!({
+                    "scim_connection_id": id.to_string(),
+                    "organization_id": session.organization().to_string(),
+                    "display_name": display_name,
+                    "provider": provider,
+                    "token_digest": token_digest,
+                }),
+            },
+        )
+        .await
+        .map(|_| ())
 }

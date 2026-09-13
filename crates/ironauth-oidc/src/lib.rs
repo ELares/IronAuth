@@ -571,6 +571,10 @@ pub fn oidc_router(state: OidcState) -> Router {
             post(portal_route::connection_test_post),
         )
         .route(
+            "/t/{tenant_id}/e/{environment_id}/portal/s/scim/connections",
+            post(portal_route::scim_setup_post),
+        )
+        .route(
             "/t/{tenant_id}/e/{environment_id}/portal/s/scim/test",
             post(portal_route::scim_token_check_post),
         )
