@@ -7,11 +7,17 @@
 //!
 //! # What this proves, and the one thing it does not
 //!
-//! Every ENTITLEMENT FACT is folded out of the feed: which memberships exist, which groups
-//! exist and which of them was deleted, who is in which group, which role reaches which group
-//! or membership, which role the organization hands out by default, and every withdrawal of
-//! each. The snapshot is then resolved through the same ancestor closure the server uses and
-//! compared, row for row, against the access-review export for the same organization.
+//! The entitlement facts are folded out of the feed: which memberships exist and whose they
+//! are, which groups exist and how they nest, who is in which group, which role reaches which
+//! group or membership, which role the organization hands out by default, whether the
+//! organization is still active, and every withdrawal of each. The snapshot is then resolved
+//! through an ancestor walk mirroring the server's closure and compared against the
+//! access-review export for the same organization.
+//!
+//! The comparison is a SET EQUALITY over four of the export's nine columns -- the membership,
+//! the role slug, the source and the group -- and not a row-for-row comparison of the file: the
+//! remaining five are the organization, the principal kind, the subject and the two time-boxed
+//! columns, which say who a row is ABOUT rather than what it grants.
 //!
 //! TWO LOOKUPS COME FROM THE MANAGEMENT API AND NOT FROM THE FEED, and pretending otherwise is
 //! what sank the first attempt at this (PR #1222, closed):
@@ -23,18 +29,25 @@
 //!     nothing to replay. `event_catalog.rs` documents and refuses this exact move on
 //!     `token_hook.deployed`, and prescribes the alternative this file takes: "a consumer that
 //!     needs it reads it from the management API".
-//!   * A GROUP'S PARENT AT CREATION. `POST /groups` accepts and stores `parent_id`, and
-//!     `org_group.created` carries only the group and the organization; parentage reaches the
-//!     feed only through a later `org_group.reparented`. Announcing it at create would need
-//!     either the same refused schema change or a second event outside the create's
-//!     transaction, and an announcement that can be lost is worse than one a consumer knows to
-//!     go and read.
+//!
+//! # The group's parent was on that list and should not have been
+//!
+//! It was there on the grounds that announcing it at create would need
+//! either the same refused schema change or a second event outside the create's transaction.
+//! That was wrong, and a review caught it: `create_with_event` enqueues through
+//! `enqueue_domain_event(tx, ..)` INSIDE the write's transaction, so a second event costs a
+//! signature widened from one event to a slice and nothing else. It is done, the create now
+//! announces `org_group.reparented` beside `org_group.created`, and the tree comes from the
+//! feed. It was also a live defect rather than only a gap in this test: a consumer mirroring
+//! the tree attached every nested group to the root, and then resolved the wrong members for
+//! every role granted to a parent.
 //!
 //! So the claim this file makes is narrower than the criterion's wording and is stated rather
-//! than implied: the entitlement GRAPH is rebuilt from events alone; the role CATALOGUE and the
-//! group TREE are synced from the API, which is what a `SailPoint`- or `Vanta`-class consumer does
-//! anyway because it needs display names and descriptions the feed will never carry. Whether
-//! that satisfies "from events alone" is a product decision, and #145 carries it.
+//! than implied: the entitlement GRAPH is rebuilt from events alone, the group tree included;
+//! the role CATALOGUE is synced from the API, which is what a `SailPoint`- or `Vanta`-class
+//! consumer does anyway because it needs display names and descriptions the feed will never
+//! carry. Whether that satisfies "from events alone" is a product decision, and #145 carries
+//! it.
 //!
 //! # Why the fixture is deliberately awkward
 //!
@@ -83,24 +96,75 @@ struct Replay {
     roles: BTreeMap<String, String>,
     /// The organization's default role, when it has one.
     default_role: BTreeMap<String, String>,
+    /// Each group's parent, from the feed. Absent means nobody ever announced one.
+    group_parents: BTreeMap<String, Option<String>>,
+    /// The user or service account behind each membership.
+    membership_subject: BTreeMap<String, String>,
+    /// Organizations that are disabled or deleted, and so resolve nothing.
+    inactive_orgs: BTreeSet<String>,
+    /// Subjects whose own row is gone, taking their memberships' grants with it.
+    dead_subjects: BTreeSet<String>,
 }
 
 impl Replay {
     /// Fold ONE envelope in.
     ///
-    /// The `_ => {}` arm at the end is the dangerous one and it is why every removal the
-    /// export honours is named explicitly above it. A catch-all that silently ignores
-    /// `org_role.deleted` leaves the fold reporting a role the resolver stopped reporting the
-    /// moment it was deleted, and the test that compares them would be measuring nothing.
+    /// The `_ => {}` arm at the end is the dangerous one: anything the resolver honours and
+    /// this match does not name is access the fold goes on reporting after the product has
+    /// revoked it. The first version of this file claimed the arms above were exhaustive over
+    /// "every removal the export honours", and they were not -- `organization.state_changed`,
+    /// `organization.deleted` and `user.deleted` all fell through, and a reviewer reproduced
+    /// two of them by adding the case to the fixture and watching the comparison fail.
+    ///
+    /// So the claim is now the narrower one the code can support: every fence
+    /// `EFFECTIVE_CLOSURE_CTE` applies has an arm here, and the fixture reaches each of them.
+    /// The fences are the organization's state and tombstone, the membership's, the user's,
+    /// the role's, the group's, and the assignment rows themselves. What is deliberately NOT
+    /// handled is `user.deactivated`, `user.deprovisioned` and `user.state_changed`: they move
+    /// `users.state`, and the closure fences on `users.deleted_at` rather than on the state,
+    /// so they change nothing the export reports.
     fn apply(&mut self, kind: &str, payload: &Value) {
         let field = |name: &str| payload[name].as_str().unwrap_or_default().to_owned();
         match kind {
             "organization.member_added" | "organization.service_account_added" => {
                 self.memberships
                     .insert(field("membership_id"), field("organization_id"));
+                // WHO is behind the membership, so a user's own lifecycle can reach it. The
+                // closure LEFT JOINs `users u ... AND u.deleted_at IS NULL` and requires
+                // `u.id IS NOT NULL`, so soft-deleting a USER empties that member's grants
+                // while the membership row itself is untouched and announces nothing.
+                let subject = if payload["user_id"].is_string() {
+                    field("user_id")
+                } else {
+                    field("service_account_id")
+                };
+                self.membership_subject
+                    .insert(field("membership_id"), subject);
             }
             "organization.member_removed" | "organization.service_account_removed" => {
                 self.memberships.remove(&field("membership_id"));
+            }
+            // THE ORGANIZATION'S OWN LIFECYCLE. `EFFECTIVE_CLOSURE_CTE` seeds `membership` only
+            // under `o.state = 'active' AND o.deleted_at IS NULL`, so a DISABLED or DELETED
+            // organization resolves nothing for every one of its members -- the export still
+            // lists them, each with a single `none` row. A fold without these two arms goes on
+            // reporting every grant in an organization an operator has already shut off, which
+            // is the coarsest revocation there is.
+            "organization.state_changed" => {
+                if payload["state"].as_str() == Some("active") {
+                    self.inactive_orgs.remove(&field("organization_id"));
+                } else {
+                    self.inactive_orgs.insert(field("organization_id"));
+                }
+            }
+            "organization.deleted" => {
+                self.inactive_orgs.insert(field("organization_id"));
+            }
+            // A USER's lifecycle, reaching the membership through the subject recorded above.
+            // `user.deleted` is the soft-delete offboarding; it cascades sessions and leaves
+            // `org_memberships` alone, so nothing else on the feed says the grants are gone.
+            "user.deleted" => {
+                self.dead_subjects.insert(field("user_id"));
             }
             "organization.default_role_set" => {
                 self.default_role
@@ -119,6 +183,17 @@ impl Replay {
             "org_group.created" => {
                 self.groups
                     .insert(field("org_group_id"), field("organization_id"));
+            }
+            // THE EDGE, from the feed. A group created underneath a parent announces the
+            // create and then the parentage, both from the create's own transaction, so a
+            // consumer that folds both has the tree. An absent `parent_org_group_id` means
+            // the group was moved to the root, which is why this writes `None` rather than
+            // skipping.
+            "org_group.reparented" => {
+                let parent = payload["parent_org_group_id"]
+                    .as_str()
+                    .map(ToOwned::to_owned);
+                self.group_parents.insert(field("org_group_id"), parent);
             }
             "org_group.deleted" => {
                 self.groups.remove(&field("org_group_id"));
@@ -153,17 +228,25 @@ impl Replay {
 
     /// Resolve the folded state into the grant paths the export would report.
     ///
-    /// `parents` and `slugs` are the two API-sourced tables the module header names. Everything
-    /// else in this function reads only what the fold produced.
-    fn resolve(
-        &self,
-        organization: &str,
-        parents: &BTreeMap<String, Option<String>>,
-        slugs: &BTreeMap<String, String>,
-    ) -> BTreeSet<GrantPath> {
+    /// `slugs` is the ONE API-sourced table left, and the module header says why. Everything
+    /// else here reads only what the fold produced, the group tree included.
+    fn resolve(&self, organization: &str, slugs: &BTreeMap<String, String>) -> BTreeSet<GrantPath> {
+        let parents = &self.group_parents;
         let mut paths = BTreeSet::new();
+        // A DISABLED OR DELETED ORGANIZATION RESOLVES NOTHING, for every member at once.
+        if self.inactive_orgs.contains(organization) {
+            return paths;
+        }
         for (membership, member_org) in &self.memberships {
             if member_org != organization {
+                continue;
+            }
+            // ...and neither does a membership whose subject is gone.
+            if self
+                .membership_subject
+                .get(membership)
+                .is_some_and(|subject| self.dead_subjects.contains(subject))
+            {
                 continue;
             }
             let mut push = |role: &String, source: &str, via: &str| {
@@ -174,8 +257,8 @@ impl Replay {
                 // already excludes deleted roles, so the lookup below drops them anyway. It is
                 // kept because the alternative is a fold whose correctness DEPENDS on an API
                 // read -- and the whole claim of this file is that the graph comes from the
-                // feed, with the API supplying names and nothing else. Keep it, and do not
-                // read the surviving mutation as evidence that it does nothing.
+                // feed, with the API supplying the role CATALOGUE and nothing else. Keep it,
+                // and do not read the surviving mutation as evidence that it does nothing.
                 if self.roles.get(role).map(String::as_str) != Some(organization) {
                     return;
                 }
@@ -244,6 +327,16 @@ async fn act(h: &Harness, path: &str, key: &str, body: &Value) {
 
 /// Create a user and bind it into the organization; returns the membership id.
 async fn member(h: &Harness, base: &str, org: &str, handle: &str) -> String {
+    member_with_user(h, base, org, handle).await.1
+}
+
+/// The same, returning `(user id, membership id)` for a caller that needs the subject.
+async fn member_with_user(
+    h: &Harness,
+    base: &str,
+    org: &str,
+    handle: &str,
+) -> (String, String) {
     let user = create(
         h,
         &format!("{base}/users"),
@@ -251,13 +344,14 @@ async fn member(h: &Harness, base: &str, org: &str, handle: &str) -> String {
         &serde_json::json!({ "identifier": format!("{handle}@acme.test") }),
     )
     .await;
-    create(
+    let membership = create(
         h,
         &format!("{base}/organizations/{org}/memberships"),
         &format!("er-mem-{handle}"),
         &serde_json::json!({ "user_id": user }),
     )
-    .await
+    .await;
+    (user, membership)
 }
 
 /// Read the whole feed, paging on the cursor, until `sentinel` has arrived.
@@ -268,19 +362,30 @@ async fn member(h: &Harness, base: &str, org: &str, handle: &str) -> String {
 /// finished. One reviewer measured a single-shot read elsewhere in this crate failing 5 of 12
 /// runs. PR #1222 read the feed once; that test was flaky by construction.
 ///
-/// PAGED, separately from the polling: the default page is smaller than this scenario's event
-/// count, so a single request would return a prefix and the fold would be missing whatever
-/// fell off the end -- which looks exactly like a withdrawal that never happened.
-async fn fold_feed(h: &Harness, tenant: &str, environment: &str, sentinel: &str) -> Replay {
+/// PAGED, and the page size is deliberately far SMALLER than the scenario's event count.
+///
+/// The first version asked for `limit=100`, which is the feed's own default, against a
+/// scenario that emits well under a hundred events -- so it took exactly one page every time
+/// and the loop below never ran twice. It claimed to exercise paging and could not have. The
+/// criterion names CURSOR REPLAY, and a single request that happens to return everything
+/// proves the cursor is accepted, not that it works: the thing that breaks is resuming FROM
+/// one, and that only happens on the second page.
+///
+/// `PAGE` is five, so this scenario spans many pages and the fold is assembled across them.
+/// `pages_read` is returned so the caller can refuse a run that did not actually page.
+const PAGE: usize = 5;
+
+async fn fold_feed(h: &Harness, tenant: &str, environment: &str, sentinel: &str) -> (Replay, usize) {
     let feed = format!("/v1/tenants/{tenant}/environments/{environment}/events");
     for _ in 0..100 {
         let mut replay = Replay::default();
         let mut cursor: Option<String> = None;
         let mut saw_sentinel = false;
+        let mut pages_read = 0_usize;
         loop {
             let url = match &cursor {
-                None => format!("{feed}?limit=100"),
-                Some(after) => format!("{feed}?limit=100&cursor={after}"),
+                None => format!("{feed}?limit={PAGE}"),
+                Some(after) => format!("{feed}?limit={PAGE}&cursor={after}"),
             };
             let (status, _, body) = h.get_as(&url, OPERATOR_TOKEN).await;
             assert_eq!(status, StatusCode::OK, "event feed: {body}");
@@ -289,6 +394,7 @@ async fn fold_feed(h: &Harness, tenant: &str, environment: &str, sentinel: &str)
             if events.is_empty() {
                 break;
             }
+            pages_read += 1;
             for item in &events {
                 let envelope = &item["payload"];
                 let kind = envelope["type"].as_str().unwrap_or_default();
@@ -297,13 +403,18 @@ async fn fold_feed(h: &Harness, tenant: &str, environment: &str, sentinel: &str)
                 }
                 replay.apply(kind, &envelope["payload"]);
             }
+            // The feed documents `next_cursor` as always present ("Present even when `events`
+            // is empty, so a caller always has somewhere to continue"), so this is not the
+            // loop's exit -- the empty page above is. It is here because a cursor that DID go
+            // missing would otherwise restart the fold from the beginning of the feed on every
+            // iteration, which reads as a hang rather than as a contract change.
             cursor = page["next_cursor"].as_str().map(ToOwned::to_owned);
             if cursor.is_none() {
                 break;
             }
         }
         if saw_sentinel {
-            return replay;
+            return (replay, pages_read);
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -364,6 +475,45 @@ async fn exported_paths(h: &Harness, org_base: &str) -> BTreeSet<GrantPath> {
             }
         })
         .collect()
+}
+
+/// A second organization that works, and is then DISABLED.
+///
+/// Returns `(id, whether it resolved a grant while it was still active)`. The second half is
+/// the control: an organization that never granted anything is empty afterwards for a reason
+/// that has nothing to do with the disable.
+async fn seed_and_disable_a_second_org(h: &Harness, base: &str) -> (String, bool) {
+    let org = create(
+        h,
+        &format!("{base}/organizations"),
+        "er-org-2",
+        &serde_json::json!({ "display_name": "Initech" }),
+    )
+    .await;
+    let org_base = format!("{base}/organizations/{org}");
+    let role = create(
+        h,
+        &format!("{org_base}/roles"),
+        "er2-role",
+        &serde_json::json!({ "slug": "staff", "display_name": "Staff" }),
+    )
+    .await;
+    let (status, _, body) = h
+        .put(
+            &format!("{org_base}/default-role"),
+            &serde_json::json!({ "role_id": role }).to_string(),
+        )
+        .await;
+    assert!(status.is_success(), "second org default role: {body}");
+    let _member = member(h, base, &org, "gail").await;
+
+    let was_live = !exported_paths(h, &org_base).await.is_empty();
+
+    let (status, _, body) = h
+        .post(&format!("{org_base}/disable"), "er2-disable", "")
+        .await;
+    assert!(status.is_success(), "disable the second org: {status} {body}");
+    (org, was_live)
 }
 
 /// The roles, the default role and the group tree, before anybody is a member of anything.
@@ -435,22 +585,32 @@ async fn seed_catalogue(h: &Harness, org_base: &str) -> (String, String, String,
     (billing, reports, doomed_role, finance, finance_ap, doomed_group)
 }
 
-/// Take the organization apart in the four ways the resolver honours.
+/// Take the organization apart in the ways the resolver honours and the feed announces.
 ///
 /// Each drops rows from the export through `deleted_at IS NULL` at some level, and each is a
 /// way for a fold to go on reporting access that no longer exists. They are a separate step
 /// from the build so that the build reads as a working organization and this reads as what
 /// happens to it.
-async fn disturb(
-    h: &Harness,
-    org_base: &str,
-    alice: &str,
-    dave: &str,
-    reports: &str,
-    doomed_role: &str,
-    doomed_group: &str,
-) {
-    // THE FOUR DIVERGENCES, in the order that makes each of them awkward.
+/// What `disturb` takes away, named so the call site reads as a list of removals.
+struct Doomed<'a> {
+    alice: &'a str,
+    dave: &'a str,
+    reports: &'a str,
+    role: &'a str,
+    group: &'a str,
+    frank_user: &'a str,
+}
+
+async fn disturb(h: &Harness, org_base: &str, doomed: &Doomed<'_>) {
+    let Doomed {
+        alice,
+        dave,
+        reports,
+        role: doomed_role,
+        group: doomed_group,
+        frank_user,
+    } = doomed;
+    // THE DIVERGENCES, in the order that makes each of them awkward.
     let (status, _, body) = h
         .delete(&format!("{org_base}/memberships/{alice}/roles/{reports}"))
         .await;
@@ -462,10 +622,29 @@ async fn disturb(
     let (status, _, body) = h.delete(&format!("{org_base}/groups/{doomed_group}")).await;
     assert!(status.is_success(), "delete the group: {body}");
 
+    // THE FIFTH AND SIXTH, which a reviewer reproduced against the first version of this file
+    // by adding them: each empties a member's grants in the export through a fence the fold
+    // had no arm for, and neither announces anything the earlier arms were watching.
+    //
+    // Soft-deleting the USER leaves `org_memberships` untouched, so `organization.member_added`
+    // is never undone and only `user.deleted` says the access is gone.
+    let base = org_base
+        .split_once("/organizations/")
+        .expect("an organization path")
+        .0;
+    let (status, _, body) = h.delete(&format!("{base}/users/{frank_user}")).await;
+    assert!(status.is_success(), "soft-delete the user: {status} {body}");
+
 }
 
 /// Every id the scenario mints, so the assertions can name what they are talking about.
 struct Fixture {
+    /// A second organization, disabled after it was working.
+    elsewhere: String,
+    /// Whether it resolved anything BEFORE the disable.
+    elsewhere_was_live: bool,
+    erin: String,
+    frank: String,
     billing: String,
     doomed_role: String,
     finance: String,
@@ -480,6 +659,7 @@ struct Fixture {
 /// naive fold does not.
 async fn seed_and_disturb(h: &Harness, base: &str, org: &str) -> Fixture {
     let org_base = format!("{base}/organizations/{org}");
+    let (elsewhere, elsewhere_was_live) = seed_and_disable_a_second_org(h, base).await;
     let (billing, reports, doomed_role, finance, finance_ap, doomed_group) =
         seed_catalogue(h, &org_base).await;
 
@@ -492,6 +672,10 @@ async fn seed_and_disturb(h: &Harness, base: &str, org: &str) -> Fixture {
     // the other reason -- measured, that mutant survived. Erin is in the doomed group and
     // stays a member, so the group's deletion is the ONLY thing that can take her grant away.
     let erin = member(h, base, org, "erin").await;
+    // FRANK holds only the organization default, and his USER is soft-deleted below. That is
+    // the narrowest possible case: the membership survives, no assignment is touched, and the
+    // only thing that takes his access away is a fence on the users table.
+    let (frank_user, frank) = member_with_user(h, base, org, "frank").await;
 
     // Direct grants, one of which is withdrawn again and one of which loses its ROLE.
     act(
@@ -556,15 +740,22 @@ async fn seed_and_disturb(h: &Harness, base: &str, org: &str) -> Fixture {
     disturb(
         h,
         &org_base,
-        &alice,
-        &dave,
-        &reports,
-        &doomed_role,
-        &doomed_group,
+        &Doomed {
+            alice: &alice,
+            dave: &dave,
+            reports: &reports,
+            role: &doomed_role,
+            group: &doomed_group,
+            frank_user: &frank_user,
+        },
     )
     .await;
 
     Fixture {
+        elsewhere,
+        elsewhere_was_live,
+        erin,
+        frank,
         billing,
         doomed_role,
         finance,
@@ -574,6 +765,56 @@ async fn seed_and_disturb(h: &Harness, base: &str, org: &str) -> Fixture {
         carol,
         dave,
     }
+}
+
+/// Every removal actually reached the snapshot.
+///
+/// Every assertion in the comparison above is satisfied by a fixture in which none of the
+/// removals landed, which is precisely how #1222 passed while proving nothing. These name each
+/// one, so a fixture that stopped reaching a case fails here rather than going quiet.
+fn assert_every_removal_landed(rebuilt: &BTreeSet<GrantPath>, f: &Fixture) {
+    let slugs_of = |membership: &str| {
+        rebuilt
+            .iter()
+            .filter(|path| path.membership_id == membership)
+            .map(|path| path.role_slug.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    // AND THE DIVERGENCES ACTUALLY HAPPENED. Every assertion above is satisfied by a fixture
+    // in which none of the four removals landed, which is precisely how the first attempt at
+    // this passed while proving nothing.
+    assert!(
+        !slugs_of(&f.alice).contains("reports-reader"),
+        "the withdrawn direct grant is still in the snapshot"
+    );
+    assert!(
+        !slugs_of(&f.carol).contains("temp-admin"),
+        "the deleted role is still granted in the snapshot"
+    );
+    assert!(
+        slugs_of(&f.dave).is_empty(),
+        "the removed membership still holds roles in the snapshot"
+    );
+    assert!(
+        slugs_of(&f.bob).contains("reports-reader"),
+        "the role held through the ANCESTOR group is missing, so the closure was not folded"
+    );
+    assert!(
+        slugs_of(&f.alice).contains("billing-admin") && slugs_of(&f.alice).contains("member"),
+        "alice should still hold her direct grant and the organization default"
+    );
+    assert!(
+        slugs_of(&f.frank).is_empty(),
+        "the member whose USER was soft-deleted still holds roles in the snapshot. Nothing on \
+         the feed undoes his membership -- `user.deleted` is the only announcement -- so a \
+         fold without that arm keeps reporting access the product already revoked"
+    );
+    assert!(
+        slugs_of(&f.erin).contains("member")
+            && !slugs_of(&f.erin).contains("billing-admin"),
+        "erin was only ever in the DELETED group, so she should keep the default and lose the \
+         role that group held"
+    );
 }
 
 /// The snapshot folded from the feed matches what the resolver reports.
@@ -603,15 +844,16 @@ async fn the_snapshot_folded_from_the_feed_matches_what_the_resolver_reports() {
         f.finance.clone(),
         f.doomed_group.clone(),
     );
-    let (alice, bob, carol, dave) = (
-        f.alice.clone(),
-        f.bob.clone(),
-        f.carol.clone(),
-        f.dave.clone(),
-    );
 
     // THE FOLD, waiting for the last of those to reach the feed.
-    let replay = fold_feed(&h, &tenant, &environment, "org_group.deleted").await;
+    // The SENTINEL is the last thing `disturb` does, so seeing it means the whole scenario has
+    // reached the feed.
+    let (replay, pages_read) = fold_feed(&h, &tenant, &environment, "user.deleted").await;
+    assert!(
+        pages_read > 1,
+        "the fold read the whole feed in {pages_read} page(s), so nothing here exercised the \
+         cursor and `limit={PAGE}` is no longer smaller than the scenario"
+    );
     // WHAT THE FOLD ITSELF SAW, asserted before anything resolves it.
     //
     // The comparison below cannot carry these three on its own, and finding that out took a
@@ -630,7 +872,7 @@ async fn the_snapshot_folded_from_the_feed_matches_what_the_resolver_reports() {
         "the fold did not see `org_group.deleted`; it still believes the deleted group exists"
     );
     assert!(
-        !replay.memberships.contains_key(&dave),
+        !replay.memberships.contains_key(&f.dave),
         "the fold did not see `organization.member_removed`; the removed member is still live"
     );
     // AND THE CONTROLS, so the three above are not satisfied by a fold that saw nothing at all.
@@ -639,9 +881,20 @@ async fn the_snapshot_folded_from_the_feed_matches_what_the_resolver_reports() {
         "the fold lost rows it was never told to drop, so the absences above prove nothing"
     );
 
-    let parents = api_group_parents(&h, &org_base).await;
+    // THE TREE THE FOLD BUILT must match the one the API reports. Not a redundant check: the
+    // parent edge only reaches the feed because the create announces it, and if that
+    // announcement were dropped the fold would silently attach every nested group to the root
+    // and still agree with the export for any role granted to a LEAF.
+    let api_parents = api_group_parents(&h, &org_base).await;
+    for (group, parent) in &api_parents {
+        assert_eq!(
+            replay.group_parents.get(group).cloned().flatten().as_ref(),
+            parent.as_ref(),
+            "the feed and the API disagree about the parent of {group}"
+        );
+    }
     let slugs = api_role_slugs(&h, &org_base).await;
-    let rebuilt = replay.resolve(&org, &parents, &slugs);
+    let rebuilt = replay.resolve(&org, &slugs);
     let exported = exported_paths(&h, &org_base).await;
 
     // NOT EMPTY FIRST. Two empty sets are equal, and that is the shape this whole test would
@@ -659,34 +912,38 @@ async fn the_snapshot_folded_from_the_feed_matches_what_the_resolver_reports() {
         exported.difference(&rebuilt).collect::<Vec<_>>()
     );
 
-    // AND THE DIVERGENCES ACTUALLY HAPPENED. Every assertion above is satisfied by a fixture
-    // in which none of the four removals landed, which is precisely how the first attempt at
-    // this passed while proving nothing.
-    let slugs_of = |membership: &str| {
-        rebuilt
-            .iter()
-            .filter(|path| path.membership_id == membership)
-            .map(|path| path.role_slug.clone())
-            .collect::<BTreeSet<_>>()
-    };
+    // THE DISABLED ORGANIZATION, compared separately because the export is scoped to ONE
+    // organization and disabling the one under test would empty both sides at once -- which
+    // every assertion above would happily accept.
+    //
+    let elsewhere_base = format!("{base}/organizations/{}", f.elsewhere);
+    // A second organization with its own member and its own default role, then disabled. The
+    // resolver seeds `membership` only under `o.state = 'active'`, so it resolves nothing and
+    // the export carries one `none` row per member; the fold has to reach the same answer from
+    // `organization.state_changed` alone, because nothing else on the feed says the grants are
+    // gone. LIVE FIRST, so the emptiness is the disable and not an organization that never
+    // worked.
+    // ITS OWN ROLE CATALOGUE, merged in. Without it `staff` has no slug in the map, `push`
+    // bails, and the fold reports nothing for this organization whatever the disable did --
+    // measured: the mutant that ignores `organization.state_changed` entirely survived until
+    // this line existed. The lookup was doing the fence's job again, exactly as it did for the
+    // deleted role.
+    let mut all_slugs = slugs.clone();
+    all_slugs.extend(api_role_slugs(&h, &elsewhere_base).await);
+    let rebuilt_elsewhere = replay.resolve(&f.elsewhere, &all_slugs);
     assert!(
-        !slugs_of(&alice).contains("reports-reader"),
-        "the withdrawn direct grant is still in the snapshot"
+        rebuilt_elsewhere.is_empty(),
+        "the fold still reports grants for a DISABLED organization: {rebuilt_elsewhere:?}"
     );
     assert!(
-        !slugs_of(&carol).contains("temp-admin"),
-        "the deleted role is still granted in the snapshot"
+        exported_paths(&h, &elsewhere_base).await.is_empty(),
+        "the export still reports grants for a disabled organization, so the fold agreeing \
+         that it has none would prove nothing"
     );
     assert!(
-        slugs_of(&dave).is_empty(),
-        "the removed membership still holds roles in the snapshot"
+        f.elsewhere_was_live,
+        "the second organization never resolved a grant even before it was disabled"
     );
-    assert!(
-        slugs_of(&bob).contains("reports-reader"),
-        "the role held through the ANCESTOR group is missing, so the closure was not folded"
-    );
-    assert!(
-        slugs_of(&alice).contains("billing-admin") && slugs_of(&alice).contains("member"),
-        "alice should still hold her direct grant and the organization default"
-    );
+
+    assert_every_removal_landed(&rebuilt, &f);
 }

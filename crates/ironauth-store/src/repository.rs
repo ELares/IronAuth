@@ -58968,7 +58968,7 @@ impl ActingOrgGroupRepo<'_> {
             created_at_micros,
             max_group_depth,
             idempotency,
-            None,
+            &[],
         )
         .await
     }
@@ -58985,7 +58985,7 @@ impl ActingOrgGroupRepo<'_> {
         created_at_micros: i64,
         max_group_depth: u32,
         idempotency: Option<IdempotencyWrite<'_>>,
-        event: Option<&DomainEvent<'_>>,
+        events: &[&DomainEvent<'_>],
     ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope || spec.organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -59062,7 +59062,18 @@ impl ActingOrgGroupRepo<'_> {
                 }
                 insert_idempotency(tx, idempotency).await?;
                 // In the write's transaction: a rolled-back change announces nothing.
-                enqueue_domain_event(tx, env, scope, event).await?;
+                //
+                // A SLICE, because a group created UNDER a parent has two things to announce
+                // and they have to land together (issue #145 criterion 2). `org_group.created`
+                // carries no parent and its schema is `additionalProperties: false`, so the
+                // edge cannot be added to it; the existing `org_group.reparented` already
+                // carries an optional `parent_org_group_id` and says exactly what is true.
+                // Emitting it after this transaction instead would let the create commit while
+                // the announcement is lost, and a consumer mirroring the tree would attach the
+                // group to the root for good.
+                for event in events {
+                    enqueue_domain_event(tx, env, scope, Some(event)).await?;
+                }
                 Ok(())
             },
             false,
