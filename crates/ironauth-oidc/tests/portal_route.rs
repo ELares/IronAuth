@@ -7113,7 +7113,7 @@ async fn apply_oidc_setups(harness: &Harness) -> usize {
             .outbox()
             .claim(
                 &env,
-                ironauth_admin::oidc_upstream_setup::OIDC_UPSTREAM_SETUP_CONSUMER,
+                ironauth_store::OIDC_UPSTREAM_SETUP_CONSUMER,
                 std::time::Duration::from_secs(30),
                 100,
             )
@@ -7239,7 +7239,7 @@ async fn an_admin_sets_up_an_oidc_upstream_and_the_secret_survives_the_queue() {
         .outbox()
         .claim(
             &Env::system(),
-            ironauth_admin::oidc_upstream_setup::OIDC_UPSTREAM_SETUP_CONSUMER,
+            ironauth_store::OIDC_UPSTREAM_SETUP_CONSUMER,
             std::time::Duration::from_secs(30),
             10,
         )

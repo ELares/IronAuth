@@ -22610,6 +22610,31 @@ pub const CERTIFICATE_PIN_REQUEST_CONSUMER: &str = "saml_certificate.pin_request
 /// is decided when that link is issued, which is where a commercial decision belongs.
 pub const SAML_CONNECTION_SETUP_CONSUMER: &str = "saml_connection.setup_request";
 
+/// The consumer that CREATES an OpenID Connect upstream an IT admin configured from the portal
+/// (issue #140 criterion 1).
+///
+/// # Why the portal cannot simply write it
+///
+/// 0056 grants `connectors` INSERT to `ironauth_control` alone; `ironauth_app` -- the role the
+/// portal serves on -- holds SELECT. The same split its two siblings describe.
+///
+/// # The row carries a SEALED secret, which neither sibling has to
+///
+/// [`CERTIFICATE_PIN_REQUEST_CONSUMER`] queues public material and says so;
+/// [`SCIM_CONNECTION_SETUP_CONSUMER`] queues a digest, which is not a credential. An upstream
+/// CLIENT SECRET is neither, and an outbox row is durable, replicated, and present in backups
+/// long after the connector is gone -- so the portal seals it under this scope and the
+/// connector's own id before enqueuing, and the consumer stores the bytes verbatim.
+///
+/// # The name lives HERE, beside its siblings, and that is not tidiness
+///
+/// The consumer is implemented in `ironauth-admin` and enqueued from `ironauth-oidc`, and those
+/// two crates do not depend on each other -- the data plane may not link the management crate.
+/// So the string is the whole contract between them, and a copy in each is a correspondence
+/// nothing enforces: change one and the queue fills with rows no consumer claims, which looks
+/// from the outside like a customer who filled in the form and waits forever.
+pub const OIDC_UPSTREAM_SETUP_CONSUMER: &str = "connector.setup_request";
+
 /// The consumer that CREATES a provisioning connection an IT admin configured from the portal
 /// (issue #140 criterion 1).
 ///

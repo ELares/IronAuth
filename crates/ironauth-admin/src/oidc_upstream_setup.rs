@@ -32,12 +32,10 @@ use std::pin::Pin;
 use ironauth_env::Env;
 use ironauth_store::outbox::{ConsumerError, OutboxConsumer};
 use ironauth_store::{
-    ActorRef, ConnectorCapabilities, ConnectorId, CorrelationId, NewOrgConnection, OrgConnectionId,
-    OrgConnectionUpstream, OrganizationId, PresealedConnector, Scope, ServiceId, Store, StoreError,
+    ActorRef, ConnectorCapabilities, ConnectorId, CorrelationId, NewOrgConnection,
+    OIDC_UPSTREAM_SETUP_CONSUMER, OrgConnectionId, OrgConnectionUpstream, OrganizationId,
+    PresealedConnector, Scope, ServiceId, Store, StoreError,
 };
-
-/// The consumer name, mirroring its siblings' `<object>.setup_request` shape.
-pub const OIDC_UPSTREAM_SETUP_CONSUMER: &str = "connector.setup_request";
 
 /// Applies queued OpenID Connect upstream setups.
 pub struct OidcUpstreamSetupConsumer {

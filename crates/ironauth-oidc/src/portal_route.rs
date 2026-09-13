@@ -3614,7 +3614,7 @@ async fn queue_oidc_setup(
         .enqueue_once(
             state.env(),
             &ironauth_store::NewOutboxMessage {
-                consumer: ironauth_admin_consumer_name(),
+                consumer: ironauth_store::OIDC_UPSTREAM_SETUP_CONSUMER,
                 idempotency_key: &connector_id.to_string(),
                 ordering_key: &session.organization().to_string(),
                 payload: serde_json::json!({
@@ -3636,14 +3636,4 @@ async fn queue_oidc_setup(
         )
         .await
         .map(|_| ())
-}
-
-/// The consumer this surface enqueues for.
-///
-/// NAMED HERE rather than imported, because `ironauth-oidc` does not depend on `ironauth-admin`
-/// -- the consumer lives there, with its two siblings, and the data plane may not link the
-/// management crate. The string is the contract, and the consumer's own `name()` is the other
-/// half of it.
-const fn ironauth_admin_consumer_name() -> &'static str {
-    "connector.setup_request"
 }
