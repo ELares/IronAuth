@@ -162,6 +162,7 @@ pub mod pkce;
 mod policy_trace;
 mod portal_guides;
 pub mod portal_route;
+pub mod portal_widgets;
 pub mod pow;
 mod pow_gate;
 pub mod prm;
@@ -568,6 +569,20 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/portal/s/scim/test",
             post(portal_route::scim_token_check_post),
+        )
+        // THE WIDGET SURFACES (issue #145 criterion 6), which are GETs by bearer rather than
+        // pages by cookie. See `portal_widgets` for why that is the design and not a shortcut.
+        // THE PREFLIGHT IS MOUNTED WITH EACH, not as an afterthought: `Authorization` is not a
+        // CORS-safelisted header, so a browser sends `OPTIONS` before every widget fetch, and a
+        // path registered with `get` alone answers that 405 with no CORS headers. `/userinfo`
+        // below does the same for the same reason.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/portal/w/sso",
+            get(portal_widgets::sso_widget).options(portal_widgets::widget_preflight),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/portal/w/scim",
+            get(portal_widgets::scim_widget).options(portal_widgets::widget_preflight),
         )
         .route(
             "/t/{tenant_id}/e/{environment_id}/portal/finish",

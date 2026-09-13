@@ -420,6 +420,8 @@ pub struct OidcState {
     // answers nothing. Nothing about a portal link prevents that pairing -- link minting never
     // consults this flag -- so the page has to.
     scim_surface_enabled: bool,
+    /// Whether this deployment serves the exploratory portal widgets (issue #145).
+    portal_widgets_enabled: bool,
     // The deployment-wide token claim budget (issue #98), installed by the boot path from
     // the TOP-LEVEL `[token_claims]` config section. Kept OUTSIDE `Inner` and set through
     // the builder for the SAME top-level-config reason as the diagnostics knobs and the
@@ -1108,6 +1110,9 @@ impl OidcState {
             scim_token_expiry_warning_secs: ironauth_config::ScimConfig::default()
                 .token_expiry_warning_secs,
             scim_surface_enabled: ironauth_config::ScimConfig::default().enabled,
+            // OFF, like every exploratory surface: a state built directly is a test's state,
+            // and a flag that defaulted on would mount the surface in every one of them.
+            portal_widgets_enabled: false,
             token_claims: TokenClaimsConfig::default(),
             quota: None,
             migration_hook: None,
@@ -1818,6 +1823,29 @@ impl OidcState {
     pub fn with_scim_surface_enabled(mut self, enabled: bool) -> Self {
         self.scim_surface_enabled = enabled;
         self
+    }
+
+    /// Serve the exploratory portal widgets (issue #145 criterion 6).
+    ///
+    /// The boot path resolves this from the SAME feature ladder every exploratory surface uses:
+    /// enabled AND acknowledged at the exact shape version.
+    ///
+    /// THE TWO FAILURES ARE NOT THE SAME, and an earlier version of this sentence ran them
+    /// together as "or the route answers the uniform not-found". NOT ENABLED resolves to `false`
+    /// here and every widget route answers that not-found. Enabled and acknowledged at the WRONG
+    /// version does not reach this at all: the ladder refuses the configuration and the process
+    /// does not boot, which is the stronger behaviour and the one an operator needs -- a shape
+    /// they acknowledged and we then changed is not a surface to quietly switch off.
+    #[must_use]
+    pub fn with_portal_widgets_enabled(mut self, enabled: bool) -> Self {
+        self.portal_widgets_enabled = enabled;
+        self
+    }
+
+    /// Whether this deployment serves the exploratory portal widgets.
+    #[must_use]
+    pub fn portal_widgets_enabled(&self) -> bool {
+        self.portal_widgets_enabled
     }
 
     /// Whether this deployment mounts the inbound SCIM surface.

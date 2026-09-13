@@ -318,6 +318,65 @@ pub async fn resolve_session(
     }
 }
 
+/// Resolve a portal session from an `Authorization: Bearer` header, and from nothing else.
+///
+/// # It deliberately does not fall back to the cookie
+///
+/// A fallback would give the widget surface the ambient authority it exists without: a page on
+/// any origin the customer's browser opens could then fetch a widget and have the browser attach
+/// the portal session for it. The failure is silent, because the fallback only fires for the
+/// request that DID NOT bring a bearer -- which is precisely the forged one.
+///
+/// THE TOKEN IS THE SAME VALUE THE COOKIE CARRIES, hashed the same way against the same rows, so
+/// there is no second credential with a second lifetime to reason about. What differs is only
+/// how it arrives, and a browser cannot convert one into the other: the cookie is `HttpOnly`.
+///
+/// # Errors
+///
+/// [`PortalRefusal::NotFound`] for an absent, malformed, unknown, spent or expired token -- one
+/// answer for all of them, so a caller cannot probe which; [`PortalRefusal::Unavailable`] when
+/// the read did not happen.
+pub async fn resolve_session_from_bearer(
+    state: &OidcState,
+    scope: Scope,
+    headers: &HeaderMap,
+) -> Result<PortalSession, PortalRefusal> {
+    let Some(token) = bearer_value(headers) else {
+        return Err(PortalRefusal::NotFound);
+    };
+    let now = epoch_micros(state.env().clock().now_utc());
+    match state
+        .store()
+        .scoped(scope)
+        .portal_sessions()
+        .authenticate(&sha256(token.as_bytes()), now)
+        .await
+    {
+        Ok(session) => Ok(PortalSession { session, scope }),
+        Err(StoreError::NotFound) => Err(PortalRefusal::NotFound),
+        Err(_) => Err(PortalRefusal::Unavailable),
+    }
+}
+
+/// The `Authorization: Bearer` value, if the header carries exactly one and it is that scheme.
+///
+/// CASE-INSENSITIVE ON THE SCHEME, as RFC 9110 section 11.1 requires, and exact on everything
+/// else: a header with two values, or one whose scheme is not `bearer`, is no token rather than
+/// a guess at which half was meant.
+fn bearer_value(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let (scheme, token) = value.to_str().ok()?.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_owned())
+}
+
 /// One cookie's value out of the request headers.
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
@@ -529,12 +588,17 @@ fn connection_rows<'a>(
             // dies on this date while the fresh one carries on, so an outage warning there would
             // be a false alarm at the exact moment a successful cutover guaranteed otherwise.
             //
-            // THE CONNECTION'S OWN EXPIRY IS CLEARED BY NOTHING. No path in this system writes
-            // `scim_connections.expires_at`: migration 0183 grants the control role
-            // `UPDATE (revoked_at, updated_at)` and no more, and rotating mints a token with no
-            // horizon while leaving that column exactly where it was. So "renew before" there
-            // names a remedy the customer can perform forever without moving the date, and on it
-            // provisioning stops for good. That one has to say so, and say what actually helps.
+            // THE CONNECTION'S OWN EXPIRY IS CLEARED BY NOTHING. `create` is the only path that
+            // WRITES `scim_connections.expires_at` and nothing UPDATES it: migration 0183 grants
+            // the control role `UPDATE (revoked_at, updated_at)` and no more, and rotating mints
+            // a token with no horizon while leaving that column exactly where it was. So "renew
+            // before" there names a remedy the customer can perform forever without moving the
+            // date, and on it provisioning stops for good. That one has to say so, and say what
+            // actually helps.
+            //
+            // (An earlier version of this sentence said "no path in this system WRITES" it,
+            // which is false -- the create path does, which is how a connection comes to carry
+            // one at all. What the argument needs is that nothing MOVES it, and that is true.)
             if connection.expires_at_unix_micros == Some(deadline) {
                 format!("Provisioning stops {when}: ask your vendor to replace this connection")
             } else if connection.credential_expiring_soon(now, lead) {
