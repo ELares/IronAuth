@@ -1828,8 +1828,14 @@ impl OidcState {
     /// Serve the exploratory portal widgets (issue #145 criterion 6).
     ///
     /// The boot path resolves this from the SAME feature ladder every exploratory surface uses:
-    /// enabled AND acknowledged at the exact shape version, or every widget route answers the
-    /// uniform not-found.
+    /// enabled AND acknowledged at the exact shape version.
+    ///
+    /// THE TWO FAILURES ARE NOT THE SAME, and an earlier version of this sentence ran them
+    /// together as "or the route answers the uniform not-found". NOT ENABLED resolves to `false`
+    /// here and every widget route answers that not-found. Enabled and acknowledged at the WRONG
+    /// version does not reach this at all: the ladder refuses the configuration and the process
+    /// does not boot, which is the stronger behaviour and the one an operator needs -- a shape
+    /// they acknowledged and we then changed is not a surface to quietly switch off.
     #[must_use]
     pub fn with_portal_widgets_enabled(mut self, enabled: bool) -> Self {
         self.portal_widgets_enabled = enabled;

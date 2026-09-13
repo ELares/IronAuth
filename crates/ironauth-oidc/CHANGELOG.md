@@ -30,6 +30,13 @@ That is also what makes `Access-Control-Allow-Origin: *` safe here:
 `Access-Control-Allow-Credentials` is never sent, the two are mutually exclusive
 by the fetch specification, and this surface wants neither.
 
+A CORS PREFLIGHT IS MOUNTED WITH EACH ROUTE. `Authorization` is not a
+safelisted request header, so a browser sends `OPTIONS` before every widget
+fetch, and a path registered with `get` alone answers that with 405 and no
+CORS headers -- which makes the cross-origin fetch this surface exists for
+impossible. `/userinfo` is the same crate's other bearer-and-CORS surface
+and mounts one for the same reason.
+
 READ ONLY, so the CSRF question the mutating portal routes answer with a
 same-origin guard does not arise.
 

@@ -79,6 +79,41 @@ pub struct SsoConnectionView {
     pub pinned_certificates: usize,
 }
 
+/// What the SSO widget answers with: both kinds of upstream, because an organization may have
+/// either or both and a host cannot tell an absent kind from an unread one.
+#[derive(Debug, Serialize)]
+pub struct SsoWidgetItems {
+    /// The SAML connections.
+    pub saml: Vec<SsoConnectionView>,
+    /// The OpenID Connect upstreams.
+    pub oidc: Vec<OidcUpstreamView>,
+}
+
+/// One OpenID Connect upstream, as a widget sees it.
+///
+/// # It exists because the hosted page reads TWO tables and the widget read one
+///
+/// A SAML upstream is a `saml_connections` row. An OIDC upstream is not a row of its own: it is
+/// an `org_connections` binding naming a connector, which is why `sso_surface` reads both and
+/// says so. The first version of this widget read only the first, so an organization whose sign
+/// on is OIDC -- an ordinary configuration -- rendered as an EMPTY list with `truncated: false`,
+/// which a host app cannot distinguish from "nothing is configured". A status widget that
+/// reports a working configuration as absent is worse than no widget.
+#[derive(Debug, Serialize)]
+pub struct OidcUpstreamView {
+    /// The connector this organization is bound to.
+    pub connector_id: String,
+    /// The connector's SLUG, or `null` when the binding names one this deployment cannot read.
+    ///
+    /// A SLUG RATHER THAN A DISPLAY NAME, because `ConnectorRecord` has no display name: the
+    /// slug is what an operator named it and what the hosted page keys its guide on.
+    ///
+    /// NULL IS A REAL STATE and the hosted page has an arm for it: a binding can name a
+    /// connector that has been removed. A host rendering the row can say so; a widget that
+    /// dropped the row would report the organization as having one fewer upstream than it has.
+    pub slug: Option<String>,
+}
+
 /// One provisioning connection, as a widget sees it.
 #[derive(Debug, Serialize)]
 pub struct ScimConnectionView {
@@ -95,22 +130,47 @@ pub struct ScimConnectionView {
     /// THE BROKEN STATE, named as its own field for the reason `ScimConnection::live_token_count`
     /// gives: a connection with no usable credential and one that simply never expires publish
     /// the same absent deadline, and only one of them needs somebody today.
+    ///
+    /// IT IS NOT `no_live_credential` ALONE. That method answers `!revoked && live_token_count
+    /// == 0` on purpose, because the hosted page renders "Revoked" in an arm above the one that
+    /// calls it. A widget is one boolean with no arms, so this ORs the two -- and the version
+    /// that did not reported a revoked connection as working, which the host-app fixture
+    /// rendered word for word.
     pub provisioning_stopped: bool,
     /// The next deadline one of its credentials meets, in epoch microseconds.
     ///
-    /// A DEADLINE TO ACT ON RATHER THAN AN OUTAGE TO EXPECT. During a rotation overlap this is
-    /// the date the customer has to have finished pasting the new token by; the date
-    /// provisioning would actually stop is usually never. The field name that got this wrong
-    /// once is recorded on `ScimConnection::credential_expires_at_unix_micros`.
+    /// A DEADLINE TO ACT ON RATHER THAN AN OUTAGE TO EXPECT, and the field name that got this
+    /// wrong once is recorded on `ScimConnection::credential_expires_at_unix_micros`.
+    ///
+    /// WHAT IT DOES NOT SAY IS WHICH DEADLINE IT IS, and a host must not assume. It is the
+    /// LEAST of the connection's own expiry and its soonest live token's, and the two have
+    /// opposite remedies: a token deadline is cleared by rotating, and the connection's own is
+    /// cleared by nothing -- no path in this system writes `scim_connections.expires_at`, so on
+    /// that date provisioning stops for good and the only remedy is a replacement connection.
+    /// The hosted page distinguishes them by comparing this against the connection's own expiry;
+    /// this payload carries only the LEAST, so a host rendering "renew before" would be wrong
+    /// for one of the two populations.
+    ///
+    /// A host that needs to tell them apart should say what it knows -- "the next deadline" --
+    /// and send the reader to the hosted page, or ask for the discriminator to be added here.
     pub next_deadline_unix_micros: Option<i64>,
     /// When a request last arrived with any of its credentials, or `null`.
     pub last_seen_at_unix_micros: Option<i64>,
     /// Whether an absent `last_seen_at_unix_micros` may be read as "nothing has used it".
     ///
-    /// FALSE IS NOT A SMALL CAVEAT. It is every token row that predates migration 0206, which is
-    /// the whole installed base on upgrade day, and a host that rendered the absent stamp as
-    /// "never used" would tell those customers their working connection is dead. The flag
-    /// travels beside the value so a renderer cannot read one without the other.
+    /// FALSE IS NOT A SMALL CAVEAT AND IT COVERS THREE POPULATIONS, not the one an earlier
+    /// version of this sentence named: every token row that predates migration 0206, which is
+    /// the whole installed base on upgrade day; a connection with no token rows at all, which
+    /// authenticates through the legacy column and may be provisioning right now; and one that
+    /// adopted a legacy credential by rotation, whose earlier life went unwatched. A host that
+    /// rendered the absent stamp as "never used" would tell all three their working connection
+    /// is dead. The flag travels beside the value so a renderer cannot read one without the
+    /// other.
+    ///
+    /// AND TRUE IS NOT PROOF EITHER. `ScimConnection::usage_history_complete` records what it
+    /// still cannot see: mid-rolling-upgrade, traffic served only by replicas that predate 0206
+    /// is watched by nobody while the rows say otherwise. Read it as "no request was observed,
+    /// and observation was in place".
     pub usage_is_knowable: bool,
 }
 
@@ -129,7 +189,11 @@ pub struct WidgetEnvelope<T> {
     /// three connections", and it renders a complete-looking list that is not one.
     pub truncated: bool,
     /// The rows.
-    pub items: Vec<T>,
+    ///
+    /// NOT ALWAYS A LIST. The SSO widget answers two kinds of upstream, which a single list
+    /// could only express by tagging each row -- so this is whatever shape that widget's items
+    /// take, and the envelope stays one type across both routes.
+    pub items: T,
 }
 
 /// `GET /t/{tenant}/e/{environment}/portal/w/sso`: this organization's SSO connections.
@@ -180,7 +244,47 @@ pub async fn sso_widget(
             pinned_certificates: certificates.len(),
         });
     }
-    widget_response(&session, truncated, items)
+
+    // AND THE OTHER KIND. `sso_surface` reads both tables and its doc says why: a SAML upstream
+    // is a row of its own, an OIDC upstream is an `org_connections` binding naming a connector,
+    // and neither table sees the other's. A widget that read one reported an organization whose
+    // sign-on is OIDC as having none.
+    let Ok(bindings) = read
+        .org_connections()
+        .list_for_organization(session.organization(), WIDGET_LIMIT + 1)
+        .await
+    else {
+        return PortalRefusal::Unavailable.into_response();
+    };
+    let truncated =
+        truncated || bindings.len() > usize::try_from(WIDGET_LIMIT).unwrap_or(usize::MAX);
+    let mut oidc = Vec::new();
+    for binding in bindings
+        .iter()
+        .take(usize::try_from(WIDGET_LIMIT).unwrap_or(usize::MAX))
+    {
+        let Some(raw) = binding.connector_id.as_deref() else {
+            continue;
+        };
+        // THE NAME IS BEST EFFORT AND THE ROW IS NOT. A binding can name a connector that has
+        // since been removed, and the hosted page has an arm for exactly that; dropping the row
+        // would report the organization as having one fewer upstream than it has.
+        let slug = match read.connectors().parse_id(raw) {
+            Ok(id) => read
+                .connectors()
+                .get(&id)
+                .await
+                .ok()
+                .map(|connector| connector.slug.clone()),
+            Err(_) => None,
+        };
+        oidc.push(OidcUpstreamView {
+            connector_id: raw.to_owned(),
+            slug,
+        });
+    }
+
+    widget_response(&session, truncated, SsoWidgetItems { saml: items, oidc })
 }
 
 /// `GET /t/{tenant}/e/{environment}/portal/w/scim`: this organization's provisioning connections.
@@ -209,7 +313,7 @@ pub async fn scim_widget(
         return PortalRefusal::Unavailable.into_response();
     };
     let truncated = connections.len() > usize::try_from(WIDGET_LIMIT).unwrap_or(usize::MAX);
-    let items = connections
+    let items: Vec<ScimConnectionView> = connections
         .iter()
         .take(usize::try_from(WIDGET_LIMIT).unwrap_or(usize::MAX))
         .map(|connection| ScimConnectionView {
@@ -217,13 +321,54 @@ pub async fn scim_widget(
             display_name: connection.display_name.clone(),
             provider: connection.provider.clone(),
             revoked: connection.revoked,
-            provisioning_stopped: connection.no_live_credential(),
+            // REVOKED COUNTS, and `no_live_credential` deliberately does not say so:
+            // it is `!revoked && live_token_count == 0`, because the hosted page renders
+            // "Revoked" in its own arm BEFORE reaching that method. A widget has no such
+            // arm -- this is one boolean -- so reading the method alone reported a revoked
+            // connection as working, and the host-app fixture rendered exactly that.
+            provisioning_stopped: connection.revoked || connection.no_live_credential(),
             next_deadline_unix_micros: connection.credential_expires_at_unix_micros,
             last_seen_at_unix_micros: connection.last_seen_at_unix_micros,
             usage_is_knowable: connection.usage_history_complete,
         })
         .collect();
     widget_response(&session, truncated, items)
+}
+
+/// `OPTIONS` on either widget path: the CORS preflight a browser sends before the real fetch.
+///
+/// # Without this the whole surface is unreachable from the only consumer it is for
+///
+/// `Authorization` is not a CORS-safelisted request header, so a cross-origin `fetch` that
+/// attaches the bearer ALWAYS sends an `OPTIONS` first. A path registered with `get(...)` alone
+/// answers that with 405 and no `Access-Control-Allow-*` headers at all, the browser blocks, and
+/// the GET is never sent -- so "a widget is fetched by code running on the vendor's origin",
+/// which is this module's entire premise, does not work in any browser.
+///
+/// THE 200's `Access-Control-Allow-Headers` DID NOT COVER THIS, and an earlier comment beside it
+/// said it did. That header is consulted only on a preflight RESPONSE; on the GET it is inert.
+///
+/// `/userinfo` is the same crate's other bearer-and-CORS surface and it mounts a preflight for
+/// exactly this reason. This one differs in one way, and deliberately: it answers every origin
+/// rather than a registered one, because the widget surface sends `*` on the GET and the two
+/// have to agree -- a preflight narrower than the response it authorises would pass for one
+/// origin and fail for another that the GET would have served.
+///
+/// NO CREDENTIAL IS CONSULTED HERE. A preflight carries none by specification, and answering it
+/// discloses only that these paths exist, which the route table already does.
+pub async fn widget_preflight() -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        [
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            (header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS"),
+            (header::ACCESS_CONTROL_ALLOW_HEADERS, "authorization"),
+            // TEN MINUTES, as `/userinfo` uses. A preflight per widget fetch would double the
+            // round trips on a page that renders several.
+            (header::ACCESS_CONTROL_MAX_AGE, "600"),
+        ],
+    )
+        .into_response()
 }
 
 /// The most rows a widget returns.
@@ -235,10 +380,18 @@ const WIDGET_LIMIT: i64 = 20;
 
 /// Resolve the session a widget request speaks for, or the uniform refusal.
 ///
-/// THE FOUR FENCES IN ORDER, and the order is what makes the answer uniform: the feature, the
-/// scope, the bearer, then the intent. An enabled-feature check that ran after the session
-/// resolution would make a spent token distinguishable from a disabled deployment by timing
-/// alone.
+/// THE FOUR FENCES: the feature, the scope, the bearer, then the intent. An earlier version of
+/// this paragraph claimed the ORDER was what made the answer uniform, and had the argument
+/// exactly backwards: checking the feature first is what CREATES a timing difference, because a
+/// disabled deployment returns without the store read an enabled one makes.
+///
+/// THE ORDER STAYS ANYWAY, and the reason is the opposite of the one that was written here. A
+/// deployment that has not enabled this surface should not be doing token lookups for it: the
+/// read is work an unauthenticated caller can compel, and the flag is the only thing standing
+/// between an unflagged deployment and that work. What the ordering does NOT buy is
+/// indistinguishability, and this deployment does not claim it: whether a feature is switched on
+/// is an operator's configuration rather than a secret, and it is discoverable from the
+/// published feature registry regardless.
 async fn widget_session(
     state: &OidcState,
     tenant_id: &str,
@@ -258,11 +411,7 @@ async fn widget_session(
 }
 
 /// The JSON body, with the headers a cross-origin reader needs and no others.
-fn widget_response<T: Serialize>(
-    session: &PortalSession,
-    truncated: bool,
-    items: Vec<T>,
-) -> Response {
+fn widget_response<T: Serialize>(session: &PortalSession, truncated: bool, items: T) -> Response {
     let body = WidgetEnvelope {
         organization_id: session.organization().to_string(),
         truncated,
