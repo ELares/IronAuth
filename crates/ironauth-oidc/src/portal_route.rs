@@ -3200,6 +3200,11 @@ async fn queue_saml_setup(
                 // records exactly that failure. A duplicate connection is visible on the page
                 // and the admin can ask for it to be removed; a connection that silently never
                 // existed is not.
+                //
+                // SO `enqueue_once` COLLAPSES NOTHING HERE and behaves as `enqueue` would. It
+                // is written this way because the key is the thing this row is ABOUT, and a
+                // reader should not have to work out whether two submissions can collide --
+                // they cannot, and the sentence above is why that is deliberate.
                 idempotency_key: &id.to_string(),
                 // THE ORGANIZATION, so two setups for one customer are applied in the order
                 // they were made and setups for different customers never wait on each other.
@@ -3635,6 +3640,10 @@ async fn queue_oidc_setup(
             state.env(),
             &ironauth_store::NewOutboxMessage {
                 consumer: ironauth_store::OIDC_UPSTREAM_SETUP_CONSUMER,
+                // THE CONNECTOR ID, unique per submission, for the reason `queue_saml_setup`
+                // gives -- and here a second one that is specific to this surface: the SEALED
+                // secret's AAD binds it to this id, so two submissions could not share a row
+                // even if the key let them.
                 idempotency_key: &connector_id.to_string(),
                 ordering_key: &session.organization().to_string(),
                 payload: serde_json::json!({
