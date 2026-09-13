@@ -22575,6 +22575,97 @@ pub const CERTIFICATE_NOTICE_CONSUMER: &str = "saml_certificate.notice";
 /// which is worth fixing and is its own change: it needs a catalogued event type.
 pub const CERTIFICATE_PIN_REQUEST_CONSUMER: &str = "saml_certificate.pin_request";
 
+/// The consumer that CREATES a SAML connection an IT admin configured from the portal
+/// (issue #140 criterion 1).
+///
+/// # Why the portal cannot simply write it
+///
+/// 0196 grants `saml_connections` INSERT to `ironauth_control` alone; `ironauth_app` -- the role
+/// the portal serves on -- holds SELECT. The same split [`CERTIFICATE_PIN_REQUEST_CONSUMER`]
+/// describes, and the same answer: the portal validates and enqueues, and the consumer applies
+/// from the plane that may.
+///
+/// # What the criterion needs and what this is
+///
+/// "An IT admin completes SSO ... end to end via a portal link with zero vendor-side actions."
+/// The setup guides shipped first, and `portal_route::sso_surface` recorded what they were
+/// missing in so many words: "#140's first criterion is an IT admin completing SSO setup with no
+/// vendor-side action, which needs a create path." This is that path for the SAML variant.
+///
+/// # One job, two writes, and the order matters
+///
+/// The consumer creates the connection and pins the certificate the admin pasted. A connection
+/// with no trust anchor refuses every response its provider sends, so shipping it half-applied
+/// would hand the admin a connection that looks finished and signs nobody in -- the exact
+/// failure the connection-test surface exists to explain.
+///
+/// THE CONNECTION IS CREATED LIVE, which is the criterion rather than an oversight. "Zero
+/// vendor-side actions" means zero, and a connection created switched off would need somebody at
+/// the vendor to enable it -- the action this issue exists to remove. An earlier draft asserted
+/// the opposite and called the switch a commercial decision: a reasonable product argument, and
+/// one that contradicts the thing being built.
+///
+/// WHAT BOUNDS IT IS THE LINK. A portal link is minted by the vendor, single-use, expires in
+/// minutes, and is scoped to one organization and one intent. "This customer may configure SSO"
+/// is decided when that link is issued, which is where a commercial decision belongs.
+pub const SAML_CONNECTION_SETUP_CONSUMER: &str = "saml_connection.setup_request";
+
+/// The consumer that CREATES an OpenID Connect upstream an IT admin configured from the portal
+/// (issue #140 criterion 1).
+///
+/// # Why the portal cannot simply write it
+///
+/// 0056 grants `connectors` INSERT to `ironauth_control` alone; `ironauth_app` -- the role the
+/// portal serves on -- holds SELECT. The same split its two siblings describe.
+///
+/// # The row carries a SEALED secret, which neither sibling has to
+///
+/// [`CERTIFICATE_PIN_REQUEST_CONSUMER`] queues public material and says so;
+/// [`SCIM_CONNECTION_SETUP_CONSUMER`] queues a digest, which is not a credential. An upstream
+/// CLIENT SECRET is neither, and an outbox row is durable, replicated, and present in backups
+/// long after the connector is gone -- so the portal seals it under this scope and the
+/// connector's own id before enqueuing, and the consumer stores the bytes verbatim.
+///
+/// # The name lives HERE, beside its siblings, and that is not tidiness
+///
+/// The consumer is implemented in `ironauth-admin` and enqueued from `ironauth-oidc`, and those
+/// two crates do not depend on each other -- the data plane may not link the management crate.
+/// So the string is the whole contract between them, and a copy in each is a correspondence
+/// nothing enforces: change one and the queue fills with rows no consumer claims, which looks
+/// from the outside like a customer who filled in the form and waits forever.
+pub const OIDC_UPSTREAM_SETUP_CONSUMER: &str = "connector.setup_request";
+
+/// The consumer that CREATES a provisioning connection an IT admin configured from the portal
+/// (issue #140 criterion 1).
+///
+/// # Why the portal cannot simply write it
+///
+/// 0183 grants `scim_connections` INSERT to `ironauth_control` alone; `ironauth_app` -- the role
+/// the portal serves on -- holds SELECT. The same split [`CERTIFICATE_PIN_REQUEST_CONSUMER`] and
+/// [`SAML_CONNECTION_SETUP_CONSUMER`] describe, and the same answer.
+///
+/// # ONLY THE DIGEST TRAVELS, and that is the whole design of this one
+///
+/// A provisioning token is a bearer credential. Queuing one would put a live credential in a
+/// durable row that every replica reads and that survives in backups long after the connection
+/// it belongs to -- the pin request beside this carefully notes that the DER it carries is
+/// public material for exactly this reason.
+///
+/// So the PORTAL mints the token, from the same entropy source every other credential in this
+/// deployment is minted from, shows it to the admin who asked for it, and enqueues only its
+/// SHA-256. The plaintext exists in one HTTP response and nowhere else. Nothing has to travel
+/// back from the worker, which is what a scheme minting it there would need: a second store, a
+/// second read, and a window in which a freshly minted credential sits somewhere waiting to be
+/// collected.
+///
+/// # What that costs, stated plainly
+///
+/// The admin sees the token ONCE. There is no second chance to read it, because this deployment
+/// keeps no copy -- rotation is the remedy, and it is the same remedy an operator has. That is
+/// the ordinary contract for a bearer credential and it is the reason the page says so beside
+/// the value rather than after it.
+pub const SCIM_CONNECTION_SETUP_CONSUMER: &str = "scim_connection.setup_request";
+
 /// The consumer that APPLIES a contact change made from the portal (issue #141 criterion 3).
 ///
 /// # Why the portal cannot simply write it
@@ -37236,6 +37327,29 @@ impl ActingClientAdminGrantRepo<'_> {
     }
 }
 
+/// A connector whose client secret the CALLER has already sealed (issue #140 criterion 1).
+///
+/// The same fields as [`NewConnector`] with one substitution: the plaintext secret becomes the
+/// ciphertext and the DEK version it was sealed under. See
+/// `ActingConnectorRepo::create_presealed` for why a portal-initiated create needs this shape.
+#[derive(Debug, Clone, Copy)]
+pub struct PresealedConnector<'a> {
+    /// The operator-visible slug, unique per scope.
+    pub slug: &'a str,
+    /// The SECRET-FREE definition document.
+    pub definition_json: &'a str,
+    /// The client secret, sealed by `ActingActingConnectorRepo::seal_client_secret` under this scope and
+    /// this connector's id.
+    pub client_secret_sealed: &'a [u8],
+    /// The DEK version the sealing used, which travels with the ciphertext because a rotation
+    /// between the seal and this write must not make it unopenable.
+    pub client_secret_dek_version: i32,
+    /// What the upstream supports.
+    pub capabilities: ConnectorCapabilities<'a>,
+    /// Whether it is live.
+    pub enabled: bool,
+}
+
 /// The mutating federation connector repository (issue #75): create (seal the
 /// upstream client secret inline, audited), update (replace and reseal, audited),
 /// and delete (audited). Every write is scope-bound.
@@ -37264,6 +37378,171 @@ impl ActingConnectorRepo<'_> {
             Err(error) => return Err(error),
         }
         Ok(())
+    }
+
+    /// Seal a client secret for a connector that does not exist yet (issue #140 criterion 1).
+    ///
+    /// # Why the DATA plane seals
+    ///
+    /// The portal's OIDC setup form takes a client secret from an IT admin and has to hand it to
+    /// the control plane, which is the only role that may INSERT a connector. Between the two
+    /// sits the outbox: a durable, replicated, backed-up table that every replica reads.
+    ///
+    /// A PLAINTEXT UPSTREAM CREDENTIAL HAS NO BUSINESS ON THAT ROW. `CERTIFICATE_PIN_REQUEST_
+    /// CONSUMER` makes the point in the other direction -- it notes that the DER it carries is
+    /// PUBLIC material and therefore fine to queue -- and `SCIM_CONNECTION_SETUP_CONSUMER`
+    /// queues a digest for the same reason. This is the third case: the value is secret, is not
+    /// a digest, and has to arrive intact, so it travels SEALED.
+    ///
+    /// # It seals under the connector's own purpose, before the connector exists
+    ///
+    /// The AAD binds the ciphertext to this scope AND to the connector id, exactly as
+    /// [`Self::open_client_secret`] expects to find it -- which is what lets the control plane
+    /// store the bytes verbatim and every later read open them. The id is minted by the caller
+    /// for precisely this reason.
+    ///
+    /// NOTHING ELSE CAN OPEN IT. A ciphertext bound to a connector id in one scope does not
+    /// authenticate under any other, so a queue row copied into another tenant's scope decrypts
+    /// to nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connector id is out of this scope;
+    /// [`StoreError::Encryption`] if no platform master key is configured;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn seal_client_secret(
+        &self,
+        env: &Env,
+        id: &ConnectorId,
+        plaintext: &[u8],
+    ) -> Result<(Vec<u8>, i32), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        // PROVISIONED IF ABSENT, exactly as `create` does before it seals. 0028 grants
+        // `tenant_keks` and `tenant_deks` SELECT and INSERT to `ironauth_app`, so the data
+        // plane may do this -- and it has to: an environment gets its envelope keys lazily on
+        // first use, so a customer whose FIRST action is configuring an upstream would
+        // otherwise be refused for a reason that is this deployment's rather than theirs, on
+        // the one surface issue #140 exists to keep free of vendor-side steps.
+        self.ensure_scope_keys(env, master).await?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let (dek_version, dek) = fetch_active_dek(&mut tx, self.scope, master).await?;
+        let sealed = dek.seal(
+            env.entropy(),
+            &secret_seal_aad(self.scope, &connector_secret_purpose(id), dek_version),
+            plaintext,
+        );
+        tx.commit().await?;
+        Ok((sealed.into_bytes(), dek_version))
+    }
+
+    /// [`Self::create`], with the client secret ALREADY SEALED by the caller
+    /// (issue #140 criterion 1).
+    ///
+    /// # Why a second create rather than a parameter
+    ///
+    /// The portal's OIDC setup takes a client secret from an IT admin, and the portal serves on
+    /// the data plane, which may not INSERT a connector. Between the two sits the outbox, and a
+    /// plaintext upstream credential has no business on a durable, replicated, backed-up row --
+    /// so `ActingActingConnectorRepo::seal_client_secret` seals it before it is queued and this stores the
+    /// bytes verbatim.
+    ///
+    /// A `client_secret_sealed: Option<..>` on `NewConnector` would have expressed the same
+    /// thing and made every existing caller carry a field that means "not this one". Two
+    /// functions, one of which is used by one caller, says which path a reader is on.
+    ///
+    /// # What it does NOT do, and the difference is the point
+    ///
+    /// It does not seal, so it never reads the active DEK -- the sealing already happened, under
+    /// whatever DEK was active THEN, and the version travels with the ciphertext. A rotation
+    /// between the two is not a problem: `open_client_secret` reads the version off the row.
+    ///
+    /// IT STILL PROVISIONS THE SCOPE'S KEYS, and an earlier version of this paragraph gave a
+    /// reason that cannot happen: "the caller's seal may have been the first use in a scope that
+    /// had none and failed". A seal that failed produced no ciphertext, so no row reaches this
+    /// function at all.
+    ///
+    /// The reason it has is narrower. This is the same call `create` makes before it seals, and
+    /// leaving it out would make the two paths differ in a way nothing here needs -- a scope
+    /// whose keys were DESTROYED between the seal and this write, which is a real operator
+    /// action, would then get a connector written against keys that no longer exist. Provisioning
+    /// is idempotent and costs one read when they are already there.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`], minus the sealing failures it cannot have.
+    pub async fn create_presealed(
+        &self,
+        env: &Env,
+        id: &ConnectorId,
+        created_at_micros: i64,
+        params: PresealedConnector<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        self.ensure_scope_keys(env, master).await?;
+        let id = *id;
+        let scope = self.scope;
+        let created_micros = created_at_micros;
+        let slug = params.slug.to_owned();
+        let definition = params.definition_json.to_owned();
+        let sealed = params.client_secret_sealed.to_vec();
+        let dek_version = params.client_secret_dek_version;
+        let caps = OwnedConnectorCapabilities::from(params.capabilities);
+        let enabled = params.enabled;
+        let detail = format!("slug={slug}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ConnectorCreate,
+                target: &id,
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "INSERT INTO connectors \
+                     (id, tenant_id, environment_id, connector_slug, definition_json, \
+                      client_secret_sealed, client_secret_dek_version, cap_refresh, cap_groups, \
+                      cap_logout_propagation, cap_email_verified_trust, enabled, created_at, \
+                      updated_at) \
+                     VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, \
+                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&slug)
+                .bind(&definition)
+                .bind(&sealed)
+                .bind(dek_version)
+                .bind(caps.refresh)
+                .bind(caps.groups)
+                .bind(caps.logout_propagation)
+                .bind(&caps.email_verified_trust)
+                .bind(enabled)
+                .bind(created_micros)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
     }
 
     /// CREATE a connector (issue #75): seal the upstream client secret INLINE under

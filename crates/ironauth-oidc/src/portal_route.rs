@@ -877,6 +877,30 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
     // regardless would send an IT admin to configure their identity provider against an endpoint
     // that answers nothing, and the failure would surface days later as "provisioning never
     // started" with the portal's own instructions as evidence that it should have.
+    // THE CREATE FORM, offered only where the endpoint is served, for the same reason the base
+    // URL beside it is: a connection minted for a deployment that answers `/scim/v2` with a
+    // uniform 404 is a credential that cannot work, handed over with a page saying it can.
+    let create = if state.scim_surface_enabled() {
+        format!(
+            "<h2>Add a provisioning connection</h2>\
+             <form method=\"post\" \
+             action=\"{base}/t/{tenant}/e/{environment}/portal/s/scim/connections\">\
+             <p><label>A name for this connection<br>\
+             <input name=\"display_name\" size=\"40\" required></label></p>\
+             <p><label>Which provider<br><select name=\"provider\">{options}</select>\
+             </label></p>\
+             <p><button type=\"submit\">Add this connection</button></p></form>\
+             <p>The next page shows your token once. Have somewhere to paste it.</p>",
+            base = escape_html(state.issuer_base().trim_end_matches('/')),
+            tenant = escape_html(&session.scope().tenant().to_string()),
+            environment = escape_html(&session.scope().environment().to_string()),
+            // FROM THE SAME LIST THE HANDLER VALIDATES AGAINST, so the form cannot offer a slug
+            // the route refuses -- which would be a page whose own control produces a 400.
+            options = provider_options(),
+        )
+    } else {
+        String::new()
+    };
     let endpoint = if state.scim_surface_enabled() {
         format!(
             "<h2>Where your provisioning client connects</h2><p><code>{base}</code></p>",
@@ -896,10 +920,11 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
          <table><thead><tr><th>Name</th><th>Provider</th><th>Status</th><th>Activity</th>\
          </tr></thead>\
          <tbody>{rows}</tbody></table>\
-         {checks}{guides}",
+         {create}{checks}{guides}",
         organization = escape_html(&session.organization().to_string()),
         endpoint = endpoint,
         rows = rows,
+        create = create,
         checks = token_check_forms(state, &connections),
         guides = guides,
     );
@@ -1597,11 +1622,12 @@ async fn sso_surface(state: &OidcState, session: &PortalSession) -> Response {
     if saml.is_empty() && connectors.is_empty() {
         // NOT A REFUSAL, for the reason the renewal surface gives: the link is fine, there is
         // simply nothing configured yet, and a not-found would read as a broken link.
-        body.push_str(
-            "<p>This organization has no sign-on connection yet. Ask your vendor to create one, \
-             then come back here for the values your identity provider needs.</p>",
-        );
-        return crate::pages::secure_html(StatusCode::OK, body);
+        //
+        // AND NOT A DEAD END EITHER, which it was until the create path landed: the sentence
+        // here said "ask your vendor to create one", which is precisely the vendor-side action
+        // #140 criterion 1 exists to remove. An admin arriving with nothing configured is the
+        // reader this whole surface is for, and the form below is what they came for.
+        body.push_str("<p>Nothing is configured yet. Start here.</p>");
     }
 
     let limit = usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX);
@@ -1613,6 +1639,59 @@ async fn sso_surface(state: &OidcState, session: &PortalSession) -> Response {
             "<p>Showing the first {limit} of each kind. Ask your vendor about the rest.</p>"
         );
     }
+    // THE CREATE FORM, FIRST, and above the connections rather than below them. An admin
+    // arriving with nothing configured sees an empty page and a form; one returning to add a
+    // second provider does not have to scroll past the first. It is the half `sso_surface`'s own
+    // doc recorded as missing: "#140's first criterion is an IT admin completing SSO setup with
+    // no vendor-side action, which needs a create path."
+    //
+    // THE TWO VALUES THIS DEPLOYMENT OWNS ARE PRINTED BESIDE IT, not asked for. They are what
+    // the admin pastes into their provider's console, and the handler derives the same pair
+    // from the same `issuer_base` rather than reading them back from the form -- so a link
+    // holder cannot create a connection expecting an audience of their choosing.
+    let _ = write!(
+        &mut body,
+        "<h2>Add a SAML connection</h2>\
+         <p>Add the connection first. This page then shows you the two values to paste into \
+         your identity provider -- both of them name the connection, so neither exists until \
+         it does.</p>\
+         <form method=\"post\" action=\"{base}/t/{tenant}/e/{environment}/portal/s/sso/saml\">\
+         <p><label>A name for this connection<br>\
+         <input name=\"display_name\" size=\"40\" required></label></p>\
+         <p><label>Your identity provider's entity ID<br>\
+         <input name=\"idp_entity_id\" size=\"60\" required></label></p>\
+         <p><label>Your identity provider's sign-on URL (https)<br>\
+         <input name=\"idp_sso_url\" size=\"60\" required></label></p>\
+         <p><label>Its signing certificate (PEM or base64)<br>\
+         <textarea name=\"certificate\" rows=\"6\" cols=\"60\" required></textarea></label></p>\
+         <p><button type=\"submit\">Add this connection</button></p></form>",
+        base = escape_html(state.issuer_base().trim_end_matches('/')),
+        tenant = escape_html(&session.scope().tenant().to_string()),
+        environment = escape_html(&session.scope().environment().to_string()),
+    );
+    // AND THE OTHER KIND. An organization may federate through SAML, through OpenID Connect, or
+    // through both, and an admin arriving with an OIDC provider needs the form for the one they
+    // have rather than the one this page happens to list first.
+    let _ = write!(
+        &mut body,
+        "<h2>Add an OpenID Connect connection</h2>\
+         <p>Add it first. This page then shows you the redirect URI to register with your \
+         provider -- it names the connection, so it does not exist until the connection \
+         does.</p>\
+         <form method=\"post\" action=\"{base}/t/{tenant}/e/{environment}/portal/s/sso/oidc\">\
+         <p><label>A name for this connection<br>\
+         <input name=\"display_name\" size=\"40\" required></label></p>\
+         <p><label>Your provider's issuer URL (https)<br>\
+         <input name=\"issuer\" size=\"60\" required></label></p>\
+         <p><label>The client ID it gave you<br>\
+         <input name=\"client_id\" size=\"60\" required></label></p>\
+         <p><label>The client secret it gave you<br>\
+         <input type=\"password\" name=\"client_secret\" size=\"60\"></label></p>\
+         <p><button type=\"submit\">Add this connection</button></p></form>",
+        base = escape_html(state.issuer_base().trim_end_matches('/')),
+        tenant = escape_html(&session.scope().tenant().to_string()),
+        environment = escape_html(&session.scope().environment().to_string()),
+    );
     for connection in saml.iter().take(limit) {
         sso_saml_section(state, session, connection, &mut body);
     }
@@ -2942,4 +3021,807 @@ fn activity_html(standing: &ironauth_store::ScimTokenStanding) -> String {
 /// it, and a 4xx would put a banner over the one sentence they came for.
 fn refusal_html(reason: &str) -> String {
     format!("<p>{}</p>", escape_html(reason))
+}
+
+/// What an IT admin fills in to set up a SAML connection from the portal (#140 criterion 1).
+#[derive(Debug, serde::Deserialize)]
+pub struct SamlSetupForm {
+    /// What the customer wants to call this connection.
+    pub display_name: String,
+    /// The identity provider's entity ID, from its own metadata.
+    pub idp_entity_id: String,
+    /// Where this deployment sends sign-in requests.
+    pub idp_sso_url: String,
+    /// The provider's signing certificate, base64 DER or PEM.
+    pub certificate: String,
+}
+
+/// `POST /t/{tenant}/e/{environment}/portal/s/sso/saml`: set up a SAML connection.
+///
+/// # The criterion this closes
+///
+/// "An IT admin completes SSO ... end to end via a portal link with zero vendor-side actions."
+/// The setup guides landed first, and `sso_surface`'s own doc recorded what they were missing:
+/// "which needs a create path". This is that path for the SAML variant.
+///
+/// # Everything it needs is on the page it was posted from
+///
+/// The admin supplies the three values only their identity provider knows -- its entity ID, its
+/// sign-on URL, its signing certificate -- and a name. The two values this deployment owns, the
+/// audience and the reply URL, are NOT taken from the form: they are derived here from the same
+/// `issuer_base` the page printed them from. A form field for either would let a link holder
+/// create a connection expecting an audience of their choosing, and the values are ours to
+/// state rather than theirs to assert.
+///
+/// # It is queued, not written
+///
+/// 0196 grants `saml_connections` INSERT to `ironauth_control` alone. `queue_pin` beside this
+/// makes the same argument at more length: the portal validates and enqueues, and
+/// `SAML_CONNECTION_SETUP_CONSUMER` applies from the plane that may.
+///
+/// THE ID IS MINTED HERE and carried on the row, so a redelivery lands on the same connection
+/// rather than creating one per attempt.
+///
+/// # The certificate is parsed BEFORE it is queued
+///
+/// A queue is not a place to defer validation to: enqueuing an unparsed blob would answer the
+/// admin "accepted" and then fail in a worker where nobody is looking. And a connection whose
+/// certificate turns out to be unreadable is a connection that refuses every response its
+/// provider sends, which is the failure this whole surface exists to prevent.
+pub async fn saml_setup_post(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::Form(form): axum::Form<SamlSetupForm>,
+) -> Response {
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return refused();
+    };
+    // THE SAME ORIGIN GUARD every mutating portal route takes, and this one creates the object
+    // every sign-in through that organization is checked against.
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+    let session = match resolve_session(&state, scope, &headers).await {
+        Ok(session) => session,
+        Err(refusal) => return refusal.into_response(),
+    };
+    if let Err(refusal) = session.require_intent("sso") {
+        return refusal.into_response();
+    }
+
+    let display_name = form.display_name.trim();
+    let idp_entity_id = form.idp_entity_id.trim();
+    let idp_sso_url = form.idp_sso_url.trim();
+    if display_name.is_empty() || idp_entity_id.is_empty() || idp_sso_url.is_empty() {
+        return setup_refusal("every field is required");
+    }
+    // BOUNDED, because these become columns and the form is reachable by whoever holds a link.
+    if display_name.len() > SETUP_NAME_MAX {
+        return setup_refusal("that name is longer than this deployment will store");
+    }
+    if idp_entity_id.len() > SETUP_URI_MAX || idp_sso_url.len() > SETUP_URI_MAX {
+        return setup_refusal(
+            "that entity ID or sign-on URL is longer than this deployment \
+                              will store",
+        );
+    }
+    // THE SIGN-ON URL IS SOMEWHERE THIS DEPLOYMENT WILL SEND A BROWSER, so it has to be an
+    // absolute HTTPS URL. A relative value, or an http one, would be a redirect off this origin
+    // to somewhere unprotected -- chosen by a link holder, which is the wrong party.
+    if !idp_sso_url.starts_with("https://") {
+        return setup_refusal("the sign-on URL has to be an https:// address");
+    }
+
+    let Some(der) = decode_certificate(&form.certificate) else {
+        return setup_refusal("the certificate is not base64 or is too large");
+    };
+    // PARSED HERE so the admin is told NOW. The consumer parses it again from the row, for the
+    // reason `queue_pin` gives.
+    if ironauth_saml::x509::pinned(&der).is_err() {
+        return setup_refusal("the certificate does not parse as X.509");
+    }
+
+    let id = ironauth_store::SamlConnectionId::generate(state.env(), &scope);
+    if queue_saml_setup(
+        &state,
+        &session,
+        &id,
+        display_name,
+        idp_entity_id,
+        idp_sso_url,
+        &der,
+    )
+    .await
+    .is_err()
+    {
+        return PortalRefusal::Unavailable.into_response();
+    }
+    // BACK TO THE SURFACE, where the new connection appears with its copy-paste values and its
+    // test form. The page is the confirmation.
+    let surface = format!(
+        "/t/{}/e/{}/portal/s/sso",
+        scope.tenant(),
+        scope.environment()
+    );
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, surface),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+    )
+        .into_response()
+}
+
+/// The longest DISPLAY NAME this surface accepts, which is the column's own bound.
+///
+/// # It is the column's, not a number of its own
+///
+/// `saml_connections_display_name_bounded` is `octet_length(display_name) <= 252`. A looser
+/// check here accepts a value the storage engine refuses, and because the write happens in a
+/// WORKER the refusal lands in a dead letter -- so the admin is answered 303, told nothing, and
+/// their connection never appears. An earlier version of this constant was 512, which is exactly
+/// that shape: twice what the column takes.
+///
+/// OCTETS, NOT CHARACTERS, because that is what the constraint counts: a name of 252 accented
+/// characters is over 252 bytes and the column refuses it.
+const SETUP_NAME_MAX: usize = 252;
+
+/// The longest URI-shaped value this surface accepts.
+///
+/// The columns bound `idp_entity_id` at 1024 octets and `idp_sso_url` at 2048; this is the
+/// tighter of the two applied to both, because a value between them would be accepted for one
+/// field and rejected for the other by the same form.
+const SETUP_URI_MAX: usize = 1024;
+
+/// Queue the connection for the control plane to create.
+///
+/// # What the row carries, and what it does not
+///
+/// The admin's three values, the two this deployment owns, the name identifier format, and the
+/// certificate DER. None of it is secret: the DER is what an identity provider publishes and
+/// the rest is configuration the admin just typed and can see on the page.
+///
+/// THE AUDIENCE AND THE REPLY URL TRAVEL ON THE ROW rather than being re-derived in the worker,
+/// and that is deliberate. They are what the page PRINTED and what the admin pasted into their
+/// provider's console minutes earlier. A worker that derived them again from configuration would
+/// be a second derivation of one pair of strings, and the day the two disagreed the admin would
+/// get a wrong-audience refusal on a setup they performed exactly as instructed.
+async fn queue_saml_setup(
+    state: &OidcState,
+    session: &PortalSession,
+    id: &ironauth_store::SamlConnectionId,
+    display_name: &str,
+    idp_entity_id: &str,
+    idp_sso_url: &str,
+    der: &[u8],
+) -> Result<(), ironauth_store::StoreError> {
+    use base64::Engine as _;
+
+    let base = state.issuer_base().trim_end_matches('/');
+    state
+        .store()
+        .scoped(session.scope())
+        .outbox()
+        .enqueue_once(
+            state.env(),
+            &ironauth_store::NewOutboxMessage {
+                consumer: ironauth_store::SAML_CONNECTION_SETUP_CONSUMER,
+                // THE CONNECTION ID, which this handler minted and which is unique per
+                // submission. A double-submit from a retrying browser mints two ids and
+                // creates two connections -- and that is the RIGHT outcome here, because the
+                // alternative is keying on the admin's values, where two organizations
+                // federating with the same identity provider (which is ordinary) would collide
+                // and the second would never be created at all. The pin request beside this
+                // records exactly that failure. A duplicate connection is visible on the page
+                // and the admin can ask for it to be removed; a connection that silently never
+                // existed is not.
+                //
+                // SO `enqueue_once` COLLAPSES NOTHING HERE and behaves as `enqueue` would. It
+                // is written this way because the key is the thing this row is ABOUT, and a
+                // reader should not have to work out whether two submissions can collide --
+                // they cannot, and the sentence above is why that is deliberate.
+                //
+                // WHAT A DOUBLE-SUBMIT ACTUALLY PRODUCES is not two connections either, and the
+                // sentence above overstated it: the second create hits
+                // `saml_connections_one_per_idp` -- one connection per identity provider per
+                // organization -- and the consumer now dead-letters that rather than silently
+                // discarding it. So the admin gets one connection and an operator gets told
+                // about the other, which is the outcome the constraint exists to produce.
+                idempotency_key: &id.to_string(),
+                // THE ORGANIZATION, so two setups for one customer are applied in the order
+                // they were made and setups for different customers never wait on each other.
+                ordering_key: &session.organization().to_string(),
+                payload: serde_json::json!({
+                    "saml_connection_id": id.to_string(),
+                    "organization_id": session.organization().to_string(),
+                    "display_name": display_name,
+                    "idp_entity_id": idp_entity_id,
+                    "idp_sso_url": idp_sso_url,
+                    // DERIVED FROM THE ID JUST MINTED, which is why the form cannot supply
+                    // them and why the page cannot print them before the connection exists:
+                    // both paths NAME the connection. `saml_connections::create` on the
+                    // management plane derives the identical pair from the identical id, and
+                    // the two must agree -- `saml_acs` compares an assertion's `Recipient`
+                    // against the stored `acs_url`, so a connection created here with a
+                    // different shape would refuse every response its provider sends.
+                    "sp_entity_id": format!(
+                        "{base}/t/{tenant}/e/{environment}/saml/metadata/{id}",
+                        tenant = session.scope().tenant(),
+                        environment = session.scope().environment(),
+                    ),
+                    "acs_url": format!(
+                        "{base}/t/{tenant}/e/{environment}/saml/acs/{id}",
+                        tenant = session.scope().tenant(),
+                        environment = session.scope().environment(),
+                    ),
+                    // THE DEFAULT THIS DEPLOYMENT ASKS FOR, and not the admin's to choose: the
+                    // format is part of the identity, and a portal link holder picking
+                    // `transient` would key their colleagues' accounts to values that are never
+                    // seen again.
+                    "nameid_format": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+                    "certificate_der_base64":
+                        base64::engine::general_purpose::STANDARD.encode(der),
+                }),
+            },
+        )
+        .await
+        .map(|_| ())
+}
+
+/// The one refusal this surface gives, whatever went wrong.
+///
+/// A REASON, unlike `renewal_refusal`'s uniform page, and the difference is who is reading. A
+/// renewal link goes to whoever administers the customer's identity provider and its refusals
+/// are about rows that may not be theirs, so telling them apart would enumerate an environment.
+/// Everything refused here is about the FORM THEY JUST TYPED, and a setup surface that answered
+/// "no" without saying which field is the generic error #140 criterion 6 is about.
+fn setup_refusal(reason: &str) -> Response {
+    crate::pages::secure_html(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>SSO setup</title>\
+             <h1>SSO setup</h1><p>{reason}.</p>",
+            reason = escape_html(reason)
+        ),
+    )
+}
+
+/// What an IT admin fills in to set up provisioning from the portal (#140 criterion 1).
+#[derive(Debug, serde::Deserialize)]
+pub struct ScimSetupForm {
+    /// What the customer wants to call this connection.
+    pub display_name: String,
+    /// Which provider it is: the guides and the status column key on this.
+    pub provider: String,
+}
+
+/// `POST /t/{tenant}/e/{environment}/portal/s/scim/connections`: set up provisioning.
+///
+/// # The token is minted HERE and shown ONCE
+///
+/// The admin needs a bearer token to paste into their identity provider, and this is the only
+/// moment this deployment can give it to them: nothing keeps a copy, because
+/// `scim_connections` holds a DIGEST and that is the whole point of holding a digest.
+///
+/// MINTED IN THE PORTAL RATHER THAN IN THE WORKER, which decides everything else about this
+/// handler. A worker that minted it would have to hand it back -- a second store, a second
+/// read, and a window in which a live credential sits somewhere waiting to be collected -- and
+/// the queue row would carry the plaintext, which is a durable row every replica reads and
+/// which outlives the connection in backups. Minting here means only the SHA-256 travels, and
+/// the plaintext exists in exactly one HTTP response.
+///
+/// THE TOKEN NAMES ITS OWN CONNECTION, `{scim_id}.{secret}`, so the id has to be minted here
+/// too and carried on the row. `ironauth-scim`'s `authenticate` reads the scope out of that
+/// first half before any query runs.
+///
+/// # It is queued, not written
+///
+/// 0183 grants `scim_connections` INSERT to `ironauth_control` alone. `queue_saml_setup` beside
+/// this makes the same argument at more length.
+///
+/// # The page says the token is not repeatable
+///
+/// Beside the value rather than after it, because an admin who scrolls past and comes back has
+/// no second chance: rotation is the remedy, and it is the same remedy an operator has.
+pub async fn scim_setup_post(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::Form(form): axum::Form<ScimSetupForm>,
+) -> Response {
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return refused();
+    };
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+    let session = match resolve_session(&state, scope, &headers).await {
+        Ok(session) => session,
+        Err(refusal) => return refusal.into_response(),
+    };
+    if let Err(refusal) = session.require_intent("scim") {
+        return refusal.into_response();
+    }
+    // AND THE SURFACE MUST BE SERVED, exactly as the token check requires. Minting a credential
+    // for an endpoint this deployment answers with a uniform 404 would hand an admin something
+    // that cannot work and tell them they are finished.
+    if !state.scim_surface_enabled() {
+        return PortalRefusal::NotFound.into_response();
+    }
+
+    let display_name = form.display_name.trim();
+    if display_name.is_empty() {
+        return setup_refusal("the connection needs a name");
+    }
+    if display_name.len() > SETUP_NAME_MAX {
+        return setup_refusal("that name is longer than this deployment will store");
+    }
+    // THE PROVIDER IS A CLOSED SET, checked HERE rather than left to the column's CHECK
+    // constraint. The constraint would refuse it in the worker, where the admin is not looking
+    // and the only trace is a dead letter -- and the set is what the setup guides key on, so a
+    // value outside it is a connection with no guide.
+    let provider = form.provider.trim();
+    let Some((provider, _)) = provider_choice(provider) else {
+        return setup_refusal("choose one of Okta, Microsoft Entra, or another provider");
+    };
+
+    let id = ironauth_store::ScimConnectionId::generate(state.env(), &scope);
+    let token = mint_scim_token(&state, &id);
+    let digest = ironauth_store::scim_token_digest(&token);
+    if queue_scim_setup(&state, &session, &id, display_name, provider, &digest)
+        .await
+        .is_err()
+    {
+        return PortalRefusal::Unavailable.into_response();
+    }
+
+    // THE ONE PAGE THE TOKEN APPEARS ON. Not a redirect: a 303 back to the surface would lose
+    // the only copy of a credential this deployment cannot produce again.
+    let scim_base = format!("{}/scim/v2", state.issuer_base());
+    let body = format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Provisioning set up</title>\
+         <h1>Provisioning set up</h1>\
+         <p>Paste these two values into {provider}:</p>\
+         <p>Base URL: <code>{base}</code></p>\
+         <p>Token: <code>{token}</code></p>\
+         <p><strong>Copy the token now.</strong> It is shown once and this deployment keeps no \
+         copy of it. If you lose it, ask your vendor to rotate the token, which gives you a new \
+         one and an overlap to paste it in.</p>\
+         <p>The connection itself is being created and appears on the provisioning page in a \
+         moment. If it has not after a few minutes, tell your vendor: the token you are holding \
+         cannot work until it does.</p>\
+         <p><a href=\"{surface}\">Back to provisioning</a></p>",
+        // THE PROVIDER'S NAME, not its stored slug: "Paste these two values into generic" is
+        // not a sentence, and the page is read by somebody looking at their provider's console.
+        provider = escape_html(provider_label(provider)),
+        base = escape_html(&scim_base),
+        token = escape_html(&token),
+        surface = escape_html(&format!(
+            "{}/t/{}/e/{}/portal/s/scim",
+            state.issuer_base().trim_end_matches('/'),
+            scope.tenant(),
+            scope.environment()
+        )),
+    );
+    crate::pages::secure_html(StatusCode::OK, body)
+}
+
+/// The stored, secret-free connector document for an admin's OIDC upstream.
+///
+/// # It goes through `ConnectorDefinition`, which is the point
+///
+/// The management API composes what it stores by parsing that type, VALIDATING it, and
+/// serialising `secret_free_json`. A hand-built object here would be a shape nothing checks: it
+/// would store, and fail later, at sign-in, as "the connection does not work" with no page able
+/// to say why. The first version of this function built one, and it was wrong -- the type
+/// refused its `client_secret` shape, which nothing would have noticed until a sign-in.
+///
+/// WHAT THE SIGN-IN PATH READS IS A THIRD TYPE, `ConnectorRuntimeConfig`, and going through
+/// `ConnectorDefinition` is what makes the stored document satisfy it: the projection is exactly
+/// what the management plane stores, and that is the document the runtime has always parsed.
+///
+/// # What it fixes, and what it leaves to the operator
+///
+/// Everything the admin supplied is in it. Everything that decides how much this deployment
+/// TRUSTS the upstream is left at the type's own defaults -- the capability matrix, the claim
+/// mapping, the quirks -- which is the same decision `oidc_upstream_setup` makes for the
+/// capability COLUMNS, and for the same reason: those are the operator's.
+///
+/// `None` means this deployment composed a document its own type refuses, which is a bug here
+/// rather than anything the admin typed.
+fn connector_definition(
+    slug: &str,
+    display_name: &str,
+    issuer: &str,
+    client_id: &str,
+) -> Option<String> {
+    // THE SECRET IS NOT IN IT. `secret_free_json` strips the field, and the portal seals the
+    // real value separately -- so the placeholder below never reaches storage and never reaches
+    // a queue. It is present only because the type requires the field to parse.
+    let document = serde_json::json!({
+        "connector_id": slug,
+        "display_name": display_name,
+        "protocol": "oidc",
+        "endpoints": { "issuer": issuer },
+        "scopes": ["openid", "email"],
+        "client_id": client_id,
+        "client_secret": "placeholder",
+    });
+    let definition: ironauth_connector::ConnectorDefinition =
+        serde_json::from_value(document).ok()?;
+    definition.validate().ok()?;
+    definition
+        .secret_free_json()
+        .ok()
+        .map(|value| value.to_string())
+}
+
+/// The providers this form offers, as `(stored slug, what to call it on a page)`.
+///
+/// # One list, because there were nearly three
+///
+/// The slug is validated here, rendered here, and CHECKED by the column: migration 0183 has
+/// `CHECK (provider IN ('okta', 'entra', 'generic'))`, which is the authority. A set spelled
+/// separately in the validation and in the label is two places to add a provider and one place
+/// to forget -- and the failure is asymmetric: a slug the validation accepts and the label does
+/// not is a page that says "Paste these two values into" and then the wrong thing, while a slug
+/// the column refuses fails in a worker where nobody is looking.
+///
+/// THE LABEL FOR `generic` IS NOT A PRODUCT NAME, so the sentence it appears in has to read
+/// without one. Printing the slug would put "Paste these two values into generic" in front of
+/// somebody looking at their provider's console.
+///
+/// It does NOT include the setup guides, which key on the same slug in `portal_guides` -- that
+/// module owns its own mapping and a connection created before a guide exists still renders.
+const PROVIDER_CHOICES: [(&str, &str); 3] = [
+    ("okta", "Okta"),
+    ("entra", "Microsoft Entra"),
+    ("generic", "your identity provider"),
+];
+
+/// The `<option>` elements of the provider picker, from the one list.
+///
+/// A FORM THAT OFFERED A SLUG THE HANDLER REFUSES would be a page whose own control produces a
+/// 400, which is the shape this list exists to make unrepresentable.
+fn provider_options() -> String {
+    let mut out = String::new();
+    for (slug, label) in PROVIDER_CHOICES {
+        let _ = write!(
+            out,
+            "<option value=\"{slug}\">{label}</option>",
+            slug = escape_html(slug),
+            label = escape_html(label),
+        );
+    }
+    out
+}
+
+/// The choice a submitted slug names, or `None` when it names none.
+fn provider_choice(provider: &str) -> Option<(&'static str, &'static str)> {
+    PROVIDER_CHOICES
+        .into_iter()
+        .find(|(slug, _)| *slug == provider)
+}
+
+/// What to call a provider on a page a customer reads.
+fn provider_label(provider: &str) -> &str {
+    provider_choice(provider).map_or("your identity provider", |(_, label)| label)
+}
+
+/// A provisioning bearer token for a connection: `{scim_id}.{secret}`.
+///
+/// # The shape is not decoration
+///
+/// `ironauth-scim`'s `authenticate` splits on the full stop and decodes the first half to a
+/// SCOPE before any query runs, so a token without it is refused before it is looked up. The
+/// portal's own token check compares that half to the connection a reader names. Minting
+/// anything else here would produce a credential this deployment refuses.
+///
+/// THE SECRET IS THE SAME WIDTH every other bearer credential in this deployment uses, from the
+/// same entropy source, because a provisioning token is a standing credential for an identity
+/// provider that will present it thousands of times.
+fn mint_scim_token(state: &OidcState, id: &ironauth_store::ScimConnectionId) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let mut bytes = [0_u8; 32];
+    state.env().entropy().fill_bytes(&mut bytes);
+    format!("{id}.{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Queue the connection for the control plane to create.
+///
+/// # Only the digest
+///
+/// The plaintext token is never written here, and the row this enqueues is durable, replicated
+/// and backed up. A digest is not a credential: it is what `scim_connections` already stores and
+/// what `authenticate` already compares against.
+async fn queue_scim_setup(
+    state: &OidcState,
+    session: &PortalSession,
+    id: &ironauth_store::ScimConnectionId,
+    display_name: &str,
+    provider: &str,
+    token_digest: &str,
+) -> Result<(), ironauth_store::StoreError> {
+    state
+        .store()
+        .scoped(session.scope())
+        .outbox()
+        .enqueue_once(
+            state.env(),
+            &ironauth_store::NewOutboxMessage {
+                consumer: ironauth_store::SCIM_CONNECTION_SETUP_CONSUMER,
+                // THE CONNECTION ID, unique per submission, for the reason `queue_saml_setup`
+                // gives. Here there is a second reason and it is stronger: the admin has ALREADY
+                // been shown a token naming this id, so collapsing two submissions onto one row
+                // would leave one of the two tokens they hold referring to nothing.
+                idempotency_key: &id.to_string(),
+                ordering_key: &session.organization().to_string(),
+                payload: serde_json::json!({
+                    "scim_connection_id": id.to_string(),
+                    "organization_id": session.organization().to_string(),
+                    "display_name": display_name,
+                    "provider": provider,
+                    "token_digest": token_digest,
+                }),
+            },
+        )
+        .await
+        .map(|_| ())
+}
+
+/// What an IT admin fills in to set up an OpenID Connect upstream (#140 criterion 1).
+#[derive(Debug, serde::Deserialize)]
+pub struct OidcSetupForm {
+    /// What the customer wants to call it. Becomes the connector's slug.
+    pub display_name: String,
+    /// The provider's issuer URL.
+    pub issuer: String,
+    /// The client id the provider assigned to this deployment.
+    pub client_id: String,
+    /// The client secret it assigned alongside.
+    pub client_secret: String,
+}
+
+/// `POST /t/{tenant}/e/{environment}/portal/s/sso/oidc`: set up an OIDC upstream.
+///
+/// # The third setup surface, and the one with a secret to move
+///
+/// Its siblings queue public material (a certificate) and a digest. This has to carry an
+/// upstream CLIENT SECRET to a control plane that is the only role allowed to insert a
+/// connector, across an outbox row that is durable, replicated, and in backups long after the
+/// connector is gone.
+///
+/// SO IT SEALS BEFORE IT QUEUES, under this scope and the connector id it mints, exactly as
+/// `ConnectorRepo::open_client_secret` expects to find it. The worker stores the bytes verbatim
+/// and never holds the plaintext.
+///
+/// # The redirect URI is derived, not asked for
+///
+/// It names this deployment and the connector, so it cannot exist before the connector does --
+/// the same two-step the SAML form explains. The page prints it once the upstream is there,
+/// through `federation_callback_url`, which is the function the flow itself uses: a second
+/// spelling is how a page comes to print an address the callback route does not serve.
+pub async fn oidc_setup_post(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::Form(form): axum::Form<OidcSetupForm>,
+) -> Response {
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return refused();
+    };
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+    let session = match resolve_session(&state, scope, &headers).await {
+        Ok(session) => session,
+        Err(refusal) => return refusal.into_response(),
+    };
+    if let Err(refusal) = session.require_intent("sso") {
+        return refusal.into_response();
+    }
+
+    let display_name = form.display_name.trim();
+    let issuer = form.issuer.trim();
+    let client_id = form.client_id.trim();
+    let client_secret = form.client_secret.trim();
+    if display_name.is_empty() || issuer.is_empty() || client_id.is_empty() {
+        return setup_refusal("every field except the secret is required");
+    }
+    if display_name.len() > SETUP_NAME_MAX {
+        return setup_refusal("that name is longer than this deployment will store");
+    }
+    if issuer.len() > SETUP_URI_MAX
+        || client_id.len() > SETUP_URI_MAX
+        || client_secret.len() > SETUP_URI_MAX
+    {
+        return setup_refusal("one of those values is longer than this deployment will store");
+    }
+    // THE ISSUER IS WHERE THIS DEPLOYMENT WILL FETCH METADATA AND SEND A BROWSER, so it has to
+    // be absolute and https for the reason the SAML form's sign-on URL does.
+    if !issuer.starts_with("https://") {
+        return setup_refusal("the issuer has to be an https:// address");
+    }
+    // THE SLUG IS AN OPERATOR-VISIBLE IDENTIFIER and it goes in URLs, so it is derived from the
+    // name rather than taken raw: a display name is prose and a slug is not.
+    if slugify(display_name).is_empty() {
+        return setup_refusal("that name has no letters or digits to make an identifier from");
+    }
+    let connector_id = ironauth_store::ConnectorId::generate(state.env(), &scope);
+    // AND IT CARRIES THE CONNECTOR'S OWN ID, which is what makes it unique and unguessable.
+    //
+    // `connectors_slug_idx` is UNIQUE on (tenant, environment, connector_slug) -- SCOPE-wide,
+    // not per-organization. A slug derived from the display name alone therefore collides the
+    // moment two of a deployment's customers both call their upstream "Okta", and the loser's
+    // whole setup is silently discarded. It also lets whoever submits first squat any name in
+    // the shared environment.
+    //
+    // THE ENTROPY MATTERS FOR A SECOND REASON. `issue_upstream_authorize` resolves a connector
+    // by this slug and gates on `enabled` alone -- no organization, no binding, no session, on
+    // an unauthenticated route -- so a guessable slug is an addressable federation entry point.
+    // The suffix makes it neither enumerable nor squattable.
+    let slug = slugify_for(display_name, &connector_id);
+    let read = state.store().scoped(scope);
+    // SEALED BEFORE ANYTHING IS QUEUED. A failure here is this deployment's -- no platform key,
+    // or a scope with no data-encryption key yet -- and never the admin's, so it answers with
+    // the unavailable page rather than a refusal blaming their input.
+    let Ok((sealed, dek_version)) = read
+        .acting(
+            // A SERVICE ACTOR, because what this writes is not the admin's act: sealing may
+            // PROVISION the scope's envelope keys, which is a system action and is audited as
+            // one. The connector the secret belongs to is audited when the control plane
+            // creates it.
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(state.env())),
+            ironauth_store::CorrelationId::generate(state.env()),
+        )
+        .connectors()
+        .seal_client_secret(state.env(), &connector_id, client_secret.as_bytes())
+        .await
+    else {
+        return PortalRefusal::Unavailable.into_response();
+    };
+
+    // THROUGH THE RUNTIME'S OWN TYPE, not hand-serialised. What is stored has to be a document
+    // `ConnectorDefinition` can read, because that is what the federation flow parses at every
+    // sign-in -- and a hand-built object that the type later stops accepting produces a
+    // connector which exists, looks configured, and fails at sign-in with nothing on any page to
+    // explain it. The management API builds its stored document the same way, through
+    // `validate` and `secret_free_json`, so the two planes cannot disagree about the shape.
+    //
+    // AND A FAILURE HERE IS USUALLY THE ADMIN'S ISSUER, which an earlier version of this
+    // comment denied -- it said "every value they supplied has already been checked", and the
+    // check above is a `starts_with("https://")` while `validate` refuses a great deal more: a
+    // query string, a fragment, an empty authority. Answering those with the unavailable page
+    // would blame this deployment for a value the reader typed and can fix, on the surface that
+    // exists to tell them which field is wrong.
+    let Some(definition) = connector_definition(&slug, display_name, issuer, client_id) else {
+        return setup_refusal(
+            "this deployment cannot use that issuer. It has to be a plain https:// address with \
+             no query string and no fragment",
+        );
+    };
+    let binding_id = ironauth_store::OrgConnectionId::generate(state.env(), &scope);
+    if queue_oidc_setup(
+        &state,
+        &session,
+        &connector_id,
+        &binding_id,
+        &slug,
+        &definition,
+        &sealed,
+        dek_version,
+    )
+    .await
+    .is_err()
+    {
+        return PortalRefusal::Unavailable.into_response();
+    }
+    let surface = format!(
+        "/t/{}/e/{}/portal/s/sso",
+        scope.tenant(),
+        scope.environment()
+    );
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, surface),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+    )
+        .into_response()
+}
+
+/// An operator-visible identifier derived from a display name.
+///
+/// LOWERCASE ASCII ALPHANUMERICS AND HYPHENS, with runs collapsed and the ends trimmed. The slug
+/// is unique per scope and appears in operator tooling, so what it must not be is the admin's
+/// prose: a name with a slash or a space in it would make a value that reads as a path.
+fn slugify_for(name: &str, id: &ironauth_store::ConnectorId) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    // A HASH OF THE ID, not a slice of it, and the difference is the whole point.
+    //
+    // `ConnectorDefinition::validate` requires a slug of LOWERCASE ASCII alphanumerics, hyphens
+    // and underscores, and an id prints as mixed-case base64url. A first version took its last
+    // twelve characters, lowercased them and dropped the rest -- which is LOSSY: two different
+    // ids differing only in the case of a character, or only in a `-` against a `_`, produce the
+    // same suffix. That reintroduces the collision this suffix exists to remove, and quietly,
+    // since the collision is then between two customers rather than inside one.
+    //
+    // A DIGEST IS LOWERCASE HEX BY CONSTRUCTION, so nothing is dropped to make it fit, and two
+    // ids collide only if SHA-256 does. Sixteen characters is sixty-four bits, which is not
+    // guessable and is short enough that the slug still reads as the name an operator gave it.
+    let digest = Sha256::digest(id.to_string().as_bytes());
+    let mut suffix = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        use std::fmt::Write as _;
+        let _ = write!(suffix, "{byte:02x}");
+    }
+    format!("{base}-{suffix}", base = slugify(name))
+}
+
+/// The slug body derived from a display name, before the id suffix.
+fn slugify(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            out.extend(character.to_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_owned()
+}
+
+/// Queue the upstream for the control plane to create.
+#[allow(clippy::too_many_arguments)]
+async fn queue_oidc_setup(
+    state: &OidcState,
+    session: &PortalSession,
+    connector_id: &ironauth_store::ConnectorId,
+    binding_id: &ironauth_store::OrgConnectionId,
+    slug: &str,
+    definition: &str,
+    sealed: &[u8],
+    dek_version: i32,
+) -> Result<(), ironauth_store::StoreError> {
+    use base64::Engine as _;
+
+    state
+        .store()
+        .scoped(session.scope())
+        .outbox()
+        .enqueue_once(
+            state.env(),
+            &ironauth_store::NewOutboxMessage {
+                consumer: ironauth_store::OIDC_UPSTREAM_SETUP_CONSUMER,
+                // THE CONNECTOR ID, unique per submission, for the reason `queue_saml_setup`
+                // gives -- and here a second one that is specific to this surface: the SEALED
+                // secret's AAD binds it to this id, so two submissions could not share a row
+                // even if the key let them.
+                idempotency_key: &connector_id.to_string(),
+                ordering_key: &session.organization().to_string(),
+                payload: serde_json::json!({
+                    "connector_id": connector_id.to_string(),
+                    "binding_id": binding_id.to_string(),
+                    "organization_id": session.organization().to_string(),
+                    "slug": slug,
+                    "definition_json": definition,
+                    // SEALED, NOT PLAINTEXT. See this module's handler doc and the consumer's.
+                    "client_secret_sealed_base64":
+                        base64::engine::general_purpose::STANDARD.encode(sealed),
+                    "client_secret_dek_version": dek_version,
+                    // THE CLOCK SAMPLE TRAVELS, so a redelivery writes the same `created_at` the
+                    // first attempt would have. A worker reading its own clock would give one
+                    // connector two creation times depending on which attempt won.
+                    "created_at_unix_micros": epoch_micros(state.env().clock().now_utc()),
+                }),
+            },
+        )
+        .await
+        .map(|_| ())
 }

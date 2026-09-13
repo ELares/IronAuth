@@ -60,8 +60,8 @@ pub(crate) fn guide_for(provider: &str, scim_base: &str) -> SetupGuide {
             steps: vec![
                 "Tick Enable API integration.".to_owned(),
                 format!("Put {scim_base} in the Base URL field."),
-                "Put the token your vendor gave you in the API Token field. It is shown once, \
-                 when the connection is created or its token is rotated, and cannot be read back \
+                "Put the token from this page in the API Token field. It is shown once, when \
+                 you add the connection or its token is rotated, and cannot be read back \
                  afterwards -- ask your vendor to rotate it if you no longer have it."
                     .to_owned(),
                 "Select Test API Credentials, then Save.".to_owned(),
@@ -77,8 +77,8 @@ pub(crate) fn guide_for(provider: &str, scim_base: &str) -> SetupGuide {
             steps: vec![
                 "Set Provisioning Mode to Automatic.".to_owned(),
                 format!("Put {scim_base} in the Tenant URL field."),
-                "Put the token your vendor gave you in the Secret Token field. It is shown once, \
-                 when the connection is created or its token is rotated, and cannot be read back \
+                "Put the token from this page in the Secret Token field. It is shown once, when \
+                 you add the connection or its token is rotated, and cannot be read back \
                  afterwards -- ask your vendor to rotate it if you no longer have it."
                     .to_owned(),
                 "Select Test Connection, then Save.".to_owned(),
@@ -98,10 +98,10 @@ pub(crate) fn guide_for(provider: &str, scim_base: &str) -> SetupGuide {
                     "Set the SCIM 2.0 base URL to {scim_base}. Your provider may call this the \
                      base URL, the tenant URL, or the endpoint."
                 ),
-                "Set the authentication method to a bearer token, and use the token your vendor \
-                 gave you. It is shown once, when the connection is created or its token is \
-                 rotated, and cannot be read back afterwards -- ask your vendor to rotate it if \
-                 you no longer have it."
+                "Set the authentication method to a bearer token, and use the token from this \
+                 page. It is shown once, when you add the connection or its token is rotated, \
+                 and cannot be read back afterwards -- ask your vendor to rotate it if you no \
+                 longer have it."
                     .to_owned(),
                 "Enable user provisioning, and group provisioning if your provider offers it \
                  separately."
@@ -170,7 +170,8 @@ pub(crate) fn saml_guide_for(
                  who sign in arrive with names rather than only an identifier."
                     .to_owned(),
                 "Save, then use View SAML setup instructions to copy Okta's signing \
-                 certificate and give it to your vendor."
+                 certificate, and paste it into the form on this page when you add the \
+                 connection."
                     .to_owned(),
             ],
         },
@@ -205,9 +206,10 @@ pub(crate) fn saml_guide_for(
                 "Under Attribute mapping map Primary email to email, First name to firstName \
                  and Last name to lastName."
                     .to_owned(),
-                "Back on the app's page download the IDP metadata and give it to your vendor, \
-                 then turn the app ON for the right organizational units -- a Google SAML app \
-                 is off for everyone until you do, and the sign-in fails with no other sign."
+                "Back on the app's page download the IDP metadata, take the signing \
+                 certificate out of it for the form on this page, then turn the app ON for the \
+                 right organizational units -- a Google SAML app is off for everyone until you \
+                 do, and the sign-in fails with no other sign."
                     .to_owned(),
             ],
         },
@@ -237,8 +239,8 @@ pub(crate) fn saml_guide_for(
                     .to_owned(),
             );
             steps.push(
-                "Give your vendor your provider's signing certificate, or the URL of its \
-                 metadata document."
+                "Copy your provider's signing certificate and paste it into the form on this \
+                 page when you add the connection."
                     .to_owned(),
             );
             SetupGuide {
@@ -289,7 +291,14 @@ pub(crate) fn upstream_guide(protocol: Option<&str>, redirect_uri: &str) -> Setu
                  tell you: there is no OpenID Connect here, so there is no openid scope and no \
                  discovery document to point at."
                     .to_owned(),
-                "Give your vendor the client id and the client secret.".to_owned(),
+                // STILL THE VENDOR, and deliberately: the form on this page creates an
+                // OPENID CONNECT upstream, and an OAuth 2.0 one has no issuer to discover from.
+                // Telling this reader to use that form would send them to a field their
+                // provider cannot fill.
+                "Give your vendor the client id and the client secret. The form on this page \
+                 adds OpenID Connect upstreams, which need an issuer URL your provider does \
+                 not have."
+                    .to_owned(),
             ],
         },
         Some("oidc") => SetupGuide {
@@ -301,8 +310,8 @@ pub(crate) fn upstream_guide(protocol: Option<&str>, redirect_uri: &str) -> Setu
                 "Grant the openid, profile and email scopes, so the people who sign in arrive \
                  with a name and an address rather than only an identifier."
                     .to_owned(),
-                "Give your vendor the client id, the client secret, and your provider's issuer \
-                 URL -- the one its discovery document sits under."
+                "Put the client id, the client secret, and your provider's issuer URL -- the \
+                 one its discovery document sits under -- into the form on this page."
                     .to_owned(),
             ],
         },

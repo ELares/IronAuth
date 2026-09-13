@@ -19,6 +19,9 @@ use ironauth_admin::flow_target_delivery::{FlowTargetDeliveryConsumer, FlowTarge
 use ironauth_admin::message_composer::DefaultComposer;
 use ironauth_admin::message_http_provider::HttpMessageProvider;
 use ironauth_admin::offboarding_worker::OffboardingConsumer;
+use ironauth_admin::oidc_upstream_setup::OidcUpstreamSetupConsumer;
+use ironauth_admin::saml_connection_setup::SamlConnectionSetupConsumer;
+use ironauth_admin::scim_connection_setup::ScimConnectionSetupConsumer;
 use ironauth_admin::scim_push_scheduler::{
     ScimPushObserver, ScimPushScheduler, ScimPushSchedulerInputs,
 };
@@ -2412,6 +2415,21 @@ fn portal_write_consumers(control_store: &ironauth_store::Store) -> Vec<Arc<dyn 
         Arc::new(CertificatePinRequestConsumer::new(control_store.clone()))
             as Arc<dyn OutboxConsumer>,
         Arc::new(ContactChangeConsumer::new(control_store.clone())) as Arc<dyn OutboxConsumer>,
+        // AND THE SETUP (issue #140 criterion 1), which is the same shape for the same reason:
+        // `saml_connections` INSERT is the control plane's, and the portal is a data-plane
+        // surface. A deployment serving the portal serves this too, so it rides the same worker
+        // -- and a connection queued with no consumer draining it is a customer who filled in
+        // the form and waits forever.
+        Arc::new(SamlConnectionSetupConsumer::new(control_store.clone()))
+            as Arc<dyn OutboxConsumer>,
+        // AND THE PROVISIONING HALF of the same criterion, for the same reason: 0183 grants
+        // `scim_connections` INSERT to the control plane and the portal is a data-plane surface.
+        Arc::new(ScimConnectionSetupConsumer::new(control_store.clone()))
+            as Arc<dyn OutboxConsumer>,
+        // AND THE OIDC HALF of the SSO setup, whose row carries a SEALED upstream secret: the
+        // portal sealed it, this opens nothing, and only the control plane may insert a
+        // connector.
+        Arc::new(OidcUpstreamSetupConsumer::new(control_store.clone())) as Arc<dyn OutboxConsumer>,
     ]
 }
 

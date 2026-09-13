@@ -563,8 +563,20 @@ pub fn oidc_router(state: OidcState) -> Router {
         // reason the two above have one: the surface route stays a read, and the form that means
         // to reach a diagnosis is the only thing that does.
         .route(
+            "/t/{tenant_id}/e/{environment_id}/portal/s/sso/saml",
+            post(portal_route::saml_setup_post),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/portal/s/sso/oidc",
+            post(portal_route::oidc_setup_post),
+        )
+        .route(
             "/t/{tenant_id}/e/{environment_id}/portal/s/sso/test",
             post(portal_route::connection_test_post),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/portal/s/scim/connections",
+            post(portal_route::scim_setup_post),
         )
         .route(
             "/t/{tenant_id}/e/{environment_id}/portal/s/scim/test",
