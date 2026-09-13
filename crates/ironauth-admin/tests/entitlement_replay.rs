@@ -9,8 +9,9 @@
 //!
 //! The entitlement facts are folded out of the feed: which memberships exist and whose they
 //! are, which groups exist and how they nest, who is in which group, which role reaches which
-//! group or membership, which role the organization hands out by default, whether the
-//! organization is still active, and every withdrawal of each. The snapshot is then resolved
+//! group or membership, which role the organization hands out by default, which time-boxed
+//! grants an approver has approved, whether the organization is still active, and every
+//! withdrawal of each. All four of the export's grant sources are in the comparison. The snapshot is then resolved
 //! through an ancestor walk mirroring the server's closure and compared against the
 //! access-review export for the same organization.
 //!
@@ -104,6 +105,8 @@ struct Replay {
     inactive_orgs: BTreeSet<String>,
     /// Subjects whose own row is gone, taking their memberships' grants with it.
     dead_subjects: BTreeSet<String>,
+    /// Approved time-boxed grants, as `(organization, subject, role slug)`.
+    time_boxed: BTreeSet<(String, String, String)>,
 }
 
 impl Replay {
@@ -172,6 +175,19 @@ impl Replay {
             }
             "organization.default_role_cleared" => {
                 self.default_role.remove(&field("organization_id"));
+            }
+            // THE FOURTH SOURCE the export can report. Unlike every other arm this one names
+            // the role by SLUG rather than by id, because that is what the payload carries --
+            // the access-request table matches on the slug too, which is why raising one for a
+            // role the organization does not define is refused at the raise.
+            "access_request.decided" => {
+                if payload["approved"].as_bool() == Some(true) {
+                    self.time_boxed.insert((
+                        field("organization_id"),
+                        field("subject_id"),
+                        field("role_slug"),
+                    ));
+                }
             }
             "org_role.created" => {
                 self.roles
@@ -303,6 +319,28 @@ impl Replay {
 
             if let Some(role) = self.default_role.get(organization) {
                 push(role, "default", "");
+            }
+
+            // THE TIME-BOXED PATH, keyed on the SUBJECT rather than the membership because
+            // that is what the decision announced. The role still has to be one this
+            // organization defines and still live, which is why it goes back through the same
+            // id lookup as every other source rather than trusting the slug on the event.
+            if let Some(subject) = self.membership_subject.get(membership) {
+                for (granted_org, granted_subject, slug) in &self.time_boxed {
+                    if granted_org != organization || granted_subject != subject {
+                        continue;
+                    }
+                    let role = self
+                        .roles
+                        .iter()
+                        .find(|(id, owner)| {
+                            *owner == organization && slugs.get(*id) == Some(slug)
+                        })
+                        .map(|(id, _)| id.clone());
+                    if let Some(role) = role {
+                        push(&role, "time_boxed", "");
+                    }
+                }
             }
         }
         paths
@@ -475,6 +513,70 @@ async fn exported_paths(h: &Harness, org_base: &str) -> BTreeSet<GrantPath> {
             }
         })
         .collect()
+}
+
+/// Raise an access request and have a DIFFERENT principal approve it.
+///
+/// The fourth source the export can report (issue #145 criterion 4). It needs two principals
+/// because the separation rule refuses a self-approval structurally, so the operator token
+/// raises and a freshly minted management key decides.
+///
+/// Returns the subject it was granted to.
+async fn raise_and_approve(h: &Harness, base: &str, org: &str, subject: &str) {
+    let org_base = format!("{base}/organizations/{org}");
+    let request = create(
+        h,
+        &format!("{org_base}/access-requests"),
+        "er-raise",
+        &serde_json::json!({
+            "subject_id": subject,
+            "role_slug": "billing-admin",
+            "reason": "quarter close",
+        }),
+    )
+    .await;
+
+    let (key_id, secret) = {
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/keys"),
+                "er-approver-key",
+                &serde_json::json!({ "display_name": "approver" }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "mint the approver key: {body}");
+        let created: Value = serde_json::from_str(&body).expect("json");
+        (
+            created["id"].as_str().expect("id").to_owned(),
+            created["secret"].as_str().expect("secret").to_owned(),
+        )
+    };
+    // The scope ids are the two path segments of `base`, which is
+    // `/v1/tenants/{tenant}/environments/{environment}`.
+    let mut parts = base.split('/').skip(3);
+    let tenant = parts.next().expect("tenant segment");
+    let environment = parts.nth(1).expect("environment segment");
+    sqlx::query(
+        "UPDATE management_credentials SET permissions = $1 \
+         WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+    )
+    .bind(vec!["management.write_organizations".to_owned()])
+    .bind(&key_id)
+    .bind(tenant)
+    .bind(environment)
+    .execute(h.db().owner_pool())
+    .await
+    .expect("grant the approver its permission");
+
+    let (status, _, body) = h
+        .post_as(
+            &format!("{org_base}/access-requests/{request}/decision"),
+            &secret,
+            "er-decide",
+            &serde_json::json!({ "approve": true, "grant_secs": 3600 }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "approve the request: {body}");
 }
 
 /// A second organization that works, and is then DISABLED.
@@ -665,7 +767,7 @@ async fn seed_and_disturb(h: &Harness, base: &str, org: &str) -> Fixture {
 
     let alice = member(h, base, org, "alice").await;
     let bob = member(h, base, org, "bob").await;
-    let carol = member(h, base, org, "carol").await;
+    let (carol_user, carol) = member_with_user(h, base, org, "carol").await;
     let dave = member(h, base, org, "dave").await;
     // ERIN EXISTS BECAUSE DAVE IS NOT ENOUGH. Dave is in the doomed group AND has his
     // membership removed, so a fold that ignores `org_group.deleted` still drops his rows for
@@ -676,6 +778,10 @@ async fn seed_and_disturb(h: &Harness, base: &str, org: &str) -> Fixture {
     // the narrowest possible case: the membership survives, no assignment is touched, and the
     // only thing that takes his access away is a fence on the users table.
     let (frank_user, frank) = member_with_user(h, base, org, "frank").await;
+    // CAROL gets a live time-boxed grant, so the export's FOURTH source is in the comparison.
+    // She is the right subject because the role she was assigned directly has been deleted, so
+    // the only thing she can hold besides the default is this.
+    raise_and_approve(h, base, org, &carol_user).await;
 
     // Direct grants, one of which is withdrawn again and one of which loses its ROLE.
     act(
@@ -802,6 +908,15 @@ fn assert_every_removal_landed(rebuilt: &BTreeSet<GrantPath>, f: &Fixture) {
     assert!(
         slugs_of(&f.alice).contains("billing-admin") && slugs_of(&f.alice).contains("member"),
         "alice should still hold her direct grant and the organization default"
+    );
+    // THE FOURTH SOURCE reached the comparison. Without this the export and the fold could
+    // both be missing it and agree, which is how a source goes unmeasured.
+    assert!(
+        rebuilt
+            .iter()
+            .any(|path| path.membership_id == f.carol && path.source == "time_boxed"),
+        "the live time-boxed grant is not in the snapshot, so the export's fourth source is \
+         outside everything this test compares"
     );
     assert!(
         slugs_of(&f.frank).is_empty(),
