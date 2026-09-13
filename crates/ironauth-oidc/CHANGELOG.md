@@ -6,6 +6,33 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+### Device-posture policy predicates, EXPLORATORY (issue #145 criterion 5)
+
+Shape `0.1.0-exp.1`, behind the `device-posture-policy-hooks` experimental
+feature. A CEL predicate over SIGNED posture signals an MDM or EDR service
+asserts about a device: managed, encrypted, patched, and the endpoint agent's
+state.
+
+Agentless. The device runs none of our code and never reports about itself, so
+every property that matters is a property of the vendor's signature: the claim
+is a compact JWS verified through the one verification door, against that
+vendor's keys and with its issuer and audience pinned.
+
+FRESHNESS IS ENFORCED SEPARATELY FROM EXPIRY. An MDM can mint a week-long
+assertion over a scan that ran on Monday; every signature and expiry check still
+passes on Friday while the machine has been unenrolled since Tuesday. So the
+predicate runs only if `iat` is inside a configured maximum age, and a claim
+carrying no `iat` is refused rather than treated as fresh.
+
+Deny is the default and every failure reaches it -- absent, unsigned, forged,
+wrong issuer, stale, malformed, predicate unsatisfied, predicate failed -- with
+the reason named for an operator reading a log.
+
+EXPLORATORY: it evaluates a predicate and returns a verdict, and NOTHING in the
+data plane calls it. No grant is refused, no session ended, no token withheld.
+The signal schema, the claim names and the predicate vocabulary are all expected
+to move before anything depends on them.
+
 ### Experimental: Native SSO for mobile apps (issue #133)
 
 A PROTOTYPE of OpenID Connect Native SSO for Mobile Apps 1.0 Implementer's Draft 2, off by

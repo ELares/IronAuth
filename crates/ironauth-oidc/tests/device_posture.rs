@@ -199,9 +199,16 @@ fn a_claim_with_no_issued_at_is_denied_rather_than_treated_as_fresh() {
     let mut body = claims(MDM, now_secs(&clock), &healthy());
     body.as_object_mut().expect("an object").remove("iat");
     let token = signed(&signer, &body);
-    // Refused by the VERIFIER, because the policy sets `require_iat`. Asserted here anyway:
-    // what matters is that an unevaluable age denies, and this test fails if somebody relaxes
-    // that flag believing the age check below would still catch it.
+    // TWO INDEPENDENT GUARDS refuse this, and the assertion tolerates either because the
+    // behaviour is what matters: `require_iat` on the policy makes `verify` refuse it, and
+    // `DenyReason::NoIssuedAt` refuses it if the flag is ever relaxed.
+    //
+    // MEASURED, and worth stating rather than leaving to be discovered: turning `require_iat`
+    // off does NOT fail any test here, because the module's own check catches the same claim.
+    // The flag is kept anyway -- the module should not depend on a policy setting for a fact
+    // it can establish itself, and vice versa -- so its mutant is equivalent BY DESIGN rather
+    // than by an oversight. Tightening this assertion to name which layer refused would pin an
+    // internal division of labour instead of a guarantee.
     assert!(
         matches!(
             policy(&signer, STRICT).evaluate(Some(&token), &clock),
