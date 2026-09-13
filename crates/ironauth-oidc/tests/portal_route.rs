@@ -7677,3 +7677,50 @@ async fn the_stored_definition_is_one_the_runtime_can_read() {
         record.definition_json
     );
 }
+
+#[tokio::test]
+async fn every_provider_the_form_offers_is_one_the_handler_accepts() {
+    // ONE LIST, MEASURED. The slug was validated in one place, labelled in another, and rendered
+    // as `<option>`s in a third -- so a provider added to the picker and not to the validation
+    // would be a page whose own control produces a 400, and one added to the validation and not
+    // to the labels would print "Paste these two values into" and then the wrong thing.
+    //
+    // THIS DRIVES THE PAGE'S OWN OPTIONS, so it cannot drift from what a customer can choose:
+    // the test reads the values out of the rendered form rather than spelling them again.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "scim", "prov-1", &org).await;
+    let scope = harness.scope();
+    let surface = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (_, _, page) = harness.get_with_cookie(&surface, Some(&cookie)).await;
+
+    let mut offered = Vec::new();
+    let mut rest = page.as_str();
+    while let Some(at) = rest.find("<option value=\"") {
+        rest = &rest[at + "<option value=\"".len()..];
+        let end = rest.find('"').expect("the value is closed");
+        offered.push(rest[..end].to_owned());
+    }
+    assert!(
+        offered.len() >= 3,
+        "the picker has to offer the providers this deployment supports: {page}"
+    );
+
+    for slug in offered {
+        let (status, body) = submit_scim_setup(&harness, &cookie, "Acme", &slug).await;
+        assert_eq!(
+            status, 200,
+            "the form offers `{slug}` and the handler refuses it: {body}"
+        );
+        // AND THE PAGE THAT COMES BACK SAYS SOMETHING, rather than printing the slug at a
+        // customer: every choice has a label, which is the other half of the one list.
+        assert!(
+            !body.contains(&format!("into {slug}")),
+            "the stored slug reached a customer's page for `{slug}`: {body}"
+        );
+    }
+}

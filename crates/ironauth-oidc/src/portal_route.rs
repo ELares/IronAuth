@@ -887,16 +887,16 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
              action=\"{base}/t/{tenant}/e/{environment}/portal/s/scim/connections\">\
              <p><label>A name for this connection<br>\
              <input name=\"display_name\" size=\"40\" required></label></p>\
-             <p><label>Which provider<br><select name=\"provider\">\
-             <option value=\"okta\">Okta</option>\
-             <option value=\"entra\">Microsoft Entra</option>\
-             <option value=\"generic\">Another provider</option>\
-             </select></label></p>\
+             <p><label>Which provider<br><select name=\"provider\">{options}</select>\
+             </label></p>\
              <p><button type=\"submit\">Add this connection</button></p></form>\
              <p>The next page shows your token once. Have somewhere to paste it.</p>",
             base = escape_html(state.issuer_base().trim_end_matches('/')),
             tenant = escape_html(&session.scope().tenant().to_string()),
             environment = escape_html(&session.scope().environment().to_string()),
+            // FROM THE SAME LIST THE HANDLER VALIDATES AGAINST, so the form cannot offer a slug
+            // the route refuses -- which would be a page whose own control produces a 400.
+            options = provider_options(),
         )
     } else {
         String::new()
@@ -3339,9 +3339,9 @@ pub async fn scim_setup_post(
     // and the only trace is a dead letter -- and the set is what the setup guides key on, so a
     // value outside it is a connection with no guide.
     let provider = form.provider.trim();
-    if !matches!(provider, "okta" | "entra" | "generic") {
-        return setup_refusal("choose one of Okta, Entra, or generic");
-    }
+    let Some((provider, _)) = provider_choice(provider) else {
+        return setup_refusal("choose one of Okta, Microsoft Entra, or another provider");
+    };
 
     let id = ironauth_store::ScimConnectionId::generate(state.env(), &scope);
     let token = mint_scim_token(&state, &id);
@@ -3434,19 +3434,56 @@ fn connector_definition(
         .map(|value| value.to_string())
 }
 
-/// What to call a provider on a page a customer reads.
+/// The providers this form offers, as `(stored slug, what to call it on a page)`.
 ///
-/// THE STORED VALUE IS A SLUG and the constraint on the column keeps it to three, which is what
-/// makes this a total function rather than a lookup that can miss. Printing the slug would put
-/// "Paste these two values into generic" in front of somebody who is looking at their provider's
-/// console.
-fn provider_label(provider: &str) -> &str {
-    match provider {
-        "okta" => "Okta",
-        "entra" => "Microsoft Entra",
-        // THE THIRD IS NOT A PRODUCT NAME, so the sentence has to work without one.
-        _ => "your identity provider",
+/// # One list, because there were nearly three
+///
+/// The slug is validated here, rendered here, and CHECKED by the column: migration 0183 has
+/// `CHECK (provider IN ('okta', 'entra', 'generic'))`, which is the authority. A set spelled
+/// separately in the validation and in the label is two places to add a provider and one place
+/// to forget -- and the failure is asymmetric: a slug the validation accepts and the label does
+/// not is a page that says "Paste these two values into" and then the wrong thing, while a slug
+/// the column refuses fails in a worker where nobody is looking.
+///
+/// THE LABEL FOR `generic` IS NOT A PRODUCT NAME, so the sentence it appears in has to read
+/// without one. Printing the slug would put "Paste these two values into generic" in front of
+/// somebody looking at their provider's console.
+///
+/// It does NOT include the setup guides, which key on the same slug in `portal_guides` -- that
+/// module owns its own mapping and a connection created before a guide exists still renders.
+const PROVIDER_CHOICES: [(&str, &str); 3] = [
+    ("okta", "Okta"),
+    ("entra", "Microsoft Entra"),
+    ("generic", "your identity provider"),
+];
+
+/// The `<option>` elements of the provider picker, from the one list.
+///
+/// A FORM THAT OFFERED A SLUG THE HANDLER REFUSES would be a page whose own control produces a
+/// 400, which is the shape this list exists to make unrepresentable.
+fn provider_options() -> String {
+    let mut out = String::new();
+    for (slug, label) in PROVIDER_CHOICES {
+        let _ = write!(
+            out,
+            "<option value=\"{slug}\">{label}</option>",
+            slug = escape_html(slug),
+            label = escape_html(label),
+        );
     }
+    out
+}
+
+/// The choice a submitted slug names, or `None` when it names none.
+fn provider_choice(provider: &str) -> Option<(&'static str, &'static str)> {
+    PROVIDER_CHOICES
+        .into_iter()
+        .find(|(slug, _)| *slug == provider)
+}
+
+/// What to call a provider on a page a customer reads.
+fn provider_label(provider: &str) -> &str {
+    provider_choice(provider).map_or("your identity provider", |(_, label)| label)
 }
 
 /// A provisioning bearer token for a connection: `{scim_id}.{secret}`.
