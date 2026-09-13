@@ -678,6 +678,58 @@ fn setup_guides(
     guides
 }
 
+/// The token-check form, one per connection the page shows.
+///
+/// PER CONNECTION rather than one form with a picker, for the reason `setup_guides` gives about
+/// guides: the reader is looking at a row, and a control that makes them re-select what they are
+/// already looking at is a place to pick the wrong one. It also means the connection id reaches
+/// the handler from the page rather than from the reader.
+///
+/// ON EVERY ROW, INCLUDING THE BROKEN ONES. A revoked or lapsed connection is exactly where a
+/// reader holding a token wants to know what it is: the handler answers "this connection was
+/// revoked" rather than "your token is wrong", which is the distinction the whole surface exists
+/// to draw.
+fn token_check_forms(state: &OidcState, connections: &[ironauth_store::ScimConnection]) -> String {
+    let Some(scope) = state_scope(connections) else {
+        return String::new();
+    };
+    let mut forms = String::new();
+    for connection in connections
+        .iter()
+        .take(usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX))
+    {
+        let _ = write!(
+            forms,
+            "<form method=\"post\" \
+             action=\"{base}/t/{tenant}/e/{environment}/portal/s/scim/test\">\
+             <input type=\"hidden\" name=\"connection_id\" value=\"{connection}\">\
+             <p><label>Paste the token you configured for {name} to find out what it is \
+             here:<br><input type=\"password\" name=\"token\" size=\"60\"></label></p>\
+             <p><button type=\"submit\">Check this token</button></p></form>",
+            base = escape_html(state.issuer_base().trim_end_matches('/')),
+            tenant = escape_html(&scope.tenant().to_string()),
+            environment = escape_html(&scope.environment().to_string()),
+            connection = escape_html(&connection.id.to_string()),
+            name = escape_html(&connection.display_name),
+        );
+    }
+    if !forms.is_empty() {
+        forms.insert_str(0, "<h2>Check a token</h2>");
+    }
+    forms
+}
+
+/// The scope every connection on this page shares, or `None` when there are no connections.
+///
+/// TAKEN FROM A ROW rather than from the session, because the ids printed into the forms are
+/// those rows' ids and a form whose path named a different scope than its `connection_id` would
+/// be refused by the handler's own parse. They cannot differ today -- the listing is scoped --
+/// and deriving it from the thing being printed is what keeps that true if the listing ever is
+/// not.
+fn state_scope(connections: &[ironauth_store::ScimConnection]) -> Option<ironauth_store::Scope> {
+    connections.first().map(|connection| connection.id.scope())
+}
+
 /// The SCIM configuration surface: what this organization's provisioning credentials are doing.
 ///
 /// # What an IT admin came here to find out
@@ -771,10 +823,11 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
          <table><thead><tr><th>Name</th><th>Provider</th><th>Status</th><th>Activity</th>\
          </tr></thead>\
          <tbody>{rows}</tbody></table>\
-         {guides}",
+         {checks}{guides}",
         organization = escape_html(&session.organization().to_string()),
         endpoint = endpoint,
         rows = rows,
+        checks = token_check_forms(state, &connections),
         guides = guides,
     );
     crate::pages::secure_html(StatusCode::OK, body)
@@ -2501,4 +2554,252 @@ pub async fn connection_test_post(
          <h1>Connection test</h1>{switched_off}{verdict}"
     );
     crate::pages::secure_html(StatusCode::OK, body)
+}
+
+/// What an operator pastes into the SCIM connection check (issue #140 criterion 6).
+#[derive(Debug, serde::Deserialize)]
+pub struct ScimTokenCheckForm {
+    /// The connection the token is supposed to belong to.
+    pub connection_id: String,
+    /// The bearer token as it was pasted into the identity provider.
+    pub token: String,
+}
+
+/// Check a pasted SCIM bearer token against one connection and say what it is.
+///
+/// # The failure this exists for
+///
+/// A provisioning client that presents a bad token gets a 401, and nothing anywhere records
+/// that it happened: `authenticate` stamps `last_seen_at` only on the row it ACCEPTED, and a
+/// refusal resolves no row at all. So the portal's activity column says "No requests yet" --
+/// which is true, and which is the same sentence it shows a customer who has not configured
+/// their identity provider at all. The two states with completely different remedies are
+/// indistinguishable, and that is precisely the generic error this criterion names.
+///
+/// Here the reader holds the token. Checking the one they hold against the one connection they
+/// are entitled to read turns "nothing has happened" into "the value you pasted is the token we
+/// superseded on the 4th", which names the fix.
+///
+/// # Why it is not a request to `/scim/v2`
+///
+/// The obvious design is to have the portal call its own SCIM endpoint with the pasted token.
+/// It would answer a narrower question -- yes or no -- and it would answer it wrongly for this
+/// reader, because `authenticate` deliberately collapses every refusal into the same `Unknown`
+/// so a caller cannot tell a fenced tenant from an invented token. That uniformity is right for
+/// an anonymous poster and useless to the person who owns the connection.
+///
+/// It would also STAMP. `authenticate` records a use, and an admin's test is not a use: the
+/// click would land on the very column the page beside it reads to answer "has your identity
+/// provider ever called?", so the page would start answering that question with the reader's own
+/// button.
+///
+/// # What bounds the reach
+///
+/// The token names a connection in its own id half, and this handler compares that to the
+/// connection the FORM names before any lookup runs -- so a token minted for another
+/// organization, or another tenant, is refused without a query. The lookup itself then takes the
+/// session's organization as a predicate, so a connection id belonging to a neighbour resolves
+/// to nothing. Neither path can stamp, read, or even confirm the existence of a row outside the
+/// session's own organization.
+pub async fn scim_token_check_post(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::Form(form): axum::Form<ScimTokenCheckForm>,
+) -> Response {
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return refused();
+    };
+    // THE SAME ORIGIN GUARD every portal POST takes. A cross-origin post here would let another
+    // site test tokens it holds against this customer's connection and read the answer.
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+    let session = match resolve_session(&state, scope, &headers).await {
+        Ok(session) => session,
+        Err(refusal) => return refusal.into_response(),
+    };
+    if let Err(refusal) = session.require_intent("scim") {
+        return refusal.into_response();
+    }
+
+    let Ok(connection_id) =
+        ironauth_store::ScimConnectionId::parse_in_scope(&form.connection_id, &scope)
+    else {
+        return test_refusal("that is not a connection of this deployment");
+    };
+    let now = epoch_micros(state.env().clock().now_utc());
+    let read = state.store().scoped(scope);
+    let connection = match read
+        .scim_connections()
+        .find_in_organization(session.organization(), &connection_id, now)
+        .await
+    {
+        Ok(Some(connection)) => connection,
+        Ok(None) => return test_refusal("no connection with that id"),
+        Err(_) => return PortalRefusal::Unavailable.into_response(),
+    };
+
+    let presented = form.token.trim();
+    let Ok(verdict) = token_verdict(&read, &connection, &connection_id, presented, now).await
+    else {
+        return PortalRefusal::Unavailable.into_response();
+    };
+    // THE PASTED VALUE IS NEVER ECHOED, on any branch. It is a live credential in most of the
+    // cases that reach here, and a page that quoted it back would put it into a browser history,
+    // a screenshot, and whatever proxy sits between. Every sentence below is about the row it
+    // matched, not about the string.
+    let body = format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Token check</title>\
+         <h1>Token check</h1><p>Connection: {name}</p>{verdict}",
+        name = escape_html(&connection.display_name),
+    );
+    crate::pages::secure_html(StatusCode::OK, body)
+}
+
+/// What to tell the reader about the token they pasted, as HTML.
+///
+/// `Err(())` is a read that did not happen, which is the deployment's failure rather than
+/// anything about the token, and must not be reported as a verdict on it.
+///
+/// # The order is the order the remedies come in
+///
+/// The connection is examined before the token because a revoked or lapsed CONNECTION makes
+/// every question about its tokens moot: no token of it authenticates, and telling a reader
+/// their token is fine would send them back to their identity provider to look for a fault that
+/// is not there. The reverse order was the first version of this function and it read
+/// convincingly, which is how a wrong instruction survives a review.
+async fn token_verdict(
+    read: &ironauth_store::ScopedStore<'_>,
+    connection: &ironauth_store::ScimConnection,
+    connection_id: &ironauth_store::ScimConnectionId,
+    presented: &str,
+    now: i64,
+) -> Result<String, ()> {
+    // THE SHAPE FIRST, because a value that is not a token of this deployment at all is the
+    // commonest paste error and needs no query to recognise. The id half is SCOPED, so this also
+    // refuses a token minted for another tenant or environment before anything is looked up.
+    let Some((handle, _)) = presented.split_once('.') else {
+        return Ok(refusal_html(
+            "That does not look like a provisioning token. Copy the whole value, including the \
+             part before the full stop.",
+        ));
+    };
+    // THE TOKEN NAMES ITS OWN CONNECTION, and comparing the two strings is the whole
+    // cross-organization fence on this path: a token belonging to a neighbour is refused HERE,
+    // before any read, so this surface cannot be used to confirm that a given connection id
+    // exists somewhere else in the deployment.
+    if handle != connection_id.to_string() {
+        return Ok(refusal_html(
+            "That token belongs to a different connection. Check you are looking at the \
+             connection you configured it on.",
+        ));
+    }
+
+    // THE CONNECTION'S OWN STATE, which outranks anything about the token; see the note above.
+    if connection.revoked {
+        return Ok(refusal_html(
+            "This connection has been revoked, so nothing provisions through it whatever token \
+             is presented. Ask your vendor for a new connection.",
+        ));
+    }
+    if connection
+        .expires_at_unix_micros
+        .is_some_and(|expires_at| expires_at <= now)
+    {
+        return Ok(refusal_html(
+            "This connection has expired, so nothing provisions through it whatever token is \
+             presented. It cannot be rotated: ask your vendor to replace it.",
+        ));
+    }
+
+    let digest = ironauth_store::scim_token_digest(presented);
+    let standing = read
+        .scim_connections()
+        .standing_of(connection_id, &digest)
+        .await
+        .map_err(|_| ())?;
+    // NO ROW, AND THE ID HALF WAS RIGHT. Something was edited or lost between this connection's
+    // token and the string in front of the reader, and the two ways that happens are worth
+    // naming because the remedies differ: a copy that dropped characters is fixed by copying
+    // again, and a token from a connection that was replaced is fixed by going to get the
+    // current one.
+    let Some(standing) = standing else {
+        return Ok(refusal_html(
+            "This is not a token of this connection. It may have been truncated when it was \
+             copied, or it may be left over from a connection that has since been replaced. \
+             Copy the current token and try again.",
+        ));
+    };
+
+    if let Some(revoked_at) = standing.revoked_at_unix_micros {
+        return Ok(refusal_html(&format!(
+            "This token was revoked on {when}, which ends it immediately rather than at the end \
+             of an overlap. Paste the current token into your identity provider.",
+            when = escape_html(&crate::saml_start::rfc3339_utc(revoked_at / 1_000_000)),
+        )));
+    }
+    if let Some(expires_at) = standing.expires_at_unix_micros {
+        // A HORIZON ON THE TOKEN MEANS A ROTATION SUPERSEDED IT, and whether the date has passed
+        // decides which half of the cutover the reader is in: still inside the window with the
+        // work left to do, or past it with provisioning already stopped.
+        let when = escape_html(&crate::saml_start::rfc3339_utc(expires_at / 1_000_000));
+        if expires_at <= now {
+            return Ok(refusal_html(&format!(
+                "This token was replaced and stopped working on {when}. Copy the current token \
+                 from this page into your identity provider.",
+            )));
+        }
+        return Ok(format!(
+            "<p>This is the PREVIOUS token. It still works, and it stops on {when}. Copy the \
+             current token into your identity provider before then, or provisioning stops when \
+             that date passes.</p>{activity}",
+            activity = activity_html(&standing),
+        ));
+    }
+
+    // NO HORIZON, NOT REVOKED, AND THE CONNECTION IS LIVE: this is what a provisioning client
+    // presenting it would authenticate as.
+    Ok(format!(
+        "<p>This token authenticates against this connection.</p>{activity}",
+        activity = activity_html(&standing),
+    ))
+}
+
+/// What has actually happened through the token that was pasted, said only where it is knowable.
+///
+/// # A working token nobody has used is the finding
+///
+/// It is the state a half-finished rotation leaves, and the one thing that predicts an outage at
+/// the end of an overlap: the credential is valid, the check says so, and the identity provider
+/// is still calling with the old one. "This token authenticates" on its own would be read as
+/// "provisioning is fine", which is the reading that ends when the window does.
+fn activity_html(standing: &ironauth_store::ScimTokenStanding) -> String {
+    if let Some(seen) = standing.last_seen_at_unix_micros {
+        return format!(
+            "<p>A request last arrived with it on {when}.</p>",
+            when = escape_html(&crate::saml_start::rfc3339_utc(seen / 1_000_000)),
+        );
+    }
+    // NOT OBSERVED IS NOT NOT USED, and the page must not collapse them: the legacy population
+    // and every row that predates migration 0206 have no observation history at all, and saying
+    // "nothing has used it" to them reports a working connection as dead. `connection_rows`
+    // above draws the same distinction for the same reason.
+    if standing.observed {
+        "<p>No request has ever arrived with it. If you have already pasted it into your \
+         identity provider, provisioning has not started: check it is in the provisioning \
+         credential field rather than the SSO one.</p>"
+            .to_owned()
+    } else {
+        "<p>Whether anything has used it is not recorded for this token.</p>".to_owned()
+    }
+}
+
+/// A refusal on the token-check surface: a 200 carrying an explanation.
+///
+/// NOT AN ERROR STATUS, because none of these is one. The request was well formed and the reader
+/// is entitled to the answer; what they pasted is the subject of the page rather than a fault in
+/// it, and a 4xx would put a banner over the one sentence they came for.
+fn refusal_html(reason: &str) -> String {
+    format!("<p>{}</p>", escape_html(reason))
 }

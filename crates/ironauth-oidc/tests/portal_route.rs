@@ -658,6 +658,47 @@ async fn connect_with_provider(
     id
 }
 
+/// As [`connect_with_provider`], with the connection id supplied by the caller.
+///
+/// THE CALLER NEEDS THE ID FIRST, because a real provisioning token is `{scim_id}.{secret}` and
+/// the digest stored here has to be the digest of that whole string. Generating the id inside
+/// would leave a fixture that can store a digest but cannot state the token it came from.
+async fn connect_with_id(
+    harness: &Harness,
+    organization: &OrganizationId,
+    display_name: &str,
+    provider: &str,
+    id: &ironauth_store::ScimConnectionId,
+    token: &str,
+    expires_at_unix_micros: Option<i64>,
+) -> ironauth_store::ScimConnectionId {
+    let env = Env::system();
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .create(
+            &env,
+            ironauth_store::NewScimConnection {
+                id,
+                organization_id: organization,
+                display_name,
+                provider,
+                token_digest: &hex_digest(token),
+                expires_at_unix_micros,
+            },
+            None,
+        )
+        .await
+        .expect("create the connection");
+    *id
+}
+
 /// The harness clock in epoch microseconds, which is the unit every deadline here is in.
 fn now_micros(harness: &Harness) -> i64 {
     i64::try_from(
@@ -4768,6 +4809,72 @@ async fn a_captured_response_reaches_the_end_without_being_told_the_connection_i
     );
 }
 
+/// Post a pasted provisioning token to the token check and return the page.
+async fn check_token(
+    harness: &Harness,
+    cookie: &str,
+    connection: &ironauth_store::ScimConnectionId,
+    token: &str,
+) -> (axum::http::StatusCode, String) {
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim/test",
+        scope.tenant(),
+        scope.environment()
+    );
+    let form = format!(
+        "connection_id={}&token={}",
+        urlencoding(&connection.to_string()),
+        urlencoding(token),
+    );
+    post_form_from_with_cookie(harness, &path, &form, "same-origin", cookie).await
+}
+
+/// The token a real mint would hand the customer for this connection: `{scim_id}.{secret}`.
+///
+/// THE ID HALF IS NOT DECORATION. `ironauth-scim`'s `authenticate` reads the scope out of it
+/// before any query runs, and the portal check compares it to the connection the form names
+/// before any read at all. A fixture that invented an unshaped token would exercise neither.
+fn token_for(connection: &ironauth_store::ScimConnectionId, secret: &str) -> String {
+    format!("{connection}.{secret}")
+}
+
+#[tokio::test]
+async fn the_current_token_is_reported_as_working_and_as_unused() {
+    // #140 criterion 6's third named failure, the bad token, and the state that makes it worth
+    // having: a token that authenticates and that nothing has ever presented.
+    //
+    // THE ACTIVITY LINE IS THE POINT. "This token authenticates" on its own reads as
+    // "provisioning is fine", and during a rotation that reading is what ends when the overlap
+    // does. The connection was created by this binary, so an absent stamp genuinely means
+    // nothing has used it -- see `observed_since`.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let id = ironauth_store::ScimConnectionId::generate(&Env::system(), &harness.scope());
+    let token = token_for(&id, "s3cr3t");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &token, None).await;
+    let cookie = open_session_in(&harness, "scim", "tok-s1", &org).await;
+
+    let (status, body) = check_token(&harness, &cookie, &connection, &token).await;
+
+    assert_eq!(status, 200, "the check page: {body}");
+    assert!(
+        body.contains("authenticates against this connection"),
+        "a working token has to be reported as working: {body}"
+    );
+    assert!(
+        body.contains("No request has ever arrived"),
+        "and a working token nobody has used is the finding, not a detail: {body}"
+    );
+    // THE PASTED SECRET IS A LIVE CREDENTIAL. A page that quoted it back would put it in a
+    // browser history, a screenshot, and every proxy in between.
+    assert!(
+        !body.contains("s3cr3t"),
+        "the pasted token was echoed into the page: {body}"
+    );
+}
+
 #[tokio::test]
 async fn a_missing_bound_names_which_bound_is_missing() {
     // THE VARIANT CARRIES THE ATTRIBUTE and the arm used to throw it away, printing one sentence
@@ -4808,5 +4915,340 @@ async fn a_missing_bound_names_which_bound_is_missing() {
     assert!(
         !body.contains("switch on the assertion lifetime"),
         "it must not send an operator to enable something already there: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_previous_token_is_named_as_the_previous_one() {
+    // THE ROTATION'S OWN FAILURE MODE, and the one the status column beside this cannot see. An
+    // admin who has not finished their cutover is presenting the old token, which still works --
+    // so every other signal on the page says healthy right up to the end of the overlap.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let old = token_for(&id, "old-one");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &old, None).await;
+    let new = token_for(&id, "new-one");
+    let now = now_micros(&harness);
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .rotate_token(&env, &connection, &hex_digest(&new), 3600, now)
+        .await
+        .expect("rotate")
+        .expect("the connection exists");
+    let cookie = open_session_in(&harness, "scim", "tok-s2", &org).await;
+
+    let (status, body) = check_token(&harness, &cookie, &connection, &old).await;
+    assert_eq!(status, 200, "the check page: {body}");
+    assert!(
+        body.contains("PREVIOUS token"),
+        "the superseded token has to be named as superseded: {body}"
+    );
+    assert!(
+        body.contains("still works"),
+        "and it does still work, which is what an overlap is for: {body}"
+    );
+
+    // THE CONTROL: the token that replaced it is reported as the live one, so the sentence above
+    // is about WHICH token and not about this connection being in a rotated state.
+    let (_, fresh) = check_token(&harness, &cookie, &connection, &new).await;
+    assert!(
+        fresh.contains("authenticates against this connection"),
+        "the new token is the live one: {fresh}"
+    );
+    assert!(
+        !fresh.contains("PREVIOUS token"),
+        "and must not be reported as the old one: {fresh}"
+    );
+}
+
+#[tokio::test]
+async fn a_lapsed_token_says_when_it_stopped_rather_than_that_it_is_unknown() {
+    // AFTER THE OVERLAP the old token is refused by `authenticate` and the customer's
+    // provisioning has stopped. "This is not a token of this connection" would be true of a
+    // truncated paste and is the wrong instruction here: what they need is the date, because it
+    // tells them the cutover they started is the thing that is finished.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let old = token_for(&id, "old-one");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &old, None).await;
+    let new = token_for(&id, "new-one");
+    let now = now_micros(&harness);
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        // A WINDOW THAT HAS ALREADY CLOSED, which the harness clock makes expressible: the
+        // overlap is one second and the page is read after it.
+        .rotate_token(&env, &connection, &hex_digest(&new), 0, now - 2_000_000)
+        .await
+        .expect("rotate")
+        .expect("the connection exists");
+    let cookie = open_session_in(&harness, "scim", "tok-s3", &org).await;
+
+    let (status, body) = check_token(&harness, &cookie, &connection, &old).await;
+    assert_eq!(status, 200, "the check page: {body}");
+    assert!(
+        body.contains("stopped working on"),
+        "a lapsed token has to say when it lapsed: {body}"
+    );
+    assert!(
+        !body.contains("not a token of this connection"),
+        "and must not be confused with a value that was never one: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_token_of_another_connection_is_refused_without_a_lookup() {
+    // THE CROSS-CONNECTION FENCE, which is a string comparison rather than a query: the token
+    // names its own connection in its id half, so a value minted for a neighbour is refused here
+    // BEFORE anything is read. That is what stops this surface confirming that a given
+    // connection id exists somewhere else in the deployment.
+    //
+    // BOTH CONNECTIONS ARE THIS ORGANIZATION'S, so what is measured is the token-to-connection
+    // binding and not the organization fence, which has its own test below.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let mine = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let other = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let my_token = token_for(&mine, "s3cr3t");
+    let other_token = token_for(&other, "s3cr3t");
+    let mine = connect_with_id(
+        &harness,
+        &org,
+        "Okta Production",
+        "okta",
+        &mine,
+        &my_token,
+        None,
+    )
+    .await;
+    let _other = connect_with_id(
+        &harness,
+        &org,
+        "Entra Staging",
+        "entra",
+        &other,
+        &other_token,
+        None,
+    )
+    .await;
+    let cookie = open_session_in(&harness, "scim", "tok-s4", &org).await;
+
+    // THE CONTROL FIRST: this connection recognises its own token, so the refusal below is the
+    // binding rather than a page that refuses everything.
+    let (_, own) = check_token(&harness, &cookie, &mine, &my_token).await;
+    assert!(
+        own.contains("authenticates against this connection"),
+        "the control: {own}"
+    );
+
+    let (status, body) = check_token(&harness, &cookie, &mine, &other_token).await;
+    assert_eq!(status, 200, "the check page: {body}");
+    assert!(
+        body.contains("belongs to a different connection"),
+        "a token minted for another connection has to be named as one: {body}"
+    );
+    assert!(
+        !body.contains("authenticates"),
+        "and must not be reported as working here: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_token_is_not_confused_with_a_revoked_one() {
+    // THE COMMONEST PASTE ERROR, and the one the page has to keep separate from every lifecycle
+    // answer: a value that was never a token of this connection is fixed by copying again, and a
+    // revoked one is fixed by going to get the current one.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let token = token_for(&id, "s3cr3tttt");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &token, None).await;
+    let cookie = open_session_in(&harness, "scim", "tok-s5", &org).await;
+
+    // THE RIGHT CONNECTION, THE WRONG SECRET: the id half still names this connection, so this
+    // reaches the store read rather than the string comparison in front of it.
+    let truncated = token_for(&id, "s3cr3t");
+    let (status, body) = check_token(&harness, &cookie, &connection, &truncated).await;
+    assert_eq!(status, 200, "the check page: {body}");
+    assert!(
+        body.contains("not a token of this connection"),
+        "an unrecognised value has to be named as one: {body}"
+    );
+    assert!(
+        body.contains("truncated"),
+        "and the commonest cause is worth naming: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_connection_outranks_anything_about_the_token() {
+    // ORDER, WHICH IS THE ORDER THE REMEDIES COME IN. A revoked connection authenticates nothing
+    // whatever token is presented, so reporting the token as fine would send the reader back to
+    // their identity provider to look for a fault that is not there.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let token = token_for(&id, "s3cr3t");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &token, None).await;
+    let cookie = open_session_in(&harness, "scim", "tok-s6", &org).await;
+
+    // THE CONTROL FIRST, on the same token: before the revocation it reads as working, so the
+    // sentence below is the revocation and not the token.
+    let (_, before) = check_token(&harness, &cookie, &connection, &token).await;
+    assert!(
+        before.contains("authenticates against this connection"),
+        "the control: {before}"
+    );
+
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .revoke(&env, &connection, now_micros(&harness))
+        .await
+        .expect("revoke the connection");
+
+    let (status, body) = check_token(&harness, &cookie, &connection, &token).await;
+    assert_eq!(status, 200, "the check page: {body}");
+    assert!(
+        body.contains("has been revoked"),
+        "the connection's own state has to be reported first: {body}"
+    );
+    assert!(
+        !body.contains("authenticates against this connection"),
+        "and a token of a revoked connection must not read as working: {body}"
+    );
+}
+
+#[tokio::test]
+async fn one_organizations_session_cannot_check_a_token_against_anothers_connection() {
+    // #140 criterion 3 on this route. Without the organization predicate a link issued for one
+    // customer would confirm the existence of a neighbour's connection, and -- with a token they
+    // happened to hold -- its lifecycle dates as well.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let mine = seed_org(&harness, "Acme").await;
+    let theirs = seed_org(&harness, "Globex").await;
+    let env = Env::system();
+    let my_id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let their_id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let my_token = token_for(&my_id, "mine");
+    let their_token = token_for(&their_id, "theirs");
+    let my_connection = connect_with_id(
+        &harness,
+        &mine,
+        "Okta Production",
+        "okta",
+        &my_id,
+        &my_token,
+        None,
+    )
+    .await;
+    let their_connection = connect_with_id(
+        &harness,
+        &theirs,
+        "Entra Staging",
+        "entra",
+        &their_id,
+        &their_token,
+        None,
+    )
+    .await;
+    let cookie = open_session_in(&harness, "scim", "tok-s7", &mine).await;
+
+    // THE CONTROL: this session checks its OWN connection, so the refusal below is the fence.
+    let (status, own) = check_token(&harness, &cookie, &my_connection, &my_token).await;
+    assert_eq!(status, 200, "the session's own connection: {own}");
+
+    let (status, body) = check_token(&harness, &cookie, &their_connection, &their_token).await;
+    assert_eq!(
+        status, 400,
+        "one customer's portal checked a token against ANOTHER customer's connection: {body}"
+    );
+    assert!(
+        !body.contains("Entra Staging"),
+        "and it must not name them either: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_cross_site_token_check_is_refused() {
+    // The CSRF guard every portal POST takes. A cross-origin post here would let another site
+    // test tokens it holds against this customer's connection and read the answer.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let token = token_for(&id, "s3cr3t");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &token, None).await;
+    let cookie = open_session_in(&harness, "scim", "tok-s8", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim/test",
+        scope.tenant(),
+        scope.environment()
+    );
+    let form = format!(
+        "connection_id={}&token={}",
+        urlencoding(&connection.to_string()),
+        urlencoding(&token),
+    );
+    let (status, body) =
+        post_form_from_with_cookie(&harness, &path, &form, "cross-site", &cookie).await;
+    assert_eq!(status, 403, "a cross-site token check was served: {body}");
+}
+
+#[tokio::test]
+async fn an_sso_session_cannot_reach_the_token_check() {
+    // THE INTENT FENCE, which every portal surface keeps and which a new POST is exactly the
+    // place to forget. A link minted for `sso` reaches a connection's trust material; it has no
+    // business reading provisioning credentials' lifecycle.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let token = token_for(&id, "s3cr3t");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &token, None).await;
+
+    // THE CONTROL: a `scim` session checks the same token on the same connection and is served.
+    let scim_cookie = open_session_in(&harness, "scim", "tok-s9", &org).await;
+    let (status, served) = check_token(&harness, &scim_cookie, &connection, &token).await;
+    assert_eq!(status, 200, "the control: {served}");
+
+    let sso_cookie = open_session_in(&harness, "sso", "tok-s10", &org).await;
+    let (status, body) = check_token(&harness, &sso_cookie, &connection, &token).await;
+    assert_eq!(
+        status, 404,
+        "an sso session reached the token check: {body}"
     );
 }

@@ -15098,6 +15098,27 @@ pub fn user_code_hash(normalized_user_code: &str) -> String {
     sha256_hex(normalized_user_code)
 }
 
+/// The lookup key a presented SCIM bearer token is stored under: its SHA-256, lowercase hex.
+///
+/// # One implementation, because two would disagree silently
+///
+/// The digest IS the credential check: `ScimConnectionRepo::authenticate` compares nothing else,
+/// and `scim_connection_tokens.token_digest` stores nothing else. Any second surface that wants
+/// to ask about a token a human pasted -- the portal's connection check does -- has to arrive at
+/// the same string, and a private copy of "hash it with SHA-256" in another crate is a
+/// correspondence nothing enforces. The day the scheme changes, the copy keeps compiling and
+/// starts reporting every live token as unrecognised, which reads to an operator as the exact
+/// failure they are trying to diagnose.
+///
+/// So it lives here, beside the column, and every caller goes through it.
+///
+/// IT COVERS THE WHOLE TOKEN, id half included, which is what stops a caller keeping a valid
+/// secret and repointing the scoped handle in front of it.
+#[must_use]
+pub fn scim_token_digest(token: &str) -> String {
+    sha256_hex(token)
+}
+
 /// The one canonical digest for a magic-link bearer token (issue #68): the send path
 /// hashes the whole `ira_mlk_<id>~<secret>` token with this to store it, and
 /// [`ActingMagicLinkRepo::consume_by_token`] hashes the presented token with this to
@@ -76958,6 +76979,48 @@ impl NativeSsoDeviceSecretRepo<'_> {
     }
 }
 
+/// What one presented bearer token IS to one SCIM connection (issue #140).
+///
+/// The answer to "I pasted this into Okta and provisioning is not working": it names the row the
+/// token matched inside the connection the reader is looking at, with the dates that decide what
+/// they should do about it. An ABSENT standing -- `None` from
+/// [`ScimConnectionRepo::standing_of`] -- is itself a diagnosis, and a common one: a token
+/// truncated on its way through a copy buffer, or the token of a different connection.
+///
+/// EVERY FIELD IS ABOUT THE ONE TOKEN, not the connection. A connection can be revoked while the
+/// token presented against it is perfectly live, and the reverse, and an admin needs to be told
+/// which of the two stopped their provisioning because the remedies are not the same: one is a
+/// rotation they can perform, the other is a conversation with their vendor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimTokenStanding {
+    /// When this token was minted.
+    pub created_at_unix_micros: Option<i64>,
+    /// When it stops working, or `None` if it has no horizon of its own.
+    ///
+    /// A ROTATION IS WHAT SETS THIS, on the token being superseded, to the end of the overlap
+    /// window. So a value here does not mean "expiring": it means "this is the OLD one", and
+    /// whether the date has passed decides whether the reader is inside a cutover they have not
+    /// finished or after one they missed.
+    pub expires_at_unix_micros: Option<i64>,
+    /// When it was revoked outright, skipping any remaining overlap.
+    pub revoked_at_unix_micros: Option<i64>,
+    /// When a request last authenticated with THIS token, or `None` if none was observed.
+    ///
+    /// Read it beside `observed`, never alone: see `ScimConnection::usage_history_complete` for
+    /// the population whose absent stamp means "nobody was watching".
+    pub last_seen_at_unix_micros: Option<i64>,
+    /// Whether this row has been watched since it was created, so an absent `last_seen_at` can
+    /// be read as "nothing has used it" rather than "nothing saw".
+    pub observed: bool,
+    /// Whether the match came through the pre-migration-0205 column rather than a token row.
+    ///
+    /// The whole lifecycle above is empty for these, because that column carries none of it --
+    /// not because the token is fresh and unrevoked. A surface must not render "no expiry, never
+    /// revoked, never used" as a finding here; what it knows is that this token is the
+    /// connection's original credential and that it works.
+    pub legacy: bool,
+}
+
 /// One inbound SCIM connection, WITHOUT its bearer token (issue #135).
 ///
 /// There is no field for the plaintext and deliberately no way to obtain one. The token is
@@ -82416,6 +82479,70 @@ pub struct ScimConnectionRepo<'a> {
     scope: Scope,
 }
 
+/// The columns every read of a SCIM connection projects, and the ONE place they are written.
+///
+/// Eight of these are COMPUTED rather than stored, and each one carries an argument in
+/// `hydrate_connection` about what a surface would wrongly claim without it. A second copy of
+/// them -- for a point lookup beside the listing, say -- is the shape where one copy gains a
+/// correction and the other does not, and two pages then disagree about whether the same
+/// connection is healthy depending on which one the reader opened.
+///
+/// `$1` tenant, `$2` environment, `$3` organization, `$4` the clock. A caller appends its own
+/// `FROM`, its own predicate, and numbers anything further from `$5`.
+const SCIM_CONNECTION_PROJECTION: &str = "SELECT c.id, c.organization_id, c.display_name, c.provider, \
+                    (EXTRACT(EPOCH FROM c.created_at) * 1000000)::bigint AS created_us, \
+                    (EXTRACT(EPOCH FROM c.expires_at) * 1000000)::bigint AS expires_us, \
+                    (EXTRACT(EPOCH FROM c.revoked_at) * 1000000)::bigint AS revoked_us, \
+                    (c.revoked_at IS NOT NULL) AS revoked, \
+                    (EXTRACT(EPOCH FROM LEAST( \
+                        CASE WHEN c.expires_at > TIMESTAMPTZ 'epoch' \
+                                                 + ($4::bigint * INTERVAL '1 microsecond') \
+                             THEN c.expires_at END, \
+                        (SELECT MIN(t.expires_at) FROM scim_connection_tokens t \
+                         WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                           AND t.environment_id = c.environment_id \
+                           AND t.revoked_at IS NULL \
+                           AND t.expires_at > TIMESTAMPTZ 'epoch' \
+                                              + ($4::bigint * INTERVAL '1 microsecond')))) \
+                     * 1000000)::bigint AS credential_expires_us, \
+                    (SELECT count(*) FROM scim_connection_tokens t \
+                     WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                       AND t.environment_id = c.environment_id \
+                       AND t.revoked_at IS NULL \
+                       AND (t.expires_at IS NULL OR t.expires_at > TIMESTAMPTZ 'epoch' \
+                                                    + ($4::bigint * INTERVAL '1 microsecond'))) \
+                        AS live_tokens \
+                    , (c.expires_at IS NOT NULL AND c.expires_at <= TIMESTAMPTZ 'epoch' \
+                                                    + ($4::bigint * INTERVAL '1 microsecond')) \
+                        AS connection_lapsed \
+                    , EXISTS (SELECT 1 FROM scim_connection_tokens t \
+                              WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                                AND t.environment_id = c.environment_id) AS has_token_rows \
+                    , (SELECT (EXTRACT(EPOCH FROM max(t.last_seen_at)) * 1000000)::bigint \
+                       FROM scim_connection_tokens t \
+                       WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                         AND t.environment_id = c.environment_id) AS last_seen_us \
+                    , (EXISTS (SELECT 1 FROM scim_connection_tokens t \
+                               WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                                 AND t.environment_id = c.environment_id) \
+                       AND NOT EXISTS (SELECT 1 FROM scim_connection_tokens t \
+                                       WHERE t.connection_id = c.id \
+                                         AND t.tenant_id = c.tenant_id \
+                                         AND t.environment_id = c.environment_id \
+                                         AND (t.observed_since IS NULL \
+                                              OR t.observed_since > t.created_at))) \
+                        AS usage_history_complete \
+                    , (SELECT t.last_seen_at IS NOT NULL FROM scim_connection_tokens t \
+                       WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                         AND t.environment_id = c.environment_id \
+                         AND t.revoked_at IS NULL \
+                       ORDER BY t.created_at DESC, t.token_digest DESC LIMIT 1) \
+                        AS newest_token_used \
+                    , (SELECT (o.deleted_at IS NULL AND o.state = 'active') \
+                       FROM organizations o \
+                       WHERE o.id = $3 AND o.tenant_id = $1 AND o.environment_id = $2) \
+                        AS org_active ";
+
 impl ScimConnectionRepo<'_> {
     /// The LIVE connection whose token digest matches, or `None`.
     ///
@@ -82622,6 +82749,131 @@ impl ScimConnectionRepo<'_> {
         }))
     }
 
+    /// What one PRESENTED token is to ONE named connection, without authenticating it.
+    ///
+    /// # Why this is not `authenticate`
+    ///
+    /// [`Self::authenticate`] answers the data plane's question -- "which connection, if any,
+    /// does this token speak for" -- and it answers it across the whole scope. The portal's
+    /// question is the operator's, and it is a different one: "the connection I am looking at,
+    /// and the string I pasted: do they go together, and if not, what do I do about it".
+    ///
+    /// THREE THINGS FOLLOW FROM THAT AND EACH IS A FENCE.
+    ///
+    /// It takes the connection as an ARGUMENT and looks only inside it. A digest that belongs to
+    /// another connection -- of another organization in the same scope, which a portal session
+    /// holder may not read -- simply misses here, so this call can never resolve a row its caller
+    /// is not entitled to see. `authenticate` deliberately does the opposite, because a
+    /// provisioning client names no connection anywhere in its request.
+    ///
+    /// It does NOT stamp `last_seen_at`. `authenticate` records that a token was USED, and a
+    /// check is not a use: stamping here would make an admin's test show up on the very column
+    /// migration 0206 added to tell them whether their identity provider has ever called. The
+    /// page would then answer "has anything used this?" with the reader's own click.
+    ///
+    /// It reports a REVOKED or LAPSED row rather than hiding it. `authenticate` must return
+    /// `None` for those -- they authenticate nothing -- but "this token was revoked on the 4th"
+    /// and "this token is not one of yours" are opposite instructions to the person holding it,
+    /// and collapsing them is exactly the generic error issue #140 criterion 6 is about.
+    ///
+    /// # It carries the DATES back rather than a verdict, which reverses `authenticate`'s rule
+    ///
+    /// That function checks liveness in SQL on purpose, and its doc says why: a handler that read
+    /// the row and compared timestamps in Rust is one refactor away from forgetting to, and the
+    /// failure mode is a revoked credential that still provisions.
+    ///
+    /// NOTHING AUTHENTICATES ON THIS ANSWER, which is what makes the opposite choice safe here.
+    /// No caller of this is on a request path a provisioning client can reach; the SCIM server
+    /// calls `authenticate` and only `authenticate`. What this feeds is a sentence on a page, and
+    /// that sentence needs the dates themselves -- "revoked on the 4th" and "replaced, and the
+    /// old one stops on the 9th" are different instructions, and a boolean cannot tell them
+    /// apart. The caller also holds the clock the rest of its page is rendered against, so
+    /// deciding liveness there keeps one page consistent with itself rather than mixing a
+    /// database `now()` into a set of rows dated by an application sample.
+    ///
+    /// # The legacy fallback is read here too, for the reason it exists there
+    ///
+    /// A connection created by a binary that predates migration 0205 has no token rows and
+    /// authenticates through `scim_connections.token_digest`. Consulting only the token table
+    /// would report that customer's WORKING token as unrecognised, and the message would send
+    /// them to re-paste a credential that was already correct. The same `NOT EXISTS` guard
+    /// applies, for the same reason: once a connection has token rows the old column is not
+    /// consulted, so a superseded token cannot come back through this door either.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn standing_of(
+        &self,
+        connection_id: &ScimConnectionId,
+        token_digest: &str,
+    ) -> Result<Option<ScimTokenStanding>, StoreError> {
+        if connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT (EXTRACT(EPOCH FROM t.created_at) * 1000000)::bigint AS created_us, \
+                    (EXTRACT(EPOCH FROM t.expires_at) * 1000000)::bigint AS expires_us, \
+                    (EXTRACT(EPOCH FROM t.revoked_at) * 1000000)::bigint AS revoked_us, \
+                    (EXTRACT(EPOCH FROM t.last_seen_at) * 1000000)::bigint AS last_seen_us, \
+                    (t.observed_since IS NOT NULL AND t.observed_since <= t.created_at) \
+                        AS observed \
+             FROM scim_connection_tokens t \
+             WHERE t.tenant_id = $1 AND t.environment_id = $2 \
+               AND t.connection_id = $3 AND t.token_digest = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .bind(token_digest)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let standing = if let Some(row) = row {
+            Some(ScimTokenStanding {
+                created_at_unix_micros: row.get("created_us"),
+                expires_at_unix_micros: row.get("expires_us"),
+                revoked_at_unix_micros: row.get("revoked_us"),
+                last_seen_at_unix_micros: row.get("last_seen_us"),
+                observed: row.get("observed"),
+                legacy: false,
+            })
+        } else {
+            // THE PRE-0205 POPULATION, guarded by the same `NOT EXISTS` the authentication path
+            // uses. `scim_connections` carries no per-token lifecycle columns -- its `expires_at`
+            // and `revoked_at` bound the CONNECTION, which the caller reads separately -- so a
+            // match here is a live credential with no horizon of its own, and no observation
+            // history at all.
+            let legacy = sqlx::query(
+                "SELECT (EXTRACT(EPOCH FROM c.created_at) * 1000000)::bigint AS created_us \
+                 FROM scim_connections c \
+                 WHERE c.tenant_id = $1 AND c.environment_id = $2 AND c.id = $3 \
+                   AND c.token_digest = $4 \
+                   AND NOT EXISTS (SELECT 1 FROM scim_connection_tokens t \
+                                   WHERE t.connection_id = c.id \
+                                     AND t.tenant_id = c.tenant_id \
+                                     AND t.environment_id = c.environment_id)",
+            )
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(connection_id.to_string())
+            .bind(token_digest)
+            .fetch_optional(&mut *tx)
+            .await?;
+            legacy.map(|row| ScimTokenStanding {
+                created_at_unix_micros: row.get("created_us"),
+                expires_at_unix_micros: None,
+                revoked_at_unix_micros: None,
+                last_seen_at_unix_micros: None,
+                observed: false,
+                legacy: true,
+            })
+        };
+        tx.commit().await?;
+        Ok(standing)
+    }
+
     /// Whether one connection handle names a LIVE OR REVOKED row inside one organization.
     ///
     /// A POINT LOOKUP rather than a scan of [`Self::list_for_organization`]. The revoke handler
@@ -82688,79 +82940,72 @@ impl ScimConnectionRepo<'_> {
         }
         let (after_micros, after_id) = split_cursor(after);
         let mut tx = begin_scoped(self.store, self.scope).await?;
-        let rows = sqlx::query(
-            "SELECT c.id, c.organization_id, c.display_name, c.provider, \
-                    (EXTRACT(EPOCH FROM c.created_at) * 1000000)::bigint AS created_us, \
-                    (EXTRACT(EPOCH FROM c.expires_at) * 1000000)::bigint AS expires_us, \
-                    (EXTRACT(EPOCH FROM c.revoked_at) * 1000000)::bigint AS revoked_us, \
-                    (c.revoked_at IS NOT NULL) AS revoked, \
-                    (EXTRACT(EPOCH FROM LEAST( \
-                        CASE WHEN c.expires_at > TIMESTAMPTZ 'epoch' \
-                                                 + ($7::bigint * INTERVAL '1 microsecond') \
-                             THEN c.expires_at END, \
-                        (SELECT MIN(t.expires_at) FROM scim_connection_tokens t \
-                         WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
-                           AND t.environment_id = c.environment_id \
-                           AND t.revoked_at IS NULL \
-                           AND t.expires_at > TIMESTAMPTZ 'epoch' \
-                                              + ($7::bigint * INTERVAL '1 microsecond')))) \
-                     * 1000000)::bigint AS credential_expires_us, \
-                    (SELECT count(*) FROM scim_connection_tokens t \
-                     WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
-                       AND t.environment_id = c.environment_id \
-                       AND t.revoked_at IS NULL \
-                       AND (t.expires_at IS NULL OR t.expires_at > TIMESTAMPTZ 'epoch' \
-                                                    + ($7::bigint * INTERVAL '1 microsecond'))) \
-                        AS live_tokens \
-                    , (c.expires_at IS NOT NULL AND c.expires_at <= TIMESTAMPTZ 'epoch' \
-                                                    + ($7::bigint * INTERVAL '1 microsecond')) \
-                        AS connection_lapsed \
-                    , EXISTS (SELECT 1 FROM scim_connection_tokens t \
-                              WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
-                                AND t.environment_id = c.environment_id) AS has_token_rows \
-                    , (SELECT (EXTRACT(EPOCH FROM max(t.last_seen_at)) * 1000000)::bigint \
-                       FROM scim_connection_tokens t \
-                       WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
-                         AND t.environment_id = c.environment_id) AS last_seen_us \
-                    , (EXISTS (SELECT 1 FROM scim_connection_tokens t \
-                               WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
-                                 AND t.environment_id = c.environment_id) \
-                       AND NOT EXISTS (SELECT 1 FROM scim_connection_tokens t \
-                                       WHERE t.connection_id = c.id \
-                                         AND t.tenant_id = c.tenant_id \
-                                         AND t.environment_id = c.environment_id \
-                                         AND (t.observed_since IS NULL \
-                                              OR t.observed_since > t.created_at))) \
-                        AS usage_history_complete \
-                    , (SELECT t.last_seen_at IS NOT NULL FROM scim_connection_tokens t \
-                       WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
-                         AND t.environment_id = c.environment_id \
-                         AND t.revoked_at IS NULL \
-                       ORDER BY t.created_at DESC, t.token_digest DESC LIMIT 1) \
-                        AS newest_token_used \
-                    , (SELECT (o.deleted_at IS NULL AND o.state = 'active') \
-                       FROM organizations o \
-                       WHERE o.id = $3 AND o.tenant_id = $1 AND o.environment_id = $2) \
-                        AS org_active \
-             FROM scim_connections c \
+        let rows = sqlx::query(&format!(
+            "{SCIM_CONNECTION_PROJECTION}FROM scim_connections c \
              WHERE c.tenant_id = $1 AND c.environment_id = $2 AND c.organization_id = $3 \
-             AND ($4::bigint IS NULL OR (c.created_at, c.id) > \
-                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
-             ORDER BY c.created_at, c.id LIMIT $6",
-        )
+             AND ($5::bigint IS NULL OR (c.created_at, c.id) > \
+                  (TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, $6::text)) \
+             ORDER BY c.created_at, c.id LIMIT $7"
+        ))
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(organization_id.to_string())
+        .bind(now_micros)
         .bind(after_micros)
         .bind(after_id)
         .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
-        .bind(now_micros)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
         rows.into_iter()
             .map(|row| hydrate_connection(&row, self.scope))
             .collect()
+    }
+
+    /// ONE connection of one organization, by id, with every column the listing computes.
+    ///
+    /// A POINT LOOKUP rather than a scan of [`Self::list_for_organization`], for the reason
+    /// [`Self::exists_in_organization`] exists: the listing is BOUNDED, so a connection past the
+    /// first page is invisible to a caller that filters the listing by id -- and a portal holder
+    /// whose connection sat there would be told it does not exist, which is the same sentence
+    /// they get for another organization's id. The revoke handler shipped that bug once.
+    ///
+    /// `exists_in_organization` cannot serve here because a boolean is not a diagnosis: the
+    /// connection-test surface has to say WHICH of revoked, lapsed, or credential-less it is.
+    ///
+    /// THE ORGANIZATION IS A PREDICATE, not a post-filter, so a caller holding another
+    /// organization's id gets `None` from the database rather than a row it must remember to
+    /// check.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the organization or the connection is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn find_in_organization(
+        &self,
+        organization_id: &OrganizationId,
+        id: &ScimConnectionId,
+        now_micros: i64,
+    ) -> Result<Option<ScimConnection>, StoreError> {
+        if organization_id.scope() != self.scope || id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "{SCIM_CONNECTION_PROJECTION}FROM scim_connections c \
+             WHERE c.tenant_id = $1 AND c.environment_id = $2 AND c.organization_id = $3 \
+               AND c.id = $5"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .bind(now_micros)
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| hydrate_connection(&row, self.scope))
+            .transpose()
     }
 }
 

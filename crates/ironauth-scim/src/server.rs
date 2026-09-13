@@ -709,15 +709,12 @@ fn presented_token(headers: &HeaderMap) -> Option<&str> {
 
 /// The SHA-256 hex digest a presented token is looked up by.
 fn token_digest(token: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    let mut out = String::with_capacity(64);
-    for byte in hasher.finalize() {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    // DELEGATED, because a second surface now asks the same question. The portal's connection
+    // check (issue #140 criterion 6) has to arrive at the same string this does, and two private
+    // copies of "SHA-256, lowercase hex" is a correspondence nothing enforces: change the scheme
+    // in one and the other keeps compiling while reporting every live token as unrecognised.
+    // The canonical one lives beside the column it is stored in.
+    ironauth_store::scim_token_digest(token)
 }
 
 /// Resolve the connection a request authenticates as.

@@ -83,6 +83,7 @@
 /t/{tenant_id}/e/{environment_id}/portal/finish
 /t/{tenant_id}/e/{environment_id}/portal/s/certificate-renewal/pin
 /t/{tenant_id}/e/{environment_id}/portal/s/contacts/change
+/t/{tenant_id}/e/{environment_id}/portal/s/scim/test
 /t/{tenant_id}/e/{environment_id}/portal/s/sso/test
 /t/{tenant_id}/e/{environment_id}/portal/s/{intent}
 /t/{tenant_id}/e/{environment_id}/portal/{link_id}
