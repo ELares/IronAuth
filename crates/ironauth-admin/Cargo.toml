@@ -339,6 +339,14 @@ name = "access_review"
 path = "tests/access_review.rs"
 required-features = ["testing"]
 
+# Rebuilding the entitlement graph from the ordered feed (issue #145 criterion 2). Needs a
+# database because the proof is a comparison against what the RESOLVER answers, and the whole
+# point is that a fold and a recursive SQL closure agree about who holds what.
+[[test]]
+name = "entitlement_replay"
+path = "tests/entitlement_replay.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "audit_retention"
 path = "tests/audit_retention.rs"
