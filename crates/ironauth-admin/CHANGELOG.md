@@ -6,6 +6,25 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+### A nested group create now announces its parent (issue #145 criterion 2)
+
+`POST .../organizations/{id}/groups` with a `parent_id` emits an
+`org_group.reparented` event alongside `org_group.created`, both in the create's
+own transaction. ADDITIVE for a subscriber: no payload changed and no version
+moved, and a consumer that ignores the second event sees exactly what it saw
+before.
+
+It is a FIX for a consumer that mirrors the group tree from the feed.
+`org_group.created` carries only the group and its organization, and its schema
+is closed, so the edge could not be added to it; until now parentage reached the
+feed only if somebody later MOVED the group. A consumer folding the feed
+therefore attached every nested group to the root, and then resolved the wrong
+members for every role granted to a parent.
+
+Consumers that converge on either event -- the SCIM push bridge is one -- will
+see one additional converge per nested group create. Converging is idempotent,
+so the effect is a duplicate push and not a different outcome.
+
 ### Time-boxed access requests, EXPLORATORY (issue #145 criterion 4)
 
 Shape `access-request-approval-1`. Three routes under an organization --

@@ -309,6 +309,37 @@ pub async fn create_org_group(
         response_body: &body_string,
     };
     let pending = org_group_event(&state, scope, &group_id, &org_id, None, "org_group.created");
+    // AND THE PARENT, when there is one (issue #145 criterion 2).
+    //
+    // `org_group.created` carries only the group and the organization, and it cannot carry
+    // more: its schema is `additionalProperties: false`, so adding a field would dead-letter
+    // the row at any pod still running the older registry. `org_group.reparented` already
+    // carries an optional `parent_org_group_id` and already means "this group's parent is now
+    // X", which is exactly what is true of a group created underneath one.
+    //
+    // Without this the edge reached the feed only if somebody later MOVED the group, so a
+    // consumer mirroring the tree attached every nested group to the root -- and then resolved
+    // the wrong members for every role granted to a parent. Both events are handed to the same
+    // write and land in its transaction, so a create either announces both or announces
+    // nothing.
+    let pending_parent = parent.as_ref().and_then(|parent| {
+        org_group_event(
+            &state,
+            scope,
+            &group_id,
+            &org_id,
+            Some(parent),
+            "org_group.reparented",
+        )
+    });
+    // Borrowed into one slice before the call, because both `PendingEvent`s have to outlive it.
+    let created_event = pending.as_ref().map(crate::events::PendingEvent::domain_event);
+    let parent_event = pending_parent
+        .as_ref()
+        .map(crate::events::PendingEvent::domain_event);
+    let announced: Vec<&ironauth_store::DomainEvent<'_>> =
+        created_event.iter().chain(parent_event.iter()).collect();
+
     let result = state
         .store()
         .management()
@@ -329,10 +360,7 @@ pub async fn create_org_group(
             created_at_micros,
             state.max_group_depth(),
             Some(write),
-            pending
-                .as_ref()
-                .map(crate::events::PendingEvent::domain_event)
-                .as_ref(),
+            &announced,
         )
         .await;
 
@@ -723,9 +751,12 @@ pub async fn delete_org_group(
 /// group is scoped to one organization and a receiver keeping a per-organization view cannot
 /// file the event without knowing which.
 ///
-/// `parent` is passed only by the reparent, and is OMITTED from the payload when the group
-/// becomes a ROOT -- mirroring the column, and matching the subscription payload's rule: no
-/// invented sentinel for "none".
+/// `parent` is passed by the reparent AND by the create, which emits an
+/// `org_group.reparented` of its own when the new group is nested (issue #145 criterion 2):
+/// `org_group.created` cannot carry the edge, its schema being closed, and a consumer that
+/// never learns it attaches every nested group to the root. It is OMITTED from the payload
+/// when the group becomes a ROOT -- mirroring the column, and matching the subscription
+/// payload's rule: no invented sentinel for "none".
 fn org_group_event(
     state: &AdminState,
     scope: ironauth_store::Scope,
