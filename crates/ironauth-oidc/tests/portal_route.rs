@@ -7165,6 +7165,44 @@ async fn submit_oidc_setup(
     post_form_from_with_cookie(harness, &path, &form, "same-origin", cookie).await
 }
 
+/// The connector an organization's single OIDC binding names, and the secret it holds.
+///
+/// THE READ THE FEDERATION FLOW MAKES, which is the point of asserting on it: a ciphertext
+/// nothing can open is the failure a portal-side seal could ship silently, and it is invisible
+/// from the row.
+async fn bound_connector_secret(harness: &Harness, org: &OrganizationId) -> Vec<u8> {
+    let scope = harness.scope();
+    let bindings = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .org_connections()
+        .list_for_organization(org, 10)
+        .await
+        .expect("list the bindings");
+    assert_eq!(bindings.len(), 1, "one OIDC upstream is bound");
+    let connector = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .connectors()
+        .parse_id(
+            bindings[0]
+                .connector_id
+                .as_deref()
+                .expect("the binding names a connector"),
+        )
+        .expect("the connector id parses");
+    harness
+        .db()
+        .store()
+        .scoped(scope)
+        .connectors()
+        .open_client_secret(&connector)
+        .await
+        .expect("the sealed secret has to open")
+}
+
 #[tokio::test]
 async fn an_admin_sets_up_an_oidc_upstream_and_the_secret_survives_the_queue() {
     // #140 CRITERION 1, THE OIDC HALF. The journey ends where it has to: the secret the admin
@@ -7237,44 +7275,11 @@ async fn an_admin_sets_up_an_oidc_upstream_and_the_secret_survives_the_queue() {
             .expect("complete");
     }
 
-    // THE BINDING EXISTS, which is what makes the connector reach this organization at all.
-    let bindings = harness
-        .db()
-        .store()
-        .scoped(scope)
-        .org_connections()
-        .list_for_organization(&org, 10)
-        .await
-        .expect("list the bindings");
+    // THE BINDING EXISTS, and THE SECRET OPENS. The AAD binds the ciphertext to this scope
+    // and this connector id, so a seal performed on the data plane before the row existed has
+    // to authenticate here.
     assert_eq!(
-        bindings.len(),
-        1,
-        "the upstream is bound to the organization"
-    );
-    let connector_id = bindings[0]
-        .connector_id
-        .as_deref()
-        .expect("the binding names a connector");
-
-    // AND THE SECRET OPENS. The AAD binds the ciphertext to this scope and this connector id,
-    // so a seal performed on the data plane before the row existed has to authenticate here.
-    let parsed = harness
-        .db()
-        .store()
-        .scoped(scope)
-        .connectors()
-        .parse_id(connector_id)
-        .expect("the connector id parses");
-    let opened = harness
-        .db()
-        .store()
-        .scoped(scope)
-        .connectors()
-        .open_client_secret(&parsed)
-        .await
-        .expect("the sealed secret has to open");
-    assert_eq!(
-        opened,
+        bound_connector_secret(&harness, &org).await,
         b"super-secret-value".to_vec(),
         "the secret the admin typed has to be the one the federation flow reads"
     );
@@ -7509,36 +7514,10 @@ async fn one_it_admin_configures_sso_and_provisioning_end_to_end_with_no_vendor_
     );
 
     // OIDC: the secret the admin typed, back out through the read the federation flow makes.
-    let bindings = harness
-        .db()
-        .store()
-        .scoped(scope)
-        .org_connections()
-        .list_for_organization(&org, 10)
-        .await
-        .expect("list the bindings");
-    assert_eq!(bindings.len(), 1, "the OIDC upstream is bound");
-    let connector = harness
-        .db()
-        .store()
-        .scoped(scope)
-        .connectors()
-        .parse_id(
-            bindings[0]
-                .connector_id
-                .as_deref()
-                .expect("the binding names a connector"),
-        )
-        .expect("parses");
-    let opened = harness
-        .db()
-        .store()
-        .scoped(scope)
-        .connectors()
-        .open_client_secret(&connector)
-        .await
-        .expect("the sealed secret opens");
-    assert_eq!(opened, b"super-secret-value".to_vec());
+    assert_eq!(
+        bound_connector_secret(&harness, &org).await,
+        b"super-secret-value".to_vec()
+    );
 
     // SCIM: the token the admin was shown, through the read every provisioning request makes.
     let resolved = harness
