@@ -7782,6 +7782,8 @@ async fn the_guide_and_the_created_connection_agree_about_the_name_id() {
 
 #[tokio::test]
 async fn a_second_connection_to_the_same_provider_is_not_silently_discarded() {
+    use ironauth_store::outbox::OutboxConsumer as _;
+
     // `saml_connections_one_per_idp` is `UNIQUE (tenant, environment, organization,
     // idp_entity_id)`, and the consumer's Conflict arm assumed the conflict was always on the
     // connection ID -- a redelivery. It is not: an admin who submits the form twice for one
@@ -7812,7 +7814,6 @@ async fn a_second_connection_to_the_same_provider_is_not_silently_discarded() {
     }
 
     // THE FIRST APPLIES, THE SECOND DOES NOT, and the second is an ERROR rather than a no-op.
-    use ironauth_store::outbox::OutboxConsumer as _;
     let env = Env::system();
     let scope = harness.scope();
     let consumer = ironauth_admin::saml_connection_setup::SamlConnectionSetupConsumer::new(
@@ -7905,6 +7906,7 @@ async fn two_organizations_naming_their_upstream_the_same_both_get_one() {
 
     // BOTH BINDINGS NAME A CONNECTOR THAT EXISTS, which is the property the dangling write broke.
     let scope = harness.scope();
+    let mut slugs = Vec::new();
     for (label, org) in [("one", &first), ("two", &second)] {
         let bindings = harness
             .db()
@@ -7926,7 +7928,7 @@ async fn two_organizations_naming_their_upstream_the_same_both_get_one() {
             .connectors()
             .parse_id(raw)
             .expect("parses");
-        harness
+        let connector = harness
             .db()
             .store()
             .scoped(scope)
@@ -7936,6 +7938,23 @@ async fn two_organizations_naming_their_upstream_the_same_both_get_one() {
             .unwrap_or_else(|error| {
                 panic!("organization {label} is bound to a connector that does not exist: {error}")
             });
+        slugs.push(connector.slug);
+    }
+
+    // AND THE SLUGS DIFFER, which is the property underneath: the suffix has to be INJECTIVE in
+    // the connector id. A first version derived it by lowercasing the id's last twelve
+    // characters and dropping the rest, which two ids differing only in case -- or in a `-`
+    // against a `_`, both of which base64url uses -- collapse into one. The digest cannot.
+    assert_ne!(
+        slugs[0], slugs[1],
+        "two customers naming their upstream the same got one slug: {slugs:?}"
+    );
+    // AND EACH STILL READS AS THE NAME THE ADMIN GAVE IT, which is what a slug is for.
+    for slug in &slugs {
+        assert!(
+            slug.starts_with("okta-"),
+            "the slug has to carry the admin's name: {slug}"
+        );
     }
 }
 

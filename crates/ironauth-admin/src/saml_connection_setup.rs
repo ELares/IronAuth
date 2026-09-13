@@ -61,8 +61,6 @@ impl SamlConnectionSetupConsumer {
         message: &ironauth_store::OutboxMessage,
     ) -> Result<(), ConsumerError> {
         use base64::Engine as _;
-        use ironauth_jose::xmldsig::XmlSigKey;
-        use sha2::{Digest as _, Sha256};
 
         let payload = &message.payload;
         let organization = payload["organization_id"]
@@ -170,37 +168,7 @@ impl SamlConnectionSetupConsumer {
             Err(_) => return Err(ConsumerError::retryable("setup_create_failed")),
         }
 
-        let (key_kind, public_key, rsa_exponent) = match &parsed.key {
-            XmlSigKey::EcdsaP256(point) => (SamlKeyKind::EcdsaP256, point.clone(), None),
-            XmlSigKey::EcdsaP384(point) => (SamlKeyKind::EcdsaP384, point.clone(), None),
-            XmlSigKey::Rsa { modulus, exponent } => {
-                (SamlKeyKind::Rsa, modulus.clone(), Some(exponent.clone()))
-            }
-        };
-        // OF THE WHOLE DER, which is the number an identity provider's console shows and the one
-        // an operator compares against.
-        let fingerprint: Vec<u8> = Sha256::digest(&der).to_vec();
-        match acting
-            .saml_connections()
-            .pin_certificate(
-                env,
-                NewSamlCertificate {
-                    id: &SamlCertificateId::generate(env, &scope),
-                    connection_id: &connection,
-                    key_kind,
-                    public_key: &public_key,
-                    rsa_exponent: rsa_exponent.as_deref(),
-                    certificate_der: &der,
-                    fingerprint_sha256: &fingerprint,
-                    // SECONDS ON THE CERTIFICATE, MICROSECONDS IN THE COLUMN.
-                    not_before_unix_micros: parsed.not_before_unix_secs * 1_000_000,
-                    not_after_unix_micros: parsed.not_after_unix_secs * 1_000_000,
-                },
-                None,
-                None,
-            )
-            .await
-        {
+        match pin_parsed(&acting, env, scope, &connection, &der, &parsed).await {
             Ok(()) | Err(StoreError::Conflict) => Ok(()),
             // THE CONNECTION WENT AWAY between the create above and this pin, which means an
             // operator deleted it in between. The deletion wins and there is nothing to pin
@@ -219,6 +187,53 @@ impl SamlConnectionSetupConsumer {
             Err(_) => Err(ConsumerError::retryable("setup_pin_failed")),
         }
     }
+}
+
+/// Pin one parsed certificate onto a connection.
+///
+/// SPLIT OUT so `apply` reads as the two writes it performs rather than as the shape of an X.509
+/// key, which is the same reason its OIDC sibling reads its payload through a struct.
+async fn pin_parsed(
+    acting: &ironauth_store::ActingStore<'_>,
+    env: &Env,
+    scope: Scope,
+    connection: &SamlConnectionId,
+    der: &[u8],
+    parsed: &ironauth_saml::x509::Pinned,
+) -> Result<(), StoreError> {
+    use ironauth_jose::xmldsig::XmlSigKey;
+    use sha2::{Digest as _, Sha256};
+
+    let (key_kind, public_key, rsa_exponent) = match &parsed.key {
+        XmlSigKey::EcdsaP256(point) => (SamlKeyKind::EcdsaP256, point.clone(), None),
+        XmlSigKey::EcdsaP384(point) => (SamlKeyKind::EcdsaP384, point.clone(), None),
+        XmlSigKey::Rsa { modulus, exponent } => {
+            (SamlKeyKind::Rsa, modulus.clone(), Some(exponent.clone()))
+        }
+    };
+    // OF THE WHOLE DER, which is the number an identity provider's console shows and the one an
+    // operator compares against.
+    let fingerprint: Vec<u8> = Sha256::digest(der).to_vec();
+    acting
+        .saml_connections()
+        .pin_certificate(
+            env,
+            NewSamlCertificate {
+                id: &SamlCertificateId::generate(env, &scope),
+                connection_id: connection,
+                key_kind,
+                public_key: &public_key,
+                rsa_exponent: rsa_exponent.as_deref(),
+                certificate_der: der,
+                fingerprint_sha256: &fingerprint,
+                // SECONDS ON THE CERTIFICATE, MICROSECONDS IN THE COLUMN.
+                not_before_unix_micros: parsed.not_before_unix_secs * 1_000_000,
+                not_after_unix_micros: parsed.not_after_unix_secs * 1_000_000,
+            },
+            None,
+            None,
+        )
+        .await
 }
 
 /// One required string out of the payload, or a permanent failure naming which was absent.

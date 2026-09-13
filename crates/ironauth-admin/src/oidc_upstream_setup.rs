@@ -57,27 +57,26 @@ use ironauth_store::{
     PresealedConnector, Scope, ServiceId, Store, StoreError,
 };
 
-/// Applies queued OpenID Connect upstream setups.
-pub struct OidcUpstreamSetupConsumer {
-    store: Store,
+/// Everything a queued upstream setup carries, read out of one row.
+///
+/// SPLIT OUT so `apply` reads as the two writes it performs rather than as the shape of a JSON
+/// document, which is the same reason `hydrate_connection` exists in the store.
+struct QueuedSetup {
+    organization: OrganizationId,
+    connector: ConnectorId,
+    binding: OrgConnectionId,
+    slug: String,
+    definition: String,
+    sealed: Vec<u8>,
+    dek_version: i32,
+    created_at_micros: i64,
 }
 
-impl OidcUpstreamSetupConsumer {
-    /// A consumer writing through `store`, which MUST be the control-plane one.
-    #[must_use]
-    pub fn new(store: Store) -> Self {
-        Self { store }
-    }
-
-    async fn apply(
-        &self,
-        env: &Env,
-        scope: Scope,
-        message: &ironauth_store::OutboxMessage,
-    ) -> Result<(), ConsumerError> {
+impl QueuedSetup {
+    /// Read one, or the permanent failure naming the field that was absent.
+    fn read(payload: &serde_json::Value, scope: Scope) -> Result<Self, ConsumerError> {
         use base64::Engine as _;
 
-        let payload = &message.payload;
         let organization = payload["organization_id"]
             .as_str()
             .and_then(|raw| OrganizationId::parse_in_scope(raw, &scope).ok())
@@ -106,6 +105,47 @@ impl OidcUpstreamSetupConsumer {
         let created_at_micros = payload["created_at_unix_micros"]
             .as_i64()
             .ok_or_else(|| ConsumerError::permanent("oidc_setup_without_created_at"))?;
+        Ok(Self {
+            organization,
+            connector,
+            binding,
+            slug: slug.to_owned(),
+            definition: definition.to_owned(),
+            sealed,
+            dek_version,
+            created_at_micros,
+        })
+    }
+}
+
+/// Applies queued OpenID Connect upstream setups.
+pub struct OidcUpstreamSetupConsumer {
+    store: Store,
+}
+
+impl OidcUpstreamSetupConsumer {
+    /// A consumer writing through `store`, which MUST be the control-plane one.
+    #[must_use]
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+
+    async fn apply(
+        &self,
+        env: &Env,
+        scope: Scope,
+        message: &ironauth_store::OutboxMessage,
+    ) -> Result<(), ConsumerError> {
+        let QueuedSetup {
+            organization,
+            connector,
+            binding,
+            slug,
+            definition,
+            sealed,
+            dek_version,
+            created_at_micros,
+        } = QueuedSetup::read(&message.payload, scope)?;
 
         let acting = self.store.scoped(scope).acting(
             ActorRef::service(ServiceId::generate(env)),
@@ -118,8 +158,8 @@ impl OidcUpstreamSetupConsumer {
                 &connector,
                 created_at_micros,
                 PresealedConnector {
-                    slug,
-                    definition_json: definition,
+                    slug: &slug,
+                    definition_json: &definition,
                     client_secret_sealed: &sealed,
                     client_secret_dek_version: dek_version,
                     // WHAT THE UPSTREAM SUPPORTS IS NOT THE ADMIN'S TO DECLARE. Each of these

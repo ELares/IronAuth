@@ -3741,22 +3741,27 @@ pub async fn oidc_setup_post(
 /// is unique per scope and appears in operator tooling, so what it must not be is the admin's
 /// prose: a name with a slash or a space in it would make a value that reads as a path.
 fn slugify_for(name: &str, id: &ironauth_store::ConnectorId) -> String {
-    let base = slugify(name);
-    // THE LAST TWELVE CHARACTERS of the id, which are its entropy rather than its prefix. Twelve
-    // base64url characters is seventy-two bits, which is not guessable and is short enough that
-    // the slug still reads as the name an operator gave it.
-    let printed = id.to_string();
-    let suffix: String = printed
-        .chars()
-        .rev()
-        .take(12)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .flat_map(char::to_lowercase)
-        .filter(char::is_ascii_alphanumeric)
-        .collect();
-    format!("{base}-{suffix}")
+    use sha2::{Digest as _, Sha256};
+
+    // A HASH OF THE ID, not a slice of it, and the difference is the whole point.
+    //
+    // `ConnectorDefinition::validate` requires a slug of LOWERCASE ASCII alphanumerics, hyphens
+    // and underscores, and an id prints as mixed-case base64url. A first version took its last
+    // twelve characters, lowercased them and dropped the rest -- which is LOSSY: two different
+    // ids differing only in the case of a character, or only in a `-` against a `_`, produce the
+    // same suffix. That reintroduces the collision this suffix exists to remove, and quietly,
+    // since the collision is then between two customers rather than inside one.
+    //
+    // A DIGEST IS LOWERCASE HEX BY CONSTRUCTION, so nothing is dropped to make it fit, and two
+    // ids collide only if SHA-256 does. Sixteen characters is sixty-four bits, which is not
+    // guessable and is short enough that the slug still reads as the name an operator gave it.
+    let digest = Sha256::digest(id.to_string().as_bytes());
+    let mut suffix = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        use std::fmt::Write as _;
+        let _ = write!(suffix, "{byte:02x}");
+    }
+    format!("{base}-{suffix}", base = slugify(name))
 }
 
 /// The slug body derived from a display name, before the id suffix.
