@@ -134,6 +134,65 @@ use crate::wellknown::parse_scope;
 /// still small enough that the decode is uninteresting.
 const MAX_ENCODED_RESPONSE: usize = 512 * 1024;
 
+/// Why a `SAMLResponse` form field could not be turned into bytes.
+///
+/// TWO REASONS, KEPT APART, because each caller says something different about them: the ACS
+/// answers a poster it owes no explanation and the portal's connection test answers the operator
+/// who pasted the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponseDecodeError {
+    /// Longer than [`MAX_ENCODED_RESPONSE`], measured before any decoding happens.
+    TooLarge,
+    /// Not base64 once line breaks are removed.
+    NotBase64,
+}
+
+/// The bytes of a `SAMLResponse` form field: bounded, unwrapped, and decoded.
+///
+/// # One implementation, because the portal test and the ACS must agree
+///
+/// Both take the same field from the same identity providers, and a second copy of the rules
+/// below is a correspondence nothing enforces. The consequence of drifting is specific rather
+/// than theoretical: the connection test exists to tell an operator what a real sign-in would
+/// do, so any input the two treat differently makes the test lie in whichever direction the
+/// copies disagree. The first version of the portal route called `.trim()` and `STANDARD.decode`
+/// directly, and the divergence was immediate -- it refused the wrapped field every provider
+/// actually emits, with the message "that does not look like a `SAMLResponse`", while the ACS
+/// beside it accepted the same bytes.
+///
+/// # The bound is on the ENCODED form, before decoding
+///
+/// That is the work being bounded: a megabyte of base64 costs a megabyte of decode before
+/// `ironauth-saml`'s own limits ever see a byte.
+///
+/// # ONLY CR AND LF ARE STRIPPED
+///
+/// Line wrapping is the whole reason to strip anything: identity providers wrap the field and a
+/// conformant decoder rejects the break. An earlier version used `is_ascii_whitespace`, which
+/// also matches SPACE -- and by the time this runs, a space is ambiguous.
+/// `application/x-www-form-urlencoded` decodes `+` to a space, and `+` is base64 character 62,
+/// so a poster who failed to percent-encode their field arrives here with spaces where their
+/// data had `+`. Deleting them SILENTLY REPAIRS the field into a shorter string that, whenever
+/// the count is a multiple of four, still decodes -- to bytes the identity provider never
+/// signed. The operator is then told the signature is wrong, on the one endpoint whose job is
+/// telling them whether their certificate is right. Leaving SPACE in place makes the same input
+/// answer "not valid base64", which names the real fault.
+///
+/// STANDARD BASE64 WITH PADDING, which is what OASIS Bindings 3.5.4 specifies for this field --
+/// not the URL-safe alphabet the rest of this crate uses for its own tokens.
+pub(crate) fn decode_response_field(field: &str) -> Result<Vec<u8>, ResponseDecodeError> {
+    if field.len() > MAX_ENCODED_RESPONSE {
+        return Err(ResponseDecodeError::TooLarge);
+    }
+    let packed: String = field
+        .chars()
+        .filter(|character| !matches!(character, '\r' | '\n'))
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(packed)
+        .map_err(|_| ResponseDecodeError::NotBase64)
+}
+
 /// The deployment clock in the unit `ironauth-saml` reads it in.
 ///
 /// A NAMED SEAM WITH ITS OWN TEST, because this is the module's only unit conversion and the
@@ -142,11 +201,7 @@ const MAX_ENCODED_RESPONSE: usize = 512 * 1024;
 /// green. On a real clock the same mistake passes ~1.8e15 as a second count, which puts every
 /// window tens of millions of years in the future and refuses every genuine response as expired.
 /// The unit test below is where that is measured.
-pub(crate) fn unix_seconds_for_test(now: SystemTime) -> i64 {
-    unix_seconds(now)
-}
-
-fn unix_seconds(now: SystemTime) -> i64 {
+pub(crate) fn unix_seconds(now: SystemTime) -> i64 {
     epoch_micros(now) / 1_000_000
 }
 
@@ -208,32 +263,17 @@ pub async fn acs_post(
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return not_found();
     };
-    if form.saml_response.len() > MAX_ENCODED_RESPONSE {
-        return refused(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "the response is too large to read",
-        );
-    }
-    // STANDARD BASE64 WITH PADDING, which is what OASIS Bindings 3.5.4 specifies for this field
-    // -- not the URL-safe alphabet the rest of this crate uses for its own tokens.
-    //
-    // ONLY CR AND LF ARE STRIPPED, because line wrapping is the whole reason to strip anything:
-    // identity providers wrap the field and a conformant decoder rejects the break. An earlier
-    // version used `is_ascii_whitespace`, which also matches SPACE -- and by the time this runs,
-    // a space is ambiguous. `application/x-www-form-urlencoded` decodes `+` to a space, and `+`
-    // is base64 character 62, so a poster who failed to percent-encode their field arrives here
-    // with spaces where their data had `+`. Deleting them SILENTLY REPAIRS the field into a
-    // shorter string that, whenever the count is a multiple of four, still decodes -- to bytes
-    // the identity provider never signed. The operator is then told the signature is wrong, on
-    // the one endpoint whose job is telling them whether their certificate is right. Leaving
-    // SPACE in place makes the same input answer "not valid base64", which names the real fault.
-    let packed: String = form
-        .saml_response
-        .chars()
-        .filter(|character| !matches!(character, '\r' | '\n'))
-        .collect();
-    let Ok(response) = base64::engine::general_purpose::STANDARD.decode(packed) else {
-        return refused(StatusCode::BAD_REQUEST, "the response is not valid base64");
+    let response = match decode_response_field(&form.saml_response) {
+        Ok(response) => response,
+        Err(ResponseDecodeError::TooLarge) => {
+            return refused(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "the response is too large to read",
+            );
+        }
+        Err(ResponseDecodeError::NotBase64) => {
+            return refused(StatusCode::BAD_REQUEST, "the response is not valid base64");
+        }
     };
 
     // A MALFORMED ID AND AN UNKNOWN ONE ANSWER IDENTICALLY, and so does an inactive connection.
@@ -398,18 +438,18 @@ fn no_store() -> [(axum::http::header::HeaderName, &'static str); 1] {
 /// the browser reading them belongs to whoever posted, who on this endpoint is anybody.
 ///
 /// THE TYPE IS THE DELIVERABLE, NOT THE PAGE. `AcsError` is a public enum with a variant per
-/// fixable cause, for the connection-test flow #140 owns to render to an authenticated operator
-/// -- a reader entitled to their own configuration. THAT FLOW IS NOT BUILT, and saying so
-/// belongs here rather than in a sentence that reads as though the detail already reaches
-/// somebody: today the variant reaches a Rust caller and nothing else, and the page carries the
-/// coarse class. What this function decides is only that the page is not the place.
+/// fixable cause, and `portal_route::diagnose` is where those variants become sentences -- for a
+/// reader holding a portal session for the organization that owns the connection, which is the
+/// entitlement this endpoint cannot establish about its own poster. What this function decides
+/// is only that THIS page is not the place.
 fn refused_by(error: &AcsError) -> Response {
-    // THE TYPED REASON GOES TO THE LOG, which is the only place it can go today: the page is
-    // read by whoever posted, and the connection-test flow that will render it to an
-    // authenticated operator is not built. Without this the variant reached a `match` and was
-    // dropped on the stack -- so `NoTrustAnchor`, whose whole purpose is to tell an operator
-    // they have pinned nothing rather than blaming their identity provider, was recoverable
-    // from nowhere at all.
+    // THE TYPED REASON GOES TO THE LOG, which is the only place it can go FROM HERE: the page
+    // is read by whoever posted, and this endpoint knows nothing about them. The operator who
+    // is entitled to the detail reaches it through the portal's connection test instead, which
+    // resolves a session first. Without this the variant reached a `match` and was dropped on
+    // the stack -- so `NoTrustAnchor`, whose whole purpose is to tell an operator they have
+    // pinned nothing rather than blaming their identity provider, was recoverable from nowhere
+    // at all for anyone reading a live deployment's logs.
     //
     // `Display` RATHER THAN `Debug`, because `AcsError::Store` wraps a database error whose
     // `Debug` carries connection detail; every `Display` in that enum is a sentence written to

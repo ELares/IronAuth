@@ -1535,6 +1535,12 @@ fn sso_saml_section(
     // criterion 6). An admin whose connection is off is exactly the one still setting it up,
     // and telling them to come back later to find out why their response is refused is the
     // conversation this page exists to prevent.
+    //
+    // THE HANDLER HAS TO AGREE WITH THAT, and the first version did not: it resolved with
+    // `find_active`, which cannot see a switched-off row, so this form led exactly that admin
+    // to a refusal reading "no active connection with that id" -- the same sentence the
+    // organization fence returns. It resolves with `find_in_org` now, and says separately that
+    // sign-in is off, so the verdict on their document is not read as "you are finished".
     let _ = write!(
         body,
         "<form method=\"post\" action=\"{base}/t/{tenant}/e/{environment}/portal/s/sso/test\">\
@@ -2008,7 +2014,6 @@ fn diagnose(
     connection: &ironauth_store::SamlConnection,
 ) -> String {
     use crate::saml_acs::AcsError;
-    use ironauth_saml::ConditionError;
 
     match error {
         AcsError::NoTrustAnchor => format!(
@@ -2023,7 +2028,88 @@ fn diagnose(
              can be read.</strong> That is a stored row this deployment should not be holding \
              rather than anything you configured. Send this page to your vendor.</p>"
         ),
-        AcsError::Condition(ConditionError::WrongAudience { found }) => format!(
+        AcsError::Condition(condition) => diagnose_condition(condition, connection),
+        AcsError::Signature(failure) => diagnose_signature(*failure, connection),
+        // THE NAME IDENTIFIER FORMAT IS A COLUMN ON THIS CONNECTION, and both halves of the
+        // mismatch are worth printing: the expected value is what an operator sets in their
+        // provider, and the found value is what it is sending today.
+        AcsError::WrongNameIdFormat { expected, found } => format!(
+            "<p><strong>Your identity provider is sending the wrong kind of name \
+             identifier.</strong></p><p>It sent <code>{found}</code>. This connection expects \
+             <code>{expected}</code>.</p><p>In your identity provider, set the name ID format \
+             to the expected value. The format is part of the identity: a transient identifier \
+             names somebody for one session only, and a persistent one names them forever.</p>",
+            found = escape_html(found.as_deref().unwrap_or("nothing")),
+            expected = escape_html(expected)
+        ),
+        // A CONNECTION SETTING THIS PIPELINE CANNOT HONOUR, which is the vendor's problem and
+        // not the reader's. Telling them to capture a fresh response would be a loop.
+        AcsError::EncryptionRequired => {
+            "<p><strong>This connection is configured to require an encrypted assertion, and \
+             this deployment cannot accept one.</strong></p><p>Nothing you change in your \
+             identity provider will get past this. Send this page to your vendor: either the \
+             requirement comes off the connection, or encryption has to be finished here.</p>"
+                .to_owned()
+        }
+        AcsError::EncryptedAttributes { count } => format!(
+            "<p><strong>The assertion carries {count} encrypted attribute(s), and this \
+             deployment cannot read them.</strong></p><p>An attribute it cannot read may be the \
+             group membership that decides what the person is allowed to do, so it refuses \
+             rather than signing them in with part of the document unknown. In your identity \
+             provider, send these attributes unencrypted, or ask your vendor whether the \
+             connection needs them at all.</p>"
+        ),
+        AcsError::Attributes(_) => {
+            "<p><strong>The attribute statement could not be read.</strong></p><p>The document \
+             is the problem rather than any setting: capture a fresh response and try again. If \
+             it keeps happening, send this page to your vendor.</p>"
+                .to_owned()
+        }
+        // EVERYTHING THE SIGNATURE AND THE CONDITIONS COVER HELD, and that is all this can say.
+        //
+        // `examine` refuses an unsolicited response BEFORE it reaches the connection's remaining
+        // controls -- the encryption requirement, the name ID format, and the attribute
+        // statement -- so this page must not vouch for those. An earlier version said "the
+        // certificate, issuer, audience and validity window all check out" and then went on to
+        // call the correlation "the one thing this test cannot check", which was false in a way
+        // that mattered: a connection requiring encryption refuses every real sign-in and this
+        // page would have called it healthy.
+        //
+        // WHY THIS IS THE GOOD NEWS ANYWAY. A pasted document answers no sign-in this deployment
+        // started, so on a connection that accepts only its own requests -- the safe default --
+        // the correlation check is the first thing a paste can fail and it fails for a reason
+        // that is not a fault. Reporting it as one would tell an operator whose setup is right
+        // to go and change something.
+        AcsError::UnsolicitedRefused => format!(
+            "<p><strong>The certificate, issuer, audience and validity window all check \
+             out.</strong></p><p>The test stops there. A pasted response answers no sign-in \
+             that this deployment started, and <code>{name}</code> accepts only responses to \
+             its own requests -- which is the right setting, and which a real sign-in \
+             satisfies.</p><p>So this does not vouch for what comes after that point: the \
+             assertion's name ID format, its attributes, and any encryption this connection \
+             requires are checked during a real sign-in and not here.</p>",
+            name = escape_html(&connection.display_name)
+        ),
+        // WHAT IS LEFT is `NoConnection` and `UnknownRequest`, neither of which `examine` can
+        // return -- this surface resolved the connection itself, and correlation is the caller's
+        // half. A future variant lands here too, so it says what it knows and no more.
+        other => format!(
+            "<p><strong>This response was refused.</strong> {detail}</p><p>Send this page to \
+             your vendor.</p>",
+            detail = escape_html(&other.to_string())
+        ),
+    }
+}
+
+/// The conditions half of [`diagnose`], split out only because the whole match outgrew one
+/// screen. Each arm names WHERE the fix is, exactly as the parent's doc requires.
+fn diagnose_condition(
+    error: &ironauth_saml::ConditionError,
+    connection: &ironauth_store::SamlConnection,
+) -> String {
+    use ironauth_saml::ConditionError;
+    match error {
+        ConditionError::WrongAudience { found } => format!(
             "<p><strong>Your identity provider is sending the wrong audience.</strong></p>\
              <p>It sent <code>{found}</code>. This connection expects <code>{expected}</code>.</p>\
              <p>In your identity provider, set the audience (sometimes called the SP entity ID, \
@@ -2035,7 +2121,7 @@ fn diagnose(
             // means the sentence names the value an operator can go and copy.
             expected = escape_html(&connection.sp_entity_id)
         ),
-        AcsError::Condition(ConditionError::WrongIssuer { found }) => format!(
+        ConditionError::WrongIssuer { found } => format!(
             "<p><strong>The response came from a different identity provider.</strong></p>\
              <p>It said it was <code>{found}</code>. This connection expects \
              <code>{expected}</code>.</p><p>Either you pasted a response from another \
@@ -2044,30 +2130,122 @@ fn diagnose(
             found = escape_html(found.as_deref().unwrap_or("nothing")),
             expected = escape_html(&connection.idp_entity_id)
         ),
-        AcsError::Condition(ConditionError::Expired) => {
+        ConditionError::Expired => {
             "<p><strong>This response has expired.</strong> That is expected for a document \
              captured a while ago: SAML responses are valid for minutes. Capture a fresh one \
              and paste that.</p><p>If it was captured seconds ago, the clock on your identity \
              provider and the clock here disagree.</p>"
                 .to_owned()
         }
-        // EVERYTHING PASSED. `examine` checks the signature, then the conditions, and only then
-        // whether the connection accepts a response it did not ask for -- so reaching this
-        // variant means the certificate, the issuer, the audience and the window all held.
-        //
-        // A PASTED DOCUMENT IS ALWAYS UNSOLICITED, because nothing here started the sign-in it
-        // answers. Reporting that as a failure would tell an operator whose setup is perfect to
-        // go and change something, which is the exact complaint #140 makes about generic
-        // errors. So it is the good news, with the one thing it cannot vouch for said plainly.
-        AcsError::UnsolicitedRefused => format!(
-            "<p><strong>The certificate, issuer, audience and validity window all check \
-             out.</strong></p><p>The one thing this test cannot check is the correlation: a \
-             pasted response answers no sign-in that this deployment started, and \
-             <code>{name}</code> is set to accept only responses to its own requests. That is \
-             the right setting and a real sign-in will carry what it needs.</p>",
-            name = escape_html(&connection.display_name)
+        // A BOUND THIS CONNECTION REQUIRES AND THE DOCUMENT DOES NOT CARRY. `max_assertion_age`
+        // is a column on this connection, so an operator reading "capture a fresh response" --
+        // which the catch-all used to say -- would recapture forever: every document their
+        // provider emits is missing the same element.
+        ConditionError::MissingBound { .. } => {
+            "<p><strong>The assertion does not say when it stops being valid.</strong></p>\
+             <p>This connection refuses an assertion whose lifetime cannot be bounded. In your \
+             identity provider, switch on the assertion lifetime (a <code>NotOnOrAfter</code> \
+             condition); most emit one by default and it can be turned off.</p>"
+                .to_owned()
+        }
+        ConditionError::UnreadableBound { .. } => {
+            "<p><strong>The validity window is written in a form this deployment cannot \
+             read.</strong></p><p>SAML timestamps have to be UTC, ending in <code>Z</code>. A \
+             provider emitting a numeric offset instead produces a document that looks correct \
+             on screen and is refused here. Send this page to your vendor.</p>"
+                .to_owned()
+        }
+        // THE LIFETIME IS A COLUMN ON THIS CONNECTION, so "capture a fresh response" -- what the
+        // catch-all used to say -- would have an operator recapturing forever: every document
+        // their provider emits carries the same window.
+        ConditionError::TooLongLived => format!(
+            "<p><strong>Your identity provider issues assertions that stay valid for longer \
+             than this connection will accept.</strong></p><p>This connection accepts at most \
+             {seconds} seconds. Shorten the assertion lifetime in your identity provider, or \
+             ask your vendor to raise the limit knowing what it costs: an assertion is a bearer \
+             credential for as long as its window lasts.</p>",
+            seconds = connection.max_assertion_age_secs
         ),
-        AcsError::Signature(_) => format!(
+        // THE ACS URL IS A COPY-PASTE VALUE THIS PAGE ALREADY PRINTS, which makes this one of
+        // the most actionable messages here: the two strings sit side by side and one of them is
+        // wrong.
+        ConditionError::WrongRecipient { found } => format!(
+            "<p><strong>Your identity provider is sending the response to the wrong \
+             address.</strong></p><p>The assertion names <code>{found}</code>. This connection \
+             expects <code>{expected}</code>.</p><p>In your identity provider, set the \
+             single sign-on URL (sometimes called the ACS URL, or the Reply URL) to exactly the \
+             expected value above.</p>",
+            found = escape_html(found.as_deref().unwrap_or("nothing")),
+            expected = escape_html(&connection.acs_url)
+        ),
+        // THE CORRELATION, which a pasted document can never satisfy and a real sign-in always
+        // does. It reaches this page only for a connection that ACCEPTS unsolicited responses
+        // and was handed one carrying an `InResponseTo` naming nothing -- so it is not the
+        // ordinary paste case, which `AcsError::UnsolicitedRefused` answers instead.
+        ConditionError::UnknownRequest => {
+            "<p><strong>This response answers a sign-in this deployment did not start.</strong>\
+             </p><p>That is expected for a document captured earlier and pasted here, and it is \
+             not a fault in your configuration. A real sign-in carries the reference this \
+             check is looking for.</p>"
+                .to_owned()
+        }
+        ConditionError::Malformed => {
+            "<p><strong>The assertion is not shaped the way the specification requires.</strong>\
+             </p><p>Either it is not a SAML assertion, or it carries two of something it may \
+             carry one of -- two conditions blocks, two subjects, or two bearer confirmations. \
+             An ambiguous document is not read rather than having one half believed. Capture a \
+             fresh response; if it keeps happening, send this page to your vendor.</p>"
+                .to_owned()
+        }
+        ConditionError::UnsupportedCondition { .. } => {
+            "<p><strong>The assertion carries a restriction this deployment does not \
+             implement.</strong></p><p>The specification requires refusing it rather than \
+             ignoring it, so this is not something you can fix in your identity provider by \
+             correcting a value. Send this page to your vendor.</p>"
+                .to_owned()
+        }
+    }
+}
+
+/// The signature half of [`diagnose`].
+///
+/// FIVE VARIANTS AND FIVE SENTENCES. An earlier version matched `AcsError::Signature(_)` and
+/// printed the certificate-rotation message for all of them, so an identity provider with
+/// assertion signing switched off, or still emitting RSA-SHA1, sent its administrator to rotate
+/// a certificate that was correct.
+fn diagnose_signature(
+    error: ironauth_saml::VerifyError,
+    connection: &ironauth_store::SamlConnection,
+) -> String {
+    use ironauth_saml::VerifyError;
+    match error {
+        // THE SIGNATURE FAILURES ARE FIVE DIFFERENT PROBLEMS AND ONE SENTENCE WOULD FIT ONE OF
+        // THEM. An earlier version printed the certificate-rotation message for all five, so an
+        // identity provider with assertion signing switched OFF, or still emitting RSA-SHA1, was
+        // sent to rotate a certificate that was correct -- the exact generic error this surface
+        // exists to replace.
+        VerifyError::SignatureMissing => {
+            "<p><strong>The assertion is not signed.</strong></p><p>This is a setting in your \
+             identity provider, not a certificate problem. Most providers can sign the response, \
+             the assertion, or both, and default to a combination this deployment does not \
+             accept: switch on assertion signing.</p><p>A document carrying two signatures \
+             lands here as well, which usually means both were switched on.</p>"
+                .to_owned()
+        }
+        VerifyError::AlgorithmRefused => {
+            "<p><strong>The signature uses an algorithm this deployment refuses.</strong></p>\
+             <p>Again a setting rather than a certificate: SHA-1 digests and RSA-SHA1 signatures \
+             are refused outright. In your identity provider, set the signature algorithm to \
+             RSA-SHA256 and the digest to SHA-256.</p>"
+                .to_owned()
+        }
+        VerifyError::ReferenceRefused => {
+            "<p><strong>The signature does not cover the assertion the way it must.</strong></p>\
+             <p>The signature has to name exactly the element it protects, and this one does \
+             not. It is not a value you can correct: send this page to your vendor.</p>"
+                .to_owned()
+        }
+        VerifyError::SignatureInvalid => format!(
             "<p><strong>The signature did not verify against the certificate pinned for this \
              connection.</strong></p><p>The usual cause is a certificate that has been rotated \
              at your identity provider and not re-pinned here. Export the current signing \
@@ -2075,15 +2253,12 @@ fn diagnose(
              against <code>{name}</code>.</p>",
             name = escape_html(&connection.display_name)
         ),
-        // EVERY OTHER VARIANT, and it is a real answer rather than a shrug: the ones that reach
-        // here are about the document's own shape, and the operator's next step is the same for
-        // all of them, which is to capture a fresh response rather than to change a setting.
-        other => format!(
-            "<p><strong>This response was refused.</strong> {detail}</p><p>Nothing in this \
-             connection's configuration explains it, so capture a fresh response and try \
-             again. If it keeps happening, send this page to your vendor.</p>",
-            detail = escape_html(&other.to_string())
-        ),
+        VerifyError::Malformed(_) => {
+            "<p><strong>This does not parse as a SAML response.</strong></p><p>Copy the value \
+             of the <code>SAMLResponse</code> form field exactly as your browser sent it -- not \
+             the decoded XML, and not a value that has been through an editor.</p>"
+                .to_owned()
+        }
     }
 }
 
@@ -2146,48 +2321,89 @@ pub async fn connection_test_post(
     else {
         return test_refusal("that is not a connection of this deployment");
     };
-    let connection = match read.saml_connections().find_active(&connection_id).await {
+    // NOT `find_active`, WHICH IS THE WHOLE POINT OF THIS SURFACE. A switched-off connection is
+    // invisible to that read, so the admin who is still SETTING THEIRS UP -- the one the form
+    // beside it is rendered for -- posted this and was told "no active connection with that id",
+    // which is also what the organization fence below answers. The sentence that came back read
+    // as "that connection is not yours" and the page went quiet about the one fact that would
+    // have helped.
+    //
+    // THE EXAMINATION IS WORTH RUNNING ON AN INACTIVE CONNECTION, and that is why this resolves
+    // one rather than refusing it politely. `examine` reads the connection's columns and the
+    // pinned certificates; none of that depends on the switch, so an operator can get their
+    // audience and their certificate right BEFORE their vendor turns sign-in on. What they must
+    // not get is a verdict that reads as "you are finished".
+    let connection = match read
+        .saml_connections()
+        .find_in_org(session.organization(), &connection_id)
+        .await
+    {
         Ok(Some(connection)) => connection,
-        Ok(None) => return test_refusal("no active connection with that id"),
+        // THE ORGANIZATION IS A PREDICATE OF THE READ, so a connection belonging to a neighbour
+        // resolves to nothing here rather than to a row this handler must remember to check. A
+        // portal session is bound to ONE organization and a connection id is guessable in the way
+        // every id is: without this, a link issued for one customer diagnoses another's
+        // connection and reports their audience and certificate count back.
+        Ok(None) => return test_refusal("no connection with that id"),
         Err(_) => return PortalRefusal::Unavailable.into_response(),
     };
-    // THE ORGANIZATION FENCE, and it is the reason this is not simply a management route. A
-    // portal session is bound to ONE organization, and a connection id is guessable in the way
-    // every id is: without this, a link issued for one customer diagnoses another's connection
-    // and reports their audience and certificate count back.
-    if &connection.organization_id != session.organization() {
-        return test_refusal("no active connection with that id");
-    }
     let Ok(certificates) = read.saml_connections().certificates(&connection_id).await else {
         return PortalRefusal::Unavailable.into_response();
     };
 
-    let decoded = {
-        use base64::Engine as _;
-        base64::engine::general_purpose::STANDARD.decode(form.saml_response.trim())
-    };
-    let Ok(response) = decoded else {
-        return test_refusal(
-            "that does not look like a SAMLResponse. Paste the base64 value of the \
-             SAMLResponse form field, not the URL or the decoded XML",
-        );
+    // THE SAME DECODER THE ACS USES, for the reason its doc gives: any input the two treat
+    // differently makes this test lie about what a real sign-in would do. The first version here
+    // called `.trim()` and decoded, which refused the line-wrapped field every identity provider
+    // actually emits.
+    let response = match crate::saml_route::decode_response_field(&form.saml_response) {
+        Ok(response) => response,
+        Err(crate::saml_route::ResponseDecodeError::TooLarge) => {
+            return test_refusal(
+                "that is larger than any SAMLResponse this deployment will read. Paste the \
+                 value of the SAMLResponse form field rather than a whole captured trace",
+            );
+        }
+        Err(crate::saml_route::ResponseDecodeError::NotBase64) => {
+            return test_refusal(
+                "that does not look like a SAMLResponse. Paste the base64 value of the \
+                 SAMLResponse form field, not the URL and not the decoded XML",
+            );
+        }
     };
 
     let acs = crate::saml_acs::Acs {
         connection: &connection,
         certificates: &certificates,
-        now_unix_secs: crate::saml_route::unix_seconds_for_test(state.now()),
+        now_unix_secs: crate::saml_route::unix_seconds(state.now()),
         limits: &ironauth_saml::Limits::default(),
     };
     let verdict = match crate::saml_acs::examine(&acs, &response) {
-        Ok(_) => "<p>This response verifies against this connection. Signature, audience, \
-                  issuer and conditions all hold.</p>"
+        // EVERY CHECK `examine` MAKES, which on this connection includes the ones that come
+        // after the correlation: it accepts unsolicited responses, so the name ID format, the
+        // encryption requirement and the attribute statement were all reached. The
+        // `UnsolicitedRefused` arm of `diagnose` is the weaker sentence, and says so.
+        Ok(_) => "<p><strong>This response passes every check this deployment makes.</strong>\
+                  </p><p>Certificate, issuer, audience, validity window, name ID format and \
+                  attributes all hold, and this connection accepts a response it did not ask \
+                  for -- so a pasted document reaches the end of the same path a real sign-in \
+                  takes.</p>"
             .to_owned(),
         Err(error) => diagnose(&error, &connection),
     };
+    // WHAT THE VERDICT DOES NOT COVER, said above it rather than folded into it. A response can
+    // be perfect and sign nobody in, because sign-in through this connection is switched off --
+    // and a page that reported only the document's health would have an operator waiting for
+    // something that is never going to start.
+    let switched_off = if connection.active {
+        String::new()
+    } else {
+        "<p><strong>Sign-in through this connection is switched off</strong>, whatever this \
+         test says about the document. Your vendor has to enable it before anyone can use it.</p>"
+            .to_owned()
+    };
     let body = format!(
         "<!doctype html><meta charset=\"utf-8\"><title>Connection test</title>\
-         <h1>Connection test</h1>{verdict}"
+         <h1>Connection test</h1>{switched_off}{verdict}"
     );
     crate::pages::secure_html(StatusCode::OK, body)
 }
