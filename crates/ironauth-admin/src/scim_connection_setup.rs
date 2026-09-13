@@ -87,12 +87,14 @@ impl ScimConnectionSetupConsumer {
                     display_name,
                     provider,
                     token_digest,
-                    // NO HORIZON. A connection created with one cannot be rotated once the date
-                    // passes -- `rotate_token` refuses it and no path in this system moves
-                    // `scim_connections.expires_at` -- so a portal form setting one would be
-                    // handing a customer a provisioning connection with a one-way expiry date
-                    // and no remedy but asking their vendor for a new one. An operator may still
-                    // choose that through the management API, where the decision is theirs.
+                    // NO HORIZON. `create` is the ONLY path that writes
+                    // `scim_connections.expires_at` and nothing UPDATES it -- 0183 grants the
+                    // control role `UPDATE (revoked_at, updated_at)` and no more -- so once a
+                    // connection carries one, that date is fixed and `rotate_token` refuses the
+                    // connection after it passes. A portal form setting one would be handing a
+                    // customer a provisioning connection with a one-way expiry and no remedy but
+                    // asking their vendor for a replacement. An operator may still choose that
+                    // through the management API, where the decision is theirs.
                     expires_at_unix_micros: None,
                 },
                 None,
