@@ -6,6 +6,42 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+### Embeddable portal widgets, EXPLORATORY (issue #145 criterion 6)
+
+Shape `0.1.0-exp.1`, registered as the `admin-portal-widgets` experimental
+feature and GATED by it: with the flag off, every widget route answers the same
+uniform not-found a spent token gets.
+
+`GET /portal/w/sso` and `GET /portal/w/scim` return this organization's SSO and
+provisioning state as JSON, for a vendor to render inside its own application
+instead of sending its customer to a hosted page.
+
+BEARER ONLY, and that is the design rather than a convenience. Every other
+portal route authenticates with the `__Host-` session cookie, which a browser
+attaches by itself; a widget is fetched by code on the vendor's own origin, so a
+route that accepted that ambient cookie would be spendable by any page the
+customer happens to have open. These read `Authorization: Bearer` and nothing
+else, with no fallback. The token is the same value the cookie carries, hashed
+the same way against the same row, so there is no second credential with a
+second lifetime -- and a browser cannot turn one into the other, because the
+cookie is `HttpOnly`.
+
+That is also what makes `Access-Control-Allow-Origin: *` safe here:
+`Access-Control-Allow-Credentials` is never sent, the two are mutually exclusive
+by the fetch specification, and this surface wants neither.
+
+READ ONLY, so the CSRF question the mutating portal routes answer with a
+same-origin guard does not arise.
+
+NOTHING NEW MINTS A TOKEN. A vendor's backend redeems the portal link it already
+mints and reads the session out of the `Set-Cookie`, so the TTL, the single-use
+rule and the intent all still come from the link. A second minting path would be
+a second place for those three to be decided.
+
+The envelope echoes the organization it is about, and REPORTS truncation at its
+20-row bound: a list that stops without saying so renders, in a host app, as a
+complete list.
+
 ### Device-posture policy predicates, EXPLORATORY (issue #145 criterion 5)
 
 Shape `0.1.0-exp.1`, registered as the `device-posture-policy-hooks` experimental

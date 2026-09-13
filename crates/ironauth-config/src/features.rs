@@ -168,6 +168,16 @@ pub const DEVICE_POSTURE_FEATURE: &str = "device-posture-policy-hooks";
 /// dictates what a device-posture assertion carries, so what may break is our decision.
 pub const DEVICE_POSTURE_VERSION: &str = "0.1.0-exp.1";
 
+/// Embeddable portal widgets (issue #145 criterion 6, EXPLORATORY).
+pub const PORTAL_WIDGETS_FEATURE: &str = "admin-portal-widgets";
+
+/// The shape acknowledged by an operator enabling [`PORTAL_WIDGETS_FEATURE`].
+///
+/// A counter rather than a draft revision, for the reason [`DEVICE_POSTURE_VERSION`] gives: the
+/// JSON a widget reads is IronAuth's own shape and no standard governs it. What an operator
+/// acknowledges is that we expect to change it.
+pub const PORTAL_WIDGETS_VERSION: &str = "0.1.0-exp.1";
+
 /// The registry name of the `AuthZEN` agent tool-authorization profile (issue #133,
 /// exploratory bet 5).
 ///
@@ -491,6 +501,24 @@ impl FeatureRegistry {
         ));
     }
 
+    /// Registers the embeddable portal widgets (issue #145 criterion 6, EXPLORATORY).
+    pub fn register_portal_widgets(&mut self) {
+        self.register(Feature::experimental(
+            PORTAL_WIDGETS_FEATURE,
+            "Embeddable portal widgets (issue #145): the SSO-status and SCIM-setup surfaces \
+             as org-scoped JSON a vendor renders inside its OWN application, instead of \
+             sending its customer to a hosted page. BEARER ONLY, and that is the design \
+             rather than a convenience: the hosted pages authenticate with a `__Host-` cookie, \
+             which is ambient authority a third-party page could spend, so these routes refuse \
+             the cookie outright and take the session token as an `Authorization: Bearer`. \
+             They are READ ONLY. The organization and the intent come from the session row, \
+             so a widget cannot be pointed at a neighbour by its host. EXPLORATORY: the JSON \
+             shape is expected to move, and nothing but a vendor's own front end reads it.",
+            PORTAL_WIDGETS_VERSION,
+            "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+    }
+
     /// Registers the `AuthZEN` agent tool-authorization profile (issue #133, PROTOTYPE).
     pub fn register_authzen_agent_profile(&mut self) {
         self.register(Feature::experimental(
@@ -552,6 +580,7 @@ impl FeatureRegistry {
         registry.register_wasm_hooks();
         registry.register_access_request_approval();
         registry.register_device_posture();
+        registry.register_portal_widgets();
         registry
     }
 

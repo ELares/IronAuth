@@ -703,6 +703,20 @@ impl Harness {
         }
     }
 
+    /// A store-backed harness serving the EXPLORATORY portal widgets (issue #145 criterion 6).
+    ///
+    /// OFF by default on `OidcState`, like every exploratory surface, so a test that wants the
+    /// routes to exist has to say so -- and the flag-off test says so by NOT calling this.
+    pub async fn start_store_backed_with_widgets(enabled: bool) -> Self {
+        let harness = Self::start_store_backed_with_scim_surface(true).await;
+        let state = harness.state.clone().with_portal_widgets_enabled(enabled);
+        Self {
+            router: oidc_router(state.clone()),
+            state,
+            ..harness
+        }
+    }
+
     fn with_scim_warning_lead(mut self, secs: u64) -> Self {
         // THE ROUTER IS REBUILT, matching `with_hook_runtime` below: the router captures the
         // state it was built from, so installing on the state afterwards without rebuilding

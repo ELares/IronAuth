@@ -31,9 +31,9 @@ use ironauth_config::{
     ADVANCED_RECOVERY_FEATURE, AGENT_TOKEN_VAULT_FEATURE, ATTESTATION_CLIENT_AUTH_FEATURE,
     AUTHZEN_AGENT_PROFILE_FEATURE, Config, FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE,
     FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, IDENTITY_CHAINING_FEATURE, Loaded,
-    NATIVE_SSO_FEATURE, ORG_SCOPED_CLIENTS_FEATURE, OidcConfig, OutboxConfig, PasswordPolicyConfig,
-    RISK_SIGNALS_FEATURE, ScreeningFailurePolicy, ScreeningProvider, TRANSACTION_TOKENS_FEATURE,
-    WASM_HOOKS_FEATURE, WebhooksConfig,
+    NATIVE_SSO_FEATURE, ORG_SCOPED_CLIENTS_FEATURE, OidcConfig, OutboxConfig,
+    PORTAL_WIDGETS_FEATURE, PasswordPolicyConfig, RISK_SIGNALS_FEATURE, ScreeningFailurePolicy,
+    ScreeningProvider, TRANSACTION_TOKENS_FEATURE, WASM_HOOKS_FEATURE, WebhooksConfig,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -773,6 +773,12 @@ struct DataPlaneSurfaces {
     org_scoped_clients: bool,
     /// The experimental OAuth 2.0 Authorization Challenge Endpoint (issue #93, Bet 3).
     first_party_challenge: bool,
+    /// The EXPLORATORY embeddable portal widgets (issue #145 criterion 6).
+    ///
+    /// ONE PLANE, like the attester registry below and for the same reason: the management API
+    /// serves no widget, so declaring it as a cross-plane value would have meant an
+    /// `AdminState` builder holding a flag nothing on that plane reads.
+    portal_widgets: bool,
     /// The headless flow API (issue #84), a plain operator toggle.
     flows: bool,
     /// The hosted-page render app cutover (issue #85), a plain operator toggle.
@@ -812,6 +818,7 @@ impl DataPlaneSurfaces {
             risk_signals: features.is_enabled(config, RISK_SIGNALS_FEATURE),
             org_scoped_clients: features.is_enabled(config, ORG_SCOPED_CLIENTS_FEATURE),
             first_party_challenge: features.is_enabled(config, FIRST_PARTY_CHALLENGE_FEATURE),
+            portal_widgets: features.is_enabled(config, PORTAL_WIDGETS_FEATURE),
             flows: config.flows.enabled,
             // The hosted pages retarget the `/authorize` login and registration
             // interaction redirects onto the flow browser page, but ONLY in composition
@@ -1720,6 +1727,7 @@ async fn build_oidc_plane(
     .with_risk_signals_enabled(surfaces.risk_signals)
     .with_org_scoped_clients_enabled(surfaces.org_scoped_clients)
     .with_first_party_challenge_enabled(surfaces.first_party_challenge)
+    .with_portal_widgets_enabled(surfaces.portal_widgets)
     // Attestation-based client authentication (issue #133, PROTOTYPE). ONE plane, and
     // deliberately not routed through the shared cross-plane capture: the management API
     // authenticates no client instances, so declaring it there would have meant an

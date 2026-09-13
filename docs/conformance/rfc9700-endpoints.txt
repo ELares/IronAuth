@@ -86,6 +86,8 @@
 /t/{tenant_id}/e/{environment_id}/portal/s/scim/test
 /t/{tenant_id}/e/{environment_id}/portal/s/sso/test
 /t/{tenant_id}/e/{environment_id}/portal/s/{intent}
+/t/{tenant_id}/e/{environment_id}/portal/w/scim
+/t/{tenant_id}/e/{environment_id}/portal/w/sso
 /t/{tenant_id}/e/{environment_id}/portal/{link_id}
 /t/{tenant_id}/e/{environment_id}/pow/challenge
 /t/{tenant_id}/e/{environment_id}/recover/admin-approved/initiate

@@ -5391,3 +5391,362 @@ async fn the_token_check_is_absent_where_nothing_can_authenticate() {
     let (status, body) = check_token(&live, &cookie, &connection, &token).await;
     assert_eq!(status, 200, "the control: {body}");
 }
+// ---------------------------------------------------------------------------------------------
+// THE WIDGET SURFACE (issue #145 criterion 6), and the host app that renders it.
+// ---------------------------------------------------------------------------------------------
+
+/// The vendor's backend, doing what a vendor's backend does to get a widget token.
+///
+/// It mints a portal link through the control plane and REDEEMS IT ITSELF, reading the session
+/// value out of the `Set-Cookie` rather than handing the link to a browser. That is the whole
+/// mechanism, and it is why the widget surface needs no second minting path: the TTL, the
+/// single-use rule and the intent all still come from the link.
+async fn widget_token(
+    harness: &Harness,
+    intent: &str,
+    token: &str,
+    organization: &OrganizationId,
+) -> String {
+    let cookie = open_session_in(harness, intent, token, organization).await;
+    cookie
+        .split_once('=')
+        .expect("the cookie carries a value")
+        .1
+        .to_owned()
+}
+
+/// `GET` a widget with a bearer, the way the host's own code does.
+async fn widget_get(
+    harness: &Harness,
+    surface: &str,
+    bearer: Option<&str>,
+) -> (axum::http::StatusCode, axum::http::HeaderMap, String) {
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/w/{surface}",
+        scope.tenant(),
+        scope.environment()
+    );
+    let mut builder = axum::http::Request::builder().method("GET").uri(&path);
+    if let Some(bearer) = bearer {
+        builder = builder.header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {bearer}"),
+        );
+    }
+    harness
+        .send(
+            builder
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+}
+
+/// THE HOST APP. A vendor's page, rendering the widget payload into its own markup.
+///
+/// IT IS HERE BECAUSE THE CRITERION IS ABOUT RENDERING. "Widgets render the SSO-status and
+/// SCIM-setup flows inside a host-app fixture" is a claim about what a consumer can build out of
+/// this surface, and a test that only asserted JSON field names would leave it unmeasured: a
+/// payload can carry every field and still not answer the question a status panel asks.
+///
+/// IT IS DELIBERATELY DUMB. It does no lookup of its own and holds no notion of which customer
+/// it is showing; everything on the page comes out of the response, including the organization
+/// it labels itself with. That is what makes the cross-organization assertions below meaningful
+/// -- if the surface leaked a neighbour's row, this would render it.
+fn host_app_render(payload: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let mut page = String::new();
+    page.push_str("<section class=\"ironauth-widget\">");
+    let _ = write!(
+        page,
+        "<h3>Organization {}</h3>",
+        payload["organization_id"].as_str().unwrap_or("?")
+    );
+    for item in payload["items"].as_array().cloned().unwrap_or_default() {
+        page.push_str("<div class=\"row\">");
+        let _ = write!(
+            page,
+            "<span class=\"name\">{}</span>",
+            item["display_name"].as_str().unwrap_or("?")
+        );
+        if let Some(active) = item["active"].as_bool() {
+            page.push_str(if active {
+                "<span class=\"state\">Sign-in is on</span>"
+            } else {
+                "<span class=\"state\">Sign-in is off</span>"
+            });
+            let _ = write!(
+                page,
+                "<span class=\"certs\">{} certificate(s) pinned</span>",
+                item["pinned_certificates"].as_u64().unwrap_or(0)
+            );
+        }
+        if let Some(stopped) = item["provisioning_stopped"].as_bool() {
+            page.push_str(if stopped {
+                "<span class=\"state\">Provisioning has stopped</span>"
+            } else {
+                "<span class=\"state\">Provisioning is working</span>"
+            });
+            // THE FLAG IS READ BESIDE THE VALUE, which is the contract the field carries. A host
+            // that rendered an absent stamp as "never used" would say that to every customer of
+            // a freshly upgraded deployment.
+            page.push_str(
+                match (
+                    item["last_seen_at_unix_micros"].as_i64(),
+                    item["usage_is_knowable"].as_bool(),
+                ) {
+                    (Some(_), _) => "<span class=\"seen\">Recently used</span>",
+                    (None, Some(true)) => "<span class=\"seen\">Never used</span>",
+                    (None, _) => "<span class=\"seen\">Usage not recorded</span>",
+                },
+            );
+        }
+        page.push_str("</div>");
+    }
+    page.push_str("</section>");
+    page
+}
+
+#[tokio::test]
+async fn a_host_app_renders_this_organizations_sso_status_and_no_others() {
+    // #145 criterion 6. TWO ORGANIZATIONS EXIST and the widget is fetched with ONE's token, so
+    // "no cross-org leakage" is measured against a deployment that actually has something to
+    // leak. An assertion made in a single-tenant fixture proves nothing: every list is correct
+    // when there is only one customer.
+    let harness = Harness::start_store_backed_with_widgets(true).await;
+    let mine = seed_org(&harness, "Acme").await;
+    let theirs = seed_org(&harness, "Globex").await;
+    let ours =
+        saml_connection_from(&harness, &mine, "acme-okta", "https://idp.example/entity").await;
+    let _theirs = saml_connection_from(
+        &harness,
+        &theirs,
+        "globex-entra",
+        "https://other.example/entity",
+    )
+    .await;
+    let key = XmlTestKey::generate();
+    pin_certificate_for(&harness, &ours, &key).await;
+    let bearer = widget_token(&harness, "sso", "w-1", &mine).await;
+
+    let (status, headers, body) = widget_get(&harness, "sso", Some(&bearer)).await;
+    assert_eq!(status, 200, "the widget: {body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let page = host_app_render(&payload);
+
+    assert!(
+        page.contains("acme-okta"),
+        "the host app has to be able to render this organization's connection: {page}"
+    );
+    assert!(
+        page.contains("1 certificate(s) pinned"),
+        "and the one fact a status panel exists for -- whether setup is finished: {page}"
+    );
+    assert!(
+        page.contains("Sign-in is on"),
+        "and whether anyone can actually use it: {page}"
+    );
+    assert!(
+        !page.contains("globex-entra"),
+        "another customer's connection reached this host app: {page}"
+    );
+    assert!(
+        page.contains(&mine.to_string()),
+        "the payload labels itself with the session's organization: {page}"
+    );
+    // THE HEADERS A CROSS-ORIGIN READER NEEDS, and no credentialed variant of them.
+    assert_eq!(
+        headers
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some("*"),
+        "a widget is fetched from the vendor's origin"
+    );
+    assert!(
+        headers
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+            .is_none(),
+        "credentials must never be allowed: the whole design is that none ride along"
+    );
+}
+
+#[tokio::test]
+async fn a_host_app_renders_this_organizations_provisioning_state() {
+    // The SCIM half of the criterion, and the state a status panel is for: a connection whose
+    // credentials are gone provisions nothing, and that is invisible from every other field.
+    let harness = Harness::start_store_backed_with_widgets(true).await;
+    let mine = seed_org(&harness, "Acme").await;
+    let theirs = seed_org(&harness, "Globex").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let token = token_for(&id, "s3cr3t");
+    let working = connect_with_id(
+        &harness,
+        &mine,
+        "Okta Production",
+        "okta",
+        &id,
+        &token,
+        None,
+    )
+    .await;
+    let _ = working;
+    let their_id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let _theirs = connect_with_id(
+        &harness,
+        &theirs,
+        "Globex Entra",
+        "entra",
+        &their_id,
+        &token_for(&their_id, "other"),
+        None,
+    )
+    .await;
+    let bearer = widget_token(&harness, "scim", "w-2", &mine).await;
+
+    let (status, _, body) = widget_get(&harness, "scim", Some(&bearer)).await;
+    assert_eq!(status, 200, "the widget: {body}");
+    let page = host_app_render(&serde_json::from_str(&body).expect("json"));
+
+    assert!(
+        page.contains("Okta Production"),
+        "this organization's provisioning connection: {page}"
+    );
+    assert!(
+        page.contains("Provisioning is working"),
+        "a live connection reads as live: {page}"
+    );
+    // A CONNECTION CREATED BY THIS BINARY IS WATCHED, so the absent stamp is knowable and the
+    // host may say so. The other branch is the installed base, and this is the assertion that
+    // keeps the flag load-bearing rather than decorative.
+    assert!(
+        page.contains("Never used"),
+        "a watched connection nobody has called reads as unused: {page}"
+    );
+    assert!(
+        !page.contains("Globex Entra"),
+        "another customer's provisioning reached this host app: {page}"
+    );
+}
+
+#[tokio::test]
+async fn a_widget_refuses_the_cookie_that_every_hosted_page_accepts() {
+    // THE DESIGN, MEASURED. Every other portal route authenticates with the `__Host-` cookie,
+    // which a browser attaches by itself -- and a widget is fetched by code on somebody else's
+    // origin, so a route that took the ambient cookie would be spendable by any page the
+    // customer happens to have open. The refusal is the control that says the bearer is doing
+    // the work.
+    let harness = Harness::start_store_backed_with_widgets(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let _connection =
+        saml_connection_from(&harness, &org, "acme-okta", "https://idp.example/entity").await;
+    let cookie = open_session_in(&harness, "sso", "w-3", &org).await;
+    let bearer = cookie
+        .split_once('=')
+        .expect("the cookie carries a value")
+        .1
+        .to_owned();
+
+    // THE CONTROL: the same session, presented as a bearer, is served.
+    let (status, _, served) = widget_get(&harness, "sso", Some(&bearer)).await;
+    assert_eq!(status, 200, "the control: {served}");
+
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/w/sso",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, _, body) = harness.get_with_cookie(&path, Some(&cookie)).await;
+    assert_eq!(status, 404, "the widget accepted an ambient cookie: {body}");
+}
+
+#[tokio::test]
+async fn an_sso_token_cannot_read_the_provisioning_widget() {
+    // The intent fence, on a surface that is new and therefore exactly where it gets forgotten.
+    // A link minted to show an admin their SSO status has no business listing provisioning
+    // credentials' health.
+    let harness = Harness::start_store_backed_with_widgets(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let _connection = connect_with_id(
+        &harness,
+        &org,
+        "Okta Production",
+        "okta",
+        &id,
+        &token_for(&id, "s3cr3t"),
+        None,
+    )
+    .await;
+
+    // THE CONTROL: a `scim` token reads the same widget.
+    let scim = widget_token(&harness, "scim", "w-4", &org).await;
+    let (status, _, served) = widget_get(&harness, "scim", Some(&scim)).await;
+    assert_eq!(status, 200, "the control: {served}");
+
+    let sso = widget_token(&harness, "sso", "w-5", &org).await;
+    let (status, _, body) = widget_get(&harness, "scim", Some(&sso)).await;
+    assert_eq!(
+        status, 404,
+        "an sso token read the provisioning widget: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_widgets_are_absent_until_an_operator_enables_them() {
+    // EXPLORATORY MEANS OFF. A surface whose JSON shape is expected to move must not appear on a
+    // deployment that never asked for it, and the answer has to be the SAME not-found a spent
+    // token gets -- otherwise a caller learns which deployments have it switched on.
+    let harness = Harness::start_store_backed_with_widgets(false).await;
+    let org = seed_org(&harness, "Acme").await;
+    let _connection =
+        saml_connection_from(&harness, &org, "acme-okta", "https://idp.example/entity").await;
+    let bearer = widget_token(&harness, "sso", "w-6", &org).await;
+
+    let (status, _, body) = widget_get(&harness, "sso", Some(&bearer)).await;
+    assert_eq!(
+        status, 404,
+        "an unflagged deployment served a widget: {body}"
+    );
+
+    // THE SAME ANSWER a live deployment gives an invented token, so the pair is uniform.
+    let live = Harness::start_store_backed_with_widgets(true).await;
+    let (status, _, _) = widget_get(&live, "sso", Some("not-a-token")).await;
+    assert_eq!(status, 404, "the refusals have to be the same shape");
+}
+
+#[tokio::test]
+async fn a_widget_bound_reports_itself_rather_than_truncating_quietly() {
+    // A LIST THAT STOPS WITHOUT SAYING SO renders, in a host app, as a complete list. The host
+    // has no way to know otherwise: it holds no count of its own and asks for no page. So the
+    // envelope carries the fact.
+    let harness = Harness::start_store_backed_with_widgets(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    for index in 0..21 {
+        saml_connection_from(
+            &harness,
+            &org,
+            &format!("connection-{index}"),
+            &format!("https://idp-{index}.example/entity"),
+        )
+        .await;
+    }
+    let bearer = widget_token(&harness, "sso", "w-7", &org).await;
+
+    let (status, _, body) = widget_get(&harness, "sso", Some(&bearer)).await;
+    assert_eq!(status, 200, "the widget: {body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        payload["items"].as_array().map(Vec::len),
+        Some(20),
+        "the bound is what it says it is"
+    );
+    assert_eq!(
+        payload["truncated"].as_bool(),
+        Some(true),
+        "and a bounded response has to admit it: {body}"
+    );
+}
