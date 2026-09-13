@@ -150,6 +150,7 @@ mod resource_servers;
 mod resource_types;
 mod response;
 mod routing_rules;
+pub mod saml_connection_setup;
 mod saml_connections;
 mod secrets;
 mod service_account_keys;

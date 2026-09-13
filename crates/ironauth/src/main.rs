@@ -19,6 +19,7 @@ use ironauth_admin::flow_target_delivery::{FlowTargetDeliveryConsumer, FlowTarge
 use ironauth_admin::message_composer::DefaultComposer;
 use ironauth_admin::message_http_provider::HttpMessageProvider;
 use ironauth_admin::offboarding_worker::OffboardingConsumer;
+use ironauth_admin::saml_connection_setup::SamlConnectionSetupConsumer;
 use ironauth_admin::scim_push_scheduler::{
     ScimPushObserver, ScimPushScheduler, ScimPushSchedulerInputs,
 };
@@ -2412,6 +2413,13 @@ fn portal_write_consumers(control_store: &ironauth_store::Store) -> Vec<Arc<dyn 
         Arc::new(CertificatePinRequestConsumer::new(control_store.clone()))
             as Arc<dyn OutboxConsumer>,
         Arc::new(ContactChangeConsumer::new(control_store.clone())) as Arc<dyn OutboxConsumer>,
+        // AND THE SETUP (issue #140 criterion 1), which is the same shape for the same reason:
+        // `saml_connections` INSERT is the control plane's, and the portal is a data-plane
+        // surface. A deployment serving the portal serves this too, so it rides the same worker
+        // -- and a connection queued with no consumer draining it is a customer who filled in
+        // the form and waits forever.
+        Arc::new(SamlConnectionSetupConsumer::new(control_store.clone()))
+            as Arc<dyn OutboxConsumer>,
     ]
 }
 

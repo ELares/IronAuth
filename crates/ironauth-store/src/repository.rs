@@ -22575,6 +22575,41 @@ pub const CERTIFICATE_NOTICE_CONSUMER: &str = "saml_certificate.notice";
 /// which is worth fixing and is its own change: it needs a catalogued event type.
 pub const CERTIFICATE_PIN_REQUEST_CONSUMER: &str = "saml_certificate.pin_request";
 
+/// The consumer that CREATES a SAML connection an IT admin configured from the portal
+/// (issue #140 criterion 1).
+///
+/// # Why the portal cannot simply write it
+///
+/// 0196 grants `saml_connections` INSERT to `ironauth_control` alone; `ironauth_app` -- the role
+/// the portal serves on -- holds SELECT. The same split [`CERTIFICATE_PIN_REQUEST_CONSUMER`]
+/// describes, and the same answer: the portal validates and enqueues, and the consumer applies
+/// from the plane that may.
+///
+/// # What the criterion needs and what this is
+///
+/// "An IT admin completes SSO ... end to end via a portal link with zero vendor-side actions."
+/// The setup guides shipped first, and `portal_route::sso_surface` recorded what they were
+/// missing in so many words: "#140's first criterion is an IT admin completing SSO setup with no
+/// vendor-side action, which needs a create path." This is that path for the SAML variant.
+///
+/// # One job, two writes, and the order matters
+///
+/// The consumer creates the connection and pins the certificate the admin pasted. A connection
+/// with no trust anchor refuses every response its provider sends, so shipping it half-applied
+/// would hand the admin a connection that looks finished and signs nobody in -- the exact
+/// failure the connection-test surface exists to explain.
+///
+/// THE CONNECTION IS CREATED LIVE, which is the criterion rather than an oversight. "Zero
+/// vendor-side actions" means zero, and a connection created switched off would need somebody at
+/// the vendor to enable it -- the action this issue exists to remove. An earlier draft asserted
+/// the opposite and called the switch a commercial decision: a reasonable product argument, and
+/// one that contradicts the thing being built.
+///
+/// WHAT BOUNDS IT IS THE LINK. A portal link is minted by the vendor, single-use, expires in
+/// minutes, and is scoped to one organization and one intent. "This customer may configure SSO"
+/// is decided when that link is issued, which is where a commercial decision belongs.
+pub const SAML_CONNECTION_SETUP_CONSUMER: &str = "saml_connection.setup_request";
+
 /// The consumer that APPLIES a contact change made from the portal (issue #141 criterion 3).
 ///
 /// # Why the portal cannot simply write it

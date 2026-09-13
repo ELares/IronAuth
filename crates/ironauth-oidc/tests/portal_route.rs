@@ -4024,21 +4024,31 @@ async fn an_sso_session_sees_only_its_own_organizations_connections() {
 }
 
 #[tokio::test]
-async fn an_organization_with_no_sign_on_connection_says_so() {
+async fn an_organization_with_no_sign_on_connection_is_offered_the_form() {
     // NOT A REFUSAL. The link is fine and nothing is configured yet, and the two are different
     // things to an admin holding a link they were told would work.
+    //
+    // AND NOT A DEAD END. This page used to say "ask your vendor to create one", which is
+    // exactly the vendor-side action #140 criterion 1 exists to remove -- and it said it to the
+    // reader the whole surface is for, the one who has just arrived with nothing set up. The
+    // assertion changed with the behaviour rather than being relaxed: what is measured now is
+    // that they can finish, which is a stronger property than being told they cannot.
     let harness = Harness::start().await;
     let organization = seed_org(&harness, "Contoso").await;
 
     let body = sso_page(&harness, &organization, "k-sso-empty").await;
 
     assert!(
-        body.contains("no sign-on connection yet"),
+        body.contains("Nothing is configured yet"),
         "an unconfigured organization must be told so: {body}"
     );
     assert!(
-        body.contains("Ask your vendor"),
-        "and told who can fix it: {body}"
+        body.contains("Add a SAML connection"),
+        "and handed the form, not sent to their vendor: {body}"
+    );
+    assert!(
+        !body.contains("Ask your vendor to create one"),
+        "the dead end has to be gone: {body}"
     );
 }
 
@@ -6347,4 +6357,433 @@ async fn a_widget_refusal_is_readable_from_the_host_origin() {
         Some("*"),
         "a host cannot read the malformed-scope refusal"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE CREATE PATH (issue #140 criterion 1), and the journey it completes.
+// ---------------------------------------------------------------------------------------------
+
+/// Drain the SAML setup queue through the CONTROL-plane consumer, as the worker does.
+///
+/// The portal cannot create a connection -- 0196 grants that INSERT to `ironauth_control` alone
+/// -- so it enqueues and this applies. A test stopping at the 303 would be measuring that a row
+/// reached a queue, which is not what the customer asked for.
+async fn apply_saml_setups(harness: &Harness) -> usize {
+    use ironauth_store::outbox::OutboxConsumer as _;
+
+    let scope = harness.scope();
+    let env = Env::system();
+    let consumer = ironauth_admin::saml_connection_setup::SamlConnectionSetupConsumer::new(
+        harness.db().control_store().clone(),
+    );
+    let mut applied = 0;
+    loop {
+        let claimed = harness
+            .db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::SAML_CONNECTION_SETUP_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        if claimed.is_empty() {
+            return applied;
+        }
+        for message in &claimed {
+            consumer
+                .handle(&env, scope, message)
+                .await
+                .expect("the setup applies");
+            harness
+                .db()
+                .store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, message)
+                .await
+                .expect("complete");
+            applied += 1;
+        }
+    }
+}
+
+/// Submit the SAML setup form the way the page renders it.
+async fn submit_saml_setup(
+    harness: &Harness,
+    cookie: &str,
+    display_name: &str,
+    idp_entity_id: &str,
+    idp_sso_url: &str,
+    certificate: &str,
+) -> (axum::http::StatusCode, String) {
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/sso/saml",
+        scope.tenant(),
+        scope.environment()
+    );
+    let form = format!(
+        "display_name={}&idp_entity_id={}&idp_sso_url={}&certificate={}",
+        urlencode(display_name),
+        urlencode(idp_entity_id),
+        urlencode(idp_sso_url),
+        urlencode(certificate),
+    );
+    post_form_from_with_cookie(harness, &path, &form, "same-origin", cookie).await
+}
+
+/// A signed response addressed to a connection, using that connection's OWN stored values.
+///
+/// READ OFF THE ROW rather than written into the fixture, which is the point on the create path:
+/// the audience and the recipient a provider must send are the ones the portal DERIVED, and a
+/// fixture that spelled them out again would pass while the two disagreed.
+fn response_for(key: &XmlTestKey, connection: &ironauth_store::SamlConnection) -> String {
+    let children = format!(
+        "<saml:Issuer>https://idp.example/entity</saml:Issuer>\
+         <saml:Subject><saml:NameID \
+         Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\">\
+         ada@acme.example</saml:NameID>\
+         <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
+         <saml:SubjectConfirmationData Recipient=\"{acs}\" \
+         NotOnOrAfter=\"1970-01-01T00:02:00Z\"/></saml:SubjectConfirmation></saml:Subject>\
+         <saml:Conditions NotBefore=\"1969-12-31T23:58:00Z\" \
+         NotOnOrAfter=\"1970-01-01T00:02:00Z\">\
+         <saml:AudienceRestriction><saml:Audience>{audience}</saml:Audience>\
+         </saml:AudienceRestriction></saml:Conditions>\
+         <saml:AttributeStatement><saml:Attribute Name=\"email\">\
+         <saml:AttributeValue>ada@acme.example</saml:AttributeValue></saml:Attribute>\
+         </saml:AttributeStatement>",
+        acs = connection.acs_url,
+        audience = connection.sp_entity_id,
+    );
+    ironauth_saml::test_util::signed_response_with(key, "_a1", &children)
+}
+
+#[tokio::test]
+async fn an_admin_sets_up_saml_from_the_portal_and_a_response_then_verifies() {
+    // #140 CRITERION 1, THE SAML HALF, AS A SCRIPTED JOURNEY. Nothing the vendor does appears
+    // between the link being minted and sign-in working except switching the connection on --
+    // which the page says is theirs, because whether a customer's users may sign in is a
+    // commercial decision and not a portal link holder's to make.
+    //
+    // THE LAST STEP IS THE ONE THAT MATTERS. Asserting a row exists would measure that a form
+    // wrote a database. What a customer asked for is that a response their identity provider
+    // signs is ACCEPTED, so the journey ends by signing one with the key they pasted and
+    // running it through the connection test -- the same `examine` a real sign-in runs.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "sso", "setup-1", &org).await;
+
+    // THE PAGE OFFERS THE FORM before anything exists, which is the state an admin arrives in.
+    let scope = harness.scope();
+    let surface = format!(
+        "/t/{}/e/{}/portal/s/sso",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, _, page) = harness.get_with_cookie(&surface, Some(&cookie)).await;
+    assert_eq!(status, 200, "the sso surface: {page}");
+    assert!(
+        page.contains("Add a SAML connection"),
+        "an admin with nothing configured needs a form, not an empty page: {page}"
+    );
+
+    // THE ADMIN'S OWN KEY, so the response signed at the end is signed by what they pasted.
+    let key = XmlTestKey::generate();
+    let der = ironauth_saml::test_util::certificate_carrying(&key.public_point());
+    let pem = {
+        use base64::Engine as _;
+        let body = base64::engine::general_purpose::STANDARD.encode(&der);
+        format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n")
+    };
+
+    let (status, body) = submit_saml_setup(
+        &harness,
+        &cookie,
+        "Acme Okta",
+        "https://idp.example/entity",
+        "https://idp.example/sso",
+        &pem,
+    )
+    .await;
+    assert_eq!(status, 303, "the setup was refused: {body}");
+
+    // NOTHING EXISTS YET, and that is the design rather than a lag to paper over: the data
+    // plane may not write this table at all.
+    let before = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .saml_connections()
+        .list_for_org(&org, 10, None)
+        .await
+        .expect("list");
+    assert!(
+        before.is_empty(),
+        "the portal wrote a connection it has no grant for"
+    );
+
+    assert_eq!(apply_saml_setups(&harness).await, 1, "one setup to apply");
+
+    let created = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .saml_connections()
+        .list_for_org(&org, 10, None)
+        .await
+        .expect("list");
+    assert_eq!(created.len(), 1, "the connection was created");
+    let connection = &created[0];
+    assert_eq!(connection.display_name, "Acme Okta");
+    assert_eq!(connection.idp_entity_id, "https://idp.example/entity");
+    // THE TWO VALUES THIS DEPLOYMENT OWNS, derived from the id and NOT from the form. Both paths
+    // name the connection, which is why the page cannot print them until it exists.
+    assert!(
+        connection
+            .acs_url
+            .ends_with(&format!("/saml/acs/{}", connection.id)),
+        "the reply URL has to name this connection: {}",
+        connection.acs_url
+    );
+    assert!(
+        connection
+            .sp_entity_id
+            .ends_with(&format!("/saml/metadata/{}", connection.id)),
+        "and so does the audience: {}",
+        connection.sp_entity_id
+    );
+    // THE SAFE DEFAULTS ARE NOT THE ADMIN'S TO CHOOSE, and the form offers no field for them.
+    assert!(
+        !connection.allow_unsolicited,
+        "a link holder must not be able to create a connection that accepts any response"
+    );
+    // SWITCHED ON, and this is the criterion rather than an oversight. "Zero vendor-side
+    // actions" means zero: a connection created switched off would need somebody at the vendor
+    // to enable it, which is the action the criterion exists to remove. An earlier version of
+    // this work asserted the opposite and called it a commercial decision -- a reasonable
+    // product argument, and one that contradicts the thing being built.
+    //
+    // WHAT BOUNDS IT IS THE LINK, not the switch. A portal link is minted by the vendor, is
+    // single-use, expires in minutes, and is scoped to one organization and one intent. The
+    // decision "this customer may configure SSO" is made when that link is issued.
+    assert!(
+        connection.active,
+        "an admin who completes the form has to end up with a connection that works"
+    );
+
+    // AND THE PAGE NOW HANDS OVER THE TWO VALUES, which is what the admin came back for.
+    let (_, _, page) = harness.get_with_cookie(&surface, Some(&cookie)).await;
+    assert!(
+        page.contains(&connection.acs_url),
+        "the page has to print the reply URL now that it exists: {page}"
+    );
+
+    // THE CERTIFICATE CAME WITH IT, so the connection is not the half-applied kind that looks
+    // finished and refuses everything.
+    let certificates = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .saml_connections()
+        .certificates(&connection.id)
+        .await
+        .expect("certificates");
+    assert_eq!(certificates.len(), 1, "the pasted certificate was pinned");
+
+    // THE JOURNEY'S END. A response signed by the admin's own key, addressed to the connection
+    // the portal created, run through the same `examine` a real sign-in runs.
+    let response = response_for(&key, connection);
+    let (status, verdict) =
+        test_connection(&harness, &cookie, &connection.id, &base64_of(&response)).await;
+    assert_eq!(status, 200, "the connection test: {verdict}");
+    assert!(
+        verdict.contains("all check out"),
+        "a response signed by the certificate the admin pasted has to verify against the \
+         connection the admin created: {verdict}"
+    );
+}
+
+#[tokio::test]
+async fn a_setup_form_cannot_choose_what_this_deployment_expects() {
+    // THE FORM HAS NO FIELD for the audience, the reply URL, the name ID format, or
+    // `allow_unsolicited` -- and a form field is not the fence, because a POST can carry
+    // anything. What refuses them is that the handler reads none of them: it derives the two
+    // URLs from the id it minted and hard-codes the rest.
+    //
+    // THIS POSTS THEM ANYWAY, which is what an attacker holding a link would do.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "sso", "setup-2", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/sso/saml",
+        scope.tenant(),
+        scope.environment()
+    );
+    let form = format!(
+        "display_name=Acme&idp_entity_id={}&idp_sso_url={}&certificate={}\
+         &sp_entity_id={}&acs_url={}&allow_unsolicited=true&nameid_format={}",
+        urlencode("https://idp.example/entity"),
+        urlencode("https://idp.example/sso"),
+        urlencode(&pem_certificate(7)),
+        urlencode("https://attacker.example/audience"),
+        urlencode("https://attacker.example/acs"),
+        urlencode("urn:oasis:names:tc:SAML:2.0:nameid-format:transient"),
+    );
+    let (status, body) =
+        post_form_from_with_cookie(&harness, &path, &form, "same-origin", &cookie).await;
+    assert_eq!(status, 303, "the setup was refused: {body}");
+    apply_saml_setups(&harness).await;
+
+    let created = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .saml_connections()
+        .list_for_org(&org, 10, None)
+        .await
+        .expect("list");
+    assert_eq!(created.len(), 1);
+    let connection = &created[0];
+    assert!(
+        !connection.acs_url.contains("attacker.example"),
+        "a link holder chose where responses are sent: {}",
+        connection.acs_url
+    );
+    assert!(
+        !connection.sp_entity_id.contains("attacker.example"),
+        "a link holder chose what audience this deployment expects: {}",
+        connection.sp_entity_id
+    );
+    assert!(
+        !connection.allow_unsolicited,
+        "a link holder switched off the correlation check"
+    );
+    assert!(
+        connection.nameid_format.ends_with("emailAddress"),
+        "a link holder chose a transient identifier: {}",
+        connection.nameid_format
+    );
+}
+
+#[tokio::test]
+async fn a_setup_names_the_field_that_is_wrong() {
+    // EVERY REFUSAL HERE IS ABOUT THE FORM THEY JUST TYPED, so unlike the renewal surface's
+    // uniform page it says which. A setup form that answered "no" without saying what is
+    // wrong is the generic error #140 criterion 6 complains about, one surface over.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "sso", "setup-3", &org).await;
+
+    // AN http SIGN-ON URL. This deployment sends a browser there, so a link holder choosing an
+    // unprotected address is a downgrade they do not get to make.
+    let (status, body) = submit_saml_setup(
+        &harness,
+        &cookie,
+        "Acme",
+        "https://idp.example/entity",
+        "http://idp.example/sso",
+        &pem_certificate(3),
+    )
+    .await;
+    assert_eq!(status, 400, "an http sign-on URL was accepted: {body}");
+    assert!(body.contains("https://"), "and it has to say why: {body}");
+
+    // A CERTIFICATE THAT IS NOT ONE, told NOW rather than in a worker where nobody is looking.
+    let (status, body) = submit_saml_setup(
+        &harness,
+        &cookie,
+        "Acme",
+        "https://idp.example/entity",
+        "https://idp.example/sso",
+        "-----BEGIN CERTIFICATE-----\nbm90LWEtY2VydA==\n-----END CERTIFICATE-----\n",
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an unparseable certificate was accepted: {body}"
+    );
+    assert!(
+        body.contains("X.509"),
+        "and it has to name what failed: {body}"
+    );
+
+    // NOTHING WAS QUEUED BY EITHER, which is the property that matters: a queue is not a place
+    // to defer validation to.
+    assert_eq!(
+        apply_saml_setups(&harness).await,
+        0,
+        "a refused form still queued a job"
+    );
+}
+
+#[tokio::test]
+async fn a_scim_session_cannot_create_an_sso_connection() {
+    // THE INTENT FENCE on the newest mutating route, which is exactly where it gets forgotten.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+
+    // THE CONTROL: an `sso` session creates one.
+    let sso = open_session_in(&harness, "sso", "setup-4", &org).await;
+    let (status, body) = submit_saml_setup(
+        &harness,
+        &sso,
+        "Acme",
+        "https://idp.example/entity",
+        "https://idp.example/sso",
+        &pem_certificate(4),
+    )
+    .await;
+    assert_eq!(status, 303, "the control: {body}");
+
+    let scim = open_session_in(&harness, "scim", "setup-5", &org).await;
+    let (status, body) = submit_saml_setup(
+        &harness,
+        &scim,
+        "Acme",
+        "https://idp.example/entity",
+        "https://idp.example/sso",
+        &pem_certificate(5),
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "a scim session created an SSO connection: {body}"
+    );
+    assert_eq!(
+        apply_saml_setups(&harness).await,
+        1,
+        "only the control's setup should have been queued"
+    );
+}
+
+#[tokio::test]
+async fn a_cross_site_setup_is_refused() {
+    // The CSRF guard every mutating portal route takes. This one creates the object every
+    // sign-in through that organization is checked against.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "sso", "setup-6", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/sso/saml",
+        scope.tenant(),
+        scope.environment()
+    );
+    let form = format!(
+        "display_name=Acme&idp_entity_id={}&idp_sso_url={}&certificate={}",
+        urlencode("https://idp.example/entity"),
+        urlencode("https://idp.example/sso"),
+        urlencode(&pem_certificate(6)),
+    );
+    let (status, body) =
+        post_form_from_with_cookie(&harness, &path, &form, "cross-site", &cookie).await;
+    assert_eq!(status, 403, "a cross-site setup was served: {body}");
+    assert_eq!(apply_saml_setups(&harness).await, 0, "and queued nothing");
 }

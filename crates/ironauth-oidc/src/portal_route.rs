@@ -1597,11 +1597,12 @@ async fn sso_surface(state: &OidcState, session: &PortalSession) -> Response {
     if saml.is_empty() && connectors.is_empty() {
         // NOT A REFUSAL, for the reason the renewal surface gives: the link is fine, there is
         // simply nothing configured yet, and a not-found would read as a broken link.
-        body.push_str(
-            "<p>This organization has no sign-on connection yet. Ask your vendor to create one, \
-             then come back here for the values your identity provider needs.</p>",
-        );
-        return crate::pages::secure_html(StatusCode::OK, body);
+        //
+        // AND NOT A DEAD END EITHER, which it was until the create path landed: the sentence
+        // here said "ask your vendor to create one", which is precisely the vendor-side action
+        // #140 criterion 1 exists to remove. An admin arriving with nothing configured is the
+        // reader this whole surface is for, and the form below is what they came for.
+        body.push_str("<p>Nothing is configured yet. Start here.</p>");
     }
 
     let limit = usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX);
@@ -1613,6 +1614,36 @@ async fn sso_surface(state: &OidcState, session: &PortalSession) -> Response {
             "<p>Showing the first {limit} of each kind. Ask your vendor about the rest.</p>"
         );
     }
+    // THE CREATE FORM, FIRST, and above the connections rather than below them. An admin
+    // arriving with nothing configured sees an empty page and a form; one returning to add a
+    // second provider does not have to scroll past the first. It is the half `sso_surface`'s own
+    // doc recorded as missing: "#140's first criterion is an IT admin completing SSO setup with
+    // no vendor-side action, which needs a create path."
+    //
+    // THE TWO VALUES THIS DEPLOYMENT OWNS ARE PRINTED BESIDE IT, not asked for. They are what
+    // the admin pastes into their provider's console, and the handler derives the same pair
+    // from the same `issuer_base` rather than reading them back from the form -- so a link
+    // holder cannot create a connection expecting an audience of their choosing.
+    let _ = write!(
+        &mut body,
+        "<h2>Add a SAML connection</h2>\
+         <p>Add the connection first. This page then shows you the two values to paste into \
+         your identity provider -- both of them name the connection, so neither exists until \
+         it does.</p>\
+         <form method=\"post\" action=\"{base}/t/{tenant}/e/{environment}/portal/s/sso/saml\">\
+         <p><label>A name for this connection<br>\
+         <input name=\"display_name\" size=\"40\" required></label></p>\
+         <p><label>Your identity provider's entity ID<br>\
+         <input name=\"idp_entity_id\" size=\"60\" required></label></p>\
+         <p><label>Your identity provider's sign-on URL (https)<br>\
+         <input name=\"idp_sso_url\" size=\"60\" required></label></p>\
+         <p><label>Its signing certificate (PEM or base64)<br>\
+         <textarea name=\"certificate\" rows=\"6\" cols=\"60\" required></textarea></label></p>\
+         <p><button type=\"submit\">Add this connection</button></p></form>",
+        base = escape_html(state.issuer_base().trim_end_matches('/')),
+        tenant = escape_html(&session.scope().tenant().to_string()),
+        environment = escape_html(&session.scope().environment().to_string()),
+    );
     for connection in saml.iter().take(limit) {
         sso_saml_section(state, session, connection, &mut body);
     }
@@ -2942,4 +2973,240 @@ fn activity_html(standing: &ironauth_store::ScimTokenStanding) -> String {
 /// it, and a 4xx would put a banner over the one sentence they came for.
 fn refusal_html(reason: &str) -> String {
     format!("<p>{}</p>", escape_html(reason))
+}
+
+/// What an IT admin fills in to set up a SAML connection from the portal (#140 criterion 1).
+#[derive(Debug, serde::Deserialize)]
+pub struct SamlSetupForm {
+    /// What the customer wants to call this connection.
+    pub display_name: String,
+    /// The identity provider's entity ID, from its own metadata.
+    pub idp_entity_id: String,
+    /// Where this deployment sends sign-in requests.
+    pub idp_sso_url: String,
+    /// The provider's signing certificate, base64 DER or PEM.
+    pub certificate: String,
+}
+
+/// `POST /t/{tenant}/e/{environment}/portal/s/sso/saml`: set up a SAML connection.
+///
+/// # The criterion this closes
+///
+/// "An IT admin completes SSO ... end to end via a portal link with zero vendor-side actions."
+/// The setup guides landed first, and `sso_surface`'s own doc recorded what they were missing:
+/// "which needs a create path". This is that path for the SAML variant.
+///
+/// # Everything it needs is on the page it was posted from
+///
+/// The admin supplies the three values only their identity provider knows -- its entity ID, its
+/// sign-on URL, its signing certificate -- and a name. The two values this deployment owns, the
+/// audience and the reply URL, are NOT taken from the form: they are derived here from the same
+/// `issuer_base` the page printed them from. A form field for either would let a link holder
+/// create a connection expecting an audience of their choosing, and the values are ours to
+/// state rather than theirs to assert.
+///
+/// # It is queued, not written
+///
+/// 0196 grants `saml_connections` INSERT to `ironauth_control` alone. `queue_pin` beside this
+/// makes the same argument at more length: the portal validates and enqueues, and
+/// `SAML_CONNECTION_SETUP_CONSUMER` applies from the plane that may.
+///
+/// THE ID IS MINTED HERE and carried on the row, so a redelivery lands on the same connection
+/// rather than creating one per attempt.
+///
+/// # The certificate is parsed BEFORE it is queued
+///
+/// A queue is not a place to defer validation to: enqueuing an unparsed blob would answer the
+/// admin "accepted" and then fail in a worker where nobody is looking. And a connection whose
+/// certificate turns out to be unreadable is a connection that refuses every response its
+/// provider sends, which is the failure this whole surface exists to prevent.
+pub async fn saml_setup_post(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::Form(form): axum::Form<SamlSetupForm>,
+) -> Response {
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return refused();
+    };
+    // THE SAME ORIGIN GUARD every mutating portal route takes, and this one creates the object
+    // every sign-in through that organization is checked against.
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+    let session = match resolve_session(&state, scope, &headers).await {
+        Ok(session) => session,
+        Err(refusal) => return refusal.into_response(),
+    };
+    if let Err(refusal) = session.require_intent("sso") {
+        return refusal.into_response();
+    }
+
+    let display_name = form.display_name.trim();
+    let idp_entity_id = form.idp_entity_id.trim();
+    let idp_sso_url = form.idp_sso_url.trim();
+    if display_name.is_empty() || idp_entity_id.is_empty() || idp_sso_url.is_empty() {
+        return setup_refusal("every field is required");
+    }
+    // BOUNDED, because these become columns and the form is reachable by whoever holds a link.
+    if display_name.len() > SETUP_FIELD_MAX
+        || idp_entity_id.len() > SETUP_FIELD_MAX
+        || idp_sso_url.len() > SETUP_FIELD_MAX
+    {
+        return setup_refusal("one of those values is longer than this deployment will store");
+    }
+    // THE SIGN-ON URL IS SOMEWHERE THIS DEPLOYMENT WILL SEND A BROWSER, so it has to be an
+    // absolute HTTPS URL. A relative value, or an http one, would be a redirect off this origin
+    // to somewhere unprotected -- chosen by a link holder, which is the wrong party.
+    if !idp_sso_url.starts_with("https://") {
+        return setup_refusal("the sign-on URL has to be an https:// address");
+    }
+
+    let Some(der) = decode_certificate(&form.certificate) else {
+        return setup_refusal("the certificate is not base64 or is too large");
+    };
+    // PARSED HERE so the admin is told NOW. The consumer parses it again from the row, for the
+    // reason `queue_pin` gives.
+    if ironauth_saml::x509::pinned(&der).is_err() {
+        return setup_refusal("the certificate does not parse as X.509");
+    }
+
+    let id = ironauth_store::SamlConnectionId::generate(state.env(), &scope);
+    if queue_saml_setup(
+        &state,
+        &session,
+        &id,
+        display_name,
+        idp_entity_id,
+        idp_sso_url,
+        &der,
+    )
+    .await
+    .is_err()
+    {
+        return PortalRefusal::Unavailable.into_response();
+    }
+    // BACK TO THE SURFACE, where the new connection appears with its copy-paste values and its
+    // test form. The page is the confirmation.
+    let surface = format!(
+        "/t/{}/e/{}/portal/s/sso",
+        scope.tenant(),
+        scope.environment()
+    );
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, surface),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+    )
+        .into_response()
+}
+
+/// The longest value this surface will put in a column.
+///
+/// An entity ID is a URI and a display name is a label; both run to tens of characters in
+/// practice. This is roughly an order of magnitude of headroom and still small enough that a
+/// link holder cannot use the form to store anything substantial.
+const SETUP_FIELD_MAX: usize = 512;
+
+/// Queue the connection for the control plane to create.
+///
+/// # What the row carries, and what it does not
+///
+/// The admin's three values, the two this deployment owns, the name identifier format, and the
+/// certificate DER. None of it is secret: the DER is what an identity provider publishes and
+/// the rest is configuration the admin just typed and can see on the page.
+///
+/// THE AUDIENCE AND THE REPLY URL TRAVEL ON THE ROW rather than being re-derived in the worker,
+/// and that is deliberate. They are what the page PRINTED and what the admin pasted into their
+/// provider's console minutes earlier. A worker that derived them again from configuration would
+/// be a second derivation of one pair of strings, and the day the two disagreed the admin would
+/// get a wrong-audience refusal on a setup they performed exactly as instructed.
+async fn queue_saml_setup(
+    state: &OidcState,
+    session: &PortalSession,
+    id: &ironauth_store::SamlConnectionId,
+    display_name: &str,
+    idp_entity_id: &str,
+    idp_sso_url: &str,
+    der: &[u8],
+) -> Result<(), ironauth_store::StoreError> {
+    use base64::Engine as _;
+
+    let base = state.issuer_base().trim_end_matches('/');
+    state
+        .store()
+        .scoped(session.scope())
+        .outbox()
+        .enqueue_once(
+            state.env(),
+            &ironauth_store::NewOutboxMessage {
+                consumer: ironauth_store::SAML_CONNECTION_SETUP_CONSUMER,
+                // THE CONNECTION ID, which this handler minted and which is unique per
+                // submission. A double-submit from a retrying browser mints two ids and
+                // creates two connections -- and that is the RIGHT outcome here, because the
+                // alternative is keying on the admin's values, where two organizations
+                // federating with the same identity provider (which is ordinary) would collide
+                // and the second would never be created at all. The pin request beside this
+                // records exactly that failure. A duplicate connection is visible on the page
+                // and the admin can ask for it to be removed; a connection that silently never
+                // existed is not.
+                idempotency_key: &id.to_string(),
+                // THE ORGANIZATION, so two setups for one customer are applied in the order
+                // they were made and setups for different customers never wait on each other.
+                ordering_key: &session.organization().to_string(),
+                payload: serde_json::json!({
+                    "saml_connection_id": id.to_string(),
+                    "organization_id": session.organization().to_string(),
+                    "display_name": display_name,
+                    "idp_entity_id": idp_entity_id,
+                    "idp_sso_url": idp_sso_url,
+                    // DERIVED FROM THE ID JUST MINTED, which is why the form cannot supply
+                    // them and why the page cannot print them before the connection exists:
+                    // both paths NAME the connection. `saml_connections::create` on the
+                    // management plane derives the identical pair from the identical id, and
+                    // the two must agree -- `saml_acs` compares an assertion's `Recipient`
+                    // against the stored `acs_url`, so a connection created here with a
+                    // different shape would refuse every response its provider sends.
+                    "sp_entity_id": format!(
+                        "{base}/t/{tenant}/e/{environment}/saml/metadata/{id}",
+                        tenant = session.scope().tenant(),
+                        environment = session.scope().environment(),
+                    ),
+                    "acs_url": format!(
+                        "{base}/t/{tenant}/e/{environment}/saml/acs/{id}",
+                        tenant = session.scope().tenant(),
+                        environment = session.scope().environment(),
+                    ),
+                    // THE DEFAULT THIS DEPLOYMENT ASKS FOR, and not the admin's to choose: the
+                    // format is part of the identity, and a portal link holder picking
+                    // `transient` would key their colleagues' accounts to values that are never
+                    // seen again.
+                    "nameid_format": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+                    "certificate_der_base64":
+                        base64::engine::general_purpose::STANDARD.encode(der),
+                }),
+            },
+        )
+        .await
+        .map(|_| ())
+}
+
+/// The one refusal this surface gives, whatever went wrong.
+///
+/// A REASON, unlike `renewal_refusal`'s uniform page, and the difference is who is reading. A
+/// renewal link goes to whoever administers the customer's identity provider and its refusals
+/// are about rows that may not be theirs, so telling them apart would enumerate an environment.
+/// Everything refused here is about the FORM THEY JUST TYPED, and a setup surface that answered
+/// "no" without saying which field is the generic error #140 criterion 6 is about.
+fn setup_refusal(reason: &str) -> Response {
+    crate::pages::secure_html(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>SSO setup</title>\
+             <h1>SSO setup</h1><p>{reason}.</p>",
+            reason = escape_html(reason)
+        ),
+    )
 }
