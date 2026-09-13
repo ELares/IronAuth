@@ -7724,3 +7724,58 @@ async fn every_provider_the_form_offers_is_one_the_handler_accepts() {
         );
     }
 }
+
+#[tokio::test]
+async fn the_guide_and_the_created_connection_agree_about_the_name_id() {
+    // A CORRESPONDENCE NOTHING ENFORCED. The setup guide tells an admin "Set Name ID format to
+    // EmailAddress", and the create path writes the format the connection will EXPECT. Those are
+    // two sentences in two files, and if they ever disagree the admin configures exactly what
+    // they were told and every sign-in is refused with `WrongNameIdFormat` -- a failure the
+    // connection test would then diagnose correctly and blame on their provider.
+    //
+    // THE TEST READS BOTH off the same connection, so it pins the pair rather than either.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "sso", "nameid-1", &org).await;
+
+    let (status, body) = submit_saml_setup(
+        &harness,
+        &cookie,
+        "Acme Okta",
+        "https://idp.example/entity",
+        "https://idp.example/sso",
+        &pem_certificate(9),
+    )
+    .await;
+    assert_eq!(status, 303, "the setup: {body}");
+    apply_saml_setups(&harness).await;
+
+    let created = harness
+        .db()
+        .store()
+        .scoped(harness.scope())
+        .saml_connections()
+        .list_for_org(&org, 10, None)
+        .await
+        .expect("list");
+    assert_eq!(created.len(), 1);
+    // WHAT THE CONNECTION EXPECTS.
+    assert!(
+        created[0].nameid_format.ends_with("emailAddress"),
+        "the created connection expects: {}",
+        created[0].nameid_format
+    );
+
+    // AND WHAT THE PAGE TELLS THE ADMIN TO CONFIGURE, for that same connection.
+    let page = sso_surface_page(&harness, &cookie).await;
+    assert!(
+        page.contains("EmailAddress"),
+        "the guide has to name the format the connection expects: {page}"
+    );
+    // AND IT MUST NOT SEND THEM TO THE VENDOR FOR THE CERTIFICATE, which is the step this
+    // create path removed: the guides told an admin to hand it over, and the form now takes it.
+    assert!(
+        !page.contains("give it to your vendor"),
+        "the guide still names the vendor-side action the criterion removes: {page}"
+    );
+}
