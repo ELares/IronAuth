@@ -24,14 +24,18 @@ async fn create_org(h: &Harness, tenant: &str, environment: &str, key: &str, nam
         .to_owned()
 }
 
-/// Bind a fresh user into `org` and return the membership id.
+/// Bind a fresh user into `org` and return `(user id, membership id)`.
+///
+/// BOTH, because the export reports the subject and keys the row on the membership. A caller
+/// that knows only one of them cannot name every id in a row, and the comparison below needs
+/// to name every id it sees or it is comparing run-specific strings.
 async fn add_member(
     h: &Harness,
     tenant: &str,
     environment: &str,
     org: &str,
     handle: &str,
-) -> String {
+) -> (String, String) {
     let users = format!("/v1/tenants/{tenant}/environments/{environment}/users");
     let (status, _, body) = h
         .post(
@@ -56,10 +60,11 @@ async fn add_member(
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "create membership: {body}");
-    serde_json::from_str::<Value>(&body).expect("json")["id"]
+    let membership = serde_json::from_str::<Value>(&body).expect("json")["id"]
         .as_str()
         .expect("id")
-        .to_owned()
+        .to_owned();
+    (user, membership)
 }
 
 #[tokio::test]
@@ -67,7 +72,7 @@ async fn both_formats_describe_the_same_review() {
     let h = Harness::start(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
     let org = create_org(&h, &tenant, &environment, "ak-org", "Acme").await;
-    let membership = add_member(&h, &tenant, &environment, &org, "alice@acme.test").await;
+    let (_user, membership) = add_member(&h, &tenant, &environment, &org, "alice@acme.test").await;
     let base = format!(
         "/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/access-review"
     );
@@ -141,8 +146,9 @@ async fn the_export_is_bounded_by_the_organization_in_the_path() {
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
     let mine = create_org(&h, &tenant, &environment, "ak-mine", "Contoso").await;
     let theirs = create_org(&h, &tenant, &environment, "ak-theirs", "Initech").await;
-    let my_member = add_member(&h, &tenant, &environment, &mine, "alice@contoso.test").await;
-    let their_member = add_member(&h, &tenant, &environment, &theirs, "bob@initech.test").await;
+    let (_, my_member) = add_member(&h, &tenant, &environment, &mine, "alice@contoso.test").await;
+    let (_, their_member) =
+        add_member(&h, &tenant, &environment, &theirs, "bob@initech.test").await;
 
     let (status, _, body) = h
         .get(&format!(
@@ -227,16 +233,43 @@ async fn create_group(
 async fn a_compliance_consumer_reconstructs_who_has_which_role_from_a_real_export() {
     // BOTH RESOLUTION TAILS, and finding out that this mattered took a surviving mutant.
     //
-    // `Harness::start` ARMS the exploratory access-request feature, so every admin test built
-    // on it resolves the export through `EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL`. Deleting the
-    // group arm from the PLAIN tail left this test green, because this test never ran the
-    // plain tail. Whatever else that is, it is not coverage of the export as a deployment
-    // without the flag serves it -- which is every deployment.
+    // `Harness::start` ARMS the exploratory access-request feature, so an admin test built on
+    // it resolves the USER half of the export through `EFFECTIVE_ROLE_GRANTS_TIME_BOXED_TAIL`.
+    // Deleting the group arm from the PLAIN tail left this test green, because this test never
+    // ran the plain tail. Whatever else that is, it is not coverage of the export as a
+    // deployment without the flag serves it -- which is every deployment.
     //
-    // So the scenario runs twice. The answers have to be IDENTICAL: this fixture contains no
-    // time-boxed grant, and the widened tail is supposed to add rows only when one exists.
-    // That equality is the compatibility claim the fourth arm was merged on, measured here
-    // rather than asserted in a comment.
+    // THE USER HALF ONLY, and the distinction is the code's rather than a quibble.
+    // `access_review_in_pages` drains members in two loops: the user loop branches on the
+    // instant, and the SERVICE-ACCOUNT loop calls `effective_role_grants_for_service_account`,
+    // which is hard-wired to the plain tail and has no time-boxed sibling. So a machine member
+    // resolves through the plain tail whatever the flag says -- which is correct, because only
+    // a USER can be the subject of an access request (`require_grantable` parses `subject_id`
+    // as a `UserId`), so there is no time-boxed row for a machine member to miss. This
+    // scenario seeds no machine member, so neither run below enters that loop; the
+    // `service_account` row is covered end to end by the pinned store fixture instead, and the
+    // route is driven with a real machine member in `live_surface`.
+    //
+    // WHAT THE SECOND RUN BUYS, stated exactly, because the first version of this comment
+    // credited it with a measurement it does not make.
+    //
+    // The measurement is that the scenario's assertions -- which compare against ABSOLUTE
+    // literals, not against the other run -- execute a second time with the plain tail
+    // resolving the export. That is the coverage the surviving mutant showed was missing, and
+    // it is strictly stronger than the two runs agreeing with each other.
+    //
+    // The equality below is a REDUNDANCY CHECK over the columns those assertions ignore
+    // (`organization_id`, `principal_kind`, `subject_id`, `via_request_id`,
+    // `granted_until_unix_ms`), and against this fixture it cannot currently fail. Measured,
+    // not assumed: projecting a non-NULL `granted_until_micros` from all three copied arms of
+    // the time-boxed tail leaves every test here green, because `decode_grants` discards those
+    // two columns for any source that is not `time_boxed`. With no time-boxed grant in the
+    // fixture, every column of every row is fixed outside the tail except the slug, the source
+    // and the group -- which is precisely what the assertions already pin.
+    //
+    // It is kept rather than deleted because it becomes load-bearing the moment this fixture
+    // grows a time-boxed grant, and because a wrong answer it WOULD catch is cheap to check.
+    // It is not the thing that makes this test cover both tails.
     let armed = review_scenario(Harness::start(50).await).await;
     let plain = review_scenario(Harness::start_with_access_requests(50, false).await).await;
     assert_eq!(
@@ -253,8 +286,12 @@ async fn a_compliance_consumer_reconstructs_who_has_which_role_from_a_real_expor
 ///
 /// Returns `(finance group id, alice, bob, carol)` -- the membership ids, because the export
 /// keys rows on the membership rather than on the user.
-async fn seed_review_fixture(h: &Harness, tenant: &str, environment: &str, org: &str)
--> (String, String, String, String) {
+async fn seed_review_fixture(
+    h: &Harness,
+    tenant: &str,
+    environment: &str,
+    org: &str,
+) -> Fixture {
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
     let org_base = format!("{base}/organizations/{org}");
 
@@ -290,10 +327,10 @@ async fn seed_review_fixture(h: &Harness, tenant: &str, environment: &str, org: 
         .await;
     assert!(status.is_success(), "grant the role to the group: {body}");
 
-    let alice = add_member(h, tenant, environment, org, "alice@acme.test").await;
-    let bob = add_member(h, tenant, environment, org, "bob@acme.test").await;
+    let (alice_user, alice) = add_member(h, tenant, environment, org, "alice@acme.test").await;
+    let (bob_user, bob) = add_member(h, tenant, environment, org, "bob@acme.test").await;
     // carol joins and is assigned nothing: the DEFAULT is all she holds.
-    let carol = add_member(h, tenant, environment, org, "carol@acme.test").await;
+    let (carol_user, carol) = add_member(h, tenant, environment, org, "carol@acme.test").await;
 
     let (status, _, body) = h
         .post(
@@ -312,23 +349,50 @@ async fn seed_review_fixture(h: &Harness, tenant: &str, environment: &str, org: 
         .await;
     assert!(status.is_success(), "put bob in the child group: {body}");
 
-    (finance, alice, bob, carol)
+    Fixture {
+        finance,
+        finance_ap,
+        alice,
+        bob,
+        carol,
+        alice_user,
+        bob_user,
+        carol_user,
+    }
+}
+
+/// Every id the scenario minted, so a row can be named rather than compared as a string.
+struct Fixture {
+    finance: String,
+    finance_ap: String,
+    alice: String,
+    bob: String,
+    carol: String,
+    alice_user: String,
+    bob_user: String,
+    carol_user: String,
 }
 
 /// Build the organization, export it, and return the reconstruction a consumer arrives at.
 ///
-/// One entry per member, keyed by a STABLE NAME rather than by the membership id, because the
-/// two runs above mint different ids and a comparison between those would be a comparison
-/// between two random strings. The per-member assertions inside still run against the real
-/// ids; what is returned is only what the two tails are compared on.
-async fn review_scenario(h: Harness) -> Vec<(String, Vec<String>)> {
+/// Returns EVERY parsed row with the run-specific ids replaced by stable names, sorted, so the
+/// caller can compare two runs that minted different ids. The per-member assertions inside run
+/// against the real ids; what is returned is deliberately WIDER than those assertions, because
+/// a comparison between two values that are each already pinned to the same literal cannot
+/// fail.
+async fn review_scenario(h: Harness) -> Vec<Vec<(String, String)>> {
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
     let org = create_org(&h, &tenant, &environment, "ak-org", "Acme").await;
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
     let org_base = format!("{base}/organizations/{org}");
 
-    let (finance, alice, bob, carol) =
-        seed_review_fixture(&h, &tenant, &environment, &org).await;
+    let f = seed_review_fixture(&h, &tenant, &environment, &org).await;
+    let (finance, alice, bob, carol) = (
+        f.finance.clone(),
+        f.alice.clone(),
+        f.bob.clone(),
+        f.carol.clone(),
+    );
 
     // THE INGEST. Both formats, parsed by the consumer's half of the contract.
     let export = format!("{org_base}/access-review");
@@ -413,12 +477,61 @@ async fn review_scenario(h: Harness) -> Vec<(String, Vec<String>)> {
         "the export has to carry a row for every member of the organization"
     );
 
-    // The shape the caller compares between the two tails: who, by name rather than by id.
-    let mut shape: Vec<(String, Vec<String>)> = vec![
-        ("alice".to_owned(), describe(&alice)),
-        ("bob".to_owned(), describe(&bob)),
-        ("carol".to_owned(), describe(&carol)),
-    ];
-    shape.sort();
-    shape
+    // WHAT THE TWO TAILS ARE COMPARED ON: every row, every column, with the run-specific ids
+    // replaced by stable names. See the caller for what that comparison does and does not buy.
+    normalise_rows(
+        &from_csv,
+        &[
+            (&org, "ORG"),
+            (&alice, "ALICE_MEMBERSHIP"),
+            (&bob, "BOB_MEMBERSHIP"),
+            (&carol, "CAROL_MEMBERSHIP"),
+            (&f.alice_user, "ALICE_USER"),
+            (&f.bob_user, "BOB_USER"),
+            (&f.carol_user, "CAROL_USER"),
+            (&f.finance, "FINANCE_GROUP"),
+            (&f.finance_ap, "FINANCE_AP_GROUP"),
+        ],
+    )
+}
+
+/// Replace every id this scenario minted with a stable name, so two runs can be compared.
+///
+/// The first version of the two-run comparison returned the three `describe` vectors -- the
+/// very expressions the scenario had already asserted equal to literals -- so the caller
+/// compared two values pinned to the same constants and could not fail. This returns the whole
+/// parsed table instead, which is at least WIDER than what those assertions fix.
+fn normalise_rows(
+    rows: &[ironauth_store::access_review::ConsumedRow],
+    names: &[(&str, &str)],
+) -> Vec<Vec<(String, String)>> {
+    let mut normalised: Vec<Vec<(String, String)>> = rows
+        .iter()
+        .map(|row| {
+            row.fields
+                .iter()
+                .map(|(column, value)| {
+                    let stable = names
+                        .iter()
+                        .find(|(id, _)| id == value)
+                        .map_or_else(|| value.clone(), |(_, name)| (*name).to_owned());
+                    // AN ID THIS TEST DID NOT MINT is not normalisable, and leaving it in
+                    // would make the two runs differ for a reason that is not a defect --
+                    // which is how a comparison like this turns into a flake and then gets
+                    // deleted. It is also a finding in its own right: the export is bounded by
+                    // one organization, so every id in it should be one of ours.
+                    assert!(
+                        !["org_", "omb_", "usr_", "sva_", "grp_", "orl_", "agr_"]
+                            .iter()
+                            .any(|prefix| stable.starts_with(prefix)),
+                        "the export carried an id this scenario never created, in column \
+                         {column}: {value}"
+                    );
+                    (column.clone(), stable)
+                })
+                .collect()
+        })
+        .collect();
+    normalised.sort();
+    normalised
 }

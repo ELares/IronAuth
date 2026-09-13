@@ -7,3 +7,5 @@ org_fixture01,user,omb_carol,usr_carol,billing-admin,time_boxed,,agr_quarterclos
 org_fixture01,service_account,omb_robot,sva_nightly,reports-reader,direct,,,
 org_fixture01,user,omb_dave,usr_dave,,none,,,
 org_fixture01,user,omb_eve,usr_eve,"ops,""emergency""",direct,,,
+org_fixture01,user,omb_frank,usr_frank,"ops
+second-line",direct,,,

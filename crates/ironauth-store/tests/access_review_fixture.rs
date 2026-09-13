@@ -36,9 +36,18 @@ use std::path::Path;
 ///
 /// Every `source` the export can emit appears at least once, including the `none` row for a
 /// member who holds nothing -- the row an access review exists to surface and the one most
-/// likely to be dropped by a writer that iterates grants. The last row's slug carries a comma
-/// AND a quote, so the fixture pins the QUOTING and not only the columns: a writer that
-/// stopped quoting would produce a different file and this test would say so.
+/// likely to be dropped by a writer that iterates grants.
+///
+/// The last row's slug carries ALL FOUR characters RFC 4180 makes the writer quote: a comma, a
+/// quote, a CR and an LF. Two of them would have been enough to catch a writer that stopped
+/// quoting ENTIRELY, and nothing weaker: a writer that quoted on a comma and not on a bare CR
+/// would have produced a file that splits into two records in a reader that scans for line
+/// endings, and the earlier fixture could not have told the difference.
+///
+/// No slug validator would accept that value, and it is in the fixture anyway. What is frozen
+/// here is the WRITER's contract, which is about bytes: the day a column carries free text --
+/// a display name, a reason, a metadata field -- the quoting has to already work, and a
+/// fixture that only ever held well-formed ids would not have been pinning it.
 fn fixture_rows() -> Vec<AccessReviewRow> {
     vec![
         row("user", "omb_alice", "usr_alice", "billing-admin", "direct", None, None, None),
@@ -80,6 +89,21 @@ fn fixture_rows() -> Vec<AccessReviewRow> {
             "omb_eve",
             "usr_eve",
             "ops,\"emergency\"",
+            "direct",
+            None,
+            None,
+            None,
+        ),
+        // A field whose ONLY quoting trigger is the record separator. Kept apart from eve's
+        // because a value carrying a comma AND a line break is quoted by the comma rule alone:
+        // measured, a writer narrowed to `[',', '"']` still produced the identical file while
+        // eve was the only crafted row, so the CR and LF halves of the rule were pinned by
+        // nothing. Split out, that same narrowing changes the bytes and this test says so.
+        row(
+            "user",
+            "omb_frank",
+            "usr_frank",
+            "ops\r\nsecond-line",
             "direct",
             None,
             None,
@@ -132,6 +156,13 @@ fn fixture(name: &str) -> String {
 /// and for nothing else: a rename, a reorder or a removal is a v2, and running this with the
 /// variable set would quietly retire a contract instead of versioning it. The variable is
 /// spelled out rather than defaulted for that reason.
+///
+/// RUN IT SINGLE-THREADED: `IRONAUTH_REGENERATE_FIXTURES=1 cargo test -p ironauth-store
+/// --test access_review_fixture -- --test-threads=1`. The two writer tests rewrite the same
+/// files the two reader tests are reading, and in parallel a reader can observe a half-written
+/// file and report a failure that has nothing to do with the format. Observed, not predicted:
+/// the first regeneration of the four-character fixture reported two failures that vanished on
+/// the next ordinary run.
 fn pinned(name: &str, produced: &str, what: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -229,6 +260,7 @@ fn a_consumer_reconstructs_who_has_which_role_from_the_pinned_files() {
                  until 1767225600000"
                     .to_owned(),
                 "usr_eve (user) holds ops,\"emergency\" by direct".to_owned(),
+                "usr_frank (user) holds ops\r\nsecond-line by direct".to_owned(),
             ],
             "{name}: the reconstruction does not match what the fixture records"
         );

@@ -6,3 +6,4 @@
 {"granted_until_unix_ms":null,"membership_id":"omb_robot","organization_id":"org_fixture01","principal_kind":"service_account","role_slug":"reports-reader","source":"direct","subject_id":"sva_nightly","via_group_id":null,"via_request_id":null}
 {"granted_until_unix_ms":null,"membership_id":"omb_dave","organization_id":"org_fixture01","principal_kind":"user","role_slug":"","source":"none","subject_id":"usr_dave","via_group_id":null,"via_request_id":null}
 {"granted_until_unix_ms":null,"membership_id":"omb_eve","organization_id":"org_fixture01","principal_kind":"user","role_slug":"ops,\"emergency\"","source":"direct","subject_id":"usr_eve","via_group_id":null,"via_request_id":null}
+{"granted_until_unix_ms":null,"membership_id":"omb_frank","organization_id":"org_fixture01","principal_kind":"user","role_slug":"ops\r\nsecond-line","source":"direct","subject_id":"usr_frank","via_group_id":null,"via_request_id":null}
