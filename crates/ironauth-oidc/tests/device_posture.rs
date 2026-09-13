@@ -294,6 +294,84 @@ fn a_claim_missing_a_signal_is_malformed_rather_than_false() {
 }
 
 #[test]
+fn a_predicate_that_cannot_evaluate_denies_rather_than_passing() {
+    let signer = key(1);
+    let clock = clock();
+    let token = signed(&signer, &claims(MDM, now_secs(&clock), &healthy()));
+    // THE ARM A REVIEWER FOUND UNTESTED, and it is a FAIL-OPEN if it goes wrong: replacing
+    // `Err(_) => Deny` with `Err(_) => Allow` passed all thirteen tests that existed before
+    // this one, while making every predicate below allow.
+    //
+    // The path is ordinary rather than exotic. `compile_within_budget` checks cost, not names,
+    // so a predicate naming a signal the schema does not carry compiles and then fails at
+    // EVALUATION -- and `!device.compromised`, which this file's own comment names as the
+    // motivating future case, is exactly that shape. An operator who writes it against a
+    // schema that has no `compromised` field gets a policy that would have admitted every
+    // device.
+    for predicate in [
+        "!device.compromised",   // a field the schema does not carry
+        "device.unknown",        // likewise
+        "user.x",                // an unbound name entirely
+        "device.managed + 1 == 2", // a type error
+    ] {
+        assert_eq!(
+            policy(&signer, predicate).evaluate(Some(&token), &clock),
+            PostureVerdict::Deny(DenyReason::PredicateFailed),
+            "a predicate that cannot evaluate must DENY: {predicate}"
+        );
+    }
+}
+
+#[test]
+fn a_verified_fresh_claim_carrying_no_signals_is_denied() {
+    let signer = key(1);
+    let clock = clock();
+    // THE OTHER UNTESTED ARM, and the same shape: a token that verifies and is fresh and
+    // simply has no `device_posture` claim at all. Mutating its deny to an allow also passed
+    // the whole suite. An MDM that changed its claim name, or a token minted for another
+    // purpose by the same issuer, lands here.
+    let mut body = claims(MDM, now_secs(&clock), &healthy());
+    body.as_object_mut()
+        .expect("an object")
+        .remove("device_posture");
+    let token = signed(&signer, &body);
+    assert_eq!(
+        policy(&signer, STRICT).evaluate(Some(&token), &clock),
+        PostureVerdict::Deny(DenyReason::Malformed),
+        "a claim with no signals at all carries no evidence, and no evidence is not consent"
+    );
+}
+
+#[test]
+fn the_signals_reaching_the_predicate_are_the_decoded_ones() {
+    let signer = key(1);
+    let clock = clock();
+    // The module decodes into `PostureSignals` and re-serialises THAT, rather than binding the
+    // vendor's raw object. Measured: replacing the round trip with the raw claim passes every
+    // other test, because every other fixture's claim happens to be exactly the schema.
+    //
+    // This one is not. It carries an extra vendor field and a differently-typed one, and the
+    // predicate names the extra field: bound raw it would evaluate, bound decoded it cannot,
+    // which is the whole point of having a schema.
+    let mut body = claims(MDM, now_secs(&clock), &healthy());
+    body["device_posture"]["vendor_risk_score"] = json!(11);
+    let token = signed(&signer, &body);
+    assert_eq!(
+        policy(&signer, "device.vendor_risk_score < 50").evaluate(Some(&token), &clock),
+        PostureVerdict::Deny(DenyReason::PredicateFailed),
+        "a predicate naming a field OUTSIDE the schema must not silently start working \
+         because one vendor happens to send it: that is how a vendor's field name becomes \
+         part of our contract without anybody deciding it"
+    );
+    // And the schema's own fields still reach it from the same claim.
+    assert_eq!(
+        policy(&signer, STRICT).evaluate(Some(&token), &clock),
+        PostureVerdict::Allow,
+        "an unknown extra field is ignored rather than fatal"
+    );
+}
+
+#[test]
 fn a_predicate_returning_a_non_boolean_is_refused_rather_than_coerced() {
     let signer = key(1);
     let clock = clock();
@@ -304,6 +382,62 @@ fn a_predicate_returning_a_non_boolean_is_refused_rather_than_coerced() {
     assert_eq!(
         odd.evaluate(Some(&token), &clock),
         PostureVerdict::Deny(DenyReason::PredicateUnsatisfied)
+    );
+}
+
+#[test]
+fn a_claim_minted_for_another_audience_is_denied() {
+    let signer = key(1);
+    let clock = clock();
+    // THE AUDIENCE PIN, which the module names as one of the things that makes
+    // `ExpectedTyp::ForeignIssuer` safe here and which nothing was measuring. One MDM signing
+    // for several relying parties is the ordinary deployment, so a posture assertion minted
+    // for somebody else's tenant must not be replayable into this one.
+    let mut body = claims(MDM, now_secs(&clock), &healthy());
+    body["aud"] = json!("https://someone-else.example.test");
+    let token = signed(&signer, &body);
+    assert_eq!(
+        policy(&signer, STRICT).evaluate(Some(&token), &clock),
+        PostureVerdict::Deny(DenyReason::Unverifiable),
+        "only the audience differs from the allow case"
+    );
+}
+
+#[test]
+fn an_expensive_predicate_is_refused_at_build_rather_than_at_evaluation() {
+    let signer = key(1);
+    // THE COST BUDGET, the other named guarantee with no negative. A posture predicate reads a
+    // handful of booleans off one flat object; anything that has to iterate is doing something
+    // this surface is not for. Refusing at BUILD means an operator hears about it when they
+    // write the policy rather than on the request that needed it.
+    let expensive = "[1,2,3].all(a, [1,2,3].all(b, [1,2,3].all(c, \
+                     [1,2,3].all(d, [1,2,3].all(e, a + b + c + d + e > 0)))))";
+    assert!(
+        matches!(
+            PosturePolicy::new(
+                MDM,
+                AUDIENCE,
+                vec![signer.verifying_key().expect("a public key")],
+                vec![JwsAlgorithm::EdDsa],
+                MAX_AGE,
+                expensive,
+            ),
+            Err(PolicyBuildError::Predicate(_))
+        ),
+        "an expression past the budget has to be refused where it is written"
+    );
+    // AND AN ORDINARY PREDICATE IS NOT, so the budget is a ceiling rather than a wall.
+    assert!(
+        PosturePolicy::new(
+            MDM,
+            AUDIENCE,
+            vec![signer.verifying_key().expect("a public key")],
+            vec![JwsAlgorithm::EdDsa],
+            MAX_AGE,
+            STRICT,
+        )
+        .is_ok(),
+        "the predicate this file uses everywhere else must fit the budget"
     );
 }
 
@@ -321,8 +455,9 @@ fn a_freshness_bound_of_zero_is_refused_at_build() {
         )
         .err(),
         Some(PolicyBuildError::MaxAgeNotPositive),
-        "zero denies a claim minted this instant, which is a policy nobody can satisfy rather \
-         than a strict one"
+        "the bound is INCLUSIVE, so zero would allow a claim dated this second and deny one a \
+         second older: a race against the clock's resolution rather than the strictest \
+         possible policy it reads as"
     );
 }
 

@@ -42,7 +42,7 @@
 //! scope in as many words. The signal schema, the claim names and the predicate vocabulary are
 //! all expected to move before anything depends on them.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use ironauth_cel::{compile_within_budget, BudgetedProgram, InputShape, DEFAULT_MAX_STRING_BYTES};
 use ironauth_env::Clock;
@@ -110,16 +110,27 @@ pub enum PostureVerdict {
 
 /// WHY a posture evaluation denied.
 ///
-/// For a log line and an operator, never for a caller to branch on into an allow: there is no
-/// constructor here that produces [`PostureVerdict::Allow`] from a `DenyReason`, and the two
-/// live in one enum so a caller cannot hold a reason without holding the verdict it belongs to.
+/// For a log line and an operator, never for a caller to branch on into an allow. Nothing here
+/// turns a `DenyReason` back into [`PostureVerdict::Allow`], and a caller matching on the
+/// verdict reaches a reason only inside the `Deny` arm it came from.
+///
+/// That is a convenience rather than a guarantee, and the first version of this comment
+/// overstated it: `DenyReason` is a public enum, so a caller CAN name one on its own. What
+/// stops a reason being mistaken for a verdict is the type it is returned in, not the type it
+/// is declared in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenyReason {
     /// No claim was presented at all.
     Absent,
     /// The claim did not verify: unsigned, forged, wrong issuer or audience, unlisted
-    /// algorithm, expired, or a header that steers trust. The uniform reason is deliberate and
-    /// comes from `ironauth-jose`, which does not tell a caller WHICH of those it was.
+    /// algorithm, expired, or a header that steers trust.
+    ///
+    /// THIS MODULE collapses them, not `ironauth-jose`: its `VerifyError` carries a `reason()`
+    /// for exactly this, and the first version of this comment blamed the wrong layer. What is
+    /// discarded here is discarded on purpose -- the verdict a caller acts on should not vary
+    /// with which way a forgery was malformed -- but an operator who needs the detail can have
+    /// it, and a deployment that wants it in a log should take it from the error rather than
+    /// from this enum.
     Unverifiable,
     /// It verified and carried no `iat`, so its age cannot be decided.
     NoIssuedAt,
@@ -148,8 +159,17 @@ pub struct PosturePolicy {
 /// What went wrong building a [`PosturePolicy`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyBuildError {
-    /// The freshness bound was not positive. Zero would deny every claim including one minted
-    /// this instant, which is a policy that cannot be satisfied rather than a strict one.
+    /// The freshness bound was not positive.
+    ///
+    /// NOT because zero would deny everything -- the first version of this said so and had it
+    /// exactly backwards. The bound is inclusive (`age > max_age` denies), so a `max_age` of
+    /// zero ALLOWS a claim whose `iat` is this second and denies one a second older. That is a
+    /// freshness policy an operator cannot have meant: it reads as "the strictest possible"
+    /// and behaves as a race against the clock's own resolution. A NEGATIVE bound is worse
+    /// still, denying everything including a claim minted now.
+    ///
+    /// Refused at build either way, because a policy whose behaviour nobody would choose is
+    /// better refused where it is written than obeyed where it is used.
     MaxAgeNotPositive,
     /// The predicate did not compile, or did not fit the budget.
     Predicate(String),
@@ -174,9 +194,17 @@ impl PosturePolicy {
         if max_age_secs <= 0 {
             return Err(PolicyBuildError::MaxAgeNotPositive);
         }
-        // `ExpectedTyp::ForeignIssuer` because the MDM mints this and we do not control its header.
-        // What separates it instead is exactly what that variant's doc requires: the keys are
-        // that one vendor's, and the issuer and audience are pinned to that one relationship.
+        // `ExpectedTyp::ForeignIssuer` because the MDM mints this and we do not control its
+        // header, so `typ` cannot be the separator.
+        //
+        // THE WEAKER OF THE TWO FORMS that variant's doc describes, and it says so rather than
+        // borrowing the stronger one. Where the pinned issuer is a value no IronAuth issuer
+        // can take, the separation is STRUCTURAL. Here both the keys and the issuer come from
+        // OPERATOR CONFIGURATION, which is the case that doc explicitly warns about: a
+        // deployment that registered its own issuer and JWKS as the MDM would have its own
+        // tokens reach the signature check with `typ` unread. What stands between that and a
+        // confusion is the operator not doing it, plus the audience pin and the posture claim
+        // a token minted for another purpose would not carry.
         //
         // `require_iat` because `max_age_secs` is meaningless without it, and a bound that
         // cannot be evaluated must deny rather than pass.
@@ -259,8 +287,3 @@ pub fn now_secs(clock: &dyn Clock) -> i64 {
         .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
 }
 
-/// The epoch, for a fixture that needs a fixed instant.
-#[must_use]
-pub const fn epoch() -> SystemTime {
-    UNIX_EPOCH
-}
