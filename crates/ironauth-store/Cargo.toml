@@ -1080,6 +1080,14 @@ name = "access_requests"
 path = "tests/access_requests.rs"
 required-features = ["testing"]
 
+# The pinned wire format of the access-review export (issue #145 criterion 1). NO
+# `required-features`, and that is the point rather than an omission: it needs no database and
+# no `testing` feature, because it reads two committed files and compares them to what the
+# writer emits. A consumer's contract should be checkable in the cheapest lane there is.
+[[test]]
+name = "access_review_fixture"
+path = "tests/access_review_fixture.rs"
+
 # The portal SESSION a redeemed link opens (issue #140). Its own target rather than more cases in
 # the file above, because the subject is different: that one is about a link being spent exactly
 # once, this one is about what the resulting credential may reach and for how long.
