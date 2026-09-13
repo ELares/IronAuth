@@ -4463,7 +4463,7 @@ async fn a_response_that_passes_every_check_says_so_and_the_unsolicited_one_does
     // THE LIMIT IS STATED. This is the assertion that would have failed against the sentence
     // this test replaced.
     assert!(
-        narrow.contains("does not vouch"),
+        narrow.contains("does not vouch for what comes after"),
         "the page must say what it did NOT reach, or an operator reads it as finished: {narrow}"
     );
 
@@ -4485,12 +4485,25 @@ async fn a_response_that_passes_every_check_says_so_and_the_unsolicited_one_does
     // THE `Ok` BRANCH, which nothing reached before: every earlier fixture stopped at the
     // correlation, so the strongest sentence on the page was unmeasured.
     assert!(
-        full.contains("passes every check this deployment makes"),
+        full.contains("passes every check this deployment makes on the document itself"),
         "a response that reaches the end of `examine` must be reported as doing so: {full}"
     );
     assert!(
-        !full.contains("does not vouch"),
+        !full.contains("does not vouch for what comes after"),
         "and it must not carry the narrower page's caveat: {full}"
+    );
+    // THE CORRELATION SENTENCE IS READ FROM THE COLUMN. This connection really does accept
+    // unsolicited responses, and the page says so BECAUSE the column says so rather than because
+    // reaching this branch implies it -- which it does not; see the sibling test below.
+    assert!(
+        full.contains("accepts a response it did not ask for"),
+        "the page must report the connection's own setting: {full}"
+    );
+    // AND THE STATE HALF IS EXCLUDED ON BOTH BRANCHES. `examine` is stateless: a real sign-in
+    // also has to spend an outstanding request, which a pasted document cannot.
+    assert!(
+        full.contains("NOT checked here"),
+        "the page must not imply a real sign-in would succeed: {full}"
     );
 }
 
@@ -4512,7 +4525,12 @@ async fn an_unsigned_assertion_is_not_blamed_on_the_certificate() {
     pin_certificate_for(&harness, &connection, &key).await;
     let cookie = open_session_in(&harness, "sso", "tok-t6", &org).await;
 
-    // THE SAME DOCUMENT THE OTHER FIXTURES SIGN, with the signature taken off. One thing varies.
+    // AN UNSIGNED DOCUMENT, and the comment that used to sit here claimed it differed from the
+    // signed fixtures in one field. It does not: `signed_response_with` builds a subject, a
+    // conditions block and an attribute statement that this one has none of. What the fixture
+    // establishes is narrower and is all this test needs -- a document with NO signature over
+    // its assertion, against a connection that HAS a certificate pinned, so the answer is a
+    // signature verdict rather than `NoTrustAnchor`.
     let unsigned = "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" \
          xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"_r1\" Version=\"2.0\" \
          IssueInstant=\"1970-01-01T00:00:00Z\">\
@@ -4524,8 +4542,15 @@ async fn an_unsigned_assertion_is_not_blamed_on_the_certificate() {
 
     assert_eq!(status, 200, "the diagnosis page: {body}");
     assert!(
-        body.contains("not signed"),
-        "an unsigned assertion has to be named as one: {body}"
+        body.contains("could not find exactly one signature"),
+        "the page has to name what it observed: {body}"
+    );
+    // AND IT MUST NOT NAME A CAUSE IT CANNOT SEE. `SignatureMissing` has seven producers, so
+    // "assertion signing is off" -- what this arm said before -- is one of them presented as the
+    // diagnosis. A provider signing BOTH elements reaches the same variant.
+    assert!(
+        body.contains("not a certificate problem"),
+        "and say what it is not, since that is where the wrong remedy lives: {body}"
     );
     assert!(
         !body.contains("rotated at your identity provider"),
@@ -4665,5 +4690,123 @@ async fn a_wrong_reply_url_names_both_addresses() {
     assert!(
         !body.contains("Send this page to your vendor"),
         "this is the customer's own to fix and must not be routed to support: {body}"
+    );
+}
+
+/// A signed response that ANSWERS a request, so it carries an `InResponseTo`.
+///
+/// ONE THING VARIES from [`response_with_audience`]'s passing form: the
+/// `SubjectConfirmationData` gains that attribute. Everything else -- issuer, audience,
+/// recipient, window, name ID, attribute statement -- is byte for byte the same.
+fn response_answering(key: &XmlTestKey, in_response_to: &str) -> String {
+    let children = format!(
+        "<saml:Issuer>https://idp.example/entity</saml:Issuer>\
+         <saml:Subject><saml:NameID \
+         Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\">\
+         ada@globex.example</saml:NameID>\
+         <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
+         <saml:SubjectConfirmationData InResponseTo=\"{in_response_to}\" \
+         Recipient=\"https://ironauth.example/saml/acs\" \
+         NotOnOrAfter=\"1970-01-01T00:02:00Z\"/></saml:SubjectConfirmation></saml:Subject>\
+         <saml:Conditions NotBefore=\"1969-12-31T23:58:00Z\" \
+         NotOnOrAfter=\"1970-01-01T00:02:00Z\">\
+         <saml:AudienceRestriction>\
+         <saml:Audience>https://ironauth.example/saml/metadata</saml:Audience>\
+         </saml:AudienceRestriction></saml:Conditions>\
+         <saml:AttributeStatement><saml:Attribute Name=\"email\">\
+         <saml:AttributeValue>ada@globex.example</saml:AttributeValue></saml:Attribute>\
+         </saml:AttributeStatement>"
+    );
+    ironauth_saml::test_util::signed_response_with(key, "_a1", &children)
+}
+
+#[tokio::test]
+async fn a_captured_response_reaches_the_end_without_being_told_the_connection_is_unsolicited() {
+    // THE BRANCH NOTHING REACHED, and the false sentence it used to print.
+    //
+    // `examine` refuses an unsolicited response only when the document carries NO
+    // `InResponseTo`. A response captured from a real sign-in -- the commonest thing an operator
+    // has to paste, because it is what their own browser posted -- carries one, so it sails past
+    // that guard on a connection whose `allow_unsolicited` is FALSE. The page then printed "this
+    // connection accepts a response it did not ask for", which is the opposite of this
+    // connection's setting, and "reaches the end of the same path a real sign-in takes", which
+    // is the half `examine` does not reach at all.
+    //
+    // THE FIXTURE IS THE DEFAULT CONNECTION, deliberately: `allow_unsolicited` is false, as
+    // migration 0196 defaults it and as every real deployment leaves it.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let connection =
+        saml_connection_from(&harness, &org, "acme-okta", "https://idp.example/entity").await;
+    let key = XmlTestKey::generate();
+    pin_certificate_for(&harness, &connection, &key).await;
+    let cookie = open_session_in(&harness, "sso", "tok-t10", &org).await;
+
+    let answering = response_answering(&key, "_req-that-was-issued");
+    let (status, body) =
+        test_connection(&harness, &cookie, &connection, &base64_of(&answering)).await;
+
+    assert_eq!(status, 200, "the diagnosis page: {body}");
+    assert!(
+        body.contains("passes every check this deployment makes on the document itself"),
+        "a document that reaches the end of `examine` is reported as doing so: {body}"
+    );
+    // THE SENTENCE THAT WAS FALSE.
+    assert!(
+        !body.contains("accepts a response it did not ask for"),
+        "a connection that accepts ONLY solicited responses was told it accepts any: {body}"
+    );
+    assert!(
+        body.contains("accepts only responses to its own requests"),
+        "the page has to report this connection's actual setting: {body}"
+    );
+    // AND THE SECOND FALSE SENTENCE: a real sign-in with these bytes would additionally have to
+    // spend an outstanding request, and this document names one that is long gone.
+    assert!(
+        body.contains("NOT checked here"),
+        "the page must not imply a real sign-in would succeed: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_bound_names_which_bound_is_missing() {
+    // THE VARIANT CARRIES THE ATTRIBUTE and the arm used to throw it away, printing one sentence
+    // for four producers. Here `Conditions/@NotBefore` is absent while `NotOnOrAfter` is
+    // present, and the sentence that got discarded sent the operator to switch on a condition
+    // their document already had.
+    //
+    // ONE ATTRIBUTE VARIES from the passing fixture.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let connection =
+        saml_connection_from(&harness, &org, "acme-okta", "https://idp.example/entity").await;
+    let key = XmlTestKey::generate();
+    pin_certificate_for(&harness, &connection, &key).await;
+    let cookie = open_session_in(&harness, "sso", "tok-t11", &org).await;
+
+    let children = "<saml:Issuer>https://idp.example/entity</saml:Issuer>\
+         <saml:Subject><saml:NameID \
+         Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\">\
+         ada@globex.example</saml:NameID>\
+         <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
+         <saml:SubjectConfirmationData Recipient=\"https://ironauth.example/saml/acs\" \
+         NotOnOrAfter=\"1970-01-01T00:02:00Z\"/></saml:SubjectConfirmation></saml:Subject>\
+         <saml:Conditions NotOnOrAfter=\"1970-01-01T00:02:00Z\">\
+         <saml:AudienceRestriction>\
+         <saml:Audience>https://ironauth.example/saml/metadata</saml:Audience>\
+         </saml:AudienceRestriction></saml:Conditions>";
+    let missing = ironauth_saml::test_util::signed_response_with(&key, "_a1", children);
+    let (status, body) =
+        test_connection(&harness, &cookie, &connection, &base64_of(&missing)).await;
+
+    assert_eq!(status, 200, "the diagnosis page: {body}");
+    assert!(
+        body.contains("Conditions/@NotBefore"),
+        "the page has to name the bound that is actually absent: {body}"
+    );
+    // THE SENTENCE THAT WAS WRONG: `NotOnOrAfter` IS in this document.
+    assert!(
+        !body.contains("switch on the assertion lifetime"),
+        "it must not send an operator to enable something already there: {body}"
     );
 }

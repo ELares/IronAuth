@@ -2015,6 +2015,11 @@ fn diagnose(
 ) -> String {
     use crate::saml_acs::AcsError;
 
+    // EXHAUSTIVE, AND THAT IS THE REPAIR. The first version had a catch-all whose sentence --
+    // "nothing in this connection's configuration explains it" -- was false for four of the
+    // variants that reached it, and a catch-all is exactly what let those variants arrive
+    // unconsidered. With no `_` arm, a variant added to `AcsError` stops compiling here until
+    // somebody decides what to tell an operator about it.
     match error {
         AcsError::NoTrustAnchor => format!(
             "<p><strong>No signing certificate is pinned for this connection.</strong> Until \
@@ -2030,20 +2035,30 @@ fn diagnose(
         ),
         AcsError::Condition(condition) => diagnose_condition(condition, connection),
         AcsError::Signature(failure) => diagnose_signature(*failure, connection),
-        // THE NAME IDENTIFIER FORMAT IS A COLUMN ON THIS CONNECTION, and both halves of the
-        // mismatch are worth printing: the expected value is what an operator sets in their
-        // provider, and the found value is what it is sending today.
-        AcsError::WrongNameIdFormat { expected, found } => format!(
-            "<p><strong>Your identity provider is sending the wrong kind of name \
-             identifier.</strong></p><p>It sent <code>{found}</code>. This connection expects \
-             <code>{expected}</code>.</p><p>In your identity provider, set the name ID format \
-             to the expected value. The format is part of the identity: a transient identifier \
-             names somebody for one session only, and a persistent one names them forever.</p>",
-            found = escape_html(found.as_deref().unwrap_or("nothing")),
-            expected = escape_html(expected)
-        ),
-        // A CONNECTION SETTING THIS PIPELINE CANNOT HONOUR, which is the vendor's problem and
-        // not the reader's. Telling them to capture a fresh response would be a loop.
+        // THE NAME IDENTIFIER FORMAT, and BOTH SIDES CAN BE THE FAULT. The expected value is a
+        // column on this connection, and migration 0196 asks only that it be non-empty -- so a
+        // single space is storable and collapses to nothing, which refuses every document. An
+        // earlier version of this arm blamed the identity provider unconditionally.
+        AcsError::WrongNameIdFormat { expected, found } => {
+            if expected.trim().is_empty() {
+                "<p><strong>This connection's name ID format is blank, so no document can \
+                 match it.</strong></p><p>Nothing you send will get past this. Send this page \
+                 to your vendor: the connection needs a real format configured.</p>"
+                    .to_owned()
+            } else {
+                format!(
+                    "<p><strong>The name identifier format does not match.</strong></p><p>Your \
+                     identity provider sent <code>{found}</code>. This connection expects \
+                     <code>{expected}</code>.</p><p>Set the name ID format in your identity \
+                     provider to the expected value, or ask your vendor to change what this \
+                     connection expects. The format is part of the identity: a transient \
+                     identifier names somebody for one session only, and a persistent one names \
+                     them forever, so the two are not interchangeable.</p>",
+                    found = escape_html(found.as_deref().unwrap_or("nothing")),
+                    expected = escape_html(expected)
+                )
+            }
+        }
         AcsError::EncryptionRequired => {
             "<p><strong>This connection is configured to require an encrypted assertion, and \
              this deployment cannot accept one.</strong></p><p>Nothing you change in your \
@@ -2059,50 +2074,76 @@ fn diagnose(
              provider, send these attributes unencrypted, or ask your vendor whether the \
              connection needs them at all.</p>"
         ),
-        AcsError::Attributes(_) => {
-            "<p><strong>The attribute statement could not be read.</strong></p><p>The document \
-             is the problem rather than any setting: capture a fresh response and try again. If \
-             it keeps happening, send this page to your vendor.</p>"
-                .to_owned()
-        }
-        // EVERYTHING THE SIGNATURE AND THE CONDITIONS COVER HELD, and that is all this can say.
+        AcsError::Attributes(unreadable) => diagnose_attributes(unreadable),
+        // EVERYTHING THE SIGNATURE AND THE CONDITIONS COVER HELD, and that is all this says.
         //
         // `examine` refuses an unsolicited response BEFORE it reaches the connection's remaining
         // controls -- the encryption requirement, the name ID format, and the attribute
-        // statement -- so this page must not vouch for those. An earlier version said "the
-        // certificate, issuer, audience and validity window all check out" and then went on to
-        // call the correlation "the one thing this test cannot check", which was false in a way
-        // that mattered: a connection requiring encryption refuses every real sign-in and this
-        // page would have called it healthy.
-        //
-        // WHY THIS IS THE GOOD NEWS ANYWAY. A pasted document answers no sign-in this deployment
-        // started, so on a connection that accepts only its own requests -- the safe default --
-        // the correlation check is the first thing a paste can fail and it fails for a reason
-        // that is not a fault. Reporting it as one would tell an operator whose setup is right
-        // to go and change something.
+        // statement -- so this page must not vouch for those.
         AcsError::UnsolicitedRefused => format!(
             "<p><strong>The certificate, issuer, audience and validity window all check \
-             out.</strong></p><p>The test stops there. A pasted response answers no sign-in \
-             that this deployment started, and <code>{name}</code> accepts only responses to \
-             its own requests -- which is the right setting, and which a real sign-in \
-             satisfies.</p><p>So this does not vouch for what comes after that point: the \
-             assertion's name ID format, its attributes, and any encryption this connection \
-             requires are checked during a real sign-in and not here.</p>",
+             out.</strong></p><p>The test stops there. This response answers no sign-in that \
+             this deployment started, and <code>{name}</code> accepts only responses to its own \
+             requests -- which is the right setting, and which a real sign-in satisfies.</p>\
+             <p>So this does not vouch for what comes after that point: the assertion's name ID \
+             format, its attributes, and any encryption this connection requires are checked \
+             during a real sign-in and not here.</p>",
             name = escape_html(&connection.display_name)
         ),
-        // WHAT IS LEFT is `NoConnection` and `UnknownRequest`, neither of which `examine` can
-        // return -- this surface resolved the connection itself, and correlation is the caller's
-        // half. A future variant lands here too, so it says what it knows and no more.
-        other => format!(
-            "<p><strong>This response was refused.</strong> {detail}</p><p>Send this page to \
-             your vendor.</p>",
-            detail = escape_html(&other.to_string())
-        ),
+        // NEITHER OF THESE CAN REACH THIS PAGE, and they are written out rather than swept into
+        // a catch-all so that stays true by construction. `examine` is the stateless half:
+        // `NoConnection` is the ACS route's answer before it has a connection at all, and
+        // `UnknownRequest`, `Replayed` and `Store` are `consume`'s, which this surface never
+        // calls. `Store` matters most: its `Display` wraps a database error, and a catch-all
+        // that rendered `Display` would have put one on a customer's screen.
+        AcsError::NoConnection
+        | AcsError::UnknownRequest
+        | AcsError::Replayed
+        | AcsError::Store(_) => "<p><strong>This response was refused for a reason this page \
+             cannot reach.</strong> Send this page to your vendor.</p>"
+            .to_owned(),
+    }
+}
+
+/// The attribute-statement half of [`diagnose`].
+///
+/// NONE OF THESE IS FIXED BY CAPTURING AGAIN, which is what an earlier version of this advice
+/// said. Every one is a property of what the identity provider emits or of which element was
+/// verified, so the same capture repeated produces the same refusal.
+fn diagnose_attributes(error: &ironauth_saml::Unreadable) -> String {
+    use ironauth_saml::Unreadable;
+    match error {
+        Unreadable::NotAnAssertion => {
+            "<p><strong>The signature covers the response rather than the assertion inside \
+             it.</strong></p><p>In your identity provider, switch on assertion signing. Signing \
+             only the response leaves the statement about the person unprotected, so this \
+             deployment will not read it.</p>"
+                .to_owned()
+        }
+        Unreadable::NamelessAttribute => {
+            "<p><strong>The assertion carries an attribute with no name.</strong></p><p>An \
+             unnamed attribute cannot be mapped to anything, and this deployment will not guess \
+             which one it was. Look at the attribute statement your identity provider is \
+             configured to send: one of its entries has an empty name.</p>"
+                .to_owned()
+        }
+        Unreadable::Duplicate { .. } => {
+            "<p><strong>The assertion sends the same attribute twice with different \
+             values.</strong></p><p>This deployment will not choose between them. In your \
+             identity provider, remove the duplicate mapping -- usually one of a pair added at \
+             different times.</p>"
+                .to_owned()
+        }
     }
 }
 
 /// The conditions half of [`diagnose`], split out only because the whole match outgrew one
 /// screen. Each arm names WHERE the fix is, exactly as the parent's doc requires.
+///
+/// EVERY ARM PRINTS WHAT THE VARIANT CARRIES. Two of these variants name the exact attribute
+/// that failed, and an earlier version discarded both and guessed a cause instead -- so a
+/// missing `Conditions/@NotBefore` was reported as a missing `NotOnOrAfter`, and the operator
+/// was sent to switch on something already in their document.
 fn diagnose_condition(
     error: &ironauth_saml::ConditionError,
     connection: &ironauth_store::SamlConnection,
@@ -2130,31 +2171,43 @@ fn diagnose_condition(
             found = escape_html(found.as_deref().unwrap_or("nothing")),
             expected = escape_html(&connection.idp_entity_id)
         ),
-        ConditionError::Expired => {
-            "<p><strong>This response has expired.</strong> That is expected for a document \
-             captured a while ago: SAML responses are valid for minutes. Capture a fresh one \
-             and paste that.</p><p>If it was captured seconds ago, the clock on your identity \
-             provider and the clock here disagree.</p>"
-                .to_owned()
-        }
-        // A BOUND THIS CONNECTION REQUIRES AND THE DOCUMENT DOES NOT CARRY. `max_assertion_age`
-        // is a column on this connection, so an operator reading "capture a fresh response" --
-        // which the catch-all used to say -- would recapture forever: every document their
-        // provider emits is missing the same element.
-        ConditionError::MissingBound { .. } => {
-            "<p><strong>The assertion does not say when it stops being valid.</strong></p>\
-             <p>This connection refuses an assertion whose lifetime cannot be bounded. In your \
-             identity provider, switch on the assertion lifetime (a <code>NotOnOrAfter</code> \
-             condition); most emit one by default and it can be turned off.</p>"
-                .to_owned()
-        }
-        ConditionError::UnreadableBound { .. } => {
-            "<p><strong>The validity window is written in a form this deployment cannot \
-             read.</strong></p><p>SAML timestamps have to be UTC, ending in <code>Z</code>. A \
-             provider emitting a numeric offset instead produces a document that looks correct \
-             on screen and is refused here. Send this page to your vendor.</p>"
-                .to_owned()
-        }
+        // BOTH ENDS OF THE WINDOW, because one variant carries both. `check` returns this when
+        // the clock is before `NotBefore` as well as after `NotOnOrAfter`, and an earlier
+        // version said only "this response has expired" -- which sends an operator whose clocks
+        // are ahead looking for a stale document.
+        ConditionError::Expired => format!(
+            "<p><strong>This response is outside its validity window.</strong></p><p>SAML \
+             responses are valid for minutes, so a document captured a while ago lands here and \
+             the remedy is to capture a fresh one.</p><p>If it was captured seconds ago, the \
+             clock here and the clock on your identity provider disagree by more than the \
+             {skew} seconds of tolerance this connection allows -- in either direction. A \
+             response can be refused for being too NEW as easily as too old.</p>",
+            skew = connection.clock_skew_secs
+        ),
+        // THE VARIANT NAMES THE ATTRIBUTE, so the page does too. Four different bounds produce
+        // this, on two different elements, and the remedy is not the same for all of them: what
+        // is common is that the named attribute is absent from what the provider emitted.
+        ConditionError::MissingBound { attribute } => format!(
+            "<p><strong>The assertion does not carry <code>{attribute}</code>.</strong></p>\
+             <p>This deployment refuses an assertion whose lifetime it cannot bound, and that \
+             attribute is one of the bounds. In your identity provider, look at what it emits \
+             for the element named above; most emit all of these by default and each can be \
+             turned off.</p>",
+            attribute = escape_html(attribute)
+        ),
+        // AND THE VALUE, which is the whole point of the variant carrying it: "unreadable" with
+        // nothing quoted leaves an operator looking at a timestamp that appears perfectly
+        // ordinary. An earlier version named a numeric offset as the cause, which is one of
+        // several and not the commonest.
+        ConditionError::UnreadableBound { attribute, found } => format!(
+            "<p><strong>This deployment cannot read <code>{attribute}</code>.</strong></p>\
+             <p>It said <code>{found}</code>. SAML timestamps have to be UTC in the narrow \
+             <code>xsd:dateTime</code> form, ending in <code>Z</code>, with a four-digit year \
+             this side of 2200 and no leap second. A value that looks right on screen and is \
+             refused here is usually one of those. Send this page to your vendor.</p>",
+            attribute = escape_html(attribute),
+            found = escape_html(found)
+        ),
         // THE LIFETIME IS A COLUMN ON THIS CONNECTION, so "capture a fresh response" -- what the
         // catch-all used to say -- would have an operator recapturing forever: every document
         // their provider emits carries the same window.
@@ -2178,30 +2231,34 @@ fn diagnose_condition(
             found = escape_html(found.as_deref().unwrap_or("nothing")),
             expected = escape_html(&connection.acs_url)
         ),
-        // THE CORRELATION, which a pasted document can never satisfy and a real sign-in always
-        // does. It reaches this page only for a connection that ACCEPTS unsolicited responses
-        // and was handed one carrying an `InResponseTo` naming nothing -- so it is not the
-        // ordinary paste case, which `AcsError::UnsolicitedRefused` answers instead.
+        // THE VARIANT NAMES WHAT IT DID NOT UNDERSTAND, and the two producers are opposite in
+        // where the fix lives, so the page prints the name and lets it distinguish them: an
+        // unknown `Condition` element is a restriction this deployment does not implement, and
+        // a `SubjectConfirmationData/@NotBefore` is an attribute an operator can remove.
+        ConditionError::UnsupportedCondition { name } => format!(
+            "<p><strong>The assertion carries <code>{name}</code>, which this deployment does \
+             not implement.</strong></p><p>The specification requires refusing what we cannot \
+             evaluate rather than ignoring it. If that names a setting in your identity \
+             provider, turning it off is the fix; if it names an element of the specification, \
+             send this page to your vendor.</p>",
+            name = escape_html(name)
+        ),
+        // NOT REACHABLE FROM THIS SURFACE, and written out rather than swept into a catch-all.
+        // `examine` passes the document's own `InResponseTo` as the expectation, so the
+        // comparison can only agree; `saml_acs` records the same reachability at that call site.
         ConditionError::UnknownRequest => {
-            "<p><strong>This response answers a sign-in this deployment did not start.</strong>\
-             </p><p>That is expected for a document captured earlier and pasted here, and it is \
-             not a fault in your configuration. A real sign-in carries the reference this \
-             check is looking for.</p>"
+            "<p><strong>This response does not answer a sign-in this deployment \
+             started.</strong></p><p>That is expected for a document captured earlier, and it \
+             is not a fault in your configuration.</p>"
                 .to_owned()
         }
         ConditionError::Malformed => {
-            "<p><strong>The assertion is not shaped the way the specification requires.</strong>\
-             </p><p>Either it is not a SAML assertion, or it carries two of something it may \
-             carry one of -- two conditions blocks, two subjects, or two bearer confirmations. \
-             An ambiguous document is not read rather than having one half believed. Capture a \
-             fresh response; if it keeps happening, send this page to your vendor.</p>"
-                .to_owned()
-        }
-        ConditionError::UnsupportedCondition { .. } => {
-            "<p><strong>The assertion carries a restriction this deployment does not \
-             implement.</strong></p><p>The specification requires refusing it rather than \
-             ignoring it, so this is not something you can fix in your identity provider by \
-             correcting a value. Send this page to your vendor.</p>"
+            "<p><strong>The assertion is not shaped the way the specification \
+             requires.</strong></p><p>Either it is not a SAML assertion, or it carries two of \
+             something it may carry one of -- two conditions blocks, two subjects, or two \
+             bearer confirmations. An ambiguous document is not read rather than having one \
+             half believed. This is the provider's own output rather than anything you pasted \
+             wrongly, so send this page to your vendor.</p>"
                 .to_owned()
         }
     }
@@ -2209,54 +2266,70 @@ fn diagnose_condition(
 
 /// The signature half of [`diagnose`].
 ///
-/// FIVE VARIANTS AND FIVE SENTENCES. An earlier version matched `AcsError::Signature(_)` and
-/// printed the certificate-rotation message for all of them, so an identity provider with
-/// assertion signing switched off, or still emitting RSA-SHA1, sent its administrator to rotate
-/// a certificate that was correct.
+/// # It names the observation, not a cause it cannot see
+///
+/// `VerifyError` has five variants and each covers SEVERAL producers -- `SignatureMissing`
+/// alone has seven. An earlier version of this function printed one certificate-rotation
+/// sentence for all five; the version that replaced it printed five sentences, each naming ONE
+/// cause as if it were the only one, which is the same defect at finer grain. A reader told
+/// "assertion signing is off" when their provider signs both elements goes and changes a setting
+/// that was right.
+///
+/// So each arm says what this deployment OBSERVED, and offers the common causes as causes to
+/// check rather than as the diagnosis.
 fn diagnose_signature(
     error: ironauth_saml::VerifyError,
     connection: &ironauth_store::SamlConnection,
 ) -> String {
     use ironauth_saml::VerifyError;
     match error {
-        // THE SIGNATURE FAILURES ARE FIVE DIFFERENT PROBLEMS AND ONE SENTENCE WOULD FIT ONE OF
-        // THEM. An earlier version printed the certificate-rotation message for all five, so an
-        // identity provider with assertion signing switched OFF, or still emitting RSA-SHA1, was
-        // sent to rotate a certificate that was correct -- the exact generic error this surface
-        // exists to replace.
         VerifyError::SignatureMissing => {
-            "<p><strong>The assertion is not signed.</strong></p><p>This is a setting in your \
-             identity provider, not a certificate problem. Most providers can sign the response, \
-             the assertion, or both, and default to a combination this deployment does not \
-             accept: switch on assertion signing.</p><p>A document carrying two signatures \
-             lands here as well, which usually means both were switched on.</p>"
+            "<p><strong>This deployment could not find exactly one signature over the \
+             assertion.</strong></p><p>It is not a certificate problem: nothing was compared \
+             against what is pinned. The shapes that land here are an assertion with no \
+             signature at all, a document carrying more than one where one was expected, and a \
+             signature whose structure could not be read far enough to use.</p><p>In your \
+             identity provider, check what it is configured to sign. Many can sign the response, \
+             the assertion, or both, and this deployment reads the assertion's own \
+             signature.</p>"
                 .to_owned()
         }
         VerifyError::AlgorithmRefused => {
-            "<p><strong>The signature uses an algorithm this deployment refuses.</strong></p>\
-             <p>Again a setting rather than a certificate: SHA-1 digests and RSA-SHA1 signatures \
-             are refused outright. In your identity provider, set the signature algorithm to \
-             RSA-SHA256 and the digest to SHA-256.</p>"
+            "<p><strong>The signature uses something this deployment refuses.</strong></p>\
+             <p>Also not a certificate problem. Three families land here: SHA-1 digests and \
+             RSA-SHA1 signatures, which are refused outright; transform chains other than the \
+             enveloped-signature and exclusive canonicalization pair; and an exclusive \
+             canonicalization carrying an inclusive-namespace prefix list, which is legal and \
+             which this deployment does not implement.</p><p>In your identity provider, set the \
+             signature algorithm to RSA-SHA256 and the digest to SHA-256 first -- that is the \
+             commonest of the three. If it persists, send this page to your vendor.</p>"
                 .to_owned()
         }
         VerifyError::ReferenceRefused => {
-            "<p><strong>The signature does not cover the assertion the way it must.</strong></p>\
-             <p>The signature has to name exactly the element it protects, and this one does \
-             not. It is not a value you can correct: send this page to your vendor.</p>"
+            "<p><strong>The signature does not name the element this deployment needs to \
+             read.</strong></p><p>The reference has to name exactly one element, that element \
+             has to be the one being verified, and no other element may claim the same \
+             identifier. A response carrying no assertion at all lands here too, which is what \
+             an encrypted assertion looks like from outside.</p><p>This is the document's own \
+             structure rather than a value you can correct, so send this page to your \
+             vendor.</p>"
                 .to_owned()
         }
         VerifyError::SignatureInvalid => format!(
             "<p><strong>The signature did not verify against the certificate pinned for this \
-             connection.</strong></p><p>The usual cause is a certificate that has been rotated \
-             at your identity provider and not re-pinned here. Export the current signing \
-             certificate from your identity provider and compare it with what is pinned \
-             against <code>{name}</code>.</p>",
+             connection.</strong></p><p>This is the one that IS about the certificate: the \
+             document was well formed and the comparison was made and failed. The usual cause \
+             is a certificate rotated at your identity provider and not re-pinned here. Export \
+             the current signing certificate and compare it with what is pinned against \
+             <code>{name}</code>.</p>",
             name = escape_html(&connection.display_name)
         ),
         VerifyError::Malformed(_) => {
-            "<p><strong>This does not parse as a SAML response.</strong></p><p>Copy the value \
-             of the <code>SAMLResponse</code> form field exactly as your browser sent it -- not \
-             the decoded XML, and not a value that has been through an editor.</p>"
+            "<p><strong>This does not parse as a SAML document.</strong></p><p>If you pasted \
+             it by hand, copy the value of the <code>SAMLResponse</code> form field exactly as \
+             your browser sent it -- not the decoded XML, and not a value that has been through \
+             an editor. If it came straight from a capture, the provider's own output is \
+             malformed and your vendor should see this page.</p>"
                 .to_owned()
         }
     }
@@ -2378,16 +2451,38 @@ pub async fn connection_test_post(
         limits: &ironauth_saml::Limits::default(),
     };
     let verdict = match crate::saml_acs::examine(&acs, &response) {
-        // EVERY CHECK `examine` MAKES, which on this connection includes the ones that come
-        // after the correlation: it accepts unsolicited responses, so the name ID format, the
-        // encryption requirement and the attribute statement were all reached. The
-        // `UnsolicitedRefused` arm of `diagnose` is the weaker sentence, and says so.
-        Ok(_) => "<p><strong>This response passes every check this deployment makes.</strong>\
-                  </p><p>Certificate, issuer, audience, validity window, name ID format and \
-                  attributes all hold, and this connection accepts a response it did not ask \
-                  for -- so a pasted document reaches the end of the same path a real sign-in \
-                  takes.</p>"
-            .to_owned(),
+        // EVERY CHECK `examine` MAKES, AND NOT ONE MORE, and the second sentence is what an
+        // earlier version got wrong twice.
+        //
+        // IT DOES NOT MEAN THE CONNECTION ACCEPTS UNSOLICITED RESPONSES. Reaching here means the
+        // unsolicited GUARD did not fire, and there are two ways that happens: the connection
+        // allows them, or the document carries an `InResponseTo` -- which a captured response
+        // from a real sign-in does, and that is the commonest thing an operator has to hand.
+        // The earlier sentence asserted the first unconditionally, so a default connection was
+        // told it accepted unsolicited responses when it refuses them.
+        //
+        // AND IT DOES NOT MEAN A REAL SIGN-IN WOULD SUCCEED. `examine` is the stateless half;
+        // `consume` then spends the outstanding request and admits the assertion id, and a
+        // captured document names a request that is already spent. So the same bytes in a real
+        // sign-in end in `UnknownRequest` or `Replayed`. The earlier sentence said this reaches
+        // "the end of the same path a real sign-in takes", which is exactly the half it does
+        // not reach.
+        Ok(_) => format!(
+            "<p><strong>This response passes every check this deployment makes on the document \
+             itself.</strong></p><p>Certificate, issuer, audience, validity window, name ID \
+             format and attributes all hold.</p><p>{correlation}</p><p>What is NOT checked here \
+             is the sign-in state: a real response also has to answer an outstanding request \
+             that has not been spent, and a document captured earlier no longer does. That is \
+             not a fault in your setup.</p>",
+            correlation = if connection.allow_unsolicited {
+                "This connection accepts a response it did not ask for, so a real sign-in does \
+                 not have to carry a request reference either."
+            } else {
+                "This connection accepts only responses to its own requests. This document \
+                 carries a request reference, which is why the check was reached at all -- a \
+                 document without one would have stopped earlier."
+            }
+        ),
         Err(error) => diagnose(&error, &connection),
     };
     // WHAT THE VERDICT DOES NOT COVER, said above it rather than folded into it. A response can
