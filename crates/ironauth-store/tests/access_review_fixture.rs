@@ -28,7 +28,7 @@
 //! does not break on a Tuesday.
 
 use ironauth_store::access_review::{
-    parse_csv, parse_jsonl, to_csv, to_jsonl, AccessReviewRow, ACCESS_REVIEW_COLUMNS,
+    ACCESS_REVIEW_COLUMNS, AccessReviewRow, parse_csv, parse_jsonl, to_csv, to_jsonl,
 };
 use std::path::Path;
 
@@ -69,8 +69,26 @@ fn a_regeneration_run_is_not_a_verification() {
 /// fixture that only ever held well-formed ids would not have been pinning it.
 fn fixture_rows() -> Vec<AccessReviewRow> {
     vec![
-        row("user", "omb_alice", "usr_alice", "billing-admin", "direct", None, None, None),
-        row("user", "omb_alice", "usr_alice", "member", "default", None, None, None),
+        row(
+            "user",
+            "omb_alice",
+            "usr_alice",
+            "billing-admin",
+            "direct",
+            None,
+            None,
+            None,
+        ),
+        row(
+            "user",
+            "omb_alice",
+            "usr_alice",
+            "member",
+            "default",
+            None,
+            None,
+            None,
+        ),
         row(
             "user",
             "omb_bob",
@@ -81,7 +99,9 @@ fn fixture_rows() -> Vec<AccessReviewRow> {
             None,
             None,
         ),
-        row("user", "omb_bob", "usr_bob", "member", "default", None, None, None),
+        row(
+            "user", "omb_bob", "usr_bob", "member", "default", None, None, None,
+        ),
         row(
             "user",
             "omb_carol",
@@ -113,10 +133,46 @@ fn fixture_rows() -> Vec<AccessReviewRow> {
         // One trigger per row makes each character individually load-bearing: remove any one
         // from `csv_field` and exactly one of these four rows stops being quoted, which changes
         // the file and fails this test by name.
-        row("user", "omb_eve", "usr_eve", "ops,emergency", "direct", None, None, None),
-        row("user", "omb_frank", "usr_frank", "ops\"emergency", "direct", None, None, None),
-        row("user", "omb_grace", "usr_grace", "ops\rsecond", "direct", None, None, None),
-        row("user", "omb_heidi", "usr_heidi", "ops\nsecond", "direct", None, None, None),
+        row(
+            "user",
+            "omb_eve",
+            "usr_eve",
+            "ops,emergency",
+            "direct",
+            None,
+            None,
+            None,
+        ),
+        row(
+            "user",
+            "omb_frank",
+            "usr_frank",
+            "ops\"emergency",
+            "direct",
+            None,
+            None,
+            None,
+        ),
+        row(
+            "user",
+            "omb_grace",
+            "usr_grace",
+            "ops\rsecond",
+            "direct",
+            None,
+            None,
+            None,
+        ),
+        row(
+            "user",
+            "omb_heidi",
+            "usr_heidi",
+            "ops\nsecond",
+            "direct",
+            None,
+            None,
+            None,
+        ),
     ]
 }
 
@@ -221,7 +277,11 @@ fn the_pinned_csv_is_what_the_writer_emits() {
 
 #[test]
 fn the_pinned_jsonl_is_what_the_writer_emits() {
-    pinned("access-review-v1.jsonl", &to_jsonl(&fixture_rows()), "JSONL");
+    pinned(
+        "access-review-v1.jsonl",
+        &to_jsonl(&fixture_rows()),
+        "JSONL",
+    );
 }
 
 /// A consumer that has only the FILE reconstructs who has which role.

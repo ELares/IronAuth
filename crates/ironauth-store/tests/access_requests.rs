@@ -877,9 +877,7 @@ async fn plant_foreign_role_mapping(
     here: &OrganizationId,
     elsewhere: &OrganizationId,
 ) {
-    use ironauth_store::{
-        NewOrgRole, NewPermission, OrgRoleId, OrgRolePermissionId, PermissionId,
-    };
+    use ironauth_store::{NewOrgRole, NewPermission, OrgRoleId, OrgRolePermissionId, PermissionId};
 
     let store = db.control_store();
     let foreign_role = OrgRoleId::generate(env, &scope);

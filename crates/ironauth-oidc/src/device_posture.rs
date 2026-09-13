@@ -44,9 +44,9 @@
 
 use std::time::UNIX_EPOCH;
 
-use ironauth_cel::{compile_within_budget, BudgetedProgram, InputShape, DEFAULT_MAX_STRING_BYTES};
+use ironauth_cel::{BudgetedProgram, DEFAULT_MAX_STRING_BYTES, InputShape, compile_within_budget};
 use ironauth_env::Clock;
-use ironauth_jose::{verify, ExpectedTyp, JwsAlgorithm, TrustedKey, VerificationPolicy};
+use ironauth_jose::{ExpectedTyp, JwsAlgorithm, TrustedKey, VerificationPolicy, verify};
 use serde::{Deserialize, Serialize};
 
 /// The claim carrying the posture signals, inside the MDM's assertion.
@@ -55,10 +55,15 @@ const SIGNALS_CLAIM: &str = "device_posture";
 /// The cost ceiling a posture predicate compiles under.
 ///
 /// Deliberately small, and precise about what "small" reaches. `estimate_parsed_cost` returns
-/// 1 for any comprehension-free expression, so this constrains ITERATION DEPTH and nothing
-/// else: no flat predicate over these signals can exceed it at any budget, and a single-level
-/// comprehension still fits. What it refuses is the nested kind, which a posture expression
-/// reading a handful of booleans off one flat object has no reason to contain.
+/// 1 for any comprehension-free expression, so no flat predicate over these signals can exceed
+/// this at any value: what the budget bites on is COMPREHENSIONS, whose estimate grows with
+/// the declared collection size raised to the nesting depth. A single-level one fits and a
+/// two-level one does not, which is the boundary the test pins.
+///
+/// It is a CEILING on that growth rather than a rule about what a predicate may contain, and
+/// an earlier version of this comment implied the second. A posture expression reading a
+/// handful of booleans off one flat object has no reason to iterate at all; this is what
+/// stops one that does from being expensive, not what stops it from existing.
 ///
 /// Refusing at COMPILE time means an operator hears about it when they configure the policy
 /// rather than on the request that needed it.
@@ -192,6 +197,12 @@ pub enum DenyReason {
         /// The configured bound it exceeded.
         max_age_secs: i64,
     },
+    /// The clock could not be read as seconds since the epoch, so no age can be computed.
+    ///
+    /// Its own reason rather than folding into `Stale`: an operator seeing this has a HOST
+    /// problem, not a device one, and telling them a device's posture is stale would send them
+    /// to the wrong machine entirely.
+    UnreadableClock,
     /// It verified and was fresh, and the signals could not be decoded.
     Malformed,
     /// Everything held and the predicate said no.
@@ -259,10 +270,15 @@ impl PosturePolicy {
         //
         // `require_iat` because `max_age_secs` is meaningless without it, and a bound that
         // cannot be evaluated must deny rather than pass.
-        let verification =
-            VerificationPolicy::new(algorithms, keys, issuer, audience, ExpectedTyp::ForeignIssuer)
-                .map_err(|error| PolicyBuildError::Verification(format!("{error:?}")))?
-                .require_iat(true);
+        let verification = VerificationPolicy::new(
+            algorithms,
+            keys,
+            issuer,
+            audience,
+            ExpectedTyp::ForeignIssuer,
+        )
+        .map_err(|error| PolicyBuildError::Verification(format!("{error:?}")))?
+        .require_iat(true);
         let shape = InputShape {
             max_collection_size: 16,
             max_string_bytes: DEFAULT_MAX_STRING_BYTES,
@@ -300,10 +316,29 @@ impl PosturePolicy {
         // FRESHNESS, the half `verify` does not do. Measured from the same clock the
         // verification used, so a deployment with a skewed clock is wrong in one direction
         // rather than in two that can disagree.
-        let now = clock
-            .now_utc()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX));
+        //
+        // A CLOCK THIS CANNOT READ DENIES. The first version wrote `map_or(0, ..)`, which
+        // makes `now` the epoch and therefore every claim's age NEGATIVE -- so a clock set
+        // before 1970, which `SystemTime` permits and `duration_since` reports as an error,
+        // turned the freshness bound off entirely. A fallback that silences an error by
+        // choosing a value is a fail-open wearing a default's clothes.
+        let Ok(since_epoch) = clock.now_utc().duration_since(UNIX_EPOCH) else {
+            return PostureVerdict::Deny(DenyReason::UnreadableClock);
+        };
+        let Ok(now) = i64::try_from(since_epoch.as_secs()) else {
+            return PostureVerdict::Deny(DenyReason::UnreadableClock);
+        };
+
+        // A FUTURE-DATED OBSERVATION cannot reach here, and that is worth a sentence because
+        // `age_secs` going negative would otherwise sail under the bound: `age > max_age` is
+        // false for a claim stamped next year. `verify` refuses an `iat` outside the policy's
+        // skew before this function sees it, so the deployment's existing notion of honest
+        // clock disagreement is the one that applies.
+        //
+        // A guard here was written and then removed. It was unreachable -- exactly the
+        // two-guards-for-one-fact shape that made the `NoIssuedAt` arm unmeasurable a round
+        // earlier -- and the test that would have covered it instead asserts the reason
+        // `verify` produces, so relaxing the skew fails there rather than silently here.
         let age_secs = now.saturating_sub(issued_at);
         if age_secs > self.max_age_secs {
             return PostureVerdict::Deny(DenyReason::Stale {
@@ -347,6 +382,7 @@ pub fn now_secs(clock: &dyn Clock) -> i64 {
     clock
         .now_utc()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
 }
-

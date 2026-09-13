@@ -27,12 +27,11 @@
 use std::time::Duration;
 
 use ironauth_env::ManualClock;
-use ironauth_jose::{sign_jws, EmissionOptions, JwsAlgorithm, SigningKey};
+use ironauth_jose::{EmissionOptions, JwsAlgorithm, SigningKey, sign_jws};
 use ironauth_oidc::device_posture::{
-    now_secs, DenyReason, EdrState, PolicyBuildError, PostureSignals, PosturePolicy,
-    PostureVerdict,
+    DenyReason, EdrState, PolicyBuildError, PosturePolicy, PostureSignals, PostureVerdict, now_secs,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const MDM: &str = "https://mdm.example.test";
 const AUDIENCE: &str = "https://ironauth.example.test";
@@ -93,7 +92,9 @@ fn claims(issuer: &str, issued_at: i64, signals: &PostureSignals) -> Value {
 fn signed(signer: &SigningKey, body: &Value) -> String {
     sign_jws(
         signer,
-        serde_json::to_vec(body).expect("claims serialize").as_slice(),
+        serde_json::to_vec(body)
+            .expect("claims serialize")
+            .as_slice(),
         &EmissionOptions::new(),
     )
     .expect("sign")
@@ -139,7 +140,11 @@ fn an_unsigned_claim_is_denied() {
     let unsigned = format!(
         "{}.{}.",
         base64_url(br#"{"alg":"none","typ":"JWT"}"#),
-        base64_url(serde_json::to_vec(&body).expect("claims serialize").as_slice()),
+        base64_url(
+            serde_json::to_vec(&body)
+                .expect("claims serialize")
+                .as_slice()
+        ),
     );
     assert_eq!(
         policy(&signer, STRICT).evaluate(Some(&unsigned), &clock),
@@ -168,7 +173,13 @@ fn a_claim_naming_a_key_the_policy_does_not_hold_is_denied() {
     let clock = clock();
     // The lookup failure, kept as its own case now that it is no longer standing in for the
     // forgery above. An MDM rotating to a key this deployment has not been given lands here.
-    let token = signed(&key(2), &claims(MDM, now_secs(&clock), &healthy()));
+    //
+    // `keyed("mdm-unknown", 1)` and not `key(2)`: the SAME material under an unknown name, so
+    // this varies the identifier alone. Written with `key(2)` it varied both, which is the
+    // exact defect round 2 fixed one test up and left standing here -- and the helper that
+    // makes the one-dimension form available was already sitting there unused.
+    let rotated = keyed("mdm-unknown", 1);
+    let token = signed(&rotated, &claims(MDM, now_secs(&clock), &healthy()));
     assert_eq!(
         policy(&key(1), STRICT).evaluate(Some(&token), &clock),
         PostureVerdict::Deny(DenyReason::Unverifiable),
@@ -185,12 +196,78 @@ fn a_claim_from_another_issuer_is_denied() {
     // admit every one of them.
     let token = signed(
         &signer,
-        &claims("https://other-mdm.example.test", now_secs(&clock), &healthy()),
+        &claims(
+            "https://other-mdm.example.test",
+            now_secs(&clock),
+            &healthy(),
+        ),
     );
     assert_eq!(
         policy(&signer, STRICT).evaluate(Some(&token), &clock),
         PostureVerdict::Deny(DenyReason::Unverifiable),
         "only the issuer differs from the allow case"
+    );
+}
+
+#[test]
+fn a_clock_that_cannot_be_read_denies_rather_than_dating_everything_to_the_epoch() {
+    let signer = key(1);
+    // A HOST whose clock is set before 1970. `SystemTime` permits it and `duration_since`
+    // reports it as an error, and the first version answered that error with `map_or(0, ..)`
+    // -- making `now` the epoch, every age negative, and the freshness bound inert. A fallback
+    // that silences an error by choosing a value is a fail-open wearing a default's clothes.
+    //
+    // Measured: without this test, replacing the refusal with `unwrap_or_default()` passes the
+    // whole suite, because every other fixture's clock is after the epoch.
+    let broken = ManualClock::new(std::time::UNIX_EPOCH - Duration::from_secs(1));
+    let good = clock();
+    // The claim itself is impeccable: minted now, by the trusted key, for this audience.
+    let token = signed(&signer, &claims(MDM, now_secs(&good), &healthy()));
+    assert_eq!(
+        policy(&signer, STRICT).evaluate(Some(&token), &broken),
+        PostureVerdict::Deny(DenyReason::Unverifiable),
+        "a host that cannot say what time it is cannot say whether an observation is fresh"
+    );
+    // THE REASON IS THE VERIFIER'S, and that is the third time in this PR the layer below
+    // turned out to enforce the thing a new arm was written for. `verify` reads the SAME clock
+    // to check `iat`, so a claim minted in 2023 is wildly outside skew against a 1969 clock and
+    // never reaches this module's own check.
+    //
+    // The module's `UnreadableClock` arm is kept anyway, and the difference from the other two
+    // is the whole point: `NoIssuedAt` and `FutureDated` were removed because an unreachable
+    // arm that DENIES is redundant with a guard that already denies. This one replaced a
+    // `map_or(0, ..)` that failed OPEN -- it made `now` the epoch and every age negative, so
+    // the freshness bound went inert. Unreachable-and-fail-closed is a backstop; the thing it
+    // replaced was unreachable-and-fail-open, which is a bug. Keeping it costs a branch and
+    // removes the chance that a future refactor reintroduces the default.
+}
+
+#[test]
+fn a_future_dated_observation_is_denied_rather_than_counted_as_fresh() {
+    let signer = key(1);
+    let clock = clock();
+    // `age_secs` GOES NEGATIVE for a claim dated ahead of this clock, and `age > max_age` is
+    // then false -- so before this, a posture assertion stamped a year from now passed the
+    // freshness bound. That is the claim an MDM with a broken clock emits, and the one anybody
+    // who can choose `iat` would emit on purpose.
+    let ahead = now_secs(&clock) + 86_400;
+    let token = signed(&signer, &claims(MDM, ahead, &healthy()));
+    assert_eq!(
+        policy(&signer, STRICT).evaluate(Some(&token), &clock),
+        PostureVerdict::Deny(DenyReason::Unverifiable),
+        "only `iat` differs from the allow case, and it is in the future. `verify` refuses it \
+         before this module sees it, which is why the module has no arm of its own: one was \
+         written, found unreachable, and removed -- the same two-guards shape that made the \
+         `NoIssuedAt` arm unmeasurable a round earlier"
+    );
+    // WITHIN SKEW IS STILL FRESH, so the bound above is the skew allowance rather than a
+    // refusal of every clock disagreement.
+    let slightly_ahead = now_secs(&clock) + 5;
+    let token = signed(&signer, &claims(MDM, slightly_ahead, &healthy()));
+    assert_eq!(
+        policy(&signer, STRICT).evaluate(Some(&token), &clock),
+        PostureVerdict::Allow,
+        "two clocks a few seconds apart is the ordinary case, not an attack"
     );
 }
 
@@ -220,7 +297,10 @@ fn a_claim_one_second_inside_the_bound_is_still_allowed() {
     let clock = clock();
     // THE OTHER SIDE of the bound, so the staleness test above is measuring the bound rather
     // than the sign of a subtraction.
-    let token = signed(&signer, &claims(MDM, now_secs(&clock) - MAX_AGE, &healthy()));
+    let token = signed(
+        &signer,
+        &claims(MDM, now_secs(&clock) - MAX_AGE, &healthy()),
+    );
     assert_eq!(
         policy(&signer, STRICT).evaluate(Some(&token), &clock),
         PostureVerdict::Allow,
@@ -263,6 +343,118 @@ fn signals_that_do_not_satisfy_the_predicate_are_denied() {
         policy(&signer, STRICT).evaluate(Some(&token), &clock),
         PostureVerdict::Deny(DenyReason::PredicateUnsatisfied),
         "only one signal differs from the allow case"
+    );
+}
+
+#[test]
+fn every_signal_is_read_from_its_own_name_and_reaches_the_predicate() {
+    let signer = key(1);
+    let clock = clock();
+    // THE FINDING THIS EXISTS FOR, and it is the sharpest of the three rounds. Before it, only
+    // `patched` and `edr` were ever presented as anything but healthy, so `managed` and
+    // `encrypted` were unmeasured from the wire to the verdict. A reviewer measured what that
+    // permitted: hardcoding `"managed": true` and `"encrypted": true` in the CEL binding left
+    // all twenty tests green while an UNENROLLED, UNENCRYPTED device was allowed. So did
+    // hardcoding them in the decoder, and so did swapping any two of the three booleans at
+    // either site.
+    //
+    // Worse, round 2 caused half of it: hand-writing `Deserialize` to close the positional
+    // array hole DOUBLED the number of places a name is paired with a value by hand, and the
+    // doc block justifying that change is the one warning about exactly this swap.
+    //
+    // One case per signal, each under a predicate naming only that signal, so a pairing that
+    // stops reading its field or starts reading a neighbour's fails HERE rather than in a
+    // deployment.
+    for (name, predicate, signals) in [
+        (
+            "managed",
+            "device.managed",
+            PostureSignals {
+                managed: false,
+                ..healthy()
+            },
+        ),
+        (
+            "encrypted",
+            "device.encrypted",
+            PostureSignals {
+                encrypted: false,
+                ..healthy()
+            },
+        ),
+        (
+            "patched",
+            "device.patched",
+            PostureSignals {
+                patched: false,
+                ..healthy()
+            },
+        ),
+        (
+            "edr",
+            "device.edr == 'healthy'",
+            PostureSignals {
+                edr: EdrState::Absent,
+                ..healthy()
+            },
+        ),
+    ] {
+        let token = signed(&signer, &claims(MDM, now_secs(&clock), &signals));
+        assert_eq!(
+            policy(&signer, predicate).evaluate(Some(&token), &clock),
+            PostureVerdict::Deny(DenyReason::PredicateUnsatisfied),
+            "a device reporting {name} as unhealthy was allowed by a predicate that reads \
+             only {name}"
+        );
+        // AND THE SAME PREDICATE ADMITS THE HEALTHY DEVICE, so the denial above is this
+        // signal's value and not a predicate that refuses everything.
+        let healthy_token = signed(&signer, &claims(MDM, now_secs(&clock), &healthy()));
+        assert_eq!(
+            policy(&signer, predicate).evaluate(Some(&healthy_token), &clock),
+            PostureVerdict::Allow,
+            "the predicate reading only {name} must admit a device that is healthy in it"
+        );
+    }
+}
+
+#[test]
+fn the_wire_names_are_the_contract() {
+    let signer = key(1);
+    let clock = clock();
+    // THE JSON AN MDM ACTUALLY SENDS, spelled out once. Every other fixture builds the signals
+    // through `PostureSignals`, so both sides of the pairing move together and renaming a
+    // field on both would pass: measured, `managed` -> `enrolled` in the decoder AND the
+    // binding left the suite green. A vendor integrating against this needs to know which
+    // spellings we read, and this is where that is written down.
+    let body = json!({
+        "iss": MDM,
+        "aud": AUDIENCE,
+        "sub": "device-1",
+        "iat": now_secs(&clock),
+        "exp": now_secs(&clock) + 86_400,
+        "device_posture": {
+            "managed": true,
+            "encrypted": true,
+            "patched": true,
+            "edr": "healthy",
+        },
+    });
+    assert_eq!(
+        policy(&signer, STRICT).evaluate(Some(&signed(&signer, &body)), &clock),
+        PostureVerdict::Allow,
+        "the wire form an MDM sends has to be the one this reads"
+    );
+    // And a claim spelling one of them differently is NOT read as that signal.
+    let mut renamed = body.clone();
+    let posture = renamed["device_posture"]
+        .as_object_mut()
+        .expect("an object");
+    let value = posture.remove("managed").expect("managed present");
+    posture.insert("enrolled".to_owned(), value);
+    assert_eq!(
+        policy(&signer, STRICT).evaluate(Some(&signed(&signer, &renamed)), &clock),
+        PostureVerdict::Deny(DenyReason::Malformed),
+        "a signal under a different name is a MISSING signal, not a present one"
     );
 }
 
@@ -342,9 +534,9 @@ fn a_predicate_that_cannot_evaluate_denies_rather_than_passing() {
     // schema that has no `compromised` field gets a policy that would have admitted every
     // device.
     for predicate in [
-        "!device.compromised",   // a field the schema does not carry
-        "device.unknown",        // likewise
-        "user.x",                // an unbound name entirely
+        "!device.compromised",     // a field the schema does not carry
+        "device.unknown",          // likewise
+        "user.x",                  // an unbound name entirely
         "device.managed + 1 == 2", // a type error
     ] {
         assert_eq!(
@@ -383,9 +575,10 @@ fn the_signals_reaching_the_predicate_are_the_decoded_ones() {
     // vendor's raw object. Measured: replacing the round trip with the raw claim passes every
     // other test, because every other fixture's claim happens to be exactly the schema.
     //
-    // This one is not. It carries an extra vendor field and a differently-typed one, and the
-    // predicate names the extra field: bound raw it would evaluate, bound decoded it cannot,
-    // which is the whole point of having a schema.
+    // This one is not. It carries an extra vendor field, and the predicate names that field:
+    // bound raw it would evaluate, bound decoded it cannot, which is the whole point of having
+    // a schema. (An earlier version of this comment also claimed a "differently-typed" field;
+    // the fixture never had one.)
     let mut body = claims(MDM, now_secs(&clock), &healthy());
     body["device_posture"]["vendor_risk_score"] = json!(11);
     let token = signed(&signer, &body);

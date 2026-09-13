@@ -300,12 +300,7 @@ async fn a_compliance_consumer_reconstructs_who_has_which_role_from_a_real_expor
 /// The three ROLE ids it mints are deliberately not among them, and that is not an omission
 /// the next reader should close: the export carries a role SLUG and never a role id, so a
 /// `rol_` value appearing in it would be a defect rather than something to normalise away.
-async fn seed_review_fixture(
-    h: &Harness,
-    tenant: &str,
-    environment: &str,
-    org: &str,
-) -> Fixture {
+async fn seed_review_fixture(h: &Harness, tenant: &str, environment: &str, org: &str) -> Fixture {
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
     let org_base = format!("{base}/organizations/{org}");
 

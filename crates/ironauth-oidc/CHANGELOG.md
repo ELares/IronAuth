@@ -8,10 +8,15 @@ range per docs/RELEASING.md.
 
 ### Device-posture policy predicates, EXPLORATORY (issue #145 criterion 5)
 
-Shape `0.1.0-exp.1`, behind the `device-posture-policy-hooks` experimental
+Shape `0.1.0-exp.1`, registered as the `device-posture-policy-hooks` experimental
 feature. A CEL predicate over SIGNED posture signals an MDM or EDR service
 asserts about a device: managed, encrypted, patched, and the endpoint agent's
 state.
+
+REGISTERED, not GATED, and the difference matters: no code consults the flag,
+because no code calls the evaluator either. The registry entry is what an
+operator acknowledges and what the maturity ladder tracks; the day this is wired
+into a decision, that call site is what the flag has to gate.
 
 Agentless. The device runs none of our code and never reports about itself, so
 every property that matters is a property of the vendor's signature: the claim
