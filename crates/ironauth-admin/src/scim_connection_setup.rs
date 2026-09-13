@@ -105,6 +105,19 @@ impl ScimConnectionSetupConsumer {
             // successful create is ordinary, and the conflict it raises means the connection
             // this row asked for exists -- which is what the admin's token needs.
             Ok(()) | Err(StoreError::Conflict) => Ok(()),
+            // THE ORGANIZATION WENT AWAY between the form and the worker, which is the only way
+            // an in-scope payload produces this. Retrying it for the fourteen attempts the
+            // outbox allows delays the dead letter by roughly a day and a half, and the answer
+            // will be the same every time -- the SAML sibling makes the same argument about a
+            // certificate that will never parse.
+            Err(StoreError::NotFound) => {
+                tracing::info!(
+                    target: "ironauth.scim_setup",
+                    connection = %connection,
+                    "queued provisioning setup not applied: the organization no longer exists"
+                );
+                Ok(())
+            }
             Err(_) => Err(ConsumerError::retryable("scim_setup_create_failed")),
         }
     }

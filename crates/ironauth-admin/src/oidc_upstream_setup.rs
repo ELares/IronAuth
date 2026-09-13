@@ -121,6 +121,16 @@ impl OidcUpstreamSetupConsumer {
             .await
         {
             Ok(()) | Err(StoreError::Conflict) => {}
+            // NOTHING TO CREATE IT AGAINST. An in-scope payload reaches this only when the scope
+            // itself has gone, and the answer will be the same on every attempt.
+            Err(StoreError::NotFound) => {
+                tracing::info!(
+                    target: "ironauth.oidc_setup",
+                    connector = %connector,
+                    "queued upstream setup not applied: the scope no longer exists"
+                );
+                return Ok(());
+            }
             Err(_) => return Err(ConsumerError::retryable("oidc_setup_create_failed")),
         }
 
@@ -143,6 +153,17 @@ impl OidcUpstreamSetupConsumer {
             .await
         {
             Ok(()) | Err(StoreError::Conflict) => Ok(()),
+            // THE ORGANIZATION WENT AWAY between the connector landing and this, which leaves a
+            // connector bound to nothing. That is untidy and it is not a fault: there is no
+            // organization left to bind it to, and retrying cannot make one.
+            Err(StoreError::NotFound) => {
+                tracing::info!(
+                    target: "ironauth.oidc_setup",
+                    connector = %connector,
+                    "queued upstream created but not bound: the organization no longer exists"
+                );
+                Ok(())
+            }
             // RETRYABLE, and this is the branch that matters: a connector nothing is bound to
             // reaches no organization, so reporting the job done here would leave the admin a
             // configuration that exists and signs nobody in.
