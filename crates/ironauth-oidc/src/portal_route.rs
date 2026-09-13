@@ -1669,6 +1669,29 @@ async fn sso_surface(state: &OidcState, session: &PortalSession) -> Response {
         tenant = escape_html(&session.scope().tenant().to_string()),
         environment = escape_html(&session.scope().environment().to_string()),
     );
+    // AND THE OTHER KIND. An organization may federate through SAML, through OpenID Connect, or
+    // through both, and an admin arriving with an OIDC provider needs the form for the one they
+    // have rather than the one this page happens to list first.
+    let _ = write!(
+        &mut body,
+        "<h2>Add an OpenID Connect connection</h2>\
+         <p>Add it first. This page then shows you the redirect URI to register with your \
+         provider -- it names the connection, so it does not exist until the connection \
+         does.</p>\
+         <form method=\"post\" action=\"{base}/t/{tenant}/e/{environment}/portal/s/sso/oidc\">\
+         <p><label>A name for this connection<br>\
+         <input name=\"display_name\" size=\"40\" required></label></p>\
+         <p><label>Your provider's issuer URL (https)<br>\
+         <input name=\"issuer\" size=\"60\" required></label></p>\
+         <p><label>The client ID it gave you<br>\
+         <input name=\"client_id\" size=\"60\" required></label></p>\
+         <p><label>The client secret it gave you<br>\
+         <input type=\"password\" name=\"client_secret\" size=\"60\"></label></p>\
+         <p><button type=\"submit\">Add this connection</button></p></form>",
+        base = escape_html(state.issuer_base().trim_end_matches('/')),
+        tenant = escape_html(&session.scope().tenant().to_string()),
+        environment = escape_html(&session.scope().environment().to_string()),
+    );
     for connection in saml.iter().take(limit) {
         sso_saml_section(state, session, connection, &mut body);
     }
@@ -3412,4 +3435,215 @@ async fn queue_scim_setup(
         )
         .await
         .map(|_| ())
+}
+
+/// What an IT admin fills in to set up an OpenID Connect upstream (#140 criterion 1).
+#[derive(Debug, serde::Deserialize)]
+pub struct OidcSetupForm {
+    /// What the customer wants to call it. Becomes the connector's slug.
+    pub display_name: String,
+    /// The provider's issuer URL.
+    pub issuer: String,
+    /// The client id the provider assigned to this deployment.
+    pub client_id: String,
+    /// The client secret it assigned alongside.
+    pub client_secret: String,
+}
+
+/// `POST /t/{tenant}/e/{environment}/portal/s/sso/oidc`: set up an OIDC upstream.
+///
+/// # The third setup surface, and the one with a secret to move
+///
+/// Its siblings queue public material (a certificate) and a digest. This has to carry an
+/// upstream CLIENT SECRET to a control plane that is the only role allowed to insert a
+/// connector, across an outbox row that is durable, replicated, and in backups long after the
+/// connector is gone.
+///
+/// SO IT SEALS BEFORE IT QUEUES, under this scope and the connector id it mints, exactly as
+/// `ConnectorRepo::open_client_secret` expects to find it. The worker stores the bytes verbatim
+/// and never holds the plaintext.
+///
+/// # The redirect URI is derived, not asked for
+///
+/// It names this deployment and the connector, so it cannot exist before the connector does --
+/// the same two-step the SAML form explains. The page prints it once the upstream is there,
+/// through `federation_callback_url`, which is the function the flow itself uses: a second
+/// spelling is how a page comes to print an address the callback route does not serve.
+pub async fn oidc_setup_post(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::Form(form): axum::Form<OidcSetupForm>,
+) -> Response {
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return refused();
+    };
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+    let session = match resolve_session(&state, scope, &headers).await {
+        Ok(session) => session,
+        Err(refusal) => return refusal.into_response(),
+    };
+    if let Err(refusal) = session.require_intent("sso") {
+        return refusal.into_response();
+    }
+
+    let display_name = form.display_name.trim();
+    let issuer = form.issuer.trim();
+    let client_id = form.client_id.trim();
+    let client_secret = form.client_secret.trim();
+    if display_name.is_empty() || issuer.is_empty() || client_id.is_empty() {
+        return setup_refusal("every field except the secret is required");
+    }
+    if display_name.len() > SETUP_FIELD_MAX
+        || issuer.len() > SETUP_FIELD_MAX
+        || client_id.len() > SETUP_FIELD_MAX
+        || client_secret.len() > SETUP_FIELD_MAX
+    {
+        return setup_refusal("one of those values is longer than this deployment will store");
+    }
+    // THE ISSUER IS WHERE THIS DEPLOYMENT WILL FETCH METADATA AND SEND A BROWSER, so it has to
+    // be absolute and https for the reason the SAML form's sign-on URL does.
+    if !issuer.starts_with("https://") {
+        return setup_refusal("the issuer has to be an https:// address");
+    }
+    // THE SLUG IS AN OPERATOR-VISIBLE IDENTIFIER and it goes in URLs, so it is derived from the
+    // name rather than taken raw: a display name is prose and a slug is not.
+    let slug = slugify(display_name);
+    if slug.is_empty() {
+        return setup_refusal("that name has no letters or digits to make an identifier from");
+    }
+
+    let connector_id = ironauth_store::ConnectorId::generate(state.env(), &scope);
+    let read = state.store().scoped(scope);
+    // SEALED BEFORE ANYTHING IS QUEUED. A failure here is this deployment's -- no platform key,
+    // or a scope with no data-encryption key yet -- and never the admin's, so it answers with
+    // the unavailable page rather than a refusal blaming their input.
+    let Ok((sealed, dek_version)) = read
+        .acting(
+            // A SERVICE ACTOR, because what this writes is not the admin's act: sealing may
+            // PROVISION the scope's envelope keys, which is a system action and is audited as
+            // one. The connector the secret belongs to is audited when the control plane
+            // creates it.
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(state.env())),
+            ironauth_store::CorrelationId::generate(state.env()),
+        )
+        .connectors()
+        .seal_client_secret(state.env(), &connector_id, client_secret.as_bytes())
+        .await
+    else {
+        return PortalRefusal::Unavailable.into_response();
+    };
+
+    let definition = serde_json::json!({
+        "connector_id": slug,
+        "display_name": display_name,
+        "protocol": "oidc",
+        "endpoints": { "issuer": issuer },
+        "scopes": ["openid", "email"],
+        "client_id": client_id,
+    })
+    .to_string();
+    let binding_id = ironauth_store::OrgConnectionId::generate(state.env(), &scope);
+    if queue_oidc_setup(
+        &state,
+        &session,
+        &connector_id,
+        &binding_id,
+        &slug,
+        &definition,
+        &sealed,
+        dek_version,
+    )
+    .await
+    .is_err()
+    {
+        return PortalRefusal::Unavailable.into_response();
+    }
+    let surface = format!(
+        "/t/{}/e/{}/portal/s/sso",
+        scope.tenant(),
+        scope.environment()
+    );
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, surface),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+    )
+        .into_response()
+}
+
+/// An operator-visible identifier derived from a display name.
+///
+/// LOWERCASE ASCII ALPHANUMERICS AND HYPHENS, with runs collapsed and the ends trimmed. The slug
+/// is unique per scope and appears in operator tooling, so what it must not be is the admin's
+/// prose: a name with a slash or a space in it would make a value that reads as a path.
+fn slugify(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            out.extend(character.to_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_owned()
+}
+
+/// Queue the upstream for the control plane to create.
+#[allow(clippy::too_many_arguments)]
+async fn queue_oidc_setup(
+    state: &OidcState,
+    session: &PortalSession,
+    connector_id: &ironauth_store::ConnectorId,
+    binding_id: &ironauth_store::OrgConnectionId,
+    slug: &str,
+    definition: &str,
+    sealed: &[u8],
+    dek_version: i32,
+) -> Result<(), ironauth_store::StoreError> {
+    use base64::Engine as _;
+
+    state
+        .store()
+        .scoped(session.scope())
+        .outbox()
+        .enqueue_once(
+            state.env(),
+            &ironauth_store::NewOutboxMessage {
+                consumer: ironauth_admin_consumer_name(),
+                idempotency_key: &connector_id.to_string(),
+                ordering_key: &session.organization().to_string(),
+                payload: serde_json::json!({
+                    "connector_id": connector_id.to_string(),
+                    "binding_id": binding_id.to_string(),
+                    "organization_id": session.organization().to_string(),
+                    "slug": slug,
+                    "definition_json": definition,
+                    // SEALED, NOT PLAINTEXT. See this module's handler doc and the consumer's.
+                    "client_secret_sealed_base64":
+                        base64::engine::general_purpose::STANDARD.encode(sealed),
+                    "client_secret_dek_version": dek_version,
+                    // THE CLOCK SAMPLE TRAVELS, so a redelivery writes the same `created_at` the
+                    // first attempt would have. A worker reading its own clock would give one
+                    // connector two creation times depending on which attempt won.
+                    "created_at_unix_micros": epoch_micros(state.env().clock().now_utc()),
+                }),
+            },
+        )
+        .await
+        .map(|_| ())
+}
+
+/// The consumer this surface enqueues for.
+///
+/// NAMED HERE rather than imported, because `ironauth-oidc` does not depend on `ironauth-admin`
+/// -- the consumer lives there, with its two siblings, and the data plane may not link the
+/// management crate. The string is the contract, and the consumer's own `name()` is the other
+/// half of it.
+const fn ironauth_admin_consumer_name() -> &'static str {
+    "connector.setup_request"
 }

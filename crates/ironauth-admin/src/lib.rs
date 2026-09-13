@@ -123,6 +123,7 @@ mod migration;
 mod migration_runs;
 mod migration_status;
 pub mod offboarding_worker;
+pub mod oidc_upstream_setup;
 mod openapi;
 mod operators;
 mod org_contacts;

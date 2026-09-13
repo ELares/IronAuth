@@ -7094,3 +7094,326 @@ async fn a_cross_site_provisioning_setup_is_refused() {
     assert_eq!(status, 403, "a cross-site setup was served: {body}");
     assert_eq!(apply_scim_setups(&harness).await, 0, "and queued nothing");
 }
+
+/// Drain the OIDC upstream setup queue through the CONTROL-plane consumer.
+async fn apply_oidc_setups(harness: &Harness) -> usize {
+    use ironauth_store::outbox::OutboxConsumer as _;
+
+    let scope = harness.scope();
+    let env = Env::system();
+    let consumer = ironauth_admin::oidc_upstream_setup::OidcUpstreamSetupConsumer::new(
+        harness.db().control_store().clone(),
+    );
+    let mut applied = 0;
+    loop {
+        let claimed = harness
+            .db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_admin::oidc_upstream_setup::OIDC_UPSTREAM_SETUP_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        if claimed.is_empty() {
+            return applied;
+        }
+        for message in &claimed {
+            consumer
+                .handle(&env, scope, message)
+                .await
+                .expect("the setup applies");
+            harness
+                .db()
+                .store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, message)
+                .await
+                .expect("complete");
+            applied += 1;
+        }
+    }
+}
+
+/// Submit the OIDC setup form the way the page renders it.
+async fn submit_oidc_setup(
+    harness: &Harness,
+    cookie: &str,
+    display_name: &str,
+    issuer: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> (axum::http::StatusCode, String) {
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/sso/oidc",
+        scope.tenant(),
+        scope.environment()
+    );
+    let form = format!(
+        "display_name={}&issuer={}&client_id={}&client_secret={}",
+        urlencode(display_name),
+        urlencode(issuer),
+        urlencode(client_id),
+        urlencode(client_secret),
+    );
+    post_form_from_with_cookie(harness, &path, &form, "same-origin", cookie).await
+}
+
+#[tokio::test]
+async fn an_admin_sets_up_an_oidc_upstream_and_the_secret_survives_the_queue() {
+    // #140 CRITERION 1, THE OIDC HALF. The journey ends where it has to: the secret the admin
+    // typed comes back OUT of the connector through `open_client_secret`, which is the read the
+    // federation flow itself makes. Asserting a row exists would leave the one thing that can
+    // silently break -- a ciphertext nothing can open -- unmeasured.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "sso", "oidcsetup-1", &org).await;
+
+    let page = sso_surface_page(&harness, &cookie).await;
+    assert!(
+        page.contains("Add an OpenID Connect connection"),
+        "an admin with an OIDC provider needs the form for the one they have: {page}"
+    );
+
+    let (status, body) = submit_oidc_setup(
+        &harness,
+        &cookie,
+        "Acme Entra",
+        "https://login.example/acme",
+        "client-abc",
+        "super-secret-value",
+    )
+    .await;
+    assert_eq!(status, 303, "the setup was refused: {body}");
+
+    // THE PLAINTEXT IS NOT ON THE QUEUE, which is the claim the whole sealing design rests on.
+    let scope = harness.scope();
+    let queued = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &Env::system(),
+            ironauth_admin::oidc_upstream_setup::OIDC_UPSTREAM_SETUP_CONSUMER,
+            std::time::Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(queued.len(), 1, "one setup queued");
+    let payload = queued[0].payload.to_string();
+    assert!(
+        !payload.contains("super-secret-value"),
+        "the upstream client secret reached a durable queue row: {payload}"
+    );
+    assert!(
+        payload.contains("client_secret_sealed_base64"),
+        "and the sealed form has to be what travels instead: {payload}"
+    );
+
+    {
+        use ironauth_store::outbox::OutboxConsumer as _;
+        let consumer = ironauth_admin::oidc_upstream_setup::OidcUpstreamSetupConsumer::new(
+            harness.db().control_store().clone(),
+        );
+        consumer
+            .handle(&Env::system(), scope, &queued[0])
+            .await
+            .expect("the setup applies");
+        harness
+            .db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .complete(&Env::system(), &queued[0])
+            .await
+            .expect("complete");
+    }
+
+    // THE BINDING EXISTS, which is what makes the connector reach this organization at all.
+    let bindings = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .org_connections()
+        .list_for_organization(&org, 10)
+        .await
+        .expect("list the bindings");
+    assert_eq!(
+        bindings.len(),
+        1,
+        "the upstream is bound to the organization"
+    );
+    let connector_id = bindings[0]
+        .connector_id
+        .as_deref()
+        .expect("the binding names a connector");
+
+    // AND THE SECRET OPENS. The AAD binds the ciphertext to this scope and this connector id,
+    // so a seal performed on the data plane before the row existed has to authenticate here.
+    let parsed = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .connectors()
+        .parse_id(connector_id)
+        .expect("the connector id parses");
+    let opened = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .connectors()
+        .open_client_secret(&parsed)
+        .await
+        .expect("the sealed secret has to open");
+    assert_eq!(
+        opened,
+        b"super-secret-value".to_vec(),
+        "the secret the admin typed has to be the one the federation flow reads"
+    );
+
+    // AND THE PAGE NOW LISTS IT, which is what the admin came back for.
+    let page = sso_surface_page(&harness, &cookie).await;
+    assert!(
+        page.contains("acme-entra"),
+        "the page has to show the upstream once it exists: {page}"
+    );
+}
+
+#[tokio::test]
+async fn an_oidc_setup_form_cannot_declare_what_this_deployment_believes() {
+    // THE CAPABILITIES ARE NOT THE ADMIN'S TO DECLARE. Each one widens what this deployment does
+    // with an upstream's answers -- trust its `email_verified`, act on its group claims, honour
+    // its logout propagation -- so a link holder asserting them would be configuring how much we
+    // believe their identity provider. The form has no field for any of them, and a form field
+    // is not the fence: this posts them anyway.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "sso", "oidcsetup-2", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/sso/oidc",
+        scope.tenant(),
+        scope.environment()
+    );
+    let form = format!(
+        "display_name=Acme&issuer={}&client_id=abc&client_secret=s\
+         &capabilities.groups=true&capabilities.email_verified_trust=trusted\
+         &enabled=true&protocol=oauth2",
+        urlencode("https://login.example/acme"),
+    );
+    let (status, body) =
+        post_form_from_with_cookie(&harness, &path, &form, "same-origin", &cookie).await;
+    assert_eq!(status, 303, "the setup was refused: {body}");
+    apply_oidc_setups(&harness).await;
+
+    let bindings = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .org_connections()
+        .list_for_organization(&org, 10)
+        .await
+        .expect("list");
+    let connector_id = bindings[0]
+        .connector_id
+        .as_deref()
+        .expect("the binding names a connector");
+    let parsed = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .connectors()
+        .parse_id(connector_id)
+        .expect("parses");
+    let connector = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .connectors()
+        .get(&parsed)
+        .await
+        .expect("the connector exists");
+    assert!(
+        !connector.capabilities.groups,
+        "a link holder switched on group claims from their own provider"
+    );
+    assert!(
+        !connector.capabilities.logout_propagation,
+        "a link holder switched on logout propagation"
+    );
+    assert_eq!(
+        connector.capabilities.email_verified_trust, "untrusted",
+        "a link holder made us believe their provider's email_verified"
+    );
+}
+
+#[tokio::test]
+async fn an_oidc_setup_names_what_is_wrong() {
+    // AS THE SAML FORM DOES, and for the same reason: everything refused here is about the form
+    // the reader just typed.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "sso", "oidcsetup-3", &org).await;
+
+    let (status, body) = submit_oidc_setup(
+        &harness,
+        &cookie,
+        "Acme",
+        "http://login.example/acme",
+        "abc",
+        "s",
+    )
+    .await;
+    assert_eq!(status, 400, "an http issuer was accepted: {body}");
+    assert!(body.contains("https://"), "and it has to say why: {body}");
+
+    // A NAME WITH NOTHING TO MAKE AN IDENTIFIER FROM. The slug goes in operator tooling and in
+    // URLs, so it is derived rather than taken raw -- and a name that derives to nothing is a
+    // refusal rather than a connector nobody can address.
+    let (status, body) = submit_oidc_setup(
+        &harness,
+        &cookie,
+        "!!!",
+        "https://login.example/a",
+        "abc",
+        "s",
+    )
+    .await;
+    assert_eq!(status, 400, "a nameless connector was created: {body}");
+
+    assert_eq!(
+        apply_oidc_setups(&harness).await,
+        0,
+        "a refused form still queued a job"
+    );
+}
+
+#[tokio::test]
+async fn a_cross_site_oidc_setup_is_refused() {
+    // The CSRF guard. This one creates an upstream this deployment will believe about identity.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let cookie = open_session_in(&harness, "sso", "oidcsetup-4", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/sso/oidc",
+        scope.tenant(),
+        scope.environment()
+    );
+    let form = format!(
+        "display_name=Acme&issuer={}&client_id=abc&client_secret=s",
+        urlencode("https://login.example/acme"),
+    );
+    let (status, body) =
+        post_form_from_with_cookie(&harness, &path, &form, "cross-site", &cookie).await;
+    assert_eq!(status, 403, "a cross-site setup was served: {body}");
+    assert_eq!(apply_oidc_setups(&harness).await, 0, "and queued nothing");
+}

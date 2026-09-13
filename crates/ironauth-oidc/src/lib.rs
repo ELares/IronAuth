@@ -567,6 +567,10 @@ pub fn oidc_router(state: OidcState) -> Router {
             post(portal_route::saml_setup_post),
         )
         .route(
+            "/t/{tenant_id}/e/{environment_id}/portal/s/sso/oidc",
+            post(portal_route::oidc_setup_post),
+        )
+        .route(
             "/t/{tenant_id}/e/{environment_id}/portal/s/sso/test",
             post(portal_route::connection_test_post),
         )

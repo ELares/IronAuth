@@ -19,6 +19,7 @@ use ironauth_admin::flow_target_delivery::{FlowTargetDeliveryConsumer, FlowTarge
 use ironauth_admin::message_composer::DefaultComposer;
 use ironauth_admin::message_http_provider::HttpMessageProvider;
 use ironauth_admin::offboarding_worker::OffboardingConsumer;
+use ironauth_admin::oidc_upstream_setup::OidcUpstreamSetupConsumer;
 use ironauth_admin::saml_connection_setup::SamlConnectionSetupConsumer;
 use ironauth_admin::scim_connection_setup::ScimConnectionSetupConsumer;
 use ironauth_admin::scim_push_scheduler::{
@@ -2425,6 +2426,10 @@ fn portal_write_consumers(control_store: &ironauth_store::Store) -> Vec<Arc<dyn 
         // `scim_connections` INSERT to the control plane and the portal is a data-plane surface.
         Arc::new(ScimConnectionSetupConsumer::new(control_store.clone()))
             as Arc<dyn OutboxConsumer>,
+        // AND THE OIDC HALF of the SSO setup, whose row carries a SEALED upstream secret: the
+        // portal sealed it, this opens nothing, and only the control plane may insert a
+        // connector.
+        Arc::new(OidcUpstreamSetupConsumer::new(control_store.clone())) as Arc<dyn OutboxConsumer>,
     ]
 }
 
