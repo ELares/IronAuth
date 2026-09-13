@@ -76997,10 +76997,19 @@ pub struct ScimTokenStanding {
     pub created_at_unix_micros: Option<i64>,
     /// When it stops working, or `None` if it has no horizon of its own.
     ///
-    /// A ROTATION IS WHAT SETS THIS, on the token being superseded, to the end of the overlap
-    /// window. So a value here does not mean "expiring": it means "this is the OLD one", and
-    /// whether the date has passed decides whether the reader is inside a cutover they have not
-    /// finished or after one they missed.
+    /// TWO WRITERS SET THIS AND THEY MEAN OPPOSITE THINGS, which an earlier version of this doc
+    /// got wrong -- it said a rotation was what set it, so "a value here means this is the OLD
+    /// one". `create` copies the CONNECTION's `expires_at` onto the very first token row, so a
+    /// connection created with an expiry has exactly one token, never rotated, carrying a date.
+    /// A rotation then sets it on the token being SUPERSEDED, and mints the replacement with no
+    /// horizon at all -- so after a real rotation it is the old token that has a date and the
+    /// new one that has none.
+    ///
+    /// THE DATE ALONE THEREFORE CANNOT TELL THEM APART. [`Self::superseded`] is what does, and
+    /// nothing should read this field without it: the remedies are opposite. A superseded token
+    /// is fixed by copying the current one, which exists; a first token bounded by its
+    /// connection's own expiry has no replacement to copy, and `rotate_token` refuses a lapsed
+    /// connection, so telling its holder to rotate names something the product will not do.
     pub expires_at_unix_micros: Option<i64>,
     /// When it was revoked outright, skipping any remaining overlap.
     pub revoked_at_unix_micros: Option<i64>,
@@ -77012,6 +77021,18 @@ pub struct ScimTokenStanding {
     /// Whether this row has been watched since it was created, so an absent `last_seen_at` can
     /// be read as "nothing has used it" rather than "nothing saw".
     pub observed: bool,
+    /// Whether a LATER unrevoked token of this connection exists.
+    ///
+    /// THE DISCRIMINATOR [`Self::expires_at_unix_micros`] needs, and the only exact one: a
+    /// supersession means something replaced this credential, so a token that nothing is newer
+    /// than cannot have been superseded however its horizon got there. Comparing the two dates
+    /// instead -- the token's against the connection's -- would be a heuristic that a rotation
+    /// setting a coincidentally equal instant defeats.
+    ///
+    /// UNREVOKED, because a revoked replacement replaced nothing: a rotation whose fresh token
+    /// was then revoked outright leaves the holder of the old one with no current token to copy,
+    /// which is the same position as never having been superseded.
+    pub superseded: bool,
     /// Whether the match came through the pre-migration-0205 column rather than a token row.
     ///
     /// The whole lifecycle above is empty for these, because that column carries none of it --
@@ -82819,7 +82840,14 @@ impl ScimConnectionRepo<'_> {
                     (EXTRACT(EPOCH FROM t.revoked_at) * 1000000)::bigint AS revoked_us, \
                     (EXTRACT(EPOCH FROM t.last_seen_at) * 1000000)::bigint AS last_seen_us, \
                     (t.observed_since IS NOT NULL AND t.observed_since <= t.created_at) \
-                        AS observed \
+                        AS observed, \
+                    EXISTS (SELECT 1 FROM scim_connection_tokens newer \
+                            WHERE newer.connection_id = t.connection_id \
+                              AND newer.tenant_id = t.tenant_id \
+                              AND newer.environment_id = t.environment_id \
+                              AND newer.revoked_at IS NULL \
+                              AND (newer.created_at, newer.token_digest) \
+                                  > (t.created_at, t.token_digest)) AS superseded \
              FROM scim_connection_tokens t \
              WHERE t.tenant_id = $1 AND t.environment_id = $2 \
                AND t.connection_id = $3 AND t.token_digest = $4",
@@ -82837,6 +82865,7 @@ impl ScimConnectionRepo<'_> {
                 revoked_at_unix_micros: row.get("revoked_us"),
                 last_seen_at_unix_micros: row.get("last_seen_us"),
                 observed: row.get("observed"),
+                superseded: row.get("superseded"),
                 legacy: false,
             })
         } else {
@@ -82867,6 +82896,9 @@ impl ScimConnectionRepo<'_> {
                 revoked_at_unix_micros: None,
                 last_seen_at_unix_micros: None,
                 observed: false,
+                // A CONNECTION WITH NO TOKEN ROWS AT ALL, which is what the `NOT EXISTS` guard
+                // above establishes, so nothing can have replaced this credential.
+                superseded: false,
                 legacy: true,
             })
         };

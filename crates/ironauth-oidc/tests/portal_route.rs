@@ -5252,3 +5252,142 @@ async fn an_sso_session_cannot_reach_the_token_check() {
         "an sso session reached the token check: {body}"
     );
 }
+
+#[tokio::test]
+async fn a_first_token_bounded_by_its_connection_is_not_called_the_previous_one() {
+    // ROUND 3's HIGH FINDING. `create` copies the CONNECTION's expiry onto the very first token
+    // row, so a horizon on a token row is not evidence of a rotation -- and the arm that assumed
+    // it was told the holder of a connection's ONLY token that it was "the PREVIOUS token" and
+    // to go and copy a current one that does not exist. `rotate_token` refuses a lapsed
+    // connection, so the remedy they would then ask for is one this product answers with a
+    // not-found.
+    //
+    // THE STATUS COLUMN ON THE SAME PAGE said the opposite about the same date, which is how a
+    // page comes to give two contradictory instructions.
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let token = token_for(&id, "s3cr3t");
+    // A FUTURE EXPIRY, which is the only kind the management API will store, so this is the
+    // reachable state rather than a contrived one.
+    let expires = now_micros(&harness) + 30 * 24 * 60 * 60 * 1_000_000;
+    let connection = connect_with_id(
+        &harness,
+        &org,
+        "Okta Production",
+        "okta",
+        &id,
+        &token,
+        Some(expires),
+    )
+    .await;
+    let cookie = open_session_in(&harness, "scim", "tok-s11", &org).await;
+
+    let (status, body) = check_token(&harness, &cookie, &connection, &token).await;
+    assert_eq!(status, 200, "the check page: {body}");
+    assert!(
+        !body.contains("PREVIOUS token"),
+        "a connection's only token was called the previous one: {body}"
+    );
+    assert!(
+        !body.contains("Copy the current token"),
+        "and its holder was sent to copy a token that does not exist: {body}"
+    );
+    assert!(
+        body.contains("Nothing has replaced it"),
+        "the page has to say the date is the connection's own: {body}"
+    );
+    assert!(
+        body.contains("replace this connection"),
+        "and name the remedy that exists, which is the one the status column names: {body}"
+    );
+
+    // THE CONTROL, on the same connection: rotate, and the OLD token is now genuinely the
+    // previous one. One fact changes -- a newer token exists -- and the sentence changes with
+    // it, which is what makes the assertion above about supersession rather than about expiry.
+    let new = token_for(&id, "new-one");
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .rotate_token(
+            &env,
+            &connection,
+            &hex_digest(&new),
+            3600,
+            now_micros(&harness),
+        )
+        .await
+        .expect("rotate")
+        .expect("the connection exists");
+
+    let (_, after) = check_token(&harness, &cookie, &connection, &token).await;
+    assert!(
+        after.contains("PREVIOUS token"),
+        "once something HAS replaced it, that is what it is: {after}"
+    );
+}
+
+#[tokio::test]
+async fn the_token_check_is_absent_where_nothing_can_authenticate() {
+    // A DEPLOYMENT THAT DOES NOT SERVE `/scim/v2` answers every provisioning request with a
+    // uniform 404, so no token authenticates anything however healthy its row is. The check
+    // would have said "this token authenticates against this connection" -- a sentence about a
+    // credential table, true of the row and false of everything the reader came to find out.
+    // They would go away satisfied and nothing would ever call.
+    //
+    // BOTH HALVES: the form is not offered, AND the route refuses, because a form not being
+    // rendered is not a fence.
+    let harness = Harness::start_store_backed_with_scim_surface(false).await;
+    let org = seed_org(&harness, "Acme").await;
+    let env = Env::system();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &harness.scope());
+    let token = token_for(&id, "s3cr3t");
+    let connection =
+        connect_with_id(&harness, &org, "Okta Production", "okta", &id, &token, None).await;
+    let cookie = open_session_in(&harness, "scim", "tok-s12", &org).await;
+
+    let scope = harness.scope();
+    let surface = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, _, page) = harness.get_with_cookie(&surface, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {page}");
+    assert!(
+        !page.contains("Check a token"),
+        "a check that cannot mean anything was offered: {page}"
+    );
+
+    let (status, body) = check_token(&harness, &cookie, &connection, &token).await;
+    assert_eq!(
+        status, 404,
+        "the route answered on a deployment serving no SCIM: {body}"
+    );
+
+    // THE CONTROL: the same fixture with the surface on serves both.
+    let live = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&live, "Acme").await;
+    let id = ironauth_store::ScimConnectionId::generate(&env, &live.scope());
+    let token = token_for(&id, "s3cr3t");
+    let connection =
+        connect_with_id(&live, &org, "Okta Production", "okta", &id, &token, None).await;
+    let cookie = open_session_in(&live, "scim", "tok-s13", &org).await;
+    let scope = live.scope();
+    let surface = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (_, _, page) = live.get_with_cookie(&surface, Some(&cookie)).await;
+    assert!(page.contains("Check a token"), "the control: {page}");
+    let (status, body) = check_token(&live, &cookie, &connection, &token).await;
+    assert_eq!(status, 200, "the control: {body}");
+}

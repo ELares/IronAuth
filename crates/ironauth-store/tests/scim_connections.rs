@@ -481,6 +481,78 @@ async fn every_scope_guard_refuses_a_foreign_id() {
 }
 
 #[tokio::test]
+async fn the_portal_read_paths_refuse_a_foreign_id() {
+    // THE TWO GUARDS ISSUE #140 CRITERION 6 ADDED, driven the same way as their siblings above
+    // and split out only because that test outgrew one screen. A portal session resolves through
+    // both, so a missing guard here would let a link holder read a neighbour's connection.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    let org_b = seed_org(&db, &env, scope_b, "Beta").await;
+    let local_org = seed_org(&db, &env, scope_a, "Alpha two").await;
+    let local_id = ScimConnectionId::generate(&env, &scope_a);
+    let foreign_id = ScimConnectionId::generate(&env, &scope_b);
+
+    // `find_in_organization`, which fences on BOTH arguments for the same reason and landed
+    // with issue #140 criterion 6. The portal's token check resolves through it, so a missing
+    // guard here would let a portal session holding a neighbour's connection id read that
+    // connection's lifecycle.
+    for (label, org, id) in [
+        ("a foreign ORGANIZATION", &org_b, &local_id),
+        ("a foreign CONNECTION id", &local_org, &foreign_id),
+        ("both foreign", &org_b, &foreign_id),
+    ] {
+        let outcome = db
+            .store()
+            .scoped(scope_a)
+            .scim_connections()
+            .find_in_organization(org, id, now_micros(&env))
+            .await;
+        assert!(
+            matches!(outcome, Err(ironauth_store::StoreError::NotFound)),
+            "find_in_organization accepted {label}: {outcome:?}"
+        );
+    }
+
+    // `standing_of`, which fences on its connection id. The digest is the caller's own value,
+    // so the id is the only thing that could reach across a scope.
+    let outcome = db
+        .store()
+        .scoped(scope_a)
+        .scim_connections()
+        .standing_of(&foreign_id, &digest("scim_tok_foreign_id"))
+        .await;
+    assert!(
+        matches!(outcome, Err(ironauth_store::StoreError::NotFound)),
+        "standing_of accepted a foreign connection id: {outcome:?}"
+    );
+
+    // THE CONTROLS for both, so the refusals above are the scope guards rather than two
+    // functions that refuse everything.
+    let outcome = db
+        .store()
+        .scoped(scope_a)
+        .scim_connections()
+        .find_in_organization(&local_org, &local_id, now_micros(&env))
+        .await;
+    assert!(
+        matches!(outcome, Ok(None)),
+        "an in-scope pair naming no row must answer Ok(None), not a refusal: {outcome:?}"
+    );
+    let outcome = db
+        .store()
+        .scoped(scope_a)
+        .scim_connections()
+        .standing_of(&local_id, &digest("scim_tok_nothing"))
+        .await;
+    assert!(
+        matches!(outcome, Ok(None)),
+        "an in-scope id naming no row must answer Ok(None), not a refusal: {outcome:?}"
+    );
+}
+
+#[tokio::test]
 async fn revoking_a_handle_that_names_nothing_is_not_found() {
     // And it writes no audit row, which the shape of `revoke` now guarantees: an absent handle
     // returns before the audit write. The first version wrapped the UPDATE unconditionally, so

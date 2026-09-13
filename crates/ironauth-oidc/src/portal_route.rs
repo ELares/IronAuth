@@ -690,6 +690,15 @@ fn setup_guides(
 /// revoked" rather than "your token is wrong", which is the distinction the whole surface exists
 /// to draw.
 fn token_check_forms(state: &OidcState, connections: &[ironauth_store::ScimConnection]) -> String {
+    // ONLY WHERE THE ENDPOINT IS SERVED, exactly as the provisioning URL above it is. With
+    // `scim.enabled` off this deployment answers `/scim/v2` with a uniform 404, so no token
+    // authenticates anything here however healthy its row is -- and the check would have told a
+    // reader "this token authenticates against this connection", which is a sentence about a
+    // credential table rather than about provisioning. They would go away satisfied and nothing
+    // would ever call.
+    if !state.scim_surface_enabled() {
+        return String::new();
+    }
     let Some(scope) = state_scope(connections) else {
         return String::new();
     };
@@ -2166,11 +2175,18 @@ fn diagnose(
 fn diagnose_attributes(error: &ironauth_saml::Unreadable) -> String {
     use ironauth_saml::Unreadable;
     match error {
+        // NOT REACHABLE FROM THIS SURFACE. `examine` hands `attributes` the element it
+        // verified, and it verifies the assertion, so the guard this variant exists for -- a
+        // caller holding a `samlp:Response` -- cannot arise on this path. A response signed only
+        // at the response level lands in `Signature` long before here.
+        //
+        // IT IS STILL WRITTEN OUT rather than folded into a neighbour, because the match is
+        // exhaustive on purpose and a sentence that named a cause would be a guess about a state
+        // this deployment does not produce.
         Unreadable::NotAnAssertion => {
-            "<p><strong>The signature covers the response rather than the assertion inside \
-             it.</strong></p><p>In your identity provider, switch on assertion signing. Signing \
-             only the response leaves the statement about the person unprotected, so this \
-             deployment will not read it.</p>"
+            "<p><strong>This deployment read something other than an assertion where an \
+             assertion was verified.</strong></p><p>That is an internal inconsistency rather \
+             than anything in your configuration. Send this page to your vendor.</p>"
                 .to_owned()
         }
         Unreadable::NamelessAttribute => {
@@ -2181,8 +2197,11 @@ fn diagnose_attributes(error: &ironauth_saml::Unreadable) -> String {
                 .to_owned()
         }
         Unreadable::Duplicate { .. } => {
-            "<p><strong>The assertion sends the same attribute twice with different \
-             values.</strong></p><p>This deployment will not choose between them. In your \
+            // WHETHER THE TWO AGREE IS NOT CHECKED, and an earlier version of this sentence
+            // said "with different values" as though it were. The producer refuses on the
+            // second occurrence of a NAME; it never compares what they carry.
+            "<p><strong>The assertion sends the same attribute name twice.</strong></p><p>This \
+             deployment will not choose between them, whether or not they agree. In your \
              identity provider, remove the duplicate mapping -- usually one of a pair added at \
              different times.</p>"
                 .to_owned()
@@ -2221,7 +2240,12 @@ fn diagnose_condition(
              <code>{expected}</code>.</p><p>Either you pasted a response from another \
              application, or the issuer (entity ID) configured here is not the one your \
              identity provider uses.</p>",
-            found = escape_html(found.as_deref().unwrap_or("nothing")),
+            // ABSENT IS NOT THE ONLY WAY THIS IS `None`. The variant declines to name what it
+            // read when the document carries no `Issuer` AND when it carries more than one,
+            // because an ambiguous read is no read. "nothing" is the honest rendering of both:
+            // it says what this deployment could use, which is what the operator has to fix,
+            // rather than picking one of two values to blame.
+            found = escape_html(found.as_deref().unwrap_or("nothing usable")),
             expected = escape_html(&connection.idp_entity_id)
         ),
         // BOTH ENDS OF THE WINDOW, because one variant carries both. `check` returns this when
@@ -2242,10 +2266,11 @@ fn diagnose_condition(
         // is common is that the named attribute is absent from what the provider emitted.
         ConditionError::MissingBound { attribute } => format!(
             "<p><strong>The assertion does not carry <code>{attribute}</code>.</strong></p>\
-             <p>This deployment refuses an assertion whose lifetime it cannot bound, and that \
-             attribute is one of the bounds. In your identity provider, look at what it emits \
-             for the element named above; most emit all of these by default and each can be \
-             turned off.</p>",
+             <p>This deployment refuses an assertion whose lifetime it cannot bound, and that is \
+             one of the bounds -- one of the four names it can be is a whole element rather than \
+             an attribute of one, which is why the page prints the name instead of describing \
+             it. In your identity provider, look at what it emits under that name; most emit all \
+             of these by default and each can be turned off.</p>",
             attribute = escape_html(attribute)
         ),
         // AND THE VALUE, which is the whole point of the variant carrying it: "unreadable" with
@@ -2306,12 +2331,17 @@ fn diagnose_condition(
                 .to_owned()
         }
         ConditionError::Malformed => {
+            // NOT AN EXHAUSTIVE LIST, and it does not present itself as one. The variant is
+            // returned from many places -- a root element that is not an assertion, a duplicated
+            // element where one is allowed, a bearer confirmation that cannot be read, a window
+            // whose ends are the wrong way round -- and an enumeration written as "either this
+            // or that" would tell an operator their document is one of two things it may not be.
             "<p><strong>The assertion is not shaped the way the specification \
-             requires.</strong></p><p>Either it is not a SAML assertion, or it carries two of \
-             something it may carry one of -- two conditions blocks, two subjects, or two \
-             bearer confirmations. An ambiguous document is not read rather than having one \
-             half believed. This is the provider's own output rather than anything you pasted \
-             wrongly, so send this page to your vendor.</p>"
+             requires.</strong></p><p>Something in it could not be read unambiguously: a common \
+             case is two of an element the specification allows one of, and a document that says \
+             two things is not read rather than having one half believed.</p><p>This is the \
+             provider's own output rather than anything you pasted wrongly, so send this page to \
+             your vendor.</p>"
                 .to_owned()
         }
     }
@@ -2349,13 +2379,13 @@ fn diagnose_signature(
         }
         VerifyError::AlgorithmRefused => {
             "<p><strong>The signature uses something this deployment refuses.</strong></p>\
-             <p>Also not a certificate problem. Three families land here: SHA-1 digests and \
-             RSA-SHA1 signatures, which are refused outright; transform chains other than the \
-             enveloped-signature and exclusive canonicalization pair; and an exclusive \
-             canonicalization carrying an inclusive-namespace prefix list, which is legal and \
-             which this deployment does not implement.</p><p>In your identity provider, set the \
-             signature algorithm to RSA-SHA256 and the digest to SHA-256 first -- that is the \
-             commonest of the three. If it persists, send this page to your vendor.</p>"
+             <p>Also not a certificate problem. SHA-1 digests and RSA-SHA1 signatures land \
+             here, and so does anything outside the narrow set of canonicalization methods and \
+             transforms this deployment implements -- several shapes, all of them legal and \
+             none of them read.</p><p>In your identity provider, set the signature algorithm to \
+             RSA-SHA256 and the digest to SHA-256 first: that is by far the commonest of them \
+             and the only one you can usually change. If it persists, the shape is one this \
+             deployment does not implement and your vendor should see this page.</p>"
                 .to_owned()
         }
         VerifyError::ReferenceRefused => {
@@ -2369,12 +2399,14 @@ fn diagnose_signature(
                 .to_owned()
         }
         VerifyError::SignatureInvalid => format!(
-            "<p><strong>The signature did not verify against the certificate pinned for this \
-             connection.</strong></p><p>This is the one that IS about the certificate: the \
-             document was well formed and the comparison was made and failed. The usual cause \
-             is a certificate rotated at your identity provider and not re-pinned here. Export \
-             the current signing certificate and compare it with what is pinned against \
-             <code>{name}</code>.</p>",
+            "<p><strong>The signature did not check out.</strong></p><p>This is the one that is \
+             usually about the certificate: the likeliest cause by far is one rotated at your \
+             identity provider and not re-pinned here, so export the current signing \
+             certificate and compare it with what is pinned against <code>{name}</code>.</p>\
+             <p>It is not the only cause. The digest over the signed element can fail before any \
+             key is consulted, which is what a document altered in transit looks like -- copied \
+             through something that reformatted it, most often. If the certificate matches, that \
+             is the next thing to suspect.</p>",
             name = escape_html(&connection.display_name)
         ),
         VerifyError::Malformed(_) => {
@@ -2595,12 +2627,18 @@ pub struct ScimTokenCheckForm {
 ///
 /// # What bounds the reach
 ///
-/// The token names a connection in its own id half, and this handler compares that to the
-/// connection the FORM names before any lookup runs -- so a token minted for another
-/// organization, or another tenant, is refused without a query. The lookup itself then takes the
-/// session's organization as a predicate, so a connection id belonging to a neighbour resolves
-/// to nothing. Neither path can stamp, read, or even confirm the existence of a row outside the
-/// session's own organization.
+/// TWO FENCES, AND THE LOOKUP IS THE ONE THAT DOES THE WORK. The connection the FORM names is
+/// resolved with the session's organization as a PREDICATE, so a connection id belonging to a
+/// neighbour resolves to nothing -- that is what stops this surface reading, stamping, or even
+/// confirming the existence of a row outside the session's own organization, and it runs first.
+///
+/// The token then names a connection in its own id half, and `token_verdict` compares that
+/// string to the connection already resolved. An earlier version of this paragraph said the
+/// comparison happened "before any lookup runs", which is not the code's order and was not the
+/// code's order when it was written. Saying so mattered: a reader would have taken the string
+/// comparison for the cross-organization fence, and it is not -- it is the token-to-connection
+/// binding, which refuses a token minted for a DIFFERENT connection of the SAME organization
+/// without a second read.
 pub async fn scim_token_check_post(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
@@ -2621,6 +2659,14 @@ pub async fn scim_token_check_post(
     };
     if let Err(refusal) = session.require_intent("scim") {
         return refusal.into_response();
+    }
+    // AND THE SURFACE MUST BE SERVED. The form is not rendered with `scim.enabled` off, but a
+    // form not being rendered is not a fence: this path is reachable by anyone who can post. A
+    // verdict here would be about a credential table on a deployment that answers `/scim/v2`
+    // with a uniform 404, so "this token authenticates" would be true of the row and false of
+    // everything the reader cares about.
+    if !state.scim_surface_enabled() {
+        return PortalRefusal::NotFound.into_response();
     }
 
     let Ok(connection_id) =
@@ -2740,10 +2786,40 @@ async fn token_verdict(
         )));
     }
     if let Some(expires_at) = standing.expires_at_unix_micros {
-        // A HORIZON ON THE TOKEN MEANS A ROTATION SUPERSEDED IT, and whether the date has passed
-        // decides which half of the cutover the reader is in: still inside the window with the
-        // work left to do, or past it with provisioning already stopped.
+        // A HORIZON ON A TOKEN ROW HAS TWO WRITERS AND THEY MEAN OPPOSITE THINGS. An earlier
+        // version of this arm asserted only one of them -- "a horizon means a rotation
+        // superseded it" -- and `create` copies the CONNECTION's own expiry onto the very first
+        // token row. So a connection created with an expiry had its ONLY token reported as "the
+        // PREVIOUS token", and its holder was told to go and copy a current one that does not
+        // exist. `rotate_token` refuses a lapsed connection, so the remedy they would have asked
+        // for is one this product answers with a not-found.
+        //
+        // WORSE, THE SAME PAGE SAID THE OPPOSITE. `connection_rows` renders that same date as
+        // "Provisioning stops {when}: ask your vendor to replace this connection", with its own
+        // comment explaining at length that the connection's expiry is cleared by nothing. Two
+        // halves of one page, two contradictory instructions about one date.
+        //
+        // `superseded` IS THE DISCRIMINATOR and it is exact: something replaced this credential,
+        // or nothing did.
         let when = escape_html(&crate::saml_start::rfc3339_utc(expires_at / 1_000_000));
+        if !standing.superseded {
+            // NOTHING REPLACED IT, so this date came from the connection it belongs to. The
+            // sentence matches the status column's, because it is the same fact.
+            if expires_at <= now {
+                return Ok(refusal_html(&format!(
+                    "This token stopped working on {when}, and nothing has replaced it. This \
+                     connection cannot be rotated once that date has passed: ask your vendor to \
+                     replace the connection.",
+                )));
+            }
+            return Ok(format!(
+                "<p>This token authenticates, and it stops on {when}.</p><p>Nothing has \
+                 replaced it, and this date is the connection's own rather than a rotation's, \
+                 so there is no newer token to copy. Ask your vendor to replace this connection \
+                 before then.</p>{activity}",
+                activity = activity_html(&standing),
+            ));
+        }
         if expires_at <= now {
             return Ok(refusal_html(&format!(
                 "This token was replaced and stopped working on {when}. Copy the current token \
