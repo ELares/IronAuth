@@ -52,8 +52,14 @@ pub enum HotError {
     Malformed,
 }
 
-/// A boxed future, because this trait is used behind `dyn`.
-type Answer<'a, T> = Pin<Box<dyn Future<Output = Result<T, HotError>> + Send + 'a>>;
+/// What every [`HotState`] method returns: a boxed future, because the trait is used behind
+/// `dyn` and a bare `async fn` in a trait is not `dyn`-safe.
+///
+/// PUBLIC BECAUSE AN IMPLEMENTOR NEEDS TO NAME IT. It was private when this crate shipped,
+/// which meant every implementation outside `ironauth-hot` -- the Postgres one, the IronCache
+/// one, and every test fake -- had to spell out the whole `Pin<Box<dyn Future<Output = ...>>>`
+/// four times. That was not a deliberate restriction; it was an export nobody had needed yet.
+pub type Answer<'a, T> = Pin<Box<dyn Future<Output = Result<T, HotError>> + Send + 'a>>;
 
 /// Hot state an accelerator may hold and Postgres always can.
 ///

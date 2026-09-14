@@ -1189,6 +1189,23 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The data-plane HOT STATE for this scope (issue #146): the always-present implementation
+    /// behind `ironauth-hot`'s classified interface, so a deployment with no accelerator
+    /// attached behaves identically and only more slowly.
+    ///
+    /// Callers reach this through [`crate::hot_state::PgHotState`] rather than directly: that
+    /// adapter supplies the clock instants every method here takes, and implements the foreign
+    /// [`ironauth_hot::HotState`] trait. The SQL lives HERE because every scoped statement in
+    /// this crate lives here -- `scripts/query-audit.sh` allows exactly one module, and an
+    /// exception for this one would be the first.
+    #[must_use]
+    pub fn hot_state(&self) -> HotStateRepo<'a> {
+        HotStateRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The data-plane federation outbound-login correlation store for this scope
     /// (issue #75, PR B): persist an outbound authorize leg's correlation row (state,
     /// nonce, sealed PKCE verifier, connector, resume target) and consume it ATOMICALLY
@@ -32213,6 +32230,247 @@ impl ConnectorRepo<'_> {
 /// to another row, scope, or DEK version fails authenticated decryption (issue #75).
 fn federation_verifier_purpose(id: &FederationLoginStateId) -> String {
     format!("federation_code_verifier:{id}")
+}
+
+/// The scoped hot-state table (issue #146).
+///
+/// # Every method takes its instants
+///
+/// `now_unix_micros` and `expires_at_unix_micros` are parameters rather than a `now()` in the
+/// SQL, which is the same rule the rest of this module follows: expiry is then deterministic
+/// under a manual clock, and expiry is the thing here most worth testing.
+pub struct HotStateRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl HotStateRepo<'_> {
+    /// Read `key` for `use_name`, treating an EXPIRED row as absent.
+    ///
+    /// The expiry filter is in the statement and not in Rust, so a row the sweep has not reached
+    /// yet is still a miss. The two are deliberately independent: a sweep that is behind, or
+    /// disabled, or has never run, can never make a stale entry readable.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(
+        &self,
+        use_name: &str,
+        key: &str,
+        now_unix_micros: i64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT value FROM hot_state \
+             WHERE tenant_id = $1 AND environment_id = $2 AND use_name = $3 AND key = $4 \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(use_name)
+        .bind(key)
+        .bind(now_unix_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|(value,)| value))
+    }
+
+    /// Write, replacing whatever was there and whatever it was going to expire at.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the key or value is past the table's bounds;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn put(
+        &self,
+        use_name: &str,
+        key: &str,
+        value: &[u8],
+        expires_at_unix_micros: i64,
+    ) -> Result<(), StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let result = sqlx::query(
+            "INSERT INTO hot_state \
+             (tenant_id, environment_id, use_name, key, value, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, \
+                     TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, use_name, key) \
+             DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(use_name)
+        .bind(key)
+        .bind(value)
+        .bind(expires_at_unix_micros)
+        .execute(&mut *tx)
+        .await;
+        match result {
+            Ok(_) => {}
+            Err(error) if is_check_violation(&error) => return Err(StoreError::Conflict),
+            Err(error) => return Err(error.into()),
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Claim `key` if nothing LIVE holds it, in ONE statement, answering whether this call got
+    /// it.
+    ///
+    /// # The race this closes
+    ///
+    /// A read, a decision, and a write is three steps with two gaps, and two callers arriving
+    /// together both read "absent" and both write. For a single-use marker that is the double
+    /// redemption the marker exists to prevent. `ON CONFLICT` makes the conflict itself the
+    /// decision, and the mechanism differs by case:
+    ///
+    /// * NO ROW EXISTS and two callers insert at once. There is nothing to lock yet, so
+    ///   Postgres uses SPECULATIVE INSERTION against the primary-key index: one caller wins the
+    ///   index entry, the other's speculative tuple is killed and it re-reads and takes the
+    ///   `ON CONFLICT` path. Saying "a row lock" here, as an earlier version of this comment
+    ///   did, describes the wrong half of the mechanism -- the half that cannot apply when the
+    ///   contested row does not exist, which is the common case for a fresh marker.
+    /// * A ROW EXISTS (live or expired) and callers arrive together. Now there is a row, the
+    ///   conflict arm takes its lock, and the loser waits and re-evaluates the guard against
+    ///   the committed state.
+    ///
+    /// Either way exactly one `RETURNING` row comes back across both callers, which is the
+    /// property the caller depends on; the two paths are worth naming because only one of them
+    /// is what a reader pictures.
+    ///
+    /// # The expired-row trap, which is why this is DO UPDATE and not DO NOTHING
+    ///
+    /// The obvious spelling is `ON CONFLICT DO NOTHING`, and it is wrong here. A row whose
+    /// `expires_at` has passed is a MISS to [`HotStateRepo::get`] and not yet swept, so a
+    /// `DO NOTHING` would read a dead holder as a live one and refuse the claim -- for a
+    /// rotation lock, a lock nobody can take again until a sweep happens to run. The guarded
+    /// `DO UPDATE ... WHERE hot_state.expires_at <= $now` claims exactly the dead rows and
+    /// leaves the live ones, and it is the SAME statement, so no gap opens between deciding a
+    /// row is dead and taking it.
+    ///
+    /// `RETURNING` then answers with no second query: A ROW MEANS THIS CALL GOT THE KEY,
+    /// whether by inserting into an empty slot or by taking over an expired one, and NO ROW
+    /// MEANS A LIVE HOLDER IS THERE. Those are three cases and two answers, and the collapse is
+    /// the right one: a caller asked whether it may proceed, and "I inserted" and "I revived"
+    /// are the same permission.
+    ///
+    /// # The guard assumes `expires_at_unix_micros > now_unix_micros`
+    ///
+    /// If a caller passed an `expires_at` at or before `now`, the row it writes would satisfy
+    /// its own `expires_at <= now` guard, so EVERY concurrent caller would claim it in turn and
+    /// the exactly-once property would be gone. Nothing in the SQL prevents that, so it is
+    /// stated here and held upstream: [`ironauth_hot::Ttl::of`] clamps to at least one second,
+    /// and the adapter computes `expires_at` as `now + ttl` with a saturating add, so the sum
+    /// is always strictly greater. A future caller reaching this repository directly is the one
+    /// this paragraph is for.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if the key or value is past the table's bounds;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn put_if_absent(
+        &self,
+        use_name: &str,
+        key: &str,
+        value: &[u8],
+        expires_at_unix_micros: i64,
+        now_unix_micros: i64,
+    ) -> Result<bool, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let result: Result<Option<(i32,)>, sqlx::Error> = sqlx::query_as(
+            "INSERT INTO hot_state \
+             (tenant_id, environment_id, use_name, key, value, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, \
+                     TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, use_name, key) \
+             DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at \
+             WHERE hot_state.expires_at \
+                   <= TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval \
+             RETURNING 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(use_name)
+        .bind(key)
+        .bind(value)
+        .bind(expires_at_unix_micros)
+        .bind(now_unix_micros)
+        .fetch_optional(&mut *tx)
+        .await;
+        let claimed = match result {
+            Ok(claimed) => claimed,
+            Err(error) if is_check_violation(&error) => return Err(StoreError::Conflict),
+            Err(error) => return Err(error.into()),
+        };
+        tx.commit().await?;
+        Ok(claimed.is_some())
+    }
+
+    /// Remove the entry, whether or not it was there.
+    ///
+    /// NOT AN ERROR WHEN ABSENT. Every caller of this is making the key not-present, and it is
+    /// already not-present; reporting that as a failure would make revocation of a token with
+    /// no cached entry look like a revocation that did not happen.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, use_name: &str, key: &str) -> Result<(), StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "DELETE FROM hot_state \
+             WHERE tenant_id = $1 AND environment_id = $2 AND use_name = $3 AND key = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(use_name)
+        .bind(key)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Delete up to `batch` expired entries IN THIS SCOPE and report how many went.
+    ///
+    /// # This is disk hygiene and never correctness
+    ///
+    /// An expired row is already a miss to [`HotStateRepo::get`] and already claimable by
+    /// [`HotStateRepo::put_if_absent`], both by the statement rather than by the sweep having
+    /// run. So a sweep that is behind, or has never run, changes NOTHING a caller can observe --
+    /// and that is the property worth keeping, because a sweep is the part of a system most
+    /// likely to be misconfigured, paused, or quietly failing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn sweep_expired(&self, now_unix_micros: i64, batch: i64) -> Result<u64, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // `ctid IN (SELECT ... LIMIT n)` rather than a bare `DELETE ... LIMIT`, which Postgres
+        // does not accept. The subquery picks the batch off the scoped expiry index and the
+        // delete addresses those physical rows.
+        let deleted = sqlx::query(
+            "DELETE FROM hot_state WHERE ctid IN ( \
+                 SELECT ctid FROM hot_state \
+                 WHERE tenant_id = $1 AND environment_id = $2 \
+                   AND expires_at \
+                       <= TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+                 ORDER BY expires_at \
+                 LIMIT $4 \
+             )",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_unix_micros)
+        .bind(batch)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(deleted)
+    }
 }
 
 /// The data-plane federation outbound-login correlation store (issue #75, PR B): a

@@ -121,8 +121,11 @@ are explicit rejects) and by property tests over the CVE regression corpus.
   returns, as demonstrated by an incumbent's public retreat from exactly
   this. Instead: PostgreSQL only. Revisit: none planned.
 - **Mandatory IronCache or IronBus.** Why: covenant; self-hosters count
-  containers, and optionality is enforced by dual-mode CI. Instead:
-  Postgres-only default with optional accelerators. Revisit: never.
+  containers. Instead: Postgres-only default with optional accelerators.
+  IronBus optionality is enforced today by the dual-mode outbox matrix
+  (issue #104); IronCache's seam is `ironauth-hot`, whose Postgres
+  implementation is the always-present one, and its dual-mode lane is
+  issue #146 criterion 6 and not yet running. Revisit: never.
 - **In-process native plugin APIs and embedded JS interpreters.** Why: the
   upgrade tax of in-process plugin ABIs and the abandonment history of
   embedded JS runtimes in this field; both put third-party code inside the

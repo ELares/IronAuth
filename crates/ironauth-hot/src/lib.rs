@@ -57,4 +57,4 @@ mod state;
 
 pub use bounded::{Bounded, Bounds};
 pub use class::{Class, HotUse, OnLoss};
-pub use state::{HotError, HotState, Ttl};
+pub use state::{Answer, HotError, HotState, Ttl};

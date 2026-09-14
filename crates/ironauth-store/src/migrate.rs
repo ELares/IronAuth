@@ -1861,6 +1861,17 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0225_access_grant_requests.sql"),
         },
+        Migration {
+            version: 226,
+            name: "hot_state",
+            // EXPAND. A new table with no writer on any older binary: `ironauth-hot` had no
+            // implementation at all before this migration, so during a rolling upgrade the
+            // old binary neither reads nor writes it. Nothing else reads it either -- the
+            // table IS the hot state, not a projection of something older -- so there is no
+            // contract phase to follow.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0226_hot_state.sql"),
+        },
     ]
 }
 

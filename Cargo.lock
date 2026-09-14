@@ -2419,6 +2419,7 @@ dependencies = [
  "caseless",
  "ironauth-env",
  "ironauth-fetch",
+ "ironauth-hot",
  "ironauth-jose",
  "ironauth-journey",
  "ironauth-kms",
