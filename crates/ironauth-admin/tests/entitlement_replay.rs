@@ -1451,8 +1451,12 @@ async fn the_snapshot_folded_from_the_feed_matches_what_the_resolver_reports() {
     // A grant whose deadline fell inside that window would make the two sides disagree for a
     // reason that is not a defect, in either direction. The fixture's grant runs for an hour,
     // so the window is not one this test can land in.
+    // THROUGH THE SEAM, not through `SystemTime` directly: `scripts/invariant-lints.sh` rule
+    // `time-via-env` requires every wall-clock read outside `crates/ironauth-env` to come from
+    // the `Clock` trait, and a test is not exempt -- the reason the rule exists is that a
+    // direct read is invisible to the determinism the seam provides.
     let now_unix_ms = i64::try_from(
-        std::time::SystemTime::now()
+        ironauth_env::Clock::now_utc(&ironauth_env::SystemClock)
             .duration_since(std::time::UNIX_EPOCH)
             .expect("after the epoch")
             .as_millis(),

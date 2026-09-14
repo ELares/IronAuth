@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-hot"
+version = "0.1.0"
+description = "The hot-state seam for IronAuth: one classified interface over an optional accelerator, complete on Postgres alone"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# THE TIME BOX NEEDS A TIMER, and that is the whole dependency list. `tokio::time::timeout` is
+# what makes the stall bound a property of the wrapper rather than of every caller.
+#
+# NO `ironauth-env`. It was listed here at first, with a comment calling it "the determinism
+# seam" this crate used -- and nothing in the crate referenced it. The tests that appeared to
+# need a clock now assert their bounds under a paused timer instead, which needs no clock at
+# all, so the honest dependency list is one line long. A crate that takes the seam without
+# using it teaches the next reader that the seam is optional.
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time", "sync", "test-util"] }
+
+[lints]
+workspace = true

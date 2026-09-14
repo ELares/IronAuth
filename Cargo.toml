@@ -22,6 +22,7 @@ members = [
     "crates/ironauth-fetch",
     "crates/ironauth-jose",
     "crates/ironauth-hash-scheme",
+    "crates/ironauth-hot",
     "crates/ironauth-der",
     "crates/ironauth-webauthn",
     "crates/ironauth-kms",
@@ -71,6 +72,7 @@ quick-xml = { version = "0.41", default-features = false }
 ironbus-client = { version = "0.1.0", default-features = false }
 ironauth-env = { path = "crates/ironauth-env", version = "0.1.0" }
 ironauth-hash-scheme = { path = "crates/ironauth-hash-scheme", version = "0.2.0" }
+ironauth-hot = { path = "crates/ironauth-hot", version = "0.1.0" }
 ironauth-config = { path = "crates/ironauth-config", version = "0.1.0" }
 ironauth-connector = { path = "crates/ironauth-connector", version = "0.1.0" }
 ironauth-saml = { path = "crates/ironauth-saml", version = "0.1.0" }

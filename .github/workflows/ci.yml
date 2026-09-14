@@ -1050,6 +1050,14 @@ jobs:
         run: scripts/no-m2m-metering.sh
       - name: dash scan
         run: scripts/dash-scan.sh
+      - name: hot-state classification (every use declares what it may lose)
+        # Issue #146 asks that "every trait use must declare its class in code; CI rejects
+        # unclassified uses". The compiler does half of it -- a `HotState` call with no
+        # `&HotUse` does not compile, and a correctness use with no documented fallback fails a
+        # const assertion -- and what a compiler cannot insist on is that the declaration be
+        # somewhere a person can read. A classification spread over twenty call sites is a
+        # property of the codebase nobody has ever seen at once.
+        run: scripts/hotstate-classification.sh
       - name: emulator doc freshness (the documented CI recipe's OTP code matches CI's pin)
         run: scripts/emulator-doc-freshness.sh
       - name: no plaintext credentials (no login path writes a token to a file)
