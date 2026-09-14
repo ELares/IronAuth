@@ -1872,6 +1872,16 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0226_hot_state.sql"),
         },
+        Migration {
+            version: 227,
+            name: "hot_state_invalidation_cursors",
+            // EXPAND. A new table an older binary neither reads nor writes: cross-node
+            // invalidation does not exist before this migration, so a rolling upgrade has
+            // nothing on the old side that could be confused by it. A node running the old
+            // binary simply does not invalidate, which is the behaviour it already had.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0227_hot_state_invalidation_cursors.sql"),
+        },
     ]
 }
 

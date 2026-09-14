@@ -141,6 +141,11 @@ path = "tests/hot_state.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "hot_state_invalidation"
+path = "tests/hot_state_invalidation.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "idempotency_retention"
 path = "tests/idempotency_retention.rs"
 required-features = ["testing"]

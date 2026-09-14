@@ -1198,6 +1198,26 @@ impl<'a> ScopedStore<'a> {
     /// [`ironauth_hot::HotState`] trait. The SQL lives HERE because every scoped statement in
     /// this crate lives here -- `scripts/query-audit.sh` allows exactly one module, and an
     /// exception for this one would be the first.
+    /// The cross-node hot-state invalidation feed for this scope (issue #147): append a
+    /// "forget this key" to the shared feed inside the transaction that made the change, and
+    /// read forward from a per-node position to apply what other nodes appended.
+    #[must_use]
+    pub fn hot_state_invalidations(&self) -> HotStateInvalidationRepo<'a> {
+        HotStateInvalidationRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The data-plane HOT STATE for this scope (issue #146): the always-present implementation
+    /// behind `ironauth-hot`'s classified interface, so a deployment with no accelerator
+    /// attached behaves identically and only more slowly.
+    ///
+    /// Callers reach this through [`crate::hot_state::PgHotState`] rather than directly: that
+    /// adapter supplies the clock instants every method here takes, and implements the foreign
+    /// [`ironauth_hot::HotState`] trait. The SQL lives HERE because every scoped statement in
+    /// this crate lives here -- `scripts/query-audit.sh` allows exactly one module, and an
+    /// exception for this one would be the first.
     #[must_use]
     pub fn hot_state(&self) -> HotStateRepo<'a> {
         HotStateRepo {
@@ -32258,6 +32278,275 @@ pub struct HotStateQuota {
     pub per_scope_entries: Option<u32>,
     /// The application-clock instant an entry is judged live against.
     pub now_unix_micros: i64,
+}
+
+/// The consumer name invalidation rows carry in the shared feed (issue #147).
+///
+/// A CONSUMER NAME ON ROWS NOTHING CLAIMS, which is worth explaining because the word means
+/// something else everywhere near it. Every other constant like this names a worker that
+/// `claim`s a message and `complete`s it. These rows are never claimed: the field is what a
+/// cursor reader filters on, because `OutboxRepo::events_page_after` serves every row in the
+/// scope and its readers select their own.
+///
+/// It is deliberately NOT `WEBHOOK_EVENT_CONSUMER`. Those rows are validated against the event
+/// catalog at enqueue and are what the webhook fan-out reads; an invalidation is neither.
+pub const HOT_STATE_INVALIDATION_CONSUMER: &str = "hot.invalidate";
+
+/// What a node does with its cursor when it reads the feed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidationBatch {
+    /// Keys to forget, and the position to checkpoint having forgotten them.
+    ///
+    /// `through` is the sequence of the LAST ROW IN THE PAGE, not of the last invalidation. The
+    /// page is a slice of the whole feed and most of it is other consumers' rows; checkpointing
+    /// only as far as the last invalidation would make the node re-read every intervening row
+    /// on the next pass, for ever, whenever the tail of a page holds no invalidation.
+    Apply {
+        /// The `(use_name, key)` pairs to delete, in feed order.
+        forget: Vec<(String, String)>,
+        /// The sequence to record as applied through.
+        through: i64,
+    },
+    /// The node's position is before the retained window: it cannot know what it missed.
+    ///
+    /// # This is the cold flush, and it is not optional
+    ///
+    /// A node that resumes from a pruned position has an accelerator holding entries whose
+    /// invalidations were deleted before it read them, and no way to enumerate which. The only
+    /// safe response is to discard everything it holds and start again from `resume_at`.
+    /// Anything cleverer needs a record of what was pruned, which is the thing that was pruned.
+    ColdFlush {
+        /// The position to adopt after flushing.
+        resume_at: i64,
+    },
+}
+
+/// The cross-node invalidation feed for one scope (issue #147).
+pub struct HotStateInvalidationRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl HotStateInvalidationRepo<'_> {
+    /// Write a hot-state entry and its invalidation in ONE transaction, then commit.
+    ///
+    /// # Why this exists rather than a bare `enqueue`
+    ///
+    /// Criterion 2 is about ATOMICITY between a mutation and its invalidation, and a function
+    /// that only enqueues cannot demonstrate it: a caller could still put the two in separate
+    /// transactions. This is the smallest thing that has the property -- a change and its
+    /// announcement, committed together or not at all -- and it is the shape every production
+    /// call site will take when the registry's uses acquire them.
+    ///
+    /// `fail_before_commit` is how the rollback half is exercised. A test asks for the whole
+    /// transaction to be abandoned after both writes, and then asserts that NEITHER is there:
+    /// no cache entry and no invalidation. Without a way to abandon a transaction after the
+    /// writes, "a rolled-back mutation produces no invalidation" can only be argued.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] if this mutation already announced this key;
+    /// [`StoreError::Database`] on a persistence failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_and_announce(
+        &self,
+        env: &Env,
+        use_name: &str,
+        key: &str,
+        value: &[u8],
+        expires_at_unix_micros: i64,
+        mutation: &str,
+        fail_before_commit: bool,
+    ) -> Result<(), StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "INSERT INTO hot_state \
+             (tenant_id, environment_id, use_name, key, value, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, \
+                     TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, use_name, key) \
+             DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(use_name)
+        .bind(key)
+        .bind(value)
+        .bind(expires_at_unix_micros)
+        .execute(&mut *tx)
+        .await?;
+        enqueue_hot_invalidation_in_tx(&mut tx, env, self.scope, use_name, key, mutation).await?;
+        if fail_before_commit {
+            // DROPPED, NOT COMMITTED. `Transaction`'s `Drop` rolls back, which is the same thing
+            // a panicking handler or a lost connection does, so this exercises the real path
+            // rather than a `ROLLBACK` a production caller would never issue.
+            return Ok(());
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Read the feed forward from `node`'s position and say what to forget.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn next_batch(
+        &self,
+        node: &str,
+        limit: i64,
+    ) -> Result<InvalidationBatch, StoreError> {
+        let cursor = self.cursor_for(node).await?;
+        let page = OutboxRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+        .events_page_after(EventCursor::after_sequence(cursor), limit)
+        .await?;
+        match page {
+            EventPage::Gone { oldest_retained } => Ok(InvalidationBatch::ColdFlush {
+                // MINUS ONE, so the resumed cursor sits BEFORE the oldest retained row rather
+                // than after it. Adopting `oldest_retained` itself would skip that row, which is
+                // an invalidation this node has never seen -- the exact loss the cold flush is
+                // compensating for, reintroduced by the compensation.
+                resume_at: oldest_retained.saturating_sub(1),
+            }),
+            EventPage::Page(messages) => {
+                let through = messages.last().map_or(cursor, |message| message.sequence);
+                let forget = messages
+                    .iter()
+                    .filter(|message| message.consumer == HOT_STATE_INVALIDATION_CONSUMER)
+                    .filter_map(|message| {
+                        let payload = message.payload.as_object()?;
+                        let r#use = payload.get("use")?.as_str()?;
+                        let key = payload.get("key")?.as_str()?;
+                        Some((r#use.to_owned(), key.to_owned()))
+                    })
+                    .collect();
+                Ok(InvalidationBatch::Apply { forget, through })
+            }
+        }
+    }
+
+    /// Where `node` has read to, or the beginning if it has never read.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn cursor_for(&self, node: &str) -> Result<i64, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT applied_through FROM hot_state_invalidation_cursors \
+             WHERE tenant_id = $1 AND environment_id = $2 AND node_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(node)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        // A NODE WITH NO ROW STARTS AT THE BEGINNING, not at the head. Starting at the head
+        // would make a new node's accelerator authoritative for keys other nodes had already
+        // invalidated, and a new node is exactly the case where a cache is empty and re-reading
+        // the feed is cheap.
+        Ok(row.map_or(0, |(sequence,)| sequence))
+    }
+
+    /// Record that `node` has applied through `sequence`.
+    ///
+    /// # It only ever moves FORWARD
+    ///
+    /// The `GREATEST` is not defensive tidiness. Two passes for one node can overlap (a slow
+    /// one reading an old position while a fast one has already advanced), and the loser
+    /// writing its lower number would make the node re-apply rows it has done -- harmless, since
+    /// forgetting a key twice is forgetting it -- and, worse, re-apply them FOR EVER if the
+    /// overlap is periodic. A cursor that can go backwards is a cursor that can livelock.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_cursor(
+        &self,
+        env: &Env,
+        node: &str,
+        sequence: i64,
+    ) -> Result<(), StoreError> {
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "INSERT INTO hot_state_invalidation_cursors \
+             (tenant_id, environment_id, node_id, applied_through, updated_at) \
+             VALUES ($1, $2, $3, $4, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, node_id) \
+             DO UPDATE SET \
+                 applied_through = GREATEST( \
+                     hot_state_invalidation_cursors.applied_through, EXCLUDED.applied_through), \
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(node)
+        .bind(sequence)
+        .bind(now_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+/// Append "forget this key" to the feed, INSIDE the caller's transaction.
+///
+/// # This is the whole of criterion 2
+///
+/// #147 asks that "invalidations are transactional with their mutation: a rolled-back mutation
+/// produces no invalidation, and a committed mutation's invalidation is never lost". Both halves
+/// are properties of writing the row in the same transaction as the change, which is what this
+/// function is for and why it takes a `tx` rather than opening one. A caller that opened its own
+/// would have built a two-phase commit by accident: the mutation rolls back and the invalidation
+/// stands, so every node forgets a key that never changed (harmless), or the mutation commits
+/// and the invalidation rolls back, so every node serves the old value until its TTL (not).
+///
+/// # The idempotency key must be UNIQUE PER MUTATION, not per key
+///
+/// `outbox_messages` refuses a duplicate `(scope, consumer, idempotency_key)`. Deriving the key
+/// from `(use, key)` alone would make the SECOND change to one cache key a unique violation --
+/// so the first invalidation would stand, the second would be refused, and every node would keep
+/// serving the value the first change wrote. `mutation` is the caller's handle for the change
+/// itself; passing a constant, or the cache key again, reintroduces exactly that.
+///
+/// # Errors
+///
+/// [`StoreError::Conflict`] if `mutation` has already produced an invalidation for this key;
+/// [`StoreError::Database`] on a persistence failure.
+pub(crate) async fn enqueue_hot_invalidation_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
+    scope: Scope,
+    use_name: &str,
+    key: &str,
+    mutation: &str,
+) -> Result<(), StoreError> {
+    let payload = serde_json::json!({ "use": use_name, "key": key });
+    let idempotency_key = format!("{use_name}:{key}:{mutation}");
+    enqueue_outbox_in_tx(
+        tx,
+        env,
+        scope,
+        &NewOutboxMessage {
+            consumer: HOT_STATE_INVALIDATION_CONSUMER,
+            idempotency_key: &idempotency_key,
+            // EVERY INVALIDATION ITS OWN GROUP. An ordering key exists to keep two messages
+            // from being in flight at once, which matters for work that must happen in order.
+            // Forgetting a key is order-independent, so grouping them would serialise a fan-out
+            // that has no reason to be serial.
+            ordering_key: &idempotency_key,
+            payload,
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 /// The scoped hot-state table (issue #146).

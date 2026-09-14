@@ -395,6 +395,11 @@ pub use repository::{
     AuditChainRepo, ChainEntry, ChainFault, ChainVerified, ChainedAuditRow, CursorOrigin,
     LogStreamOwnership, LogStreamRepo, NewLogStream, PruneReport, SealReport, verify_chain_entries,
 };
+/// The cross-node hot-state invalidation feed (issue #147): the consumer discriminator its rows
+/// carry, the repository that appends and reads them, and what a reader is told to do.
+pub use repository::{
+    HOT_STATE_INVALIDATION_CONSUMER, HotStateInvalidationRepo, InvalidationBatch,
+};
 /// The testing-only atomicity probes (issue #247): the seams at which a test can force
 /// the joined invitation create and the joined recovery approve to fail INSIDE their one
 /// transaction. Present only under the `testing` feature, so a production build carries
