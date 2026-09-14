@@ -55,6 +55,8 @@
 
 mod bounded;
 mod class;
+#[cfg(feature = "ironcache")]
+pub mod ironcache;
 pub mod registry;
 mod state;
 mod tiered;

@@ -70,6 +70,11 @@ quick-xml = { version = "0.41", default-features = false }
 # is a complete, supported mode, and this crate is behind the `ironbus` feature so a
 # deployment that does not want it does not build it.
 ironbus-client = { version = "0.1.0", default-features = false }
+# THE ACCELERATOR CLIENT (#146). IronCache publishes no client crate -- its repository is server
+# crates -- and it speaks RESP, so the client is the `redis` crate against its Redis-compatible
+# surface. That also makes the same implementation work against any RESP server an operator
+# already runs, which is the point of an OPTIONAL accelerator.
+redis = { version = "1", default-features = false, features = ["tokio-comp", "connection-manager"] }
 ironauth-env = { path = "crates/ironauth-env", version = "0.1.0" }
 ironauth-hash-scheme = { path = "crates/ironauth-hash-scheme", version = "0.2.0" }
 ironauth-hot = { path = "crates/ironauth-hot", version = "0.1.0" }
