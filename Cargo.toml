@@ -53,6 +53,16 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/ELares/IronAuth"
 
 [workspace.dependencies]
+# Linear-time regular expressions for the access-rule path matcher (issue #154). ALREADY IN
+# THE GRAPH transitively, so this is a direct path edge rather than a new crate: no licence
+# change, MSRV 1.85 and the musl static lane unaffected.
+#
+# The engine choice is load-bearing, not incidental. Access rules are evaluated per request on
+# a surface that answers before authentication, and their patterns come from operator
+# configuration. A backtracking engine would make a mis-written rule a denial-of-service on
+# the endpoint that decides whether to admit traffic; this one has no backtracking and matches
+# in time linear in the input.
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
 # The ONE XML library, for `ironauth-saml`, and its only consumer in the tree. Pure Rust, no
 # C, and it does not resolve entities: see that crate's doc for the evaluation and the rejected
 # alternatives. Default features off, so no serialisation or async surface is compiled.
