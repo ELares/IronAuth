@@ -102,6 +102,10 @@ pub struct TestDatabase {
     control_url: String,
     /// The audit retention connection URL, kept for the same reason as `app_url`.
     audit_retention_url: String,
+    /// The OWNER connection URL, kept for the same reason as `app_url`, and for one more:
+    /// a test that drives a COMPILED binary needing owner privileges (the `ironauth
+    /// doctor` preflight, issue #148) has to hand it a DSN, not a pool.
+    owner_url: String,
     /// The platform envelope master key (issue #48), shared across every data-plane
     /// handle this database hands out (including a simulated restart), so encrypted
     /// PII sealed by one handle reads back through another. Deterministic (a fixed
@@ -131,6 +135,7 @@ impl TestDatabase {
         create_database(&owner_base, &db_name).await;
 
         let owner_url = swap_database(&owner_base, &db_name);
+        let owner_dsn = owner_url.clone();
         let owner_pool = PgPool::connect(&owner_url)
             .await
             .expect("connect as owner to fresh database");
@@ -210,6 +215,7 @@ impl TestDatabase {
             app_url,
             control_url,
             audit_retention_url,
+            owner_url: owner_dsn,
             master,
         }
     }
@@ -320,6 +326,17 @@ impl TestDatabase {
     #[must_use]
     pub fn owner_pool(&self) -> &PgPool {
         &self.owner_pool
+    }
+
+    /// The OWNER connection URL for THIS throwaway database.
+    ///
+    /// The peer of [`TestDatabase::app_url`], for a test that must hand a DSN to a
+    /// subprocess rather than use a pool. `ironauth doctor` is the case: it refuses to
+    /// run on a role that row-level security applies to, so a test of it needs the owner
+    /// DSN and could not use `app_url`.
+    #[must_use]
+    pub fn owner_url(&self) -> &str {
+        &self.owner_url
     }
 
     /// Execute a raw statement as the OWNER role, for test setup and fault injection

@@ -127,6 +127,13 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 name = "step_up_policy_cli"
 required-features = ["testing"]
 
+# The pre-upgrade preflight CLI (issue #148): drives the COMPILED `ironauth doctor`
+# against a throwaway database, including the refusal to report on a role that row-level
+# security applies to. Needs a real Postgres, so it is gated like the suites above.
+[[test]]
+name = "doctor_cli"
+required-features = ["testing"]
+
 # The outbox retention boot suite (issue #104, PR 3) boots the COMPILED `ironauth serve`
 # against a throwaway database and watches the queue. It is the only thing in the tree that
 # observes the `serve` call site itself: replacing that call with a no-op left every other

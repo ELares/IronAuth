@@ -98,6 +98,7 @@ pub mod outbox;
 #[cfg(feature = "ironbus")]
 pub mod outbox_ironbus;
 pub mod pow_challenge;
+pub mod preflight;
 pub mod promotion;
 pub mod rar;
 pub mod recovery;
@@ -234,7 +235,7 @@ pub use interchange::{
     export_archive, import_archive,
 };
 pub use locale_bundle::{LocaleBundleRecord, NewLocaleBundle};
-pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase};
+pub use migrate::{Migration, MigrationError, MigrationReport, MigrationRunner, Phase, chain};
 pub use org_policy::{
     AllowedDomains, AllowedFactors, AuthPolicy, AuthPolicyError, KNOWN_FACTOR_TOKENS,
     ORG_POLICY_MAX_SESSION_TTL_SECS, PolicyLevels, ResolvedAuthPolicy, SECOND_FACTOR_TOKENS,

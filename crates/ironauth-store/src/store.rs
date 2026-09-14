@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use ironauth_jose::MasterKey;
-use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Row};
 
 use crate::error::StoreError;
 use crate::migrate::MigrationRunner;
@@ -51,6 +51,57 @@ pub struct Store {
 }
 
 impl Store {
+    /// Run the pre-upgrade data preflight against this store's database (issue #148).
+    ///
+    /// Read-only: it probes live rows against the constraints every pending migration
+    /// would impose and reports the ones that would be rejected. See
+    /// [`crate::preflight`] for what it examines and what it says when it cannot.
+    ///
+    /// The pool stays private, as it does for every other operation on this type: the
+    /// preflight is a method here rather than a free function taking a pool, so no
+    /// caller gains a raw handle.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::MigrationError::Database`] if the migration ledger cannot be read. An
+    /// individual probe failing is reported in the returned value, not raised.
+    pub async fn preflight(
+        &self,
+        chain: &[crate::Migration],
+    ) -> Result<crate::preflight::Report, crate::MigrationError> {
+        crate::preflight::run(&self.pool, chain).await
+    }
+
+    /// Whether the connected role can see every row, or is itself subject to row-level
+    /// security (issue #148).
+    ///
+    /// This exists because of how the preflight fails when it is wrong. The scoped
+    /// tables are FORCE ROW LEVEL SECURITY, and `ironauth_app` is deliberately neither
+    /// superuser nor table owner, so a probe run on that connection with no scope bound
+    /// returns zero rows FOR EVERY TABLE. Zero rows is exactly what a clean preflight
+    /// looks like. Connecting as the server's own runtime role would therefore not make
+    /// the doctor wrong occasionally; it would make it report a clean bill every time,
+    /// most confidently on the databases with the most data in them.
+    ///
+    /// So the caller asks this first and refuses to report anything if the answer is no.
+    ///
+    /// `rolsuper OR rolbypassrls` and not "is the owner": FORCE ROW LEVEL SECURITY exists
+    /// precisely to stop a table owner bypassing their own policies, so ownership is not
+    /// sufficient here and the refusal message must not suggest it.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::StoreError::Database`] if `pg_roles` cannot be read.
+    pub async fn sees_through_row_level_security(&self) -> Result<bool, crate::StoreError> {
+        let row = sqlx::query(
+            "SELECT rolsuper OR rolbypassrls AS unrestricted \
+             FROM pg_roles WHERE rolname = current_user",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<bool, _>("unrestricted"))
+    }
+
     /// Connect to Postgres at `url` with a bounded pool.
     ///
     /// In production `url` should authenticate as the low-privilege
