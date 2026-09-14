@@ -70,6 +70,7 @@ pub mod flow;
 pub mod flow_target;
 pub mod flow_version;
 pub mod grant_restriction;
+pub mod hot_state;
 mod id;
 pub mod identifier;
 pub mod identity_fact;

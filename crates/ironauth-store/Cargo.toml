@@ -16,6 +16,8 @@ autotests = false
 
 [dependencies]
 ironauth-env.workspace = true
+# The hot-state interface this crate supplies the always-present implementation of (#146).
+ironauth-hot.workspace = true
 # The pure, database-free journey artifact library (issue #92): the store validates a
 # flow_versions artifact on write (only a load-valid journey is persisted) and the
 # config-snapshot import validates a snapshotted journey artifact, both through
@@ -132,6 +134,11 @@ axum = { workspace = true, default-features = false }
 name = "outbox_ironbus"
 path = "tests/outbox_ironbus.rs"
 required-features = ["testing", "ironbus"]
+
+[[test]]
+name = "hot_state"
+path = "tests/hot_state.rs"
+required-features = ["testing"]
 
 [[test]]
 name = "idempotency_retention"
