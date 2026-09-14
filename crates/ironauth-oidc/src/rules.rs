@@ -39,7 +39,9 @@
 //! operation this engine's ordering invites -- would change the meaning of a rule that was
 //! not touched.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 
@@ -221,6 +223,113 @@ impl RuleSet {
     #[must_use]
     pub fn rules(&self) -> &[Rule] {
         &self.rules
+    }
+
+    /// Which request facts these rules actually read.
+    ///
+    /// Used to narrow a decision cache key to exactly the inputs a decision depends on. See
+    /// [`FactDependencies`] for why the narrowing has to be derived rather than chosen.
+    ///
+    /// The `match` below is exhaustive on purpose: a new [`Criterion`] does not compile
+    /// until it declares what it reads, which is what stops a cache key silently omitting an
+    /// input and handing one caller another caller's verdict.
+    #[must_use]
+    pub fn dependencies(&self) -> FactDependencies {
+        let mut deps = FactDependencies::default();
+        for rule in &self.rules {
+            for criterion in &rule.criteria {
+                match criterion {
+                    Criterion::Method(_) => {
+                        deps.fields.insert(FactField::Method);
+                    }
+                    Criterion::Host(_) => {
+                        deps.fields.insert(FactField::Host);
+                    }
+                    Criterion::PathPrefix(_) | Criterion::PathMatches(_) => {
+                        deps.fields.insert(FactField::Path);
+                    }
+                    Criterion::Header { name, .. } => {
+                        deps.headers.insert(name.to_ascii_lowercase());
+                    }
+                    Criterion::Subject(check) => match check {
+                        // A capture comes from a path pattern, so a rule reading one depends
+                        // on the PATH as well as the subject. Missing this would let two
+                        // requests with the same subject and different paths share an entry.
+                        SubjectCheck::Is(_)
+                        | SubjectCheck::Authenticated
+                        | SubjectCheck::Anonymous => {
+                            deps.fields.insert(FactField::Subject);
+                        }
+                        SubjectCheck::EqualsCapture(_) => {
+                            deps.fields.insert(FactField::Subject);
+                            deps.fields.insert(FactField::Path);
+                        }
+                        SubjectCheck::InGroup(_) => {
+                            deps.fields.insert(FactField::Subject);
+                            deps.fields.insert(FactField::Groups);
+                        }
+                        SubjectCheck::HasRole(_) => {
+                            deps.fields.insert(FactField::Subject);
+                            deps.fields.insert(FactField::Roles);
+                        }
+                    },
+                }
+            }
+        }
+        deps
+    }
+
+    /// A fingerprint of these rules, used as a decision cache's generation.
+    ///
+    /// # Why not a counter
+    ///
+    /// It was a per-instance counter starting at zero, and that is wrong the moment the
+    /// cache is SHARED, which is the case [`DecisionStore`] exists for. Two processes over
+    /// one store both start at zero, so a replica holding revoked rules reads entries the
+    /// old rules wrote and serves the revoked answer for a full TTL. A review measured
+    /// exactly that: a replica constructed with deny rules served the previous replica's
+    /// cached ALLOW. A restart is enough; a second replica is enough.
+    ///
+    /// A fingerprint has no such lifetime. The same rules produce the same value in every
+    /// process and different rules a different one, so sharing is safe and a revocation is
+    /// unreachable everywhere at once rather than only where it was made.
+    ///
+    /// Derived from the same rendering the traces use, so it covers every part of a rule a
+    /// decision can depend on. A collision would need two rule sets to agree on 64 bits; the
+    /// rules are operator-authored rather than attacker-chosen, and the consequence is a
+    /// shared entry rather than a bypass.
+    #[must_use]
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // Hashed first so that appending a rule cannot be absorbed by the concatenation of
+        // the ones before it.
+        self.rules.len().hash(&mut hasher);
+        for rule in &self.rules {
+            rule.name.hash(&mut hasher);
+            rule.criteria.len().hash(&mut hasher);
+            for criterion in &rule.criteria {
+                // `describe` is exhaustive, so a new variant has to say how it renders
+                // before this can silently stop distinguishing it.
+                describe(criterion).hash(&mut hasher);
+                // `describe` deliberately omits a header's configured VALUE, so hash it
+                // here: two rules differing only in the value they require are different
+                // rules and must not share a generation.
+                if let Criterion::Header { value, .. } = criterion {
+                    value.hash(&mut hasher);
+                }
+            }
+            match &rule.action {
+                Action::Allow => 0u8.hash(&mut hasher),
+                Action::Deny => 1u8.hash(&mut hasher),
+                Action::StepUp { acr } => {
+                    2u8.hash(&mut hasher);
+                    acr.hash(&mut hasher);
+                }
+            }
+        }
+        hasher.finish()
     }
 
     /// Decide `facts` against the set: the first rule whose criteria all hold.
@@ -685,8 +794,458 @@ fn path_has_prefix(path: &str, prefix: &str) -> bool {
     matches!(path.as_bytes().get(trimmed.len()), None | Some(b'/'))
 }
 
+// ===========================================================================
+// Criterion 6: cached decisions with bounded TTLs, invalidation on a rule
+// change, and full evaluation when the cache cannot answer.
+// ===========================================================================
+
+/// Which request facts a rule set actually reads.
+///
+/// # Why this is DERIVED and not hand-written
+///
+/// A decision cache is only correct if its key covers every input the decision depends on.
+/// Key on too little and two different requests collide, and one caller is handed the other
+/// caller's verdict: a cross-request authorization failure, silent, and in whichever
+/// direction the first request happened to go.
+///
+/// Keying on the whole of [`RequestFacts`] is correct and nearly useless, because the facts
+/// differ on every request and nothing would ever hit. So the key is narrowed to exactly
+/// what the configured rules consult, computed by walking the criteria. The narrowing is
+/// therefore a consequence of the rules rather than a guess about them, and a rule set that
+/// reads nothing collapses to one entry, which is right.
+///
+/// [`RuleSet::dependencies`] builds this with an exhaustive `match`, so a new [`Criterion`]
+/// cannot be added without an arm.
+///
+/// # What exhaustiveness does NOT buy
+///
+/// An earlier version of this comment called that "the whole safety argument: the compiler,
+/// not a reviewer's memory". It is not. Exhaustiveness forces an arm to EXIST; it says
+/// nothing about the arm being right, and a review demonstrated the gap by adding a
+/// criterion with an empty arm, which compiled, passed the suite, and let two requests that
+/// differ only in the new fact share a key.
+///
+/// The compiler-forced half is therefore paired with
+/// `every_criterion_contributes_the_facts_it_reads`, which states the expected facts in a
+/// SECOND exhaustive match written independently of this one. Two independent statements of
+/// the same fact have to agree, and a new variant does not compile until both are written.
+///
+/// The other half of the risk is not here at all: [`CachedRuleSet::key_for`] is a second
+/// hand-written reading of what each fact MEANS -- case-insensitivity for method and host,
+/// every matching entry for a header, the empty-subject normalization -- and nothing ties it
+/// to `matches`. Three of those four readings were wrong when this landed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FactDependencies {
+    /// The single-valued facts that are read. A SET rather than a row of booleans, so
+    /// adding a fact does not widen a struct nobody re-reads, and so the key can iterate
+    /// exactly what matters in a stable order.
+    fields: BTreeSet<FactField>,
+    /// Lowercased header names, so the set matches the case-insensitive comparison.
+    headers: BTreeSet<String>,
+}
+
+/// One single-valued request fact a rule can read.
+///
+/// `Ord` so a [`DecisionKey`] enumerates fields in a stable order: a key whose field order
+/// depended on iteration order would make two equal requests produce unequal keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FactField {
+    /// The request method.
+    Method,
+    /// The host.
+    Host,
+    /// The path.
+    Path,
+    /// The authenticated subject.
+    Subject,
+    /// The subject's groups.
+    Groups,
+    /// The subject's roles.
+    Roles,
+}
+
+impl FactDependencies {
+    /// Whether nothing at all is read, so every request shares one cache entry.
+    #[must_use]
+    pub fn reads_nothing(&self) -> bool {
+        self.fields.is_empty() && self.headers.is_empty()
+    }
+
+    /// Whether `field` is read by the rules this was derived from.
+    #[must_use]
+    pub fn reads(&self, field: FactField) -> bool {
+        self.fields.contains(&field)
+    }
+
+    /// The header names that are read, lowercased.
+    pub fn headers(&self) -> impl Iterator<Item = &str> {
+        self.headers.iter().map(String::as_str)
+    }
+}
+
+/// The cache key for one request under one rule set.
+///
+/// Carries the rule set's generation, so a rule change cannot be answered from an entry
+/// computed under the previous rules: the old entries are not evicted, they become
+/// unreachable, which is the same thing and needs no sweep.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DecisionKey {
+    generation: u64,
+    /// `(field, value)` for every single-valued fact the rules read, in `FactField` order.
+    ///
+    /// Only the fields that are READ appear, so a fact no rule consults cannot split the
+    /// cache. The value is an `Option` because a fact can be read and absent, and those two
+    /// states must not collide: a subject that is set and one that is absent are different
+    /// callers. An EMPTY subject is not a third class -- it is read through
+    /// `RequestFacts::authenticated_subject`, the same accessor the engine decides with, so
+    /// the key has exactly the classes the rules can tell apart.
+    fields: Vec<(FactField, Option<String>)>,
+    /// `(name, values)` for every header name the rules read: ALL values carried under any
+    /// case-spelling of that name, sorted.
+    ///
+    /// A single value here was a defect, not a simplification. `matches` decides with
+    /// `.any()` over every entry whose name matches case-insensitively, while this built the
+    /// key with `.find()`, which picks ONE arbitrarily from a `HashMap`. A request carrying
+    /// two spellings of one header was therefore evaluated against both and stored under a
+    /// key belonging to a different equivalence class, so an ordinary later request with a
+    /// single correctly-spelled header was served that stored ALLOW. A review measured
+    /// 18089 wrong answers in 640000 comparisons, and 112 unauthorized admissions in 200
+    /// constructions of one identical request.
+    ///
+    /// Sorted, because a `HashMap` has no order and a key that depended on one would not be
+    /// a function of its input.
+    headers: Vec<(String, Vec<String>)>,
+    /// Sorted membership, when read. Absent when no rule consults it.
+    groups: Option<Vec<String>>,
+    /// Sorted membership, when read.
+    roles: Option<Vec<String>>,
+}
+
+/// What a cache answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheOutcome {
+    /// A live entry.
+    Hit(Decision),
+    /// No entry, or one past its TTL.
+    Miss,
+    /// The cache could not answer at all.
+    ///
+    /// Distinct from [`CacheOutcome::Miss`] on purpose: a miss is the cache working, and an
+    /// outage is the cache being unavailable. They lead to the same evaluation but they are
+    /// different operational events, and a metric that cannot tell them apart cannot show an
+    /// operator that their cache is down.
+    Unavailable,
+}
+
+/// Somewhere decisions can be remembered.
+///
+/// A trait rather than a concrete map, because criterion 6 requires behaviour under a cache
+/// OUTAGE, and an in-process map cannot have one. A remote cache can, and this is the seam
+/// where that is representable and testable today.
+pub trait DecisionStore {
+    /// Look `key` up as of `now`.
+    fn get(&self, key: &DecisionKey, now: Instant) -> CacheOutcome;
+    /// Remember `decision` for `key` as of `now`. Failures are silent by contract: a cache
+    /// that cannot store must never turn into a request that cannot be served.
+    fn put(&self, key: DecisionKey, decision: Decision, now: Instant);
+}
+
+/// A rule set with a decision cache in front of it.
+///
+/// # The two properties that make this safe
+///
+/// **A cached answer is never stale past the TTL.** Entries carry the instant they were
+/// stored and are ignored once older than `ttl`, so the worst-case age of any served
+/// decision is bounded by a number the operator set.
+///
+/// **A rule change is immediate, not TTL-bounded.** The generation is part of the key, so
+/// after [`CachedRuleSet::replace_rules`] no request can reach an entry computed under the
+/// old rules. The bound criterion 6 asks about (TTL plus the invalidation SLO) is therefore
+/// the TTL for an unchanged rule set and zero for a changed one.
+pub struct CachedRuleSet<S> {
+    rules: RuleSet,
+    dependencies: FactDependencies,
+    generation: u64,
+    store: S,
+}
+
+impl<S: DecisionStore> CachedRuleSet<S> {
+    /// Wrap `rules` with `store`.
+    #[must_use]
+    pub fn new(rules: RuleSet, store: S) -> Self {
+        let dependencies = rules.dependencies();
+        let generation = rules.fingerprint();
+        Self {
+            rules,
+            dependencies,
+            generation,
+            store,
+        }
+    }
+
+    /// The rule set being cached.
+    #[must_use]
+    pub fn rules(&self) -> &RuleSet {
+        &self.rules
+    }
+
+    /// What the current rules read.
+    #[must_use]
+    pub fn dependencies(&self) -> &FactDependencies {
+        &self.dependencies
+    }
+
+    /// The backing store, for metrics and for health reporting.
+    #[must_use]
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
+    /// Swap the rules, making every entry computed under the old ones unreachable.
+    pub fn replace_rules(&mut self, rules: RuleSet) {
+        self.dependencies = rules.dependencies();
+        self.generation = rules.fingerprint();
+        self.rules = rules;
+    }
+
+    /// The key `facts` presents under the current rules.
+    #[must_use]
+    pub fn key_for(&self, facts: &RequestFacts) -> DecisionKey {
+        let deps = &self.dependencies;
+        // BTreeSet iteration is sorted, so the field order is stable and two equal requests
+        // cannot produce unequal keys through iteration order alone.
+        let fields = deps
+            .fields
+            .iter()
+            .filter_map(|field| {
+                let value = match field {
+                    // LOWERCASED, because `matches` compares these with
+                    // `eq_ignore_ascii_case`. Keying on the raw bytes splits the cache for
+                    // callers the engine cannot tell apart, which is the harmless direction
+                    // but makes the feature pointless, and it is a second reading of the
+                    // same field.
+                    FactField::Method => Some(facts.method.to_ascii_lowercase()),
+                    FactField::Host => Some(facts.host.to_ascii_lowercase()),
+                    // NOT lowercased: a path is compared exactly.
+                    FactField::Path => Some(facts.path.clone()),
+                    // Through the SAME accessor the engine decides with, so an empty
+                    // subject is one caller with `None` rather than a third class the key
+                    // invents. The file documented both readings at once.
+                    FactField::Subject => facts.authenticated_subject().map(str::to_owned),
+                    // Carried in their own fields below, because they are lists.
+                    FactField::Groups | FactField::Roles => return None,
+                };
+                Some((*field, value))
+            })
+            .collect();
+
+        DecisionKey {
+            generation: self.generation,
+            fields,
+            // EVERY value under any case-spelling of the name, matching what `matches`
+            // consults. Taking one arbitrarily is the collision described on the field.
+            headers: deps
+                .headers
+                .iter()
+                .map(|name| {
+                    let mut values: Vec<String> = facts
+                        .headers
+                        .iter()
+                        .filter(|(actual, _)| actual.eq_ignore_ascii_case(name))
+                        .map(|(_, value)| value.clone())
+                        .collect();
+                    values.sort_unstable();
+                    (name.clone(), values)
+                })
+                .collect(),
+            groups: deps.reads(FactField::Groups).then(|| {
+                let mut sorted = facts.groups.clone();
+                // Sorted, because membership is a SET: the same caller presented in a
+                // different order is the same caller and must not miss its own entry.
+                sorted.sort_unstable();
+                sorted
+            }),
+            roles: deps.reads(FactField::Roles).then(|| {
+                let mut sorted = facts.roles.clone();
+                sorted.sort_unstable();
+                sorted
+            }),
+        }
+    }
+
+    /// Decide, consulting the cache.
+    ///
+    /// A [`CacheOutcome::Unavailable`] falls through to full evaluation exactly as a miss
+    /// does. A cache is an optimisation, and an optimisation that can refuse a request is a
+    /// liability: the answer is always computable from the rules and the facts.
+    pub fn decide(&self, facts: &RequestFacts, now: Instant) -> CachedDecision {
+        let key = self.key_for(facts);
+        match self.store.get(&key, now) {
+            CacheOutcome::Hit(decision) => CachedDecision {
+                decision,
+                cached: true,
+                store_available: true,
+            },
+            CacheOutcome::Miss => {
+                let decision = self.rules.decide(facts);
+                self.store.put(key, decision.clone(), now);
+                CachedDecision {
+                    decision,
+                    cached: false,
+                    store_available: true,
+                }
+            }
+            CacheOutcome::Unavailable => CachedDecision {
+                decision: self.rules.decide(facts),
+                cached: false,
+                store_available: false,
+            },
+        }
+    }
+}
+
+/// A decision, plus where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedDecision {
+    /// The answer, identical either way.
+    pub decision: Decision,
+    /// Whether it was served from the cache.
+    pub cached: bool,
+    /// Whether the cache was reachable. `false` means the answer was computed and the
+    /// operator has a cache outage worth alerting on.
+    pub store_available: bool,
+}
+
+/// An in-process [`DecisionStore`] with a bounded TTL.
+///
+/// Never reports [`CacheOutcome::Unavailable`], because an in-process map has no outage to
+/// report. Testing the outage path needs a store that can fail, which is exactly why
+/// [`DecisionStore`] is a trait.
+pub struct MemoryStore {
+    ttl: Duration,
+    max_entries: usize,
+    entries: Mutex<HashMap<DecisionKey, (Decision, Instant)>>,
+}
+
+/// How many decisions a [`MemoryStore`] retains before it reclaims.
+///
+/// Without a ceiling the map grows with the request stream. Any rule set reading the path
+/// puts it in the key, and on a forward-auth surface the path is unauthenticated attacker
+/// input, so the growth is driven by exactly the traffic this sits in front of. A review
+/// measured 20000 entries retained after 20000 distinct paths on a one-second TTL: expired
+/// entries were ignored on read and kept forever.
+pub const DEFAULT_MAX_DECISIONS: usize = 100_000;
+
+impl MemoryStore {
+    /// A store whose entries are ignored once older than `ttl`.
+    #[must_use]
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            max_entries: DEFAULT_MAX_DECISIONS,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Override the entry ceiling. Mainly for tests, which cannot drive 100k distinct keys.
+    #[must_use]
+    pub fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries.max(1);
+        self
+    }
+
+    /// How many entries are held, live or not.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the internal lock is poisoned.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.lock().expect("decision cache lock").len()
+    }
+
+    /// Whether the store holds nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the internal lock is poisoned.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl DecisionStore for MemoryStore {
+    fn get(&self, key: &DecisionKey, now: Instant) -> CacheOutcome {
+        let entries = self.entries.lock().expect("decision cache lock");
+        let Some((decision, stored)) = entries.get(key) else {
+            return CacheOutcome::Miss;
+        };
+        // A backwards clock reads as EXPIRED rather than fresh, so the failure direction is
+        // recomputing an answer we already had, never serving one past its bound.
+        //
+        // This said exactly that while doing the opposite. `saturating_duration_since`
+        // returns ZERO when the entry is stamped after `now`, i.e. age zero, i.e. FRESH --
+        // so an entry stamped in the future was served forever. A review measured six hits
+        // out of six across a simulated year on a thirty-second TTL. `checked_duration_since`
+        // returns `None` instead, which is what makes the sentence above true.
+        let Some(age) = now.checked_duration_since(*stored) else {
+            return CacheOutcome::Miss;
+        };
+        if age >= self.ttl {
+            return CacheOutcome::Miss;
+        }
+        CacheOutcome::Hit(decision.clone())
+    }
+
+    fn put(&self, key: DecisionKey, decision: Decision, now: Instant) {
+        let mut entries = self.entries.lock().expect("decision cache lock");
+        if entries.len() >= self.max_entries {
+            // Expired entries are free to drop: they are already ignored on read, so
+            // removing one changes no answer. This is the exact pass that was missing, and
+            // it is enough whenever the TTL is doing its job.
+            entries.retain(|_, (_, stored)| {
+                now.checked_duration_since(*stored)
+                    .is_some_and(|age| age < self.ttl)
+            });
+        }
+        if entries.len() >= self.max_entries {
+            // Everything is live and something still has to go. Dropping a LIVE entry costs
+            // only a recomputation, never a wrong answer, because the decision is always
+            // derivable from the rules and the facts.
+            //
+            // OLDEST FIRST, rather than clearing.
+            //
+            // A consequence worth recording: once the fallback prefers the oldest, the
+            // expired-entry pass above stops being a separate CORRECTNESS property, because
+            // expired entries are also the oldest and this pass would reclaim them anyway.
+            // Disabling that pass leaves every test green, and that is the right answer
+            // rather than a gap: what it still buys is avoiding this sort on the common
+            // path, which is a timing difference, not a different answer. The bound itself
+            // is pinned by `the_store_does_not_grow_without_bound`, which fails when BOTH
+            // passes are removed. Clearing is simpler and was what this did,
+            // and it throws away the newest entries too -- precisely the ones most likely to
+            // be asked for again. The oldest are also the closest to expiring, so this is
+            // the same preference the pass above has, continued past the point where it runs
+            // out of free choices.
+            let mut by_age: Vec<(DecisionKey, Instant)> = entries
+                .iter()
+                .map(|(key, (_, stored))| (key.clone(), *stored))
+                .collect();
+            by_age.sort_by_key(|(_, stored)| *stored);
+            let excess = entries.len() + 1 - self.max_entries;
+            for (key, _) in by_age.into_iter().take(excess) {
+                entries.remove(&key);
+            }
+        }
+        entries.insert(key, (decision, now));
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use ironauth_env::Clock;
+
     use super::*;
 
     fn facts() -> RequestFacts {
@@ -2038,6 +2597,1013 @@ mod tests {
                 },
             ],
             "the second rule matches the path too, and must be NotReached rather than Matched"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Criterion 6: bounded TTLs, invalidation on a rule change, and full
+    // evaluation when the cache cannot answer.
+    // -----------------------------------------------------------------------
+
+    /// A store that can be switched off, so the OUTAGE path is reachable in a test.
+    struct FlakyStore {
+        inner: MemoryStore,
+        up: std::sync::atomic::AtomicBool,
+        puts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakyStore {
+        fn new(ttl: Duration) -> Self {
+            Self {
+                inner: MemoryStore::new(ttl),
+                up: std::sync::atomic::AtomicBool::new(true),
+                puts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn set_up(&self, up: bool) {
+            self.up.store(up, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn is_up(&self) -> bool {
+            self.up.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn puts(&self) -> usize {
+            self.puts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl DecisionStore for FlakyStore {
+        fn get(&self, key: &DecisionKey, now: Instant) -> CacheOutcome {
+            if self.is_up() {
+                self.inner.get(key, now)
+            } else {
+                CacheOutcome::Unavailable
+            }
+        }
+        fn put(&self, key: DecisionKey, decision: Decision, now: Instant) {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.is_up() {
+                self.inner.put(key, decision, now);
+            }
+        }
+    }
+
+    fn admin_rules() -> RuleSet {
+        RuleSet::new(vec![allow(
+            "admins",
+            vec![
+                Criterion::PathPrefix("/admin".to_owned()),
+                Criterion::Subject(SubjectCheck::HasRole("admin".to_owned())),
+            ],
+        )])
+    }
+
+    /// The instant `secs` after a fixed origin.
+    ///
+    /// The origin comes from a `ManualClock` rather than from the system clock, because the
+    /// `time-via-env` invariant forbids reading the clock directly and is right to: a test
+    /// that sleeps to advance time is slow and flaky, and one that samples the real clock
+    /// twice is measuring the machine. A manual clock never advances on its own, so this is
+    /// a constant origin and every instant below is arithmetic on it.
+    fn at(secs: u64) -> Instant {
+        TEST_CLOCK.monotonic() + Duration::from_secs(secs)
+    }
+
+    static TEST_CLOCK: std::sync::LazyLock<ironauth_env::ManualClock> =
+        std::sync::LazyLock::new(ironauth_env::ManualClock::default);
+
+    /// THE KEY COVERS EVERY FACT THE RULES READ.
+    ///
+    /// This is the property the whole design rests on. Key on too little and two different
+    /// callers collide, and one is handed the other's verdict: a cross-request authorization
+    /// failure, silent, in whichever direction the first request happened to go.
+    ///
+    /// Driven per criterion rather than by a hand-written list, so a criterion that stops
+    /// contributing its fact is caught here.
+    #[test]
+    fn every_criterion_contributes_the_facts_it_reads() {
+        /// The facts a criterion reads, stated INDEPENDENTLY of `RuleSet::dependencies`.
+        ///
+        /// A second exhaustive match, not a hand-written table. The table it replaced had
+        /// ten rows and a doc claiming it was "driven per criterion"; a new variant simply
+        /// got no row, so a criterion could declare nothing and nothing would notice. Now a
+        /// new variant does not compile until it is written down twice, and the two
+        /// statements have to agree.
+        fn expected(criterion: &Criterion) -> Vec<FactField> {
+            match criterion {
+                Criterion::Method(_) => vec![FactField::Method],
+                Criterion::Host(_) => vec![FactField::Host],
+                Criterion::PathPrefix(_) | Criterion::PathMatches(_) => vec![FactField::Path],
+                // Carried by name rather than as a `FactField`; checked separately below.
+                Criterion::Header { .. } => vec![],
+                Criterion::Subject(check) => match check {
+                    SubjectCheck::Is(_) | SubjectCheck::Authenticated | SubjectCheck::Anonymous => {
+                        vec![FactField::Subject]
+                    }
+                    // A capture comes from a path pattern, so this reads the path too.
+                    SubjectCheck::EqualsCapture(_) => vec![FactField::Subject, FactField::Path],
+                    SubjectCheck::InGroup(_) => vec![FactField::Subject, FactField::Groups],
+                    SubjectCheck::HasRole(_) => vec![FactField::Subject, FactField::Roles],
+                },
+            }
+        }
+
+        let every_criterion = vec![
+            Criterion::Method(vec!["GET".to_owned()]),
+            Criterion::Host("h".to_owned()),
+            Criterion::PathPrefix("/p".to_owned()),
+            Criterion::PathMatches(Regex::new("^/p$").expect("pattern")),
+            Criterion::Header {
+                name: "X-Service".to_owned(),
+                value: "v".to_owned(),
+            },
+            Criterion::Subject(SubjectCheck::Is("s".to_owned())),
+            Criterion::Subject(SubjectCheck::Authenticated),
+            Criterion::Subject(SubjectCheck::Anonymous),
+            Criterion::Subject(SubjectCheck::EqualsCapture("c".to_owned())),
+            Criterion::Subject(SubjectCheck::InGroup("g".to_owned())),
+            Criterion::Subject(SubjectCheck::HasRole("r".to_owned())),
+        ];
+
+        for criterion in every_criterion {
+            let rendered = describe(&criterion);
+            let wanted = expected(&criterion);
+            let deps = RuleSet::new(vec![allow("r", vec![criterion])]).dependencies();
+            for field in &wanted {
+                assert!(
+                    deps.reads(*field),
+                    "{rendered}: {field:?} is not in the cache key, so two requests \
+                     differing only in it would share an entry"
+                );
+            }
+            // And nothing MORE, which is the over-splitting direction.
+            for field in [
+                FactField::Method,
+                FactField::Host,
+                FactField::Path,
+                FactField::Subject,
+                FactField::Groups,
+                FactField::Roles,
+            ] {
+                assert_eq!(
+                    deps.reads(field),
+                    wanted.contains(&field),
+                    "{rendered}: disagreement on {field:?}"
+                );
+            }
+        }
+
+        // Headers are keyed by name, lowercased to match the case-insensitive comparison.
+        let set = RuleSet::new(vec![allow(
+            "r",
+            vec![Criterion::Header {
+                name: "X-Service".to_owned(),
+                value: "v".to_owned(),
+            }],
+        )]);
+        assert_eq!(
+            set.dependencies().headers().collect::<Vec<_>>(),
+            vec!["x-service"]
+        );
+    }
+
+    /// TWO CALLERS THE RULES CAN TELL APART MUST NOT SHARE A CACHE ENTRY.
+    ///
+    /// The end-to-end version of the property above: an admin and a non-admin hitting the
+    /// same path must get their own answers, not each other's.
+    #[test]
+    fn two_callers_with_different_roles_do_not_share_an_entry() {
+        let cached = CachedRuleSet::new(admin_rules(), MemoryStore::new(Duration::from_secs(60)));
+        let admin = RequestFacts {
+            path: "/admin/keys".to_owned(),
+            subject: Some("usr_1".to_owned()),
+            roles: vec!["admin".to_owned()],
+            ..facts()
+        };
+        let guest = RequestFacts {
+            roles: vec!["guest".to_owned()],
+            ..admin.clone()
+        };
+
+        assert_ne!(
+            cached.key_for(&admin),
+            cached.key_for(&guest),
+            "a rule reading roles must put roles in the key"
+        );
+
+        let first = cached.decide(&admin, at(0));
+        assert_eq!(first.decision.action, Action::Allow);
+        let second = cached.decide(&guest, at(0));
+        assert_eq!(
+            second.decision.action,
+            Action::Deny,
+            "the guest must not be served the admin's cached admission"
+        );
+        assert!(
+            !second.cached,
+            "and it must be a miss, not a hit on the wrong key"
+        );
+    }
+
+    /// A FACT THE RULES DO NOT READ IS NOT IN THE KEY, so the cache actually hits.
+    ///
+    /// The counterweight to the test above: keying on the whole of `RequestFacts` would be
+    /// trivially safe and would never hit, because the facts differ on every request.
+    #[test]
+    fn a_fact_no_rule_reads_does_not_split_the_cache() {
+        let cached = CachedRuleSet::new(admin_rules(), MemoryStore::new(Duration::from_secs(60)));
+        let one = RequestFacts {
+            path: "/admin/keys".to_owned(),
+            subject: Some("usr_1".to_owned()),
+            roles: vec!["admin".to_owned()],
+            host: "a.example.com".to_owned(),
+            ..facts()
+        };
+        // Same everything the rules read; a different host, which they do not.
+        let two = RequestFacts {
+            host: "b.example.com".to_owned(),
+            ..one.clone()
+        };
+
+        assert_eq!(cached.key_for(&one), cached.key_for(&two));
+        assert!(!cached.decide(&one, at(0)).cached);
+        assert!(
+            cached.decide(&two, at(0)).cached,
+            "a fact no rule consults must not split the cache"
+        );
+    }
+
+    /// GROUP AND ROLE ORDER DOES NOT CHANGE THE KEY. Membership is a set.
+    #[test]
+    fn membership_order_does_not_split_the_cache() {
+        let set = RuleSet::new(vec![allow(
+            "eng",
+            vec![Criterion::Subject(SubjectCheck::InGroup("eng".to_owned()))],
+        )]);
+        let cached = CachedRuleSet::new(set, MemoryStore::new(Duration::from_secs(60)));
+        let one = RequestFacts {
+            subject: Some("u".to_owned()),
+            groups: vec!["eng".to_owned(), "ops".to_owned()],
+            ..facts()
+        };
+        let two = RequestFacts {
+            groups: vec!["ops".to_owned(), "eng".to_owned()],
+            ..one.clone()
+        };
+        assert_eq!(
+            cached.key_for(&one),
+            cached.key_for(&two),
+            "the same caller presented in a different order is the same caller"
+        );
+    }
+
+    /// AN ABSENT HEADER IS NOT THE SAME AS A PRESENT ONE.
+    ///
+    /// This test was written for a hazard that does not exist, and a review proved it: the
+    /// header NAME is in the key structurally, so dropping an absent entry removes a pair
+    /// and can never make two different requests equal. The mutant that skipped absent
+    /// headers survived this test, which passed identically either way.
+    ///
+    /// It is kept because the property it asserts is still worth holding -- a request
+    /// carrying a header the rules read must not share a key with one that lacks it -- and
+    /// because the REAL collision in this area was the opposite shape: two case-spellings of
+    /// one name, covered by
+    /// `two_spellings_of_one_header_cannot_poison_another_callers_entry`.
+    #[test]
+    fn a_missing_header_does_not_share_a_key_with_a_present_one() {
+        let set = RuleSet::new(vec![allow(
+            "svc",
+            vec![Criterion::Header {
+                name: "X-Service".to_owned(),
+                value: "billing".to_owned(),
+            }],
+        )]);
+        let cached = CachedRuleSet::new(set, MemoryStore::new(Duration::from_secs(60)));
+
+        let without = facts();
+        let mut with = facts();
+        with.headers
+            .insert("x-service".to_owned(), "billing".to_owned());
+
+        assert_ne!(cached.key_for(&without), cached.key_for(&with));
+        assert_eq!(cached.decide(&without, at(0)).decision.action, Action::Deny);
+        let allowed = cached.decide(&with, at(0));
+        assert_eq!(
+            allowed.decision.action,
+            Action::Allow,
+            "the header-bearing request must not inherit the bare request's denial"
+        );
+    }
+
+    /// THE TTL BOUNDS HOW STALE A SERVED DECISION CAN BE.
+    #[test]
+    fn an_entry_is_not_served_past_its_ttl() {
+        let ttl = Duration::from_secs(30);
+        let cached = CachedRuleSet::new(admin_rules(), MemoryStore::new(ttl));
+        let request = RequestFacts {
+            path: "/admin/keys".to_owned(),
+            subject: Some("u".to_owned()),
+            roles: vec!["admin".to_owned()],
+            ..facts()
+        };
+
+        assert!(!cached.decide(&request, at(0)).cached, "first call fills");
+        assert!(
+            cached.decide(&request, at(29)).cached,
+            "inside the TTL it is served"
+        );
+        assert!(
+            !cached.decide(&request, at(30)).cached,
+            "AT the TTL it is already too old: the bound is exclusive"
+        );
+
+        // That miss REFILLED the entry at t=30, so the window restarts from there. An
+        // earlier version of this test asserted a miss at t=31 and failed; the TEST was
+        // wrong. A miss that did not refill would mean every request past the first TTL
+        // recomputes forever, which is a cache that stops being one.
+        assert!(
+            cached.decide(&request, at(59)).cached,
+            "the miss at 30 refilled, so 29s later is inside the NEW window"
+        );
+        assert!(
+            !cached.decide(&request, at(60)).cached,
+            "and that window expires exactly one TTL after the refill"
+        );
+    }
+
+    /// A RULE CHANGE TAKES EFFECT IMMEDIATELY, not after the TTL.
+    ///
+    /// The generation is part of the key, so entries computed under the old rules are not
+    /// evicted, they become unreachable. Criterion 6's "TTL plus the invalidation SLO" is
+    /// therefore the TTL for unchanged rules and ZERO for changed ones.
+    #[test]
+    fn replacing_the_rules_takes_effect_before_the_ttl_expires() {
+        let mut cached =
+            CachedRuleSet::new(admin_rules(), MemoryStore::new(Duration::from_secs(3600)));
+        let request = RequestFacts {
+            path: "/admin/keys".to_owned(),
+            subject: Some("u".to_owned()),
+            roles: vec!["admin".to_owned()],
+            ..facts()
+        };
+
+        assert_eq!(
+            cached.decide(&request, at(0)).decision.action,
+            Action::Allow
+        );
+        assert!(cached.decide(&request, at(1)).cached);
+
+        // Revoke, with the old entry still well inside its hour-long TTL.
+        cached.replace_rules(RuleSet::new(vec![deny(
+            "no-admin",
+            vec![Criterion::PathPrefix("/admin".to_owned())],
+        )]));
+
+        let after = cached.decide(&request, at(2));
+        assert_eq!(
+            after.decision.action,
+            Action::Deny,
+            "a revocation must not wait out the TTL"
+        );
+        assert!(
+            !after.cached,
+            "and it must be recomputed, not served from the old generation"
+        );
+    }
+
+    /// A RULE CHANGE ALSO RE-DERIVES WHAT THE KEY COVERS.
+    ///
+    /// New rules can read facts the old ones did not. If `dependencies` were computed once at
+    /// construction, the key would keep omitting a fact the new rules consult, and callers
+    /// the new rules distinguish would share an entry.
+    #[test]
+    fn replacing_the_rules_re_derives_the_key_fields() {
+        let mut cached = CachedRuleSet::new(
+            RuleSet::new(vec![allow(
+                "any-path",
+                vec![Criterion::PathPrefix("/x".to_owned())],
+            )]),
+            MemoryStore::new(Duration::from_secs(60)),
+        );
+        assert!(
+            !cached.dependencies().reads(FactField::Roles),
+            "the first rule set ignores roles"
+        );
+
+        cached.replace_rules(admin_rules());
+        assert!(
+            cached.dependencies().reads(FactField::Roles),
+            "the new rule set reads roles, so the key must now carry them"
+        );
+
+        let admin = RequestFacts {
+            path: "/admin/k".to_owned(),
+            subject: Some("u".to_owned()),
+            roles: vec!["admin".to_owned()],
+            ..facts()
+        };
+        let guest = RequestFacts {
+            roles: vec!["guest".to_owned()],
+            ..admin.clone()
+        };
+        assert_ne!(cached.key_for(&admin), cached.key_for(&guest));
+    }
+
+    /// A CACHE OUTAGE FALLS BACK TO FULL EVALUATION.
+    ///
+    /// A cache is an optimisation, and an optimisation that can refuse a request is a
+    /// liability. The answer is always computable from the rules and the facts.
+    #[test]
+    fn a_cache_outage_still_answers_and_answers_correctly() {
+        let store = FlakyStore::new(Duration::from_secs(60));
+        let cached = CachedRuleSet::new(admin_rules(), store);
+        let admin = RequestFacts {
+            path: "/admin/keys".to_owned(),
+            subject: Some("u".to_owned()),
+            roles: vec!["admin".to_owned()],
+            ..facts()
+        };
+        let guest = RequestFacts {
+            roles: vec!["guest".to_owned()],
+            ..admin.clone()
+        };
+
+        assert_eq!(cached.decide(&admin, at(0)).decision.action, Action::Allow);
+
+        // The cache goes away. The rules are untouched; the store is what fails.
+        cached.store().set_up(false);
+
+        let during = cached.decide(&admin, at(1));
+        assert_eq!(during.decision.action, Action::Allow, "still answered");
+        assert!(!during.cached, "computed, not served");
+        assert!(
+            !during.store_available,
+            "and the outage is reported, not hidden"
+        );
+
+        // And it is still CORRECT during the outage, not just non-failing.
+        let guest_during = cached.decide(&guest, at(1));
+        assert_eq!(
+            guest_during.decision.action,
+            Action::Deny,
+            "an outage must not turn into an admission"
+        );
+
+        // A DOWN CACHE IS NOT WRITTEN TO. Hammering a dead cache with stores on every
+        // request is how a cache outage becomes a latency incident, so the outage path
+        // skips the write entirely rather than attempting one and swallowing the error.
+        let before = cached.store().puts();
+        let _ = cached.decide(&admin, at(1));
+        assert_eq!(
+            cached.store().puts(),
+            before,
+            "an unavailable cache must not be written to on every request"
+        );
+
+        // Recovery needs no intervention.
+        cached.store().set_up(true);
+        let recovered = cached.decide(&admin, at(2));
+        assert!(recovered.store_available);
+        assert!(
+            recovered.cached,
+            "the entry stored before the outage is still live and still served"
+        );
+
+        // And a key that was never stored gets stored now. Checking this with `admin`
+        // would prove nothing: its entry predates the outage and is still inside the TTL,
+        // so that request is a HIT and a hit writes nothing.
+        let fresh = RequestFacts {
+            subject: Some("someone-else".to_owned()),
+            ..admin.clone()
+        };
+        let before_fresh = cached.store().puts();
+        assert!(!cached.decide(&fresh, at(2)).cached);
+        assert!(
+            cached.store().puts() > before_fresh,
+            "once the cache is back, a miss stores again"
+        );
+    }
+
+    /// AN OUTAGE IS REPORTED AS AN OUTAGE, not as a miss.
+    ///
+    /// Both lead to evaluation, but they are different operational events, and a metric that
+    /// cannot tell them apart cannot show an operator their cache is down.
+    #[test]
+    fn an_outage_is_distinguishable_from_a_miss() {
+        let cached = CachedRuleSet::new(admin_rules(), FlakyStore::new(Duration::from_secs(60)));
+        let request = RequestFacts {
+            path: "/admin/keys".to_owned(),
+            subject: Some("u".to_owned()),
+            roles: vec!["admin".to_owned()],
+            ..facts()
+        };
+
+        let miss = cached.decide(&request, at(0));
+        assert!(
+            !miss.cached && miss.store_available,
+            "a miss: cache up, no entry"
+        );
+
+        cached.store().set_up(false);
+        let outage = cached.decide(&request, at(1));
+        assert!(
+            !outage.cached && !outage.store_available,
+            "an outage: distinguishable from the miss above"
+        );
+    }
+
+    /// A RULE SET READING NOTHING COLLAPSES TO ONE ENTRY.
+    #[test]
+    fn rules_that_read_nothing_share_a_single_entry() {
+        let set = RuleSet::new(vec![allow("everything", vec![])]);
+        let cached = CachedRuleSet::new(set, MemoryStore::new(Duration::from_secs(60)));
+        assert!(cached.dependencies().reads_nothing());
+
+        let one = RequestFacts {
+            path: "/a".to_owned(),
+            ..facts()
+        };
+        let two = RequestFacts {
+            path: "/b".to_owned(),
+            subject: Some("anyone".to_owned()),
+            ..facts()
+        };
+        assert_eq!(cached.key_for(&one), cached.key_for(&two));
+        assert!(!cached.decide(&one, at(0)).cached);
+        assert!(cached.decide(&two, at(0)).cached);
+        assert_eq!(cached.rules().rules().len(), 1);
+    }
+
+    /// A CACHED ANSWER IS THE SAME ANSWER, across the whole corpus.
+    #[test]
+    fn caching_never_changes_the_answer() {
+        let plain = corpus_rules();
+        let cached = CachedRuleSet::new(corpus_rules(), MemoryStore::new(Duration::from_secs(60)));
+        for case in corpus_cases() {
+            let expected = plain.decide(&case.facts);
+            // Twice: the miss that fills, and the hit that serves.
+            let first = cached.decide(&case.facts, at(0));
+            let second = cached.decide(&case.facts, at(1));
+            assert_eq!(first.decision, expected, "{}: miss", case.name);
+            assert_eq!(second.decision, expected, "{}: hit", case.name);
+        }
+    }
+
+    /// THE GENERATION IS WHAT INVALIDATES, pinned with the dependencies held CONSTANT.
+    ///
+    /// `replacing_the_rules_takes_effect_before_the_ttl_expires` swaps an admin rule for a
+    /// blanket deny, and those two rule sets read DIFFERENT facts: the key changes because
+    /// `dependencies` changed, not because the generation did. A sweep proved it, twice:
+    /// removing the generation from the key and removing the bump from `replace_rules` both
+    /// left the whole suite green.
+    ///
+    /// So this swaps rules that read EXACTLY the same facts (one path prefix, nothing else)
+    /// and differ only in their answer. Nothing but the generation can make the old entry
+    /// unreachable here.
+    #[test]
+    fn the_generation_alone_invalidates_when_the_key_fields_are_unchanged() {
+        let before = RuleSet::new(vec![allow(
+            "gate",
+            vec![Criterion::PathPrefix("/x".to_owned())],
+        )]);
+        let after = RuleSet::new(vec![deny(
+            "gate",
+            vec![Criterion::PathPrefix("/x".to_owned())],
+        )]);
+        assert_eq!(
+            before.dependencies(),
+            after.dependencies(),
+            "precondition: the two rule sets read the same facts, so only the generation differs"
+        );
+
+        let mut cached = CachedRuleSet::new(before, MemoryStore::new(Duration::from_secs(3600)));
+        let request = RequestFacts {
+            path: "/x/y".to_owned(),
+            ..facts()
+        };
+
+        assert_eq!(
+            cached.decide(&request, at(0)).decision.action,
+            Action::Allow
+        );
+        assert!(
+            cached.decide(&request, at(1)).cached,
+            "precondition: it is cached"
+        );
+
+        let old_key = cached.key_for(&request);
+        cached.replace_rules(after);
+        let new_key = cached.key_for(&request);
+        assert_ne!(
+            old_key, new_key,
+            "the same request must present a different key after a rule change"
+        );
+
+        let served = cached.decide(&request, at(2));
+        assert_eq!(
+            served.decision.action,
+            Action::Deny,
+            "the old admission is unreachable, with an hour of TTL left on it"
+        );
+        assert!(!served.cached);
+    }
+
+    /// THE COLLISION THAT SERVED AN ALLOW TO A DENIED CALLER.
+    ///
+    /// `matches` decides with `.any()` over every header entry whose name matches
+    /// case-insensitively; the key was built with `.find()`, which picks one arbitrarily
+    /// from a `HashMap`. A request carrying two spellings was evaluated against both and
+    /// stored under a key belonging to a different equivalence class, so an ordinary later
+    /// request with one correctly-spelled header was served that stored admission.
+    #[test]
+    fn two_spellings_of_one_header_cannot_poison_another_callers_entry() {
+        let set = RuleSet::new(vec![allow(
+            "billing",
+            vec![Criterion::Header {
+                name: "X-Service".to_owned(),
+                value: "billing".to_owned(),
+            }],
+        )]);
+        let plain = RuleSet::new(set.rules().to_vec());
+        let cached = CachedRuleSet::new(set, MemoryStore::new(Duration::from_secs(60)));
+
+        // Carries BOTH spellings. The engine allows it, because one of them matches.
+        let mut poisoner = facts();
+        poisoner
+            .headers
+            .insert("X-Service".to_owned(), "public".to_owned());
+        poisoner
+            .headers
+            .insert("x-service".to_owned(), "billing".to_owned());
+
+        // Carries only the non-matching spelling. The engine denies it.
+        let mut victim = facts();
+        victim
+            .headers
+            .insert("X-Service".to_owned(), "public".to_owned());
+
+        assert_eq!(
+            plain.decide(&poisoner).action,
+            Action::Allow,
+            "precondition"
+        );
+        assert_eq!(plain.decide(&victim).action, Action::Deny, "precondition");
+
+        assert_ne!(
+            cached.key_for(&poisoner),
+            cached.key_for(&victim),
+            "requests the rules answer differently must not share a key"
+        );
+
+        let _ = cached.decide(&poisoner, at(0));
+        let served = cached.decide(&victim, at(0));
+        assert_eq!(
+            served.decision.action,
+            Action::Deny,
+            "the victim must get its own answer, not the admission stored by the poisoner"
+        );
+    }
+
+    /// THE KEY IS A FUNCTION OF ITS INPUT.
+    ///
+    /// `HashMap` iteration order varies per construction, so a key built by picking one
+    /// arbitrary matching entry was not stable: a review got two different keys from 200
+    /// constructions of one identical request.
+    #[test]
+    fn one_request_always_produces_one_key() {
+        let set = RuleSet::new(vec![allow(
+            "billing",
+            vec![Criterion::Header {
+                name: "X-Service".to_owned(),
+                value: "billing".to_owned(),
+            }],
+        )]);
+        let cached = CachedRuleSet::new(set, MemoryStore::new(Duration::from_secs(60)));
+
+        let build = || {
+            let mut request = facts();
+            request
+                .headers
+                .insert("X-Service".to_owned(), "public".to_owned());
+            request
+                .headers
+                .insert("x-service".to_owned(), "billing".to_owned());
+            cached.key_for(&request)
+        };
+        let first = build();
+        for _ in 0..100 {
+            assert_eq!(
+                build(),
+                first,
+                "the key must not depend on map iteration order"
+            );
+        }
+    }
+
+    /// THE KEY NORMALIZES EXACTLY WHERE THE ENGINE DOES.
+    ///
+    /// Method and host compare case-insensitively, and an empty subject reads as anonymous.
+    /// A key that disagrees splits the cache for callers the rules cannot tell apart: the
+    /// harmless direction, but it makes the feature pointless and it is a second reading of
+    /// the same field.
+    #[test]
+    fn the_key_normalizes_the_same_way_the_engine_compares() {
+        let set = RuleSet::new(vec![allow(
+            "mixed",
+            vec![
+                Criterion::Method(vec!["GET".to_owned()]),
+                Criterion::Host("app.example.com".to_owned()),
+                Criterion::Subject(SubjectCheck::Anonymous),
+            ],
+        )]);
+        let cached = CachedRuleSet::new(set, MemoryStore::new(Duration::from_secs(60)));
+
+        let lower = RequestFacts {
+            method: "get".to_owned(),
+            host: "app.example.com".to_owned(),
+            subject: None,
+            ..facts()
+        };
+        let upper = RequestFacts {
+            method: "GET".to_owned(),
+            host: "APP.Example.COM".to_owned(),
+            // An empty subject is anonymous to the engine, so it must be one caller here.
+            subject: Some(String::new()),
+            ..lower.clone()
+        };
+
+        assert_eq!(
+            cached.key_for(&lower),
+            cached.key_for(&upper),
+            "callers the engine cannot tell apart must share an entry"
+        );
+        assert!(!cached.decide(&lower, at(0)).cached);
+        assert!(cached.decide(&upper, at(0)).cached);
+    }
+
+    /// AN ENTRY STAMPED IN THE FUTURE IS NOT FRESH FOREVER.
+    ///
+    /// `saturating_duration_since` returns zero when the entry is newer than `now`, i.e. age
+    /// zero, i.e. fresh. The comment beside it claimed the opposite for the whole of this
+    /// PR's first version, and a review measured six hits out of six across a simulated year
+    /// on a thirty-second TTL.
+    #[test]
+    fn an_entry_stamped_in_the_future_is_not_served() {
+        let request = RequestFacts {
+            path: "/admin/keys".to_owned(),
+            subject: Some("u".to_owned()),
+            roles: vec!["admin".to_owned()],
+            ..facts()
+        };
+
+        // A FRESH store per probe. Reusing one would prove nothing after the first read:
+        // the miss refills at the reading instant, so the entry is no longer future-stamped
+        // and every later read is a legitimate hit. An earlier version of this test reused
+        // one store and failed on its second probe for exactly that reason.
+        for earlier in [0, 1, 60, 3_600, 86_400] {
+            let cached =
+                CachedRuleSet::new(admin_rules(), MemoryStore::new(Duration::from_secs(30)));
+            assert!(
+                !cached.decide(&request, at(1_000_000)).cached,
+                "precondition: the fill is a miss"
+            );
+            assert!(
+                !cached.decide(&request, at(earlier)).cached,
+                "a future-stamped entry must not be served at t={earlier}"
+            );
+        }
+    }
+
+    /// THE STORE IS BOUNDED, and expired entries are what it drops first.
+    ///
+    /// The path is in the key whenever a rule reads it, and on a forward-auth surface the
+    /// path is unauthenticated attacker input, so unbounded growth is driven by exactly the
+    /// traffic this sits in front of.
+    #[test]
+    fn the_store_does_not_grow_without_bound() {
+        let store = MemoryStore::new(Duration::from_secs(1)).with_max_entries(64);
+        let cached = CachedRuleSet::new(
+            RuleSet::new(vec![allow(
+                "any",
+                vec![Criterion::PathPrefix("/p".to_owned())],
+            )]),
+            store,
+        );
+
+        for n in 0..5_000_u32 {
+            let request = RequestFacts {
+                path: format!("/p/{n}"),
+                ..facts()
+            };
+            // Each request well past the previous entry's TTL, so the expired-entry pass is
+            // the one doing the work.
+            let _ = cached.decide(&request, at(u64::from(n) * 10));
+        }
+        let retained = cached.store().len();
+        assert!(
+            retained <= 64,
+            "the store must stay at or under its ceiling, retained {retained}"
+        );
+        assert!(
+            !cached.store().is_empty(),
+            "and it must still be caching something"
+        );
+    }
+
+    /// A SECOND REPLICA OVER A SHARED STORE CANNOT SERVE REVOKED RULES.
+    ///
+    /// The generation was a per-instance counter starting at zero, so two processes over one
+    /// store both started at zero and the second read the first's entries. A review built
+    /// exactly this and watched a replica holding DENY rules serve a cached ALLOW. The
+    /// fingerprint has no per-instance history, so the same rules agree everywhere and
+    /// different rules never collide.
+    #[test]
+    fn a_replica_with_revoked_rules_does_not_read_the_old_ones_entries() {
+        struct Shared<'a>(&'a MemoryStore);
+        impl DecisionStore for Shared<'_> {
+            fn get(&self, key: &DecisionKey, now: Instant) -> CacheOutcome {
+                self.0.get(key, now)
+            }
+            fn put(&self, key: DecisionKey, decision: Decision, now: Instant) {
+                self.0.put(key, decision, now);
+            }
+        }
+
+        let shared = MemoryStore::new(Duration::from_secs(3600));
+        let permissive = RuleSet::new(vec![allow(
+            "gate",
+            vec![Criterion::PathPrefix("/x".to_owned())],
+        )]);
+        let revoked = RuleSet::new(vec![deny(
+            "gate",
+            vec![Criterion::PathPrefix("/x".to_owned())],
+        )]);
+        assert_eq!(
+            permissive.dependencies(),
+            revoked.dependencies(),
+            "precondition: the two read the same facts, so only the generation can differ"
+        );
+
+        let request = RequestFacts {
+            path: "/x/y".to_owned(),
+            ..facts()
+        };
+
+        let replica_a = CachedRuleSet::new(permissive, Shared(&shared));
+        assert_eq!(
+            replica_a.decide(&request, at(0)).decision.action,
+            Action::Allow
+        );
+
+        // A fresh process that has only ever held the revoked rules.
+        let replica_b = CachedRuleSet::new(revoked, Shared(&shared));
+        let served = replica_b.decide(&request, at(1));
+        assert_eq!(
+            served.decision.action,
+            Action::Deny,
+            "a replica must never serve an answer computed under rules it does not hold"
+        );
+        assert!(!served.cached);
+    }
+
+    /// THE FINGERPRINT DISTINGUISHES EVERY PART OF A RULE A DECISION CAN DEPEND ON.
+    #[test]
+    fn the_fingerprint_changes_with_anything_that_changes_a_decision() {
+        let base = RuleSet::new(vec![allow(
+            "r",
+            vec![Criterion::Header {
+                name: "X-A".to_owned(),
+                value: "one".to_owned(),
+            }],
+        )]);
+        let variants = vec![
+            (
+                "the action",
+                RuleSet::new(vec![deny(
+                    "r",
+                    vec![Criterion::Header {
+                        name: "X-A".to_owned(),
+                        value: "one".to_owned(),
+                    }],
+                )]),
+            ),
+            (
+                // `describe` omits a header's configured value, so the fingerprint hashes it
+                // separately. Without that, two rules requiring different values collide.
+                "the required header value",
+                RuleSet::new(vec![allow(
+                    "r",
+                    vec![Criterion::Header {
+                        name: "X-A".to_owned(),
+                        value: "two".to_owned(),
+                    }],
+                )]),
+            ),
+            (
+                "the header name",
+                RuleSet::new(vec![allow(
+                    "r",
+                    vec![Criterion::Header {
+                        name: "X-B".to_owned(),
+                        value: "one".to_owned(),
+                    }],
+                )]),
+            ),
+            (
+                "the rule name",
+                RuleSet::new(vec![allow(
+                    "other",
+                    vec![Criterion::Header {
+                        name: "X-A".to_owned(),
+                        value: "one".to_owned(),
+                    }],
+                )]),
+            ),
+            ("an added rule", {
+                let mut rules = base.rules().to_vec();
+                rules.push(deny("extra", vec![]));
+                RuleSet::new(rules)
+            }),
+            ("no rules at all", RuleSet::default()),
+        ];
+        for (what, other) in variants {
+            assert_ne!(
+                base.fingerprint(),
+                other.fingerprint(),
+                "changing {what} must change the fingerprint"
+            );
+        }
+
+        // And it is stable: the same rules built twice agree, which is what makes a shared
+        // cache usable at all.
+        let rebuilt = RuleSet::new(base.rules().to_vec());
+        assert_eq!(base.fingerprint(), rebuilt.fingerprint());
+    }
+
+    /// ROLE ORDER DOES NOT SPLIT THE CACHE EITHER.
+    ///
+    /// `membership_order_does_not_split_the_cache` covered groups only, and the roles sort
+    /// was unpinned: its mutant survived.
+    #[test]
+    fn role_order_does_not_split_the_cache() {
+        let set = RuleSet::new(vec![allow(
+            "ops",
+            vec![Criterion::Subject(SubjectCheck::HasRole("ops".to_owned()))],
+        )]);
+        let cached = CachedRuleSet::new(set, MemoryStore::new(Duration::from_secs(60)));
+        let one = RequestFacts {
+            subject: Some("u".to_owned()),
+            roles: vec!["ops".to_owned(), "audit".to_owned()],
+            ..facts()
+        };
+        let two = RequestFacts {
+            roles: vec!["audit".to_owned(), "ops".to_owned()],
+            ..one.clone()
+        };
+        assert_eq!(cached.key_for(&one), cached.key_for(&two));
+        assert!(!cached.decide(&one, at(0)).cached);
+        assert!(cached.decide(&two, at(0)).cached);
+    }
+
+    /// RECLAMATION DROPS THE EXPIRED AND KEEPS THE LIVE.
+    ///
+    /// The size bound alone cannot tell the two passes apart: with the expired-entry pass
+    /// disabled, the fallback still clears and the map still stays small, so
+    /// `the_store_does_not_grow_without_bound` passes either way. A sweep showed that.
+    ///
+    /// What distinguishes them is what SURVIVES. Dropping an expired entry is free, because
+    /// it was already ignored on read. Clearing takes live entries with it, which is a
+    /// correctness-neutral but pointless loss of exactly the entries the cache exists for.
+    #[test]
+    fn reclamation_keeps_a_live_entry_and_drops_the_expired_ones() {
+        let store = MemoryStore::new(Duration::from_secs(1_000)).with_max_entries(16);
+        let cached = CachedRuleSet::new(
+            RuleSet::new(vec![allow(
+                "any",
+                vec![Criterion::PathPrefix("/p".to_owned())],
+            )]),
+            store,
+        );
+        let path = |n: u32| RequestFacts {
+            path: format!("/p/{n}"),
+            ..facts()
+        };
+
+        // Fifteen entries that will be long expired by the time reclamation runs.
+        for n in 0..15_u32 {
+            let _ = cached.decide(&path(n), at(0));
+        }
+
+        // The one that must survive: stored well after the others, and still live.
+        let live = path(999);
+        assert!(!cached.decide(&live, at(5_000)).cached, "fills at 5000");
+
+        // One more insert at the same instant. That is enough to reach the ceiling, so
+        // reclamation runs with the fifteen above expired and the live entry not.
+        let _ = cached.decide(&path(100), at(5_000));
+
+        assert!(
+            cached.decide(&live, at(5_001)).cached,
+            "an entry still inside its TTL must survive a reclamation driven by expired ones"
         );
     }
 }
