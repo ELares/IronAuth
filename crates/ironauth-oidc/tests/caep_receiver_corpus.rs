@@ -20,6 +20,13 @@
 //! fan-out calls, and `scripts/validate-caep-receiver.py` judges them with rules written from
 //! the profile rather than from this repository's code.
 //!
+//! # One type today, and the reason the others are absent is the point
+//!
+//! `session-revoked` is the only CAEP event this build emits. The other three in the vocabulary
+//! have no producer, which `ssf_set::EVENTS_SUPPORTED` states and `caep`'s own tests enforce --
+//! and the corpus covering exactly the advertised set is the same rule one level out. A case for
+//! a type nothing emits would be validating a fixture.
+//!
 //! # Why a public receiver is not what runs in CI
 //!
 //! The criterion names caep.dev "or an equivalent". A build gate that posted to somebody else's
@@ -64,31 +71,37 @@ struct Case {
 
 /// Every CAEP event type this build emits, each built by its own producer.
 ///
-/// # The list is derived, not written twice
+/// # The list is written here and CHECKED against the advertised set, in both directions
 ///
-/// `ssf_set::EVENTS_SUPPORTED` is what a receiver is told it may request, and a case here that
-/// was not on it would be validating an event no receiver can subscribe to. The assertion in the
-/// test below is what keeps the two from drifting: it is the same honesty check
-/// `caep::tests::the_defined_but_unemitted_types_are_not_advertised` makes from the other side.
+/// An earlier version of this doc said the list was "derived, not written twice". It was not:
+/// this is a second hand-written list, and the only assertion over it compared the loop's own
+/// push count to the list it had just iterated, which cannot fail. What keeps it honest is the
+/// pair of checks in the test below -- every case must be ADVERTISED, and every advertised CAEP
+/// type must have a CASE -- and the second is the one that catches a type this build starts
+/// emitting and nobody adds here.
+///
+/// A LIST RATHER THAN A DERIVATION because each case needs its own PRODUCER: the point is that
+/// the corpus is the emitter's output, and `EVENTS_SUPPORTED` carries type strings rather than
+/// the functions that make them.
 fn cases() -> Vec<Case> {
-    vec![
-        Case {
-            label: "session-revoked",
-            // THE REAL MAPPER, with a cause a real revocation carries. `Revoked` is the
-            // individual case; the mapping's own tests cover all six, and what this corpus
-            // needs is one instance of the event's SHAPE.
-            event: caep::session_end_event(SessionEndCause::Revoked, "user", 1_700_000_000_000_000),
-        },
-        Case {
-            label: "token-claims-change",
-            event: caep::map_domain_event(
-                "user.updated",
-                &serde_json::json!({ "user_id": "usr_corpus", "fields": ["claims"] }),
-                1_700_000_000_000,
-            )
-            .expect("a claims update maps to a CAEP event"),
-        },
-    ]
+    vec![Case {
+        label: "session-revoked",
+        // THE REAL MAPPER, with a cause a real revocation carries. `Revoked` is the individual
+        // case; the mapping's own tests cover all six, and what this corpus needs is one
+        // instance of the event's SHAPE.
+        event: caep::session_end_event(SessionEndCause::Revoked, "user", 1_700_000_000_000_000),
+    }]
+}
+
+/// The CAEP types this build advertises, which is what the corpus must cover.
+fn advertised_caep_types() -> Vec<&'static str> {
+    ironauth_oidc::ssf_set::EVENTS_SUPPORTED
+        .iter()
+        .copied()
+        .filter(|event_type| {
+            event_type.starts_with("https://schemas.openid.net/secevent/caep/event-type/")
+        })
+        .collect()
 }
 
 /// Where the corpus lands. The gate sets `CAEP_RECEIVER_CORPUS_DIR`; a bare `cargo test` does not.
@@ -210,13 +223,18 @@ async fn the_caep_receiver_corpus_is_minted_and_written() {
         written.push(case.label);
     }
 
-    // THE COUNT IS DERIVED FROM THE EMITTER, so a type that stops being emitted shrinks the
-    // corpus rather than leaving the validator to notice a missing directory.
-    assert_eq!(
-        written.len(),
-        cases().len(),
-        "every case must be written: {written:?}"
-    );
+    // THE DIRECTION THAT CAN ACTUALLY FAIL: every CAEP type a receiver may subscribe to must
+    // have a case here. The earlier version compared the loop's own push count to the list it
+    // had just iterated, which is the same number by construction -- it would have gone on
+    // passing while a newly emitted type was validated by nothing.
+    for advertised in advertised_caep_types() {
+        assert!(
+            cases()
+                .iter()
+                .any(|case| case.event.event_type == advertised),
+            "{advertised} is advertised to receivers and no corpus case validates it"
+        );
+    }
     assert!(
         !written.is_empty(),
         "an empty corpus would let the validator report success having judged nothing"

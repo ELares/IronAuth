@@ -51,7 +51,7 @@ pub const CREDENTIAL_CHANGE: &str =
 
 /// CAEP 1.0: a claim the transmitter asserts about the subject changed value.
 ///
-/// EMITTED by [`map_domain_event`] from a `user.updated` whose `fields` name `claims`.
+/// DEFINED, NOT EMITTED.
 pub const TOKEN_CLAIMS_CHANGE: &str =
     "https://schemas.openid.net/secevent/caep/event-type/token-claims-change";
 
@@ -224,85 +224,6 @@ pub fn session_end_event(
         event_type: mapping.event_type.to_owned(),
         payload,
     }
-}
-
-/// The domain events that become a CAEP signal, and what each becomes.
-///
-/// # Why this is a second mapping beside `risc::map_domain_event` rather than a branch in it
-///
-/// The two vocabularies answer different questions about the same stream. RISC asks "what
-/// happened to this ACCOUNT" -- disabled, purged, identifiers changed -- and a receiver acts by
-/// deciding whether the person may sign in at all. CAEP asks "what changed about the assertions
-/// I am holding", and a receiver acts by re-reading them. One event can be both, neither, or one
-/// and not the other, and a single function returning one `SecurityEvent` could not say so.
-///
-/// # `user.updated` is the producer, and its `fields` member is the whole decision
-///
-/// The event carries `fields`, an array of what changed, whose members are `claims` and
-/// `traits`. Only the first is a token claim: `traits` are attributes this deployment stores
-/// about a person and does not put in a token, so a receiver told its claims had changed
-/// because somebody edited a trait would re-read a token that says exactly what it said before.
-///
-/// THAT DISTINCTION IS THE POINT OF THE CRITERION. #144 asks for a mapping table in which
-/// "session-revoked is never emitted for a mere credential change"; the same discipline applies
-/// here, and a `user.updated` that touched no claim emits nothing.
-///
-/// # What it does NOT map, and why each absence is deliberate
-///
-/// `org_role.assigned_to_member` and its neighbours change what a token WOULD say, and they are
-/// absent because they carry a `membership_id` rather than a user: emitting from them would mean
-/// resolving membership to user inside the fan-out, which is a store read this consumer does not
-/// make, and a subject this build could get wrong is worse than a signal it does not send.
-/// Mapping them is worth doing and is its own change.
-///
-/// `user.created` and `user.signed_in` are not claim changes. `user.state_changed` is an account
-/// transition and is RISC's, which is the split the module header describes.
-#[must_use]
-pub fn map_domain_event(
-    event_type: &str,
-    payload: &serde_json::Value,
-    occurred_at_unix_ms: i64,
-) -> Option<SecurityEvent> {
-    let caep_type = match event_type {
-        "user.updated" => {
-            // THE ARRAY MUST SAY `claims`. An absent or unreadable `fields` is not a claim
-            // change: the catalog makes it required, so a payload without one is malformed
-            // rather than empty, and inventing a signal from it would announce a change this
-            // build cannot describe.
-            let touched_claims = payload
-                .get("fields")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|fields| {
-                    fields
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .any(|field| field == "claims")
-                });
-            if !touched_claims {
-                return None;
-            }
-            TOKEN_CLAIMS_CHANGE
-        }
-        _ => return None,
-    };
-    let mut body = serde_json::Map::new();
-    // CAEP RENDERS `event_timestamp` IN SECONDS, and the envelope carries MILLISECONDS.
-    // `div_euclid` rather than `/` so a pre-epoch stamp floors instead of truncating toward
-    // zero, which would round it into its own future -- the same conversion `session_end_event`
-    // and `risc::map_domain_event` make, for the same reason.
-    body.insert(
-        "event_timestamp".to_owned(),
-        serde_json::Value::from(occurred_at_unix_ms.div_euclid(1_000)),
-    );
-    // NO `claims` MEMBER, and its absence is a decision rather than an omission. CAEP lets a
-    // transmitter name which claims changed and what they became; this build knows THAT the
-    // claim document changed and not which members of it differ, because `user.updated` carries
-    // the field group rather than a diff. Naming claims we did not compute would be worse than
-    // saying nothing: a receiver that trusted the list would re-read only what we listed.
-    Some(SecurityEvent {
-        event_type: caep_type.to_owned(),
-        payload: body,
-    })
 }
 
 #[cfg(test)]
@@ -556,77 +477,19 @@ mod tests {
     fn the_defined_but_unemitted_types_are_not_advertised() {
         // The honesty check that pairs with the module header: a receiver requesting one of
         // these would be told it will be delivered, and then never hear it.
-        //
-        // THE LIST SHRANK BY ONE when `map_domain_event` gave `token-claims-change` a producer,
-        // and the test below is the other direction of the same property: an emitted type that
-        // is NOT advertised is a signal a receiver cannot ask for.
-        for unemitted in [CREDENTIAL_CHANGE, ASSURANCE_LEVEL_CHANGE] {
+        for unemitted in [
+            CREDENTIAL_CHANGE,
+            TOKEN_CLAIMS_CHANGE,
+            ASSURANCE_LEVEL_CHANGE,
+        ] {
             assert!(
                 !crate::ssf_set::EVENTS_SUPPORTED.contains(&unemitted),
                 "{unemitted} is advertised but nothing emits it"
             );
         }
-        for emitted in [SESSION_REVOKED, TOKEN_CLAIMS_CHANGE] {
-            assert!(
-                crate::ssf_set::EVENTS_SUPPORTED.contains(&emitted),
-                "{emitted} is emitted, so it must be advertised"
-            );
-        }
-    }
-
-    /// `user.updated` becomes a claims change ONLY when it says claims changed.
-    ///
-    /// THE NEGATIVE IS THE POINT. A `fields` naming only `traits` is an edit to something this
-    /// deployment stores and does not put in a token; telling a receiver its claims changed
-    /// would have it re-read a token that says exactly what it said before, and do so every
-    /// time anybody edited a profile.
-    #[test]
-    fn only_a_claim_change_becomes_a_token_claims_change() {
-        let cases: [(&str, &[&str], Option<&str>); 5] = [
-            ("user.updated", &["claims"], Some(TOKEN_CLAIMS_CHANGE)),
-            (
-                "user.updated",
-                &["claims", "traits"],
-                Some(TOKEN_CLAIMS_CHANGE),
-            ),
-            ("user.updated", &["traits"], None),
-            // AN EMPTY OR ABSENT `fields` IS NOT A CLAIM CHANGE. The catalog makes the member
-            // required, so a payload without one is malformed rather than empty -- and a signal
-            // invented from it would announce a change this build cannot describe.
-            ("user.updated", &[], None),
-            // A TYPE ON THE PRODUCER WHITELIST FOR THE OTHER VOCABULARY. `user.deleted` is a
-            // RISC account purge and must not also become a claims change.
-            ("user.deleted", &["claims"], None),
-        ];
-        for (event_type, fields, expected) in cases {
-            let payload = serde_json::json!({ "user_id": "usr_1", "fields": fields });
-            let mapped = map_domain_event(event_type, &payload, 0);
-            assert_eq!(
-                mapped.as_ref().map(|event| event.event_type.as_str()),
-                expected,
-                "{event_type} with fields {fields:?}"
-            );
-        }
-    }
-
-    /// The timestamp is SECONDS, floored, from a millisecond envelope.
-    ///
-    /// A PRE-EPOCH STAMP IS THE CASE WORTH PINNING: `/` truncates toward zero, which moves a
-    /// negative stamp INTO ITS OWN FUTURE, and a receiver ordering events by it would sort the
-    /// oldest last. `div_euclid` floors.
-    #[test]
-    fn the_event_timestamp_is_floored_seconds() {
-        for (millis, expected) in [(1_500, 1_i64), (0, 0), (-1_500, -2), (-1_000, -1)] {
-            let payload = serde_json::json!({ "user_id": "usr_1", "fields": ["claims"] });
-            let event = map_domain_event("user.updated", &payload, millis).expect("maps");
-            assert_eq!(
-                event
-                    .payload
-                    .get("event_timestamp")
-                    .and_then(serde_json::Value::as_i64),
-                Some(expected),
-                "{millis} ms"
-            );
-        }
+        assert!(
+            crate::ssf_set::EVENTS_SUPPORTED.contains(&SESSION_REVOKED),
+            "the fan-out emits this one, so it must be advertised"
+        );
     }
 }

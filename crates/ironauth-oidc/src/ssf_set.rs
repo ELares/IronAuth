@@ -60,17 +60,15 @@ pub const VERIFICATION_EVENT_TYPE: &str =
 /// was empty while nothing produced a SET, gained the verification event with the verification
 /// endpoint, and gains `session-revoked` with the session-end fan-out (issue #144).
 ///
-/// STILL NO TYPE WITHOUT A PRODUCER. `caep::CREDENTIAL_CHANGE` and `caep::ASSURANCE_LEVEL_CHANGE`
-/// are defined in the vocabulary and emitted by nothing, and `risc::CREDENTIAL_COMPROMISE` is a
-/// type this build RECEIVES rather than sends; all of them stay out of this list.
-/// `caep::TOKEN_CLAIMS_CHANGE` joined it when `caep::map_domain_event` gave it a producer.
+/// STILL NO TYPE WITHOUT A PRODUCER. `caep::CREDENTIAL_CHANGE` and its neighbours are defined
+/// in the vocabulary and emitted by nothing, and `risc::CREDENTIAL_COMPROMISE` is a type this
+/// build RECEIVES rather than sends; all of them stay out of this list.
 /// `caep::tests::the_defined_but_unemitted_types_are_not_advertised` and
 /// `risc::tests::the_inbound_only_type_is_not_advertised_as_emitted` keep those facts from
 /// drifting apart.
 pub const EVENTS_SUPPORTED: &[&str] = &[
     VERIFICATION_EVENT_TYPE,
     crate::caep::SESSION_REVOKED,
-    crate::caep::TOKEN_CLAIMS_CHANGE,
     crate::risc::ACCOUNT_DISABLED,
     crate::risc::ACCOUNT_ENABLED,
     crate::risc::ACCOUNT_PURGED,

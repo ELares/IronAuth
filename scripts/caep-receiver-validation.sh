@@ -21,8 +21,14 @@
 # the validator is.
 #
 # THE EVIDENCE IS THE REPORT the validator writes: which event types were accepted, under which
-# algorithm, and how many negative controls each rejected. It is printed here so a CI log carries
-# it, which is what "captured" means for a check that must not depend on a third party.
+# algorithm, how many negative controls each rejected, and which controls did not apply to it. It
+# is printed here so a CI log carries it, which is what "captured" means for a check that must
+# not depend on a third party.
+#
+# THE VALIDATOR CHECKS ITSELF FIRST. A rule that only fires for an event type this build does not
+# emit is exercised by no corpus case, so it would sit in the file looking like coverage and
+# catch nothing -- which is the shape the first version had, and what let a non-conformant
+# `token-claims-change` through. Its self-test runs before any corpus case and fails the gate.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
