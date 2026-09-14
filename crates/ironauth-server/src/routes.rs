@@ -50,16 +50,33 @@ pub async fn healthz() -> impl IntoResponse {
 /// TCP-reachable, 503 otherwise. Provisional until issue #7 replaces the TCP
 /// probe with a real pool health check.
 pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    // THREE OUTCOMES, TWO STATUS CODES, and the asymmetry is deliberate (issue #149
+    // criterion 6). Healthy and DEGRADED are both `200`, because a degraded tier still serves
+    // every flow: answering `503` would have a Kubernetes readiness probe pull the pod out of
+    // its Service because an OPTIONAL component is down, which turns an accelerator outage into
+    // an availability outage. Hard down is the only `503`, because Postgres is the tier
+    // everything is complete on.
+    //
+    // The BODY is what distinguishes healthy from degraded, so an operator and a dashboard see
+    // the tier while the orchestrator keeps routing. It is a stable token rather than prose:
+    // `degraded: accelerator_absent`.
     match state.readiness.probe().await {
         Readiness::Ready => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            "ready\n",
+            std::borrow::Cow::Borrowed("ready\n"),
+        ),
+        Readiness::Degraded(tier) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            std::borrow::Cow::Owned(format!("degraded: {}\n", tier.token())),
         ),
         Readiness::DatabaseUnreachable => (
             StatusCode::SERVICE_UNAVAILABLE,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            "not ready: database address unreachable (provisional check until #7)\n",
+            std::borrow::Cow::Borrowed(
+                "not ready: database address unreachable (provisional check until #7)\n",
+            ),
         ),
     }
 }
