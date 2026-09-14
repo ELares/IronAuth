@@ -1198,9 +1198,10 @@ impl<'a> ScopedStore<'a> {
     /// [`ironauth_hot::HotState`] trait. The SQL lives HERE because every scoped statement in
     /// this crate lives here -- `scripts/query-audit.sh` allows exactly one module, and an
     /// exception for this one would be the first.
-    /// The cross-node hot-state invalidation feed for this scope (issue #147): append a
-    /// "forget this key" to the shared feed inside the transaction that made the change, and
-    /// read forward from a per-node position to apply what other nodes appended.
+    /// The cross-node hot-state invalidation feed for this scope (issue #147).
+    ///
+    /// Append a "forget this key" to the shared feed inside the transaction that made the
+    /// change, and read forward from a per-node position to apply what other nodes appended.
     #[must_use]
     pub fn hot_state_invalidations(&self) -> HotStateInvalidationRepo<'a> {
         HotStateInvalidationRepo {
@@ -25965,6 +25966,64 @@ impl OutboxRepo<'_> {
         Ok(rows.iter().map(|row| row.get("consumer")).collect())
     }
 
+    /// Delete broadcast rows older than `cutoff_micros`, at most `limit` of them.
+    ///
+    /// # It runs on the CONTROL plane, and that is not a detail
+    ///
+    /// `ironauth_app` has no DELETE on `outbox_messages`: migration 0102 grants it to
+    /// `ironauth_control` alone. This was written on the data-plane invalidation repository
+    /// first, where every call returned `permission denied for table outbox_messages` -- found
+    /// by running it, not by reading it. It lives here beside the other two reaps because the
+    /// retention sweeper already holds a control-plane store for exactly this reason.
+    ///
+    /// # Why the existing reaps could not serve
+    ///
+    /// `reap_completed` and `reap_dead_lettered` remove a row once it is COMPLETED or
+    /// DEAD-LETTERED, because for queued work those are the two ways a message stops being owed
+    /// to anybody. A broadcast row is never either: nothing claims it and nothing completes it,
+    /// so both predicates are false for ever. Without this, invalidation rows accumulate in
+    /// `outbox_messages` without bound -- which was true of this feature as first written, and
+    /// is the kind of growth that stays invisible until a feed read is paging through a million
+    /// rows no consumer wants.
+    ///
+    /// # The window IS the staleness bound, which is what makes the cold flush reachable
+    ///
+    /// An age predicate is refused for queued work, and the reaper says why: it would delete
+    /// work that was never delivered. A broadcast row has no delivery to wait for, so age is the
+    /// only rule available -- and it is the right one, because it defines exactly the contract
+    /// #147 criterion 5 describes. A node that has not read within the window finds its position
+    /// pruned, is told to cold flush, and discards its cache. So this window is not a tidy-up
+    /// interval: it is the longest a node may be absent before it must assume it missed
+    /// something, and it is what an operator tunes against the SLO.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn reap_broadcast(&self, cutoff_micros: i64, limit: i64) -> Result<u64, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let removed = sqlx::query(
+            "DELETE FROM outbox_messages \
+             WHERE id IN ( \
+                 SELECT id FROM outbox_messages \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND consumer = $3 \
+                   AND enqueued_at <= \
+                       (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+                 ORDER BY sequence \
+                 LIMIT $5 \
+             )",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(HOT_STATE_INVALIDATION_CONSUMER)
+        .bind(cutoff_micros)
+        .bind(limit)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(removed)
+    }
+
     /// Remove up to `limit` COMPLETED messages of `consumer` in this scope whose
     /// `completed_at` is at or before `cutoff_micros` (issue #104, PR 3). Returns how many
     /// rows were removed.
@@ -32343,10 +32402,24 @@ impl HotStateInvalidationRepo<'_> {
     /// no cache entry and no invalidation. Without a way to abandon a transaction after the
     /// writes, "a rolled-back mutation produces no invalidation" can only be argued.
     ///
+    /// # `#[cfg(feature = "testing")]`, like every other failure-injection seam here
+    ///
+    /// A production build must carry no way to ask for a write to be discarded, and no NAME for
+    /// one. The first version of this was public in every build, which put a boolean on the
+    /// shipped API whose `true` value silently throws away the caller's work -- the shape that
+    /// eventually gets passed by a caller that misread it. The atomicity probes for the joined
+    /// invitation create and the joined recovery approve are gated the same way and for the same
+    /// reason.
+    ///
+    /// It returns `Ok(())` for an abandoned transaction, which is deliberate and is why this is
+    /// test-only: the caller ASKED for it, so it is not an error, and nothing but a test can
+    /// ask.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::Conflict`] if this mutation already announced this key;
-    /// [`StoreError::Database`] on a persistence failure.
+    /// [`StoreError::Database`] on a persistence failure, including a duplicate announcement;
+    /// see [`enqueue_hot_invalidation_in_tx`] for why that is not a typed conflict.
+    #[cfg(feature = "testing")]
     #[allow(clippy::too_many_arguments)]
     pub async fn write_and_announce(
         &self,
@@ -32406,9 +32479,21 @@ impl HotStateInvalidationRepo<'_> {
         match page {
             EventPage::Gone { oldest_retained } => Ok(InvalidationBatch::ColdFlush {
                 // MINUS ONE, so the resumed cursor sits BEFORE the oldest retained row rather
-                // than after it. Adopting `oldest_retained` itself would skip that row, which is
-                // an invalidation this node has never seen -- the exact loss the cold flush is
-                // compensating for, reintroduced by the compensation.
+                // than after it. Adopting `oldest_retained` itself would skip that row, which
+                // this node has never seen -- the exact loss the cold flush is compensating
+                // for, reintroduced by the compensation.
+                //
+                // `oldest_retained` IS THE OLDEST ROW OF ANY CONSUMER IN THE SCOPE, not the
+                // oldest invalidation: `events_page_after` takes `MIN(sequence)` over the whole
+                // feed. So another consumer's retention sweep can trigger this node's cold
+                // flush even though no invalidation was pruned at all.
+                //
+                // That is a SPURIOUS FLUSH and not a wrong answer: the node discards a cache it
+                // was entitled to keep and refills it from the durable tier, which costs reads
+                // and no correctness. Erring this way is the right direction for a mechanism
+                // whose failure in the other direction is serving stale credentials, and
+                // narrowing it would mean a per-consumer MIN, a change to a reader three other
+                // subsystems share.
                 resume_at: oldest_retained.saturating_sub(1),
             }),
             EventPage::Page(messages) => {
@@ -32518,8 +32603,13 @@ impl HotStateInvalidationRepo<'_> {
 ///
 /// # Errors
 ///
-/// [`StoreError::Conflict`] if `mutation` has already produced an invalidation for this key;
-/// [`StoreError::Database`] on a persistence failure.
+/// [`StoreError::Database`] on a persistence failure, INCLUDING a duplicate announcement: a
+/// second call with the same `mutation` for the same key trips the outbox's uniqueness and
+/// arrives here as a database error rather than as a typed conflict, because
+/// `enqueue_outbox_in_tx` does not classify it. Worth knowing rather than discovering, and not
+/// worth a typed variant: in a transactional outbox a producer does not retry an enqueue on its
+/// own, so a duplicate means two domain writes claimed one mutation handle, which is a caller
+/// bug rather than a condition to recover from.
 pub(crate) async fn enqueue_hot_invalidation_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     env: &Env,
@@ -32529,7 +32619,22 @@ pub(crate) async fn enqueue_hot_invalidation_in_tx(
     mutation: &str,
 ) -> Result<(), StoreError> {
     let payload = serde_json::json!({ "use": use_name, "key": key });
-    let idempotency_key = format!("{use_name}:{key}:{mutation}");
+    // LENGTH-PREFIXED, NOT COLON-JOINED. Joining three free-form strings with a separator is
+    // not injective: a cache key may contain a colon (it is whatever a caller chose, and
+    // several registry uses take one an unauthenticated request influenced), so
+    // ("u", "a:b", "m") and ("u", "a", "b:m") produce one string. The collision is a unique
+    // violation that REFUSES the second announcement, so one of the two changes is never
+    // propagated and every node serves its old value -- the same permanent staleness the
+    // per-mutation key exists to prevent, arriving by a different route.
+    //
+    // A length prefix cannot itself be confused, being digits followed by a separator, so the
+    // encoding is unambiguous whatever the components contain.
+    let idempotency_key = format!(
+        "{}:{use_name}:{}:{key}:{}:{mutation}",
+        use_name.len(),
+        key.len(),
+        mutation.len()
+    );
     enqueue_outbox_in_tx(
         tx,
         env,

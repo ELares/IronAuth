@@ -27,10 +27,37 @@
 -- interleaving of deletes that produces a wrong cache, so the ordering guarantee costs
 -- contention and buys nothing here.
 --
--- What invalidation DOES need is the other two properties the feed already has. It must not be
--- applied before the mutation it accompanies is visible, which is what the reader's
--- `xmin < pg_snapshot_xmin(pg_current_snapshot())` watermark gives. And it must not be MISSED,
--- which is what a durable per-node cursor gives.
+-- What invalidation DOES need is that it is not applied before the mutation it accompanies is
+-- visible, which is what the reader's `xmin < pg_snapshot_xmin(pg_current_snapshot())` watermark
+-- gives.
+--
+-- # AN INVALIDATION CAN STILL BE MISSED, and this comment said otherwise
+--
+-- The first version of this paragraph claimed a durable per-node cursor makes an invalidation
+-- impossible to miss. IT DOES NOT, and `events_after`'s own documentation says so, measured:
+-- the watermark is a FILTER and not a prefix cut, so it "serves settled rows that sit ABOVE an
+-- unsettled one, so a cursor can advance past a row that is later filled in and a consumer
+-- never sees it ... The skip is real, PREDATES this change, and belongs to criterion 1."
+--
+-- The inversion is reachable here by construction rather than by bad luck. A producer's `xmin`
+-- is fixed at its transaction's FIRST write, and this producer is called INSIDE a caller's
+-- mutation transaction, after that transaction's own writes -- so a long mutation can hold a
+-- low xid while inserting a high sequence, and a short one that started later can hold a high
+-- xid on a low sequence. A reader then serves the high sequence, checkpoints past the low one,
+-- and the low one is settled beneath every cursor for ever. The append lock would not rescue
+-- it either, for the reason that doc gives: the lock orders INSERTs while `xmin` is fixed
+-- earlier, so two producers can take it in one order and still have inverted xmins.
+--
+-- WHAT THE CURSOR ACTUALLY GIVES is the two things it does give, and they are why it is still
+-- the right shape: DURABILITY across a restart, and BROADCAST, because no other node can
+-- consume a row away from this one.
+--
+-- WHAT BOUNDS THE MISS is the entry's TTL. An invalidation that is skipped leaves a node
+-- serving a stale value until the entry lapses, which for an accelerator use is the ordinary
+-- cost of caching and is why `ironauth_hot` caps every accelerator write at ten seconds. So the
+-- propagation SLO #147 asks for is not the feed's latency alone: it is the LONGER of that and
+-- the cache TTL, and a use whose staleness cannot be bounded by its TTL is a use that should
+-- not be read through a cache at all.
 --
 -- Not taking the lock also avoids inheriting a known deadlock: #1009 records that the advisory
 -- lock cannot be made safe from the data plane, because the insert's referential-integrity check

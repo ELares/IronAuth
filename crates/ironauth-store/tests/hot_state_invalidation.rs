@@ -26,6 +26,67 @@ use ironauth_store::{HOT_STATE_INVALIDATION_CONSUMER, InvalidationBatch};
 /// An hour from the epoch, in microseconds: long enough that nothing in these tests expires.
 const AN_HOUR: i64 = 3_600_000_000;
 
+/// Read a batch, retrying while the feed withholds rows.
+///
+/// # Why a poll and not a single read
+///
+/// The feed gates every read on `xmin < pg_snapshot_xmin(pg_current_snapshot())`, and that
+/// watermark is CLUSTER-WIDE: the oldest transaction anywhere holds it down, including one
+/// belonging to a completely unrelated test running beside this one. A single read can therefore
+/// return an empty page for rows that are committed and settled, and the suite fails under
+/// `--test-threads=2` while passing alone -- which is exactly how this was found.
+///
+/// `events_cursor_ordering.rs` documents meeting the same wall and chose not to assert the
+/// release side at all. These tests need the rows, so they poll instead, which is also what a
+/// production applier does: "not yet" is an ordinary answer from this feed, and an applier that
+/// gave up on the first empty page would be one that stops invalidating whenever somebody runs
+/// a long report.
+///
+/// It is bounded, so a genuine failure to produce the rows still fails the test rather than
+/// hanging.
+/// Apply until something was actually forgotten, for the same watermark reason as
+/// [`batch_with_rows`]. An applier that saw an empty page is not evidence the rows are absent.
+async fn apply_until_forgotten(
+    hot: &dyn ironauth_hot::HotState,
+    store: &ironauth_store::Store,
+    scope: ironauth_store::Scope,
+    env: &Env,
+    node: &str,
+) -> ironauth_store::hot_state::Applied {
+    use ironauth_store::hot_state::{Applied, apply_invalidations};
+    for _ in 0..50 {
+        let applied = apply_invalidations(hot, store, scope, env, node, 100)
+            .await
+            .expect("apply");
+        if applied
+            != (Applied::Forgot {
+                keys: 0,
+                unknown_uses: 0,
+            })
+        {
+            return applied;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the feed never served a row: the watermark did not settle within five seconds")
+}
+
+async fn batch_with_rows(
+    feed: &ironauth_store::HotStateInvalidationRepo<'_>,
+    node: &str,
+    limit: i64,
+) -> InvalidationBatch {
+    for _ in 0..50 {
+        let batch = feed.next_batch(node, limit).await.expect("read");
+        match &batch {
+            InvalidationBatch::Apply { forget, .. } if forget.is_empty() => {}
+            _ => return batch,
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the feed never served a row: the watermark did not settle within five seconds")
+}
+
 #[tokio::test]
 async fn a_change_on_one_node_is_seen_by_every_other_node() {
     // CRITERION 1. Two nodes read one feed from their own positions, so both see the same
@@ -51,7 +112,7 @@ async fn a_change_on_one_node_is_seen_by_every_other_node() {
     .expect("write and announce");
 
     for node in ["node-a", "node-b"] {
-        let batch = feed.next_batch(node, 100).await.expect("read");
+        let batch = batch_with_rows(&feed, node, 100).await;
         let InvalidationBatch::Apply { forget, through } = batch else {
             panic!("{node} was told to cold flush with a fresh feed");
         };
@@ -80,8 +141,7 @@ async fn a_node_that_has_applied_a_change_does_not_see_it_again() {
         .await
         .expect("announce");
 
-    let InvalidationBatch::Apply { forget, through } =
-        feed.next_batch("node-a", 100).await.expect("first read")
+    let InvalidationBatch::Apply { forget, through } = batch_with_rows(&feed, "node-a", 100).await
     else {
         panic!("cold flush on a fresh feed")
     };
@@ -103,8 +163,7 @@ async fn a_node_that_has_applied_a_change_does_not_see_it_again() {
     // AND THE OTHER NODE STILL SEES IT, which is what makes the cursor per node rather than per
     // feed. Without this assertion, a reader that advanced one shared position would pass the
     // check above and silently deprive every other node.
-    let InvalidationBatch::Apply { forget, .. } =
-        feed.next_batch("node-b", 100).await.expect("other node")
+    let InvalidationBatch::Apply { forget, .. } = batch_with_rows(&feed, "node-b", 100).await
     else {
         panic!("cold flush for a node that has never read")
     };
@@ -215,8 +274,7 @@ async fn two_changes_to_one_key_announce_twice() {
     .await
     .expect("second change to the SAME key must also announce");
 
-    let InvalidationBatch::Apply { forget, .. } =
-        feed.next_batch("node-a", 100).await.expect("read")
+    let InvalidationBatch::Apply { forget, .. } = batch_with_rows(&feed, "node-a", 100).await
     else {
         panic!("cold flush")
     };
@@ -319,19 +377,35 @@ async fn another_consumers_row_is_not_read_as_an_invalidation() {
     .await
     .expect("seed a foreign-consumer row");
 
-    let InvalidationBatch::Apply { forget, through } =
-        feed.next_batch("node-a", 100).await.expect("read")
-    else {
-        panic!("cold flush on a fresh feed")
-    };
+    // WAIT FOR THE ROW TO BE VISIBLE BEFORE JUDGING IT. This test's subject is a row that the
+    // reader must IGNORE, and "ignored" and "not served yet" are the same empty `forget` -- so
+    // reading once would let the cluster-wide watermark make it pass without the row ever
+    // having been offered. Polling on `through` advancing is what distinguishes the two: the
+    // cursor moves only when the page actually contained the row.
+    let mut seen = None;
+    for _ in 0..50 {
+        let InvalidationBatch::Apply { forget, through } =
+            feed.next_batch("node-a", 100).await.expect("read")
+        else {
+            panic!("cold flush on a fresh feed")
+        };
+        if through > 0 {
+            seen = Some((forget, through));
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let (forget, through) =
+        seen.expect("the foreign row was never served: the watermark did not settle in 5s");
+
     assert!(
         forget.is_empty(),
         "a row belonging to another consumer must not be read as an invalidation: {forget:?}"
     );
 
-    // AND THE CURSOR STILL ADVANCES PAST IT. The page is a slice of the WHOLE feed, so a reader
-    // that only checkpointed as far as the last INVALIDATION would re-read this row on every
-    // pass for ever. That is the other half of why `through` is the page's last sequence.
+    // AND THE CURSOR ADVANCED PAST IT. The page is a slice of the WHOLE feed, so a reader that
+    // only checkpointed as far as the last INVALIDATION would re-read this row on every pass
+    // for ever. That is the other half of why `through` is the page's last sequence.
     assert!(
         through > 0,
         "the cursor must advance past another consumer's row, not stall on it"
@@ -383,9 +457,7 @@ async fn a_node_behind_the_retained_window_is_told_to_cold_flush() {
     // The first version of this test checkpointed nothing, pruned the oldest row and expected a
     // flush; it got a two-row page, which is the correct answer to the question it actually
     // asked.
-    let InvalidationBatch::Apply { through, .. } =
-        feed.next_batch("node-a", 1).await.expect("read one")
-    else {
+    let InvalidationBatch::Apply { through, .. } = batch_with_rows(&feed, "node-a", 1).await else {
         panic!("cold flush on a fresh feed")
     };
     feed.record_cursor(&env, "node-a", through)
@@ -468,5 +540,338 @@ async fn one_scope_s_invalidations_are_invisible_to_another() {
     assert!(
         forget.is_empty(),
         "another tenant's invalidation must not reach this scope: {forget:?}"
+    );
+}
+
+#[tokio::test]
+async fn applying_a_batch_forgets_the_key_on_this_node_and_checkpoints() {
+    // CRITERION 1's OPERATIVE HALF, which the feed tests alone do not reach: they show the rows
+    // come back, not that any cache entry is invalidated. This drives the applier, so a key
+    // cached on this node is actually gone afterwards.
+    use ironauth_hot::{HotState, Ttl, registry};
+    use ironauth_store::hot_state::{Applied, PgHotState, apply_invalidations};
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = std::sync::Arc::new(db.restart_app_store().await);
+    let hot = PgHotState::new(std::sync::Arc::clone(&store), scope, &env);
+
+    hot.put(
+        &registry::TENANT_CONFIG,
+        "config",
+        b"cached",
+        Ttl::of(std::time::Duration::from_secs(3600)),
+    )
+    .await
+    .expect("cache it");
+    assert_eq!(
+        hot.get(&registry::TENANT_CONFIG, "config").await,
+        Ok(Some(b"cached".to_vec())),
+        "baseline: the entry is there, or the assertion below proves nothing"
+    );
+
+    let feed = store.scoped(scope);
+    feed.hot_state_invalidations()
+        .write_and_announce(
+            &env,
+            "tenant_config",
+            "config",
+            b"v2",
+            AN_HOUR,
+            "another-nodes-change",
+            false,
+        )
+        .await
+        .expect("another node announces");
+
+    let applied = apply_until_forgotten(&hot, &store, scope, &env, "this-node").await;
+    assert_eq!(
+        applied,
+        Applied::Forgot {
+            keys: 1,
+            unknown_uses: 0
+        }
+    );
+    assert_eq!(
+        hot.get(&registry::TENANT_CONFIG, "config").await,
+        Ok(None),
+        "the entry must be GONE from this node's hot state"
+    );
+
+    // AND THE CHECKPOINT LANDED, so a second pass finds nothing. Without this, an applier that
+    // never advanced its cursor would re-delete the same key on every pass for ever.
+    let again = apply_invalidations(&hot, &store, scope, &env, "this-node", 100)
+        .await
+        .expect("second pass");
+    assert_eq!(
+        again,
+        Applied::Forgot {
+            keys: 0,
+            unknown_uses: 0
+        },
+        "a checkpointed node must not re-apply what it already applied"
+    );
+}
+
+#[tokio::test]
+async fn a_use_this_build_does_not_have_is_counted_and_skipped() {
+    // THE ROLLING-UPGRADE CASE. A newer node announces a use this build does not know; there is
+    // nothing here to forget, and that must not be an error, a panic, or a stalled cursor.
+    use ironauth_hot::{HotState, Ttl, registry};
+    use ironauth_store::hot_state::{Applied, PgHotState};
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = std::sync::Arc::new(db.restart_app_store().await);
+    let hot = PgHotState::new(std::sync::Arc::clone(&store), scope, &env);
+    hot.put(
+        &registry::JWKS,
+        "kid",
+        b"v",
+        Ttl::of(std::time::Duration::from_secs(3600)),
+    )
+    .await
+    .expect("cache something this build DOES know");
+
+    let feed = store.scoped(scope);
+    let feed = feed.hot_state_invalidations();
+    feed.write_and_announce(
+        &env,
+        "a_use_from_the_future",
+        "k",
+        b"v",
+        AN_HOUR,
+        "m1",
+        false,
+    )
+    .await
+    .expect("announce an unknown use");
+    feed.write_and_announce(&env, "jwks", "kid", b"v", AN_HOUR, "m2", false)
+        .await
+        .expect("announce a known one");
+
+    let applied = apply_until_forgotten(&hot, &store, scope, &env, "this-node").await;
+    assert_eq!(
+        applied,
+        Applied::Forgot {
+            keys: 1,
+            unknown_uses: 1
+        },
+        "the unknown use is counted and skipped, and the known one is still applied"
+    );
+    assert_eq!(
+        hot.get(&registry::JWKS, "kid").await,
+        Ok(None),
+        "an unknown use earlier in the batch must not strand the ones after it"
+    );
+}
+
+#[tokio::test]
+async fn a_cold_flush_checkpoints_so_it_is_not_repeated_for_ever() {
+    // THE APPLIER'S HALF OF CRITERION 5. Returning MustColdFlush without recording the position
+    // would tell a caller to flush on every pass for ever, because the cursor would still sit
+    // behind the retained window.
+    use ironauth_hot::{HotState, Ttl, registry};
+    use ironauth_store::hot_state::{Applied, PgHotState, apply_invalidations};
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = std::sync::Arc::new(db.restart_app_store().await);
+    let hot = PgHotState::new(std::sync::Arc::clone(&store), scope, &env);
+    let feed = store.scoped(scope);
+    let feed = feed.hot_state_invalidations();
+
+    for change in 0..4 {
+        feed.write_and_announce(
+            &env,
+            "jwks",
+            "kid",
+            b"v",
+            AN_HOUR,
+            &format!("change-{change}"),
+            false,
+        )
+        .await
+        .expect("announce");
+    }
+    let InvalidationBatch::Apply { through, .. } = batch_with_rows(&feed, "node-a", 1).await else {
+        panic!("cold flush on a fresh feed")
+    };
+    feed.record_cursor(&env, "node-a", through)
+        .await
+        .expect("checkpoint");
+    sqlx::query("DELETE FROM outbox_messages WHERE sequence <= $1")
+        .bind(through + 1)
+        .execute(db.owner_pool())
+        .await
+        .expect("prune past the node's position");
+
+    assert_eq!(
+        apply_invalidations(&hot, &store, scope, &env, "node-a", 100)
+            .await
+            .expect("apply"),
+        Applied::MustColdFlush,
+        "a node behind the window must be told to flush"
+    );
+
+    // AND NOT AGAIN. The caller has flushed; a second pass must resume normally.
+    assert!(
+        matches!(
+            apply_invalidations(&hot, &store, scope, &env, "node-a", 100)
+                .await
+                .expect("second pass"),
+            Applied::Forgot { .. }
+        ),
+        "a flushed node must resume, not be told to flush for ever"
+    );
+
+    // AND THE CACHE IS UNTOUCHED BY THE FLUSH SIGNAL ITSELF. `apply_invalidations` must not
+    // empty the durable tier: that is the copy the cold flush falls back ON, and deleting it
+    // would turn a cache miss into data loss.
+    hot.put(
+        &registry::JWKS,
+        "survivor",
+        b"v",
+        Ttl::of(std::time::Duration::from_secs(3600)),
+    )
+    .await
+    .expect("write");
+    let _ = apply_invalidations(&hot, &store, scope, &env, "node-b", 100).await;
+    assert_eq!(
+        hot.get(&registry::JWKS, "survivor").await,
+        Ok(Some(b"v".to_vec())),
+        "the applier must never empty the durable tier itself"
+    );
+}
+
+#[tokio::test]
+async fn broadcast_rows_are_reaped_by_age_because_nothing_completes_them() {
+    // UNBOUNDED GROWTH, WHICH THIS FEATURE SHIPPED WITH. The reaper removes a row once it is
+    // COMPLETED or DEAD-LETTERED; an invalidation is never either, so both predicates are false
+    // for ever and the rows accumulate. Age is the only rule available, and it is the same
+    // number that bounds how far a node may fall behind.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.restart_app_store().await;
+    let feed = store.scoped(scope);
+    let feed = feed.hot_state_invalidations();
+    // THE REAP IS A CONTROL-PLANE OPERATION. `ironauth_app` has no DELETE on
+    // `outbox_messages`, so a data-plane handle answers `permission denied` -- which is how the
+    // first version of this test failed, and why `reap_broadcast` lives on `OutboxRepo`.
+    let control = db.control_store();
+    let reaper = control.scoped(scope);
+    let reaper = reaper.outbox();
+
+    for change in 0..3 {
+        feed.write_and_announce(
+            &env,
+            "jwks",
+            "kid",
+            b"v",
+            AN_HOUR,
+            &format!("c{change}"),
+            false,
+        )
+        .await
+        .expect("announce");
+    }
+
+    // A cutoff BEFORE every row: nothing is old enough yet, which is the control. Without it a
+    // reap that deleted unconditionally would pass the assertion below.
+    assert_eq!(
+        reaper.reap_broadcast(0, 100).await.expect("reap"),
+        0,
+        "nothing is past a cutoff at the epoch"
+    );
+
+    let removed = reaper
+        .reap_broadcast(i64::MAX, 100)
+        .await
+        .expect("reap everything older than the end of time");
+    assert_eq!(removed, 3, "every broadcast row is removable by age");
+
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox_messages WHERE consumer = $1")
+        .bind(HOT_STATE_INVALIDATION_CONSUMER)
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("count");
+    assert_eq!(left, 0, "and they are gone from the table");
+}
+
+#[tokio::test]
+async fn a_reap_does_not_touch_another_consumers_rows() {
+    // THE CONSUMER FILTER ON THE REAP. Without it, an age-based delete over the shared feed
+    // would remove webhook event rows that no consumer had delivered -- the exact thing the
+    // reaper's own doc refuses age-based deletion for.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.restart_app_store().await;
+    let feed = store.scoped(scope);
+    let feed = feed.hot_state_invalidations();
+
+    let control = db.control_store();
+    let reaper = control.scoped(scope);
+    let reaper = reaper.outbox();
+
+    feed.write_and_announce(&env, "jwks", "kid", b"v", AN_HOUR, "c1", false)
+        .await
+        .expect("announce");
+    sqlx::query(
+        "INSERT INTO outbox_messages \
+         (id, tenant_id, environment_id, consumer, idempotency_key, ordering_key, payload, \
+          next_attempt_at, enqueued_at) \
+         VALUES ($1, $2, $3, 'webhook.delivery', 'keep-me', 'keep-me', '{}'::jsonb, now(), now())",
+    )
+    .bind("obm_a2VlcC1tZS0wMDAwMDAwMA")
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("seed another consumer's row");
+
+    assert_eq!(
+        reaper.reap_broadcast(i64::MAX, 100).await.expect("reap"),
+        1,
+        "only the invalidation goes"
+    );
+    let survivors: Vec<(String,)> =
+        sqlx::query_as("SELECT consumer FROM outbox_messages ORDER BY consumer")
+            .fetch_all(db.owner_pool())
+            .await
+            .expect("select");
+    assert_eq!(
+        survivors,
+        vec![("webhook.delivery".to_owned(),)],
+        "another consumer's undelivered row must survive an age-based reap"
+    );
+}
+
+#[tokio::test]
+async fn a_checkpoint_moves_a_cursor_forward_from_an_existing_row() {
+    // THE UPDATE ARM, which nothing pinned: every other checkpoint in this file either creates
+    // the row or tries to move it BACKWARDS. `ON CONFLICT DO NOTHING` would pass all of them,
+    // and a cursor that never advances after its first write re-applies every invalidation for
+    // ever.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.restart_app_store().await;
+    let feed = store.scoped(scope);
+    let feed = feed.hot_state_invalidations();
+
+    feed.record_cursor(&env, "node-a", 10).await.expect("first");
+    assert_eq!(feed.cursor_for("node-a").await.expect("read"), 10);
+    feed.record_cursor(&env, "node-a", 20)
+        .await
+        .expect("advance");
+    assert_eq!(
+        feed.cursor_for("node-a").await.expect("read"),
+        20,
+        "a later, higher checkpoint must move the cursor forward"
     );
 }

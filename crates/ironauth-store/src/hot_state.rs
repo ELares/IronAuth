@@ -369,3 +369,106 @@ impl HotState for PgHotState {
         })
     }
 }
+
+/// What applying a batch of invalidations did (issue #147).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Applied {
+    /// Entries forgotten, and the cursor recorded.
+    Forgot {
+        /// How many keys were deleted from this node's hot state.
+        keys: usize,
+        /// How many named a use this build does not have, and were therefore skipped.
+        ///
+        /// NOT AN ERROR. During a rolling upgrade a newer node announces a use an older one does
+        /// not know, and a retired use leaves rows naming it behind. A use this build does not
+        /// have is a use this build caches nothing for, so there is nothing to forget -- but the
+        /// count is reported rather than swallowed, because a number that is persistently
+        /// non-zero outside an upgrade means the registries have diverged.
+        unknown_uses: usize,
+    },
+    /// This node fell behind the retained window and must discard everything it holds.
+    ///
+    /// THE CALLER DOES THE FLUSHING, not this function, and the split is deliberate: what has to
+    /// be discarded is the ACCELERATOR, and only the caller knows what it attached. Flushing a
+    /// [`ironauth_hot::Tiered`]'s fast tier is a different operation from flushing a bare
+    /// `PgHotState`, which holds the durable copy and must NOT be emptied -- doing so would
+    /// delete the data the cold flush exists to fall back on.
+    MustColdFlush,
+}
+
+/// Apply everything this node has not yet seen, and checkpoint.
+///
+/// # This is the consuming half of #147, and without it the feed is a write-only log
+///
+/// The producer side appends "forget this key" transactionally with the change. Nothing
+/// propagates until something reads those rows and calls [`HotState::delete`] on the node's own
+/// hot state, which is what this does. Criterion 1 -- "a config change on one node invalidates
+/// the corresponding cache entries on all nodes" -- is about this function existing and being
+/// called, not about the rows being appended.
+///
+/// # The checkpoint is recorded AFTER the deletes, and that ordering is the safety property
+///
+/// A crash between a delete and the checkpoint re-applies that delete on the next pass, which
+/// costs nothing: forgetting a key twice is forgetting it. A crash between a checkpoint and its
+/// deletes would skip them permanently, and the node would serve a stale value with no way to
+/// learn otherwise. So the cheap failure is chosen deliberately over the silent one.
+///
+/// # Errors
+///
+/// [`HotError::Unavailable`] if the feed cannot be read or the checkpoint cannot be written.
+/// A FAILING DELETE DOES NOT ABORT THE BATCH: one unreachable key must not strand every later
+/// invalidation behind it, and the un-advanced cursor means the whole batch is retried.
+pub async fn apply_invalidations(
+    hot: &dyn HotState,
+    store: &Store,
+    scope: Scope,
+    env: &Env,
+    node: &str,
+    limit: i64,
+) -> Result<Applied, HotError> {
+    let feed = store.scoped(scope);
+    let feed = feed.hot_state_invalidations();
+    let batch = feed
+        .next_batch(node, limit)
+        .await
+        .map_err(|_| HotError::Unavailable)?;
+
+    let (forget, through) = match batch {
+        crate::repository::InvalidationBatch::ColdFlush { resume_at } => {
+            // CHECKPOINT FIRST, THEN TELL THE CALLER. If this returned without recording the
+            // position, a caller that flushed its accelerator would be told to flush again on
+            // every pass for ever, because the cursor would still be behind the window.
+            feed.record_cursor(env, node, resume_at)
+                .await
+                .map_err(|_| HotError::Unavailable)?;
+            return Ok(Applied::MustColdFlush);
+        }
+        crate::repository::InvalidationBatch::Apply { forget, through } => (forget, through),
+    };
+
+    let mut keys = 0;
+    let mut unknown_uses = 0;
+    let mut all_deleted = true;
+    for (use_name, key) in &forget {
+        let Some(r#use) = ironauth_hot::registry::by_name(use_name) else {
+            unknown_uses += 1;
+            continue;
+        };
+        if hot.delete(r#use, key).await.is_ok() {
+            keys += 1;
+        } else {
+            all_deleted = false;
+        }
+    }
+
+    // THE CURSOR ADVANCES ONLY IF EVERY DELETE LANDED. A checkpoint past a key this node failed
+    // to forget is a stale entry nothing will ever revisit, so a partial batch is retried whole.
+    // Retrying costs repeated deletes, which are idempotent; not retrying costs a wrong answer.
+    if all_deleted {
+        feed.record_cursor(env, node, through)
+            .await
+            .map_err(|_| HotError::Unavailable)?;
+    }
+
+    Ok(Applied::Forgot { keys, unknown_uses })
+}
