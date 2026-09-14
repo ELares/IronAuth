@@ -717,3 +717,361 @@ async fn an_oversized_value_is_malformed_and_not_an_outage() {
         "and a value AT the bound must still be written"
     );
 }
+
+/// The registry's declared ceiling for a use, so a test names the same number the code does
+/// rather than a copy of it that can drift.
+fn ceiling(r#use: &'static ironauth_hot::HotUse) -> u32 {
+    r#use
+        .per_scope_entry_quota()
+        .expect("this test is about a use that declares a ceiling")
+}
+
+/// Fill a scope to `rows` live entries for `use_name` in ONE statement.
+///
+/// # Why the setup does not go through the API
+///
+/// Writing ten thousand entries one `put` at a time is ten thousand transactions, each with its
+/// own scope binding, count and commit. That is minutes of CI time spent re-testing the single
+/// write these tests already exercise once, and it is the kind of slow test that later gets a
+/// bigger timeout instead of a fix.
+///
+/// What is under test is the BOUNDARY -- the write at the ceiling and the one past it -- and
+/// those still go through `PgHotState`. The rows below are indistinguishable from ones the API
+/// wrote IN EVERY RESPECT THE CEILING READS: same columns, same scope, same use, an
+/// `expires_at` in the same `timestamptz` column at the same offset from the epoch.
+///
+/// It gets there differently, and that difference is worth naming rather than glossing: the API
+/// computes `now + ttl` from the clock seam, while this binds the offset directly. Since these
+/// tests run at the deterministic clock's own epoch the two agree, and nothing the quota does
+/// reads `expires_at` except to compare it against an instant. A test that cared how the value
+/// was DERIVED could not use this.
+///
+/// Seeding through the owner pool skips row-level security, which is what makes this a setup
+/// step rather than part of the measurement.
+async fn fill_to(
+    db: &TestDatabase,
+    scope: ironauth_store::Scope,
+    use_name: &str,
+    rows: u32,
+    ttl_secs: i64,
+) {
+    sqlx::query(
+        "INSERT INTO hot_state (tenant_id, environment_id, use_name, key, value, expires_at) \
+         SELECT $1, $2, $3, 'seed-' || generated, '\\x01'::bytea, \
+                TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+         FROM generate_series(1, $4) AS generated",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(use_name)
+    .bind(i32::try_from(rows).expect("row count fits i32"))
+    .bind(ttl_secs * 1_000_000)
+    .execute(db.owner_pool())
+    .await
+    .expect("seed");
+}
+
+#[tokio::test]
+async fn an_anonymous_flood_stops_at_the_declared_ceiling() {
+    // CRITERION 5. "A synthetic pre-auth flood cannot grow storage unbounded" -- the Dex #1292
+    // shape, an unauthenticated flow-row denial of service open since 2018. PRE_AUTH_QUOTA is
+    // the use named for it, and every entry is caused by an anonymous request by definition.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 7);
+    let scope = db.seed_scope(&env).await;
+    let hot = PgHotState::new(Arc::new(db.restart_app_store().await), scope, &env);
+
+    // A SMALL STAND-IN FOR THE CEILING would be a different test. This drives the real declared
+    // number, so a change to the registry that raised it past what this asserts fails here.
+    let cap = ceiling(&registry::PRE_AUTH_QUOTA);
+    fill_to(&db, scope, "pre_auth_quota", cap - 1, 60).await;
+
+    // THE LAST ADMITTED WRITE goes through the API, so the boundary is measured and not seeded.
+    hot.put(&registry::PRE_AUTH_QUOTA, "the-last-one", b"1", a_minute())
+        .await
+        .expect("the entry that reaches the ceiling exactly must be admitted");
+
+    assert_eq!(
+        hot.put(&registry::PRE_AUTH_QUOTA, "one-too-many", b"1", a_minute())
+            .await,
+        Err(ironauth_hot::HotError::QuotaExceeded),
+        "the entry past the ceiling must be refused"
+    );
+
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM hot_state WHERE use_name = 'pre_auth_quota'")
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("count");
+    assert_eq!(
+        rows,
+        i64::from(cap),
+        "storage stopped growing at the ceiling, which is the whole claim"
+    );
+}
+
+#[tokio::test]
+async fn a_use_at_its_ceiling_can_still_refresh_an_entry_it_holds() {
+    // THE ARM THAT MAKES THE CEILING USABLE. Overwriting a key adds no row, so refusing it would
+    // stop a rate counter from counting the very subject it was already counting -- the opposite
+    // of what the ceiling is for, and a self-inflicted outage at exactly the moment of load the
+    // ceiling exists for.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 7);
+    let scope = db.seed_scope(&env).await;
+    let hot = PgHotState::new(Arc::new(db.restart_app_store().await), scope, &env);
+
+    let cap = ceiling(&registry::PRE_AUTH_QUOTA);
+    fill_to(&db, scope, "pre_auth_quota", cap - 1, 60).await;
+    hot.put(&registry::PRE_AUTH_QUOTA, "held-0", b"first", a_minute())
+        .await
+        .expect("reach the ceiling exactly");
+
+    assert_eq!(
+        hot.put(&registry::PRE_AUTH_QUOTA, "held-0", b"second", a_minute())
+            .await,
+        Ok(()),
+        "a key the scope already holds must remain writable at the ceiling"
+    );
+    assert_eq!(
+        hot.get(&registry::PRE_AUTH_QUOTA, "held-0").await,
+        Ok(Some(b"second".to_vec())),
+        "and the write must have landed, not merely been reported as accepted"
+    );
+}
+
+#[tokio::test]
+async fn reaching_the_ceiling_prunes_the_dead_before_refusing() {
+    // WHERE THE SWEEP GETS ITS CALLER. Pruning on every write costs a delete per request;
+    // pruning here costs nothing until the ceiling is actually reached, which is the only moment
+    // it changes an outcome. Without it a scope whose entries had all EXPIRED would stay refused
+    // until a background job nobody has scheduled happened to run.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 7);
+    let scope = db.seed_scope(&env).await;
+    let hot = PgHotState::new(Arc::new(db.restart_app_store().await), scope, &env);
+
+    let cap = ceiling(&registry::PRE_AUTH_QUOTA);
+    fill_to(&db, scope, "pre_auth_quota", cap, 30).await;
+    assert_eq!(
+        hot.put(&registry::PRE_AUTH_QUOTA, "blocked", b"1", a_minute())
+            .await,
+        Err(ironauth_hot::HotError::QuotaExceeded),
+        "the control: while those entries are LIVE the ceiling refuses"
+    );
+
+    clock.advance(Duration::from_secs(31));
+
+    assert_eq!(
+        hot.put(&registry::PRE_AUTH_QUOTA, "after-expiry", b"1", a_minute())
+            .await,
+        Ok(()),
+        "once they are dead the same write must be admitted, without any sweep having run"
+    );
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM hot_state WHERE use_name = 'pre_auth_quota'")
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("count");
+    assert_eq!(
+        rows, 1,
+        "and the dead rows are GONE rather than merely ignored: the prune is what made room"
+    );
+}
+
+#[tokio::test]
+async fn a_claim_refused_by_the_ceiling_does_not_report_losing_the_race() {
+    // THE LIE THIS AVOIDS. Folding the count into the claim's INSERT would make a quota refusal
+    // and a lost race both zero rows, and `put_if_absent` reports zero rows as `Ok(false)` --
+    // "somebody else got there first". For SINGLE_USE_MARKER that is a correctness use being
+    // told a falsehood: it will not redeem, and the artifact it protects is refused for a reason
+    // that has nothing to do with whether anyone claimed it.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 7);
+    let scope = db.seed_scope(&env).await;
+    let hot = PgHotState::new(Arc::new(db.restart_app_store().await), scope, &env);
+
+    // SINGLE_USE_MARKER, because it is the use the argument above is ABOUT: it is the only
+    // Correctness use an anonymous caller can reach, so it is the only one where being told
+    // "somebody got there first" changes a decision rather than a statistic. An earlier version
+    // of this test made that argument and then drove PRE_AUTH_QUOTA, which is not a Correctness
+    // use at all.
+    let cap = ceiling(&registry::SINGLE_USE_MARKER);
+    fill_to(&db, scope, "single_use_marker", cap, 60).await;
+
+    let answer = hot
+        .put_if_absent(&registry::SINGLE_USE_MARKER, "fresh-key", b"1", a_minute())
+        .await;
+    assert_eq!(
+        answer,
+        Err(ironauth_hot::HotError::QuotaExceeded),
+        "a claim blocked by the ceiling must say so"
+    );
+    assert_ne!(
+        answer,
+        Ok(false),
+        "and must NOT say the key was already held, which is what a folded count would report"
+    );
+    assert_ne!(answer, Ok(true), "nor that it was won");
+
+    // AND A KEY THE SCOPE ALREADY HOLDS IS STILL ANSWERED BY THE CLAIM, not by the ceiling. A
+    // live holder means somebody got there first, which is the true answer and a different one
+    // from "the store is full"; without this the implementation could return QuotaExceeded for
+    // every claim at the ceiling and the assertions above would not notice.
+    assert_eq!(
+        hot.put_if_absent(&registry::SINGLE_USE_MARKER, "seed-1", b"1", a_minute())
+            .await,
+        Ok(false),
+        "a key held by a live row must be reported as lost, not as a quota refusal"
+    );
+}
+
+#[tokio::test]
+async fn a_claim_at_the_ceiling_prunes_the_dead_before_refusing() {
+    // THE CLAIM PATH'S OWN PRUNE, which nothing pinned: the equivalent test above drives `put`,
+    // so deleting the prune from `put_if_absent` left every test green. The two paths reach it
+    // differently -- `put` retries its guarded upsert, the claim probes for a holder first -- so
+    // one covering the other is an assumption rather than a measurement.
+    //
+    // What it protects is worse here than for `put`. A single-use marker that cannot be claimed
+    // is an artifact that cannot be redeemed, and a scope whose markers have ALL expired would
+    // otherwise stay unredeemable until something else happened to write.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 7);
+    let scope = db.seed_scope(&env).await;
+    let hot = PgHotState::new(Arc::new(db.restart_app_store().await), scope, &env);
+
+    let cap = ceiling(&registry::SINGLE_USE_MARKER);
+    fill_to(&db, scope, "single_use_marker", cap, 30).await;
+
+    assert_eq!(
+        hot.put_if_absent(&registry::SINGLE_USE_MARKER, "code-a", b"1", a_minute())
+            .await,
+        Err(ironauth_hot::HotError::QuotaExceeded),
+        "the control: while those markers are LIVE a new claim is refused"
+    );
+
+    clock.advance(Duration::from_secs(31));
+
+    assert_eq!(
+        hot.put_if_absent(&registry::SINGLE_USE_MARKER, "code-a", b"1", a_minute())
+            .await,
+        Ok(true),
+        "once they are dead the claim must be WON, not merely admitted: a marker nobody holds \
+         is a marker this caller gets"
+    );
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM hot_state WHERE use_name = 'single_use_marker'")
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("count");
+    assert_eq!(
+        rows, 1,
+        "and the dead markers are GONE: the claim path pruned them rather than the write \
+         succeeding for some other reason"
+    );
+}
+
+#[tokio::test]
+async fn a_ceiling_reached_for_one_use_does_not_bind_another() {
+    // THE PER-USE GRAIN, which nothing else pins. The ceiling, the count and the prune are all
+    // keyed on (scope, use); an implementation that dropped `use_name` from any of the three
+    // would let one flooded use refuse writes for every other use in the tenant -- turning a
+    // bounded artifact class into a tenant-wide outage, which is the failure the per-scope
+    // grain was chosen to avoid in the first place.
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 7);
+    let scope = db.seed_scope(&env).await;
+    let hot = PgHotState::new(Arc::new(db.restart_app_store().await), scope, &env);
+
+    let flooded = ceiling(&registry::PRE_AUTH_QUOTA);
+    fill_to(&db, scope, "pre_auth_quota", flooded, 30).await;
+    assert_eq!(
+        hot.put(&registry::PRE_AUTH_QUOTA, "blocked", b"1", a_minute())
+            .await,
+        Err(ironauth_hot::HotError::QuotaExceeded),
+        "the control: the flooded use is refused"
+    );
+
+    // A DIFFERENT ANONYMOUS USE, with its own ceiling, nowhere near it.
+    //
+    // THE SAME SHORT TTL AS THE FLOOD, deliberately. These two entries have to be EXPIRED at
+    // the moment the prune below runs, or they are not evidence: a prune that had dropped
+    // `use_name` from its WHERE would delete every expired row in the scope, and with these
+    // still live there would be nothing of theirs for it to take. Giving them a minute is what
+    // an earlier version did, and it made the final assertion unable to fail.
+    let short = Ttl::of(Duration::from_secs(30));
+    assert_eq!(
+        hot.put(&registry::RATE_COUNTER, "subject-1", b"1", short)
+            .await,
+        Ok(()),
+        "a different use must be unaffected by the flooded one's ceiling"
+    );
+    // AND A USE WITH NO CEILING AT ALL.
+    assert_eq!(
+        hot.put(&registry::JWKS, "kid-1", b"1", short).await,
+        Ok(()),
+        "and so must a use that declares no ceiling"
+    );
+
+    // THE PRUNE IS PER USE TOO. Expire everything, then drive a write on the flooded use: its
+    // own dead rows go, and the two entries belonging to other uses must not.
+    clock.advance(Duration::from_secs(31));
+    hot.put(&registry::PRE_AUTH_QUOTA, "after", b"1", a_minute())
+        .await
+        .expect("admitted once its own dead rows are pruned");
+
+    let by_use: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT use_name, count(*) FROM hot_state GROUP BY use_name ORDER BY use_name",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("select");
+    assert_eq!(
+        by_use,
+        vec![
+            ("jwks".to_owned(), 1),
+            ("pre_auth_quota".to_owned(), 1),
+            ("rate_counter".to_owned(), 1),
+        ],
+        "the prune must have taken ONLY the flooded use's dead rows: the other two entries are \
+         equally expired and equally unswept, and a prune that ignored use_name would have \
+         taken them too"
+    );
+}
+
+#[tokio::test]
+async fn a_use_with_no_ceiling_is_not_bounded_by_one() {
+    // THE CONTROL FOR EVERY ASSERTION ABOVE. Without it, an implementation that refused every
+    // write past some fixed number -- or that treated `None` as zero -- passes all four, and the
+    // three uses no anonymous caller can reach would be silently capped.
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 7);
+    let scope = db.seed_scope(&env).await;
+    let hot = PgHotState::new(Arc::new(db.restart_app_store().await), scope, &env);
+
+    assert_eq!(
+        registry::JWKS.per_scope_entry_quota(),
+        None,
+        "JWKS is the Authenticated-reach use this test is about"
+    );
+    // PAST THE LARGEST DECLARED CEILING, so no ceiling in the registry could admit this write.
+    // An earlier version used the SMALLEST, which would have missed an implementation that
+    // applied some other use's larger number to every use.
+    let past_every_ceiling = [
+        &registry::PRE_AUTH_QUOTA,
+        &registry::RATE_COUNTER,
+        &registry::SINGLE_USE_MARKER,
+    ]
+    .into_iter()
+    .map(ceiling)
+    .max()
+    .expect("the registry declares at least one ceiling")
+        + 10;
+    fill_to(&db, scope, "jwks", past_every_ceiling, 60).await;
+
+    // THROUGH THE API, past the point at which any declared ceiling would have refused.
+    hot.put(&registry::JWKS, "one-more", b"1", a_minute())
+        .await
+        .expect("a use with no ceiling must not be bounded by another use's");
+}

@@ -29,19 +29,33 @@
 //! page, and a reviewer asking "what does this deployment do when the cache is gone" has one
 //! place to read.
 
-use crate::{Class, HotUse, OnLoss};
+use crate::{Class, HotUse, OnLoss, Reach};
 
 /// The JSON Web Key Set an environment publishes.
 ///
 /// AN ACCELERATOR, unambiguously: the keys are in the store, the document is derived from them,
 /// and a miss costs one read and a render. Nothing about a missing entry weakens anything.
-pub static JWKS: HotUse = HotUse::declare("jwks", Class::Accelerator, None);
+pub static JWKS: HotUse = HotUse::declare(
+    "jwks",
+    Class::Accelerator,
+    None,
+    // One document per environment, derived from the signing keys. An anonymous caller READS
+    // it (the JWKS endpoint is public) but cannot cause an entry: only a key rotation does.
+    Reach::Authenticated,
+);
 
 /// A tenant's resolved configuration, as the request path reads it.
 ///
 /// ALSO AN ACCELERATOR. It is read on nearly every request and changes rarely, which is the
 /// shape a cache is for; and every reader can resolve it from the store.
-pub static TENANT_CONFIG: HotUse = HotUse::declare("tenant_config", Class::Accelerator, None);
+pub static TENANT_CONFIG: HotUse = HotUse::declare(
+    "tenant_config",
+    Class::Accelerator,
+    None,
+    // One entry per environment, written when the configuration changes, which is a management
+    // operation.
+    Reach::Authenticated,
+);
 
 /// The result of an introspection call, for the seconds until it could change.
 ///
@@ -62,7 +76,14 @@ pub static TENANT_CONFIG: HotUse = HotUse::declare("tenant_config", Class::Accel
 /// Classifying it fail-open to mark it "sensitive" would have been a label with no consequence,
 /// since fail-open and accelerator behave identically when the cache is down. A class whose
 /// members do not differ in behaviour is a comment.
-pub static INTROSPECTION: HotUse = HotUse::declare("introspection", Class::Accelerator, None);
+pub static INTROSPECTION: HotUse = HotUse::declare(
+    "introspection",
+    Class::Accelerator,
+    None,
+    // Keyed by a token that was ISSUED, so the number of entries is bounded by the number of
+    // live tokens, which the grant paths already bound. An anonymous caller cannot mint one.
+    Reach::Authenticated,
+);
 
 /// Per-subject counters the rate limiter spends.
 ///
@@ -79,6 +100,23 @@ pub static RATE_COUNTER: HotUse = HotUse::declare(
         on_loss: OnLoss::FailOpen,
     },
     None,
+    // ANONYMOUS, and this is the use that most obviously is: a rate counter exists precisely to
+    // count what unauthenticated traffic does, and it is keyed by a subject or an address the
+    // caller chooses. Without a ceiling, minting counters IS the flood -- an attacker rotating
+    // the key writes one row per request and never trips the limit those rows exist to enforce.
+    //
+    // 50_000 counters per scope, between the other two because this one is keyed per SUBJECT:
+    // more than the pre-auth counters (one per artifact class) and fewer than the single-use
+    // markers (one per outstanding artifact, of which a subject may have several).
+    //
+    // A tenant with more than fifty thousand distinct subjects active inside one counter window
+    // is past what this number is sized for, and the right answer then is a deployment-specific
+    // one. That belongs with the limiter that spends these counters (issue #150), where an
+    // operator already configures the limits; until it lands this is a ceiling rather than a
+    // tuning, and it is set where a healthy deployment does not meet it.
+    Reach::Anonymous {
+        per_scope_entries: 50_000,
+    },
 );
 
 /// The count of unauthenticated artifacts a tenant or an address has outstanding.
@@ -99,6 +137,22 @@ pub static PRE_AUTH_QUOTA: HotUse = HotUse::declare(
         on_loss: OnLoss::FailClosed,
     },
     None,
+    // THE USE NAMED FOR THE PROBLEM. It counts pre-authentication artifacts, so every entry is
+    // caused by an anonymous request by definition, and a use that bounds a flood while being
+    // unbounded itself would be the flood.
+    //
+    // 10_000, the smallest ceiling here, because this use is keyed per ARTIFACT CLASS rather
+    // than per subject: the number of distinct pre-auth counters a tenant needs is the number of
+    // kinds of pre-authentication artifact it issues, which is a property of the product and is
+    // two orders of magnitude below this. A scope holding ten thousand distinct ones is already
+    // the anomaly, so refusing there costs a healthy deployment nothing.
+    //
+    // Note this is a ceiling on the COUNTERS, not on what they count. A tenant under a flood
+    // holds a handful of counters with large values, which is the shape this is sized for; an
+    // attacker rotating the counter KEY to mint rows is the shape it refuses.
+    Reach::Anonymous {
+        per_scope_entries: 10_000,
+    },
 );
 
 /// The marker that says a single-use artifact has been redeemed.
@@ -114,6 +168,32 @@ pub static SINGLE_USE_MARKER: HotUse = HotUse::declare(
     "single_use_marker",
     Class::Correctness,
     Some("the artifact's own conditional UPDATE, which is the authority either way"),
+    // ANONYMOUS. A device code, an authorization code and a magic-link token are all redeemed by
+    // a caller that has not authenticated yet, and each redemption can mint a marker.
+    //
+    // AND THE QUOTA CAN REFUSE A CLAIM, which needs saying because an earlier version of this
+    // comment asserted the opposite. `put_if_absent` on a NEW key, for a scope at this ceiling,
+    // returns `HotError::QuotaExceeded`. It does not lie about who won -- that distinction is
+    // the whole reason the ceiling gets its own statement -- but it does decline to answer.
+    //
+    // WHY THAT IS SAFE HERE, AND ONLY HERE. This use is Correctness, so an unanswered claim is
+    // not a degraded answer; it is no answer. The class system's response to no answer is the
+    // FALLBACK, and this use's fallback is the artifact's own conditional UPDATE, named above --
+    // which was always the authority. A caller that gets `QuotaExceeded` does exactly what it
+    // does when the accelerator is down: it spends the artifact against the row, and the row
+    // settles it. So the ceiling costs a round trip and never a decision.
+    //
+    // That argument does NOT transfer to a Correctness use with no fallback, and
+    // `HotUse::declare` refuses to construct one.
+    //
+    // 100_000, the largest ceiling here, because a marker lives only as long as its artifact's
+    // redemption window and an environment can legitimately have very many codes outstanding at
+    // once -- far more than it has pre-auth counters, which are per artifact CLASS. The number
+    // is a ceiling and not a capacity plan: at it, every claim still gets a correct answer from
+    // Postgres, which is why it can be set high enough to never be reached in normal operation.
+    Reach::Anonymous {
+        per_scope_entries: 100_000,
+    },
 );
 
 /// The lock a rotation or migration holds while it moves something that must move once.
@@ -124,6 +204,9 @@ pub static ROTATION_LOCK: HotUse = HotUse::declare(
     "rotation_lock",
     Class::Correctness,
     Some("the Postgres advisory lock, which is the authority either way"),
+    // A rotation is an operator action or a scheduled job, never an anonymous request, and the
+    // number of locks is the number of things that can be rotated -- a fixed, small set.
+    Reach::Authenticated,
 );
 
 /// Every declared use.
@@ -214,6 +297,65 @@ mod tests {
                  upper case; the registry's two spellings have drifted",
                 r#use.name()
             );
+        }
+    }
+
+    #[test]
+    fn every_use_states_whether_an_anonymous_request_can_cause_an_entry() {
+        // BOTH ANSWERS MUST OCCUR. Every quota test in `ironauth-store` fills a use to its
+        // declared ceiling and asserts the next write is refused; a registry where nothing were
+        // `Anonymous` would make all of them vacuous, and one where EVERYTHING were would cap
+        // three uses no anonymous caller can reach -- including JWKS, whose entry count is the
+        // number of environments.
+        let mut anonymous = Vec::new();
+        let mut authenticated = Vec::new();
+        for r#use in ALL {
+            match r#use.reach() {
+                Reach::Anonymous { per_scope_entries } => {
+                    assert!(
+                        per_scope_entries > 0,
+                        "{}'s ceiling is zero, which is a use nothing can write",
+                        r#use.name()
+                    );
+                    assert_eq!(
+                        r#use.per_scope_entry_quota(),
+                        Some(per_scope_entries),
+                        "{}'s accessor must report the ceiling its declaration carries",
+                        r#use.name()
+                    );
+                    anonymous.push(r#use.name());
+                }
+                Reach::Authenticated => {
+                    assert_eq!(
+                        r#use.per_scope_entry_quota(),
+                        None,
+                        "{} is only reachable authenticated, so it must report no ceiling -- a \
+                         number here would be enforced against a count nothing bounds",
+                        r#use.name()
+                    );
+                    authenticated.push(r#use.name());
+                }
+            }
+        }
+        assert!(
+            !anonymous.is_empty() && !authenticated.is_empty(),
+            "both reaches must occur: {anonymous:?} are anonymous and {authenticated:?} are \
+             not, and a registry where either list is empty makes the other's tests vacuous"
+        );
+
+        // A CONSTRAINT NOTHING ELSE ENFORCES. The two assertions above are close to what the
+        // enum and the const assertion already give; this one is not. Every ceiling is converted
+        // to a signed integer to reach SQL, and the integration tests seed up to a ceiling
+        // through a bind that is `i32`. A ceiling past `i32::MAX` would compile, declare
+        // cleanly, and then fail at the point of use rather than here.
+        for r#use in ALL {
+            if let Some(ceiling) = r#use.per_scope_entry_quota() {
+                assert!(
+                    i32::try_from(ceiling).is_ok(),
+                    "{}'s ceiling of {ceiling} does not fit the signed integer it is bound as",
+                    r#use.name()
+                );
+            }
         }
     }
 

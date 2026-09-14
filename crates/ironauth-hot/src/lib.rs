@@ -12,11 +12,14 @@
 //! tenant config, an introspection result, a one-time-use marker, a rate counter -- is meant to
 //! reach it through [`HotState`].
 //!
-//! NO IMPLEMENTATION SHIPS IN THIS SLICE, and saying so here matters more than it would in a
-//! commit message: this crate is a contract and nothing satisfies it yet. The Postgres-backed
-//! default that makes the covenant's "complete on PostgreSQL alone" true of this seam, and the
-//! IronCache one it accelerates, are the next pieces of #146. Until they land, [`registry`] is a
-//! set of declarations rather than a set of call sites.
+//! THE POSTGRES IMPLEMENTATION SHIPS, in `ironauth-store` (`hot_state::PgHotState`), and it is
+//! what makes the covenant's "complete on PostgreSQL alone" true of this seam. The IronCache one
+//! it accelerates is still to come.
+//!
+//! WHAT IS STILL ABSENT IS CALLERS. [`registry`] declares seven uses and no request path reaches
+//! any of them yet, so this crate is a contract with an implementation and no traffic. That is
+//! worth stating here rather than discovering: a use added to the registry does not become live
+//! by being declared.
 //!
 //! # The industry keeps relearning why this has to be a seam
 //!
@@ -56,5 +59,5 @@ pub mod registry;
 mod state;
 
 pub use bounded::{Bounded, Bounds};
-pub use class::{Class, HotUse, OnLoss};
+pub use class::{Class, HotUse, OnLoss, Reach};
 pub use state::{Answer, HotError, HotState, Ttl};

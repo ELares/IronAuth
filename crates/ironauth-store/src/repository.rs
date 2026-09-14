@@ -32232,6 +32232,34 @@ fn federation_verifier_purpose(id: &FederationLoginStateId) -> String {
     format!("federation_code_verifier:{id}")
 }
 
+/// A use's per-scope entry ceiling, and the instant a row is judged dead against.
+///
+/// # Why the instant travels with the ceiling
+///
+/// NOT because the count needs it -- it does not, and an earlier version of this comment said it
+/// did. The count is over every stored row, so no clock enters it.
+///
+/// The instant is here because of what happens WHEN THE CEILING IS REACHED: the only thing that
+/// can relieve it is deleting rows, the only rows safe to delete are the expired ones, and
+/// "expired" is a question about an instant. So the ceiling and the instant are one decision --
+/// how many rows may be stored, and which of them may be reclaimed to stay under that -- and
+/// splitting them across two parameters is how a caller ends up reclaiming against one clock
+/// while the claim guard beside it evaluates expiry against another.
+#[derive(Debug, Clone, Copy)]
+pub struct HotStateQuota {
+    /// The ceiling, or [`None`] for a use no unauthenticated caller can cause an entry for.
+    ///
+    /// COUNTED OVER EVERY ROW, live and expired alike, because the ceiling bounds DISK and an
+    /// expired row occupies disk until something deletes it. Counting only live rows was the
+    /// first version and it made the pruning below unreachable: what blocked a write was the
+    /// live count, what the prune removed was dead rows, so the retry could never succeed and
+    /// the ceiling could never be relieved by anything short of the entries actually being
+    /// deleted. A bound on storage has to count what is stored.
+    pub per_scope_entries: Option<u32>,
+    /// The application-clock instant an entry is judged live against.
+    pub now_unix_micros: i64,
+}
+
 /// The scoped hot-state table (issue #146).
 ///
 /// # Every method takes its instants
@@ -32282,6 +32310,8 @@ impl HotStateRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::Conflict`] if the key or value is past the table's bounds;
+    /// [`StoreError::QuotaExceeded`] if `quota` names a ceiling this scope has reached for this
+    /// use and pruning its expired rows did not bring it under;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn put(
         &self,
@@ -32289,13 +32319,103 @@ impl HotStateRepo<'_> {
         key: &str,
         value: &[u8],
         expires_at_unix_micros: i64,
+        quota: HotStateQuota,
     ) -> Result<(), StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
+        let mut wrote = self
+            .guarded_upsert(&mut tx, use_name, key, value, expires_at_unix_micros, quota)
+            .await?;
+        if !wrote {
+            // AT THE CEILING, so delete what is already dead and try once more. This is where
+            // the expiry sweep gets its caller: pruning on every write would cost a delete per
+            // request, and pruning here costs nothing until the ceiling is actually reached,
+            // which is the only moment it can change an outcome.
+            //
+            // IT CAN ONLY CHANGE AN OUTCOME BECAUSE THE CEILING COUNTS STORED ROWS. An earlier
+            // version counted only LIVE ones, which made this unreachable in the sense that
+            // matters: the retry re-ran the same live count the prune had not touched, so it
+            // failed identically every time. The test that fills a scope, lets every entry
+            // expire and expects the next write to be admitted is what found it.
+            self.prune_expired_for_use(&mut tx, use_name, quota).await?;
+            wrote = self
+                .guarded_upsert(&mut tx, use_name, key, value, expires_at_unix_micros, quota)
+                .await?;
+        }
+        if !wrote {
+            // COMMIT BEFORE REFUSING, so the prune's deletes survive the refusal.
+            //
+            // Returning here with the transaction still open drops it, and a dropped transaction
+            // rolls back -- including every expired row the prune just removed. The next write
+            // would then repeat the same delete against the same rows and refuse again, doing
+            // the work forever and keeping none of it.
+            //
+            // It usually cannot bite, because a prune that frees anything lets the retry through
+            // and commits on the success path. It bites when the scope is OVER its ceiling
+            // rather than at it, which concurrency allows: the count and the insert are one
+            // statement but two callers can still interleave, so a scope can hold a few rows
+            // more than its ceiling. Then the prune frees rows, the retry still refuses, and
+            // without this commit the reclaimed space is given straight back.
+            tx.commit().await?;
+            return Err(StoreError::QuotaExceeded);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The insert, refused when the scope is at this use's ceiling.
+    ///
+    /// # Why an existing key is exempt
+    ///
+    /// The ceiling counts ROWS, and overwriting a key adds none. Without the `EXISTS` arm a
+    /// scope at its ceiling could not refresh an entry it already holds -- so a rate counter
+    /// would stop being able to count the very subject it was already counting, which is the
+    /// opposite of what the ceiling is for.
+    async fn guarded_upsert(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        use_name: &str,
+        key: &str,
+        value: &[u8],
+        expires_at_unix_micros: i64,
+        quota: HotStateQuota,
+    ) -> Result<bool, StoreError> {
+        let Some(limit) = quota.per_scope_entries else {
+            let result = sqlx::query(
+                "INSERT INTO hot_state \
+                 (tenant_id, environment_id, use_name, key, value, expires_at) \
+                 VALUES ($1, $2, $3, $4, $5, \
+                         TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+                 ON CONFLICT (tenant_id, environment_id, use_name, key) \
+                 DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at",
+            )
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(use_name)
+            .bind(key)
+            .bind(value)
+            .bind(expires_at_unix_micros)
+            .execute(&mut **tx)
+            .await;
+            return match result {
+                Ok(_) => Ok(true),
+                Err(error) if is_check_violation(&error) => Err(StoreError::Conflict),
+                Err(error) => Err(error.into()),
+            };
+        };
         let result = sqlx::query(
             "INSERT INTO hot_state \
              (tenant_id, environment_id, use_name, key, value, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, \
-                     TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+             SELECT $1, $2, $3, $4, $5, \
+                    TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
+             WHERE EXISTS ( \
+                       SELECT 1 FROM hot_state \
+                       WHERE tenant_id = $1 AND environment_id = $2 \
+                         AND use_name = $3 AND key = $4 \
+                   ) \
+                OR ( \
+                       SELECT count(*) FROM hot_state \
+                       WHERE tenant_id = $1 AND environment_id = $2 AND use_name = $3 \
+                   ) < $7 \
              ON CONFLICT (tenant_id, environment_id, use_name, key) \
              DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at",
         )
@@ -32305,14 +32425,48 @@ impl HotStateRepo<'_> {
         .bind(key)
         .bind(value)
         .bind(expires_at_unix_micros)
-        .execute(&mut *tx)
+        // NO INSTANT HERE. It was bound as $7 while the statement went straight from $6 to $8,
+        // so it was a parameter nothing read -- which reads, to anyone checking whether the
+        // count is clock-correct, as though the count consulted it. The count is over every
+        // stored row and consults no clock; the instant belongs to the prune, and only there.
+        .bind(i64::from(limit))
+        .execute(&mut **tx)
         .await;
         match result {
-            Ok(_) => {}
-            Err(error) if is_check_violation(&error) => return Err(StoreError::Conflict),
-            Err(error) => return Err(error.into()),
+            Ok(done) => Ok(done.rows_affected() == 1),
+            Err(error) if is_check_violation(&error) => Err(StoreError::Conflict),
+            Err(error) => Err(error.into()),
         }
-        tx.commit().await?;
+    }
+
+    /// Delete this scope's expired rows FOR ONE USE, inside the caller's transaction.
+    ///
+    /// Unbounded by a `LIMIT`, unlike [`HotStateRepo::sweep_expired`], and deliberately: this
+    /// runs only when a write has just been refused, so the rows it removes are the ones
+    /// standing between a caller and an answer. A batch here would refuse writes while dead rows
+    /// remained, which is the failure the pruning exists to prevent.
+    async fn prune_expired_for_use(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        use_name: &str,
+        quota: HotStateQuota,
+    ) -> Result<(), StoreError> {
+        // THE ROW COUNT IS DELIBERATELY NOT RETURNED. Both callers re-count afterwards anyway,
+        // because what they need to know is whether the scope is now under its ceiling, and
+        // "how many rows went" does not answer that: a prune that deleted a thousand rows still
+        // leaves a scope refused if a thousand live ones remain. Returning it would be a number
+        // callers would have to decide to ignore, and one of them eventually would not.
+        sqlx::query(
+            "DELETE FROM hot_state \
+             WHERE tenant_id = $1 AND environment_id = $2 AND use_name = $3 \
+               AND expires_at <= TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(use_name)
+        .bind(quota.now_unix_micros)
+        .execute(&mut **tx)
+        .await?;
         Ok(())
     }
 
@@ -32369,6 +32523,8 @@ impl HotStateRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::Conflict`] if the key or value is past the table's bounds;
+    /// [`StoreError::QuotaExceeded`] if `quota` names a ceiling this scope has reached for this
+    /// use, pruning did not bring it under, and this key is not one the scope already holds;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn put_if_absent(
         &self,
@@ -32377,13 +32533,107 @@ impl HotStateRepo<'_> {
         value: &[u8],
         expires_at_unix_micros: i64,
         now_unix_micros: i64,
+        quota: HotStateQuota,
     ) -> Result<bool, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
+        let mut claimed = self
+            .try_claim(
+                &mut tx,
+                use_name,
+                key,
+                value,
+                expires_at_unix_micros,
+                now_unix_micros,
+                quota,
+            )
+            .await?;
+
+        if claimed.is_none() && quota.per_scope_entries.is_some() {
+            // ZERO ROWS HAS TWO CAUSES HERE and they need different answers: a LIVE holder (the
+            // claim was lost, which is this method's ordinary business) or the ceiling (the
+            // store is full, which is not an answer about who won). One indexed probe tells them
+            // apart, and it runs ONLY on the path that already has no answer -- the common case
+            // pays one statement and nothing else.
+            //
+            // An earlier version counted before every claim instead, which put a `count(*)` on
+            // the hot path of all three anonymous uses and contradicted the principle the `put`
+            // path states two methods above: the ceiling should cost nothing until it is
+            // actually reached.
+            let held: Option<(i32,)> = sqlx::query_as(
+                "SELECT 1 FROM hot_state \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND use_name = $3 AND key = $4",
+            )
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(use_name)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if held.is_none() {
+                // Nothing holds the key, so the ceiling refused it. Reclaim this use's dead rows
+                // and try once more before saying so.
+                self.prune_expired_for_use(&mut tx, use_name, quota).await?;
+                claimed = self
+                    .try_claim(
+                        &mut tx,
+                        use_name,
+                        key,
+                        value,
+                        expires_at_unix_micros,
+                        now_unix_micros,
+                        quota,
+                    )
+                    .await?;
+                if claimed.is_none() {
+                    // COMMIT BEFORE REFUSING: see the note on the same branch in `put`. The
+                    // prune's deletes must outlive the refusal, or a scope over its ceiling
+                    // repeats them on every attempt and keeps none.
+                    tx.commit().await?;
+                    return Err(StoreError::QuotaExceeded);
+                }
+            }
+            // `held.is_some()` falls through to `Ok(false)`: a live row holds the key, which is
+            // somebody having got there first. That is the true answer and a different fact from
+            // "the store is full", with a different remedy.
+        }
+
+        tx.commit().await?;
+        Ok(claimed.is_some())
+    }
+
+    /// The claim itself: one statement, refused by the ceiling when `quota` names one.
+    ///
+    /// Returns `None` for BOTH "a live holder has it" and "the ceiling refused it"; the caller
+    /// separates them, and only when it has to.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_claim(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        use_name: &str,
+        key: &str,
+        value: &[u8],
+        expires_at_unix_micros: i64,
+        now_unix_micros: i64,
+        quota: HotStateQuota,
+    ) -> Result<Option<(i32,)>, StoreError> {
+        // The ceiling is a conjunct of the INSERT's own SELECT, exactly as in `guarded_upsert`,
+        // so a scope at its ceiling produces no row to insert and never reaches ON CONFLICT. A
+        // key the scope already holds is exempt: taking it over adds no row.
+        let ceiling = quota.per_scope_entries.map_or(i64::MAX, i64::from);
         let result: Result<Option<(i32,)>, sqlx::Error> = sqlx::query_as(
             "INSERT INTO hot_state \
              (tenant_id, environment_id, use_name, key, value, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, \
-                     TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+             SELECT $1, $2, $3, $4, $5, \
+                    TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval \
+             WHERE EXISTS ( \
+                       SELECT 1 FROM hot_state \
+                       WHERE tenant_id = $1 AND environment_id = $2 \
+                         AND use_name = $3 AND key = $4 \
+                   ) \
+                OR ( \
+                       SELECT count(*) FROM hot_state \
+                       WHERE tenant_id = $1 AND environment_id = $2 AND use_name = $3 \
+                   ) < $8 \
              ON CONFLICT (tenant_id, environment_id, use_name, key) \
              DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at \
              WHERE hot_state.expires_at \
@@ -32397,15 +32647,14 @@ impl HotStateRepo<'_> {
         .bind(value)
         .bind(expires_at_unix_micros)
         .bind(now_unix_micros)
-        .fetch_optional(&mut *tx)
+        .bind(ceiling)
+        .fetch_optional(&mut **tx)
         .await;
-        let claimed = match result {
-            Ok(claimed) => claimed,
-            Err(error) if is_check_violation(&error) => return Err(StoreError::Conflict),
-            Err(error) => return Err(error.into()),
-        };
-        tx.commit().await?;
-        Ok(claimed.is_some())
+        match result {
+            Ok(claimed) => Ok(claimed),
+            Err(error) if is_check_violation(&error) => Err(StoreError::Conflict),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Remove the entry, whether or not it was there.
