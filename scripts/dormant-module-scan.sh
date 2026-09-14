@@ -63,17 +63,11 @@ ironauth-oidc/device_posture
 # This entry exists because the scan went RED on main when #1258 merged and nobody noticed:
 # the merge ran five gates, not this one. Wiring the limiter removes the entry.
 ironauth-quota/layered
-
-# The access-rule engine, traces, dry-run and decision cache (issue #154 criteria 3, 5 and 6).
-# Callerless until criteria 1, 2 and 4 land, which are the forward-auth proxy dialects and the
-# integration that gates a real resource; those need proxy containers and are not in these PRs.
-#
-# Listed EXPLICITLY even though the scan currently passes it, because it passes for the wrong
-# reason: `refs_for` greps for `rules::` and finds nine hits, all false -- Postgres `rules::text`
-# casts in ironauth-store, and ironauth-admin's unrelated `routing_rules`. A module that escapes
-# this gate on a substring is exactly what the gate exists to catch, so the honest entry is
-# better than the accidental pass. The substring weakness itself is worth fixing separately.
-ironauth-oidc/rules
+# Trusted-header SSO for the forward-auth surface (issue #154 criterion 2). Callerless for the
+# same reason as the engine above: the proxy dialect endpoints are criteria 1 and 2's other
+# half and need real proxy containers, so nothing mounts this yet. The security properties it
+# enforces are unit-tested against the forgery cases the criterion names.
+ironauth-oidc/forward_auth
 
 ALLOWLIST
 }

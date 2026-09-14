@@ -333,6 +333,7 @@ pub mod token_hook {
 /// yet: a module nothing reaches and nothing can name is not a surface an operator can try.
 pub mod device_posture;
 /// The ordered access-rule engine (issue #154).
+pub mod forward_auth;
 pub mod rules;
 mod tokens;
 mod totp;
