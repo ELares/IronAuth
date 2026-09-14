@@ -156,8 +156,8 @@ async fn a_statement_the_preflight_cannot_read_blocks_and_is_named_as_unread() {
         v1(),
         pending(
             2,
-            "widgets gain a primary key constraint",
-            "ALTER TABLE owners ADD CONSTRAINT owners_pkey2 PRIMARY KEY (name);",
+            "widgets owner is retyped",
+            "ALTER TABLE widgets ALTER COLUMN owner TYPE varchar(8);",
         ),
     ];
     let report = preflight::run(&pool, &chain).await.expect("preflight runs");
@@ -175,7 +175,10 @@ async fn a_statement_the_preflight_cannot_read_blocks_and_is_named_as_unread() {
         rendered.contains("could NOT be checked. This is not a pass"),
         "{rendered}"
     );
-    assert!(rendered.contains("PRIMARY KEY"), "{rendered}");
+    assert!(
+        rendered.contains("ALTER COLUMN owner TYPE varchar(8)"),
+        "the report must quote the statement it could not read: {rendered}"
+    );
 }
 
 /// Most constraints in a migration are on tables that same migration creates. Nothing
@@ -205,15 +208,14 @@ async fn a_constraint_on_a_table_a_pending_migration_creates_is_clean_and_counte
     );
 }
 
-/// The column half of the same excuse, and the one a mutation sweep found uncovered.
+/// A CHECK over a column this run creates is NOT decidable from the migration text.
 ///
-/// A migration routinely adds a column and constrains it in the same file, so the probe
-/// for the constraint names a column that is not there yet and Postgres answers
-/// `undefined_column` rather than `undefined_table`. Excusing only `undefined_table`
-/// leaves that probe reported as an unanswered failure, which blocks an upgrade that was
-/// never at risk. Nothing here has rows to strand: the column does not exist.
+/// The expression may reference other columns, so an all-NULL new column does not make the
+/// whole expression NULL, and the preflight cannot say whether the filled rows satisfy it.
+/// It blocks and says so. The first version called this clean, which was right for this
+/// particular CHECK and wrong as a rule -- and the rule is what shipped.
 #[tokio::test]
-async fn a_constraint_on_a_column_the_same_pending_migration_adds_is_clean() {
+async fn a_check_over_a_column_this_run_creates_is_unanswered_not_assumed_clean() {
     let pool = database_at_v1("INSERT INTO widgets (id, owner) VALUES (1, 'a')").await;
 
     let chain = vec![
@@ -227,18 +229,216 @@ async fn a_constraint_on_a_column_the_same_pending_migration_adds_is_clean() {
     ];
     let report = preflight::run(&pool, &chain).await.expect("preflight runs");
 
+    assert!(report.blocks(), "{report:#?}");
+    assert!(
+        report.findings.is_empty(),
+        "no row is known to be in the way"
+    );
+    assert_eq!(report.unanswered.len(), 1);
+    assert!(
+        report.unanswered[0]
+            .detail
+            .contains("cannot be read from the migration"),
+        "{:?}",
+        report.unanswered[0]
+    );
+}
+
+/// A UNIQUE or FOREIGN KEY over a column this run creates without a default IS decidable:
+/// every row's key is NULL, and both rules skip rows with a NULL key whatever the other
+/// columns hold. So these stay clean, and the blocking above is a judgement rather than
+/// the preflight giving up on new columns generally.
+#[tokio::test]
+async fn a_unique_index_over_a_column_this_run_creates_is_clean() {
+    let pool = database_at_v1("INSERT INTO widgets (id, owner) VALUES (1, 'a'), (2, 'b')").await;
+
+    let chain = vec![
+        v1(),
+        pending(
+            2,
+            "a new column and a unique index over it",
+            "ALTER TABLE widgets ADD COLUMN serial_no text;
+             CREATE UNIQUE INDEX widgets_serial ON widgets (serial_no);",
+        ),
+    ];
+    let report = preflight::run(&pool, &chain).await.expect("preflight runs");
+
     assert!(
         !report.blocks(),
-        "a column that does not exist yet holds no rows to strand: {report:#?}"
+        "all-NULL keys cannot collide: {report:#?}"
     );
-    assert_eq!(report.probes_not_yet_applicable, 1);
-    assert_eq!(report.probes_run, 0);
-
-    // And Postgres agrees the migration applies, which is what the clean verdict claims.
     MigrationRunner::from_migrations(&pool, chain)
         .run()
         .await
-        .expect("adding a column and constraining it in one migration applies");
+        .expect("Postgres accepts a unique index whose every key is NULL");
+}
+
+/// The false pass a reviewer found, against the real database.
+///
+/// A migration that adds a column and makes it mandatory in the same file is ordinary. The
+/// `SET NOT NULL` probe asks about a column that does not exist yet, Postgres answers
+/// `undefined_column`, and the first version excused that as "nothing can be stranded" --
+/// while in fact the column arrives NULL on every existing row and the migration fails on
+/// the first one. Postgres settles it: the clean verdict is asserted to be wrong by
+/// applying the migration and requiring it to fail.
+#[tokio::test]
+async fn a_column_added_and_made_mandatory_in_one_migration_blocks_when_rows_exist() {
+    let pool =
+        database_at_v1("INSERT INTO widgets (id, owner) VALUES (1, 'a'), (2, 'b'), (3, 'c')").await;
+
+    let chain = vec![
+        v1(),
+        pending(
+            2,
+            "shelf added and made mandatory",
+            "ALTER TABLE widgets ADD COLUMN shelf text;
+             ALTER TABLE widgets ALTER COLUMN shelf SET NOT NULL;",
+        ),
+    ];
+    let report = preflight::run(&pool, &chain).await.expect("preflight runs");
+
+    assert!(
+        report.blocks(),
+        "every existing row would hold NULL in the new mandatory column: {report:#?}"
+    );
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(report.findings[0].rows, 3, "all three existing rows");
+    // The path matters as much as the verdict: the column must genuinely not exist yet,
+    // so this went through the absent-subject decision rather than finding real NULLs in
+    // a column that was already there.
+    assert_eq!(
+        report.probes_not_yet_applicable, 0,
+        "the absent column must be judged, not skipped: {report:#?}"
+    );
+
+    // The authority on the claim.
+    let refused = MigrationRunner::from_migrations(&pool, chain).run().await;
+    assert!(
+        refused.is_err(),
+        "the preflight blocked, so the migration must genuinely fail"
+    );
+}
+
+/// The same shape on an EMPTY table applies cleanly, so the test above is not passing
+/// because the preflight blocks this shape unconditionally.
+#[tokio::test]
+async fn the_same_migration_passes_when_the_table_has_no_rows() {
+    let pool = database_at_v1("").await;
+
+    let chain = vec![
+        v1(),
+        pending(
+            2,
+            "shelf added and made mandatory",
+            "ALTER TABLE widgets ADD COLUMN shelf text;
+             ALTER TABLE widgets ALTER COLUMN shelf SET NOT NULL;",
+        ),
+    ];
+    let report = preflight::run(&pool, &chain).await.expect("preflight runs");
+
+    assert!(!report.blocks(), "no rows, nothing to strand: {report:#?}");
+    MigrationRunner::from_migrations(&pool, chain)
+        .run()
+        .await
+        .expect("a clean preflight means the migration applies");
+}
+
+/// A probe naming a column NOTHING creates is this file's own parser being wrong, and the
+/// old rule laundered it into a clean verdict. It must block instead.
+#[tokio::test]
+async fn a_probe_naming_a_column_nothing_creates_is_unanswered_not_clean() {
+    let pool = database_at_v1("INSERT INTO widgets (id, owner) VALUES (1, 'a')").await;
+
+    let chain = vec![
+        v1(),
+        pending(
+            2,
+            "constrains a column that does not exist",
+            "ALTER TABLE widgets ALTER COLUMN nonexistent SET NOT NULL;",
+        ),
+    ];
+    let report = preflight::run(&pool, &chain).await.expect("preflight runs");
+
+    assert!(report.blocks(), "{report:#?}");
+    assert!(report.findings.is_empty());
+    assert_eq!(report.unanswered.len(), 1);
+    assert!(
+        report.unanswered[0]
+            .detail
+            .contains("neither exists nor is created"),
+        "the report must say the probe itself is wrong: {:?}",
+        report.unanswered[0]
+    );
+}
+
+/// `NOT VALID` defers the scan and `VALIDATE CONSTRAINT` performs it. Clearing both would
+/// mean the constraint is never checked at all, so the VALIDATE is probed -- here against
+/// a constraint an EARLIER, already-applied migration added, whose expression is in the
+/// catalog rather than in any pending migration.
+#[tokio::test]
+async fn a_validate_of_an_already_deferred_constraint_is_probed_from_the_catalog() {
+    let pool = database_at_v1(
+        "INSERT INTO widgets (id, owner, region) VALUES (1, 'a', 'eu'), (2, 'b', 'mars')",
+    )
+    .await;
+    // Applied out of band, exactly as a previous release would have left it.
+    sqlx::raw_sql(
+        "ALTER TABLE widgets ADD CONSTRAINT widgets_region_known          CHECK (region IN ('eu', 'us')) NOT VALID",
+    )
+    .execute(&pool)
+    .await
+    .expect("the deferred constraint is accepted against any data");
+
+    let chain = vec![
+        v1(),
+        pending(
+            2,
+            "validate the deferred region check",
+            "ALTER TABLE widgets VALIDATE CONSTRAINT widgets_region_known;",
+        ),
+    ];
+    let report = preflight::run(&pool, &chain).await.expect("preflight runs");
+
+    assert!(
+        report.blocks(),
+        "the 'mars' row fails the deferred check: {report:#?}"
+    );
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(report.findings[0].rows, 1);
+
+    let refused = MigrationRunner::from_migrations(&pool, chain).run().await;
+    assert!(refused.is_err(), "VALIDATE must genuinely fail on that row");
+}
+
+/// A primary key is two rules, and a row can break either. Probing one and reporting clean
+/// on the other's silence is the failure this guards.
+#[tokio::test]
+async fn a_primary_key_blocks_on_a_null_and_on_a_duplicate_independently() {
+    for (seed, why) in [
+        (
+            "INSERT INTO widgets (id, owner) VALUES (1, NULL), (2, 'b')",
+            "a NULL column",
+        ),
+        (
+            "INSERT INTO widgets (id, owner) VALUES (1, 'a'), (2, 'a')",
+            "a duplicate",
+        ),
+    ] {
+        let pool = database_at_v1(seed).await;
+        let chain = vec![
+            v1(),
+            pending(
+                2,
+                "owner becomes the key",
+                "ALTER TABLE widgets ADD CONSTRAINT widgets_owner_pkey PRIMARY KEY (owner);",
+            ),
+        ];
+        let report = preflight::run(&pool, &chain).await.expect("preflight runs");
+        assert!(report.blocks(), "{why} must block: {report:#?}");
+
+        let refused = MigrationRunner::from_migrations(&pool, chain).run().await;
+        assert!(refused.is_err(), "{why} must genuinely refuse the key");
+    }
 }
 
 /// A CHECK is violated only when its expression is FALSE. A row whose expression is NULL

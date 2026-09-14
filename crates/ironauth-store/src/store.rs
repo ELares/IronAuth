@@ -85,6 +85,10 @@ impl Store {
     ///
     /// So the caller asks this first and refuses to report anything if the answer is no.
     ///
+    /// `rolsuper OR rolbypassrls` and not "is the owner": FORCE ROW LEVEL SECURITY exists
+    /// precisely to stop a table owner bypassing their own policies, so ownership is not
+    /// sufficient here and the refusal message must not suggest it.
+    ///
     /// # Errors
     ///
     /// [`crate::StoreError::Database`] if `pg_roles` cannot be read.

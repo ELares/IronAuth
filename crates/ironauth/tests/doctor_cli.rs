@@ -127,6 +127,17 @@ async fn doctor_refuses_a_role_that_row_level_security_applies_to() {
         stderr.contains("row-level security"),
         "the refusal must say why: {stderr}"
     );
+    // The advice has to name a role that would actually pass. The schema owner does not:
+    // FORCE ROW LEVEL SECURITY subjects the owner to the policies too, so an operator
+    // told to use it is refused again by this same message.
+    assert!(
+        stderr.contains("SUPERUSER") || stderr.contains("BYPASSRLS"),
+        "the refusal must name a role that passes the check: {stderr}"
+    );
+    assert!(
+        stderr.contains("schema owner is not enough"),
+        "the refusal must rule out the owner explicitly: {stderr}"
+    );
     assert!(
         !stdout.contains("no row in this database would reject"),
         "it must not print a clean verdict it cannot support: {stdout}"

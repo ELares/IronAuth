@@ -31,15 +31,23 @@
 //! | `ALTER TABLE t ADD COLUMN c ... NOT NULL` (no DEFAULT) | any existing row |
 //! | `CREATE UNIQUE INDEX n ON t (cols)` | a duplicate over `cols` |
 //! | `ALTER TABLE t ADD CONSTRAINT n FOREIGN KEY (c) REFERENCES p (k)` | an orphan `c` |
+//! | `ALTER TABLE t ADD PRIMARY KEY (cols)` | a NULL in any column, or a duplicate |
+//! | `ALTER TABLE t VALIDATE CONSTRAINT n` | a row the deferred constraint rejects |
 //!
-//! Everything else in a migration is additive against existing rows, or it is
-//! `NOT VALID` (which Postgres accepts without scanning), or it is a kind this parser
-//! does not recognise. That last case is the one that matters: a preflight whose
-//! silence means BOTH "no row is at risk" and "I did not understand this statement" is
-//! not a preflight. So any statement that LOOKS constraint-shaped (it contains one of
-//! the phrases above) and that [`derive`] could not turn into a probe is reported by
-//! name in [`Derivation::unexamined`], and `ironauth doctor` prints those separately
-//! from its findings rather than folding them into a clean verdict.
+//! # Silence means one thing
+//!
+//! A preflight whose silence means BOTH "no row is at risk" and "I did not understand
+//! this statement" is not a preflight. So the verdict is three-way: a statement is a
+//! hazard, or it is CLEARED by a decision written down here, or it is UNREAD -- and
+//! unread is reported by name in [`Derivation::unexamined`] and BLOCKS.
+//!
+//! The clearing decisions are allow lists ([`RELAXING_COLUMN_ACTIONS`],
+//! [`RELAXING_TABLE_ACTIONS`], a nullable or defaulted new column, `NOT VALID`), never a
+//! fall-through. An earlier version inverted that -- anything unmatched was cleared --
+//! and it handed a clean bill to `ALTER COLUMN ... TYPE` (which rewrites the table and
+//! re-casts every row, so an over-long value rejects it) and parsed
+//! `ADD PRIMARY KEY (id)` as a column named `PRIMARY`. An inverted list turns every
+//! construct nobody thought of into a pass, including the ones added after it is written.
 //!
 //! # Scope
 //!
@@ -49,6 +57,8 @@
 //! whether the NEW BINARY can read the OLD rows is `scripts/expand-phase-ddl.sh`, and
 //! whether an APPLIED migration's text has changed is the checksum in
 //! [`crate::MigrationRunner`].
+
+use std::collections::BTreeMap;
 
 use sqlx::{PgPool, Row};
 
@@ -90,6 +100,22 @@ pub enum Hazard {
         columns: String,
         /// The partial-index predicate, if the index has a WHERE clause.
         predicate: Option<String>,
+    },
+    /// `VALIDATE CONSTRAINT n` against a row the deferred constraint rejects.
+    ///
+    /// This is the other half of the `NOT VALID` escape. `ADD CONSTRAINT ... NOT VALID`
+    /// is cleared because Postgres does not scan for it, and the scan it skipped happens
+    /// HERE. Clearing both would mean such a constraint is never checked by this preflight
+    /// at all: two defensible decisions adding up to a blind spot.
+    ValidateConstraint {
+        /// The table the constraint is on, as written.
+        table: String,
+        /// The constraint's name, as written.
+        constraint: String,
+        /// The CHECK expression, when a pending migration in this run adds it NOT VALID.
+        /// `None` when an already-applied migration added it, in which case the probe
+        /// resolves it from `pg_constraint` instead.
+        expression: Option<String>,
     },
     /// `ADD CONSTRAINT n FOREIGN KEY (c) REFERENCES p (k)` against an orphan.
     ForeignKey {
@@ -150,6 +176,15 @@ impl Hazard {
                      GROUP BY {columns} HAVING count(*) > 1) AS duplicated"
                 )
             }
+            Hazard::ValidateConstraint {
+                table, expression, ..
+            } => {
+                // Only reachable with the expression resolved: probe() looks it up in
+                // pg_constraint first when it is None, and reports the statement
+                // unanswered if it cannot be found.
+                let predicate = expression.clone().unwrap_or_else(|| "true".to_owned());
+                format!("SELECT count(*) AS n FROM {table} WHERE ({predicate}) IS FALSE")
+            }
             Hazard::ForeignKey {
                 table,
                 columns,
@@ -185,6 +220,7 @@ impl Hazard {
             Hazard::NotNull { table, .. }
             | Hazard::Check { table, .. }
             | Hazard::MandatoryNewColumn { table, .. }
+            | Hazard::ValidateConstraint { table, .. }
             | Hazard::UniqueIndex { table, .. }
             | Hazard::ForeignKey { table, .. } => table,
         }
@@ -211,6 +247,12 @@ impl Hazard {
                 ..
             } => format!(
                 "{table} gains UNIQUE {index} on ({columns}), and these groups are duplicated"
+            ),
+            Hazard::ValidateConstraint {
+                table, constraint, ..
+            } => format!(
+                "{table} validates the deferred constraint {constraint}, \
+                 and these rows do not satisfy it"
             ),
             Hazard::ForeignKey {
                 table,
@@ -486,26 +528,105 @@ fn split_top_level_commas(input: &str) -> Vec<String> {
     parts.into_iter().filter(|p| !p.is_empty()).collect()
 }
 
-/// Case-insensitive prefix match, returning the remainder.
+/// Case-insensitive keyword match at a WORD BOUNDARY, returning the remainder.
+///
+/// The boundary is the point. A bare prefix match splits an identifier that merely starts
+/// with a keyword (`ALTER COLUMN uniqueness ...` matching `UNIQUE`), and the wrong parse
+/// that follows produces a probe naming a column that does not exist, which the database
+/// answers with `undefined_column` -- the one error this module used to excuse. A parser
+/// bug would have been laundered into a clean verdict.
 fn eat(input: &str, keyword: &str) -> Option<String> {
     let trimmed = input.trim_start();
-    if trimmed.len() >= keyword.len() && trimmed[..keyword.len()].eq_ignore_ascii_case(keyword) {
-        Some(trimmed[keyword.len()..].to_owned())
-    } else {
-        None
+    if trimmed.len() < keyword.len() || !trimmed[..keyword.len()].eq_ignore_ascii_case(keyword) {
+        return None;
     }
+    let rest = &trimmed[keyword.len()..];
+    // A keyword ending in a non-word character (none here today) needs no boundary; one
+    // ending in a word character must not be followed by another.
+    let ends_word = keyword
+        .chars()
+        .last()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let continues_word = rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+    if ends_word && continues_word {
+        return None;
+    }
+    Some(rest.to_owned())
+}
+
+/// Whether `needle` occurs in `haystack` as a standalone keyword, outside any string
+/// literal or quoted identifier.
+///
+/// `haystack.to_ascii_uppercase().contains(needle)` is the shape this replaces, and it is
+/// wrong twice over: it matches inside a quoted value (a DEFAULT of `'NOT VALID'`, a
+/// constraint named `not_valid_yet`) and it matches a fragment of a longer word. Both
+/// turn into a statement cleared on the strength of text that was never a keyword.
+fn contains_keyword(haystack: &str, needle: &str) -> bool {
+    let upper_needle = needle.to_ascii_uppercase();
+    let chars: Vec<char> = haystack.chars().collect();
+    let mut i = 0;
+    let mut plain = String::with_capacity(haystack.len());
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' {
+            // Replace the whole literal with a space: its contents are data, not syntax.
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == c {
+                    if chars.get(i + 1) == Some(&c) {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+            plain.push(' ');
+            continue;
+        }
+        plain.push(c.to_ascii_uppercase());
+        i += 1;
+    }
+    let bytes = plain.as_bytes();
+    let needle_bytes = upper_needle.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut from = 0;
+    while let Some(found) = plain[from..].find(&upper_needle) {
+        let start = from + found;
+        let end = start + needle_bytes.len();
+        let before_ok = start == 0 || !is_word(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_word(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 /// Whether a statement contains a phrase that can impose a constraint on existing
 /// rows. Used only to decide whether silence means "additive" or "not read".
 fn looks_constraint_shaped(statement: &str) -> bool {
-    let upper = statement.to_ascii_uppercase();
-    upper.contains("SET NOT NULL")
-        || upper.contains("ADD CONSTRAINT")
-        || upper.contains("CREATE UNIQUE INDEX")
-        || (upper.contains("ADD COLUMN") && upper.contains("NOT NULL"))
-        || (upper.contains("ALTER TABLE") && upper.contains("ADD UNIQUE"))
-        || (upper.contains("ALTER TABLE") && upper.contains("ADD PRIMARY KEY"))
+    // Only reached for statements that are NOT `ALTER TABLE` (whose actions are each
+    // judged individually and reported whenever unread) and not `CREATE UNIQUE INDEX`.
+    // The two arms that tested for "ALTER TABLE" alongside an action keyword used to be
+    // applied to the comma-split ACTION, which never contains that text, so they could
+    // not fire; they are gone rather than rewritten, because the action path no longer
+    // filters at all.
+    [
+        "SET NOT NULL",
+        "ADD CONSTRAINT",
+        "CREATE UNIQUE INDEX",
+        "VALIDATE CONSTRAINT",
+        "SET DATA TYPE",
+    ]
+    .iter()
+    .any(|keyword| contains_keyword(statement, keyword))
+        || (contains_keyword(statement, "ADD COLUMN") && contains_keyword(statement, "NOT NULL"))
 }
 
 /// Read one migration and build a probe for every statement that could be rejected by
@@ -516,9 +637,13 @@ fn looks_constraint_shaped(statement: &str) -> bool {
 #[must_use]
 pub fn derive(migration: &Migration) -> Derivation {
     let mut derivation = Derivation::default();
-    for statement in split_statements(migration.sql) {
+    let statements = split_statements(migration.sql);
+    // A migration may add a constraint NOT VALID and validate it in the same file, so the
+    // expression a later VALIDATE will scan for is in this text. Collect those first.
+    let deferred = deferred_check_constraints(&statements);
+    for statement in statements {
         if let Some(rest) = eat(&statement, "ALTER TABLE") {
-            derive_alter_table(&rest, &statement, &mut derivation);
+            derive_alter_table(&rest, &statement, &deferred, &mut derivation);
         } else if let Some(hazard) = derive_create_unique_index(&statement) {
             derivation.hazards.push(hazard);
         } else if looks_constraint_shaped(&statement) {
@@ -533,7 +658,57 @@ pub fn derive(migration: &Migration) -> Derivation {
 /// Each action is examined on its own, so a statement whose first action parses and
 /// whose second does not still reports the second as unexamined. A statement that
 /// reports one hazard is not evidence that its other actions were read.
-fn derive_alter_table(after_keyword: &str, whole: &str, derivation: &mut Derivation) {
+/// Constraint name to CHECK expression, for every `ADD CONSTRAINT ... CHECK (...) NOT
+/// VALID` in this migration.
+///
+/// The NOT VALID escape and the VALIDATE that redeems it can sit in one file, and when they
+/// do, the constraint is in neither the catalog nor any earlier migration at preflight
+/// time. Reading it out of the text is the only way the pair can be checked at all.
+fn deferred_check_constraints(statements: &[String]) -> BTreeMap<String, String> {
+    let mut deferred = BTreeMap::new();
+    for statement in statements {
+        let Some(rest) = eat(statement, "ALTER TABLE") else {
+            continue;
+        };
+        let mut rest = rest;
+        for modifier in ["IF EXISTS", "ONLY"] {
+            if let Some(stripped) = eat(&rest, modifier) {
+                rest = stripped;
+            }
+        }
+        let Some((_table, actions)) = take_ident(&rest) else {
+            continue;
+        };
+        for action in split_top_level_commas(actions) {
+            if !contains_keyword(&action, "NOT VALID") {
+                continue;
+            }
+            let Some(after_add) = eat(&action, "ADD") else {
+                continue;
+            };
+            let Some(after_constraint) = eat(&after_add, "CONSTRAINT") else {
+                continue;
+            };
+            let Some((name, body)) = take_ident(&after_constraint) else {
+                continue;
+            };
+            let Some(after_check) = eat(body, "CHECK") else {
+                continue;
+            };
+            if let Some((expression, _)) = take_parens(&after_check) {
+                deferred.insert(name, expression);
+            }
+        }
+    }
+    deferred
+}
+
+fn derive_alter_table(
+    after_keyword: &str,
+    whole: &str,
+    deferred: &BTreeMap<String, String>,
+    derivation: &mut Derivation,
+) {
     let mut rest = after_keyword.to_owned();
     for modifier in ["IF EXISTS", "ONLY"] {
         if let Some(stripped) = eat(&rest, modifier) {
@@ -548,16 +723,21 @@ fn derive_alter_table(after_keyword: &str, whole: &str, derivation: &mut Derivat
     };
 
     for action in split_top_level_commas(actions) {
-        match derive_action(&table, &action) {
-            Verdict::Hazard(hazard) => derivation.hazards.push(hazard),
+        match derive_action(&table, &action, deferred) {
+            Verdict::Hazards(hazards) => derivation.hazards.extend(hazards),
             Verdict::Safe => {}
-            Verdict::Unread => {
-                if looks_constraint_shaped(&action) {
-                    derivation
-                        .unexamined
-                        .push(format!("ALTER TABLE {table} {action}"));
-                }
-            }
+            // Every unread ALTER TABLE action is reported, with no shape filter.
+            //
+            // The filter that used to be here could not fire: it was handed the
+            // comma-split ACTION, and two of its arms tested for the text "ALTER TABLE",
+            // which an action fragment never contains by construction. Any action that
+            // only matched those arms was dropped instead of reported. It is also no
+            // longer needed: Safe is now an affirmative recognition rather than a
+            // fall-through, so Unread means the parser genuinely did not read it, and
+            // that is worth printing whatever the statement looks like.
+            Verdict::Unread => derivation
+                .unexamined
+                .push(format!("ALTER TABLE {table} {action}")),
         }
     }
 }
@@ -570,20 +750,74 @@ fn derive_alter_table(after_keyword: &str, whole: &str, derivation: &mut Derivat
 /// the statement ("this ADD COLUMN carries a DEFAULT, so no existing row is stranded");
 /// `Unread` is the absence of one.
 enum Verdict {
-    /// Existing rows can reject this statement, and here is the probe that finds them.
-    Hazard(Hazard),
+    /// Existing rows can reject this statement, and here are the probes that find them.
+    ///
+    /// A list, not one hazard: `PRIMARY KEY (a, b)` imposes TWO rules at once, that
+    /// neither column is NULL and that the pair is unique, and a verdict that could carry
+    /// only one of them would check half the constraint and report the half it checked.
+    Hazards(Vec<Hazard>),
     /// The parser read this statement and determined no existing row can reject it.
     Safe,
     /// The parser did not recognise this statement. Never a pass.
     Unread,
 }
 
-fn derive_action(table: &str, action: &str) -> Verdict {
+impl Verdict {
+    /// A verdict carrying exactly one hazard.
+    fn one(hazard: Hazard) -> Self {
+        Verdict::Hazards(vec![hazard])
+    }
+}
+
+/// Table-level `ALTER TABLE` actions that no existing row can reject.
+///
+/// Every one of these either removes a rule, removes data, or changes metadata that rows
+/// do not have to satisfy, so Postgres never scans for them. Each is a DECISION, written
+/// down, and the list is checked against the shipped chain: these five account for all 348
+/// table-level actions in it, and anything outside the list is Unread rather than assumed.
+///
+/// VALIDATE CONSTRAINT is deliberately NOT here. It is the one table-level action that
+/// does scan.
+const RELAXING_TABLE_ACTIONS: &[&str] = &[
+    "ENABLE ROW LEVEL SECURITY",
+    "DISABLE ROW LEVEL SECURITY",
+    "FORCE ROW LEVEL SECURITY",
+    "NO FORCE ROW LEVEL SECURITY",
+    "DROP CONSTRAINT",
+    "DROP COLUMN",
+    "ENABLE TRIGGER",
+    "DISABLE TRIGGER",
+    "OWNER TO",
+    "SET SCHEMA",
+    "CLUSTER ON",
+    "SET WITHOUT CLUSTER",
+    "INHERIT",
+    "NO INHERIT",
+];
+
+fn derive_action(table: &str, action: &str, deferred: &BTreeMap<String, String>) -> Verdict {
+    // Checked BEFORE the NOT VALID escape below: an action that both validates and
+    // mentions NOT VALID would otherwise be cleared by the escape.
+    if let Some(rest) = eat(action, "VALIDATE CONSTRAINT") {
+        let Some((constraint, _)) = take_ident(&rest) else {
+            return Verdict::Unread;
+        };
+        let expression = deferred.get(&constraint).cloned();
+        return Verdict::one(Hazard::ValidateConstraint {
+            table: table.to_owned(),
+            constraint,
+            expression,
+        });
+    }
     // NOT VALID defers the scan, so Postgres accepts the statement against any data and
     // nothing is stranded when it applies. Validating it later is a separate operator
     // step, outside this preflight. This is a decision about the statement, not a
     // failure to read it.
-    if action.to_ascii_uppercase().contains("NOT VALID") {
+    //
+    // Matched as a keyword outside string literals: a CHECK whose DEFAULT or comparison
+    // value is the TEXT 'NOT VALID' would otherwise clear a constraint Postgres fully
+    // validates.
+    if contains_keyword(action, "NOT VALID") {
         return Verdict::Safe;
     }
     if let Some(rest) = eat(action, "ALTER") {
@@ -592,27 +826,74 @@ fn derive_action(table: &str, action: &str) -> Verdict {
     if let Some(rest) = eat(action, "ADD") {
         return derive_add(table, &rest);
     }
+    if RELAXING_TABLE_ACTIONS
+        .iter()
+        .any(|relaxing| eat(action, relaxing).is_some())
+    {
+        return Verdict::Safe;
+    }
     Verdict::Unread
 }
 
 /// `ALTER [COLUMN] c SET NOT NULL`. The `COLUMN` keyword is optional in Postgres.
+/// The `ALTER [COLUMN] c <action>` forms that provably cannot be rejected by an existing
+/// row, because each one only relaxes a rule or changes metadata the rows do not have to
+/// satisfy.
+///
+/// This is an ALLOW LIST on purpose. The first version inverted it -- anything that was
+/// not `SET NOT NULL` was declared safe -- and that handed a clean bill to
+/// `ALTER COLUMN ... TYPE`, which rewrites the table, re-casts every row, and is rejected
+/// by data that does not fit (an over-long varchar, a failed USING cast, a numeric
+/// overflow). An inverted list makes every action nobody thought of into a pass.
+const RELAXING_COLUMN_ACTIONS: &[&str] = &[
+    "DROP NOT NULL",
+    "SET DEFAULT",
+    "DROP DEFAULT",
+    "DROP EXPRESSION",
+    "DROP IDENTITY",
+    "SET STATISTICS",
+    "SET STORAGE",
+    "SET COMPRESSION",
+    "RESET",
+];
+
 fn derive_alter_column(table: &str, after_alter: &str) -> Verdict {
     let rest = eat(after_alter, "COLUMN").unwrap_or_else(|| after_alter.to_owned());
     let Some((column, tail)) = take_ident(&rest) else {
         return Verdict::Unread;
     };
-    if eat(tail, "SET NOT NULL").is_none() {
-        // Every other ALTER COLUMN action (DROP NOT NULL, SET DEFAULT, TYPE) relaxes or
-        // retypes rather than constrains, so no existing row is rejected by it.
+    if eat(tail, "SET NOT NULL").is_some() {
+        return Verdict::one(Hazard::NotNull {
+            table: table.to_owned(),
+            column,
+        });
+    }
+    if RELAXING_COLUMN_ACTIONS
+        .iter()
+        .any(|action| eat(tail, action).is_some())
+    {
         return Verdict::Safe;
     }
-    Verdict::Hazard(Hazard::NotNull {
-        table: table.to_owned(),
-        column,
-    })
+    // TYPE, SET DATA TYPE, ADD GENERATED, SET GENERATED, and anything new: not read.
+    Verdict::Unread
 }
 
 /// `ADD CONSTRAINT n ...`, `ADD COLUMN c ...`, and the unnamed `ADD UNIQUE (...)`.
+/// The table-constraint keywords an `ADD` action can open with. A constraint may be
+/// written with or without a `CONSTRAINT name` prefix, and the unnamed form is the one
+/// that used to be mistaken for a column.
+const TABLE_CONSTRAINT_KEYWORDS: &[&str] =
+    &["CHECK", "UNIQUE", "PRIMARY KEY", "FOREIGN KEY", "EXCLUDE"];
+
+/// `ADD CONSTRAINT n ...`, the unnamed `ADD <constraint> ...`, and `ADD [COLUMN] c ...`.
+///
+/// The ordering here is load-bearing. The first version tried CONSTRAINT, then UNIQUE,
+/// then fell through to "this must be an ADD COLUMN", which parsed `ADD PRIMARY KEY (id)`
+/// as a column named `PRIMARY`, found no NOT NULL in the remainder, and returned Safe.
+/// Four statements in the shipped chain take that path (two `ADD PRIMARY KEY` in 0168, two
+/// `ADD FOREIGN KEY` in 0150), and because the misparse produced Safe rather than Unread,
+/// the chain-wide "everything is read" test passed BECAUSE of it. A fall-through to the
+/// permissive branch is how an unrecognised statement becomes a pass.
 fn derive_add(table: &str, after_add: &str) -> Verdict {
     if let Some(rest) = eat(after_add, "CONSTRAINT") {
         let Some((constraint, body)) = take_ident(&rest) else {
@@ -620,35 +901,40 @@ fn derive_add(table: &str, after_add: &str) -> Verdict {
         };
         return derive_constraint_body(table, &constraint, body);
     }
-    if let Some(rest) = eat(after_add, "UNIQUE") {
-        let Some((columns, _)) = take_parens(&rest) else {
-            return Verdict::Unread;
-        };
-        return Verdict::Hazard(Hazard::UniqueIndex {
-            table: table.to_owned(),
-            index: format!("(unnamed UNIQUE on {table})"),
-            columns,
-            predicate: None,
-        });
+    // An unnamed table constraint. Postgres names it for you; the preflight cares only
+    // about which rows it would reject.
+    for keyword in TABLE_CONSTRAINT_KEYWORDS {
+        if eat(after_add, keyword).is_some() {
+            let name = format!("(unnamed {keyword} on {table})");
+            return derive_constraint_body(table, &name, after_add);
+        }
     }
+    // Only now is this an ADD COLUMN. `COLUMN` is optional in Postgres, so a bare
+    // identifier reaches here too, but every constraint keyword has been ruled out above.
     let rest = eat(after_add, "COLUMN").unwrap_or_else(|| after_add.to_owned());
     let rest = eat(&rest, "IF NOT EXISTS").unwrap_or(rest);
     let Some((column, tail)) = take_ident(&rest) else {
         return Verdict::Unread;
     };
-    let upper = tail.to_ascii_uppercase();
+    if !contains_keyword(tail, "NOT NULL") {
+        // A nullable new column strands nothing: every existing row gets NULL.
+        return Verdict::Safe;
+    }
     // A new mandatory column strands every existing row ONLY when it has no default to
     // fill them with. A volatile default is still a default: Postgres evaluates it per
     // row, so the column is never null and no row is stranded. That is a decision about
     // the statement, so it is Safe and not Unread: 45 of the chain's ADD COLUMNs take
     // this branch, and reporting them as unread would bury the real signal.
-    if upper.contains("NOT NULL") && !upper.contains("DEFAULT") {
-        return Verdict::Hazard(Hazard::MandatoryNewColumn {
-            table: table.to_owned(),
-            column,
-        });
+    //
+    // Both keywords are matched OUTSIDE string literals. `DEFAULT 'NOT NULL'` and a
+    // default whose text contains the word DEFAULT would otherwise decide this.
+    if contains_keyword(tail, "DEFAULT") {
+        return Verdict::Safe;
     }
-    Verdict::Safe
+    Verdict::one(Hazard::MandatoryNewColumn {
+        table: table.to_owned(),
+        column,
+    })
 }
 
 fn derive_constraint_body(table: &str, constraint: &str, body: &str) -> Verdict {
@@ -656,7 +942,7 @@ fn derive_constraint_body(table: &str, constraint: &str, body: &str) -> Verdict 
         let Some((expression, _)) = take_parens(&rest) else {
             return Verdict::Unread;
         };
-        return Verdict::Hazard(Hazard::Check {
+        return Verdict::one(Hazard::Check {
             table: table.to_owned(),
             constraint: constraint.to_owned(),
             expression,
@@ -665,20 +951,55 @@ fn derive_constraint_body(table: &str, constraint: &str, body: &str) -> Verdict 
     if let Some(rest) = eat(body, "UNIQUE") {
         // NULLS NOT DISTINCT (Postgres 15+) inverts the NULL handling probe_sql assumes,
         // so this is Unread rather than probed with the wrong predicate.
-        if rest.to_ascii_uppercase().contains("NULLS NOT DISTINCT") {
+        if contains_keyword(&rest, "NULLS NOT DISTINCT") {
             return Verdict::Unread;
         }
         let Some((columns, _)) = take_parens(&rest) else {
             return Verdict::Unread;
         };
-        return Verdict::Hazard(Hazard::UniqueIndex {
+        return Verdict::one(Hazard::UniqueIndex {
             table: table.to_owned(),
             index: constraint.to_owned(),
             columns,
             predicate: None,
         });
     }
+    if let Some(rest) = eat(body, "PRIMARY KEY") {
+        // ADD PRIMARY KEY ... USING INDEX adopts an existing index, so the columns are not
+        // in this statement at all and cannot be read from it. Unread.
+        if contains_keyword(&rest, "USING INDEX") {
+            return Verdict::Unread;
+        }
+        let Some((columns, _)) = take_parens(&rest) else {
+            return Verdict::Unread;
+        };
+        // A primary key is two rules, and both can be rejected by existing rows: every
+        // column mandatory, and the tuple unique. Probing only one would report a clean
+        // bill on the strength of the half that happened to pass.
+        let mut hazards: Vec<Hazard> = columns
+            .split(',')
+            .map(|column| Hazard::NotNull {
+                table: table.to_owned(),
+                column: column.trim().to_owned(),
+            })
+            .collect();
+        hazards.push(Hazard::UniqueIndex {
+            table: table.to_owned(),
+            index: constraint.to_owned(),
+            columns: columns.clone(),
+            predicate: None,
+        });
+        return Verdict::Hazards(hazards);
+    }
     if let Some(rest) = eat(body, "FOREIGN KEY") {
+        // MATCH FULL inverts the NULL rule probe_sql assumes. Under the default MATCH
+        // SIMPLE a row is exempt if ANY referencing column is NULL, which is the `AND` of
+        // IS NOT NULL the probe builds. MATCH FULL exempts a row only if EVERY one is
+        // NULL, so a partially-NULL row IS checked and can be an orphan -- exactly the
+        // rows the probe's `AND` excludes. Probing it would under-report, so it is Unread.
+        if contains_keyword(body, "MATCH FULL") {
+            return Verdict::Unread;
+        }
         let Some((columns, after_columns)) = take_parens(&rest) else {
             return Verdict::Unread;
         };
@@ -694,7 +1015,7 @@ fn derive_constraint_body(table: &str, constraint: &str, body: &str) -> Verdict 
         let Some((parent_columns, _)) = take_parens(after_parent) else {
             return Verdict::Unread;
         };
-        return Verdict::Hazard(Hazard::ForeignKey {
+        return Verdict::one(Hazard::ForeignKey {
             table: table.to_owned(),
             constraint: constraint.to_owned(),
             columns,
@@ -714,7 +1035,7 @@ fn derive_create_unique_index(statement: &str) -> Option<Hazard> {
             rest = stripped;
         }
     }
-    if rest.to_ascii_uppercase().contains("NULLS NOT DISTINCT") {
+    if contains_keyword(&rest, "NULLS NOT DISTINCT") {
         return None;
     }
     let (index, after_index) = take_ident(&rest)?;
@@ -729,7 +1050,22 @@ fn derive_create_unique_index(statement: &str) -> Option<Hazard> {
         None => after_table.to_owned(),
     };
     let (columns, after_columns) = take_parens(&after_using)?;
-    let predicate = eat(after_columns, "WHERE").map(|p| p.trim().to_owned());
+    // The predicate has to be read exactly or not at all. INCLUDE (...), WITH (...),
+    // TABLESPACE x and NULLS NOT DISTINCT may all sit between the column list and WHERE,
+    // and `eat` only matches at the front, so a clause in between used to make the
+    // predicate silently None -- widening the probe from the partial index's row set to
+    // the WHOLE TABLE and reporting duplicates the index would never compare. Anything
+    // other than a bare WHERE or nothing at all is Unread.
+    let tail = after_columns.trim();
+    let predicate = match (tail.is_empty(), eat(tail, "WHERE")) {
+        (true, _) => None,
+        (false, Some(rest)) => Some(rest.trim().to_owned()),
+        // A clause this parser does not read sits before the predicate. Returning None
+        // here makes the whole statement Unread, which is the point: a half-read partial
+        // index probed as if it covered every row reports duplicates that would never
+        // collide.
+        (false, None) => return None,
+    };
     Some(Hazard::UniqueIndex {
         table,
         index,
@@ -823,6 +1159,7 @@ pub const PROBE_TIMEOUT_MS: i32 = 30_000;
 /// [`MigrationError::Database`] if the ledger itself cannot be read. An individual
 /// probe failing is a [`Report`] entry, not an error: the preflight's job is to report
 /// on all of them, not to stop at the first.
+#[allow(clippy::too_many_lines)]
 pub async fn run(pool: &PgPool, chain: &[Migration]) -> Result<Report, MigrationError> {
     let mut report = Report::default();
 
@@ -841,6 +1178,14 @@ pub async fn run(pool: &PgPool, chain: &[Migration]) -> Result<Report, Migration
             Err(error) => return Err(error.into()),
         };
 
+    // What this run will bring into existence, read before any probe: it is what makes an
+    // absent table or column decidable rather than merely excused.
+    let pending: Vec<&Migration> = chain
+        .iter()
+        .filter(|migration| !applied.contains(&migration.version))
+        .collect();
+    let shape = pending_shape(&pending);
+
     for migration in chain {
         if applied.contains(&migration.version) {
             continue;
@@ -858,6 +1203,35 @@ pub async fn run(pool: &PgPool, chain: &[Migration]) -> Result<Report, Migration
             });
         }
         for hazard in derivation.hazards {
+            // A VALIDATE whose constraint an APPLIED migration added carries no expression
+            // from the text; the catalog has it. Without resolving it the probe would read
+            // `WHERE (true) IS FALSE`, which matches nothing and reports clean.
+            let hazard = if let Hazard::ValidateConstraint {
+                table,
+                constraint,
+                expression: None,
+            } = &hazard
+            {
+                let Some(expression) = constraint_expression(pool, constraint).await else {
+                    report.unanswered.push(Unanswered {
+                        version: migration.version,
+                        detail: format!(
+                            "VALIDATE CONSTRAINT {constraint} on {table}: the constraint is in \
+                             neither this run's migrations nor pg_constraint, so the rows it \
+                             will scan cannot be determined"
+                        ),
+                        reason: UnansweredReason::ProbeFailed,
+                    });
+                    continue;
+                };
+                Hazard::ValidateConstraint {
+                    table: table.clone(),
+                    constraint: constraint.clone(),
+                    expression: Some(expression),
+                }
+            } else {
+                hazard
+            };
             match probe(pool, &hazard).await {
                 ProbeOutcome::Rows(0) => report.probes_run += 1,
                 ProbeOutcome::Rows(rows) => {
@@ -869,7 +1243,45 @@ pub async fn run(pool: &PgPool, chain: &[Migration]) -> Result<Report, Migration
                         rows,
                     });
                 }
-                ProbeOutcome::NotYetApplicable => report.probes_not_yet_applicable += 1,
+                ProbeOutcome::SubjectAbsent => match absent_subject_verdict(&hazard, &shape) {
+                    AbsentVerdict::CreatedByThisRun => report.probes_not_yet_applicable += 1,
+                    AbsentVerdict::EveryRowStranded => {
+                        // The column arrives NULL on every row the table already holds, so
+                        // a SET NOT NULL on it is rejected by all of them. Count the rows
+                        // rather than call it "not applicable".
+                        let count_rows = Hazard::MandatoryNewColumn {
+                            table: hazard.table().to_owned(),
+                            column: String::new(),
+                        };
+                        match probe(pool, &count_rows).await {
+                            ProbeOutcome::Rows(0) => report.probes_run += 1,
+                            ProbeOutcome::Rows(rows) => {
+                                report.probes_run += 1;
+                                report.findings.push(Finding {
+                                    version: migration.version,
+                                    name: migration.name.to_owned(),
+                                    hazard,
+                                    rows,
+                                });
+                            }
+                            _ => report.unanswered.push(Unanswered {
+                                version: migration.version,
+                                detail: format!(
+                                    "{}: this run adds the column with no default, so every \
+                                     existing row would be NULL, and the row count could not \
+                                     be read",
+                                    hazard.describe()
+                                ),
+                                reason: UnansweredReason::ProbeFailed,
+                            }),
+                        }
+                    }
+                    AbsentVerdict::Undecidable(why) => report.unanswered.push(Unanswered {
+                        version: migration.version,
+                        detail: format!("{} -- {why}: {}", hazard.describe(), hazard.probe_sql()),
+                        reason: UnansweredReason::ProbeFailed,
+                    }),
+                },
                 ProbeOutcome::Failed(message) => {
                     report.probes_run += 1;
                     report.unanswered.push(Unanswered {
@@ -887,10 +1299,183 @@ pub async fn run(pool: &PgPool, chain: &[Migration]) -> Result<Report, Migration
 
 enum ProbeOutcome {
     Rows(i64),
-    /// The table or column is not there yet, because an earlier pending migration
-    /// creates it. No existing row can be stranded in a table that does not exist.
-    NotYetApplicable,
+    /// The probe named a table or column the database does not have. Whether that is
+    /// harmless is NOT decided here: [`absent_subject_verdict`] asks whether this run
+    /// creates the subject before deciding, because "a pending migration makes it" and
+    /// "the parser named something that does not exist" arrive as the same error.
+    SubjectAbsent,
     Failed(String),
+}
+
+/// What this pending run will bring into existence before its constraints apply.
+///
+/// Needed because "the database has never heard of this column" has two very different
+/// causes. If a pending migration creates it, nothing can be stranded there and the probe
+/// is genuinely not applicable. If nothing creates it, the probe named something that does
+/// not exist, which is a PARSER ERROR, and excusing it turns a bug in this file into a
+/// clean bill of health for the upgrade.
+#[derive(Debug, Default)]
+struct PendingShape {
+    tables: std::collections::BTreeSet<String>,
+    /// (table, column) for every column a pending migration adds WITHOUT a default. Such
+    /// a column arrives NULL on every row the table already holds.
+    nullable_new_columns: std::collections::BTreeSet<(String, String)>,
+    /// (table, column) for every column a pending migration adds WITH a default.
+    defaulted_new_columns: std::collections::BTreeSet<(String, String)>,
+}
+
+impl PendingShape {
+    fn creates_table(&self, table: &str) -> bool {
+        let bare = table.rsplit('.').next().unwrap_or(table);
+        self.tables.contains(bare)
+    }
+
+    fn creates_column(&self, table: &str, column: &str) -> Option<bool> {
+        let bare = table.rsplit('.').next().unwrap_or(table).to_owned();
+        let key = (bare, column.to_owned());
+        if self.nullable_new_columns.contains(&key) {
+            return Some(false);
+        }
+        if self.defaulted_new_columns.contains(&key) {
+            return Some(true);
+        }
+        None
+    }
+}
+
+/// Read the tables and columns the pending migrations will create.
+fn pending_shape(pending: &[&Migration]) -> PendingShape {
+    let mut shape = PendingShape::default();
+    for migration in pending {
+        for statement in split_statements(migration.sql) {
+            if let Some(rest) = eat(&statement, "CREATE TABLE") {
+                let rest = eat(&rest, "IF NOT EXISTS").unwrap_or(rest);
+                if let Some((table, _)) = take_ident(&rest) {
+                    let bare = table.rsplit('.').next().unwrap_or(&table).to_owned();
+                    shape.tables.insert(bare);
+                }
+                continue;
+            }
+            let Some(rest) = eat(&statement, "ALTER TABLE") else {
+                continue;
+            };
+            let mut rest = rest;
+            for modifier in ["IF EXISTS", "ONLY"] {
+                if let Some(stripped) = eat(&rest, modifier) {
+                    rest = stripped;
+                }
+            }
+            let Some((table, actions)) = take_ident(&rest) else {
+                continue;
+            };
+            let bare = table.rsplit('.').next().unwrap_or(&table).to_owned();
+            for action in split_top_level_commas(actions) {
+                let Some(after_add) = eat(&action, "ADD") else {
+                    continue;
+                };
+                // Only a genuine ADD COLUMN: the constraint keywords are ruled out first,
+                // exactly as derive_add does, so `ADD PRIMARY KEY (id)` is not recorded as
+                // a column named PRIMARY.
+                if eat(&after_add, "CONSTRAINT").is_some()
+                    || TABLE_CONSTRAINT_KEYWORDS
+                        .iter()
+                        .any(|keyword| eat(&after_add, keyword).is_some())
+                {
+                    continue;
+                }
+                let after_column = eat(&after_add, "COLUMN").unwrap_or(after_add);
+                let after_column = eat(&after_column, "IF NOT EXISTS").unwrap_or(after_column);
+                if let Some((column, tail)) = take_ident(&after_column) {
+                    let key = (bare.clone(), column);
+                    if contains_keyword(tail, "DEFAULT") {
+                        shape.defaulted_new_columns.insert(key);
+                    } else {
+                        shape.nullable_new_columns.insert(key);
+                    }
+                }
+            }
+        }
+    }
+    shape
+}
+
+/// What an absent table or column means for one hazard.
+enum AbsentVerdict {
+    /// A pending migration creates the subject. Nothing can be stranded in a table or
+    /// column that does not exist yet.
+    CreatedByThisRun,
+    /// The column is added by this run WITHOUT a default, so it arrives NULL on every row
+    /// the table already holds, and a rule that forbids NULL is rejected by all of them.
+    EveryRowStranded,
+    /// Not decidable from the migration text. Blocks, with this as the reason.
+    Undecidable(&'static str),
+}
+
+/// Decide what an absent subject means, rather than assuming it is harmless.
+///
+/// The version this replaces mapped both `undefined_table` and `undefined_column` to
+/// "clean", on the reasoning that an earlier pending migration must be about to create
+/// them. That reasoning is right for a TABLE and wrong for a COLUMN, in a way that
+/// produced a false pass on an ordinary migration:
+///
+/// ```sql
+/// ALTER TABLE widgets ADD COLUMN region text;
+/// ALTER TABLE widgets ALTER COLUMN region SET NOT NULL;
+/// ```
+///
+/// The `SET NOT NULL` probe asks for NULLs in a column that does not exist yet, gets
+/// `undefined_column`, and was reported clean -- while in fact the column arrives NULL on
+/// every existing row and the migration fails on the first one. It also excused a probe
+/// naming a column NOTHING creates, which is this file's own parser being wrong, laundered
+/// into a clean bill for the upgrade.
+fn absent_subject_verdict(hazard: &Hazard, shape: &PendingShape) -> AbsentVerdict {
+    let table = hazard.table();
+    if shape.creates_table(table) {
+        return AbsentVerdict::CreatedByThisRun;
+    }
+    match hazard {
+        // The one case where an absent column has a determinate answer: the column is
+        // about to exist, all-NULL, and the rule forbids NULL.
+        Hazard::NotNull { column, .. } => match shape.creates_column(table, column) {
+            Some(false) => AbsentVerdict::EveryRowStranded,
+            // Added WITH a default: the rows get that default, and whether it satisfies
+            // the rule is not readable from the text (a DEFAULT NULL satisfies nothing).
+            Some(true) => AbsentVerdict::Undecidable(
+                "this run adds the column with a default, so whether the filled value \
+                 satisfies the constraint cannot be read from the migration",
+            ),
+            None => AbsentVerdict::Undecidable(
+                "the probe names a column that neither exists nor is created by any \
+                 pending migration, so the probe itself is wrong",
+            ),
+        },
+        // A unique index and a foreign key both ignore rows with a NULL key, and an
+        // all-NULL new column makes EVERY row such a row, whatever the other columns
+        // hold. So these are clean, determinately.
+        Hazard::UniqueIndex { columns, .. } | Hazard::ForeignKey { columns, .. } => {
+            let any_arrives_null = columns
+                .split(',')
+                .any(|column| shape.creates_column(table, column.trim()) == Some(false));
+            if any_arrives_null {
+                AbsentVerdict::CreatedByThisRun
+            } else {
+                AbsentVerdict::Undecidable(
+                    "the probe names a column that neither exists nor is created without a \
+                     default by any pending migration",
+                )
+            }
+        }
+        // A CHECK over an absent column is NOT determinate: its expression may reference
+        // other columns, so an all-NULL new column does not make the whole expression
+        // NULL. Blocking here is the honest answer.
+        Hazard::Check { .. } | Hazard::ValidateConstraint { .. } => AbsentVerdict::Undecidable(
+            "the constraint references a column this run creates, and whether its \
+             expression accepts the filled rows cannot be read from the migration",
+        ),
+        Hazard::MandatoryNewColumn { .. } => {
+            AbsentVerdict::Undecidable("the table is not there and no pending migration creates it")
+        }
+    }
 }
 
 async fn probe(pool: &PgPool, hazard: &Hazard) -> ProbeOutcome {
@@ -911,15 +1496,36 @@ async fn probe(pool: &PgPool, hazard: &Hazard) -> ProbeOutcome {
     }
     let outcome = match sqlx::query(&sql).fetch_one(&mut *tx).await {
         Ok(row) => ProbeOutcome::Rows(row.get::<i64, _>("n")),
+        // The caller decides what an absent subject means. This module used to excuse
+        // 42P01 and 42703 here, which excused a parser error just as readily as a table an
+        // earlier pending migration creates.
         Err(sqlx::Error::Database(error)) => match error.code().as_deref() {
-            // undefined_table, undefined_column: created by an earlier pending migration.
-            Some("42P01" | "42703") => ProbeOutcome::NotYetApplicable,
+            // undefined_table, undefined_column.
+            Some("42P01" | "42703") => ProbeOutcome::SubjectAbsent,
             _ => ProbeOutcome::Failed(error.to_string()),
         },
         Err(error) => ProbeOutcome::Failed(error.to_string()),
     };
     drop(tx);
     outcome
+}
+
+/// Resolve a `VALIDATE CONSTRAINT`'s expression from the catalog.
+///
+/// Used when the constraint was added NOT VALID by an already-applied migration, so its
+/// text is in `pg_constraint` rather than in any migration this run is about to apply.
+async fn constraint_expression(pool: &PgPool, constraint: &str) -> Option<String> {
+    let row = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conname = $1",
+    )
+    .bind(constraint)
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+    let definition: String = row.get("definition");
+    // "CHECK ((expr))" -- take what is inside the outermost parentheses after CHECK.
+    let after_check = eat(&definition, "CHECK")?;
+    take_parens(&after_check).map(|(expression, _)| expression)
 }
 
 /// Render a [`Report`] as the operator-facing text `ironauth doctor` prints.
@@ -1151,15 +1757,24 @@ mod tests {
         assert!(derivation.unexamined.is_empty());
     }
 
-    /// The honesty valve. These two ARE constraint-shaped and this parser does not read
-    /// them, so they must surface rather than pass. If this test ever fails because the
-    /// parser learned to read them, the fix is to assert the hazard, never to delete the
-    /// case.
+    /// The honesty valve. Each of these IS constraint-shaped and this parser does not read
+    /// it, so it must surface rather than pass. If one ever fails because the parser
+    /// learned to read it, the fix is to assert the hazard, never to delete the case --
+    /// which is exactly what happened to PRIMARY KEY, now covered below.
     #[test]
     fn a_constraint_kind_the_parser_does_not_read_is_reported_not_passed() {
         for sql in [
-            "ALTER TABLE t ADD CONSTRAINT t_pkey PRIMARY KEY (id);",
+            // Adopts an existing index, so the columns are not in the statement at all.
+            "ALTER TABLE t ADD CONSTRAINT p PRIMARY KEY USING INDEX t_idx;",
+            // Inverts the NULL rule the unique probe assumes.
             "ALTER TABLE t ADD CONSTRAINT u UNIQUE NULLS NOT DISTINCT (a, b);",
+            // Inverts the NULL rule the foreign-key probe assumes.
+            "ALTER TABLE t ADD CONSTRAINT f FOREIGN KEY (a, b) REFERENCES p (x, y) MATCH FULL;",
+            // Rewrites the table and re-casts every row.
+            "ALTER TABLE t ALTER COLUMN c TYPE bigint;",
+            "ALTER TABLE t ALTER COLUMN c SET DATA TYPE varchar(8);",
+            // Not a constraint this parser models.
+            "ALTER TABLE t ADD CONSTRAINT e EXCLUDE USING gist (c WITH &&);",
         ] {
             let derivation = derive(&migration(sql));
             assert!(
@@ -1174,16 +1789,209 @@ mod tests {
         }
     }
 
+    /// A type change is the case that motivated turning the ALTER COLUMN branch into an
+    /// allow list. It cannot be probed from the migration text, so it must block; the
+    /// thing it must NOT do is read as safe because it is not `SET NOT NULL`.
+    #[test]
+    fn a_narrowing_type_change_is_never_cleared() {
+        let derivation = derive(&migration(
+            "ALTER TABLE widgets ALTER COLUMN name TYPE varchar(64);",
+        ));
+        assert!(derivation.hazards.is_empty());
+        assert_eq!(derivation.unexamined.len(), 1);
+        assert!(derivation.unexamined[0].contains("TYPE"));
+    }
+
+    /// The actions that genuinely cannot be rejected by a row stay cleared, so the
+    /// allow list above does not simply block everything.
+    #[test]
+    fn a_relaxing_column_action_is_cleared() {
+        for sql in [
+            "ALTER TABLE t ALTER COLUMN c DROP NOT NULL;",
+            "ALTER TABLE t ALTER COLUMN c SET DEFAULT 'x';",
+            "ALTER TABLE t ALTER COLUMN c DROP DEFAULT;",
+            "ALTER TABLE t ENABLE ROW LEVEL SECURITY;",
+            "ALTER TABLE t FORCE ROW LEVEL SECURITY;",
+            "ALTER TABLE t DROP CONSTRAINT c;",
+            "ALTER TABLE t DROP COLUMN c;",
+        ] {
+            let derivation = derive(&migration(sql));
+            assert!(derivation.hazards.is_empty(), "{sql}");
+            assert!(
+                derivation.unexamined.is_empty(),
+                "{sql} is a decision, not an absence of one: {:?}",
+                derivation.unexamined
+            );
+        }
+    }
+
+    /// A PRIMARY KEY is two rules at once, and probing one would report a clean bill on
+    /// the strength of the half that happened to pass.
+    #[test]
+    fn a_primary_key_probes_both_mandatory_columns_and_uniqueness() {
+        let derivation = derive(&migration(
+            "ALTER TABLE t ADD CONSTRAINT t_pkey PRIMARY KEY (tenant_id, id);",
+        ));
+        assert!(derivation.unexamined.is_empty());
+        let probes: Vec<String> = derivation.hazards.iter().map(Hazard::probe_sql).collect();
+        assert_eq!(
+            probes.len(),
+            3,
+            "two NOT NULLs and one uniqueness: {probes:?}"
+        );
+        assert!(probes.contains(&"SELECT count(*) AS n FROM t WHERE tenant_id IS NULL".to_owned()));
+        assert!(probes.contains(&"SELECT count(*) AS n FROM t WHERE id IS NULL".to_owned()));
+        assert!(
+            probes.iter().any(|p| p.contains("GROUP BY tenant_id, id")),
+            "{probes:?}"
+        );
+    }
+
+    /// The four statements in the shipped chain that used to be parsed as a column named
+    /// `PRIMARY` or `FOREIGN`. An unnamed constraint is a constraint.
+    #[test]
+    fn an_unnamed_table_constraint_is_read_as_a_constraint_not_a_column() {
+        let unnamed = derive(&migration(
+            "ALTER TABLE t ADD FOREIGN KEY (env_id, tenant_id) REFERENCES e (id, tenant_id);",
+        ));
+        assert!(unnamed.unexamined.is_empty(), "{:?}", unnamed.unexamined);
+        assert_eq!(unnamed.hazards.len(), 1);
+        assert!(unnamed.hazards[0].probe_sql().contains("NOT EXISTS"));
+
+        let check = derive(&migration("ALTER TABLE t ADD CHECK (a > 0);"));
+        assert_eq!(check.hazards.len(), 1);
+        assert!(check.hazards[0].probe_sql().contains("(a > 0) IS FALSE"));
+
+        let unique = derive(&migration("ALTER TABLE t ADD UNIQUE (a, b);"));
+        assert_eq!(unique.hazards.len(), 1);
+        assert!(unique.hazards[0].probe_sql().contains("GROUP BY a, b"));
+    }
+
+    /// `DEFAULT` and `NOT VALID` decide whether a statement is cleared, so neither may be
+    /// matched inside a value. A column whose default is the TEXT 'NOT NULL' is still a
+    /// defaulted column; a constraint compared against the TEXT 'NOT VALID' is still
+    /// validated.
+    #[test]
+    fn a_keyword_inside_a_string_literal_does_not_decide_a_statement() {
+        // The word DEFAULT appears only inside the literal, so this column is mandatory
+        // with NO default and every existing row is stranded.
+        let mandatory = derive(&migration(
+            "ALTER TABLE t ADD COLUMN mode text NOT NULL COLLATE \"en_US\" CHECK (mode <> 'DEFAULT');",
+        ));
+        assert_eq!(
+            mandatory.hazards.len(),
+            1,
+            "DEFAULT inside a literal must not clear a mandatory column: {mandatory:?}"
+        );
+
+        // NOT VALID appears only inside the literal, so this constraint IS validated.
+        let validated = derive(&migration(
+            "ALTER TABLE t ADD CONSTRAINT c CHECK (status <> 'NOT VALID');",
+        ));
+        assert_eq!(
+            validated.hazards.len(),
+            1,
+            "NOT VALID inside a literal must not defer the scan: {validated:?}"
+        );
+    }
+
+    /// A keyword match without a word boundary splits an identifier that starts with one.
+    ///
+    /// `COLUMN` is optional in `ADD [COLUMN] c ...`, so a bare column name is matched
+    /// against the constraint keywords first -- and a column called `checksum` or
+    /// `uniqueness_score` begins with one. Without the boundary, `eat` consumes the
+    /// prefix, the action is taken for an unnamed CHECK or UNIQUE, and a genuinely
+    /// mandatory new column is filed as unread instead of as the hazard it is.
+    ///
+    /// The earlier version of this test used `ADD CONSTRAINT uniqueness_rule CHECK (...)`,
+    /// where the CONSTRAINT branch is taken before any keyword loop runs, so the boundary
+    /// was never consulted: deleting it left the test green. These cases discriminate.
+    #[test]
+    fn a_keyword_match_respects_word_boundaries() {
+        for (sql, column) in [
+            ("ALTER TABLE t ADD checksum text NOT NULL;", "checksum"),
+            (
+                "ALTER TABLE t ADD uniqueness_score int NOT NULL;",
+                "uniqueness_score",
+            ),
+        ] {
+            let derivation = derive(&migration(sql));
+            assert!(
+                derivation.unexamined.is_empty(),
+                "{sql} names a column, not a constraint: {:?}",
+                derivation.unexamined
+            );
+            assert_eq!(derivation.hazards.len(), 1, "{sql}");
+            let Hazard::MandatoryNewColumn { column: got, .. } = &derivation.hazards[0] else {
+                panic!(
+                    "{sql} should be a mandatory new column, got {:?}",
+                    derivation.hazards[0]
+                );
+            };
+            assert_eq!(got, column, "{sql}");
+        }
+
+        // And the named form still parses, so the boundary did not break the common case.
+        let named = derive(&migration(
+            "ALTER TABLE t ADD CONSTRAINT uniqueness_rule CHECK (uniqueness > 0);",
+        ));
+        assert_eq!(named.hazards.len(), 1);
+        assert_eq!(
+            named.hazards[0].probe_sql(),
+            "SELECT count(*) AS n FROM t WHERE (uniqueness > 0) IS FALSE"
+        );
+    }
+
+    /// A clause between the column list and WHERE used to make the predicate silently
+    /// None, widening the probe from the partial index's rows to the whole table.
+    #[test]
+    fn a_unique_index_whose_predicate_cannot_be_read_exactly_is_unread() {
+        let derivation = derive(&migration(
+            "CREATE UNIQUE INDEX u ON t (a) INCLUDE (b) WHERE deleted_at IS NULL;",
+        ));
+        assert!(
+            derivation.hazards.is_empty(),
+            "a half-read partial index must not be probed as if it covered every row: {:?}",
+            derivation.hazards
+        );
+        assert_eq!(derivation.unexamined.len(), 1);
+    }
+
+    /// NOT VALID defers the scan to a later VALIDATE, so clearing both would mean the
+    /// constraint is never checked. When the pair sits in one migration the expression is
+    /// in the text, and the VALIDATE is probed with it.
+    #[test]
+    fn a_deferred_constraint_is_probed_when_its_validate_runs() {
+        let derivation = derive(&migration(
+            "ALTER TABLE t ADD CONSTRAINT c CHECK (n >= 0) NOT VALID;\n\
+             ALTER TABLE t VALIDATE CONSTRAINT c;",
+        ));
+        assert!(
+            derivation.unexamined.is_empty(),
+            "{:?}",
+            derivation.unexamined
+        );
+        assert_eq!(
+            derivation.hazards.len(),
+            1,
+            "the ADD is deferred, the VALIDATE is not"
+        );
+        assert_eq!(
+            derivation.hazards[0].probe_sql(),
+            "SELECT count(*) AS n FROM t WHERE (n >= 0) IS FALSE"
+        );
+    }
+
     /// One statement, two actions, one of each. A statement that yields a hazard is not
     /// evidence that its other actions were read.
     #[test]
     fn an_unread_action_surfaces_even_beside_one_that_parsed() {
         let derivation = derive(&migration(
-            "ALTER TABLE t ADD CONSTRAINT c CHECK (a > 0), ADD CONSTRAINT p PRIMARY KEY (id);",
+            "ALTER TABLE t ADD CONSTRAINT c CHECK (a > 0), ALTER COLUMN b TYPE bigint;",
         ));
         assert_eq!(derivation.hazards.len(), 1);
         assert_eq!(derivation.unexamined.len(), 1);
-        assert!(derivation.unexamined[0].contains("PRIMARY KEY"));
+        assert!(derivation.unexamined[0].contains("TYPE"));
     }
 
     #[test]
@@ -1207,17 +2015,35 @@ mod tests {
         assert!(statements[1].contains("SET NOT NULL"));
     }
 
-    /// The whole shipped chain is readable by this parser. Not a restatement of the
-    /// parser's output: it asserts a property (nothing constraint-shaped went unread)
-    /// that fails the moment a new migration uses a constraint kind this cannot probe,
-    /// which is exactly when the doctor would start being quietly incomplete.
+    /// The whole shipped chain is readable by this parser.
+    ///
+    /// This guard was ONCE VACUOUS and is worth the warning. It inspects only
+    /// `unexamined`, and in the first version an unrecognised `ADD` action fell through to
+    /// the ADD COLUMN branch and returned `Verdict::Safe` -- which puts nothing in
+    /// `unexamined`. Four statements in the chain took that path (two `ADD PRIMARY KEY` in
+    /// 0168, two `ADD FOREIGN KEY` in 0150), so the test passed BECAUSE of the misparse it
+    /// was written to catch. It only means something now that `Safe` requires an
+    /// affirmative decision and every unread action is reported.
+    ///
+    /// The hazard floor is the other half. Without it a parser that stopped reading
+    /// anything at all would satisfy the `unread.is_empty()` half perfectly.
     #[test]
     fn every_constraint_in_the_shipped_chain_is_read() {
         let mut unread = Vec::new();
         let mut hazards = 0usize;
+        let mut kinds = (0usize, 0usize, 0usize, 0usize, 0usize);
         for migration in &crate::migrate::chain() {
             let derivation = derive(migration);
             hazards += derivation.hazards.len();
+            for hazard in &derivation.hazards {
+                match hazard {
+                    Hazard::NotNull { .. } | Hazard::MandatoryNewColumn { .. } => kinds.0 += 1,
+                    Hazard::Check { .. } => kinds.1 += 1,
+                    Hazard::UniqueIndex { .. } => kinds.2 += 1,
+                    Hazard::ForeignKey { .. } => kinds.3 += 1,
+                    Hazard::ValidateConstraint { .. } => kinds.4 += 1,
+                }
+            }
             for statement in derivation.unexamined {
                 unread.push(format!("{}: {statement}", migration.version));
             }
@@ -1229,9 +2055,23 @@ mod tests {
             unread.len()
         );
         assert!(
-            hazards > 100,
+            hazards > 150,
             "only {hazards} probes derived from the whole chain, which means the parser \
              stopped reading it rather than that the chain stopped constraining"
         );
+        // Every kind the parser can probe is actually exercised by the chain, so none of
+        // the five arms is dead code that nothing would notice breaking.
+        for (kind, count) in [
+            ("NOT NULL", kinds.0),
+            ("CHECK", kinds.1),
+            ("UNIQUE", kinds.2),
+            ("FOREIGN KEY", kinds.3),
+            ("VALIDATE", kinds.4),
+        ] {
+            assert!(
+                count > 0,
+                "the chain exercises no {kind} probe, so its arm is untested here"
+            );
+        }
     }
 }

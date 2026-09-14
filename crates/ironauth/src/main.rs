@@ -7669,7 +7669,9 @@ mod logout_tests {
 /// Run the `doctor` subcommand: the pre-upgrade data preflight (issue #148).
 ///
 /// The DSN is taken explicitly (`--url`, else `IRONAUTH_DOCTOR_URL`, else the config's
-/// `database.url`) because the connection this needs is NOT the server's runtime one.
+/// `database.url`) because the connection this needs is NOT the server's runtime one, and
+/// not the schema owner either: FORCE ROW LEVEL SECURITY subjects the owner to the
+/// policies as well, so only a superuser or a BYPASSRLS role sees every row.
 /// The preflight must see every row in every tenant, and `database.url` names
 /// `ironauth_app`, which is deliberately neither superuser nor table owner so that
 /// FORCE ROW LEVEL SECURITY applies to it. Probing on that connection returns zero rows
@@ -7740,12 +7742,20 @@ fn doctor(args: &mut impl Iterator<Item = String>) -> ExitCode {
         match store.sees_through_row_level_security().await {
             Ok(true) => {}
             Ok(false) => {
+                // The advice has to name a role that actually passes the check above.
+                // An earlier wording said "the schema owner or a superuser", and the
+                // schema owner is NOT sufficient: these tables are FORCE ROW LEVEL
+                // SECURITY, which is precisely the setting that stops an owner bypassing
+                // their policies, and the owner holds neither rolsuper nor rolbypassrls.
+                // An operator following that advice is refused a second time by the same
+                // message.
                 eprintln!(
                     "ironauth doctor: REFUSING to report. The connected role is subject to \
                      row-level security, so a probe of a tenant-scoped table returns zero rows \
                      whatever the data holds, and every check would pass for the wrong reason. \
-                     Re-run with --url naming the role your migrations run as (the schema \
-                     owner or a superuser), not the server's database.url."
+                     Re-run with --url naming a SUPERUSER, or a role granted BYPASSRLS. The \
+                     schema owner is not enough: these tables are FORCE ROW LEVEL SECURITY, \
+                     which subjects the owner to their policies too."
                 );
                 return ExitCode::FAILURE;
             }
@@ -7784,8 +7794,8 @@ fn print_help() {
     println!("  ironauth doctor [--config PATH] [--url DSN]");
     println!("                                   Pre-upgrade preflight: report rows that");
     println!("                                   would be rejected by a pending");
-    println!("                                   migration. Read-only. Needs the role");
-    println!("                                   your migrations run as, not database.url");
+    println!("                                   migration. Read-only. Needs a superuser");
+    println!("                                   or BYPASSRLS role, not database.url");
     println!("  ironauth hash-probe [--config PATH] [--memory-budget KIB] [--json]");
     println!("                                   Measure Argon2id on this host and");
     println!("                                   recommend parameters (issue #62)");
