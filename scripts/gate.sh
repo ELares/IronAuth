@@ -558,6 +558,16 @@ run "flow golden is committed fresh" git diff --exit-code docs/flow-golden.json
 # the gate, this line has to move below it.
 run "agent-facing docs freshness (the corpus embeds the generated docs)" scripts/llms-txt.sh
 
+# The Helm chart, rendered and asserted (issue #151). Skipped rather than failed when helm is
+# absent, because helm is not a Rust toolchain component and a developer without it should not
+# be blocked -- but the script itself refuses to pass without helm, so CI (which installs it)
+# gets the real check and this lane never reports a pass it did not perform.
+if command -v helm >/dev/null 2>&1; then
+  run "helm chart (renders, hardened, accelerators absent by default)" scripts/helm-chart.sh
+else
+  echo "gate: SKIPPING the helm chart lane -- helm is not installed. CI runs it."
+fi
+
 run "openapi freshness (served management spec vs committed artifact)" scripts/openapi-check.sh
 # Drift says the spec is CURRENT; this says it is generator-ready (issue #122).
 run "openapi lint (generator-ready)" scripts/openapi-lint.sh

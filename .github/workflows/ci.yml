@@ -1167,6 +1167,17 @@ jobs:
       # quietly halved, so the gate also walks the published set independently.
       - name: llms.txt (fresh, and covers the published documentation set)
         run: scripts/llms-txt.sh
+      # The Helm chart is rendered and its properties asserted (issue #151). helm lint alone
+      # says a chart is well formed, not that it deploys IronAuth correctly: the pod hardening,
+      # the accelerators being ABSENT rather than merely disabled, and the config landing in a
+      # Secret rather than a ConfigMap are all invisible to it. helm is a single static binary,
+      # so this costs one download rather than a cluster.
+      - name: helm chart (renders, hardened, accelerators absent by default)
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - name: helm chart assertions
+        run: scripts/helm-chart.sh
       # Issue #108 criterion 4. This job already checks out full history for the OpenAPI
       # changelog, which is the same thing this needs: a base revision to diff against.
       - name: event registry compatibility (a breaking payload change bumps its version)

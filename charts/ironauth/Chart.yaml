@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+apiVersion: v2
+name: ironauth
+description: IronAuth, a standards-first OpenID Connect identity platform
+type: application
+# The chart's own version. Bumped when the chart changes, independently of the
+# appVersion it deploys.
+version: 0.1.0
+# The IronAuth release this chart defaults to, and the fallback for the image
+# tag. Kept in step with crates/ironauth/Cargo.toml; scripts/helm-chart.sh fails
+# if they diverge, because a chart that silently deploys a different build than
+# it claims is worse than no default.
+#
+# The crate, NOT [workspace.package]: that section carries no version key, and
+# the first version of the check looked there, read the empty string, and was
+# skipped by its own guard on every run while this comment claimed enforcement.
+appVersion: "0.1.0"
+home: https://github.com/ELares/IronAuth
+sources:
+  - https://github.com/ELares/IronAuth
+keywords:
+  - oidc
+  - oauth2
+  - identity
+  - authentication
+maintainers:
+  - name: IronAuth maintainers
+    url: https://github.com/ELares/IronAuth

@@ -1,0 +1,173 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Defaults are the HIGH-AVAILABILITY shape, not a single-replica demo. An
+# operator who runs `helm install` with no values gets three replicas spread
+# across nodes with a disruption budget, because the failure this chart exists
+# to avoid is an identity provider that goes down with one node.
+
+replicaCount: 3
+
+image:
+  repository: ghcr.io/elares/ironauth
+  # Empty means "use the chart's appVersion", so the chart and the image it
+  # deploys cannot drift apart by accident.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # The server talks to Postgres and to its own peers. It never calls the
+  # Kubernetes API, so it is given no token to call it with.
+  automountServiceAccountToken: false
+
+service:
+  type: ClusterIP
+  # The PUBLIC data plane only. The management plane carries health, readiness
+  # and Prometheus metrics and is deliberately absent from this Service: it is
+  # reached on the pod IP by probes and by a scrape config, never through a
+  # cluster Service that an in-cluster caller could find.
+  port: 8443
+  annotations: {}
+
+server:
+  # Inside the pod both planes bind all interfaces: the network boundary is the
+  # Service and the NetworkPolicy, not a loopback bind that would also stop
+  # kubelet probing the management port.
+  bind: "0.0.0.0:8443"
+  managementBind: "0.0.0.0:9443"
+  # Scheme, host and issuer derive from this, never from request headers.
+  # REQUIRED: an issuer that changes with the Host header is a token-forgery
+  # surface, so the chart refuses to render without it.
+  publicUrl: ""
+  shutdownGraceSecs: 25
+
+proxy:
+  # Trust nothing by default. Set trustedHops to the number of proxies that
+  # actually sit in front of this deployment; 0 means the client IP is the
+  # transport peer.
+  trustedHops: 0
+  trustForwarded: false
+
+telemetry:
+  logFormat: "json"
+  otlpEndpoint: ""
+
+database:
+  # The FULL DSN, credentials included.
+  #
+  # It goes in a Secret rather than a ConfigMap, and that is not belt-and-braces:
+  # `database.url` is a plain string in the config schema with no environment
+  # indirection, so the credential has to reach the process inside the file. A
+  # chart that rendered this into a ConfigMap would publish the database password
+  # to anything that can read ConfigMaps. (`database.password` exists in the
+  # schema and is NOT a way out: nothing reads it to build a connection.)
+  url: ""
+  # Or supply the whole rendered config yourself, e.g. from an external secret
+  # manager. When set, the chart renders no Secret of its own and mounts this.
+  existingConfigSecret: ""
+  # The platform envelope master key (issue #48), read through the config's
+  # environment indirection, so it is never written into the file at all.
+  masterKey:
+    existingSecret: ""
+    key: "master-key"
+
+# The management (control) plane connects as a SEPARATE least-privilege role.
+# Unset means the management API is not mounted.
+admin:
+  controlDatabaseUrl: ""
+
+# ---------------------------------------------------------------------------
+# Optional accelerator: IronBus.
+#
+# OFF, and off means ABSENT: with this disabled the rendered config contains no
+# [outbox] broker key at all. IronAuth is complete on Postgres alone, and a
+# default install must not imply otherwise or name a service nobody deployed.
+#
+# Enabled, this writes `outbox.ironbus_addr` into the config file, which is the
+# key the server actually reads (crates/ironauth-config, consumed at boot and by
+# the readiness tier). An unreachable broker degrades to Postgres polling rather
+# than failing the process.
+ironbus:
+  enabled: false
+  # e.g. "ironbus.ironbus.svc.cluster.local:4222"
+  addr: ""
+
+# THERE IS NO IronCache VALUE, and its absence is deliberate.
+#
+# `ironauth-hot`'s IronCache implementation HAS NO ADDRESS IN CONFIG. There is no
+# key for it in crates/ironauth-config and nothing constructs one at boot, so a
+# deployment cannot attach one however the chart is written.
+# crates/ironauth-server/src/readiness.rs says the same thing where it explains
+# why its degraded-tier enum has no accelerator variant.
+#
+# A values key here would render an endpoint nothing reads and tell an operator
+# their cache was wired. That is the "reads as wired when it is not" defect, and
+# this repository has already removed one instance of it. It belongs here when
+# #146 gives the accelerator a config surface, and not before.
+
+# ---------------------------------------------------------------------------
+# Pod hardening. These are defaults, not suggestions: the chart is linted
+# against them, so weakening one here fails CI rather than shipping quietly.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  privileged: false
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Spread replicas across nodes so a node loss is not an outage. ScheduleAnyway
+# rather than DoNotSchedule: on a single-node cluster (kind, k3d, a laptop) a
+# hard constraint would leave the deployment permanently Pending, and a chart
+# that cannot install on the cluster CI tests it on is not a tested chart.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: ironauth
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+
+# Probes hit the MANAGEMENT plane, which is where /healthz and /readyz live.
+probes:
+  liveness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 3
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
