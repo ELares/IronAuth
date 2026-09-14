@@ -1250,6 +1250,22 @@ jobs:
         # in this lane: the invariant scripts above have already compiled ironauth-oidc's
         # dependency graph, so the marginal cost is one test target.
         run: scripts/ssf-set-external-validation.sh
+      - name: independent CAEP receiver validation (issue #144 criterion 1)
+        # The step above judges the ENVELOPE: a well formed, correctly signed JWS. A RECEIVER
+        # judges something else -- it reads the `events` map, finds a CAEP type it knows, and
+        # acts on that event's own members. An envelope can be flawless while the event inside
+        # it is one no receiver can use: two members under `events`, a subject format it cannot
+        # resolve, a millisecond `event_timestamp`. Those are the divergences the CAEP
+        # Interoperability Profile exists to remove and not one is a signature problem.
+        #
+        # The validator applies the profile's receiver-side rules in a second implementation and
+        # prints the evidence -- which event types were accepted, under which algorithm, how many
+        # negative controls each rejected, and which did not apply -- so the CI log carries it.
+        # It checks its own rules against synthetic events first, because a rule that only fires
+        # for a type this build does not emit is exercised by no corpus case. Posting to a public
+        # receiver instead would fail when that service was down, say nothing when it changed,
+        # and send this deployment's events to a third party on every pull request.
+        run: scripts/caep-receiver-validation.sh
 
   # The standalone TypeScript reference app (packages/reference-app, issue #85):
   # build and typecheck it so it cannot rot. It is a SEPARATE deployable that

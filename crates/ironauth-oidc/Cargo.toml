@@ -617,6 +617,12 @@ name = "caep_interop_profile"
 path = "tests/caep_interop_profile.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "caep_receiver_corpus"
+path = "tests/caep_receiver_corpus.rs"
+required-features = ["testing"]
+
+
 # The Google Cross-Account Protection receiver (issue #144, criteria 4 and 5): a simulated
 # Google RISC SET through the real router, asserting the configured protections reach the
 # LINKED local user with an audit trail, and that a forged, replayed, wrong-audience,
