@@ -63939,7 +63939,84 @@ const ABUSE_SUBJECT_BIDX_LABEL: &str = "ironauth.envelope.abuse-subject-bidx.v1"
 /// The associated data binding a wrapped KEK to its scope, version, and master
 /// key. A KEK wrapped under one context fails to unwrap under any other, so it
 /// cannot be lifted into another tenant, environment, or master-key generation.
-fn kek_wrap_aad(scope: Scope, version: i32, master_key_id: &str) -> Aad {
+/// One `tenant_keks` row as a master-key rotation sees it (issue #153).
+pub(crate) struct KekRow {
+    pub(crate) id: String,
+    pub(crate) tenant_id: String,
+    pub(crate) environment_id: String,
+    pub(crate) version: i32,
+    pub(crate) status: String,
+    pub(crate) wrapped_kek: Vec<u8>,
+}
+
+/// Every KEK still wrapped under `master_key_id`, ascending by id.
+///
+/// UNSCOPED ON PURPOSE, and it lives here because that is where the query audit requires SQL
+/// against a scoped table to live. A rotation is a platform operation over every tenant at
+/// once, which is the one thing the scoped repositories exist to prevent, so it runs only on
+/// a connection that row-level security does not apply to and `crate::rekey` refuses any
+/// other. Putting the statement here keeps it in the file a reader checks when they ask what
+/// can read this table.
+///
+/// Ordered by id so two operators running a rotation at the same time contend in one
+/// direction rather than deadlocking.
+pub(crate) async fn keks_under_master(
+    pool: &sqlx::PgPool,
+    master_key_id: &str,
+) -> Result<Vec<KekRow>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT id, tenant_id, environment_id, version, status, wrapped_kek \
+         FROM tenant_keks WHERE master_key_id = $1 ORDER BY id",
+    )
+    .bind(master_key_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|row| KekRow {
+            id: row.get("id"),
+            tenant_id: row.get("tenant_id"),
+            environment_id: row.get("environment_id"),
+            version: row.get("version"),
+            status: row.get("status"),
+            wrapped_kek: row.get("wrapped_kek"),
+        })
+        .collect())
+}
+
+/// Write a rewrapped KEK and the master that now wraps it, in ONE statement.
+///
+/// Split across two, a crash between them leaves a row whose recorded master cannot open its
+/// own blob, and the AAD names the master that is no longer recorded: unrecoverable.
+pub(crate) async fn store_rewrapped_kek(
+    pool: &sqlx::PgPool,
+    id: &str,
+    wrapped_kek: &[u8],
+    master_key_id: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("UPDATE tenant_keks SET wrapped_kek = $2, master_key_id = $3 WHERE id = $1")
+        .bind(id)
+        .bind(wrapped_kek)
+        .bind(master_key_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// How many KEKs are already wrapped under `master_key_id`.
+pub(crate) async fn count_keks_under_master(
+    pool: &sqlx::PgPool,
+    master_key_id: &str,
+) -> Result<usize, StoreError> {
+    let row = sqlx::query("SELECT count(*) AS n FROM tenant_keks WHERE master_key_id = $1")
+        .bind(master_key_id)
+        .fetch_one(pool)
+        .await?;
+    let n: i64 = row.get("n");
+    Ok(usize::try_from(n).unwrap_or(0))
+}
+
+pub(crate) fn kek_wrap_aad(scope: Scope, version: i32, master_key_id: &str) -> Aad {
     Aad::builder()
         .text(KEK_WRAP_LABEL)
         .text(&scope.tenant().to_string())
