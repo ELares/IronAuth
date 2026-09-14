@@ -226,22 +226,309 @@ impl RuleSet {
     /// Decide `facts` against the set: the first rule whose criteria all hold.
     #[must_use]
     pub fn decide(&self, facts: &RequestFacts) -> Decision {
+        self.walk(facts, &mut Silent)
+    }
+
+    /// The decision, plus a trace of how every rule answered.
+    ///
+    /// This is what answers "why was this denied" for a request an operator is staring at:
+    /// each rule by name, and for a rule that did not match, the INDEX and rendering of the
+    /// criterion that stopped it.
+    ///
+    /// Shares [`RuleSet::walk`] with [`RuleSet::decide`] rather than re-deriving the answer.
+    /// Two implementations of one decision is how a trace ends up explaining something the
+    /// engine did not do, and a trace that disagrees with enforcement is worse than none:
+    /// it is believed. `the_trace_agrees_with_the_decision_on_every_corpus_row` pins it.
+    #[must_use]
+    pub fn explain(&self, facts: &RequestFacts) -> Explanation {
+        let mut recording = Recording::default();
+        let decision = self.walk(facts, &mut recording);
+        Explanation {
+            decision,
+            trace: Trace {
+                rules: recording.rules,
+            },
+        }
+    }
+
+    /// What the engine WOULD decide, in a form that cannot be enforced.
+    ///
+    /// See [`DryRun`] for why this returns its own type rather than a [`Decision`].
+    #[must_use]
+    pub fn dry_run(&self, facts: &RequestFacts) -> DryRun {
+        DryRun {
+            explanation: self.explain(facts),
+        }
+    }
+
+    /// The single implementation. `decide`, `explain` and `dry_run` all come through here.
+    fn walk<R: Recorder>(&self, facts: &RequestFacts, recorder: &mut R) -> Decision {
+        let mut decided: Option<Decision> = None;
         for rule in &self.rules {
+            if decided.is_some() {
+                // Only a recording walk continues past the decision, and only to mark the
+                // rules that were never consulted. A plain `decide` returns below, so it
+                // does exactly the work it did before tracing existed.
+                recorder.not_reached(rule);
+                continue;
+            }
             // Captures are per-rule: a fresh map each time, so one rule can never read what
             // another rule's pattern bound.
             let mut captures: HashMap<String, String> = HashMap::new();
-            if rule
-                .criteria
-                .iter()
-                .all(|criterion| matches(criterion, facts, &mut captures))
-            {
-                return Decision {
-                    action: rule.action.clone(),
-                    matched: Some(rule.name.clone()),
-                };
+            let mut failed_at: Option<usize> = None;
+            for (index, criterion) in rule.criteria.iter().enumerate() {
+                if !matches(criterion, facts, &mut captures) {
+                    failed_at = Some(index);
+                    // Stop at the FIRST failure, preserving the short-circuit that
+                    // `all()` gave us. It is also the right answer for a trace: the
+                    // criteria after it never ran, so claiming anything about them
+                    // would be a guess.
+                    break;
+                }
             }
+            if let Some(index) = failed_at {
+                recorder.failed(rule, index);
+                continue;
+            }
+            recorder.matched(rule);
+            let decision = Decision {
+                action: rule.action.clone(),
+                matched: Some(rule.name.clone()),
+            };
+            if !R::RECORDS {
+                // A non-recording walk has its answer and nothing left to record, so it
+                // stops here, doing exactly the work it did before tracing existed.
+                return decision;
+            }
+            decided = Some(decision);
         }
-        Decision::no_match()
+        decided.unwrap_or_else(Decision::no_match)
+    }
+}
+
+/// Where a walk reports what each rule did.
+///
+/// A trait with a no-op implementation, so tracing costs a non-tracing caller nothing: the
+/// `RECORDS` constant lets `walk` return at the matching rule exactly as it used to, and the
+/// criterion rendering is only built by the implementation that keeps it.
+trait Recorder {
+    /// Whether this recorder keeps anything. `false` lets `walk` stop at the first match.
+    const RECORDS: bool;
+    fn matched(&mut self, rule: &Rule);
+    fn failed(&mut self, rule: &Rule, criterion_index: usize);
+    fn not_reached(&mut self, rule: &Rule);
+}
+
+/// The recorder for [`RuleSet::decide`]: keeps nothing, allocates nothing.
+struct Silent;
+
+impl Recorder for Silent {
+    const RECORDS: bool = false;
+    fn matched(&mut self, _rule: &Rule) {}
+    fn failed(&mut self, _rule: &Rule, _criterion_index: usize) {}
+    fn not_reached(&mut self, _rule: &Rule) {}
+}
+
+/// The recorder for [`RuleSet::explain`].
+#[derive(Default)]
+struct Recording {
+    rules: Vec<RuleTrace>,
+}
+
+impl Recorder for Recording {
+    const RECORDS: bool = true;
+
+    fn matched(&mut self, rule: &Rule) {
+        self.rules.push(RuleTrace {
+            rule: rule.name.clone(),
+            outcome: RuleOutcome::Matched,
+        });
+    }
+
+    fn failed(&mut self, rule: &Rule, criterion_index: usize) {
+        self.rules.push(RuleTrace {
+            rule: rule.name.clone(),
+            outcome: RuleOutcome::Failed {
+                criterion_index,
+                criterion: describe(&rule.criteria[criterion_index]),
+            },
+        });
+    }
+
+    fn not_reached(&mut self, rule: &Rule) {
+        self.rules.push(RuleTrace {
+            rule: rule.name.clone(),
+            outcome: RuleOutcome::NotReached,
+        });
+    }
+}
+
+/// How one rule answered during a traced walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleOutcome {
+    /// Every criterion held, so this rule decided.
+    Matched,
+    /// A criterion did not hold, and evaluation of this rule stopped there.
+    Failed {
+        /// The zero-based position of the criterion that stopped it.
+        criterion_index: usize,
+        /// That criterion, rendered for a human.
+        criterion: String,
+    },
+    /// Never evaluated, because an earlier rule already decided.
+    ///
+    /// Distinct from `Failed` on purpose. "This rule would have allowed you, but a rule
+    /// above it denied first" is the single most common thing an operator needs to see, and
+    /// collapsing it into "did not match" hides it.
+    NotReached,
+}
+
+/// One rule's line in a trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleTrace {
+    /// The rule's name.
+    pub rule: String,
+    /// What it did.
+    pub outcome: RuleOutcome,
+}
+
+/// Every rule's answer, in evaluation order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trace {
+    /// One entry per rule, in the order the rule set declares them, which is the order
+    /// they were evaluated in.
+    pub rules: Vec<RuleTrace>,
+}
+
+/// The decision and the trace that produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explanation {
+    /// What the engine decided.
+    pub decision: Decision,
+    /// How every rule answered.
+    pub trace: Trace,
+}
+
+impl Explanation {
+    /// A one-line answer to "why was this denied", or `None` when nothing was denied.
+    ///
+    /// # Why this lives here and not on [`Trace`]
+    ///
+    /// It was on `Trace` first, and that was wrong in a way a test caught immediately: a
+    /// trace records what each rule DID, not what the verdict was, so a matched rule looked
+    /// like a denial even when its action was `Allow`. Reporting "denied by rule open" for
+    /// an admission is precisely the trace-contradicts-the-decision failure this whole
+    /// design is trying to avoid. The explanation holds both halves, so it is the only place
+    /// that can answer honestly.
+    ///
+    /// Three shapes, because an operator acts differently on each: a rule denied by name, no
+    /// rule matched so the default refusal applied, or no rules exist at all.
+    #[must_use]
+    pub fn why_denied(&self) -> Option<String> {
+        if matches!(self.decision.action, Action::Allow) {
+            return None;
+        }
+        if let Some(rule) = self.decision.matched.as_deref() {
+            return Some(format!("denied by rule {rule}"));
+        }
+        if self.trace.rules.is_empty() {
+            return Some("denied because no rules are configured".to_owned());
+        }
+        let attempts: Vec<String> = self
+            .trace
+            .rules
+            .iter()
+            .filter_map(|entry| match &entry.outcome {
+                RuleOutcome::Failed {
+                    criterion_index,
+                    criterion,
+                } => Some(format!(
+                    "{} failed at criterion {criterion_index} ({criterion})",
+                    entry.rule
+                )),
+                _ => None,
+            })
+            .collect();
+        Some(format!(
+            "denied because no rule matched: {}",
+            attempts.join("; ")
+        ))
+    }
+}
+
+/// What the engine WOULD decide, in a form that cannot be enforced.
+///
+/// # Why this is its own type
+///
+/// "Dry-run never enforces" is a property, and a mode flag cannot carry it: a boolean on the
+/// rule set is one forgotten branch away from a dry-run verdict reaching the enforcement
+/// path, and that failure is silent and admits or denies real traffic.
+///
+/// So dry-run yields no [`Decision`] at all. Every accessor here is named `would_` and
+/// returns a borrow or a copy, never an owned `Decision`, so a dry-run answer cannot be
+/// handed to a caller that expects a real one. The type system does the enforcing, which is
+/// the only way this property survives someone refactoring in a hurry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DryRun {
+    explanation: Explanation,
+}
+
+impl DryRun {
+    /// Whether the engine would have allowed the request.
+    #[must_use]
+    pub fn would_allow(&self) -> bool {
+        matches!(self.explanation.decision.action, Action::Allow)
+    }
+
+    /// The action the engine would have taken.
+    #[must_use]
+    pub fn would_act(&self) -> &Action {
+        &self.explanation.decision.action
+    }
+
+    /// The rule that would have decided, if any.
+    #[must_use]
+    pub fn would_match(&self) -> Option<&str> {
+        self.explanation.decision.matched.as_deref()
+    }
+
+    /// The full trace, for logging what a rollout would have done.
+    #[must_use]
+    pub fn trace(&self) -> &Trace {
+        &self.explanation.trace
+    }
+
+    /// Why the rehearsal would have denied, or `None` if it would have allowed.
+    ///
+    /// The whole point of a dry run is the line an operator reads before turning
+    /// enforcement on, so a rehearsal that could not answer "why" would only be half of
+    /// criterion 5.
+    #[must_use]
+    pub fn would_deny_because(&self) -> Option<String> {
+        self.explanation.why_denied()
+    }
+}
+
+/// Render one criterion for a trace line.
+///
+/// Deliberately does NOT print header values or subject identifiers beyond what the rule
+/// itself already contains: a trace is written to a log, and a rule's own configuration is
+/// the operator's, while the request's values are the caller's.
+fn describe(criterion: &Criterion) -> String {
+    match criterion {
+        Criterion::Method(allowed) => format!("method in {allowed:?}"),
+        Criterion::Host(host) => format!("host == {host}"),
+        Criterion::PathPrefix(prefix) => format!("path under {prefix}"),
+        Criterion::PathMatches(pattern) => format!("path matches /{}/", pattern.as_str()),
+        Criterion::Header { name, .. } => format!("header {name} has the configured value"),
+        Criterion::Subject(check) => match check {
+            SubjectCheck::Is(subject) => format!("subject is {subject}"),
+            SubjectCheck::InGroup(group) => format!("subject in group {group}"),
+            SubjectCheck::HasRole(role) => format!("subject has role {role}"),
+            SubjectCheck::EqualsCapture(name) => format!("subject equals capture {name}"),
+            SubjectCheck::Authenticated => "subject is authenticated".to_owned(),
+            SubjectCheck::Anonymous => "subject is anonymous".to_owned(),
+        },
     }
 }
 
@@ -1102,6 +1389,423 @@ mod tests {
                 catch_all.decide(&request).matched.as_deref(),
                 Some("everything"),
                 "a rule with no criteria is the documented catch-all"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Criterion 5: decision traces and dry-run answer "why was this denied",
+    // asserted on trace CONTENT, and dry-run never enforces.
+    // -----------------------------------------------------------------------
+
+    /// THE TRACE AND THE DECISION CANNOT DISAGREE, across the whole corpus.
+    ///
+    /// `explain` and `decide` share one walk precisely so this holds. It is asserted anyway,
+    /// because the sharing is a code arrangement that a later refactor can undo, and a trace
+    /// that disagrees with enforcement is worse than no trace: it gets believed. This is the
+    /// guard that notices the day someone gives `explain` its own loop.
+    #[test]
+    fn the_trace_agrees_with_the_decision_on_every_corpus_row() {
+        let set = corpus_rules();
+        for case in corpus_cases() {
+            let decided = set.decide(&case.facts);
+            let explained = set.explain(&case.facts);
+            assert_eq!(
+                explained.decision, decided,
+                "{}: explain and decide must reach the same answer",
+                case.name
+            );
+
+            // And the trace's own account must agree with that answer: the rule it marks
+            // Matched is the rule the decision names.
+            let matched: Vec<&str> = explained
+                .trace
+                .rules
+                .iter()
+                .filter(|entry| entry.outcome == RuleOutcome::Matched)
+                .map(|entry| entry.rule.as_str())
+                .collect();
+            let expected: Vec<&str> = decided.matched.as_deref().into_iter().collect();
+            assert_eq!(
+                matched, expected,
+                "{}: exactly the deciding rule is marked Matched",
+                case.name
+            );
+        }
+    }
+
+    /// A DENIAL NAMES THE CRITERION THAT STOPPED EACH RULE, by index and by rendering.
+    ///
+    /// This is criterion 5's "why was this denied", asserted on content rather than on the
+    /// trace merely being non-empty.
+    #[test]
+    fn a_denied_request_reports_which_criterion_stopped_each_rule() {
+        let set = RuleSet::new(vec![
+            allow(
+                "admins-only",
+                vec![
+                    Criterion::PathPrefix("/admin".to_owned()),
+                    Criterion::Subject(SubjectCheck::HasRole("admin".to_owned())),
+                ],
+            ),
+            allow(
+                "internal-network",
+                vec![Criterion::Host("internal.example.com".to_owned())],
+            ),
+        ]);
+
+        // On /admin as a signed-in NON-admin: rule one clears its path check and fails the
+        // role check at index 1; rule two fails its host check at index 0.
+        let request = RequestFacts {
+            path: "/admin/keys".to_owned(),
+            subject: Some("usr_1".to_owned()),
+            ..facts()
+        };
+        let explained = set.explain(&request);
+        assert_eq!(explained.decision.action, Action::Deny);
+        assert_eq!(explained.decision.matched, None);
+
+        assert_eq!(
+            explained.trace.rules,
+            vec![
+                RuleTrace {
+                    rule: "admins-only".to_owned(),
+                    outcome: RuleOutcome::Failed {
+                        criterion_index: 1,
+                        criterion: "subject has role admin".to_owned(),
+                    },
+                },
+                RuleTrace {
+                    rule: "internal-network".to_owned(),
+                    outcome: RuleOutcome::Failed {
+                        criterion_index: 0,
+                        criterion: "host == internal.example.com".to_owned(),
+                    },
+                },
+            ],
+            "the trace must name the criterion that stopped each rule, not merely that it failed"
+        );
+
+        let why = explained.why_denied().expect("a denial has a reason");
+        assert!(why.contains("no rule matched"), "{why}");
+        assert!(why.contains("admins-only failed at criterion 1"), "{why}");
+        assert!(why.contains("subject has role admin"), "{why}");
+    }
+
+    /// THE INDEX IS THE FIRST FAILURE, and the criteria after it are not claimed about.
+    ///
+    /// `all()` short-circuits, so a criterion after a failing one never runs. A trace that
+    /// reported on it would be asserting something the engine did not evaluate.
+    #[test]
+    fn the_trace_stops_at_the_first_failing_criterion() {
+        let set = RuleSet::new(vec![allow(
+            "three-checks",
+            vec![
+                Criterion::Method(vec!["GET".to_owned()]),
+                // Fails here, at index 1.
+                Criterion::Host("nowhere.example.com".to_owned()),
+                // Would also fail, but must never be evaluated or reported.
+                Criterion::PathPrefix("/unreachable".to_owned()),
+            ],
+        )]);
+
+        let explained = set.explain(&facts());
+        assert_eq!(
+            explained.trace.rules,
+            vec![RuleTrace {
+                rule: "three-checks".to_owned(),
+                outcome: RuleOutcome::Failed {
+                    criterion_index: 1,
+                    criterion: "host == nowhere.example.com".to_owned(),
+                },
+            }],
+            "the first failure is the whole story; index 2 never ran"
+        );
+    }
+
+    /// A RULE BELOW THE DECIDING ONE IS `NotReached`, NOT `Failed`.
+    ///
+    /// "A rule further down would have allowed you, but this one denied first" is the most
+    /// common thing an operator needs from a trace, and reporting it as a failure to match
+    /// hides it completely.
+    #[test]
+    fn rules_below_the_decision_are_marked_unreached_rather_than_failed() {
+        let set = RuleSet::new(vec![
+            deny(
+                "blanket-deny",
+                vec![Criterion::PathPrefix("/admin".to_owned())],
+            ),
+            allow(
+                "would-have-allowed",
+                vec![
+                    Criterion::PathPrefix("/admin".to_owned()),
+                    Criterion::Subject(SubjectCheck::HasRole("admin".to_owned())),
+                ],
+            ),
+        ]);
+
+        let request = RequestFacts {
+            path: "/admin/keys".to_owned(),
+            subject: Some("usr_root".to_owned()),
+            roles: vec!["admin".to_owned()],
+            ..facts()
+        };
+        let explained = set.explain(&request);
+        assert_eq!(explained.decision.matched.as_deref(), Some("blanket-deny"));
+        assert_eq!(
+            explained.trace.rules,
+            vec![
+                RuleTrace {
+                    rule: "blanket-deny".to_owned(),
+                    outcome: RuleOutcome::Matched,
+                },
+                RuleTrace {
+                    rule: "would-have-allowed".to_owned(),
+                    outcome: RuleOutcome::NotReached,
+                },
+            ]
+        );
+
+        let why = explained.why_denied().expect("denied by a rule");
+        assert_eq!(why, "denied by rule blanket-deny");
+    }
+
+    /// AN ALLOWED REQUEST HAS NO DENIAL REASON.
+    ///
+    /// `why_denied` returning something for an admission would be a trace that contradicts
+    /// the decision it accompanies.
+    #[test]
+    fn an_allowed_request_has_nothing_to_explain() {
+        let set = RuleSet::new(vec![allow(
+            "open",
+            vec![Criterion::PathPrefix("/public".to_owned())],
+        )]);
+        let request = RequestFacts {
+            path: "/public/logo.png".to_owned(),
+            ..facts()
+        };
+        let explained = set.explain(&request);
+        assert_eq!(explained.decision.action, Action::Allow);
+        assert_eq!(
+            explained.why_denied(),
+            None,
+            "an admission has no denial to explain"
+        );
+    }
+
+    /// AN EMPTY RULE SET SAYS SO, rather than blaming a rule.
+    #[test]
+    fn an_empty_rule_set_explains_itself() {
+        let explained = RuleSet::default().explain(&facts());
+        assert_eq!(
+            explained.decision,
+            Decision {
+                action: Action::Deny,
+                matched: None
+            }
+        );
+        assert_eq!(
+            explained.why_denied().as_deref(),
+            Some("denied because no rules are configured"),
+            "the default refusal is a different situation from a rule refusing"
+        );
+    }
+
+    /// DRY-RUN REPORTS WHAT WOULD HAPPEN AND AGREES WITH ENFORCEMENT.
+    #[test]
+    fn dry_run_reports_the_same_answer_enforcement_would_reach() {
+        let set = corpus_rules();
+        for case in corpus_cases() {
+            let enforced = set.decide(&case.facts);
+            let dry = set.dry_run(&case.facts);
+            assert_eq!(
+                dry.would_act(),
+                &enforced.action,
+                "{}: dry-run must predict enforcement, or it is not a rehearsal",
+                case.name
+            );
+            assert_eq!(
+                dry.would_match(),
+                enforced.matched.as_deref(),
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                dry.would_allow(),
+                matches!(enforced.action, Action::Allow),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    /// DRY-RUN NEVER ENFORCES, and this is a property of the TYPE rather than of care.
+    ///
+    /// A boolean mode is one forgotten branch from a rehearsal verdict reaching the
+    /// enforcement path. [`DryRun`] therefore yields no [`Decision`] at all: every accessor
+    /// is a borrow or a copy named `would_`. This test drives a request that dry-run says
+    /// would be DENIED and shows the enforcement seam is untouched by it.
+    #[test]
+    fn a_dry_run_denial_cannot_reach_the_enforcement_seam() {
+        // The seam: everything that enforces takes a Decision. DryRun cannot produce one.
+        fn enforce(decision: &Decision) -> bool {
+            matches!(decision.action, Action::Allow)
+        }
+
+        let set = RuleSet::new(vec![deny(
+            "no-admin",
+            vec![Criterion::PathPrefix("/admin".to_owned())],
+        )]);
+        let request = RequestFacts {
+            path: "/admin/keys".to_owned(),
+            ..facts()
+        };
+
+        let dry = set.dry_run(&request);
+        assert!(
+            !dry.would_allow(),
+            "the rehearsal says this would be denied"
+        );
+        assert_eq!(dry.would_match(), Some("no-admin"));
+
+        // The only way to reach `enforce` is to ask the engine for a real decision. There is
+        // no From<DryRun> for Decision, no into_decision, and no owned Decision behind any
+        // accessor -- so a caller cannot pass a rehearsal where enforcement is expected even
+        // by mistake. What follows is deliberate, and it is the ONLY route.
+        let real = set.decide(&request);
+        assert!(!enforce(&real));
+
+        // And the rehearsal carries the full trace, which is the point of running one.
+        assert_eq!(
+            dry.trace().rules,
+            vec![RuleTrace {
+                rule: "no-admin".to_owned(),
+                outcome: RuleOutcome::Matched,
+            }]
+        );
+    }
+
+    /// A TRACE LINE DOES NOT CARRY THE REQUEST'S OWN VALUES.
+    ///
+    /// Traces go to logs. A rule's configuration belongs to the operator who wrote it; the
+    /// header values and subject identifiers on the request belong to the caller, and a
+    /// trace is not the place to copy them.
+    #[test]
+    fn a_trace_renders_the_rule_not_the_request() {
+        let set = RuleSet::new(vec![allow(
+            "service-only",
+            vec![Criterion::Header {
+                name: "X-Service".to_owned(),
+                value: "super-secret-token".to_owned(),
+            }],
+        )]);
+        let mut request = facts();
+        request
+            .headers
+            .insert("x-service".to_owned(), "the-callers-value".to_owned());
+
+        let explained = set.explain(&request);
+        let rendered = format!("{:?}", explained.trace);
+        assert!(
+            rendered.contains("X-Service"),
+            "the rule's own header NAME is the operator's and is useful: {rendered}"
+        );
+        assert!(
+            !rendered.contains("the-callers-value"),
+            "the caller's header VALUE must not land in a log line: {rendered}"
+        );
+        assert!(
+            !rendered.contains("super-secret-token"),
+            "nor the configured value it is compared against: {rendered}"
+        );
+    }
+
+    /// A REHEARSAL ANSWERS "WHY" TOO, in the same words enforcement would.
+    #[test]
+    fn a_dry_run_explains_its_denial_the_same_way_enforcement_does() {
+        let set = RuleSet::new(vec![allow(
+            "admins-only",
+            vec![
+                Criterion::PathPrefix("/admin".to_owned()),
+                Criterion::Subject(SubjectCheck::HasRole("admin".to_owned())),
+            ],
+        )]);
+        let request = RequestFacts {
+            path: "/admin/keys".to_owned(),
+            subject: Some("usr_1".to_owned()),
+            ..facts()
+        };
+
+        let dry = set.dry_run(&request);
+        let explained = set.explain(&request);
+        assert_eq!(
+            dry.would_deny_because(),
+            explained.why_denied(),
+            "a rehearsal and the real thing must give the operator the same sentence"
+        );
+        let why = dry.would_deny_because().expect("would have denied");
+        assert!(why.contains("subject has role admin"), "{why}");
+    }
+
+    /// THE FENCE ITSELF: no accessor on [`DryRun`] hands back an owned [`Decision`].
+    ///
+    /// The tests above show a rehearsal does not enforce. They cannot show it CANNOT, because
+    /// that is a property of the API surface rather than of any single call, and a test
+    /// inside the module cannot prove the absence of a method.
+    ///
+    /// So this is a SOURCE SCAN, and worth being honest about: it reads the text of the
+    /// `impl DryRun` block and fails if anything there returns an owned `Decision`, or if a
+    /// conversion into one appears. It catches the regression it is aimed at -- somebody
+    /// adding `into_decision` or `impl From<DryRun> for Decision` in a hurry -- and it would
+    /// not catch a cleverer route. The real guarantee is that the type exposes only borrows
+    /// and copies; this keeps that true by accident-proofing the obvious way to break it.
+    #[test]
+    fn dry_run_exposes_no_owned_decision() {
+        // Scan the PRODUCTION half only, cutting at the test module.
+        //
+        // This is load bearing, and it took three tries to get right. The scan first matched
+        // its own assertion string, then its own doc comment. Both times the file was
+        // entirely correct and the guard failed. A source scan whose own text can satisfy it
+        // is measuring the wrong thing, and the durable fix is not a cleverer needle but a
+        // narrower haystack: the property is about the shipped API, so the tests are not part
+        // of it.
+        let whole = include_str!("rules.rs");
+        let source = whole
+            .split_once("\n#[cfg(test)]")
+            .map_or(whole, |(production, _)| production);
+
+        let start = source
+            .find("\nimpl DryRun {")
+            .expect("the DryRun impl block is still named that");
+        let block = &source[start..];
+        let end = block.find("\n}\n").expect("the impl block terminates");
+        let block = &block[..end];
+
+        for (offset, line) in block.lines().enumerate() {
+            let line = line.trim();
+            assert!(
+                !line.contains("-> Decision"),
+                "DryRun line {offset} returns an owned Decision, which puts a rehearsal on \
+                 the enforcement path: {line}"
+            );
+        }
+
+        assert!(
+            !source.contains("impl From<DryRun> for Decision"),
+            "a From conversion would let a rehearsal be passed wherever a Decision is expected"
+        );
+        // The accessors that SHOULD be there, so this test fails if the block is renamed or
+        // emptied rather than silently passing over nothing.
+        for expected in [
+            "pub fn would_allow",
+            "pub fn would_act",
+            "pub fn would_match",
+            "pub fn would_deny_because",
+        ] {
+            assert!(
+                block.contains(expected),
+                "expected {expected} in the DryRun block; if it moved, this scan is no longer \
+                 reading what it thinks it is"
             );
         }
     }
