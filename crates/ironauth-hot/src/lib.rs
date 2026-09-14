@@ -56,5 +56,5 @@ pub mod registry;
 mod state;
 
 pub use bounded::{Bounded, Bounds};
-pub use class::{Class, HotUse, OnLoss};
+pub use class::{Class, HotUse, OnLoss, Reach};
 pub use state::{Answer, HotError, HotState, Ttl};

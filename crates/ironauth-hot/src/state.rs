@@ -50,6 +50,20 @@ pub enum HotError {
     Unavailable,
     /// The accelerator answered, and the answer was not usable.
     Malformed,
+    /// This scope already holds as many live entries for this use as it is allowed.
+    ///
+    /// # Not a failure of the accelerator, and not the caller's input either
+    ///
+    /// The other three variants say the accelerator could not answer or answered nonsense. This
+    /// one says it WORKED and refused, because [`crate::Reach::Anonymous`] declares a ceiling on
+    /// how many live entries one scope may hold for a use an unauthenticated request can cause,
+    /// and the ceiling is reached.
+    ///
+    /// A caller must not retry it. A caller for a [`crate::Class::Correctness`] use must go to
+    /// the fallback its declaration names, exactly as for [`HotError::Unavailable`] -- the
+    /// decision that use makes is still owed an answer, and the quota is about disk rather than
+    /// about the decision.
+    QuotaExceeded,
 }
 
 /// What every [`HotState`] method returns: a boxed future, because the trait is used behind

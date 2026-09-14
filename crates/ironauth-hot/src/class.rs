@@ -80,6 +80,38 @@ pub struct HotUse {
     name: &'static str,
     class: Class,
     fallback: Option<&'static str>,
+    reach: Reach,
+}
+
+/// Who can cause an entry for a use to exist.
+///
+/// # This is a STORAGE question, not a permission one
+///
+/// Nothing here decides what a caller may read or write; [`Class`] does that, and row-level
+/// security does the rest. This answers one narrower question the class system cannot: CAN AN
+/// ANONYMOUS REQUEST MAKE A ROW APPEAR? Because if it can, the number of rows is
+/// attacker-controlled, and a store that answers every read correctly is still a store that
+/// fills up.
+///
+/// That is the Dex #1292 shape: a pre-authentication flow-row denial of service, filed in 2018
+/// and still open. It is neither exotic nor subtle -- unauthenticated endpoints mint artifacts,
+/// nothing bounds how many, and the disk is the limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// Only an authenticated caller can cause an entry.
+    ///
+    /// The count is then bounded by whatever already limits that caller, and a second ceiling
+    /// here would be a number nobody could choose well.
+    Authenticated,
+    /// An UNAUTHENTICATED request can cause an entry, so the count needs a ceiling.
+    ///
+    /// PER SCOPE and not per deployment, on purpose: a global cap would let one tenant's flood
+    /// deny every other tenant the same store, turning a storage problem into a fairness problem,
+    /// which is strictly worse.
+    Anonymous {
+        /// The most live entries one tenant-and-environment may hold for this use at once.
+        per_scope_entries: u32,
+    },
 }
 
 impl HotUse {
@@ -102,7 +134,17 @@ impl HotUse {
         name: &'static str,
         class: Class,
         fallback: Option<&'static str>,
+        reach: Reach,
     ) -> Self {
+        assert!(
+            !matches!(
+                reach,
+                Reach::Anonymous {
+                    per_scope_entries: 0
+                }
+            ),
+            "a quota of zero is a use nothing can ever write; declare Authenticated instead"
+        );
         assert!(
             matches!(
                 (class, fallback.is_some()),
@@ -118,6 +160,27 @@ impl HotUse {
             name,
             class,
             fallback,
+            reach,
+        }
+    }
+
+    /// Who can cause an entry for this use, and the per-scope ceiling if that is anyone.
+    #[must_use]
+    pub const fn reach(&self) -> Reach {
+        self.reach
+    }
+
+    /// The per-scope ceiling on live entries, or [`None`] when only an authenticated caller can
+    /// cause one.
+    ///
+    /// A caller enforcing this does NOT need to know why the number is what it is; it needs to
+    /// know whether there is one. Returning an `Option` rather than a sentinel means a use with
+    /// no ceiling cannot be compared against accidentally.
+    #[must_use]
+    pub const fn per_scope_entry_quota(&self) -> Option<u32> {
+        match self.reach {
+            Reach::Authenticated => None,
+            Reach::Anonymous { per_scope_entries } => Some(per_scope_entries),
         }
     }
 

@@ -20,6 +20,28 @@
 //! the one place a claim is settled. That is why [`crate::repository::HotStateRepo`]'s
 //! `put_if_absent` is a single guarded statement rather than a read and a write.
 //!
+//! # Migration 0226 says this quota does not exist, and 0226 cannot be corrected
+//!
+//! Two comments in `migrations/0226_hot_state.sql` are now FALSE:
+//!
+//! * "NOTHING OUTSIDE THE TESTS REACHES THIS TABLE YET" -- still true of the registry's uses,
+//!   which have no production call sites, but no longer the whole story;
+//! * "a quota on the NUMBER of rows is the other half of that defence and does not exist yet ...
+//!   an anonymous flood is bounded in bytes per row and unbounded in rows". IT EXISTS. It is
+//!   [`ironauth_hot::Reach::Anonymous`], enforced by [`crate::repository::HotStateRepo`] on
+//!   every write, and a flood is bounded in rows per scope per use.
+//!
+//! THE FILE CANNOT BE EDITED TO SAY SO. `migrate.rs` digests each migration's whole bytes,
+//! comments included, so changing one makes every already-migrated database refuse to boot with
+//! a checksum mismatch -- and `scripts/migration-immutability.sh` fails the build for exactly
+//! that reason. A landed migration is a historical record of what was true when it ran, not a
+//! document to be kept current.
+//!
+//! So the correction lives here, where the code it is about lives, and this paragraph is the
+//! pointer a reader who started at the schema needs. The general lesson is worth stating once:
+//! a comment in a migration should describe the SCHEMA, which cannot change under it, and not
+//! the state of the code around it, which can.
+//!
 //! # This module is an ADAPTER and holds no SQL
 //!
 //! Every scoped statement in this crate lives in [`crate::repository`], which
@@ -176,6 +198,14 @@ impl PgHotState {
             // fixes these and no fallback answers them.
             StoreError::Conflict | StoreError::Invalid => HotError::Malformed,
 
+            // THE CEILING, which is neither an outage nor bad input: the write was understood
+            // and refused because this scope already holds as many live entries for this use as
+            // `Reach::Anonymous` allows. A correctness use answers it the same way it answers an
+            // outage -- by going to the fallback its declaration names -- but the two must not
+            // be the same value, because an operator watching for an unreachable database would
+            // otherwise be shown a tenant hitting a quota.
+            StoreError::QuotaExceeded => HotError::QuotaExceeded,
+
             // NOT REACHABLE FROM THIS TABLE, and `Malformed` rather than `Unavailable` because
             // if one ever did surface here it would be a bug in `HotStateRepo`, not an
             // accelerator outage -- and sending a correctness use to "the store" when the store
@@ -186,7 +216,6 @@ impl PgHotState {
             | StoreError::IdempotencyConflict
             | StoreError::SelfApproval
             | StoreError::InvalidRedirectUri
-            | StoreError::QuotaExceeded
             | StoreError::InvalidOrgContext
             | StoreError::InvitationMintCollision
             | StoreError::InvalidCustomDomain
@@ -218,19 +247,37 @@ impl PgHotState {
         self.store.scoped(self.scope).hot_state()
     }
 
+    /// The ceiling this use declares, paired with the instant "live" is judged against.
+    ///
+    /// READ OFF THE USE, never passed in. The whole point of the registry is that a ceiling is a
+    /// property of the use rather than of the call site: a caller that could choose its own
+    /// would be a caller that could choose not to have one, and the uses with a ceiling are
+    /// exactly the ones an anonymous request can reach.
+    fn quota_for(r#use: &'static HotUse, now_unix_micros: i64) -> crate::repository::HotStateQuota {
+        crate::repository::HotStateQuota {
+            per_scope_entries: r#use.per_scope_entry_quota(),
+            now_unix_micros,
+        }
+    }
+
     /// Delete up to [`SWEEP_BATCH`] expired entries in this scope, reporting how many went.
     ///
-    /// # Nothing calls this yet
+    /// # Nothing calls this ONE yet, but expired rows are no longer left to accumulate
     ///
-    /// There is no scheduler, no scope enumerator, and no configuration for a sweep interval;
-    /// this slice ships the OPERATION and not the running of it. Saying so here matters because
-    /// a method named `sweep_expired` reads as a thing that happens, and until the background
-    /// job lands (the pre-auth hygiene slice of #146, with the per-tenant quotas) expired rows
-    /// accumulate on disk in any real deployment.
+    /// There is still no scheduler, no scope enumerator, and no sweep interval, so this batched
+    /// entry point has no caller. That used to mean expired rows accumulated indefinitely.
     ///
-    /// What that costs is bounded and is NOT a correctness problem: an expired row is already
-    /// invisible to a read and already claimable, by the statement rather than by this having
-    /// run. It is disk.
+    /// IT NO LONGER DOES. Every write against a use that declares
+    /// [`ironauth_hot::Reach::Anonymous`] prunes that scope's dead rows for that use the moment
+    /// the ceiling is reached, and retries -- so the uses an anonymous caller can flood collect
+    /// their own garbage, driven by the pressure that would otherwise be the problem. What is
+    /// left uncollected is the three uses only an authenticated caller reaches, whose entry
+    /// counts are bounded by the number of environments and of live tokens.
+    ///
+    /// This remains the right entry point for a scheduled sweep when one lands, because pressure
+    /// is a poor scheduler for a store nobody is pushing on. And either way it is disk rather
+    /// than correctness: an expired row is already invisible to a read and already claimable, by
+    /// the statement rather than by any sweep having run.
     ///
     /// # Errors
     ///
@@ -271,6 +318,7 @@ impl HotState for PgHotState {
                     key,
                     value,
                     Self::expires_at_unix_micros(now, ttl),
+                    Self::quota_for(r#use, now),
                 )
                 .await
                 .map_err(|error| Self::classify(&error))
@@ -293,6 +341,7 @@ impl HotState for PgHotState {
                     value,
                     Self::expires_at_unix_micros(now, ttl),
                     now,
+                    Self::quota_for(r#use, now),
                 )
                 .await
                 .map_err(|error| Self::classify(&error))

@@ -109,7 +109,10 @@ pub enum StoreError {
     ///   (issue #31), under a per-scope advisory lock; the endpoint maps it to a typed refusal
     ///   and a `dcr.quota_hit` audit event;
     /// - a Shared Signals stream against the receiver's `max_streams_per_client` (issue #143),
-    ///   where the count is a conjunct of the INSERT.
+    ///   where the count is a conjunct of the INSERT;
+    /// - a hot-state entry against its use's `Reach::Anonymous` per-scope ceiling (issue #146),
+    ///   where the count is likewise a conjunct of the INSERT, and the caller has already had
+    ///   its expired rows pruned and the write retried before this is returned.
     QuotaExceeded,
     /// An envelope-encryption operation failed (issue #48): a wrapped key or a
     /// sealed payload could not be authenticated and decrypted. This is
@@ -475,7 +478,9 @@ impl fmt::Display for StoreError {
             StoreError::GuardrailViolation(violation) => {
                 write!(f, "guardrail violation: {violation}")
             }
-            StoreError::QuotaExceeded => f.write_str("registration quota exceeded"),
+            // NOT "registration quota exceeded", which is what this said while it already had
+            // two callers and only one of them was registration.
+            StoreError::QuotaExceeded => f.write_str("quota exceeded"),
             StoreError::Encryption => f.write_str("envelope decryption failed"),
             // Worded as the management surface reports it, because the boundary
             // renders this refusal FROM this text rather than restating it. Keeping

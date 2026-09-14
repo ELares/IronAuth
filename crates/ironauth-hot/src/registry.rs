@@ -29,19 +29,33 @@
 //! page, and a reviewer asking "what does this deployment do when the cache is gone" has one
 //! place to read.
 
-use crate::{Class, HotUse, OnLoss};
+use crate::{Class, HotUse, OnLoss, Reach};
 
 /// The JSON Web Key Set an environment publishes.
 ///
 /// AN ACCELERATOR, unambiguously: the keys are in the store, the document is derived from them,
 /// and a miss costs one read and a render. Nothing about a missing entry weakens anything.
-pub static JWKS: HotUse = HotUse::declare("jwks", Class::Accelerator, None);
+pub static JWKS: HotUse = HotUse::declare(
+    "jwks",
+    Class::Accelerator,
+    None,
+    // One document per environment, derived from the signing keys. An anonymous caller READS
+    // it (the JWKS endpoint is public) but cannot cause an entry: only a key rotation does.
+    Reach::Authenticated,
+);
 
 /// A tenant's resolved configuration, as the request path reads it.
 ///
 /// ALSO AN ACCELERATOR. It is read on nearly every request and changes rarely, which is the
 /// shape a cache is for; and every reader can resolve it from the store.
-pub static TENANT_CONFIG: HotUse = HotUse::declare("tenant_config", Class::Accelerator, None);
+pub static TENANT_CONFIG: HotUse = HotUse::declare(
+    "tenant_config",
+    Class::Accelerator,
+    None,
+    // One entry per environment, written when the configuration changes, which is a management
+    // operation.
+    Reach::Authenticated,
+);
 
 /// The result of an introspection call, for the seconds until it could change.
 ///
@@ -62,7 +76,14 @@ pub static TENANT_CONFIG: HotUse = HotUse::declare("tenant_config", Class::Accel
 /// Classifying it fail-open to mark it "sensitive" would have been a label with no consequence,
 /// since fail-open and accelerator behave identically when the cache is down. A class whose
 /// members do not differ in behaviour is a comment.
-pub static INTROSPECTION: HotUse = HotUse::declare("introspection", Class::Accelerator, None);
+pub static INTROSPECTION: HotUse = HotUse::declare(
+    "introspection",
+    Class::Accelerator,
+    None,
+    // Keyed by a token that was ISSUED, so the number of entries is bounded by the number of
+    // live tokens, which the grant paths already bound. An anonymous caller cannot mint one.
+    Reach::Authenticated,
+);
 
 /// Per-subject counters the rate limiter spends.
 ///
@@ -79,6 +100,18 @@ pub static RATE_COUNTER: HotUse = HotUse::declare(
         on_loss: OnLoss::FailOpen,
     },
     None,
+    // ANONYMOUS, and this is the use that most obviously is: a rate counter exists precisely to
+    // count what unauthenticated traffic does, and it is keyed by a subject or an address the
+    // caller chooses. Without a ceiling, minting counters IS the flood -- an attacker rotating
+    // the key writes one row per request and never trips the limit those rows exist to enforce.
+    //
+    // 50_000 live counters per scope. A tenant with more distinct active subjects than that
+    // inside one counter window is not the case this is sized for; the limiter that spends these
+    // (issue #150) is where a deployment-specific number belongs, and until it lands this is a
+    // ceiling rather than a tuning.
+    Reach::Anonymous {
+        per_scope_entries: 50_000,
+    },
 );
 
 /// The count of unauthenticated artifacts a tenant or an address has outstanding.
@@ -99,6 +132,16 @@ pub static PRE_AUTH_QUOTA: HotUse = HotUse::declare(
         on_loss: OnLoss::FailClosed,
     },
     None,
+    // THE USE NAMED FOR THE PROBLEM. It counts pre-authentication artifacts, so every entry is
+    // caused by an anonymous request by definition, and a use that bounds a flood while being
+    // unbounded itself would be the flood.
+    //
+    // Smaller than the rate counter's ceiling because this one is per tenant per artifact class
+    // rather than per subject: a scope legitimately holding ten thousand DISTINCT pre-auth
+    // counters at once is already the situation this refuses.
+    Reach::Anonymous {
+        per_scope_entries: 10_000,
+    },
 );
 
 /// The marker that says a single-use artifact has been redeemed.
@@ -114,6 +157,17 @@ pub static SINGLE_USE_MARKER: HotUse = HotUse::declare(
     "single_use_marker",
     Class::Correctness,
     Some("the artifact's own conditional UPDATE, which is the authority either way"),
+    // ANONYMOUS. A device code, an authorization code and a magic-link token are all redeemed by
+    // a caller that has not authenticated yet, and each redemption can mint a marker.
+    //
+    // AND THE QUOTA HERE CANNOT REFUSE A CLAIM, which is the subtlety worth stating: this use is
+    // Correctness, so a refusal is not a degraded answer, it is a wrong one. The ceiling is
+    // enforced against the WRITE that creates a NEW key, and a claim on a key at the ceiling is
+    // still answered from the store's fallback -- the artifact's own conditional UPDATE, named
+    // above. The quota bounds the accelerator's disk, never the decision.
+    Reach::Anonymous {
+        per_scope_entries: 100_000,
+    },
 );
 
 /// The lock a rotation or migration holds while it moves something that must move once.
@@ -124,6 +178,9 @@ pub static ROTATION_LOCK: HotUse = HotUse::declare(
     "rotation_lock",
     Class::Correctness,
     Some("the Postgres advisory lock, which is the authority either way"),
+    // A rotation is an operator action or a scheduled job, never an anonymous request, and the
+    // number of locks is the number of things that can be rotated -- a fixed, small set.
+    Reach::Authenticated,
 );
 
 /// Every declared use.
@@ -215,6 +272,50 @@ mod tests {
                 r#use.name()
             );
         }
+    }
+
+    #[test]
+    fn every_use_states_whether_an_anonymous_request_can_cause_an_entry() {
+        // BOTH ANSWERS MUST OCCUR. Every quota test in `ironauth-store` fills a use to its
+        // declared ceiling and asserts the next write is refused; a registry where nothing were
+        // `Anonymous` would make all of them vacuous, and one where EVERYTHING were would cap
+        // three uses no anonymous caller can reach -- including JWKS, whose entry count is the
+        // number of environments.
+        let mut anonymous = Vec::new();
+        let mut authenticated = Vec::new();
+        for r#use in ALL {
+            match r#use.reach() {
+                Reach::Anonymous { per_scope_entries } => {
+                    assert!(
+                        per_scope_entries > 0,
+                        "{}'s ceiling is zero, which is a use nothing can write",
+                        r#use.name()
+                    );
+                    assert_eq!(
+                        r#use.per_scope_entry_quota(),
+                        Some(per_scope_entries),
+                        "{}'s accessor must report the ceiling its declaration carries",
+                        r#use.name()
+                    );
+                    anonymous.push(r#use.name());
+                }
+                Reach::Authenticated => {
+                    assert_eq!(
+                        r#use.per_scope_entry_quota(),
+                        None,
+                        "{} is only reachable authenticated, so it must report no ceiling -- a \
+                         number here would be enforced against a count nothing bounds",
+                        r#use.name()
+                    );
+                    authenticated.push(r#use.name());
+                }
+            }
+        }
+        assert!(
+            !anonymous.is_empty() && !authenticated.is_empty(),
+            "both reaches must occur: {anonymous:?} are anonymous and {authenticated:?} are \
+             not, and a registry where either list is empty makes the other's tests vacuous"
+        );
     }
 
     #[test]
