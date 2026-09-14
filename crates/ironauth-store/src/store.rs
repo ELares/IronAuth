@@ -261,8 +261,32 @@ impl Store {
     /// refused (out of order, checksum mismatch); [`StoreError::Database`] on a
     /// connection failure.
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        MigrationRunner::new(&self.pool).run().await?;
-        Ok(())
+        self.migrate_with_contract(crate::ContractPolicy::default())
+            .await
+            .map(|_| ())
+    }
+
+    /// Apply the chain under an explicit contract policy (issue #148), returning the report.
+    ///
+    /// [`Store::migrate`] keeps the default, which DEFERS contract migrations on an
+    /// upgrade, and discards the report. Use this one wherever the deferral has to be
+    /// visible: a caller that says "migrations applied" without reading
+    /// [`MigrationReport::deferred_from`] is describing a database whose schema it has
+    /// deliberately left short.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Migration`] if the chain cannot be applied or is refused;
+    /// [`StoreError::Database`] on a connection failure.
+    pub async fn migrate_with_contract(
+        &self,
+        contract: crate::ContractPolicy,
+    ) -> Result<crate::MigrationReport, StoreError> {
+        let report = MigrationRunner::new(&self.pool)
+            .with_contract(contract)
+            .run()
+            .await?;
+        Ok(report)
     }
 
     /// Record an idempotent response for a request whose WRITE happened on the OTHER plane.

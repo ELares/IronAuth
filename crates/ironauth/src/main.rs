@@ -138,6 +138,10 @@ fn main() -> ExitCode {
         // constraint one of the pending migrations imposes, which is the failure that
         // otherwise lands part way through a rolling upgrade.
         Some("doctor") => doctor(&mut args),
+        // Apply the schema (issue #148). Separate from `serve` because a contract
+        // migration REMOVES the old shape, and the point of the expand-contract lifecycle
+        // is that a human decides when that happens, not a pod restart.
+        Some("migrate") => migrate(&mut args),
         // The config-as-code subcommands (issue #51) dispatch into ironauth-apply.
         // The verb is re-prepended so that crate parses its own argument vector.
         Some(verb @ ("validate" | "plan" | "apply" | "drift")) => {
@@ -7705,19 +7709,18 @@ fn doctor(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
     }
 
-    let dsn = match url.or_else(|| std::env::var("IRONAUTH_DOCTOR_URL").ok()) {
-        Some(dsn) => dsn,
-        None => {
-            let loaded = match &config_path {
-                Some(path) => Config::load(path),
-                None => Config::from_toml_str("", "<defaults>"),
-            };
-            match loaded {
-                Ok(Loaded { config, .. }) => config.database.url.expose().to_owned(),
-                Err(error) => {
-                    eprintln!("ironauth doctor: {error}");
-                    return ExitCode::FAILURE;
-                }
+    let dsn = if let Some(dsn) = url.or_else(|| std::env::var("IRONAUTH_DOCTOR_URL").ok()) {
+        dsn
+    } else {
+        let loaded = match &config_path {
+            Some(path) => Config::load(path),
+            None => Config::from_toml_str("", "<defaults>"),
+        };
+        match loaded {
+            Ok(Loaded { config, .. }) => config.database.url.expose().to_owned(),
+            Err(error) => {
+                eprintln!("ironauth doctor: {error}");
+                return ExitCode::FAILURE;
             }
         }
     };
@@ -7785,12 +7788,178 @@ fn doctor(args: &mut impl Iterator<Item = String>) -> ExitCode {
     })
 }
 
+/// Run the `migrate` subcommand: apply the schema (issue #148).
+///
+/// Contract migrations are DEFERRED by default on an upgrade, and `--contract` is the
+/// operator confirming the removal. That split is the whole reason this is a command
+/// rather than something `serve` does on boot: expand and migrate are additive and roll
+/// back for free, but a contract migration drops the old shape, and once it has run,
+/// rolling the binary back does not bring the data with it. A pod restart is not a
+/// decision; this is.
+///
+/// `--soak DURATION` is the unattended form: apply the contract migration once everything
+/// before it has been in place that long, measured on the database's own clock.
+#[allow(clippy::too_many_lines)]
+fn migrate(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let mut config_path: Option<String> = None;
+    let mut url: Option<String> = None;
+    let mut contract = ironauth_store::ContractPolicy::Deferred;
+    let mut soak: Option<String> = None;
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--config=") {
+            config_path = Some(value.to_owned());
+        } else if arg == "--config" {
+            let Some(path) = args.next() else {
+                eprintln!("ironauth migrate: --config requires a PATH");
+                return ExitCode::FAILURE;
+            };
+            config_path = Some(path);
+        } else if let Some(value) = arg.strip_prefix("--url=") {
+            url = Some(value.to_owned());
+        } else if arg == "--url" {
+            let Some(value) = args.next() else {
+                eprintln!("ironauth migrate: --url requires a POSTGRES DSN");
+                return ExitCode::FAILURE;
+            };
+            url = Some(value);
+        } else if arg == "--contract" {
+            contract = ironauth_store::ContractPolicy::Allowed;
+        } else if let Some(value) = arg.strip_prefix("--soak=") {
+            soak = Some(value.to_owned());
+        } else if arg == "--soak" {
+            let Some(value) = args.next() else {
+                eprintln!("ironauth migrate: --soak requires a DURATION (for example 24h)");
+                return ExitCode::FAILURE;
+            };
+            soak = Some(value);
+        } else {
+            eprintln!("ironauth migrate: unrecognized argument '{arg}'");
+            eprintln!(
+                "usage: ironauth migrate [--config PATH] [--url DSN] [--contract | --soak DURATION]"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
+    if let Some(text) = soak {
+        if contract == ironauth_store::ContractPolicy::Allowed {
+            eprintln!(
+                "ironauth migrate: --contract and --soak both decide when a contract \
+                 migration may run, and they disagree. Pass one."
+            );
+            return ExitCode::FAILURE;
+        }
+        let Some(duration) = parse_duration(&text) else {
+            eprintln!(
+                "ironauth migrate: --soak expects a duration like 30m, 24h, or 7d; got '{text}'"
+            );
+            return ExitCode::FAILURE;
+        };
+        contract = ironauth_store::ContractPolicy::AfterSoak(duration);
+    }
+
+    let dsn = if let Some(dsn) = url {
+        dsn
+    } else {
+        let loaded = match &config_path {
+            Some(path) => Config::load(path),
+            None => Config::from_toml_str("", "<defaults>"),
+        };
+        match loaded {
+            Ok(Loaded { config, .. }) => config.database.url.expose().to_owned(),
+            Err(error) => {
+                eprintln!("ironauth migrate: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ironauth migrate: cannot start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    runtime.block_on(async move {
+        let store = match Store::connect(&dsn).await {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("ironauth migrate: cannot connect: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let report = match store.migrate_with_contract(contract).await {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("ironauth migrate: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let applied = report.newly_applied();
+        if applied.is_empty() {
+            println!(
+                "migrate: nothing to apply ({} already applied)",
+                report.already_applied()
+            );
+        } else {
+            println!(
+                "migrate: applied {} migration(s): {}",
+                applied.len(),
+                applied
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        // Said plainly, because the interesting state is "the upgrade is half done ON
+        // PURPOSE" and an operator who reads only the line above would not know it.
+        if let Some(version) = report.deferred_from() {
+            println!(
+                "\nmigrate: STOPPED BEFORE migration {version}, a contract migration, and \
+                 every migration behind it.\n\
+                 \n\
+                 A contract migration removes the old shape. Until it runs, this database \
+                 serves BOTH this binary and the previous one, which is what makes the \
+                 release safe to roll back. Once it runs, rolling back no longer brings the \
+                 data with it.\n\
+                 \n\
+                 Re-run with --contract when you have decided, or --soak DURATION to let it \
+                 proceed once the rest of the upgrade has been in place that long."
+            );
+        }
+        ExitCode::SUCCESS
+    })
+}
+
+/// Parse `30m`, `24h`, `7d`, or a bare seconds count.
+fn parse_duration(text: &str) -> Option<std::time::Duration> {
+    let text = text.trim();
+    let (value, multiplier) = match text.chars().last()? {
+        's' => (&text[..text.len() - 1], 1),
+        'm' => (&text[..text.len() - 1], 60),
+        'h' => (&text[..text.len() - 1], 60 * 60),
+        'd' => (&text[..text.len() - 1], 24 * 60 * 60),
+        _ => (text, 1),
+    };
+    let count: u64 = value.trim().parse().ok()?;
+    Some(std::time::Duration::from_secs(count * multiplier))
+}
+
 fn print_help() {
     println!("ironauth {VERSION}");
     println!("A standards-first OpenID Connect identity platform.");
     println!();
     println!("USAGE:");
     println!("  ironauth serve [--config PATH]   Run the server until SIGTERM/SIGINT");
+    println!("  ironauth migrate [--config PATH] [--url DSN] [--contract | --soak DUR]");
+    println!("                                   Apply the schema. Contract migrations are");
+    println!("                                   DEFERRED on an upgrade: --contract is you");
+    println!("                                   confirming the old shape may be removed");
     println!("  ironauth doctor [--config PATH] [--url DSN]");
     println!("                                   Pre-upgrade preflight: report rows that");
     println!("                                   would be rejected by a pending");
