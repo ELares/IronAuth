@@ -79,6 +79,9 @@ use std::time::{Duration, Instant};
 use ironauth_config::{QuotaConfig, ScopeQuotaConfig};
 use ironauth_env::Clock;
 
+/// The five-layer request-plane limiter (issue #150), built on the buckets above.
+pub mod layered;
+
 /// A tenant identifier used as a quota bucket key.
 ///
 /// This is a lightweight opaque key, distinct from the store's scoped id types,
@@ -1014,7 +1017,7 @@ fn u64_to_f64(value: u64) -> f64 {
     clippy::cast_sign_loss,
     reason = "value is clamped non-negative and floored before the cast"
 )]
-fn f64_to_u64_floor(value: f64) -> u64 {
+pub(crate) fn f64_to_u64_floor(value: f64) -> u64 {
     value.max(0.0).floor() as u64
 }
 
@@ -1024,7 +1027,7 @@ fn f64_to_u64_floor(value: f64) -> u64 {
     clippy::cast_sign_loss,
     reason = "value is clamped non-negative and ceiled before the cast"
 )]
-fn f64_to_u64_ceil(value: f64) -> u64 {
+pub(crate) fn f64_to_u64_ceil(value: f64) -> u64 {
     value.max(0.0).ceil() as u64
 }
 
