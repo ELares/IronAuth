@@ -237,6 +237,15 @@ CREATE TABLE IF NOT EXISTS _schema_migrations ( \
     applied_at timestamptz NOT NULL DEFAULT now() \
 )";
 
+/// IronAuth's real migration chain, in ascending version order.
+///
+/// Exposed so the pre-upgrade preflight (`ironauth doctor`) can read the same chain the
+/// runner will apply. It reads the chain; it never applies it.
+#[must_use]
+pub fn chain() -> Vec<Migration> {
+    registry()
+}
+
 /// The applied, ordered migration chain for IronAuth.
 ///
 /// The `#6` isolation schema is version 1; the same-transaction audit log is

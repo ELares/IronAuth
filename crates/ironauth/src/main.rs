@@ -133,6 +133,11 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("serve") => serve(&mut args),
+        // The pre-upgrade data preflight (issue #148). Read-only, run BEFORE an upgrade:
+        // it asks whether any row already in the database would be rejected by a
+        // constraint one of the pending migrations imposes, which is the failure that
+        // otherwise lands part way through a rolling upgrade.
+        Some("doctor") => doctor(&mut args),
         // The config-as-code subcommands (issue #51) dispatch into ironauth-apply.
         // The verb is re-prepended so that crate parses its own argument vector.
         Some(verb @ ("validate" | "plan" | "apply" | "drift")) => {
@@ -7661,12 +7666,126 @@ mod logout_tests {
     }
 }
 
+/// Run the `doctor` subcommand: the pre-upgrade data preflight (issue #148).
+///
+/// The DSN is taken explicitly (`--url`, else `IRONAUTH_DOCTOR_URL`, else the config's
+/// `database.url`) because the connection this needs is NOT the server's runtime one.
+/// The preflight must see every row in every tenant, and `database.url` names
+/// `ironauth_app`, which is deliberately neither superuser nor table owner so that
+/// FORCE ROW LEVEL SECURITY applies to it. Probing on that connection returns zero rows
+/// for every scoped table, which is indistinguishable from a clean result. The command
+/// therefore asks the database whether the connected role is unrestricted and refuses to
+/// print a verdict when it is not, rather than printing a reassuring one.
+fn doctor(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let mut config_path: Option<String> = None;
+    let mut url: Option<String> = None;
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--config=") {
+            config_path = Some(value.to_owned());
+        } else if arg == "--config" {
+            let Some(path) = args.next() else {
+                eprintln!("ironauth doctor: --config requires a PATH");
+                return ExitCode::FAILURE;
+            };
+            config_path = Some(path);
+        } else if let Some(value) = arg.strip_prefix("--url=") {
+            url = Some(value.to_owned());
+        } else if arg == "--url" {
+            let Some(value) = args.next() else {
+                eprintln!("ironauth doctor: --url requires a POSTGRES DSN");
+                return ExitCode::FAILURE;
+            };
+            url = Some(value);
+        } else {
+            eprintln!("ironauth doctor: unrecognized argument '{arg}'");
+            eprintln!("usage: ironauth doctor [--config PATH] [--url DSN]");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let dsn = match url.or_else(|| std::env::var("IRONAUTH_DOCTOR_URL").ok()) {
+        Some(dsn) => dsn,
+        None => {
+            let loaded = match &config_path {
+                Some(path) => Config::load(path),
+                None => Config::from_toml_str("", "<defaults>"),
+            };
+            match loaded {
+                Ok(Loaded { config, .. }) => config.database.url.expose().to_owned(),
+                Err(error) => {
+                    eprintln!("ironauth doctor: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ironauth doctor: cannot start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    runtime.block_on(async move {
+        let store = match Store::connect(&dsn).await {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("ironauth doctor: cannot connect: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        match store.sees_through_row_level_security().await {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "ironauth doctor: REFUSING to report. The connected role is subject to \
+                     row-level security, so a probe of a tenant-scoped table returns zero rows \
+                     whatever the data holds, and every check would pass for the wrong reason. \
+                     Re-run with --url naming the role your migrations run as (the schema \
+                     owner or a superuser), not the server's database.url."
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!(
+                    "ironauth doctor: cannot determine the connected role's privileges: {error}"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+
+        let chain = ironauth_store::chain();
+        let report = match store.preflight(&chain).await {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("ironauth doctor: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        print!("{}", ironauth_store::preflight::render(&report));
+        if report.blocks() {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        }
+    })
+}
+
 fn print_help() {
     println!("ironauth {VERSION}");
     println!("A standards-first OpenID Connect identity platform.");
     println!();
     println!("USAGE:");
     println!("  ironauth serve [--config PATH]   Run the server until SIGTERM/SIGINT");
+    println!("  ironauth doctor [--config PATH] [--url DSN]");
+    println!("                                   Pre-upgrade preflight: report rows that");
+    println!("                                   would be rejected by a pending");
+    println!("                                   migration. Read-only. Needs the role");
+    println!("                                   your migrations run as, not database.url");
     println!("  ironauth hash-probe [--config PATH] [--memory-budget KIB] [--json]");
     println!("                                   Measure Argon2id on this host and");
     println!("                                   recommend parameters (issue #62)");
