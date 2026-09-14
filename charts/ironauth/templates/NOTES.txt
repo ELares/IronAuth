@@ -1,0 +1,24 @@
+IronAuth {{ .Chart.AppVersion }} installed as {{ include "ironauth.fullname" . }}.
+
+  Replicas:   {{ .Values.replicaCount }}
+  Public URL: {{ .Values.server.publicUrl }}
+  Data plane: {{ include "ironauth.fullname" . }}:{{ .Values.service.port }} (in-cluster)
+
+The management plane ({{ .Values.server.managementBind }}) carries /healthz, /readyz
+and metrics. It has no Service on purpose: reach it on the pod IP.
+
+{{ if or .Values.ironcache.enabled .Values.ironbus.enabled -}}
+Accelerators:
+{{ if .Values.ironcache.enabled }}  IronCache: {{ .Values.ironcache.endpoint }}
+{{ end }}{{ if .Values.ironbus.enabled }}  IronBus:   {{ .Values.ironbus.addr }}
+{{ end }}
+{{- else -}}
+No accelerators are enabled. IronAuth is complete on Postgres alone; IronCache
+and IronBus only reduce latency, and nothing degrades without them.
+{{- end }}
+
+{{ if not .Values.database.masterKey.existingSecret -}}
+WARNING: database.masterKey.existingSecret is unset. The envelope-encrypted PII
+paths (registration, login, UserInfo) fail closed rather than storing plaintext,
+so set it before serving real traffic.
+{{- end }}

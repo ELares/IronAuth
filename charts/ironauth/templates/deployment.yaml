@@ -1,0 +1,126 @@
+{{- /* SPDX-License-Identifier: MIT OR Apache-2.0 */ -}}
+{{- include "ironauth.validateValues" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ironauth.fullname" . }}
+  labels:
+    {{- include "ironauth.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ironauth.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Roll the pods when the rendered config changes. Without this a values
+        # change that only touches the Secret leaves every replica running the
+        # previous config until something else happens to restart it.
+        checksum/config: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "ironauth.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "ironauth.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Long enough for the configured drain to finish before SIGKILL. A grace
+      # period shorter than shutdown_grace_secs would cut in-flight requests at
+      # exactly the moment the setting exists to protect them.
+      terminationGracePeriodSeconds: {{ add .Values.server.shutdownGraceSecs 5 }}
+      containers:
+        - name: ironauth
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+            - --config
+            - /etc/ironauth/ironauth.toml
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: data
+              containerPort: {{ (splitList ":" .Values.server.bind) | last | int }}
+              protocol: TCP
+            - name: management
+              containerPort: {{ (splitList ":" .Values.server.managementBind) | last | int }}
+              protocol: TCP
+          env:
+            {{- if .Values.database.masterKey.existingSecret }}
+            - name: IRONAUTH_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.masterKey.existingSecret }}
+                  key: {{ .Values.database.masterKey.key }}
+            {{- end }}
+            {{- if .Values.ironcache.enabled }}
+            - name: IRONAUTH_IRONCACHE_ENDPOINT
+              value: {{ .Values.ironcache.endpoint | quote }}
+            {{- end }}
+            {{- if .Values.ironbus.enabled }}
+            - name: IRONAUTH_IRONBUS_ADDR
+              value: {{ .Values.ironbus.addr | quote }}
+            {{- end }}
+          # Both probes hit the MANAGEMENT plane: that is where /healthz and
+          # /readyz are served, and the data plane never exposes them.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: management
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: management
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ironauth
+              readOnly: true
+            # readOnlyRootFilesystem is on, so anything the process writes needs
+            # somewhere to go. An emptyDir rather than a relaxed root: the
+            # process writes temporary files, not state.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          secret:
+            secretName: {{ include "ironauth.configSecretName" . }}
+            defaultMode: 0400
+        - name: tmp
+          emptyDir: {}

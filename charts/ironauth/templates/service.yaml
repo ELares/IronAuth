@@ -1,0 +1,25 @@
+{{- /* SPDX-License-Identifier: MIT OR Apache-2.0 */ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ironauth.fullname" . }}
+  labels:
+    {{- include "ironauth.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    # The PUBLIC data plane, and only it. The management plane (health,
+    # readiness, metrics) is reachable on the pod IP for kubelet probes and for
+    # a Prometheus scrape, and deliberately has no Service in front of it: an
+    # identity provider that exposes its own readiness and metrics to any
+    # in-cluster caller has published an internal surface for no reason.
+    - name: https
+      port: {{ .Values.service.port }}
+      targetPort: data
+      protocol: TCP
+  selector:
+    {{- include "ironauth.selectorLabels" . | nindent 4 }}

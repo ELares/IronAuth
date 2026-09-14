@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+apiVersion: v2
+name: ironauth
+description: IronAuth, a standards-first OpenID Connect identity platform
+type: application
+# The chart's own version. Bumped when the chart changes, independently of the
+# appVersion it deploys.
+version: 0.1.0
+# The IronAuth release this chart defaults to. Kept in step with the workspace
+# version; scripts/helm-chart.sh fails if they diverge, because a chart that
+# silently deploys a different build than it claims is worse than no default.
+appVersion: "0.1.0"
+home: https://github.com/ELares/IronAuth
+sources:
+  - https://github.com/ELares/IronAuth
+keywords:
+  - oidc
+  - oauth2
+  - identity
+  - authentication
+maintainers:
+  - name: IronAuth maintainers
+    url: https://github.com/ELares/IronAuth
