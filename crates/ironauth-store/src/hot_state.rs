@@ -42,11 +42,14 @@ use crate::{Scope, Store, StoreError};
 /// with every pre-authentication artifact any anonymous caller ever caused -- which is the Dex
 /// #1292 shape, open since 2018.
 ///
-/// BOUNDED PER CALL rather than "delete everything expired". An unbounded delete over a backlog
-/// takes row locks proportional to the backlog, writes one enormous WAL record, and blocks the
-/// live traffic it is meant to be cleaning up for. A bounded sweep called repeatedly does the
-/// same work in pieces that each finish, and a caller that wants the backlog gone calls it until
-/// it reports fewer rows than the bound.
+/// BOUNDED PER CALL rather than "delete everything expired", and the reason is LOCK DURATION
+/// rather than volume. An unbounded delete over a large backlog holds row locks on every row it
+/// has touched until it commits, and holds one transaction open for as long as the scan takes;
+/// a concurrent `put_if_absent` for one of those keys waits behind it. Batching does not reduce
+/// the total work or the total WAL -- repeated transactions write somewhat MORE of both -- it
+/// bounds how long any single lock is held and gives the sweep a place to stop.
+///
+/// A caller that wants the backlog gone calls it until it reports fewer rows than the bound.
 pub const SWEEP_BATCH: i64 = 1_000;
 
 /// The always-present [`HotState`], backed by the `hot_state` table.
@@ -61,18 +64,28 @@ pub const SWEEP_BATCH: i64 = 1_000;
 ///
 /// # What actually isolates, measured rather than assumed
 ///
-/// ROW-LEVEL SECURITY DOES. Every statement in the repository ALSO names the scope in its
-/// `WHERE` clause, and an earlier version of this paragraph called that the filter and called
-/// RLS "the backstop". Deleting the scope predicate from the read and running the cross-tenant
-/// test proved that backwards: the test still passed, because `hot_state` is `FORCE ROW LEVEL
-/// SECURITY` and the policy reads the same `ironauth.tenant_id` setting the scoped transaction
-/// pins.
+/// THE POLICY DOES. The three statements that FILTER rows -- the read, the delete and the
+/// sweep -- also name the scope in their `WHERE` clause (the two writes bind it as the value
+/// they insert instead), and an earlier version of this paragraph called those predicates the
+/// filter and called RLS "the backstop". Deleting the scope predicate from the read and running the cross-tenant test
+/// proved that backwards: the test still passed, because `hot_state_scope` reads the same
+/// `ironauth.tenant_id` setting the scoped transaction pins, and applies whether or not the
+/// statement repeats it.
 ///
-/// The predicates are worth keeping -- they let the planner use `hot_state_scope_expires_at`
-/// directly -- but the ISOLATION claim rests on the policy, so a change that touched the policy
-/// would be the one to worry about, not a tidy-up of a `WHERE` clause. On the WRITE paths the
-/// bound scope is load-bearing in a different way: it is the value being written, and the
-/// policy's `WITH CHECK` refuses a row that names another tenant.
+/// `ENABLE` IS WHAT REACHES `ironauth_app`; `FORCE` IS FOR THE OWNER. The migration sets both,
+/// and it is worth not confusing them: `ENABLE ROW LEVEL SECURITY` subjects every non-owner,
+/// non-superuser role to the policy, which is the data-plane role this adapter runs as.
+/// `FORCE` extends the same policy to the table's OWNER, who would otherwise bypass it -- the
+/// backstop for migrations and for any tooling connecting as the owning role. Saying "FORCE is
+/// why `ironauth_app` is filtered" would name the wrong one of the two.
+///
+/// The predicates are worth keeping: `sweep_expired` needs the leading scope columns to use
+/// `hot_state_scope_expires_at` at all, and for the three single-row statements the primary key
+/// is the access path, which also begins with the scope. But the ISOLATION claim rests on the
+/// policy, so a change that touched the policy would be the one to worry about, not a tidy-up
+/// of a `WHERE` clause. On the WRITE paths the bound scope is load-bearing in a different way:
+/// it is the value being written, and the policy's `WITH CHECK` refuses a row that names
+/// another tenant.
 pub struct PgHotState {
     store: Arc<Store>,
     scope: Scope,
@@ -81,8 +94,9 @@ pub struct PgHotState {
 
 impl std::fmt::Debug for PgHotState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `dyn Clock` is not `Debug` and the store's own is enormous; the scope is the part
-        // that identifies which of these a reader is looking at.
+        // Hand-written because neither field can be derived: `dyn Clock` is not `Debug`, and
+        // `Store` has no `Debug` impl at all. The scope is the part that identifies which of
+        // these a reader is looking at.
         f.debug_struct("PgHotState")
             .field("scope", &self.scope)
             .finish_non_exhaustive()
@@ -132,15 +146,70 @@ impl PgHotState {
     /// value would retry the same oversized write against the same table for ever, and the
     /// operator would be reading a graph that says their database is down.
     ///
-    /// [`StoreError::Conflict`] is what the repository reports for a CHECK violation, which on
-    /// this table means the caller's input is out of bounds: a key past 512 bytes or a value
-    /// past 64 KiB, both of which it refuses on purpose because unauthenticated traffic can
-    /// influence them. That is [`HotError::Malformed`], which no retry fixes and no fallback
-    /// answers.
+    /// [`StoreError::Conflict`] is what the repository reports for a CHECK violation. The table
+    /// has four, and ALL FOUR are the caller's input rather than the deployment's state: an
+    /// empty or over-long `use_name` (64 bytes), an empty or over-long `key` (512), a value
+    /// past 64 KiB, and an empty scope component. The last cannot be reached through this type
+    /// -- the scope is bound at construction from a [`Scope`], which cannot hold an empty id --
+    /// but it is a CHECK on the same table, so a reader counting producers should find it named
+    /// here rather than discover it. All of them are [`HotError::Malformed`]: no retry fixes
+    /// them and no fallback answers them.
+    ///
+    /// # Exhaustive on purpose
+    ///
+    /// A `_ =>` arm here would silently absorb every variant added to [`StoreError`] later, and
+    /// the default it absorbs them into is `Unavailable` -- the one that sends a correctness
+    /// use to its fallback. [`StoreError::NotFound`] is the example that matters: no method on
+    /// `HotStateRepo` returns it today (a missing row is `Ok(None)`, which is a hit-or-miss
+    /// answer and not an error at all), and if one ever did, "not found" reaching a caller as
+    /// "the store is unreachable" is precisely the confusion this function exists to prevent.
+    /// Listing the variants makes that a compile error instead of a behaviour.
+    // TWO ARMS WITH ONE BODY, kept apart on purpose. `Conflict`/`Invalid` are what this table
+    // can actually produce; the long arm is everything that cannot reach this seam. Both answer
+    // `Malformed`, and collapsing them would erase the distinction a reader needs to decide
+    // whether a new variant belongs above or below -- which is the decision the exhaustive
+    // match exists to force.
+    #[allow(clippy::match_same_arms)]
     fn classify(error: &StoreError) -> HotError {
         match error {
-            StoreError::Conflict => HotError::Malformed,
-            _ => HotError::Unavailable,
+            // THE CALLER'S INPUT, which is what every CHECK on this table is about. No retry
+            // fixes these and no fallback answers them.
+            StoreError::Conflict | StoreError::Invalid => HotError::Malformed,
+
+            // NOT REACHABLE FROM THIS TABLE, and `Malformed` rather than `Unavailable` because
+            // if one ever did surface here it would be a bug in `HotStateRepo`, not an
+            // accelerator outage -- and sending a correctness use to "the store" when the store
+            // is what just failed to make sense is the confusion `classify` exists to prevent.
+            // `NotFound` is the one worth naming: a missing row on this seam is `Ok(None)`, a
+            // miss rather than an error, so the repository never produces it.
+            StoreError::NotFound
+            | StoreError::IdempotencyConflict
+            | StoreError::SelfApproval
+            | StoreError::InvalidRedirectUri
+            | StoreError::QuotaExceeded
+            | StoreError::InvalidOrgContext
+            | StoreError::InvitationMintCollision
+            | StoreError::InvalidCustomDomain
+            | StoreError::InvalidName
+            | StoreError::InvalidIdentifier
+            | StoreError::SchemaMalformed(_)
+            | StoreError::TraitsInvalid(_)
+            | StoreError::NoActiveTraitSchema
+            | StoreError::JourneyInvalid(_)
+            | StoreError::OrgGroupCycle
+            | StoreError::OrgAuthPolicyInvalid(_)
+            | StoreError::AuditUnclassified(_)
+            | StoreError::OrgGroupDepthExceeded { .. }
+            | StoreError::GuardrailViolation(_) => HotError::Malformed,
+
+            // THE DEPLOYMENT'S STATE: the database is not answering, or this process cannot
+            // talk to it correctly. These are the ones a class should act on.
+            StoreError::Database(_)
+            | StoreError::Migration(_)
+            | StoreError::Encryption
+            | StoreError::CutoverBlocked { .. }
+            | StoreError::IllegalMigrationTransition { .. }
+            | StoreError::RetentionGap => HotError::Unavailable,
         }
     }
 
@@ -150,6 +219,18 @@ impl PgHotState {
     }
 
     /// Delete up to [`SWEEP_BATCH`] expired entries in this scope, reporting how many went.
+    ///
+    /// # Nothing calls this yet
+    ///
+    /// There is no scheduler, no scope enumerator, and no configuration for a sweep interval;
+    /// this slice ships the OPERATION and not the running of it. Saying so here matters because
+    /// a method named `sweep_expired` reads as a thing that happens, and until the background
+    /// job lands (the pre-auth hygiene slice of #146, with the per-tenant quotas) expired rows
+    /// accumulate on disk in any real deployment.
+    ///
+    /// What that costs is bounded and is NOT a correctness problem: an expired row is already
+    /// invisible to a read and already claimable, by the statement rather than by this having
+    /// run. It is disk.
     ///
     /// # Errors
     ///

@@ -32232,9 +32232,6 @@ fn federation_verifier_purpose(id: &FederationLoginStateId) -> String {
     format!("federation_code_verifier:{id}")
 }
 
-/// The data-plane federation outbound-login correlation store (issue #75, PR B): a
-/// short-lived, single-use row correlating an upstream authorize leg to its callback.
-/// Every operation is scope-bound and runs on the least-privilege `ironauth_app` role.
 /// The scoped hot-state table (issue #146).
 ///
 /// # Every method takes its instants
@@ -32327,8 +32324,21 @@ impl HotStateRepo<'_> {
     /// A read, a decision, and a write is three steps with two gaps, and two callers arriving
     /// together both read "absent" and both write. For a single-use marker that is the double
     /// redemption the marker exists to prevent. `ON CONFLICT` makes the conflict itself the
-    /// decision: Postgres takes a row lock, the loser waits, and exactly one `RETURNING` row
-    /// comes back across both callers.
+    /// decision, and the mechanism differs by case:
+    ///
+    /// * NO ROW EXISTS and two callers insert at once. There is nothing to lock yet, so
+    ///   Postgres uses SPECULATIVE INSERTION against the primary-key index: one caller wins the
+    ///   index entry, the other's speculative tuple is killed and it re-reads and takes the
+    ///   `ON CONFLICT` path. Saying "a row lock" here, as an earlier version of this comment
+    ///   did, describes the wrong half of the mechanism -- the half that cannot apply when the
+    ///   contested row does not exist, which is the common case for a fresh marker.
+    /// * A ROW EXISTS (live or expired) and callers arrive together. Now there is a row, the
+    ///   conflict arm takes its lock, and the loser waits and re-evaluates the guard against
+    ///   the committed state.
+    ///
+    /// Either way exactly one `RETURNING` row comes back across both callers, which is the
+    /// property the caller depends on; the two paths are worth naming because only one of them
+    /// is what a reader pictures.
     ///
     /// # The expired-row trap, which is why this is DO UPDATE and not DO NOTHING
     ///
@@ -32345,6 +32355,16 @@ impl HotStateRepo<'_> {
     /// MEANS A LIVE HOLDER IS THERE. Those are three cases and two answers, and the collapse is
     /// the right one: a caller asked whether it may proceed, and "I inserted" and "I revived"
     /// are the same permission.
+    ///
+    /// # The guard assumes `expires_at_unix_micros > now_unix_micros`
+    ///
+    /// If a caller passed an `expires_at` at or before `now`, the row it writes would satisfy
+    /// its own `expires_at <= now` guard, so EVERY concurrent caller would claim it in turn and
+    /// the exactly-once property would be gone. Nothing in the SQL prevents that, so it is
+    /// stated here and held upstream: [`ironauth_hot::Ttl::of`] clamps to at least one second,
+    /// and the adapter computes `expires_at` as `now + ttl` with a saturating add, so the sum
+    /// is always strictly greater. A future caller reaching this repository directly is the one
+    /// this paragraph is for.
     ///
     /// # Errors
     ///
@@ -32453,6 +32473,9 @@ impl HotStateRepo<'_> {
     }
 }
 
+/// The data-plane federation outbound-login correlation store (issue #75, PR B): a
+/// short-lived, single-use row correlating an upstream authorize leg to its callback.
+/// Every operation is scope-bound and runs on the least-privilege `ironauth_app` role.
 pub struct FederationLoginStateRepo<'a> {
     store: &'a Store,
     scope: Scope,

@@ -52,7 +52,6 @@ pub enum HotError {
     Malformed,
 }
 
-/// A boxed future, because this trait is used behind `dyn`.
 /// What every [`HotState`] method returns: a boxed future, because the trait is used behind
 /// `dyn` and a bare `async fn` in a trait is not `dyn`-safe.
 ///
