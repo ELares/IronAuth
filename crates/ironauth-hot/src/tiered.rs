@@ -6,20 +6,33 @@ use crate::{Answer, HotState, HotUse, Ttl};
 
 /// An optional accelerator in front of the tier that is always there.
 ///
-/// # The covenant, made mechanical
+/// # The covenant, made mechanical, and stated precisely enough to be false
 ///
 /// IronAuth is complete on PostgreSQL alone. This type is where that stops being a promise and
-/// becomes a control-flow property: every operation has a path that reaches `durable` and
-/// succeeds, and no operation's outcome depends on `fast` answering. Attach an accelerator and
-/// reads get quicker; take it away, unplug it, or let it fail every call, and the same code
-/// produces the same answers.
+/// becomes a control-flow property:
+///
+/// NO OUTCOME DEPENDS ON THE ACCELERATOR BEING AVAILABLE. Take it away, unplug it, or let it
+/// fail every call, and the same code produces the same answers. That is the property the outage
+/// tests measure by running one script against three accelerators and comparing.
+///
+/// AN AVAILABLE ACCELERATOR CAN SERVE A STALE VALUE, bounded by [`POPULATE_TTL_SECS`]. This is
+/// the sentence the first version of this doc left out, and it said instead that no outcome
+/// depends on the accelerator ANSWERING -- which is not true of any cache and was not true of
+/// this one. A read served from `fast` is by definition a value the durable tier was not asked
+/// about, and [`Tiered::get`] documents the three ways it can be out of date.
+///
+/// The two together are the honest claim: an accelerator cannot make an operation FAIL, and it
+/// can make a read OLD for a bounded time. A use for which the second is unacceptable is a use
+/// that should not be read through a cache, which is what its [`crate::Class`] is for.
 ///
 /// # What each operation does, and why
 ///
 /// READ: ask the accelerator; on a hit, answer. On a miss OR ANY ERROR, ask the durable tier,
-/// and populate the accelerator with what it said. An accelerator that is down is therefore
-/// indistinguishable from one that is empty, which is the only treatment that keeps the covenant
-/// -- a read that propagated the accelerator's error would be a read that needs it.
+/// and populate the accelerator with what it said IF IT SAID ANYTHING -- a miss is not cached,
+/// because caching an absence would make the accelerator serve a "not found" it invented. An
+/// accelerator that is down is therefore indistinguishable from one that is empty, which is the
+/// only treatment that keeps the covenant: a read that propagated the accelerator's error would
+/// be a read that needs it.
 ///
 /// WRITE: the durable tier FIRST, and only then the accelerator. The order is the whole
 /// correctness argument: if the durable write fails, nothing is in the accelerator claiming
@@ -70,6 +83,25 @@ impl<F: HotState, D: HotState> HotState for Tiered<F, D> {
     /// A POPULATE FAILURE IS DISCARDED. The read has its answer, and failing the call because
     /// the accelerator would not accept a copy of it would make an optional component decide a
     /// request -- which is the one thing this type exists to prevent.
+    ///
+    /// # THE POPULATE CAN RESURRECT AN ENTRY A DELETE ALREADY REMOVED
+    ///
+    /// This method reads the durable tier and then writes the accelerator, and those are two
+    /// separate await points. A `delete` that runs to completion in between -- durable row gone,
+    /// accelerator entry gone because this populate has not written it yet -- is then UNDONE by
+    /// the write that follows. A revocation can return `Ok` and the revoked value still be
+    /// served afterwards, from an accelerator that is working perfectly.
+    ///
+    /// IT IS NOT FIXABLE AT THIS LAYER. Closing it needs a compare-and-set or a generation
+    /// number, and [`HotState`] has neither by design: it is the interface a Postgres table and
+    /// a RESP server both implement, and versioning is exactly the kind of thing they express
+    /// differently. Re-reading after the populate narrows the window without closing it, at the
+    /// cost of doubling the reads on every miss.
+    ///
+    /// SO IT IS BOUNDED INSTEAD, at [`POPULATE_TTL_SECS`] seconds by `cache_ttl`, and written
+    /// down here so a reader deciding whether a use may be cached can see the actual worst case
+    /// rather than an assurance. `a_populate_that_lands_after_a_delete_is_bounded_by_the_cap`
+    /// drives the interleaving deterministically.
     fn get<'a>(&'a self, r#use: &'static HotUse, key: &'a str) -> Answer<'a, Option<Vec<u8>>> {
         Box::pin(async move {
             // AN ERROR IS A MISS, on this path only. The durable tier answers next either way,
@@ -83,21 +115,37 @@ impl<F: HotState, D: HotState> HotState for Tiered<F, D> {
             let answer = self.durable.get(r#use, key).await?;
 
             if let Some(value) = answer.as_deref() {
-                // POPULATED WITH THE USE'S OWN TTL, not with what the durable tier has left on
-                // its copy. This type cannot see the remaining lifetime of a durable entry, and
-                // inventing one would put an entry in the accelerator that outlives the thing it
-                // caches. `populate_ttl` states the rule and its cost.
-                let _ = self.fast.put(r#use, key, value, populate_ttl(r#use)).await;
+                // BOUNDED, because this type cannot see how long the durable copy has left.
+                // `HotState::get` answers with bytes and no deadline, so any TTL chosen here is
+                // a guess; making it short is what keeps the guess cheap. See `cache_ttl`.
+                let _ = self
+                    .fast
+                    .put(r#use, key, value, Ttl::of(POPULATE_CEILING))
+                    .await;
             }
             Ok(answer)
         })
     }
 
-    /// Write to the durable tier, then to the accelerator.
+    /// Write to the durable tier, then to the accelerator; on a failed accelerator write,
+    /// REMOVE whatever it is holding.
     ///
-    /// The accelerator's failure is DISCARDED: the value is durable, a later read finds it there
-    /// and populates on the way back, and reporting an error for a write that succeeded would
-    /// make a caller retry a thing that already happened.
+    /// # The removal is the whole correctness of this method
+    ///
+    /// An earlier version simply discarded the accelerator's failure, justified with "the value
+    /// is durable, a later read finds it there and populates on the way back". That is true when
+    /// the accelerator holds NOTHING for the key, and false in the case that matters. On an
+    /// OVERWRITE it still holds the PREVIOUS value: the later read hits it, never reaches the
+    /// durable tier, and serves the old value for as long as the earlier write's TTL had left.
+    /// A signing-key rotation would keep serving the retired key set.
+    ///
+    /// So a failed write is followed by a delete, which converts a WRONG answer into a SLOW one:
+    /// the entry is gone, the next read misses and re-reads the durable tier. If the delete
+    /// fails too the stale entry survives, which is no worse than before and is bounded by
+    /// [`POPULATE_TTL_SECS`] because that is the longest any accelerator entry lives.
+    ///
+    /// The caller is still told `Ok`: the value IS durable, and reporting an error for a write
+    /// that succeeded would make it retry something that already happened.
     fn put<'a>(
         &'a self,
         r#use: &'static HotUse,
@@ -107,7 +155,14 @@ impl<F: HotState, D: HotState> HotState for Tiered<F, D> {
     ) -> Answer<'a, ()> {
         Box::pin(async move {
             self.durable.put(r#use, key, value, ttl).await?;
-            let _ = self.fast.put(r#use, key, value, ttl).await;
+            if self
+                .fast
+                .put(r#use, key, value, cache_ttl(ttl))
+                .await
+                .is_err()
+            {
+                let _ = self.fast.delete(r#use, key).await;
+            }
             Ok(())
         })
     }
@@ -141,7 +196,18 @@ impl<F: HotState, D: HotState> HotState for Tiered<F, D> {
         Box::pin(async move {
             let won = self.durable.put_if_absent(r#use, key, value, ttl).await?;
             if won {
-                let _ = self.fast.put(r#use, key, value, ttl).await;
+                // THE MIRROR IS BOUNDED LIKE EVERY OTHER ACCELERATOR WRITE. It used the
+                // CALLER's TTL, which for a sixty-second marker left a sixty-second window in
+                // which a concurrent delete could be undone by this write landing after it. The
+                // window is now the same bounded one every other path has.
+                if self
+                    .fast
+                    .put(r#use, key, value, cache_ttl(ttl))
+                    .await
+                    .is_err()
+                {
+                    let _ = self.fast.delete(r#use, key).await;
+                }
             }
             Ok(won)
         })
@@ -169,12 +235,26 @@ impl<F: HotState, D: HotState> HotState for Tiered<F, D> {
     /// not being read by anyone: [`Tiered::get`] treats its error as a miss and the durable tier
     /// answers correctly. So in the outage case the swallowed error costs nothing at all.
     ///
-    /// THE RESIDUAL CASE IS AN ACCELERATOR THAT SERVES READS WHILE REFUSING DELETES -- a
-    /// read-only replica, or one that is full. There the stale entry is served, and what bounds
-    /// it is the TTL. That is not a consolation invented here: it is why
-    /// [`crate::registry::INTROSPECTION`] is written with a seconds-scale TTL and says so, and a
-    /// use whose staleness window cannot be bounded by a TTL is a use that should not be read
-    /// through a cache.
+    /// THERE ARE RESIDUAL CASES, PLURAL, and an earlier version of this paragraph named one and
+    /// called it "the" residual case. All of them are bounded by the same thing, which is why
+    /// the bound is one constant:
+    ///
+    /// 1. An accelerator that SERVES READS WHILE REFUSING DELETES (a read-only replica, or one
+    ///    that is full): the entry it holds is served until it lapses.
+    /// 2. A POPULATE THAT LANDS AFTER THIS DELETE. [`Tiered::get`] reads the durable tier and
+    ///    then writes the accelerator, and a delete that completes between those two steps is
+    ///    undone by the write. The accelerator is perfectly healthy in this case; the race is in
+    ///    the read path, and it is described there.
+    /// 3. A DELETE ON ANOTHER NODE, for a shared accelerator: this process removes its durable
+    ///    row and its own request's view, and another process's in-flight populate can still
+    ///    resurrect the entry.
+    ///
+    /// What bounds all three is [`POPULATE_TTL_SECS`], because `cache_ttl` caps EVERY write into
+    /// the accelerator at it. That is the argument for having one cap rather than three: the
+    /// staleness story is one sentence instead of a case analysis.
+    ///
+    /// A use whose staleness window cannot be bounded by ten seconds is a use that should not be
+    /// read through a cache at all, which is what its [`crate::Class`] is for.
     ///
     /// THE DURABLE DELETE HAPPENS FIRST and its failure IS returned, so a caller that sees an
     /// error knows the durable tier was the thing that failed.
@@ -187,29 +267,41 @@ impl<F: HotState, D: HotState> HotState for Tiered<F, D> {
     }
 }
 
-/// The TTL a read-through populate writes into the accelerator.
+/// What an accelerator entry's TTL is capped at: `min(what the caller asked, the ceiling)`.
 ///
-/// # Why this is not the durable entry's remaining lifetime
+/// # One rule for every write into the accelerator
 ///
-/// Because [`HotState::get`] does not report one. It answers with bytes, not with bytes and a
-/// deadline, and widening it so this one caller could copy a TTL would put a field on every
-/// implementation for the sake of a layer above them.
+/// `put` and the `put_if_absent` mirror go through this; the read-through populate writes the
+/// ceiling directly, because it has no requested TTL to cap -- it is copying a value whose
+/// remaining lifetime it cannot see. Either way NO write into the accelerator asks for longer
+/// than the ceiling, so the type has ONE staleness bound rather than three. That bound is what every claim in this file
+/// rests on, and it is worth being able to state in a sentence: NO ENTRY IN THE ACCELERATOR
+/// OUTLIVES ITS WRITE BY MORE THAN [`POPULATE_TTL_SECS`] SECONDS.
 ///
-/// So the populate uses a FIXED, SHORT ceiling instead. The cost is bounded and worth naming: an
-/// entry the durable tier would have expired in one second can live in the accelerator for up to
-/// [`POPULATE_TTL_SECS`] seconds after that. For an accelerator use that is a stale read for a
-/// few seconds, which is the ordinary cost of caching and is why those uses are classified as
-/// they are. For anything where it would not be acceptable, the answer is not a cleverer TTL
-/// here: it is that a read-through cache is the wrong shape, and the use should be reaching the
-/// durable tier directly.
-fn populate_ttl(_use: &'static HotUse) -> Ttl {
-    Ttl::of(std::time::Duration::from_secs(POPULATE_TTL_SECS))
+/// The `min` matters as much as the ceiling. A caller asking for a one-second TTL must not have
+/// its value cached for ten, so the cap never lengthens a lifetime -- it only shortens one.
+///
+/// # What it costs, and what it buys
+///
+/// It costs a re-read every [`POPULATE_TTL_SECS`] seconds for a key under constant traffic. It
+/// buys the only bound available: [`HotState::get`] answers with bytes and no deadline, so this
+/// layer cannot know how long a durable entry has left, and a long-lived accelerator copy of an
+/// entry the durable tier has since changed or deleted would be stale for that whole time with
+/// nothing to correct it.
+fn cache_ttl(requested: Ttl) -> Ttl {
+    if requested.duration() <= POPULATE_CEILING {
+        requested
+    } else {
+        Ttl::of(POPULATE_CEILING)
+    }
 }
 
-/// Seconds a read-through populate lives in the accelerator.
+/// The ceiling [`cache_ttl`] caps at.
+const POPULATE_CEILING: std::time::Duration = std::time::Duration::from_secs(POPULATE_TTL_SECS);
+
+/// Seconds an accelerator entry may live, at most.
 ///
-/// Short on purpose: it bounds how long a populate can outlive the durable entry it copied, and
-/// nothing here can measure that overhang, so the only way to keep it small is to keep this
-/// small. Ten seconds costs a re-read every ten seconds for a key under constant traffic, which
-/// is the cheap side of the trade.
+/// Short on purpose: it is the bound on every kind of staleness this type can produce, and
+/// nothing here can measure the actual overhang, so the only way to keep it small is to keep
+/// this small.
 pub const POPULATE_TTL_SECS: u64 = 10;
