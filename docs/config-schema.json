@@ -740,6 +740,21 @@
       },
       "type": "object"
     },
+    "HotStateConfig": {
+      "additionalProperties": false,
+      "description": "The optional shared hot-state accelerator (issue #146).",
+      "properties": {
+        "ironcache_addr": {
+          "default": null,
+          "description": "The optional IronCache accelerator: `host:port`, or [`None`] for Postgres-only.\n\n# What setting this does today, and what it does not\n\nIt declares that a deployment HAS an accelerator, which is what lets readiness report\nthe accelerator tier: until this key existed there was nothing to probe and no state to\nreport, so `DegradedTier` had no variant for it.\n\nIt does NOT yet put the cache in front of any read. `ironauth-hot` is a complete,\nclassified, outage-tested layer that no request path calls: it is not a dependency of\n`ironauth-oidc`, `ironauth-server`, `ironauth-admin` or the binary. Wiring a first\nconsumer (JWKS or tenant config read-through) is the remaining #146 work, and this key\nis the half of it a deployment can act on now.\n\nThat distinction is written down rather than glossed because the alternative is a knob\nthat reads as \"my cache is on\" while nothing consults it, which is the defect this\ncodebase has removed once already.\n\nUnset is the shipped default. IronAuth is complete on Postgres alone.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "IdentifierUniqueness": {
       "description": "The per-environment login-identifier UNIQUENESS mode (issue #54).\n\nUniqueness is a POLICY, not a fixed schema rule: a greenfield identity model\nbakes scoped uniqueness in on day one rather than retrofitting it later (Zitadel\n#9535, Auth0's multi-year path to non-unique emails). The safe default\n(`environment_wide`) gives one canonical identifier at most one user per\n(tenant, environment). `org_scoped` makes an identifier unique only within an\norganization (meaningful once M10 org membership ships; a membership-free user\nfalls back to the environment scope). `non_unique` allows several accounts to\nshare one identifier (identifier-first login still resolves deterministically:\nthe M7 factor step disambiguates). Changing the mode on a POPULATED environment\nrequires a validation pass that reports post-canonicalization collisions before\nthe change applies. This is a promotable per-environment setting in spirit; the\nprocess value is the deployment default until per-environment overrides ride the\nM5 promotion pipeline.",
       "oneOf": [
@@ -3138,6 +3153,13 @@
         "enabled": false
       },
       "description": "Hosted-page render app settings (issue #85): the in-process, server-rendered pages\nthat render from the headless flow contract (login, registration, MFA, recovery,\nfederation), plus the theme seam and the served stylesheet. Off by default and\nSEPARATE from `flows.enabled`: enabling the headless flow API for native SDKs does\nNOT also cut the browser login UI over to the flow engine, and vice versa. The\nactual cutover (retargeting the `/authorize` interaction redirects onto the flow\nrender app) is a later, deliberate change; this toggle default-off ships the seam."
+    },
+    "hot_state": {
+      "$ref": "#/$defs/HotStateConfig",
+      "default": {
+        "ironcache_addr": null
+      },
+      "description": "The optional shared hot-state accelerator (issue #146). Absent means Postgres-only,\nwhich is the shipped default and fully supported."
     },
     "identifiers": {
       "$ref": "#/$defs/IdentifiersConfig",

@@ -114,14 +114,21 @@ for needle in ("IRONBUS", "ironbus_addr", "[outbox]"):
         f"the default install mentions {needle!r}: an accelerator that is off must be absent, "
         "not merely disabled"
     )
-# IronCache has NO config surface in the server, so the chart must not offer one.
-# A values key here would render an endpoint nothing reads and tell an operator the
-# cache was wired. See values.yaml, and readiness.rs on why its tier enum has no
-# accelerator variant either.
+# The chart must not offer an IronCache value, and the reason is narrower than it was.
+#
+# It used to be that the server had no config surface for IronCache at all. It has one now
+# (`[hot_state] ironcache_addr`), and readiness reports the accelerator tier from it. What
+# has not changed is that NO READ goes through the accelerator: `ironauth-hot` is not a
+# dependency of any crate that serves a request. So a chart value would still configure
+# something that accelerates nothing, which is what this assertion is for.
+#
+# The assertion is unchanged; only its justification is. Delete this check when a read path
+# consults the accelerator AND the chart renders a [hot_state] section, not before.
 for forbidden in ("ironcache", "IRONCACHE", "IronCache"):
     assert forbidden not in rendered, (
-        f"the chart renders {forbidden!r}, but ironauth-hot's IronCache implementation has "
-        "no address in config: nothing would read it"
+        f"the chart renders {forbidden!r}, but no read path consults the accelerator: "
+        "ironauth-hot is not a dependency of any crate that serves a request, so a chart "
+        "value would configure something that accelerates nothing"
     )
 print("  default install: all assertions hold")
 PY

@@ -102,6 +102,7 @@ impl Server {
         let readiness = Arc::new(ReadinessProbe::from_config(
             &config.database,
             &config.outbox,
+            &config.hot_state,
         ));
         let handle = metrics::recorder_handle();
         ::metrics::gauge!(metrics::UP).set(1.0);

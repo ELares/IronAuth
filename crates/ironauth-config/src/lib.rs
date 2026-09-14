@@ -213,6 +213,10 @@ pub struct Config {
     /// the implementation it selects.
     pub outbox: OutboxConfig,
 
+    /// The optional shared hot-state accelerator (issue #146). Absent means Postgres-only,
+    /// which is the shipped default and fully supported.
+    pub hot_state: HotStateConfig,
+
     /// User lifecycle (issue #52): whether this process executes scheduled offboardings
     /// that have come due.
     pub users: UsersConfig,
@@ -1348,6 +1352,32 @@ impl Default for OutboxConfig {
             metrics_sample_interval_secs: 15,
         }
     }
+}
+
+/// The optional shared hot-state accelerator (issue #146).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct HotStateConfig {
+    /// The optional IronCache accelerator: `host:port`, or [`None`] for Postgres-only.
+    ///
+    /// # What setting this does today, and what it does not
+    ///
+    /// It declares that a deployment HAS an accelerator, which is what lets readiness report
+    /// the accelerator tier: until this key existed there was nothing to probe and no state to
+    /// report, so `DegradedTier` had no variant for it.
+    ///
+    /// It does NOT yet put the cache in front of any read. `ironauth-hot` is a complete,
+    /// classified, outage-tested layer that no request path calls: it is not a dependency of
+    /// `ironauth-oidc`, `ironauth-server`, `ironauth-admin` or the binary. Wiring a first
+    /// consumer (JWKS or tenant config read-through) is the remaining #146 work, and this key
+    /// is the half of it a deployment can act on now.
+    ///
+    /// That distinction is written down rather than glossed because the alternative is a knob
+    /// that reads as "my cache is on" while nothing consults it, which is the defect this
+    /// codebase has removed once already.
+    ///
+    /// Unset is the shipped default. IronAuth is complete on Postgres alone.
+    pub ironcache_addr: Option<String>,
 }
 
 /// Headless flow API settings (issue #84).

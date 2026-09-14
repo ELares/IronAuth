@@ -98,18 +98,22 @@ ironbus:
   # e.g. "ironbus.ironbus.svc.cluster.local:4222"
   addr: ""
 
-# THERE IS NO IronCache VALUE, and its absence is deliberate.
+# THERE IS STILL NO IronCache VALUE HERE, and the reason has changed.
 #
-# `ironauth-hot`'s IronCache implementation HAS NO ADDRESS IN CONFIG. There is no
-# key for it in crates/ironauth-config and nothing constructs one at boot, so a
-# deployment cannot attach one however the chart is written.
-# crates/ironauth-server/src/readiness.rs says the same thing where it explains
-# why its degraded-tier enum has no accelerator variant.
+# The earlier reason was that `ironauth-hot`'s IronCache implementation had no address in
+# config at all, so a deployment could not attach one however the chart was written. That
+# is no longer true: `[hot_state] ironcache_addr` exists, and readiness probes it and
+# reports the accelerator tier.
 #
-# A values key here would render an endpoint nothing reads and tell an operator
-# their cache was wired. That is the "reads as wired when it is not" defect, and
-# this repository has already removed one instance of it. It belongs here when
-# #146 gives the accelerator a config surface, and not before.
+# What is STILL true is the half that matters for a values key: no read goes through the
+# accelerator. `ironauth-hot` is not a dependency of any crate that serves a request, so a
+# chart value would configure something that reports its own reachability and accelerates
+# nothing. That is a smaller version of the same "reads as wired when it is not" defect,
+# and a smaller version is still one.
+#
+# A deployment that wants the readiness tier today can supply its own config through
+# database.existingConfigSecret with a [hot_state] section. A first-class value belongs here
+# when a read path consults the accelerator, which is the remaining #146 work.
 
 # ---------------------------------------------------------------------------
 # Pod hardening. These are defaults, not suggestions: the chart is linted
