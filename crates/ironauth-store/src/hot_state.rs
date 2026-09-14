@@ -22,14 +22,20 @@
 //!
 //! # Migration 0226 says this quota does not exist, and 0226 cannot be corrected
 //!
-//! Two comments in `migrations/0226_hot_state.sql` are now FALSE:
+//! Three comments in `migrations/0226_hot_state.sql` are now FALSE:
 //!
-//! * "NOTHING OUTSIDE THE TESTS REACHES THIS TABLE YET" -- still true of the registry's uses,
-//!   which have no production call sites, but no longer the whole story;
-//! * "a quota on the NUMBER of rows is the other half of that defence and does not exist yet ...
-//!   an anonymous flood is bounded in bytes per row and unbounded in rows". IT EXISTS. It is
-//!   [`ironauth_hot::Reach::Anonymous`], enforced by [`crate::repository::HotStateRepo`] on
-//!   every write, and a flood is bounded in rows per scope per use.
+//! * on the `key` bound: "NOTHING OUTSIDE THE TESTS REACHES THIS TABLE YET" -- still true of the
+//!   registry's uses, which have no production call sites, but no longer the whole story;
+//! * on the `value` bound: "a quota on the NUMBER of rows is the other half of that defence and
+//!   does not exist yet ... an anonymous flood is bounded in bytes per row and unbounded in
+//!   rows". IT EXISTS. It is [`ironauth_hot::Reach::Anonymous`], enforced by
+//!   [`crate::repository::HotStateRepo`] on every write, and a flood is bounded in rows per
+//!   scope per use;
+//! * on the `use_name` column: "The per-use sweep, per-use quota and per-use disable that #146
+//!   also asks for would filter on this column, and NONE OF THEM EXIST YET". The per-use quota
+//!   now exists and does filter on it, which also makes the sentence after it -- "the sweep that
+//!   does exist is scope-wide and ignores it" -- half wrong: `sweep_expired` still is, but
+//!   `prune_expired_for_use` is per use and is the one the quota drives.
 //!
 //! THE FILE CANNOT BE EDITED TO SAY SO. `migrate.rs` digests each migration's whole bytes,
 //! comments included, so changing one makes every already-migrated database refuse to boot with
@@ -199,8 +205,8 @@ impl PgHotState {
             StoreError::Conflict | StoreError::Invalid => HotError::Malformed,
 
             // THE CEILING, which is neither an outage nor bad input: the write was understood
-            // and refused because this scope already holds as many live entries for this use as
-            // `Reach::Anonymous` allows. A correctness use answers it the same way it answers an
+            // and refused because this scope already holds as many entries for this use as
+            // `Reach::Anonymous` allows (expired ones included: the ceiling bounds disk). A correctness use answers it the same way it answers an
             // outage -- by going to the fallback its declaration names -- but the two must not
             // be the same value, because an operator watching for an unreachable database would
             // otherwise be shown a tenant hitting a quota.
@@ -267,12 +273,18 @@ impl PgHotState {
     /// There is still no scheduler, no scope enumerator, and no sweep interval, so this batched
     /// entry point has no caller. That used to mean expired rows accumulated indefinitely.
     ///
-    /// IT NO LONGER DOES. Every write against a use that declares
-    /// [`ironauth_hot::Reach::Anonymous`] prunes that scope's dead rows for that use the moment
-    /// the ceiling is reached, and retries -- so the uses an anonymous caller can flood collect
-    /// their own garbage, driven by the pressure that would otherwise be the problem. What is
-    /// left uncollected is the three uses only an authenticated caller reaches, whose entry
-    /// counts are bounded by the number of environments and of live tokens.
+    /// IT NO LONGER DOES SO WITHOUT BOUND, which is a weaker statement than "it no longer does"
+    /// and is the accurate one. A write against a use that declares
+    /// [`ironauth_hot::Reach::Anonymous`] prunes that scope's dead rows for that use AT THE
+    /// MOMENT THE CEILING IS REACHED, and retries. So the three uses an anonymous caller can
+    /// flood collect their own garbage, driven by the pressure that would otherwise be the
+    /// problem -- but only at the ceiling. BELOW IT NOTHING PRUNES, so a scope that churns and
+    /// then goes quiet keeps its dead rows until it is busy again.
+    ///
+    /// The four uses only an authenticated caller reaches have no ceiling and so are never
+    /// pruned by this path at all. Their entry counts are bounded by things that do not grow
+    /// with traffic: the number of environments for `JWKS` and `TENANT_CONFIG`, the number of
+    /// live tokens for `INTROSPECTION`, and the number of rotatable things for `ROTATION_LOCK`.
     ///
     /// This remains the right entry point for a scheduled sweep when one lands, because pressure
     /// is a poor scheduler for a store nobody is pushing on. And either way it is disk rather

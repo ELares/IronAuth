@@ -99,20 +99,26 @@ pub enum StoreError {
     ///
     /// The caller reconciles: read current state directly, then resume from a fresh cursor.
     RetentionGap,
-    /// A write would exceed a configured per-scope ceiling. Enforced ATOMICALLY inside the
-    /// same transaction as the write, so nothing is written when it fires and a concurrent
-    /// pair cannot both slip past the cap.
+    /// A write would exceed a configured per-scope ceiling. Nothing is written when it fires.
     ///
-    /// Two callers today:
+    /// HOW STRICTLY IT IS ENFORCED VARIES BY CALLER, and the sentence here used to claim the
+    /// strongest form for all of them. Read the producer's own documentation before relying on
+    /// a bound:
     ///
     /// - dynamic client registration against the environment's registered-client quota
-    ///   (issue #31), under a per-scope advisory lock; the endpoint maps it to a typed refusal
-    ///   and a `dcr.quota_hit` audit event;
+    ///   (issue #31), under a per-scope ADVISORY LOCK, so the count and the write cannot
+    ///   interleave at all; the endpoint maps it to a typed refusal and a `dcr.quota_hit` audit
+    ///   event;
     /// - a Shared Signals stream against the receiver's `max_streams_per_client` (issue #143),
-    ///   where the count is a conjunct of the INSERT;
-    /// - a hot-state entry against its use's `Reach::Anonymous` per-scope ceiling (issue #146),
-    ///   where the count is likewise a conjunct of the INSERT, and the caller has already had
-    ///   its expired rows pruned and the write retried before this is returned.
+    ///   where the count is a CONJUNCT OF THE INSERT;
+    /// - a hot-state `put` against its use's `Reach::Anonymous` ceiling (issue #146), also a
+    ///   conjunct of the insert, but only after the scope's expired rows have been pruned and
+    ///   the write retried once;
+    /// - a hot-state `put_if_absent` against the same ceiling, where the count is a SEPARATE
+    ///   STATEMENT from the claim and therefore not atomic with it. That is deliberate: folding
+    ///   it in would make a quota refusal indistinguishable from losing the claim, and reporting
+    ///   a lost claim that nobody won is worse for a correctness caller than a ceiling that can
+    ///   be crossed by a few rows under concurrency.
     QuotaExceeded,
     /// An envelope-encryption operation failed (issue #48): a wrapped key or a
     /// sealed payload could not be authenticated and decrypted. This is

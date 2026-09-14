@@ -105,10 +105,15 @@ pub static RATE_COUNTER: HotUse = HotUse::declare(
     // caller chooses. Without a ceiling, minting counters IS the flood -- an attacker rotating
     // the key writes one row per request and never trips the limit those rows exist to enforce.
     //
-    // 50_000 live counters per scope. A tenant with more distinct active subjects than that
-    // inside one counter window is not the case this is sized for; the limiter that spends these
-    // (issue #150) is where a deployment-specific number belongs, and until it lands this is a
-    // ceiling rather than a tuning.
+    // 50_000 counters per scope, between the other two because this one is keyed per SUBJECT:
+    // more than the pre-auth counters (one per artifact class) and fewer than the single-use
+    // markers (one per outstanding artifact, of which a subject may have several).
+    //
+    // A tenant with more than fifty thousand distinct subjects active inside one counter window
+    // is past what this number is sized for, and the right answer then is a deployment-specific
+    // one. That belongs with the limiter that spends these counters (issue #150), where an
+    // operator already configures the limits; until it lands this is a ceiling rather than a
+    // tuning, and it is set where a healthy deployment does not meet it.
     Reach::Anonymous {
         per_scope_entries: 50_000,
     },
@@ -136,9 +141,15 @@ pub static PRE_AUTH_QUOTA: HotUse = HotUse::declare(
     // caused by an anonymous request by definition, and a use that bounds a flood while being
     // unbounded itself would be the flood.
     //
-    // Smaller than the rate counter's ceiling because this one is per tenant per artifact class
-    // rather than per subject: a scope legitimately holding ten thousand DISTINCT pre-auth
-    // counters at once is already the situation this refuses.
+    // 10_000, the smallest ceiling here, because this use is keyed per ARTIFACT CLASS rather
+    // than per subject: the number of distinct pre-auth counters a tenant needs is the number of
+    // kinds of pre-authentication artifact it issues, which is a property of the product and is
+    // two orders of magnitude below this. A scope holding ten thousand distinct ones is already
+    // the anomaly, so refusing there costs a healthy deployment nothing.
+    //
+    // Note this is a ceiling on the COUNTERS, not on what they count. A tenant under a flood
+    // holds a handful of counters with large values, which is the shape this is sized for; an
+    // attacker rotating the counter KEY to mint rows is the shape it refuses.
     Reach::Anonymous {
         per_scope_entries: 10_000,
     },
@@ -160,11 +171,26 @@ pub static SINGLE_USE_MARKER: HotUse = HotUse::declare(
     // ANONYMOUS. A device code, an authorization code and a magic-link token are all redeemed by
     // a caller that has not authenticated yet, and each redemption can mint a marker.
     //
-    // AND THE QUOTA HERE CANNOT REFUSE A CLAIM, which is the subtlety worth stating: this use is
-    // Correctness, so a refusal is not a degraded answer, it is a wrong one. The ceiling is
-    // enforced against the WRITE that creates a NEW key, and a claim on a key at the ceiling is
-    // still answered from the store's fallback -- the artifact's own conditional UPDATE, named
-    // above. The quota bounds the accelerator's disk, never the decision.
+    // AND THE QUOTA CAN REFUSE A CLAIM, which needs saying because an earlier version of this
+    // comment asserted the opposite. `put_if_absent` on a NEW key, for a scope at this ceiling,
+    // returns `HotError::QuotaExceeded`. It does not lie about who won -- that distinction is
+    // the whole reason the ceiling gets its own statement -- but it does decline to answer.
+    //
+    // WHY THAT IS SAFE HERE, AND ONLY HERE. This use is Correctness, so an unanswered claim is
+    // not a degraded answer; it is no answer. The class system's response to no answer is the
+    // FALLBACK, and this use's fallback is the artifact's own conditional UPDATE, named above --
+    // which was always the authority. A caller that gets `QuotaExceeded` does exactly what it
+    // does when the accelerator is down: it spends the artifact against the row, and the row
+    // settles it. So the ceiling costs a round trip and never a decision.
+    //
+    // That argument does NOT transfer to a Correctness use with no fallback, and
+    // `HotUse::declare` refuses to construct one.
+    //
+    // 100_000, the largest ceiling here, because a marker lives only as long as its artifact's
+    // redemption window and an environment can legitimately have very many codes outstanding at
+    // once -- far more than it has pre-auth counters, which are per artifact CLASS. The number
+    // is a ceiling and not a capacity plan: at it, every claim still gets a correct answer from
+    // Postgres, which is why it can be set high enough to never be reached in normal operation.
     Reach::Anonymous {
         per_scope_entries: 100_000,
     },
@@ -316,6 +342,21 @@ mod tests {
             "both reaches must occur: {anonymous:?} are anonymous and {authenticated:?} are \
              not, and a registry where either list is empty makes the other's tests vacuous"
         );
+
+        // A CONSTRAINT NOTHING ELSE ENFORCES. The two assertions above are close to what the
+        // enum and the const assertion already give; this one is not. Every ceiling is converted
+        // to a signed integer to reach SQL, and the integration tests seed up to a ceiling
+        // through a bind that is `i32`. A ceiling past `i32::MAX` would compile, declare
+        // cleanly, and then fail at the point of use rather than here.
+        for r#use in ALL {
+            if let Some(ceiling) = r#use.per_scope_entry_quota() {
+                assert!(
+                    i32::try_from(ceiling).is_ok(),
+                    "{}'s ceiling of {ceiling} does not fit the signed integer it is bound as",
+                    r#use.name()
+                );
+            }
+        }
     }
 
     #[test]

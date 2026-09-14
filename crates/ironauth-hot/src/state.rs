@@ -50,19 +50,32 @@ pub enum HotError {
     Unavailable,
     /// The accelerator answered, and the answer was not usable.
     Malformed,
-    /// This scope already holds as many live entries for this use as it is allowed.
+    /// This scope already holds as many entries for this use as it is allowed.
     ///
     /// # Not a failure of the accelerator, and not the caller's input either
     ///
     /// The other three variants say the accelerator could not answer or answered nonsense. This
     /// one says it WORKED and refused, because [`crate::Reach::Anonymous`] declares a ceiling on
-    /// how many live entries one scope may hold for a use an unauthenticated request can cause,
-    /// and the ceiling is reached.
+    /// how many entries one scope may hold for a use an unauthenticated request can cause, and
+    /// the ceiling is reached. Expired entries count: the ceiling bounds disk, and an expired
+    /// entry occupies disk until something deletes it.
     ///
-    /// A caller must not retry it. A caller for a [`crate::Class::Correctness`] use must go to
-    /// the fallback its declaration names, exactly as for [`HotError::Unavailable`] -- the
-    /// decision that use makes is still owed an answer, and the quota is about disk rather than
-    /// about the decision.
+    /// A CALLER MUST NOT RETRY IT: the condition is a full store, and a retry adds load to the
+    /// thing that is full. What to do instead depends on the class, and all three answers exist:
+    ///
+    /// * [`crate::Class::Correctness`]: go to the fallback the declaration names, exactly as for
+    ///   [`HotError::Unavailable`]. The decision is still owed an answer and the fallback was
+    ///   always the authority, so the cost is a round trip and never a wrong answer.
+    /// * [`crate::Class::Accelerator`]: proceed without the entry. It could not be cached; the
+    ///   store answers, as it does on any miss.
+    /// * [`crate::Class::LossyDegradesSecurity`]: the declared `OnLoss` applies, the same as for
+    ///   an unavailable accelerator. This is the case worth thinking about, because a
+    ///   `FailClosed` counter that cannot record a new key will refuse -- which is the correct
+    ///   reading of "I cannot tell whether this is within budget", and is why the ceiling for
+    ///   such a use is set where a healthy deployment does not meet it.
+    ///
+    /// [`crate::HotUse::proceeds_without_cache`] answers the same question here as it does for a
+    /// stall, so a caller that already branches on it needs no second branch.
     QuotaExceeded,
 }
 
