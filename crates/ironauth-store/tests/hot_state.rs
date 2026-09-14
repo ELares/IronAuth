@@ -1075,3 +1075,50 @@ async fn a_use_with_no_ceiling_is_not_bounded_by_one() {
         .await
         .expect("a use with no ceiling must not be bounded by another use's");
 }
+
+/// The data plane may rewrite a hot-state entry's VALUE, never the scope it belongs to
+/// (issue #147, migration 0228).
+///
+/// 0226 granted `ironauth_app` a table-wide UPDATE. Row-level security decides which ROWS a
+/// statement may reach; it does not constrain which COLUMNS of a reached row may be
+/// rewritten. So a data-plane path that legitimately holds one of its own rows could have
+/// rewritten that row's `tenant_id` and handed the entry to another tenant -- an operation
+/// no caller performs and the grant was the only thing standing in front of.
+///
+/// The catalog guard in the migration suite asserts the table-wide grant is gone. This
+/// asserts what that BUYS, by having the app role actually try it: the value update it
+/// needs succeeds, and the scope rewrite is refused.
+#[tokio::test]
+async fn the_app_role_may_rewrite_a_value_but_not_move_an_entry_between_tenants() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0C01);
+    let scope = db.seed_scope(&env).await;
+    let hot = PgHotState::new(Arc::new(db.restart_app_store().await), scope, &env);
+
+    hot.put(&registry::JWKS, "k", b"first", a_minute())
+        .await
+        .expect("the first write lands");
+
+    // The write path the repository actually uses: an overwrite, which is the
+    // ON CONFLICT DO UPDATE SET value, expires_at that migration 0228 kept.
+    hot.put(&registry::JWKS, "k", b"second", a_minute())
+        .await
+        .expect("an overwrite must still be permitted after the grant was narrowed");
+    assert_eq!(
+        hot.get(&registry::JWKS, "k").await,
+        Ok(Some(b"second".to_vec())),
+        "the value update is the one the callers need"
+    );
+
+    // And the column the narrowing removed. Issued on the APP pool, so it is the real
+    // credential class the grant applies to.
+    let moved = sqlx::query("UPDATE hot_state SET tenant_id = 'someone-else' WHERE key = 'k'")
+        .execute(db.app_pool())
+        .await;
+    let error = moved.expect_err("the app role must not be able to move an entry's scope");
+    let message = error.to_string();
+    assert!(
+        message.contains("permission denied") || message.contains("column"),
+        "the refusal must come from the grant, not from something incidental: {message}"
+    );
+}

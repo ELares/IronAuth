@@ -1891,6 +1891,16 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0227_hot_state_invalidation_cursors.sql"),
         },
+        // Narrow the data plane's UPDATE on the two hot-state tables to the columns the
+        // repository actually writes. 0226 and 0227 granted a TABLE-WIDE UPDATE, which the
+        // #31 lesson forbids and which would let a data-plane path rewrite a row's scope
+        // columns; their bytes are frozen, so the correction is a migration of its own.
+        Migration {
+            version: 228,
+            name: "hot_state_column_scoped_updates",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0228_hot_state_column_scoped_updates.sql"),
+        },
     ]
 }
 
