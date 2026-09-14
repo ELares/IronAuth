@@ -6,17 +6,34 @@
 # > Every migration ships as expand-contract; CI rejects a migration whose expand phase
 # > contains destructive DDL.
 #
-# # What expand-contract means, and why a text scan can enforce this half of it
+# # What expand-contract means, and what this scan does and does not hold
 #
-# A rolling upgrade runs two binary versions against one database at once. The EXPAND phase is
-# the half that must be backward compatible: the OLD binary keeps running against the new schema
-# while replicas are replaced. So an expand migration may ADD -- a table, a column, an index, a
-# nullable column with a default -- and may not take anything away or change the shape of
-# anything the old binary reads or writes.
+# A rolling upgrade runs two binary versions against one database at once. EXPAND and MIGRATE are
+# the halves that must be backward compatible: the OLD binary keeps serving while replicas are
+# replaced, so neither may take anything away or change the shape of anything that binary reads
+# or writes. CONTRACT is not scanned, because running after the old binary is gone is the phase's
+# entire purpose.
 #
-# That is a property of the STATEMENTS rather than of the data, which is why a scan can hold it.
-# What a scan cannot hold is the other half (that the contract phase waits until no old binary
-# is running), and this does not claim to.
+# `Phase::Migrate` is scanned and scanning only expand was the first version's hole. Migrate is
+# documented as "backfill: populate the new shape from the old", and a backfill runs BEFORE
+# contract, so the old binary is still serving through it. Leaving it out was a one-word escape
+# hatch, and including it surfaced a violation nothing had looked at.
+#
+# # THE SCAN IS NARROWER THAN THE RULE, and the difference is where the next bug is
+#
+# The rule above is about statements, which is why a scan can hold SOME of it. It holds the eight
+# shapes listed below and nothing else. Three classes it does NOT check are present in this tree
+# today and are not all harmless:
+#
+#   DROP INDEX (1 statement)  usually recreated in the same file; an arbiter-inference break if
+#                             an ON CONFLICT names it, which none currently does.
+#   REVOKE (27 statements)    narrows a grant the old binary may still be exercising.
+#   any CHECK widened without DROP CONSTRAINT (an ALTER ... ADD CONSTRAINT alone) -- not a shape
+#                             this scan can see at all.
+#
+# A green run therefore means "none of the eight shapes appeared", not "this migration is safe to
+# roll". Saying otherwise would be the kind of sentence a reviewer carries away and a gate cannot
+# support.
 #
 # # The seven statement kinds, each with the version it breaks
 #
@@ -33,11 +50,22 @@
 #
 # # Why there is an allow list, and why it can only shrink
 #
-# FIVE MIGRATIONS ALREADY ON MAIN VIOLATE THIS, found by writing the scan before writing the
-# gate. Their bytes are frozen -- `migrate.rs` digests each file whole, so editing one makes
-# every migrated database refuse to boot -- so they cannot be corrected, only recorded. Each is
-# listed below with what it does, and the ceiling stops the list growing: a sixth needs this
-# number raised in the same diff, which is the moment somebody has to justify it.
+# EIGHTEEN (file, kind) PAIRS ACROSS FIFTEEN MIGRATIONS already on main match these shapes,
+# found by running the scan before wiring the gate. Their bytes are frozen -- `migrate.rs`
+# digests each file whole, so editing one makes every migrated database refuse to boot -- so they
+# are RECORDED and not corrected. The ceiling stops the list growing: a nineteenth needs this
+# number raised in the same diff, which is where somebody has to justify it.
+#
+# A FIRST VERSION OF THIS COMMENT SAID "FIVE MIGRATIONS", which was wrong twice over. Those five
+# entries spanned four files, not five; and five was the count for seven shapes while the
+# sentence read as the census for the whole rule. Adding DROP CONSTRAINT took it to eighteen.
+#
+# RECORDED IS NOT THE SAME AS ACCEPTED, and 0057 is why the distinction is written here.
+# `0057_registration_abuse_defenses.sql` is declared Expand and widens the `users_state_valid`
+# CHECK to admit 'waitlisted'. `UserState::from_wire` answers `None` for a tag it does not know,
+# and that `None` is fatal at every read site that ends `.ok_or(StoreError::Encryption)?`. So a
+# replica running the previous binary fails every read of a waitlisted user for the length of the
+# rollout. It is on this list because its bytes cannot change, NOT because it is safe.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -50,15 +78,30 @@ REGISTRY="crates/ironauth-store/src/migrate.rs"
 # through: it DROPs two columns and adds NOT NULL to two more, in one migration declared Expand.
 # That is a contract phase wearing an expand label, and a rolling upgrade across it would have
 # had the old binary selecting columns that no longer exist.
+# Each line is one (file, kind) pair that predates this gate. The description says what the file
+# DOES, read off its statements, not that it is safe: see the note on 0057 above.
 ALLOW=$(cat <<'ALLOWED'
 0028_envelope_encryption.sql|DROP COLUMN|drops identifier and claims after backfilling their sealed replacements
-0028_envelope_encryption.sql|SET NOT NULL|makes the sealed replacements mandatory in the same statement
+0028_envelope_encryption.sql|SET NOT NULL|makes four sealed replacement columns mandatory in the same file
+0047_step_up_policies.sql|DROP CONSTRAINT|drops and re-adds 1 constraint under the same name
+0057_registration_abuse_defenses.sql|DROP CONSTRAINT|WIDENS users_state_valid to admit waitlisted; a pre-0057 binary cannot decode it
 0124_membership_principal_arc.sql|DROP NOT NULL|relaxes user_id so a membership can name a non-user principal
+0132_backfill_login_index_job_kind.sql|DROP CONSTRAINT|drops and re-adds 1 constraint under the same name
+0134_audit_stream_backfill.sql|SET NOT NULL|a Migrate-phase backfill that makes its new column mandatory
+0150_scope_fk_naming.sql|DROP CONSTRAINT|drops 2 constraints and does not re-add either under the same name
+0156_messages_sending_state.sql|DROP CONSTRAINT|drops and re-adds 1 constraint under the same name
+0166_token_hook_component_bound.sql|DROP CONSTRAINT|drops and re-adds 2 constraints under the same names
+0181_agent_vault_refresh.sql|DROP CONSTRAINT|drops and re-adds 2 constraints under the same names
 0181_agent_vault_refresh.sql|SET NOT NULL|makes action_digest mandatory after a backfill
 0201_org_connections_saml_target.sql|DROP NOT NULL|relaxes connector_id so a SAML connection can have no upstream connector
+0209_portal_certificate_renewal_intent.sql|DROP CONSTRAINT|drops and re-adds 2 constraints under the same names
+0210_portal_contacts_intent.sql|DROP CONSTRAINT|drops and re-adds 2 constraints under the same names
+0211_portal_audit_intent.sql|DROP CONSTRAINT|drops and re-adds 2 constraints under the same names
+0213_ldap_connector_optional_groups.sql|DROP CONSTRAINT|drops and re-adds 2 constraints under the same names
+0222_trusted_device_upstream_compromise.sql|DROP CONSTRAINT|drops and re-adds 1 constraint under the same name
 ALLOWED
 )
-ALLOW_CEILING=5
+ALLOW_CEILING=18
 
 python3 - "$MIGRATIONS" "$REGISTRY" "$ALLOW" "$ALLOW_CEILING" <<'PY'
 import re, sys, pathlib
@@ -111,16 +154,26 @@ DESTRUCTIVE = [
     (r"\bDROP\s+COLUMN\b", "DROP COLUMN"),
     (r"\bTRUNCATE\b", "TRUNCATE"),
     (r"\bRENAME\s+(?:TO|COLUMN)\b", "RENAME"),
-    (r"\bALTER\s+COLUMN\s+\w+\s+TYPE\b", "ALTER COLUMN TYPE"),
+    # `COLUMN` is optional in Postgres, `SET DATA TYPE` is the SQL-standard synonym for `TYPE`,
+    # and an identifier may be quoted. The first version pinned `ALTER COLUMN <word> TYPE`, so
+    # `ALTER COLUMN v SET DATA TYPE bigint` and `ALTER v TYPE bigint` both walked past it -- and
+    # those are the spellings a generator or a standards-minded author reaches for, not
+    # obfuscations.
+    (r'\bALTER\s+(?:COLUMN\s+)?(?:"[^"]+"|\w+)\s+(?:SET\s+DATA\s+)?TYPE\b', "ALTER COLUMN TYPE"),
     (r"\bSET\s+NOT\s+NULL\b", "SET NOT NULL"),
     (r"\bDROP\s+NOT\s+NULL\b", "DROP NOT NULL"),
+    # THE CLASS THIS GATE'S OWN ARGUMENT DEMANDED AND THE FIRST VERSION OMITTED. A CHECK dropped
+    # and re-added WIDER admits a value the old binary cannot decode; dropped and re-added
+    # NARROWER rejects a value the old binary still writes. Both break the version still running,
+    # by exactly the reasoning used above to include DROP NOT NULL. 0057 is the worked example.
+    (r"\bDROP\s+CONSTRAINT\b", "DROP CONSTRAINT"),
 ]
 
 scanned = 0
 failures = []
 used = set()
 for name, phase in sorted(phase_of.items()):
-    if phase != "Expand":
+    if phase not in ("Expand", "Migrate"):
         continue
     path = pathlib.Path(migrations) / name
     if not path.exists():
@@ -142,7 +195,7 @@ for name, phase in sorted(phase_of.items()):
                 failures.append((name, number, kind, line.strip()))
 
 if scanned < 150:
-    print(f"expand-phase-ddl: scanned only {scanned} expand migrations", file=sys.stderr)
+    print(f"expand-phase-ddl: scanned only {scanned} expand and migrate migrations", file=sys.stderr)
     raise SystemExit(1)
 
 # AN ALLOW ENTRY THAT MATCHES NOTHING IS A STALE ENTRY, and a stale allow list is how a ceiling
@@ -155,13 +208,13 @@ if stale:
     raise SystemExit(1)
 
 if failures:
-    print("expand-phase-ddl: destructive DDL in a migration declared Phase::Expand:", file=sys.stderr)
+    print("expand-phase-ddl: destructive DDL in a migration declared Phase::Expand or Phase::Migrate:", file=sys.stderr)
     for name, number, kind, line in failures:
         print(f"  {name}:{number}  {kind}\n      {line}", file=sys.stderr)
     print(
-        "\n  An expand migration runs while the PREVIOUS binary is still serving. Each of the\n"
+        "\n  An expand or migrate migration runs while the PREVIOUS binary is still serving. Each\n"
         "  statements above breaks that binary: it selects a column that is gone, writes a row\n"
-        "  omitting one that became mandatory, or reads a column that became nullable into a\n"
+        "  omitting one that became mandatory, reads a column that became nullable into a field\n"
         "  field that is not.\n"
         "\n"
         "  Move the statement to a CONTRACT migration, which runs after the old binary is gone.",
@@ -170,7 +223,7 @@ if failures:
     raise SystemExit(1)
 
 print(
-    f"expand-phase-ddl: clean ({scanned} expand migrations scanned, "
+    f"expand-phase-ddl: clean ({scanned} expand and migrate migrations scanned, "
     f"{len(allowed)}/{ceiling} documented exceptions, all still matching)"
 )
 PY
