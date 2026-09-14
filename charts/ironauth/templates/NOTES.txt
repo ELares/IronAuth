@@ -7,14 +7,12 @@ IronAuth {{ .Chart.AppVersion }} installed as {{ include "ironauth.fullname" . }
 The management plane ({{ .Values.server.managementBind }}) carries /healthz, /readyz
 and metrics. It has no Service on purpose: reach it on the pod IP.
 
-{{ if or .Values.ironcache.enabled .Values.ironbus.enabled -}}
-Accelerators:
-{{ if .Values.ironcache.enabled }}  IronCache: {{ .Values.ironcache.endpoint }}
-{{ end }}{{ if .Values.ironbus.enabled }}  IronBus:   {{ .Values.ironbus.addr }}
-{{ end }}
+{{ if .Values.ironbus.enabled -}}
+IronBus is configured at {{ .Values.ironbus.addr }} through outbox.ironbus_addr. An
+unreachable broker degrades to Postgres polling; nothing about the drain changes.
 {{- else -}}
-No accelerators are enabled. IronAuth is complete on Postgres alone; IronCache
-and IronBus only reduce latency, and nothing degrades without them.
+No accelerator is enabled. IronAuth is complete on Postgres alone; IronBus only
+reduces propagation latency, and nothing degrades without it.
 {{- end }}
 
 {{ if not .Values.database.masterKey.existingSecret -}}

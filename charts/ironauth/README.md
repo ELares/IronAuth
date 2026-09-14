@@ -51,13 +51,20 @@ internal surface for nothing.
 Both planes bind `0.0.0.0` inside the pod. The boundary is the Service and your
 NetworkPolicy, not a loopback bind that would also stop the kubelet probing.
 
-## Accelerators are absent, not merely disabled
+## One accelerator, and it is absent by default
 
-IronAuth is complete on Postgres alone. With `ironcache.enabled` and
-`ironbus.enabled` false (the default) the rendered manifests contain no
-accelerator endpoint, no environment variable, and no reference to a service you
-have not deployed. `scripts/helm-chart.sh` asserts that against the rendered
-output, in both directions.
+IronAuth is complete on Postgres alone. With `ironbus.enabled` false (the
+default) the rendered config carries no `[outbox]` broker key at all, and names
+no service you have not deployed. Enabled, it writes `outbox.ironbus_addr`, which
+is the key the server actually reads. `scripts/helm-chart.sh` asserts both
+directions against the rendered config.
+
+**There is no IronCache value, and its absence is deliberate.** `ironauth-hot`'s
+IronCache implementation has no address in config: no key exists for it, and
+nothing constructs one at boot, so a deployment cannot attach one however the
+chart is written. A values key here would render an endpoint nothing reads and
+tell you your cache was wired. It belongs here when #146 gives the accelerator a
+config surface.
 
 ## What the gate checks
 
@@ -65,8 +72,9 @@ output, in both directions.
 because a value is not a property: `readOnlyRootFilesystem: true` in `values.yaml`
 proves nothing if no template reads it. It covers the pod hardening, the probe
 targets, the Secret-not-ConfigMap rule, the unpublished management plane, the HA
-shape, both accelerator directions, the four refusals, and that `appVersion`
-matches the workspace version.
+shape, both IronBus directions, the three refusals, that the chart sets no
+environment variable the server does not read, and that `appVersion` matches
+`crates/ironauth/Cargo.toml`.
 
 ## Values
 

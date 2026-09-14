@@ -83,21 +83,33 @@ admin:
   controlDatabaseUrl: ""
 
 # ---------------------------------------------------------------------------
-# Optional accelerators.
+# Optional accelerator: IronBus.
 #
-# Both are OFF, and off means ABSENT: with these disabled the rendered manifests
-# contain no accelerator key, no endpoint, and no environment variable. IronAuth
-# is complete on Postgres alone, and a default install must not imply otherwise
-# or leave a dangling reference to a service nobody deployed.
-ironcache:
-  enabled: false
-  # e.g. "ironcache.ironcache.svc.cluster.local:6379"
-  endpoint: ""
-
+# OFF, and off means ABSENT: with this disabled the rendered config contains no
+# [outbox] broker key at all. IronAuth is complete on Postgres alone, and a
+# default install must not imply otherwise or name a service nobody deployed.
+#
+# Enabled, this writes `outbox.ironbus_addr` into the config file, which is the
+# key the server actually reads (crates/ironauth-config, consumed at boot and by
+# the readiness tier). An unreachable broker degrades to Postgres polling rather
+# than failing the process.
 ironbus:
   enabled: false
   # e.g. "ironbus.ironbus.svc.cluster.local:4222"
   addr: ""
+
+# THERE IS NO IronCache VALUE, and its absence is deliberate.
+#
+# `ironauth-hot`'s IronCache implementation HAS NO ADDRESS IN CONFIG. There is no
+# key for it in crates/ironauth-config and nothing constructs one at boot, so a
+# deployment cannot attach one however the chart is written.
+# crates/ironauth-server/src/readiness.rs says the same thing where it explains
+# why its degraded-tier enum has no accelerator variant.
+#
+# A values key here would render an endpoint nothing reads and tell an operator
+# their cache was wired. That is the "reads as wired when it is not" defect, and
+# this repository has already removed one instance of it. It belongs here when
+# #146 gives the accelerator a config surface, and not before.
 
 # ---------------------------------------------------------------------------
 # Pod hardening. These are defaults, not suggestions: the chart is linted

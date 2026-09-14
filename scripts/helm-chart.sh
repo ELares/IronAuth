@@ -109,27 +109,48 @@ assert spec.get("topologySpreadConstraints"), "replicas must be spread across no
 
 # --- criterion 6: accelerators ABSENT by default ------------------------------
 rendered = sys.argv[1]
-for needle in ("IRONCACHE", "IRONBUS", "ironcache", "ironbus"):
+for needle in ("IRONBUS", "ironbus_addr", "[outbox]"):
     assert needle not in rendered, (
         f"the default install mentions {needle!r}: an accelerator that is off must be absent, "
         "not merely disabled"
+    )
+# IronCache has NO config surface in the server, so the chart must not offer one.
+# A values key here would render an endpoint nothing reads and tell an operator the
+# cache was wired. See values.yaml, and readiness.rs on why its tier enum has no
+# accelerator variant either.
+for forbidden in ("ironcache", "IRONCACHE", "IronCache"):
+    assert forbidden not in rendered, (
+        f"the chart renders {forbidden!r}, but ironauth-hot's IronCache implementation has "
+        "no address in config: nothing would read it"
     )
 print("  default install: all assertions hold")
 PY
 
 # --- criterion 6, the other direction: enabled means wired -------------------
-echo "helm-chart: rendering with the accelerators enabled"
+echo "helm-chart: rendering with IronBus enabled"
 ENABLED=$(helm template ironauth "$CHART" "${BASE[@]}" \
-    --set ironcache.enabled=true --set ironcache.endpoint=cache.svc:6379 \
     --set ironbus.enabled=true --set ironbus.addr=bus.svc:4222)
 python3 - "$ENABLED" <<'PY'
 import sys, yaml
 docs = [d for d in yaml.safe_load_all(sys.argv[1]) if d]
+# Asserted against the CONFIG FILE, not against an environment variable.
+#
+# The first version of this gate checked that the Deployment set
+# IRONAUTH_IRONBUS_ADDR -- a name the chart itself invented and that nothing in the
+# server reads. Config::from_toml_str is a plain toml::from_str with no environment
+# overlay, so an env var named after a setting reaches nothing. The check passed by
+# construction: its expectation came from the template it was checking.
+toml = next(d for d in docs if d.get("kind") == "Secret")["stringData"]["ironauth.toml"]
+assert "[outbox]" in toml, f"no [outbox] section in the rendered config:\n{toml}"
+assert 'ironbus_addr = "bus.svc:4222"' in toml, f"ironbus_addr not set:\n{toml}"
+
 c = next(d for d in docs if d.get("kind") == "Deployment")["spec"]["template"]["spec"]["containers"][0]
-env = {e["name"]: e.get("value") for e in c.get("env", [])}
-assert env.get("IRONAUTH_IRONCACHE_ENDPOINT") == "cache.svc:6379", f"ironcache not wired: {env}"
-assert env.get("IRONAUTH_IRONBUS_ADDR") == "bus.svc:4222", f"ironbus not wired: {env}"
-print("  enabled install: both accelerators wired")
+env = {e["name"] for e in (c.get("env") or []) if e["name"] != "IRONAUTH_MASTER_KEY"}
+assert not env, (
+    f"the chart sets {env}, but the server reads its configuration from the TOML file "
+    "only. An environment variable named after a setting reaches nothing."
+)
+print("  enabled install: ironbus wired through outbox.ironbus_addr")
 PY
 
 # --- the chart refuses configurations that cannot work -----------------------
@@ -142,26 +163,34 @@ refuse() {
 }
 refuse "without server.publicUrl" --set database.url=postgres://u@p/db
 refuse "without a database" --set server.publicUrl=https://id.example.com
-refuse "with ironcache enabled and no endpoint" "${BASE[@]}" --set ironcache.enabled=true
 refuse "with ironbus enabled and no address" "${BASE[@]}" --set ironbus.enabled=true
-echo "  four invalid configurations refused"
+echo "  three invalid configurations refused"
 
 # --- the chart deploys the version it claims ---------------------------------
-APP_VERSION=$(python3 -c "import yaml,sys; print(yaml.safe_load(open('$CHART/Chart.yaml'))['appVersion'])")
+APP_VERSION=$(python3 -c "import yaml; print(yaml.safe_load(open('$CHART/Chart.yaml'))['appVersion'])")
+# Read from the CRATE, because [workspace.package] has no version key: it carries only
+# edition, rust-version, license and repository. The first version of this check looked
+# there, got the empty string, and was skipped by its own `-n` guard on every run --
+# while Chart.yaml and the README both claimed it was enforced. A bound satisfied by the
+# empty string, guarding a claim made in two other files.
 CRATE_VERSION=$(python3 - <<'PY'
-import pathlib, re
-text = pathlib.Path("Cargo.toml").read_text()
-workspace = re.search(r"\[workspace\.package\](.*?)(\n\[|\Z)", text, re.S)
-section = workspace.group(1) if workspace else text
-match = re.search(r'^\s*version\s*=\s*"([^"]+)"', section, re.M)
-print(match.group(1) if match else "")
+import pathlib, re, sys
+text = pathlib.Path("crates/ironauth/Cargo.toml").read_text()
+package = re.search(r"\[package\](.*?)(\n\[|\Z)", text, re.S)
+match = re.search(r'^\s*version\s*=\s*"([^"]+)"', package.group(1) if package else "", re.M)
+if not match:
+    sys.exit(1)
+print(match.group(1))
 PY
-)
-if [ -n "$CRATE_VERSION" ] && [ "$APP_VERSION" != "$CRATE_VERSION" ]; then
-    fail "Chart.yaml appVersion is $APP_VERSION but the workspace is $CRATE_VERSION.
-  A chart whose default image tag is not the release it ships with deploys a
-  different build than it claims, which is the kind of drift nobody notices
-  until the wrong version is serving."
+) || fail "could not read the version from crates/ironauth/Cargo.toml.
+  Not skipped: a version check that cannot find a version must fail, or it passes
+  every run while asserting nothing."
+[ -n "$CRATE_VERSION" ] || fail "the version read from crates/ironauth/Cargo.toml is empty"
+if [ "$APP_VERSION" != "$CRATE_VERSION" ]; then
+    fail "Chart.yaml appVersion is $APP_VERSION but crates/ironauth is $CRATE_VERSION.
+  The chart's default image tag falls back to appVersion, so a mismatch deploys a
+  different build than the chart claims and labels the pods with the wrong version."
 fi
+echo "helm-chart: appVersion $APP_VERSION matches the crate"
 
 echo "helm-chart: clean"

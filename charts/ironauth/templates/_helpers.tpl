@@ -69,9 +69,6 @@ and is not.
 {{- if and (not .Values.database.url) (not .Values.database.existingConfigSecret) -}}
 {{- fail "ironauth: set database.url (the full DSN) or database.existingConfigSecret (a Secret holding a complete ironauth.toml)." -}}
 {{- end -}}
-{{- if and .Values.ironcache.enabled (not .Values.ironcache.endpoint) -}}
-{{- fail "ironauth: ironcache.enabled is true but ironcache.endpoint is empty. An accelerator switched on with nowhere to reach reads as configured and is not." -}}
-{{- end -}}
 {{- if and .Values.ironbus.enabled (not .Values.ironbus.addr) -}}
 {{- fail "ironauth: ironbus.enabled is true but ironbus.addr is empty. An accelerator switched on with nowhere to reach reads as configured and is not." -}}
 {{- end -}}

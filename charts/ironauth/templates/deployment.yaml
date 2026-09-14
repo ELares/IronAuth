@@ -72,22 +72,22 @@ spec:
             - name: management
               containerPort: {{ (splitList ":" .Values.server.managementBind) | last | int }}
               protocol: TCP
+          {{- /*
+            The ONLY environment variable here is the master key, and only because
+            database.master_key is a Secret indirection the config schema actually
+            resolves. The server reads everything else from the TOML file:
+            Config::from_toml_str is a plain toml::from_str with no environment
+            overlay, so an env var named after a setting reaches nothing. IronBus
+            goes through outbox.ironbus_addr in the rendered Secret instead.
+          */}}
+          {{- if .Values.database.masterKey.existingSecret }}
           env:
-            {{- if .Values.database.masterKey.existingSecret }}
             - name: IRONAUTH_MASTER_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.database.masterKey.existingSecret }}
                   key: {{ .Values.database.masterKey.key }}
-            {{- end }}
-            {{- if .Values.ironcache.enabled }}
-            - name: IRONAUTH_IRONCACHE_ENDPOINT
-              value: {{ .Values.ironcache.endpoint | quote }}
-            {{- end }}
-            {{- if .Values.ironbus.enabled }}
-            - name: IRONAUTH_IRONBUS_ADDR
-              value: {{ .Values.ironbus.addr | quote }}
-            {{- end }}
+          {{- end }}
           # Both probes hit the MANAGEMENT plane: that is where /healthz and
           # /readyz are served, and the data plane never exposes them.
           livenessProbe:
