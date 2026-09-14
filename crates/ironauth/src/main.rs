@@ -7851,10 +7851,24 @@ fn migrate(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
         let Some(duration) = parse_duration(&text) else {
             eprintln!(
-                "ironauth migrate: --soak expects a duration like 30m, 24h, or 7d; got '{text}'"
+                "ironauth migrate: --soak needs a number AND a unit, one of s, m, h, or d \
+                 (for example 30m, 24h, 7d); got '{text}'.\n\
+                 A bare number is refused rather than read as seconds: '7' meaning seven \
+                 days would otherwise wait seven seconds before an irreversible step."
             );
             return ExitCode::FAILURE;
         };
+        if duration < MINIMUM_SOAK {
+            eprintln!(
+                "ironauth migrate: --soak {text} is shorter than the {}s minimum. The \
+                 elapsed time this is compared against is stamped when a migration STARTS, \
+                 so over a window this short the comparison is dominated by how long the \
+                 migrations themselves took. Pass --contract if you mean to apply the \
+                 removal now.",
+                MINIMUM_SOAK.as_secs()
+            );
+            return ExitCode::FAILURE;
+        }
         contract = ironauth_store::ContractPolicy::AfterSoak(duration);
     }
 
@@ -7936,18 +7950,109 @@ fn migrate(args: &mut impl Iterator<Item = String>) -> ExitCode {
     })
 }
 
-/// Parse `30m`, `24h`, `7d`, or a bare seconds count.
+/// The shortest soak `--soak` will accept.
+///
+/// `applied_at` is stamped with the applying transaction's START time, so the elapsed
+/// figure the runner compares against over-reports by up to the duration of the longest
+/// migration in the run -- in the direction of opening the window EARLY. A floor well above
+/// any single migration's runtime keeps that error irrelevant. A shorter wait than this is
+/// not a soak; it is `--contract` with extra steps, and the operator should say so.
+const MINIMUM_SOAK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Parse `30s`, `30m`, `24h`, `7d`. A UNIT IS REQUIRED.
+///
+/// A bare integer used to be accepted as seconds, and that is the one mis-parse that fails
+/// OPEN: an operator who means `--soak 7` as seven days gets seven SECONDS, and the
+/// irreversible step runs almost immediately. Every other malformed input was already
+/// refused, so the fix is to refuse this one too rather than to document it -- a unit
+/// costs one keystroke and removes a silent misreading of the only flag here that can
+/// drop a column early.
 fn parse_duration(text: &str) -> Option<std::time::Duration> {
     let text = text.trim();
-    let (value, multiplier) = match text.chars().last()? {
-        's' => (&text[..text.len() - 1], 1),
-        'm' => (&text[..text.len() - 1], 60),
-        'h' => (&text[..text.len() - 1], 60 * 60),
-        'd' => (&text[..text.len() - 1], 24 * 60 * 60),
-        _ => (text, 1),
+    let multiplier: u64 = match text.chars().last()? {
+        's' => 1,
+        'm' => 60,
+        'h' => 60 * 60,
+        'd' => 24 * 60 * 60,
+        // No unit, or one this does not know. Refused, never guessed.
+        _ => return None,
     };
-    let count: u64 = value.trim().parse().ok()?;
-    Some(std::time::Duration::from_secs(count * multiplier))
+    let count: u64 = text[..text.len() - 1].trim().parse().ok()?;
+    // Unchecked, this wraps in release and panics in debug; and because the multipliers
+    // are 60, 3600 and 86400, there are inputs that wrap to exactly zero -- a soak of no
+    // time at all, which is the failure direction that matters.
+    let seconds = count.checked_mul(multiplier)?;
+    Some(std::time::Duration::from_secs(seconds))
+}
+
+#[cfg(test)]
+mod migrate_cli_tests {
+    use super::{MINIMUM_SOAK, parse_duration};
+
+    /// A unit is required. The bare-integer form used to be read as seconds, which is the
+    /// only mis-parse that fails OPEN: `--soak 7` meaning seven days waited seven seconds
+    /// before an irreversible step.
+    #[test]
+    fn a_duration_without_a_unit_is_refused_rather_than_read_as_seconds() {
+        for bare in ["7", "0", "86400", " 24 "] {
+            assert_eq!(parse_duration(bare), None, "{bare} must be refused");
+        }
+    }
+
+    #[test]
+    fn each_unit_multiplies_as_written() {
+        assert_eq!(
+            parse_duration("90s"),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_duration("30m"),
+            Some(std::time::Duration::from_secs(1_800))
+        );
+        assert_eq!(
+            parse_duration("24h"),
+            Some(std::time::Duration::from_secs(86_400))
+        );
+        assert_eq!(
+            parse_duration("7d"),
+            Some(std::time::Duration::from_secs(604_800))
+        );
+    }
+
+    /// Unchecked, `count * multiplier` wraps in release and panics in debug -- and since the
+    /// multipliers are 60, 3600 and 86400, some inputs wrap to exactly ZERO, which is a soak
+    /// of no time at all in front of the one step that cannot be undone.
+    #[test]
+    fn an_overflowing_count_is_refused_and_never_wraps_to_a_short_window() {
+        for overflowing in [
+            format!("{}d", u64::MAX),
+            format!("{}h", u64::MAX / 3_600 + 1),
+            // 2^64 / 86400 is not an integer, so this is a value that wraps rather than
+            // saturates: the case that would produce a SMALL duration from a huge input.
+            format!("{}d", (u64::MAX / 86_400) + 1),
+        ] {
+            assert_eq!(
+                parse_duration(&overflowing),
+                None,
+                "{overflowing} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_duration_is_refused() {
+        for bad in ["", "d", "h", "1.5h", "24H", "1x", "-1h", "one hour", "1 2h"] {
+            assert_eq!(parse_duration(bad), None, "{bad} must be refused");
+        }
+    }
+
+    /// The floor exists because `applied_at` is stamped at transaction START, so the
+    /// elapsed figure over-reports by up to the longest migration's runtime -- in the
+    /// direction of opening early. It has to sit well above any single migration.
+    #[test]
+    fn the_minimum_soak_is_longer_than_a_migration_takes() {
+        assert!(MINIMUM_SOAK >= std::time::Duration::from_secs(60));
+    }
 }
 
 fn print_help() {
