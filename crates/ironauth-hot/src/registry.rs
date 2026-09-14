@@ -360,6 +360,36 @@ mod tests {
     }
 
     #[test]
+    fn no_use_name_can_confuse_a_key() {
+        // WHAT THE IRONCACHE KEY ENCODING RESTS ON, and nothing else enforces.
+        //
+        // A RESP keyspace is flat, so `IronCacheHotState` isolates tenants by building
+        // `ira:{tenant}:{environment}:{use}:{key}` and relying on that being INJECTIVE: two
+        // different tuples must not produce one string. Tenant and environment cannot contain a
+        // colon (they render as a prefix plus url-safe base64, alphabet `A-Za-z0-9-_`), and the
+        // caller's key is LAST so it may contain anything. The use name is the one component
+        // whose alphabet is a convention rather than a type -- `HotUse::declare` takes any
+        // `&'static str`.
+        //
+        // So a use named "a:b" would make `ira:t:e:a:b:k` ambiguous with a use "a" and a key
+        // "b:k", and one tenant's entry could answer another use's read. This is the check that
+        // stops that being possible to write.
+        for r#use in ALL {
+            let name = r#use.name();
+            assert!(
+                !name.is_empty(),
+                "a use name may not be empty: the key would have an empty component"
+            );
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "{name:?} is not lowercase ASCII, digits and underscore, so it may not be safe \
+                 as a key component; see IronCacheHotState's key encoding"
+            );
+        }
+    }
+
+    #[test]
     fn no_two_uses_share_a_name() {
         // THE NAME IS THE KEY PREFIX and the label a report is read under. Two uses sharing one
         // would let a miss on either be attributed to the other, and would let one use's entries

@@ -19,6 +19,15 @@ repository.workspace = true
 # using it teaches the next reader that the seam is optional.
 tokio = { workspace = true, features = ["time"] }
 
+# OPTIONAL, and off by default: this crate is the seam, and a deployment that never attaches an
+# accelerator should not compile a client for one. The Postgres implementation lives in
+# `ironauth-store` and needs nothing from here.
+redis = { workspace = true, optional = true }
+
+[features]
+# The IronCache (RESP) accelerator.
+ironcache = ["dep:redis"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time", "sync", "test-util"] }
 

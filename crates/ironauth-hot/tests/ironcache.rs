@@ -1,0 +1,382 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+// GATED ON THE FEATURE, not only on the environment variable, and the two guards answer
+// different questions. Without the feature the `ironcache` module does not exist and this file
+// would not COMPILE, which would break every default build; without `IRONCACHE_ADDR` it compiles
+// and each test skips, because there is no server to run against. A crate is entitled to be
+// built without a client for an optional accelerator.
+#![cfg(feature = "ironcache")]
+
+//! The IronCache accelerator against a REAL server (issue #146).
+//!
+//! # These need a server, and they say so rather than passing without one
+//!
+//! `IRONCACHE_ADDR` names a RESP endpoint (IronCache, or anything speaking its dialect). With
+//! the variable unset every test that NEEDS a server returns early -- and prints why, because a
+//! test that silently succeeds when its subject is absent is the shape that reports a green
+//! suite for code nothing ran. The CI lane that sets the variable is what makes them binding.
+//!
+//! ONE TEST DOES NOT NEED ONE and so never skips:
+//! `an_absent_server_is_refused_at_connect_rather_than_at_a_call` is about what happens when
+//! there is NO server, so it runs everywhere and is the only case in this file that is binding
+//! in the default lane.
+//!
+//! # Every test isolates itself by scope
+//!
+//! A RESP keyspace is shared and these run against a server that may hold other runs' keys, so
+//! each test builds a unique tenant. That is not only hygiene: it exercises the same scoping the
+//! implementation relies on for tenant isolation.
+
+use std::time::Duration;
+
+use ironauth_hot::ironcache::{IronCacheHotState, connect};
+use ironauth_hot::{HotError, HotState, Ttl, registry};
+
+/// The endpoint, or `None` when this suite is not being run against a server.
+fn endpoint() -> Option<String> {
+    match std::env::var("IRONCACHE_ADDR") {
+        Ok(addr) if !addr.is_empty() => Some(if addr.starts_with("redis://") {
+            addr
+        } else {
+            format!("redis://{addr}")
+        }),
+        _ => {
+            eprintln!(
+                "SKIPPED: IRONCACHE_ADDR is unset, so this test ran against no server. It is \
+                 not evidence of anything."
+            );
+            None
+        }
+    }
+}
+
+/// A state bound to a tenant nothing else uses, IN THIS RUN OR ANY OTHER.
+///
+/// # The process id is load-bearing, and the first version did not have it
+///
+/// A RESP server is not a throwaway database: it keeps what previous runs wrote. With the tenant
+/// derived from the test's label alone, every run reused the last run's keyspace, so the second
+/// run of this suite failed four tests -- a "the key starts absent" baseline found the first
+/// run's value, and a cross-tenant test read a value it had written itself an hour earlier.
+///
+/// That is a genuinely useful failure and it is why these run against a real server rather than
+/// a fake. It is also why the scope has to be unique per PROCESS and not merely per test.
+///
+/// `std::process::id` and not a clock: `scripts/invariant-lints.sh` rule `time-via-env` rejects
+/// a direct clock read anywhere under `crates`, and a test is not exempt.
+fn test_scope(label: &str) -> String {
+    // Base64url alphabet, like a real rendered id, so the key encoding is exercised on the shape
+    // it actually has to be injective over.
+    format!("ten_test-{}-{label}", std::process::id())
+}
+
+async fn scoped(label: &str) -> Option<IronCacheHotState> {
+    let url = endpoint()?;
+    let connection = connect(&url).await.expect("connect to IRONCACHE_ADDR");
+    Some(IronCacheHotState::new(
+        connection,
+        &test_scope(label),
+        "env_test",
+    ))
+}
+
+fn a_minute() -> Ttl {
+    Ttl::of(Duration::from_secs(60))
+}
+
+#[tokio::test]
+async fn a_value_written_is_the_value_read_back() {
+    let Some(hot) = scoped("roundtrip").await else {
+        return;
+    };
+    assert_eq!(
+        hot.get(&registry::JWKS, "kid-1").await,
+        Ok(None),
+        "baseline: the key is absent, or every assertion below proves nothing"
+    );
+    hot.put(&registry::JWKS, "kid-1", b"the-jwks", a_minute())
+        .await
+        .expect("write");
+    assert_eq!(
+        hot.get(&registry::JWKS, "kid-1").await,
+        Ok(Some(b"the-jwks".to_vec()))
+    );
+}
+
+#[tokio::test]
+async fn a_claim_is_won_once_and_lost_after() {
+    // THE OPERATION THE WHOLE CLASSIFICATION RESTS ON. `SET NX PX` is one command and its reply
+    // distinguishes the two outcomes; a client that read the reply wrongly would report every
+    // caller a winner, which is the double redemption a single-use marker exists to prevent.
+    let Some(hot) = scoped("claim").await else {
+        return;
+    };
+    assert_eq!(
+        hot.put_if_absent(&registry::SINGLE_USE_MARKER, "code", b"first", a_minute())
+            .await,
+        Ok(true),
+        "the first claim wins"
+    );
+    assert_eq!(
+        hot.put_if_absent(&registry::SINGLE_USE_MARKER, "code", b"second", a_minute())
+            .await,
+        Ok(false),
+        "and the second must lose"
+    );
+    assert_eq!(
+        hot.get(&registry::SINGLE_USE_MARKER, "code").await,
+        Ok(Some(b"first".to_vec())),
+        "the loser's value must not have overwritten the winner's"
+    );
+}
+
+#[tokio::test]
+async fn an_expired_key_is_claimable_with_no_special_case() {
+    // THE ASYMMETRY WITH POSTGRES, exercised rather than asserted in a comment. There an expired
+    // ROW is still present and the claim needs a guard to take it over; here the key is simply
+    // absent. This test is what makes that difference a measured fact about this implementation.
+    //
+    // A REAL WAIT, and the only one in this file. The server holds the clock and there is no
+    // seam into it, so the choice is a short sleep or not testing expiry at all.
+    //
+    // THE TTL BELOW IS ONE SECOND, NOT 300ms, and an earlier version of this comment did the
+    // arithmetic on the number it had typed rather than the one that reaches the server:
+    // `Ttl::of` CLAMPS TO AT LEAST A SECOND, so asking for 300ms and waiting 1200ms was a
+    // 200ms margin described as "four times the window". The TTL is spelled as a second now so
+    // the two agree, and the wait is three times it.
+    let Some(hot) = scoped("expiry").await else {
+        return;
+    };
+    assert_eq!(
+        hot.put_if_absent(
+            &registry::ROTATION_LOCK,
+            "lease",
+            b"holder-1",
+            Ttl::of(Duration::from_secs(1))
+        )
+        .await,
+        Ok(true)
+    );
+    assert_eq!(
+        hot.put_if_absent(
+            &registry::ROTATION_LOCK,
+            "lease",
+            b"holder-2",
+            Ttl::of(Duration::from_secs(1))
+        )
+        .await,
+        Ok(false),
+        "the control: while the lease is live the lock is held"
+    );
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    assert_eq!(
+        hot.put_if_absent(
+            &registry::ROTATION_LOCK,
+            "lease",
+            b"holder-3",
+            Ttl::of(Duration::from_secs(60))
+        )
+        .await,
+        Ok(true),
+        "once the lease has lapsed the lock is takeable, with no guard clause anywhere"
+    );
+}
+
+#[tokio::test]
+async fn one_tenants_key_is_invisible_to_another() {
+    // THE ONLY THING THAT ISOLATES TENANTS HERE. A RESP keyspace is flat: there is no policy, no
+    // filter and no error if a key is built without its scope. This test is the whole backstop.
+    let Some(mine) = scoped("tenant-a").await else {
+        return;
+    };
+    let theirs = scoped("tenant-b").await.expect("second scope");
+
+    mine.put(&registry::TENANT_CONFIG, "config", b"mine", a_minute())
+        .await
+        .expect("write");
+
+    assert_eq!(
+        theirs.get(&registry::TENANT_CONFIG, "config").await,
+        Ok(None),
+        "the same key under another tenant must be a miss"
+    );
+    assert_eq!(
+        theirs
+            .put_if_absent(&registry::TENANT_CONFIG, "config", b"theirs", a_minute())
+            .await,
+        Ok(true),
+        "and must be claimable there, because it genuinely is absent"
+    );
+    assert_eq!(
+        mine.get(&registry::TENANT_CONFIG, "config").await,
+        Ok(Some(b"mine".to_vec())),
+        "without disturbing the first tenant's value"
+    );
+}
+
+#[tokio::test]
+async fn one_environment_is_invisible_to_another_in_the_same_tenant() {
+    // THE OTHER HALF OF THE SCOPE, which the tenant test cannot show: it varies the tenant and
+    // holds the environment constant, so a key encoding that dropped the ENVIRONMENT passes it.
+    // Two environments of one tenant are the normal case (production and staging), and they
+    // must not read each other.
+    let Some(url) = endpoint() else {
+        return;
+    };
+    let tenant = test_scope("two-envs");
+    let production = IronCacheHotState::new(
+        connect(&url).await.expect("connect"),
+        &tenant,
+        "env_production",
+    );
+    let staging = IronCacheHotState::new(
+        connect(&url).await.expect("connect"),
+        &tenant,
+        "env_staging",
+    );
+
+    production
+        .put(&registry::TENANT_CONFIG, "config", b"prod", a_minute())
+        .await
+        .expect("write");
+
+    assert_eq!(
+        staging.get(&registry::TENANT_CONFIG, "config").await,
+        Ok(None),
+        "the same tenant's other environment must not see it"
+    );
+    assert_eq!(
+        production.get(&registry::TENANT_CONFIG, "config").await,
+        Ok(Some(b"prod".to_vec())),
+        "and the writing environment still does"
+    );
+}
+
+#[tokio::test]
+async fn a_write_replaces_what_was_there_and_carries_its_ttl() {
+    // `put`'s OVERWRITE AND ITS PX, neither of which any other test here reaches: every other
+    // case writes each key once, so a `put` whose SET omitted the value, or omitted PX and left
+    // the key with no expiry at all, would pass them.
+    let Some(hot) = scoped("overwrite").await else {
+        return;
+    };
+
+    hot.put(&registry::JWKS, "kid", b"first", a_minute())
+        .await
+        .expect("first write");
+    hot.put(&registry::JWKS, "kid", b"second", a_minute())
+        .await
+        .expect("overwrite");
+    assert_eq!(
+        hot.get(&registry::JWKS, "kid").await,
+        Ok(Some(b"second".to_vec())),
+        "the second value must replace the first"
+    );
+
+    // AND IT EXPIRES. A `SET` without `PX` leaves a key that never goes away, which is the
+    // failure a TTL-bounded cache cannot notice until the server fills up. Two seconds against
+    // a one-second TTL is the same clamp arithmetic as the expiry test above.
+    hot.put(
+        &registry::JWKS,
+        "kid",
+        b"third",
+        Ttl::of(Duration::from_secs(1)),
+    )
+    .await
+    .expect("short write");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        hot.get(&registry::JWKS, "kid").await,
+        Ok(None),
+        "a written key must carry its expiry, not live for ever"
+    );
+}
+
+#[tokio::test]
+async fn two_uses_may_share_a_key_without_answering_each_other() {
+    let Some(hot) = scoped("uses").await else {
+        return;
+    };
+    hot.put(&registry::RATE_COUNTER, "subject-1", b"counter", a_minute())
+        .await
+        .expect("write");
+    assert_eq!(
+        hot.get(&registry::SINGLE_USE_MARKER, "subject-1").await,
+        Ok(None),
+        "a different use with the same key must not see it"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_removes_the_key_and_absent_is_not_an_error() {
+    let Some(hot) = scoped("delete").await else {
+        return;
+    };
+    hot.put(&registry::JWKS, "k", b"v", a_minute())
+        .await
+        .expect("write");
+    hot.delete(&registry::JWKS, "k").await.expect("delete");
+    assert_eq!(hot.get(&registry::JWKS, "k").await, Ok(None));
+    assert_eq!(
+        hot.delete(&registry::JWKS, "k").await,
+        Ok(()),
+        "deleting what is not there is the caller's goal already met"
+    );
+}
+
+#[tokio::test]
+async fn an_absent_server_is_refused_at_connect_rather_than_at_a_call() {
+    // WHERE AN OUTAGE IS ACTUALLY REPORTED, measured rather than assumed.
+    //
+    // This test was drafted asserting that each of the four methods answers `Unavailable`
+    // against a dead address. A probe against the real client showed that never runs:
+    // `ConnectionManager::new` performs the connection itself, so an address nothing listens on
+    // fails THERE with "Connection refused", and the four assertions sat behind a `let Ok(..)
+    // else { return }` that always took the early return. It would have passed for ever without
+    // executing a single one.
+    //
+    // So what is pinned is the behaviour that exists: connecting to an absent server is
+    // `Unavailable`, not a panic and not a hang. That is the case that matters for startup --
+    // a deployment whose cache is down must still boot, with the durable tier alone.
+    //
+    // The mid-life case (a server that was there and goes away) is real too and is NOT covered
+    // here: reaching it needs a server this test owns and can kill, which is the chaos suite's
+    // shape rather than this file's. `Tiered`'s own tests cover what the composition does with
+    // a failing accelerator, using a fake that fails every call.
+    //
+    // AND IT IS BOUNDED. `ConnectionManager::new` retries with backoff and takes about nine
+    // seconds to give up, which this suite noticed as a nine-second test. Nine seconds of boot
+    // spent on an optional component is the mandatory-by-the-back-door problem arriving as
+    // latency, so `connect` time-boxes it. This asserts the bound rather than the mechanism:
+    // an outer timeout at four times CONNECT_BOUND fires only if the box is gone.
+    // THE DEADLINE IS A LITERAL, NOT A MULTIPLE OF THE CONSTANT. `CONNECT_BOUND * 4` scales
+    // with any change to CONNECT_BOUND, so it could not detect one: raise the bound to a minute
+    // and the outer deadline becomes four minutes and the test still passes. An expected value
+    // that travels with the thing under test measures nothing.
+    //
+    // FOUR SECONDS, chosen against the number that MATTERS -- the un-time-boxed client, which
+    // retries with backoff for roughly nine seconds. Anything comfortably under that catches
+    // the time box being removed, and anything comfortably over CONNECT_BOUND's shipped two
+    // seconds avoids failing on a slow runner. If CONNECT_BOUND is ever raised past this, this
+    // test fails and the person raising it has to decide whether a deployment should wait that
+    // long for an optional component, which is the conversation the constant deserves.
+    let answer = tokio::time::timeout(Duration::from_secs(4), connect("redis://127.0.0.1:1"))
+        .await
+        .expect("connect must give up within its own bound, not the client's nine seconds");
+
+    assert!(
+        ironauth_hot::ironcache::CONNECT_BOUND < Duration::from_secs(4),
+        "CONNECT_BOUND is {:?}, which is past the deadline this test uses; raising it means \
+         a deployment waits that long for an accelerator it is supposed to be able to do \
+         without",
+        ironauth_hot::ironcache::CONNECT_BOUND
+    );
+
+    assert_eq!(
+        answer.err(),
+        Some(HotError::Unavailable),
+        "an absent server must be reported, so a caller can carry on without it"
+    );
+}
