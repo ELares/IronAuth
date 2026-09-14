@@ -475,6 +475,65 @@ impl IssuerRegistry {
     /// Panics only if the internal lock is poisoned, which happens after a panic
     /// while another thread held it (never in normal operation).
     pub async fn resolve(&self, scope: &Scope, now: SystemTime) -> IssuerResolution {
+        self.resolve_with(scope, now, UnreadableFence::Refuse).await
+    }
+
+    /// [`IssuerRegistry::resolve`] for a PUBLICATION surface: JWKS and discovery.
+    ///
+    /// Identical to `resolve` in every state but one. When the fence read itself
+    /// FAILS -- the shape a Postgres outage takes, since the fence is a store read --
+    /// this serves a still-FRESH cached entry instead of failing closed.
+    ///
+    /// # Why these two surfaces and nothing else
+    ///
+    /// Issue #149's design law is that a database outage must not stop discovery,
+    /// JWKS, and stateless token validation. Before this, it did: `fence_state` runs
+    /// ahead of every cache, so an unreadable store made every resolution `Absent`
+    /// on the FIRST request, with a warm, fresh entry sitting unused in memory.
+    ///
+    /// The asymmetry is justified by harm, not by convenience. A JWKS document is
+    /// public key material that every relying party already holds for the full
+    /// `Cache-Control: max-age` window, so serving a fresh cached copy during an
+    /// outage gives an attacker nothing they did not already have -- while REFUSING
+    /// it breaks token validation at every RP whose cache expires mid-incident.
+    /// Minting a new token for a scope whose serving state cannot be read is a
+    /// different magnitude, so every minting path keeps [`UnreadableFence::Refuse`].
+    ///
+    /// # What this deliberately does NOT relax
+    ///
+    /// - A `Fenced` scope -- where the read SUCCEEDED and reports an operator
+    ///   suspension -- still refuses here, exactly as everywhere else. Known operator
+    ///   intent is honoured; only UNKNOWN state is softened.
+    /// - A STALE entry is still never served. The #204 argument stands: serving stale
+    ///   keys would extend the staleness window of a compromise rotation.
+    /// - With no fresh cached entry there is nothing to publish and no way to
+    ///   establish the scope is unfenced, so it refuses.
+    ///
+    /// # What it DOES cost, measured
+    ///
+    /// A scope suspended while the database is up is refused at once, because the
+    /// fence read succeeds. A scope suspended shortly BEFORE an outage keeps
+    /// publishing until its cached entry goes stale, since during the outage there is
+    /// no way to learn of the suspension. The window is bounded by the entry TTL and
+    /// closes on its own without the database returning;
+    /// `a_suspension_landing_just_before_an_outage_is_invisible_for_at_most_one_ttl`
+    /// pins it from both sides. What leaks is public key material, for at most one
+    /// TTL, while minting is refused throughout.
+    pub async fn resolve_for_publication(
+        &self,
+        scope: &Scope,
+        now: SystemTime,
+    ) -> IssuerResolution {
+        self.resolve_with(scope, now, UnreadableFence::ServeFreshCache)
+            .await
+    }
+
+    async fn resolve_with(
+        &self,
+        scope: &Scope,
+        now: SystemTime,
+        on_unreadable: UnreadableFence,
+    ) -> IssuerResolution {
         // The fence is consulted FIRST, ahead of every cache, so it governs the fast
         // path too. A pre-populated (loader-less) registry has no serving state to
         // read and is never fenced here (the store-free test path).
@@ -482,11 +541,25 @@ impl IssuerRegistry {
             match fence_state(store, scope).await {
                 FenceState::Serving => {}
                 FenceState::Fenced => return IssuerResolution::Fenced,
-                // Fail closed, and report it as an ABSENCE rather than a fence: the
-                // serving state is UNKNOWN here, so calling it an operator suspension
-                // would be a claim the server cannot make. A store that cannot answer
-                // is a fault, and the token endpoint renders it as one.
-                FenceState::Unreadable => return IssuerResolution::Absent,
+                // The serving state is UNKNOWN. Report an ABSENCE rather than a
+                // fence: calling it an operator suspension would be a claim the
+                // server cannot make.
+                FenceState::Unreadable => {
+                    return match on_unreadable {
+                        // Fail closed. A store that cannot answer is a fault, and
+                        // the token endpoint renders it as one.
+                        UnreadableFence::Refuse => IssuerResolution::Absent,
+                        // Publish what is already public, if it is still fresh.
+                        // Returns HERE rather than falling through: the store is
+                        // demonstrably unable to answer, so a load would only add
+                        // latency to a request that must stay fast during an
+                        // incident.
+                        UnreadableFence::ServeFreshCache => match self.fresh_cached(scope, now) {
+                            Some(entry) => IssuerResolution::Ready(entry),
+                            None => IssuerResolution::Absent,
+                        },
+                    };
+                }
             }
         }
         // Fast path: a cached entry served only when this registry is loader-less
@@ -624,7 +697,10 @@ impl IssuerRegistry {
         scope: &Scope,
         now: SystemTime,
     ) -> Option<Result<String, SigningKeyError>> {
-        let entry = self.entry_for(scope, now).await?;
+        let entry = match self.resolve_for_publication(scope, now).await {
+            IssuerResolution::Ready(entry) => entry,
+            IssuerResolution::Fenced | IssuerResolution::Absent => return None,
+        };
         Some(
             entry
                 .keyset()
@@ -666,6 +742,19 @@ enum FenceState {
     /// The serving state could NOT be read (a store error). Serving is denied, but
     /// the scope's actual state is unknown, so this is a fault rather than a fence.
     Unreadable,
+}
+
+/// What a resolution does when the fence read ITSELF fails, i.e. when the scope's
+/// serving state is unknown rather than known-bad.
+///
+/// This is the single axis on which a publication read differs from a minting read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnreadableFence {
+    /// Fail closed. Every path that mints, signs, or administers.
+    Refuse,
+    /// Serve a still-FRESH cached entry when one exists, else refuse. Only the
+    /// public, read-only publication surfaces: JWKS and discovery.
+    ServeFreshCache,
 }
 
 /// The outcome of a store-backed issuer load (issue #204). A CONFIRMED absence is
