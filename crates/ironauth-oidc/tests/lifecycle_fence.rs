@@ -18,6 +18,14 @@
 //! is NOT burned, so the same code mints once the scope resumes. Every one of those is
 //! driven below.
 //!
+//! ONE EXCEPTION, added by issue #149: when the fence READ ITSELF FAILS -- the shape a
+//! database outage takes, since the fence is a store read -- JWKS publishes a still-fresh
+//! cached key set instead of refusing. A scope read successfully and found suspended is
+//! still fenced on both surfaces; only UNKNOWN serving state is softened, only for
+//! publication, and only while the cached entry is fresh. The mint refuses throughout.
+//! See `a_fence_read_error_stops_the_mint_while_publication_continues`, which carries the
+//! argument.
+//!
 //! NOT enforced, equally precisely, and MEASURED on a store-backed harness with the
 //! scope's serving state set to `suspended`:
 //!
@@ -76,10 +84,12 @@
 //! genuinely missing signing key STILL answers `500`, which
 //! `a_missing_signing_key_still_answers_a_server_error` is there to keep true.
 //!
-//! It also drives the FAIL-CLOSED arm (`a_fence_read_error_fences_rather_than_serving`),
-//! which was the other sentence this file was cited for and did not carry: flipping
-//! the fence read's `Err(_)` arm from denying to permitting survived the whole
-//! `ironauth-oidc` suite until that test existed.
+//! It also drives the fence read's `Err(_)` arm
+//! (`a_fence_read_error_stops_the_mint_while_publication_continues`), which was the other
+//! sentence this file was cited for and did not carry: flipping that arm from denying to
+//! permitting survived the whole `ironauth-oidc` suite until that test existed. It still
+//! pins the arm, and since #149 it pins a SPLIT rather than a single answer -- the mint
+//! denies, publication of an already-loaded key set continues.
 //!
 //! One test here drives the CONTROL PLANE ITSELF rather than seeding a serving state:
 //! `a_restored_tenant_that_is_still_suspended_serves_nothing` runs the real suspend ->
@@ -1412,7 +1422,7 @@ async fn a_deleted_scope_stops_serving_immediately() {
 }
 
 #[tokio::test]
-async fn a_fence_read_error_fences_rather_than_serving() {
+async fn a_fence_read_error_stops_the_mint_while_publication_continues() {
     // The FAIL-CLOSED half of the fence (issue #406). The fence read maps a store read
     // error on `environment_states` to a refusal, and that arm was previously claimed
     // by the census and pinned by NOTHING: flipping it from denying to permitting
@@ -1456,10 +1466,36 @@ async fn a_fence_read_error_fences_rather_than_serving() {
         .execute_owner_sql("ALTER TABLE environment_states RENAME TO environment_states_hidden")
         .await;
 
+    // CHANGED BY ISSUE #149, deliberately, and this is the argument.
+    //
+    // This assertion read NOT_FOUND until the publication split. #406 wrote it to stop an
+    // accidental flip of the fail-closed arm, and the flip here is not accidental: #149's
+    // design law is that a database outage must not stop JWKS, and before the split it did,
+    // on the FIRST request, with a warm and fresh entry sitting unused in memory.
+    //
+    // #406's stated worry is "a suspension enforced only while the database is healthy is
+    // not a suspension". That remains true and is still enforced. What the split permits is
+    // narrower than that sentence in three ways, each of which is pinned by a test in
+    // `issuer_registry.rs`:
+    //
+    //   - only PUBLICATION. The mint below still refuses, in this very test.
+    //   - only a scope whose cache is FRESH, so a scope suspended longer ago than the entry
+    //     TTL cannot publish even during an outage
+    //     (`a_suspension_landing_just_before_an_outage_is_invisible_for_at_most_one_ttl`).
+    //   - only when the fence read FAILED. A scope read successfully and found suspended is
+    //     still refused here (`a_fenced_scope_still_refuses_to_publish`), which is the case
+    //     an operator actually performs.
+    //
+    // So the exposure is public key material, for at most one entry TTL, for a scope that
+    // was serving when the database was last reachable, while no new token can be minted.
+    // Weighed against refusing JWKS to every relying party whose cache expires mid-incident
+    // -- which breaks validation of tokens that are still perfectly valid -- the split is
+    // the better trade. It is recorded here rather than only in the PR, because this file is
+    // where someone will come looking when they wonder why the arm changed.
     assert_eq!(
         jwks_status(&harness, &scope).await,
-        StatusCode::NOT_FOUND,
-        "a fence read error denies serving rather than permitting it"
+        StatusCode::OK,
+        "a fence read error no longer stops PUBLICATION of an already-loaded key set (#149)"
     );
     let (status, body) = exchange(&harness, &code).await;
     assert_eq!(
