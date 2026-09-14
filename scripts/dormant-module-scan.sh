@@ -54,6 +54,27 @@ ironauth-oidc/device_posture
 # it ran.
 
 
+# The five-layer request limiter (issue #150 criterion 1, PR 1258). Callerless because the
+# first caller is a DECISION, not an oversight: an absent per-IP identity currently skips the
+# only layer that applies before anyone is identified, and whether that should fail closed
+# depends on whether the caller is an internet-facing forward-auth surface or an internal one.
+# Issue #1260 holds that decision and names this module.
+#
+# This entry exists because the scan went RED on main when #1258 merged and nobody noticed:
+# the merge ran five gates, not this one. Wiring the limiter removes the entry.
+ironauth-quota/layered
+
+# The access-rule engine, traces, dry-run and decision cache (issue #154 criteria 3, 5 and 6).
+# Callerless until criteria 1, 2 and 4 land, which are the forward-auth proxy dialects and the
+# integration that gates a real resource; those need proxy containers and are not in these PRs.
+#
+# Listed EXPLICITLY even though the scan currently passes it, because it passes for the wrong
+# reason: `refs_for` greps for `rules::` and finds nine hits, all false -- Postgres `rules::text`
+# casts in ironauth-store, and ironauth-admin's unrelated `routing_rules`. A module that escapes
+# this gate on a substring is exactly what the gate exists to catch, so the honest entry is
+# better than the accidental pass. The substring weakness itself is worth fixing separately.
+ironauth-oidc/rules
+
 ALLOWLIST
 }
 
@@ -89,10 +110,27 @@ allow() {
 # host module at `crates/<crate>/src/guests/handler.rs` -- exactly the wiring the allowlist
 # entries are waiting on -- would have its references swallowed and the entry would read as
 # callerless forever.
+# Two filters, each closing a way a module escaped this gate by SUBSTRING rather than by
+# having a caller. Found while reviewing #154: `ironauth-oidc/rules` had "9 references", all
+# nine false, so a 3000-line callerless module sailed through.
+#
+#   1. A WORD BOUNDARY before the module name. Plain `rules::` also matches
+#      `routing_rules::`, so an unrelated module in another crate vouched for this one. Five
+#      of the nine.
+#   2. A Postgres cast is not a Rust path. `rules::text` inside a SQL string literal matched
+#      too. The other four. Excluded by the cast suffix rather than by trying to detect a
+#      string literal, because the suffix is unambiguous: `::text`, `::jsonb` and friends are
+#      never module paths.
 refs_for() {
+  # The FIXED-STRING grep stays first and walks the tree; the filters below run only on the
+  # handful of lines it returns. Doing the boundary match as a tree-wide regex instead made
+  # this scan take minutes, since it runs once per module.
   count="$( { grep -rn --include='*.rs' -e "${1}::" crates/ 2>/dev/null \
     | grep -v "/${1}\.rs:" \
-    | grep -vE '^crates/[^/]+/guests/' | wc -l; } || true )"
+    | grep -vE '^crates/[^/]+/guests/' \
+    | grep -E "[^A-Za-z0-9_]${1}::" \
+    | grep -vE "${1}::(text|jsonb|json|uuid|int|bigint|boolean|timestamptz)([^A-Za-z0-9_]|$)" \
+    | wc -l; } || true )"
   count="$(echo "$count" | tr -d ' ')"
   [ -n "$count" ] || count=0
   echo "$count"
