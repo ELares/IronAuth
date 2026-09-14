@@ -27,7 +27,10 @@
 #
 #   DROP INDEX (1 statement)  usually recreated in the same file; an arbiter-inference break if
 #                             an ON CONFLICT names it, which none currently does.
-#   REVOKE (27 statements)    narrows a grant the old binary may still be exercising.
+#   REVOKE (29 statements     narrows a grant the old binary may still be exercising.
+#    across 8 files)          CHECKED, not merely written down: the count below is asserted,
+#                             because the first version of this comment carried a hand-written
+#                             number that was wrong within one PR of being written.
 #   any CHECK widened without DROP CONSTRAINT (an ALTER ... ADD CONSTRAINT alone) -- not a shape
 #                             this scan can see at all.
 #
@@ -196,6 +199,44 @@ for name, phase in sorted(phase_of.items()):
 
 if scanned < 150:
     print(f"expand-phase-ddl: scanned only {scanned} expand and migrate migrations", file=sys.stderr)
+    raise SystemExit(1)
+
+# THE CENSUS OF WHAT THIS GATE DOES NOT SCAN IS ITSELF CHECKED.
+#
+# The header names three classes the scan cannot hold and gives the population of each, so a
+# reader can size the residual gap. A hand-written population rots on the next migration that
+# adds one, silently, because prose in a comment is not run -- and this one did rot: it said 27
+# one PR after being written, while the tree held 29. Counting it here makes the number a
+# measurement rather than a claim, and makes adding a REVOKE a deliberate act.
+#
+# Raising it is not a defeat. A REVOKE in an expand migration is sometimes exactly right (it is
+# how a table-wide grant gets narrowed to the columns a caller writes). The point is that the
+# number moves only when someone moves it.
+REVOKE_CENSUS = 29
+revoke_count = 0
+revoke_files = set()
+for name, phase in sorted(phase_of.items()):
+    if phase not in ("Expand", "Migrate"):
+        continue
+    path = pathlib.Path(migrations) / name
+    if not path.exists():
+        continue
+    for line in path.read_text().splitlines():
+        if line.strip().startswith("--"):
+            continue
+        if re.search(r"\bREVOKE\b", line.split("--", 1)[0], re.I):
+            revoke_count += 1
+            revoke_files.add(name)
+if revoke_count != REVOKE_CENSUS:
+    print(
+        f"expand-phase-ddl: the header says this gate does not scan {REVOKE_CENSUS} REVOKE "
+        f"statements, and the tree now holds {revoke_count} across {len(revoke_files)} files.\n"
+        "  A REVOKE in an expand migration narrows a grant the PREVIOUS binary may still be\n"
+        "  exercising, and this gate cannot tell a safe narrowing from an unsafe one. Read the\n"
+        "  new statement, satisfy yourself the old binary never uses what it removes, then\n"
+        "  update REVOKE_CENSUS and the header count together.",
+        file=sys.stderr,
+    )
     raise SystemExit(1)
 
 # AN ALLOW ENTRY THAT MATCHES NOTHING IS A STALE ENTRY, and a stale allow list is how a ceiling
