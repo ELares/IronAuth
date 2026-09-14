@@ -77,6 +77,144 @@ const DURATION_BUCKETS: [f64; 12] = [
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// What kind of series a metric is, which is what a scrape's `# TYPE` line states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricKind {
+    /// Monotonic count.
+    Counter,
+    /// Instantaneous value.
+    Gauge,
+    /// Distribution.
+    Histogram,
+}
+
+impl MetricKind {
+    /// The word a Prometheus `# TYPE` line uses.
+    #[must_use]
+    pub const fn type_word(self) -> &'static str {
+        match self {
+            Self::Counter => "counter",
+            Self::Gauge => "gauge",
+            Self::Histogram => "histogram",
+        }
+    }
+}
+
+/// One metric this build promises to export.
+#[derive(Debug, Clone, Copy)]
+pub struct MetricSpec {
+    /// The series name.
+    pub name: &'static str,
+    /// Counter, gauge or histogram.
+    pub kind: MetricKind,
+    /// The labels every sample carries, in no particular order.
+    ///
+    /// THE LABELS ARE THE PART THAT WAS ONLY PROSE. Every constant above already said what it
+    /// is "labeled by", in a doc comment, and nothing checked it: a metric emitted with a label
+    /// the comment did not mention, or missing one it promised, was invisible until a dashboard
+    /// broke. A dashboard or an alert is written against the label set, so drift in either
+    /// direction breaks somebody's query.
+    pub labels: &'static [&'static str],
+    /// The one-line HELP a scrape carries.
+    pub help: &'static str,
+}
+
+/// EVERY METRIC THIS BUILD EXPORTS (issue #152 criterion 1).
+///
+/// # What this is for
+///
+/// The criterion asks that "every metric in the documented contract is exported and carries the
+/// documented labels; a CI contract test fails on drift in either direction". This is the
+/// documented contract as a VALUE rather than a document, so the test and the published doc read
+/// the same thing and cannot disagree.
+///
+/// # Both directions, and why each has a different failure
+///
+/// A metric in the contract that is NOT exported is a promise to a dashboard that will render
+/// empty, and an alert that will never fire -- the failure that looks like quiet. A metric
+/// exported that is NOT in the contract is a series nobody documented, which is how cardinality
+/// arrives unreviewed. `tests/metric_contract.rs` fails on both.
+///
+/// # Scope
+///
+/// The server's own metrics. Other crates export their own (`ironauth-fetch` has two), and they
+/// are NOT here yet: bringing them in means moving their constants behind one registry, which is
+/// a wider change than the contract this issue asks for.
+/// `the_contract_covers_every_metric_this_module_declares` holds the boundary, so a metric added
+/// to THIS module without a contract entry fails the build rather than quietly escaping.
+pub const CONTRACT: &[MetricSpec] = &[
+    MetricSpec {
+        name: HTTP_REQUESTS_TOTAL,
+        kind: MetricKind::Counter,
+        labels: &["method", "route", "status"],
+        help: "Total HTTP requests",
+    },
+    MetricSpec {
+        name: HTTP_REQUEST_DURATION_SECONDS,
+        kind: MetricKind::Histogram,
+        labels: &["method", "route", "status"],
+        help: "HTTP request duration in seconds",
+    },
+    MetricSpec {
+        name: UP,
+        kind: MetricKind::Gauge,
+        labels: &[],
+        help: "1 while the process is serving",
+    },
+    MetricSpec {
+        name: PROXY_FORWARDING_REJECTED_TOTAL,
+        kind: MetricKind::Counter,
+        labels: &["reason"],
+        help: "Requests whose forwarding headers were rejected and failed closed",
+    },
+    MetricSpec {
+        name: OUTBOX_MESSAGES_CLAIMED_TOTAL,
+        kind: MetricKind::Counter,
+        labels: &["consumer"],
+        help: "Outbox messages leased by a worker",
+    },
+    MetricSpec {
+        name: OUTBOX_MESSAGES_TOTAL,
+        kind: MetricKind::Counter,
+        labels: &["consumer", "outcome"],
+        help: "Outbox messages that reached an outcome",
+    },
+    MetricSpec {
+        name: OUTBOX_PASS_FAILURES_TOTAL,
+        kind: MetricKind::Counter,
+        labels: &["consumer", "kind"],
+        help: "Outbox drain passes that could not run",
+    },
+    MetricSpec {
+        name: OUTBOX_DEPTH,
+        kind: MetricKind::Gauge,
+        labels: &["consumer", "state"],
+        help: "Outbox messages by state",
+    },
+    MetricSpec {
+        name: OUTBOX_OLDEST_READY_AGE_SECONDS,
+        kind: MetricKind::Gauge,
+        labels: &["consumer"],
+        help: "Age of the oldest ready outbox message in seconds",
+    },
+    MetricSpec {
+        name: LOG_STREAMS,
+        kind: MetricKind::Gauge,
+        // `sink_type` and `status`, not `state`. The first version of this entry said `state`,
+        // invented from the constant's doc comment rather than read from the call site, and the
+        // contract test caught it -- which is the entire argument for comparing the contract
+        // against the emit sites instead of against a scrape generated from the contract.
+        labels: &["sink_type", "status"],
+        help: "Configured log streams by sink type and status",
+    },
+    MetricSpec {
+        name: LOG_STREAM_DEAD_LETTERS,
+        kind: MetricKind::Gauge,
+        labels: &["sink_type"],
+        help: "Log stream dead letters awaiting replay, by sink type",
+    },
+];
+
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
 /// The process-wide Prometheus handle, installing the recorder on first call.
