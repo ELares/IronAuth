@@ -424,6 +424,27 @@ impl TestDatabase {
             .expect("connect as owner to fresh database")
     }
 
+    /// A fresh, empty database with the low-privilege roles PROVISIONED but no schema
+    /// applied.
+    ///
+    /// [`TestDatabase::fresh_owner_pool`] hands back a raw database, which is right for a
+    /// custom chain that grants to nobody. A test that drives the REAL shipped chain needs
+    /// the roles first: those migrations `GRANT ... TO ironauth_app`, and against a
+    /// database without that role they fail with `role "ironauth_app" does not exist`. The
+    /// migrations deliberately neither create the roles nor ship a password, so the harness
+    /// provisions them exactly as [`TestDatabase::start`] does.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `DATABASE_URL` is unset or the database cannot be created.
+    pub async fn fresh_owner_pool_with_roles() -> PgPool {
+        let pool = Self::fresh_owner_pool().await;
+        provision_role(&pool, APP_ROLE).await;
+        provision_role(&pool, CONTROL_ROLE).await;
+        provision_role(&pool, AUDIT_RETENTION_ROLE).await;
+        pool
+    }
+
     /// Seed a full operator -> tenant -> environment chain and return the
     /// resulting scope. Runs as the owner (the level tables carry no per-tenant
     /// row-level security; they are the management plane's, issue #11).

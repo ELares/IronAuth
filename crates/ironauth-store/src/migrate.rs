@@ -91,6 +91,31 @@ impl Phase {
     }
 }
 
+/// Whether this run may apply `Phase::Contract` migrations (issue #148).
+///
+/// A contract migration REMOVES the old shape. During a rolling upgrade the previous
+/// binary is still serving and still reads that shape, so removing it is the one step that
+/// cannot be taken back: once the column is dropped, rolling the binary back does not bring
+/// the data with it. Expand and Migrate are additive and roll back for free; Contract is
+/// the door that only opens one way.
+///
+/// So the runner defers it by default and an operator opens that door deliberately. Until
+/// they do, a deployment sits in a state where the new binary and the old one can BOTH
+/// serve, which is what makes a minor release rollback-safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContractPolicy {
+    /// Stop before the first pending contract migration. The default: an operator opens the
+    /// one-way door deliberately, not by restarting a pod.
+    #[default]
+    Deferred,
+    /// Apply contract migrations too: the operator has confirmed the removal.
+    Allowed,
+    /// Apply a contract migration once every migration before it has been applied for at
+    /// least this long, measured in the DATABASE's clock (the same one that stamped
+    /// `applied_at`), so no clock skew between a node and the ledger can shorten it.
+    AfterSoak(std::time::Duration),
+}
+
 /// One migration: an ordered version, a name, its phase, and its SQL text.
 ///
 /// The SQL is a `'static` string (embedded with `include_str!` for the real
@@ -132,6 +157,13 @@ pub struct MigrationReport {
     newly_applied: Vec<i64>,
     /// How many migrations were already applied before this run.
     already_applied: usize,
+    /// The contract migration this run stopped BEFORE, if the policy deferred one, and
+    /// every version behind it that therefore did not apply either.
+    ///
+    /// Stopped, not skipped: the ordering rule refuses to apply a version while a lower
+    /// one is pending, so skipping a contract migration would make the NEXT run refuse the
+    /// whole chain. Everything behind a deferred contract migration waits with it.
+    deferred_from: Option<i64>,
 }
 
 impl MigrationReport {
@@ -139,6 +171,17 @@ impl MigrationReport {
     #[must_use]
     pub fn newly_applied(&self) -> &[i64] {
         &self.newly_applied
+    }
+
+    /// The contract migration this run deferred, if any, and with it everything behind it.
+    ///
+    /// `Some` means the schema is deliberately NOT current: the additive half of the
+    /// upgrade is in place and the removal is waiting for an operator. A caller that
+    /// reports "migrations applied" without consulting this is describing a database it
+    /// has not finished migrating.
+    #[must_use]
+    pub fn deferred_from(&self) -> Option<i64> {
+        self.deferred_from
     }
 
     /// How many migrations had already been applied before this run.
@@ -1922,6 +1965,7 @@ const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x4952_4F4E_4155_5448;
 pub struct MigrationRunner<'a> {
     pool: &'a PgPool,
     migrations: Vec<Migration>,
+    contract: ContractPolicy,
 }
 
 impl<'a> MigrationRunner<'a> {
@@ -1931,13 +1975,25 @@ impl<'a> MigrationRunner<'a> {
         Self {
             pool,
             migrations: registry(),
+            contract: ContractPolicy::default(),
         }
     }
 
     /// A runner for an explicit migration chain (test and tooling use).
     #[must_use]
     pub fn from_migrations(pool: &'a PgPool, migrations: Vec<Migration>) -> Self {
-        Self { pool, migrations }
+        Self {
+            pool,
+            migrations,
+            contract: ContractPolicy::default(),
+        }
+    }
+
+    /// Set whether this run may apply contract migrations. See [`ContractPolicy`].
+    #[must_use]
+    pub fn with_contract(mut self, contract: ContractPolicy) -> Self {
+        self.contract = contract;
+        self
     }
 
     /// Apply every pending migration in order, recording each in the ledger.
@@ -2042,13 +2098,71 @@ impl<'a> MigrationRunner<'a> {
             }
         }
 
+        // A database with an EMPTY ledger is a fresh install, not an upgrade. There is no
+        // previous binary serving it, so there is no old shape to protect and nothing to
+        // roll back to: deferring a contract migration there would leave a brand-new
+        // database permanently short of its own schema for no benefit. The deferral is
+        // about a rolling upgrade, so it applies only when this run found a schema that a
+        // previous run had already put there.
+        //
+        // An interrupted first install (some versions applied, then a crash) reads as an
+        // upgrade by this rule and defers. That is the conservative direction and it tells
+        // the operator exactly what to do, so it is left as the simpler rule.
+        let is_upgrade = !applied.is_empty();
+
+        // DEFER ONLY WHEN NOTHING ADDITIVE IS LEFT BEHIND.
+        //
+        // Stopping at a contract migration withholds every pending migration after it, and
+        // the first version of this gate justified that with "the migrations after a
+        // removal presume the removal". That is false for the real chain. The first
+        // contract migration in the shipped registry is version 168 of 228, and the 60
+        // behind it are ordinary additive ones: 0196 creates `saml_connections`, which the
+        // LOGIN path queries. Deferring at 168 would hand a deployment a 167-era schema
+        // and a binary that 500s on a table that was never created -- while the runner
+        // reported it had deliberately stopped somewhere safe.
+        //
+        // The deferral only ever claimed one thing: that the database in the stopped state
+        // serves BOTH the new binary and the old one. That is true exactly when everything
+        // withheld is itself a removal. So the gate defers only a TRAILING RUN of contract
+        // migrations, and applies a contract migration that has any non-contract migration
+        // pending behind it, because the chain cannot reach that one otherwise.
+        //
+        // For a single minor release, whose removals sit at the end of its own migrations,
+        // this defers exactly what the issue asks. For a jump across many releases it
+        // applies the lot, which is right: a removal from sixty versions back is not the
+        // rollback boundary of the release being installed.
+        // Read ONCE, before anything is applied, so the window measures the deployment
+        // rather than this run's own work.
+        let soak_baseline = self.soak_baseline_secs().await?;
+
+        let pending_after_contract_is_all_removal = |version: i64| {
+            self.migrations
+                .iter()
+                .filter(|later| later.version > version && !applied.contains_key(&later.version))
+                .all(|later| later.phase == Phase::Contract)
+        };
+
         // 6. Apply each pending migration in order, atomically with its ledger
         //    row: a failure rolls back both, so a partial migration is never
         //    recorded as applied.
         let mut newly_applied = Vec::new();
+        let mut deferred_from = None;
         for migration in &self.migrations {
             if applied.contains_key(&migration.version) {
                 continue;
+            }
+            if migration.phase == Phase::Contract
+                && is_upgrade
+                && pending_after_contract_is_all_removal(migration.version)
+                && !self.contract_is_open_for(soak_baseline)
+            {
+                // STOP, do not skip. Step 5 refuses to apply a version while a lower one is
+                // pending, so skipping this and continuing would make the next run reject
+                // the whole chain as out of order. Everything behind a deferred contract
+                // migration waits with it, which is also what the phase means: the
+                // migrations after a removal presume the removal.
+                deferred_from = Some(migration.version);
+                break;
             }
             let mut tx = self.pool.begin().await?;
             sqlx::raw_sql(migration.sql).execute(&mut *tx).await?;
@@ -2069,7 +2183,58 @@ impl<'a> MigrationRunner<'a> {
         Ok(MigrationReport {
             newly_applied,
             already_applied: applied.len(),
+            deferred_from,
         })
+    }
+
+    /// Whether the policy lets this contract migration apply now.
+    ///
+    /// The soak window is measured with the DATABASE's clock against `applied_at`, which
+    /// the database also stamped. Reading `now()` from the process instead would compare
+    /// two clocks, and the direction of the skew decides whether a soak window that has
+    /// not elapsed is treated as though it had.
+    /// Whether the policy lets a contract migration apply now.
+    ///
+    /// `elapsed_secs` is how long the schema this run FOUND has been in place, measured
+    /// once before anything is applied. Measuring it per-migration was wrong twice over:
+    /// each contract migration the gate let through committed a ledger row stamped `now()`,
+    /// which became the newest `applied_at` for the next one, so two adjacent removals
+    /// could never both pass under any non-zero window however long the operator had
+    /// actually waited; and in the ordinary case the run's OWN additive half landed
+    /// seconds earlier, so the window restarted from this run rather than from the
+    /// deployment it is measuring.
+    fn contract_is_open_for(&self, elapsed_secs: f64) -> bool {
+        let soak = match self.contract {
+            ContractPolicy::Allowed => return true,
+            ContractPolicy::Deferred => return false,
+            ContractPolicy::AfterSoak(soak) => soak,
+        };
+        elapsed_secs >= soak.as_secs_f64()
+    }
+
+    /// How long the schema this run found has already been in place, in the DATABASE's
+    /// clock, read BEFORE anything is applied.
+    ///
+    /// `applied_at` defaults to `now()`, which in Postgres is the applying TRANSACTION's
+    /// start time, so a migration that ran for an hour is stamped an hour before its shape
+    /// became visible. The error is bounded by the longest single migration in the run and
+    /// always over-reports, which would open the window early -- so `ironauth migrate`
+    /// refuses a soak short enough for that to matter rather than pretending the stamp is
+    /// a commit time.
+    /// An empty ledger yields ZERO, not "no answer". The aggregate is NULL over no rows,
+    /// and an Option here bought a branch that cannot be reached: the soak is consulted
+    /// only when `is_upgrade` is true, which is exactly the case where the ledger has rows.
+    /// A mutation sweep showed it: inverting the NULL arm changed nothing, because nothing
+    /// gets there. Zero is also the honest reading -- a schema nobody has applied has been
+    /// in place for no time -- so the conservative answer survives without a dead guard.
+    async fn soak_baseline_secs(&self) -> Result<f64, MigrationError> {
+        let row = sqlx::query(
+            "SELECT COALESCE(EXTRACT(EPOCH FROM (now() - MAX(applied_at))), 0)::double \
+             precision AS elapsed_secs FROM _schema_migrations",
+        )
+        .fetch_one(self.pool)
+        .await?;
+        Ok(row.try_get::<f64, _>("elapsed_secs")?)
     }
 }
 

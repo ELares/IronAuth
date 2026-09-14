@@ -138,6 +138,10 @@ fn main() -> ExitCode {
         // constraint one of the pending migrations imposes, which is the failure that
         // otherwise lands part way through a rolling upgrade.
         Some("doctor") => doctor(&mut args),
+        // Apply the schema (issue #148). Separate from `serve` because a contract
+        // migration REMOVES the old shape, and the point of the expand-contract lifecycle
+        // is that a human decides when that happens, not a pod restart.
+        Some("migrate") => migrate(&mut args),
         // The config-as-code subcommands (issue #51) dispatch into ironauth-apply.
         // The verb is re-prepended so that crate parses its own argument vector.
         Some(verb @ ("validate" | "plan" | "apply" | "drift")) => {
@@ -7705,19 +7709,18 @@ fn doctor(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
     }
 
-    let dsn = match url.or_else(|| std::env::var("IRONAUTH_DOCTOR_URL").ok()) {
-        Some(dsn) => dsn,
-        None => {
-            let loaded = match &config_path {
-                Some(path) => Config::load(path),
-                None => Config::from_toml_str("", "<defaults>"),
-            };
-            match loaded {
-                Ok(Loaded { config, .. }) => config.database.url.expose().to_owned(),
-                Err(error) => {
-                    eprintln!("ironauth doctor: {error}");
-                    return ExitCode::FAILURE;
-                }
+    let dsn = if let Some(dsn) = url.or_else(|| std::env::var("IRONAUTH_DOCTOR_URL").ok()) {
+        dsn
+    } else {
+        let loaded = match &config_path {
+            Some(path) => Config::load(path),
+            None => Config::from_toml_str("", "<defaults>"),
+        };
+        match loaded {
+            Ok(Loaded { config, .. }) => config.database.url.expose().to_owned(),
+            Err(error) => {
+                eprintln!("ironauth doctor: {error}");
+                return ExitCode::FAILURE;
             }
         }
     };
@@ -7785,12 +7788,283 @@ fn doctor(args: &mut impl Iterator<Item = String>) -> ExitCode {
     })
 }
 
+/// Run the `migrate` subcommand: apply the schema (issue #148).
+///
+/// Contract migrations are DEFERRED by default on an upgrade, and `--contract` is the
+/// operator confirming the removal. That split is the whole reason this is a command
+/// rather than something `serve` does on boot: expand and migrate are additive and roll
+/// back for free, but a contract migration drops the old shape, and once it has run,
+/// rolling the binary back does not bring the data with it. A pod restart is not a
+/// decision; this is.
+///
+/// `--soak DURATION` is the unattended form: apply the contract migration once everything
+/// before it has been in place that long, measured on the database's own clock.
+#[allow(clippy::too_many_lines)]
+fn migrate(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let mut config_path: Option<String> = None;
+    let mut url: Option<String> = None;
+    let mut contract = ironauth_store::ContractPolicy::Deferred;
+    let mut soak: Option<String> = None;
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--config=") {
+            config_path = Some(value.to_owned());
+        } else if arg == "--config" {
+            let Some(path) = args.next() else {
+                eprintln!("ironauth migrate: --config requires a PATH");
+                return ExitCode::FAILURE;
+            };
+            config_path = Some(path);
+        } else if let Some(value) = arg.strip_prefix("--url=") {
+            url = Some(value.to_owned());
+        } else if arg == "--url" {
+            let Some(value) = args.next() else {
+                eprintln!("ironauth migrate: --url requires a POSTGRES DSN");
+                return ExitCode::FAILURE;
+            };
+            url = Some(value);
+        } else if arg == "--contract" {
+            contract = ironauth_store::ContractPolicy::Allowed;
+        } else if let Some(value) = arg.strip_prefix("--soak=") {
+            soak = Some(value.to_owned());
+        } else if arg == "--soak" {
+            let Some(value) = args.next() else {
+                eprintln!("ironauth migrate: --soak requires a DURATION (for example 24h)");
+                return ExitCode::FAILURE;
+            };
+            soak = Some(value);
+        } else {
+            eprintln!("ironauth migrate: unrecognized argument '{arg}'");
+            eprintln!(
+                "usage: ironauth migrate [--config PATH] [--url DSN] [--contract | --soak DURATION]"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
+    if let Some(text) = soak {
+        if contract == ironauth_store::ContractPolicy::Allowed {
+            eprintln!(
+                "ironauth migrate: --contract and --soak both decide when a contract \
+                 migration may run, and they disagree. Pass one."
+            );
+            return ExitCode::FAILURE;
+        }
+        let Some(duration) = parse_duration(&text) else {
+            eprintln!(
+                "ironauth migrate: --soak needs a number AND a unit, one of s, m, h, or d \
+                 (for example 30m, 24h, 7d); got '{text}'.\n\
+                 A bare number is refused rather than read as seconds: '7' meaning seven \
+                 days would otherwise wait seven seconds before an irreversible step."
+            );
+            return ExitCode::FAILURE;
+        };
+        if duration < MINIMUM_SOAK {
+            eprintln!(
+                "ironauth migrate: --soak {text} is shorter than the {}s minimum. The \
+                 elapsed time this is compared against is stamped when a migration STARTS, \
+                 so over a window this short the comparison is dominated by how long the \
+                 migrations themselves took. Pass --contract if you mean to apply the \
+                 removal now.",
+                MINIMUM_SOAK.as_secs()
+            );
+            return ExitCode::FAILURE;
+        }
+        contract = ironauth_store::ContractPolicy::AfterSoak(duration);
+    }
+
+    let dsn = if let Some(dsn) = url {
+        dsn
+    } else {
+        let loaded = match &config_path {
+            Some(path) => Config::load(path),
+            None => Config::from_toml_str("", "<defaults>"),
+        };
+        match loaded {
+            Ok(Loaded { config, .. }) => config.database.url.expose().to_owned(),
+            Err(error) => {
+                eprintln!("ironauth migrate: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ironauth migrate: cannot start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    runtime.block_on(async move {
+        let store = match Store::connect(&dsn).await {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("ironauth migrate: cannot connect: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let report = match store.migrate_with_contract(contract).await {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("ironauth migrate: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let applied = report.newly_applied();
+        if applied.is_empty() {
+            println!(
+                "migrate: nothing to apply ({} already applied)",
+                report.already_applied()
+            );
+        } else {
+            println!(
+                "migrate: applied {} migration(s): {}",
+                applied.len(),
+                applied
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        // Said plainly, because the interesting state is "the upgrade is half done ON
+        // PURPOSE" and an operator who reads only the line above would not know it.
+        if let Some(version) = report.deferred_from() {
+            println!(
+                "\nmigrate: STOPPED BEFORE migration {version}, a contract migration, and \
+                 every migration behind it.\n\
+                 \n\
+                 A contract migration removes the old shape. Until it runs, this database \
+                 serves BOTH this binary and the previous one, which is what makes the \
+                 release safe to roll back. Once it runs, rolling back no longer brings the \
+                 data with it.\n\
+                 \n\
+                 Re-run with --contract when you have decided, or --soak DURATION to let it \
+                 proceed once the rest of the upgrade has been in place that long."
+            );
+        }
+        ExitCode::SUCCESS
+    })
+}
+
+/// The shortest soak `--soak` will accept.
+///
+/// `applied_at` is stamped with the applying transaction's START time, so the elapsed
+/// figure the runner compares against over-reports by up to the duration of the longest
+/// migration in the run -- in the direction of opening the window EARLY. A floor well above
+/// any single migration's runtime keeps that error irrelevant. A shorter wait than this is
+/// not a soak; it is `--contract` with extra steps, and the operator should say so.
+const MINIMUM_SOAK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Parse `30s`, `30m`, `24h`, `7d`. A UNIT IS REQUIRED.
+///
+/// A bare integer used to be accepted as seconds, and that is the one mis-parse that fails
+/// OPEN: an operator who means `--soak 7` as seven days gets seven SECONDS, and the
+/// irreversible step runs almost immediately. Every other malformed input was already
+/// refused, so the fix is to refuse this one too rather than to document it -- a unit
+/// costs one keystroke and removes a silent misreading of the only flag here that can
+/// drop a column early.
+fn parse_duration(text: &str) -> Option<std::time::Duration> {
+    let text = text.trim();
+    let multiplier: u64 = match text.chars().last()? {
+        's' => 1,
+        'm' => 60,
+        'h' => 60 * 60,
+        'd' => 24 * 60 * 60,
+        // No unit, or one this does not know. Refused, never guessed.
+        _ => return None,
+    };
+    let count: u64 = text[..text.len() - 1].trim().parse().ok()?;
+    // Unchecked, this wraps in release and panics in debug; and because the multipliers
+    // are 60, 3600 and 86400, there are inputs that wrap to exactly zero -- a soak of no
+    // time at all, which is the failure direction that matters.
+    let seconds = count.checked_mul(multiplier)?;
+    Some(std::time::Duration::from_secs(seconds))
+}
+
+#[cfg(test)]
+mod migrate_cli_tests {
+    use super::{MINIMUM_SOAK, parse_duration};
+
+    /// A unit is required. The bare-integer form used to be read as seconds, which is the
+    /// only mis-parse that fails OPEN: `--soak 7` meaning seven days waited seven seconds
+    /// before an irreversible step.
+    #[test]
+    fn a_duration_without_a_unit_is_refused_rather_than_read_as_seconds() {
+        for bare in ["7", "0", "86400", " 24 "] {
+            assert_eq!(parse_duration(bare), None, "{bare} must be refused");
+        }
+    }
+
+    #[test]
+    fn each_unit_multiplies_as_written() {
+        assert_eq!(
+            parse_duration("90s"),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_duration("30m"),
+            Some(std::time::Duration::from_secs(1_800))
+        );
+        assert_eq!(
+            parse_duration("24h"),
+            Some(std::time::Duration::from_secs(86_400))
+        );
+        assert_eq!(
+            parse_duration("7d"),
+            Some(std::time::Duration::from_secs(604_800))
+        );
+    }
+
+    /// Unchecked, `count * multiplier` wraps in release and panics in debug -- and since the
+    /// multipliers are 60, 3600 and 86400, some inputs wrap to exactly ZERO, which is a soak
+    /// of no time at all in front of the one step that cannot be undone.
+    #[test]
+    fn an_overflowing_count_is_refused_and_never_wraps_to_a_short_window() {
+        for overflowing in [
+            format!("{}d", u64::MAX),
+            format!("{}h", u64::MAX / 3_600 + 1),
+            // 2^64 / 86400 is not an integer, so this is a value that wraps rather than
+            // saturates: the case that would produce a SMALL duration from a huge input.
+            format!("{}d", (u64::MAX / 86_400) + 1),
+        ] {
+            assert_eq!(
+                parse_duration(&overflowing),
+                None,
+                "{overflowing} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_duration_is_refused() {
+        for bad in ["", "d", "h", "1.5h", "24H", "1x", "-1h", "one hour", "1 2h"] {
+            assert_eq!(parse_duration(bad), None, "{bad} must be refused");
+        }
+    }
+
+    /// The floor exists because `applied_at` is stamped at transaction START, so the
+    /// elapsed figure over-reports by up to the longest migration's runtime -- in the
+    /// direction of opening early. It has to sit well above any single migration.
+    #[test]
+    fn the_minimum_soak_is_longer_than_a_migration_takes() {
+        assert!(MINIMUM_SOAK >= std::time::Duration::from_secs(60));
+    }
+}
+
 fn print_help() {
     println!("ironauth {VERSION}");
     println!("A standards-first OpenID Connect identity platform.");
     println!();
     println!("USAGE:");
     println!("  ironauth serve [--config PATH]   Run the server until SIGTERM/SIGINT");
+    println!("  ironauth migrate [--config PATH] [--url DSN] [--contract | --soak DUR]");
+    println!("                                   Apply the schema. Contract migrations are");
+    println!("                                   DEFERRED on an upgrade: --contract is you");
+    println!("                                   confirming the old shape may be removed");
     println!("  ironauth doctor [--config PATH] [--url DSN]");
     println!("                                   Pre-upgrade preflight: report rows that");
     println!("                                   would be rejected by a pending");
