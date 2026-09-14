@@ -210,13 +210,24 @@ pub struct Limit {
 impl Limit {
     /// A limit with the given sustained per-second rate and burst capacity.
     ///
-    /// Both are clamped to be non-negative. A burst of zero is not a limit; use
+    /// Both are clamped to be non-negative AND finite. A burst of zero is not a limit; use
     /// [`ScopeLimits`] with `None` for an unlimited dimension instead.
+    ///
+    /// # Why non-finite is clamped rather than merely documented
+    ///
+    /// An infinite refill rate makes `elapsed * refill` evaluate to `NaN` whenever elapsed
+    /// is zero, and `NaN.min(burst)` returns `burst` -- so the bucket silently reads as
+    /// full on every request and the limiter stops limiting. That is a fail-OPEN laundered
+    /// through the arithmetic, with nothing in the type system to catch it, so it is
+    /// removed at the only door that builds a `Limit`.
     #[must_use]
     pub fn new(refill_per_sec: f64, burst: f64) -> Self {
+        // `NaN.max(0.0)` returns 0.0 (Rust's f64::max prefers the non-NaN operand), so NaN
+        // already lands safely; infinity is the case that needs the explicit guard.
+        let finite = |value: f64| if value.is_finite() { value } else { 0.0 };
         Self {
-            refill_per_sec: refill_per_sec.max(0.0),
-            burst: burst.max(0.0),
+            refill_per_sec: finite(refill_per_sec.max(0.0)),
+            burst: finite(burst.max(0.0)),
         }
     }
 
