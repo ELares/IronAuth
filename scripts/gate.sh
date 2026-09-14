@@ -537,6 +537,21 @@ run "journey schema is committed fresh" git diff --exit-code docs/journey-schema
 run "flow golden corpus freshness (rendered flow shape, all journeys x both transports)" scripts/flow-golden.sh
 run "flow golden is committed fresh" git diff --exit-code docs/flow-golden.json
 
+# THE CORPUS THAT EMBEDS THE GENERATED DOCS, and it runs AFTER ALL OF THEM on purpose.
+#
+# docs/llms-full.txt inlines the verbatim text of every published docs/*.md, and TWO of those
+# are generated above: docs/COMPATIBILITY.md by compat-matrix.sh and docs/CONFIG.md by
+# config-schema.sh. Regenerating either without regenerating the corpus leaves CI red -- and
+# red EARLIER than the check that would explain it, because the invariants job runs the llms
+# step about fifty lines before the compat step and aborts there. That is not hypothetical:
+# a PR fixing the compat freshness failure moved the same job's failure one step up and
+# reported the fix as landed, because this line did not exist and nothing local could see it.
+#
+# Placed here rather than beside compat-matrix for the reason the bug teaches: a check on a
+# derived artifact has to run after everything that feeds it. Beside compat-matrix it would
+# have run BEFORE config-schema.sh regenerated CONFIG.md, and missed exactly this class again.
+run "agent-facing docs freshness (the corpus embeds COMPATIBILITY.md and CONFIG.md)" scripts/llms-txt.sh
+
 run "openapi freshness (served management spec vs committed artifact)" scripts/openapi-check.sh
 # Drift says the spec is CURRENT; this says it is generator-ready (issue #122).
 run "openapi lint (generator-ready)" scripts/openapi-lint.sh

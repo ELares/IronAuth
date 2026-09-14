@@ -825,12 +825,14 @@ async fn portal_write_consumers_are_registered_by_name() {
     // the PR offered as evidence that the wiring worked.
     //
     // IT WENT STALE, which is the cost of the hand-written list and worth recording rather than
-    // hiding. #140 added three more consumers to the boot list (the SAML, SCIM and OIDC setup
-    // halves) and did not extend this expectation, so CI failed on every push to main for three
-    // days. The list is still written out literally, for the reason below -- but a stale
-    // expectation fails LOUDLY and in the right direction: it says the wiring changed and made
-    // someone look, which is exactly what it is for. A list read from the constants would have
-    // absorbed all three silently.
+    // hiding. 014e137c (#140 criterion 1) added three more consumers to the boot list -- the
+    // SAML, SCIM and OIDC setup halves -- and did not extend this expectation, so this test
+    // failed on every push from then until it was corrected a day later.
+    //
+    // The list is still written out literally, for the reason above. A stale expectation fails
+    // LOUDLY and in the right direction: it says the wiring changed and makes someone look,
+    // which is exactly what it is for. A list read from the constants would have absorbed all
+    // three silently.
     //
     // What that would ship is the failure `certificate_pin_inputs`'s own doc argues against: the
     // portal accepts a contact change, answers 303, writes a durable outbox row, and nothing ever
