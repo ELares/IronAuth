@@ -133,7 +133,13 @@ pub struct MetricSpec {
 /// A metric in the contract that is NOT exported is a promise to a dashboard that will render
 /// empty, and an alert that will never fire -- the failure that looks like quiet. A metric
 /// exported that is NOT in the contract is a series nobody documented, which is how cardinality
-/// arrives unreviewed. `tests/metric_contract.rs` fails on both.
+/// arrives unreviewed.
+///
+/// `tests/metric_contract.rs` has ONE TEST PER DIRECTION, which is worth stating as a structure
+/// rather than as an assurance: this sentence previously said it "fails on both" while only one
+/// direction had an assertion behind it, because both tests iterated a collection other than
+/// this one. A bidirectional check has a loop per direction, and counting them is how that is
+/// seen without running anything.
 ///
 /// # Scope
 ///

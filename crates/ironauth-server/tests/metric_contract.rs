@@ -1,23 +1,35 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The metric contract, checked against a REAL SCRAPE (issue #152 criterion 1).
+//! The metric contract, checked against the EMIT SITES (issue #152 criterion 1).
 //!
-//! # What the criterion asks, and what would not satisfy it
+//! # What the criterion asks
 //!
 //! > Every metric in the documented contract is exported and carries the documented labels; a
 //! > CI contract test fails on drift in either direction.
 //!
-//! A test that read `metrics::CONTRACT` back and compared it to the constants would satisfy the
-//! word "contract" and none of the sentence: it would prove the list agrees with itself. What
-//! the criterion is about is EXPORT, and the only thing that establishes export is a rendered
-//! scrape. So this emits every metric in the contract, renders the Prometheus text the
-//! `/metrics` endpoint serves, and reads the result.
+//! # Two directions, and they are checked by different tests
 //!
-//! # One process, one recorder
+//! `every_contract_metric_has_an_emit_site` is CONTRACT -> CODE: a metric promised and never
+//! emitted is a graph that renders empty and an alert that never fires.
 //!
-//! The `metrics` facade installs a global recorder once per process, so every case here shares
-//! one and the whole file is one test. Splitting it into several would have them race for the
-//! install and pass or fail on scheduling.
+//! `every_emit_site_matches_the_contract_it_is_declared_under` is CODE -> CONTRACT: a series
+//! emitted and undocumented is how cardinality arrives unreviewed, and a site whose labels or
+//! kind disagree with the contract breaks whatever query was written against it.
+//!
+//! ONLY THE SECOND EXISTED AT FIRST. Both tests iterated the wrong collection -- one over the
+//! sites, one over the declared constants, neither over `CONTRACT` -- so "every metric in the
+//! contract is exported", which the criterion names FIRST, had no assertion behind it while two
+//! files claimed it did. Adding a contract entry nothing emits passed. My own mutants missed it
+//! because all three mutated the direction I had built rather than the one I had promised.
+//!
+//! # Why not a scrape
+//!
+//! An earlier version emitted every metric by READING THE CONTRACT for its kind and labels,
+//! scraped, and compared. That is circular: the expected value travelled with the thing under
+//! test, so it proved the Prometheus exporter renders what it is handed. A contract claiming a
+//! label no site emits passed it.
+//!
+//! What has to be compared is the CALL SITES, because they are what runs.
 
 use ironauth_server::metrics::{self, MetricKind};
 
@@ -42,7 +54,22 @@ fn emit_sites() -> Vec<(String, String, Vec<String>)> {
             let needle = format!("{macro_name}!(");
             let mut from = 0;
             while let Some(at) = source[from..].find(&needle) {
-                let open = from + at + needle.len();
+                let start = from + at;
+                let open = start + needle.len();
+                // ANCHORED. A bare `find` for "gauge!(" also matches inside "describe_gauge!(",
+                // and eleven of the seventy sites the first version found were describe_ calls,
+                // which register HELP and TYPE and emit no series at all. That made the scan's
+                // own definition of "emitted" wrong in the unsafe direction: a metric whose real
+                // emits were deleted still had a "site", so it looked exported when it was not.
+                if start > 0
+                    && source[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    from = open;
+                    continue;
+                }
                 // The macro's arguments, to the matching close paren. Nesting is shallow here
                 // (a call like `reason_label(reason)` appears as a label VALUE), so a depth
                 // counter is enough and a full parser is not.
@@ -203,6 +230,43 @@ fn every_emit_site_matches_the_contract_it_is_declared_under() {
                  read sets it"
             );
         }
+    }
+}
+
+#[test]
+fn every_contract_metric_has_an_emit_site() {
+    // THE DIRECTION THE CRITERION NAMES FIRST, and the one this file did not have. Both other
+    // tests use CONTRACT as a lookup or a membership set; neither iterates it, so a promise with
+    // nothing behind it was invisible to both.
+    //
+    // WHAT THIS CAN AND CANNOT SAY. A site that exists is not a site that RUNS: a metric emitted
+    // only from a branch nothing reaches is still, in practice, not exported. Establishing that
+    // needs the metric to be produced by exercising the server, which is the integration shape
+    // rather than this one. What this rules out is the case that actually happens -- a contract
+    // entry whose emits were deleted, renamed, or never written.
+    let sites = emit_sites();
+    let emitted: std::collections::HashSet<String> = sites
+        .iter()
+        .filter_map(|(ident, _, _)| value_of(ident))
+        .collect();
+    assert!(
+        !emitted.is_empty(),
+        "the scan found no emitted metric at all, so the assertion below would hold vacuously"
+    );
+
+    for spec in metrics::CONTRACT {
+        assert!(
+            emitted.contains(spec.name),
+            "the contract promises {}, and no emit site this scan can read produces it.\n\
+             A promised metric nobody emits is a dashboard that renders empty and an alert that \
+             never fires. Emitted: {:?}",
+            spec.name,
+            {
+                let mut names: Vec<&str> = emitted.iter().map(String::as_str).collect();
+                names.sort_unstable();
+                names
+            }
+        );
     }
 }
 
