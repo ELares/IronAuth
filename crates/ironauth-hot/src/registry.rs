@@ -223,6 +223,26 @@ pub static ALL: &[&HotUse] = &[
     &ROTATION_LOCK,
 ];
 
+/// The declared use with this name, or [`None`].
+///
+/// # Why a lookup exists at all
+///
+/// Everything inside this process passes a `&'static HotUse` directly, which is the point of the
+/// registry. This is for the one thing that cannot: a value that arrived from OUTSIDE the
+/// process carrying a use NAME rather than a reference -- the cross-node invalidation feed
+/// (issue #147), where another node appended the name and this one has to turn it back into a
+/// use.
+///
+/// AN UNKNOWN NAME IS `None`, NOT A PANIC, and that is the case this is shaped for. During a
+/// rolling upgrade a newer node appends invalidations for a use an older node does not have, and
+/// a use retired in a later release leaves rows naming it in the feed behind. Neither is a fault
+/// and neither is actionable: a use this build does not have is a use this build caches nothing
+/// for, so there is nothing here to forget.
+#[must_use]
+pub fn by_name(name: &str) -> Option<&'static HotUse> {
+    ALL.iter().copied().find(|r#use| r#use.name() == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
