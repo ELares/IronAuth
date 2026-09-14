@@ -54,7 +54,7 @@ NetworkPolicy, not a loopback bind that would also stop the kubelet probing.
 ## Accelerators are absent, not merely disabled
 
 IronAuth is complete on Postgres alone. With `ironcache.enabled` and
-`ironbus.enabled` false — the default — the rendered manifests contain no
+`ironbus.enabled` false (the default) the rendered manifests contain no
 accelerator endpoint, no environment variable, and no reference to a service you
 have not deployed. `scripts/helm-chart.sh` asserts that against the rendered
 output, in both directions.
