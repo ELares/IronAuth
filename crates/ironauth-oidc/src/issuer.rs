@@ -425,6 +425,11 @@ impl IssuerRegistry {
     /// fenced. A store error reading the fence FAILS CLOSED (denies serving), never
     /// open.
     ///
+    /// The one exception is [`IssuerRegistry::resolve_for_publication`], which softens
+    /// the store-error case alone -- not the fenced case -- for JWKS. Everything reached
+    /// through `entry_for`, which is every minting, signing and admin path, keeps the
+    /// fail-closed behaviour described above.
+    ///
     /// The positive keyset cache now carries a bounded TTL (issue #204, default =
     /// the JWKS cache window): a store-backed entry older than `entry_ttl` is
     /// treated as stale and reloaded, so a key rotation or an added algorithm on a
@@ -463,8 +468,9 @@ impl IssuerRegistry {
     /// ABSENT entry (no provisioned signing key, a cross-tenant environment, or a
     /// transient store error). The token endpoint has to tell them apart, because a
     /// suspension is an operator state that a relying party should wait out, while a
-    /// missing signing key is a genuine server fault. Surfaces that answer a uniform
-    /// 404 either way (JWKS, discovery) keep using `entry_for`.
+    /// missing signing key is a genuine server fault. Discovery answers a uniform 404
+    /// either way and keeps using `entry_for`; JWKS resolves through
+    /// [`IssuerRegistry::resolve_for_publication`] instead (issue #149).
     ///
     /// Every caching, fencing, and negative-caching rule documented on
     /// [`IssuerRegistry::entry_for`] applies here unchanged; this is the same code
@@ -686,8 +692,11 @@ impl IssuerRegistry {
     /// environment's policy. `None` if the environment resolves to no entry (an
     /// unprovisioned or cross-tenant environment, which fails closed as a 404).
     ///
-    /// Loads and caches the entry on the first access (see
-    /// [`IssuerRegistry::entry_for`]).
+    /// Loads and caches the entry on the first access. Resolves through
+    /// [`IssuerRegistry::resolve_for_publication`], NOT `entry_for`, so an unreadable
+    /// fence publishes a still-fresh cached key set rather than refusing (issue #149).
+    /// On that path it deliberately does not load: the store is the thing that just
+    /// failed to answer.
     ///
     /// # Errors
     ///

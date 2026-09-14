@@ -80,7 +80,7 @@ use serde_json::{Value, json};
 
 use crate::client_auth::ClientAuthMethod;
 use crate::hints::Display;
-use crate::issuer::{IssuerRegistry, IssuerResolution, JwksCacheWindow};
+use crate::issuer::{IssuerRegistry, JwksCacheWindow};
 use crate::registry::{GrantType, PkceMethod, PromptValue, ResponseMode, ResponseType};
 use crate::subject::SubjectType;
 use crate::wellknown::{cacheable_response, not_found, parse_scope};
@@ -871,17 +871,8 @@ impl DiscoveryState {
     /// not-found the caller returns for a malformed scope, so the two are
     /// indistinguishable and match the JWKS surface.
     async fn respond(&self, scope: &Scope, headers: &HeaderMap) -> Response {
-        // A PUBLICATION resolution (issue #149): discovery is public, read-only
-        // metadata, so an unreadable fence serves a still-fresh cached entry rather
-        // than 404ing the document during a database outage. A FENCED scope -- read
-        // successfully, suspended by an operator -- still gets the uniform 404.
-        let entry = match self
-            .registry
-            .resolve_for_publication(scope, self.now())
-            .await
-        {
-            IssuerResolution::Ready(entry) => entry,
-            IssuerResolution::Fenced | IssuerResolution::Absent => return not_found(),
+        let Some(entry) = self.registry.entry_for(scope, self.now()).await else {
+            return not_found();
         };
         let issuer = self.issuer_for(scope);
         let jwks_uri = format!("{issuer}/jwks.json");

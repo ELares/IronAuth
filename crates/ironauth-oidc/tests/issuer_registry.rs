@@ -295,7 +295,14 @@ async fn a_transient_store_error_does_not_negative_cache_a_real_scope() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #149 criterion 2: a database outage must not stop discovery or JWKS.
+// Issue #149 criterion 2, JWKS HALF ONLY.
+//
+// Discovery is deliberately NOT relaxed here. Its document is rendered with a SECOND
+// store read (`supported_ui_locales`), which fails open to `["en"]` during an outage --
+// so relaxing it would publish a DEGRADED document under the full `Cache-Control`
+// max-age, outliving the incident in every relying-party cache. Making discovery
+// outage-safe means caching the locale set on the entry, which is a separate change
+// with its own staleness argument. Filed rather than bundled.
 //
 // The fence read (`environment_states`) runs ahead of every cache, so renaming that
 // table away is what a Postgres outage looks like to this seam: the entry stays warm
@@ -343,10 +350,37 @@ async fn jwks_serves_a_fresh_cached_entry_when_the_fence_cannot_be_read() {
         during.is_some(),
         "a fresh cached JWKS must still publish while the database is unreadable"
     );
+    let served = during.expect("served").expect("well-formed");
+
+    // An expectation derived from the STORE rather than from the same registry call.
+    // Comparing `during` to `warm` alone is a check whose expected value comes from the
+    // thing it checks: both are rendered from one `Arc<IssuerEntry>` at one instant, so
+    // it cannot fail unless the renderer is nondeterministic. Pin the content against
+    // what the harness actually provisioned.
+    let provisioned = harness
+        .store()
+        .scoped(scope)
+        .signing_keys()
+        .list()
+        .await
+        .expect("keys listed while healthy");
+    let document: serde_json::Value = serde_json::from_str(&served).expect("valid JSON");
+    let keys = document["keys"].as_array().expect("a keys array");
+    assert!(!keys.is_empty(), "the published set must not be empty");
     assert_eq!(
-        during.expect("served").expect("well-formed"),
+        keys.len(),
+        provisioned.len(),
+        "every provisioned key must still publish during the outage"
+    );
+    assert!(
+        keys.iter().all(|key| key["kid"].is_string()),
+        "every published key carries a kid, so a relying party can select one"
+    );
+
+    assert_eq!(
+        served,
         warm.expect("warm").expect("well-formed"),
-        "and it must be the same document, not a degraded one"
+        "and it is byte-identical to the healthy document, not a degraded one"
     );
 }
 
@@ -364,17 +398,24 @@ async fn the_minting_seam_still_fails_closed_while_publication_serves() {
         "precondition"
     );
 
-    with_unreadable_fence(&harness, || async {
-        assert!(
+    // Values are collected inside the outage and asserted AFTER the restore. Asserting
+    // inside the closure would skip the restore on a panic, since there is no unwind
+    // guard -- harmless here because each test owns a throwaway database, but the PR
+    // claimed the restore always runs and that claim should be true rather than
+    // incidentally survivable.
+    let (published, minted) = with_unreadable_fence(&harness, || async {
+        (
             registry.jwks_json(&scope, at(0)).await.is_some(),
-            "publication serves"
-        );
-        assert!(
-            registry.entry_for(&scope, at(0)).await.is_none(),
-            "MINTING must still fail closed when the serving state cannot be read"
-        );
+            registry.entry_for(&scope, at(0)).await.is_some(),
+        )
     })
     .await;
+
+    assert!(published, "publication serves");
+    assert!(
+        !minted,
+        "MINTING must still fail closed when the serving state cannot be read"
+    );
 }
 
 /// A STALE entry is still never published. The #204 argument is untouched: serving a
