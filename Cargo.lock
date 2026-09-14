@@ -2225,6 +2225,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironauth-hot"
+version = "0.1.0"
+dependencies = [
+ "ironauth-env",
+ "tokio",
+]
+
+[[package]]
 name = "ironauth-import"
 version = "0.1.0"
 dependencies = [
