@@ -9,10 +9,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-ironauth-env.workspace = true
-# THE TIME BOX NEEDS A TIMER. `tokio::time::timeout` is the only dependency this crate has
-# beyond the determinism seam, and it is what makes the stall bound a property of the wrapper
-# rather than of every caller.
+# THE TIME BOX NEEDS A TIMER, and that is the whole dependency list. `tokio::time::timeout` is
+# what makes the stall bound a property of the wrapper rather than of every caller.
+#
+# NO `ironauth-env`. It was listed here at first, with a comment calling it "the determinism
+# seam" this crate used -- and nothing in the crate referenced it. The tests that appeared to
+# need a clock now assert their bounds under a paused timer instead, which needs no clock at
+# all, so the honest dependency list is one line long. A crate that takes the seam without
+# using it teaches the next reader that the seam is optional.
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]

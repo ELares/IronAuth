@@ -9,10 +9,18 @@
 //! impossible: a gate would have to decide whether some `HotUse::declare` it found in a handler
 //! was a real declaration or a way around the registry, and it cannot.
 //!
-//! Here, the rule a script can check is simple: `HotUse::declare` appears in this file and
-//! nowhere else, and [`ALL`] names every one. `scripts/hotstate-classification.sh` enforces
-//! both directions, so a use added without a class does not compile past review, and one added
-//! without being listed does not pass the gate.
+//! Here, the rule is simple: a declaration appears in this file and nowhere else, and [`ALL`]
+//! names every one. Three things hold it, in decreasing order of strength:
+//!
+//! 1. `HotUse::declare` is `pub(crate)`, so NO OTHER CRATE CAN DECLARE ONE AT ALL. Every call
+//!    site the matrix is about lives in another crate, so for all of them this is the compiler's
+//!    rule rather than a convention.
+//! 2. `scripts/hotstate-classification.sh` covers what privacy cannot say -- "within this crate,
+//!    registry.rs only" -- by matching the method NAME with any receiver, so an aliased import
+//!    or a UFCS spelling does not walk past it.
+//! 3. The same script, and `tests::every_declared_use_is_listed`, check [`ALL`] BY NAME in both
+//!    directions. Comparing the two counts (which is what both did at first) passes a registry
+//!    that declares `A` and `B` and lists `A` twice.
 //!
 //! # It also makes the classification READABLE
 //!
@@ -37,21 +45,24 @@ pub static TENANT_CONFIG: HotUse = HotUse::declare("tenant_config", Class::Accel
 
 /// The result of an introspection call, for the seconds until it could change.
 ///
-/// SECURITY SENSITIVE AND FAIL OPEN BY DEFAULT, which needs saying rather than assuming. A miss
-/// costs a read; a STALE HIT tells a caller a revoked token is still active for as long as the
-/// entry lives, which is why the TTL is seconds rather than minutes and why revocation deletes
-/// the entry rather than waiting for it to lapse.
+/// AN ACCELERATOR, and the reasoning that put it here is worth keeping because it first put it
+/// somewhere else. This was declared `LossyDegradesSecurity { FailOpen }` under the heading
+/// "security sensitive", and the paragraph justifying that said: with no cache at all, every
+/// introspection reaches the store and answers correctly. THAT IS THE DEFINITION OF
+/// [`Class::Accelerator`] -- "the caller must already be able to answer from the store" -- so the
+/// doc was arguing for a class the declaration did not use.
 ///
-/// Failing open is right for the UNAVAILABLE case specifically: with no cache at all, every
-/// introspection reaches the store and answers correctly. The weakening is the stale window,
-/// and that exists only when the cache IS available.
-pub static INTROSPECTION: HotUse = HotUse::declare(
-    "introspection",
-    Class::LossyDegradesSecurity {
-        on_loss: OnLoss::FailOpen,
-    },
-    None,
-);
+/// The confusion is worth naming because it is easy to repeat: `Class` is about WHAT HAPPENS
+/// WHEN THE ACCELERATOR IS GONE, and the risk here is the opposite case. A STALE HIT tells a
+/// caller a revoked token is still active for as long as the entry lives -- a real weakening,
+/// but one that exists only while the cache IS available, and one the class system cannot act
+/// on. It is bounded by the two things that can: a TTL in seconds rather than minutes, and
+/// revocation DELETING the entry rather than waiting for it to lapse.
+///
+/// Classifying it fail-open to mark it "sensitive" would have been a label with no consequence,
+/// since fail-open and accelerator behave identically when the cache is down. A class whose
+/// members do not differ in behaviour is a comment.
+pub static INTROSPECTION: HotUse = HotUse::declare("introspection", Class::Accelerator, None);
 
 /// Per-subject counters the rate limiter spends.
 ///
@@ -138,24 +149,72 @@ mod tests {
         // THE DIRECTION THAT CAN FAIL. Comparing `ALL` to itself proves nothing; this reads the
         // source of this very file and asserts each declaration appears in the list, which is
         // what catches a use added above and not below.
+        //
+        // BY NAME, NOT BY COUNT. An earlier version compared `declared.len()` to `ALL.len()`
+        // while its comment claimed it "asserts each declaration appears in the list" -- two
+        // different assertions, and the weaker one. A registry that declared `A` and `B` and
+        // listed `A` twice had equal lengths and passed, with `B` -- the use missing from the
+        // matrix, which is the entire defect this test is named for -- unmentioned.
         let source = include_str!("registry.rs");
-        let declared: Vec<&str> = source
+        let mut declared: Vec<&str> = source
             .lines()
             .filter_map(|line| line.trim().strip_prefix("pub static "))
             .filter_map(|rest| rest.split(':').next())
             .filter(|name| *name != "ALL")
             .collect();
+        declared.sort_unstable();
         assert!(
             declared.len() >= 7,
             "the parse found {} declarations, which is too few to be reading this file",
             declared.len()
         );
-        assert_eq!(
-            declared.len(),
-            ALL.len(),
-            "declared {declared:?} but ALL lists {} of them",
-            ALL.len()
-        );
+
+        // `ALL` holds values, and the static's IDENTIFIER is what the parse above collected, so
+        // the two are joined on the name each declaration passes to `declare`. That the two
+        // spellings agree is itself worth pinning: `no_declarations_name_disagrees_with_its_ident`
+        // below is the reason this join is sound.
+        let mut listed: Vec<&str> = ALL.iter().map(|r#use| r#use.name()).collect();
+        listed.sort_unstable();
+        let idents: Vec<String> = listed.iter().map(|name| name.to_uppercase()).collect();
+        let mut idents: Vec<&str> = idents.iter().map(String::as_str).collect();
+        idents.sort_unstable();
+
+        for name in &declared {
+            assert!(
+                idents.contains(name),
+                "{name} is declared in this file and does not appear in ALL, so the \
+                 classification matrix does not show it"
+            );
+        }
+        for name in &idents {
+            assert!(
+                declared.contains(name),
+                "ALL lists {name}, which is not declared in this file"
+            );
+        }
+    }
+
+    #[test]
+    fn no_declarations_name_disagrees_with_its_ident() {
+        // WHAT THE TEST ABOVE JOINS ON. A use declared as `pub static ROTATION_LOCK` whose name
+        // string said "rotation-lock" would make that join silently vacuous in one direction --
+        // every `contains` would fail, which is loud, or worse, a near-miss would pass. Pinning
+        // the correspondence here means the membership check is checking membership.
+        let source = include_str!("registry.rs");
+        let idents: Vec<&str> = source
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("pub static "))
+            .filter_map(|rest| rest.split(':').next())
+            .filter(|name| *name != "ALL")
+            .collect();
+        for r#use in ALL {
+            assert!(
+                idents.contains(&r#use.name().to_uppercase().as_str()),
+                "the use named {:?} has no `pub static` whose identifier is its name in \
+                 upper case; the registry's two spellings have drifted",
+                r#use.name()
+            );
+        }
     }
 
     #[test]
@@ -179,9 +238,34 @@ mod tests {
             match r#use.class() {
                 Class::Correctness => {
                     let fallback = r#use.fallback().unwrap_or("");
+                    // WHAT IT SAYS, not how long it is. The comment above used to promise the
+                    // former while the code did only the latter, and `Some("aaaaaaaaaaaaaaaaaaaaaa")`
+                    // passed it. A fallback is a sentence a person acts on when the accelerator
+                    // is down, so it must name a destination: the store is where every one of
+                    // these goes, and saying so is the minimum that is worth reading.
                     assert!(
                         fallback.len() > 20,
                         "{} is correctness-relevant and its fallback says only {fallback:?}",
+                        r#use.name()
+                    );
+                    assert!(
+                        fallback.split_whitespace().count() >= 5,
+                        "{}'s fallback is {fallback:?}, which is a phrase rather than an \
+                         instruction",
+                        r#use.name()
+                    );
+                    // NOT A KEYWORD SCAN. The first attempt here required the word "store" or
+                    // "database", and it failed against `single_use_marker` -- whose fallback
+                    // names the artifact's own conditional UPDATE, which is a BETTER answer than
+                    // the word it was looking for. A vocabulary check measures vocabulary; what
+                    // a fallback owes a reader is that it is about this use and not another,
+                    // which is what the distinctness assertion after this loop can actually
+                    // hold.
+                    assert!(
+                        !fallback
+                            .to_lowercase()
+                            .contains(&r#use.name().to_lowercase()),
+                        "{}'s fallback only repeats its own name: {fallback:?}",
                         r#use.name()
                     );
                 }
@@ -192,5 +276,19 @@ mod tests {
                 ),
             }
         }
+
+        // DISTINCT, because one sentence pasted under every correctness use is the shape this
+        // whole test is trying to prevent: it would satisfy every assertion above while telling
+        // a reader nothing about which use they are looking at.
+        let mut fallbacks: Vec<&str> = ALL.iter().filter_map(|r#use| r#use.fallback()).collect();
+        let before = fallbacks.len();
+        fallbacks.sort_unstable();
+        fallbacks.dedup();
+        assert_eq!(
+            before,
+            fallbacks.len(),
+            "two correctness uses name the same fallback, so at least one of them is describing \
+             somewhere it does not actually go"
+        );
     }
 }

@@ -2228,7 +2228,6 @@ dependencies = [
 name = "ironauth-hot"
 version = "0.1.0"
 dependencies = [
- "ironauth-env",
  "tokio",
 ]
 

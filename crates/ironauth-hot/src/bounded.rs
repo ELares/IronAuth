@@ -63,20 +63,32 @@ impl Default for Bounds {
 
 /// Any [`HotState`], time-boxed.
 ///
-/// # A stalled READ is a MISS, not an error
+/// # A stalled READ is a miss FOR THE USES THAT CAN SURVIVE ONE
 ///
-/// To a caller those are the same thing -- it goes to the store either way -- and reporting a
-/// stall as an error would make every caller write the same `Err(Stalled) => None` arm, which is
-/// the arm somebody eventually writes differently. The one thing that must not happen is a
-/// request waiting on an accelerator, and that is a property this wrapper can hold for every use
-/// at once.
+/// An earlier version of this wrapper answered every stalled read with `Ok(None)` and justified
+/// it with "to a caller those are the same thing -- it goes to the store either way". That is
+/// true of an accelerator and false of everything else, and the falsehood was not academic:
+/// `PRE_AUTH_QUOTA` is declared fail-CLOSED, a miss on a quota counter reads as "nothing
+/// outstanding", and the wrapper therefore admitted the request. The one use whose whole
+/// argument is that it must refuse when the accelerator stops answering was made to fail open by
+/// the layer above it -- and precisely under the load its own doc says is when it matters.
 ///
-/// # A stalled WRITE is an error, and the asymmetry is the point
+/// So the bound asks the use. [`crate::HotUse::proceeds_without_cache`] is exactly the question
+/// "is a silent accelerator survivable here", and a use that answers no is told
+/// [`HotError::Stalled`] so its caller can do what its class says. A wrapper that decided for
+/// them would be a second classification, contradicting the declared one.
+///
+/// THE ACCELERATOR CASE IS UNCHANGED and is still the reason the translation exists at all: an
+/// accelerator's caller goes to the store on a miss, so an error would make every such caller
+/// write the same `Err(Stalled) => None` arm -- the arm somebody eventually writes differently.
+///
+/// # A stalled WRITE is an error for every use, and the asymmetry is the point
 ///
 /// A write that did not land means a later read will miss, which for a
 /// [`crate::Class::Correctness`] use is not an ordinary outcome: `put_if_absent` answering "you
 /// got there first" when nothing was written is the double redemption the marker exists to
-/// prevent. So a caller is told, and its class decides.
+/// prevent. There is no class for which silently losing a write is right, so this one does not
+/// ask.
 pub struct Bounded<S> {
     inner: S,
     bounds: Bounds,
@@ -92,6 +104,14 @@ impl<S> Bounded<S> {
     pub const fn bounds(&self) -> Bounds {
         self.bounds
     }
+
+    /// The wrapped state.
+    ///
+    /// A caller reaching past the bound would be undoing the point of this type, so this exists
+    /// for the OTHER direction: an implementation's own tests asking what actually reached it.
+    pub const fn inner(&self) -> &S {
+        &self.inner
+    }
 }
 
 impl<S: HotState> HotState for Bounded<S> {
@@ -106,10 +126,12 @@ impl<S: HotState> HotState for Bounded<S> {
         Box::pin(async move {
             match tokio::time::timeout(bound, self.inner.get(r#use, key)).await {
                 Ok(answer) => answer,
-                // A STALL IS A MISS. See the type's own doc: the caller goes to the store either
-                // way, and a bound that produced an error would be a bound every caller had to
-                // remember to translate.
-                Err(_) => Ok(None),
+                // THE USE DECIDES, not this wrapper. See the type's own doc: an accelerator's
+                // caller goes to the store on a miss so the translation saves it an arm, and a
+                // use that cannot survive a silent accelerator must be TOLD rather than handed
+                // an answer that reads as "there is nothing there".
+                Err(_) if r#use.proceeds_without_cache() => Ok(None),
+                Err(_) => Err(HotError::Stalled),
             }
         })
     }

@@ -8,10 +8,15 @@
 //! > optional accelerators **behind documented interfaces** with safe defaults; they are never
 //! > prerequisites, and CI verifies both modes.
 //!
-//! This crate is that documented interface. Everything an accelerator could hold -- a session
-//! read-through, a JWKS, an introspection result, a one-time-use marker, a rate counter --
-//! reaches it through [`HotState`], and the default implementation is the one every deployment
-//! already has.
+//! This crate is that documented interface. Everything an accelerator could hold -- a JWKS, a
+//! tenant config, an introspection result, a one-time-use marker, a rate counter -- is meant to
+//! reach it through [`HotState`].
+//!
+//! NO IMPLEMENTATION SHIPS IN THIS SLICE, and saying so here matters more than it would in a
+//! commit message: this crate is a contract and nothing satisfies it yet. The Postgres-backed
+//! default that makes the covenant's "complete on PostgreSQL alone" true of this seam, and the
+//! IronCache one it accelerates, are the next pieces of #146. Until they land, [`registry`] is a
+//! set of declarations rather than a set of call sites.
 //!
 //! # The industry keeps relearning why this has to be a seam
 //!
@@ -36,9 +41,12 @@
 //! # The bounds live here, not in the callers
 //!
 //! A stall bound written per call site is a bound somebody forgets. [`Bounded`] wraps any
-//! implementation and enforces both time boxes for every use, and a read that outruns its box is
-//! answered as a MISS rather than as an error -- because to a caller those are the same thing,
-//! and the one thing that must not happen is a request waiting on a cache.
+//! implementation and enforces both time boxes for every use. The one thing that must not happen
+//! is a request waiting on a cache.
+//!
+//! WHAT A STALL MEANS IS THE USE'S TO SAY. A stalled read reads as a miss for a use that can
+//! survive a silent accelerator, because its caller goes to the store either way; a use that
+//! cannot survive one is told, so its class decides rather than the wrapper deciding for it.
 
 #![forbid(unsafe_code)]
 

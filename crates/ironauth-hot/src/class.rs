@@ -20,10 +20,20 @@ pub enum Class {
 
     /// Losing it weakens a control, and the deployment chooses which way that fails.
     ///
-    /// THE CHOICE IS THE OPERATOR'S because the right answer is a property of the deployment
-    /// rather than of the code. A rate counter that fails open lets a burst through; one that
-    /// fails closed turns a cache outage into an outage. Neither is universally correct, and a
-    /// library that picked one would be picking for every deployment.
+    /// THE RIGHT ANSWER IS A PROPERTY OF THE DEPLOYMENT rather than of the code. A rate counter
+    /// that fails open lets a burst through; one that fails closed turns a cache outage into an
+    /// outage. Neither is universally correct.
+    ///
+    /// SO WHAT IS THIS FIELD? It is the DEFAULT the code ships, and nothing more. Issue #146
+    /// asks for "fail open with alerting or fail closed, PER CONFIG", and this slice does not
+    /// deliver the config half: there is no operator input anywhere in this crate, so a
+    /// deployment that wants the other answer currently edits [`crate::registry`] and rebuilds.
+    /// An earlier version of this comment said the choice was the operator's, which read as a
+    /// description of a surface that does not exist.
+    ///
+    /// The override belongs with the limiter that spends the counter (issue #150), because that
+    /// is where an operator already configures the limits this would qualify; when it lands,
+    /// this field becomes the default it starts from.
     LossyDegradesSecurity {
         /// What this use does when the accelerator is unavailable.
         on_loss: OnLoss,
@@ -52,10 +62,19 @@ pub enum OnLoss {
 ///
 /// # It is a value, not a string, and that is what the CI gate rests on
 ///
-/// A caller passes a `&'static HotUse` from [`crate::registry`]. It cannot construct one at a
-/// call site, because [`HotUse::declare`] is `const` and the gate greps for uses declared
-/// anywhere but the registry -- so "every trait use is classified" is checked by the build
-/// rather than asserted in a document.
+/// A caller passes a `&'static HotUse` from [`crate::registry`], and cannot construct one of its
+/// own: [`HotUse::declare`] is visible only inside this crate, so for every OTHER crate -- which
+/// is every call site the matrix is about -- the restriction is the privacy rule rather than a
+/// convention anyone has to keep.
+///
+/// An earlier version of this comment said a call site "cannot construct one ... because
+/// `HotUse::declare` is `const`". THAT WAS FALSE: `const fn` says a call CAN be evaluated at
+/// compile time, not that it must be, and a runtime call is perfectly legal -- which would also
+/// have turned the compile-time assertion below into a runtime panic in a live process. The
+/// visibility does what the sentence claimed.
+///
+/// Inside this crate the compiler cannot express "registry.rs only", so
+/// `scripts/hotstate-classification.sh` covers that last file-sized gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HotUse {
     name: &'static str,
@@ -73,8 +92,17 @@ impl HotUse {
     /// one. The pairing is the whole content of the classification -- a correctness use with no
     /// fallback is a use that proceeds on a cache it may not trust, and an accelerator with one
     /// is a use whose class is a mislabel.
+    ///
+    /// # Visibility
+    ///
+    /// `pub(crate)` ON PURPOSE. Every declaration belongs in [`crate::registry`], and a private
+    /// constructor is the only version of that rule the compiler can hold on its own.
     #[must_use]
-    pub const fn declare(name: &'static str, class: Class, fallback: Option<&'static str>) -> Self {
+    pub(crate) const fn declare(
+        name: &'static str,
+        class: Class,
+        fallback: Option<&'static str>,
+    ) -> Self {
         assert!(
             matches!(
                 (class, fallback.is_some()),

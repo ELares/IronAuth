@@ -16,6 +16,27 @@
 //! the BOUND rather than the wall clock: a run on a loaded machine measures the same thing a run
 //! on an idle one does. A sleep-based test would be the flaky kind that gets a longer timeout
 //! and then stops measuring anything.
+//!
+//! # How a bound is asserted, and why nothing here reads a clock
+//!
+//! An earlier version of this file read the monotonic clock directly and asserted the elapsed
+//! span was under 200ms -- FOUR TIMES the 50ms bound whose name was in the failure message, so
+//! tripling the read bound would have passed. It also gave read and write the same value in every case, which made
+//! "the read bound governs reads" untested: `get` could have used `bounds.write` and all nine
+//! tests still passed.
+//!
+//! Both are fixed by [`SPLIT`], which sets the two bounds FOUR ORDERS OF MAGNITUDE apart, and by
+//! [`BETWEEN`], an outer deadline that sits between them. A test then states which side of
+//! `BETWEEN` an operation must land on, and the paused clock makes that exact:
+//!
+//! - a `get` must finish before `BETWEEN` -- it cannot if it is using the write bound;
+//! - a `put` must NOT finish before `BETWEEN` -- it would if it were using the read bound.
+//!
+//! So the two bounds pin each other, swapping them fails, and no test reads the clock. That last
+//! part is not only hygiene: `scripts/invariant-lints.sh` rule `time-via-env` fails the build on
+//! any direct clock read outside `crates/ironauth-env`, and its allow list is at the ceiling that
+//! file documents -- so "add a marker" was not available either, and is not the right answer for
+//! a test that never needed the clock.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -132,30 +153,68 @@ impl HotState for Answers {
     }
 }
 
+/// Read and write bounds far enough apart that an operation using the wrong one is visible.
+///
+/// A function rather than a `const` because [`Bounds::new`] clamps, and a bound that skipped the
+/// clamp in tests would be a bound the tests never actually exercise.
+fn split() -> Bounds {
+    Bounds::new(Duration::from_millis(50), Duration::from_secs(500))
+}
+
+/// A deadline BETWEEN the two halves of [`SPLIT`]: any read must beat it, no write may.
+const BETWEEN: Duration = Duration::from_secs(5);
+
+/// Run `fut` under [`BETWEEN`], reporting whether it finished in time -- the clock is paused, so
+/// this is the timer's own advance rather than anything about the machine.
+async fn finished_before_between<F: std::future::Future>(fut: F) -> Option<F::Output> {
+    tokio::time::timeout(BETWEEN, fut).await.ok()
+}
+
 #[tokio::test(start_paused = true)]
-async fn a_stalled_read_is_served_as_a_miss_at_the_bound() {
-    // CRITERION 3. The caller goes to the store on a miss either way, so a stall that surfaced
-    // as an error would make every caller write the same translation -- and one of them would
-    // eventually write it differently.
+async fn a_stalled_read_is_served_as_a_miss_at_the_read_bound() {
+    // CRITERION 3, and the bound it names. The accelerator here stalls for an hour, so an
+    // unbounded `get` never returns and a `get` bounded by the WRITE half returns long after
+    // `BETWEEN` -- either way this test fails rather than hanging.
     let asked = Arc::new(AtomicUsize::new(0));
     let hot = Bounded::new(
         Stalls {
             asked: Arc::clone(&asked),
         },
-        Bounds::new(Duration::from_millis(50), Duration::from_millis(50)),
+        split(),
     );
 
-    let started = tokio::time::Instant::now();
-    let answer = hot.get(&registry::JWKS, "any").await;
-    let waited = started.elapsed();
+    let answer = finished_before_between(hot.get(&registry::JWKS, "any"))
+        .await
+        .expect("a read must be bounded by the READ half, which is well inside BETWEEN");
 
-    assert_eq!(answer, Ok(None), "a stalled read must read as a miss");
+    assert_eq!(answer, Ok(None), "a stalled read reads as a miss for JWKS");
     assert_eq!(asked.load(Ordering::SeqCst), 1, "it did ask");
-    // THE BOUND, not "quickly". With the clock paused this is the timer's own advance, so the
-    // assertion is about the configured limit rather than about how loaded the machine is.
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_is_bounded_by_the_write_half_and_not_the_read_one() {
+    // THE OTHER SIDE OF THE PIN. Without this, `get` and `put` could both use `bounds.read` and
+    // the test above would still pass; with it, the two bounds are pinned against each other and
+    // SWAPPING THEM FAILS BOTH. The write bound is deliberately the long one: a write is worth
+    // waiting on, because losing it silently is the outcome the asymmetry exists to prevent.
+    let hot = Bounded::new(
+        Stalls {
+            asked: Arc::new(AtomicUsize::new(0)),
+        },
+        split(),
+    );
+
+    let finished = finished_before_between(hot.put(
+        &registry::JWKS,
+        "k",
+        b"v",
+        Ttl::of(Duration::from_secs(60)),
+    ))
+    .await;
+
     assert!(
-        waited < Duration::from_millis(200),
-        "the read waited {waited:?}, which is past its 50ms bound"
+        finished.is_none(),
+        "a write that answered before BETWEEN is using the 50ms READ bound, not its own"
     );
 }
 
@@ -222,10 +281,15 @@ fn every_registered_use_states_what_an_unavailable_cache_means_for_it() {
     // registry is covered by this the moment it exists, and one that is not classified does not
     // compile.
     //
-    // BOTH BEHAVIOURS ARE EXERCISED, which is what the criterion asks: the assertion below is
-    // that each class answers the question, and the table under it is that the two answers are
-    // actually different -- a `proceeds_without_cache` that returned one value for everything
-    // would satisfy "every use is classified" and mean nothing.
+    // THIS HALF READS DECLARATIONS, and on its own it does not discharge criterion 1's "a test
+    // exercising both behaviors per use" -- it exercises no behaviour at all, it checks that
+    // each class answers `proceeds_without_cache` consistently with what its name promises. An
+    // earlier comment here claimed the criterion outright.
+    //
+    // The behaviour half is `what_a_stalled_read_means_is_the_uses_own_answer_and_both_answers_occur`,
+    // which runs EVERY registered use through a wrapper over an accelerator that will not answer
+    // and asserts what comes back. The two together are the criterion: this one says the
+    // declarations are coherent, that one says the code obeys them.
     let mut proceeds = 0;
     let mut refuses = 0;
     for r#use in registry::ALL {
@@ -257,5 +321,223 @@ fn every_registered_use_states_what_an_unavailable_cache_means_for_it() {
         proceeds > 0 && refuses > 0,
         "the registry classifies {proceeds} as proceeding and {refuses} as not; a registry \
          where every use answered the same way would pass every assertion above and mean nothing"
+    );
+}
+
+/// An accelerator that answers every call and records the writes it was asked to make.
+#[derive(Default)]
+struct Records {
+    wrote: std::sync::Mutex<Vec<(String, Vec<u8>, Duration)>>,
+    deleted: std::sync::Mutex<Vec<String>>,
+    claim_wins: bool,
+}
+
+impl HotState for Records {
+    fn get<'a>(
+        &'a self,
+        _use: &'static HotUse,
+        _key: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>, HotError>> + Send + 'a>,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn put<'a>(
+        &'a self,
+        _use: &'static HotUse,
+        key: &'a str,
+        value: &'a [u8],
+        ttl: Ttl,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HotError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.wrote.lock().expect("test mutex").push((
+                key.to_owned(),
+                value.to_vec(),
+                ttl.duration(),
+            ));
+            Ok(())
+        })
+    }
+
+    fn put_if_absent<'a>(
+        &'a self,
+        _use: &'static HotUse,
+        key: &'a str,
+        value: &'a [u8],
+        ttl: Ttl,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, HotError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.wrote.lock().expect("test mutex").push((
+                key.to_owned(),
+                value.to_vec(),
+                ttl.duration(),
+            ));
+            Ok(self.claim_wins)
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        _use: &'static HotUse,
+        key: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HotError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.deleted
+                .lock()
+                .expect("test mutex")
+                .push(key.to_owned());
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_that_lands_is_passed_through_unchanged_and_reports_success() {
+    // THE CONTROL FOR EVERY WRITE ASSERTION ABOVE. Without it, a `Bounded` whose `put` returned
+    // `Err(Stalled)` unconditionally -- a wrapper through which NO WRITE EVER LANDS -- passes
+    // the stalled-write test, the stalled-claim test, and the classification test. The earlier
+    // comment claiming "each has a control" was true of reads only.
+    let hot = Bounded::new(Records::default(), split());
+    let ttl = Ttl::of(Duration::from_secs(90));
+
+    assert_eq!(
+        hot.put(&registry::JWKS, "kid-1", b"jwks", ttl).await,
+        Ok(())
+    );
+
+    let wrote = hot.inner().wrote.lock().expect("test mutex").clone();
+    assert_eq!(
+        wrote,
+        vec![(
+            "kid-1".to_owned(),
+            b"jwks".to_vec(),
+            Duration::from_secs(90)
+        )],
+        "the wrapper must hand the inner state the key, value and TTL it was given"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_claim_that_lands_reports_the_inner_verdict_rather_than_a_fixed_one() {
+    // BOTH VERDICTS, because `put_if_absent` returning a constant is the failure that matters:
+    // an always-`true` claim lets every caller believe it won, which for SINGLE_USE_MARKER is
+    // the double redemption the use exists to prevent.
+    let ttl = Ttl::of(Duration::from_secs(30));
+
+    let won = Bounded::new(
+        Records {
+            claim_wins: true,
+            ..Records::default()
+        },
+        split(),
+    );
+    assert_eq!(
+        won.put_if_absent(&registry::SINGLE_USE_MARKER, "code", b"1", ttl)
+            .await,
+        Ok(true)
+    );
+
+    let lost = Bounded::new(
+        Records {
+            claim_wins: false,
+            ..Records::default()
+        },
+        split(),
+    );
+    assert_eq!(
+        lost.put_if_absent(&registry::SINGLE_USE_MARKER, "code", b"1", ttl)
+            .await,
+        Ok(false),
+        "a claim the inner state refused must be reported as refused"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_delete_that_lands_reaches_the_inner_state() {
+    // A `delete` that quietly did nothing leaves a single-use marker in place, which refuses a
+    // legitimate retry forever. Nothing else in this file would notice.
+    let hot = Bounded::new(Records::default(), split());
+    assert_eq!(
+        hot.delete(&registry::SINGLE_USE_MARKER, "code").await,
+        Ok(())
+    );
+    assert_eq!(
+        hot.inner().deleted.lock().expect("test mutex").as_slice(),
+        ["code"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_delete_is_reported_rather_than_swallowed() {
+    let hot = Bounded::new(
+        Stalls {
+            asked: Arc::new(AtomicUsize::new(0)),
+        },
+        split(),
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(600),
+            hot.delete(&registry::SINGLE_USE_MARKER, "code")
+        )
+        .await,
+        Ok(Err(HotError::Stalled)),
+        "a delete that did not land must not read as one that did"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn what_a_stalled_read_means_is_the_uses_own_answer_and_both_answers_occur() {
+    // CRITERION 1's "a test exercising both behaviors PER USE", driven through the wrapper
+    // rather than asserted about the declaration. The classification test above reads what each
+    // use SAYS; this one runs every registered use against an accelerator that will not answer
+    // and checks what actually comes back.
+    //
+    // THIS IS THE TEST THAT FAILS against the version of `Bounded::get` that answered every
+    // stalled read with `Ok(None)`. Under that wrapper PRE_AUTH_QUOTA -- declared fail-CLOSED --
+    // was handed "nothing outstanding", which is the admit answer, so the one use whose whole
+    // argument is that it must refuse was made to fail open by the layer above it.
+    let hot = Bounded::new(
+        Stalls {
+            asked: Arc::new(AtomicUsize::new(0)),
+        },
+        split(),
+    );
+
+    let mut served_a_miss = Vec::new();
+    let mut told_about_it = Vec::new();
+    for r#use in registry::ALL {
+        let answer = finished_before_between(hot.get(r#use, "key"))
+            .await
+            .expect("every read is bounded by the read half");
+        if r#use.proceeds_without_cache() {
+            assert_eq!(
+                answer,
+                Ok(None),
+                "{} can survive a silent accelerator, so a stall is a miss for it",
+                r#use.name()
+            );
+            served_a_miss.push(r#use.name());
+        } else {
+            assert_eq!(
+                answer,
+                Err(HotError::Stalled),
+                "{} cannot survive a silent accelerator, so it must be TOLD rather than handed \
+                 an answer that reads as 'there is nothing there'",
+                r#use.name()
+            );
+            told_about_it.push(r#use.name());
+        }
+    }
+
+    assert!(
+        !served_a_miss.is_empty() && !told_about_it.is_empty(),
+        "both behaviours must actually occur: {served_a_miss:?} were served a miss and \
+         {told_about_it:?} were told, and a run where either list is empty means the loop \
+         above asserted only one of the two arms"
     );
 }
