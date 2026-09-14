@@ -57,7 +57,9 @@ mod bounded;
 mod class;
 pub mod registry;
 mod state;
+mod tiered;
 
 pub use bounded::{Bounded, Bounds};
 pub use class::{Class, HotUse, OnLoss, Reach};
 pub use state::{Answer, HotError, HotState, Ttl};
+pub use tiered::{POPULATE_TTL_SECS, Tiered};
