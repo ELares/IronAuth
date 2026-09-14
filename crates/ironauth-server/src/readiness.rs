@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use ironauth_config::{DatabaseConfig, OutboxConfig};
+use ironauth_config::{DatabaseConfig, HotStateConfig, OutboxConfig};
 use tokio::net::TcpStream;
 
 /// Maximum time to wait for the database TCP connect before reporting not
@@ -109,24 +109,29 @@ pub enum DegradedTier {
     /// Outbox work accumulates and drains on recovery rather than being lost, because the drain
     /// is a Postgres poll and the backbone only decides WHEN it runs.
     BackboneAbsent,
+    /// The shared hot-state accelerator is unreachable.
+    ///
+    /// Reported only when a deployment declared one (`hot_state.ironcache_addr`). Nothing
+    /// degrades in correctness: `ironauth_hot::Tiered`'s outage tests measure that every answer
+    /// is identical with the accelerator failing every call, so this is a latency tier.
+    ///
+    /// # This variant was removed once, deliberately, and this is what changed
+    ///
+    /// It was here before, rendered by `readyz` and named in a commit message, while no
+    /// deployment could attach an accelerator at all -- the "reads as wired when it is not"
+    /// defect. It is back because `hot_state.ironcache_addr` now exists, so there IS something
+    /// to probe and a state a running binary can report.
+    ///
+    /// It still reports only REACHABILITY. No request path consults the accelerator yet
+    /// (`ironauth-hot` is not a dependency of any crate that serves a request), so this says
+    /// "the cache you declared is not answering", never "your reads are slower". That is the
+    /// honest reading of what the process can currently observe.
+    AcceleratorAbsent,
 }
-
-// # Why there is no `AcceleratorAbsent`, though the accelerator is a degraded tier
-//
-// `ironauth_hot::Tiered`'s outage tests measure that every answer is identical with the
-// accelerator failing every call, so it IS a tier in the sense #149 means. It is not a variant
-// here because a deployment cannot attach one: `ironauth-hot`'s IronCache implementation has no
-// address in config, so there is nothing to probe and no state to report.
-//
-// The first version of this enum had the variant anyway. It was rendered by `readyz`, described
-// in a doc, named in a commit message, and reachable only from a unit test -- which is the
-// "reads as wired when it is not" defect, committed by someone who had spent the day finding it
-// in other people's work. It returns when the accelerator has a config surface, which is #146
-// work rather than this criterion's.
 
 impl DegradedTier {
     /// Every tier, so a census reads the enum rather than a list somebody maintains beside it.
-    pub const ALL: &'static [Self] = &[Self::BackboneAbsent];
+    pub const ALL: &'static [Self] = &[Self::BackboneAbsent, Self::AcceleratorAbsent];
 
     /// The stable token a probe body and an alert match on.
     ///
@@ -136,6 +141,7 @@ impl DegradedTier {
     pub const fn token(self) -> &'static str {
         match self {
             Self::BackboneAbsent => "backbone_absent",
+            Self::AcceleratorAbsent => "accelerator_absent",
         }
     }
 }
@@ -181,7 +187,11 @@ impl ReadinessProbe {
     /// (IPv6 brackets stripped for connection); the port defaults to the
     /// Postgres default when the DSN omits it.
     #[must_use]
-    pub fn from_config(database: &DatabaseConfig, outbox: &OutboxConfig) -> Self {
+    pub fn from_config(
+        database: &DatabaseConfig,
+        outbox: &OutboxConfig,
+        hot_state: &HotStateConfig,
+    ) -> Self {
         let raw_host = database.url.host();
         let host = raw_host
             .strip_prefix('[')
@@ -197,17 +207,26 @@ impl ReadinessProbe {
         // connects to the broker and is what should refuse a bad address; a readiness probe
         // that stopped a boot over one would be a health check deciding whether the process may
         // run, which is the wrong way round.
-        let optional = outbox
-            .ironbus_addr
+        // DECLARATION ORDER IS REPORT ORDER: the first absent component names the tier. The
+        // backbone is first because a queue that is not draining is a worse thing to be told
+        // about than a cache that is not answering.
+        let mut optional = Vec::new();
+        if let Some((host, port)) = outbox.ironbus_addr.as_deref().and_then(split_host_port) {
+            optional.push(OptionalComponent {
+                tier: DegradedTier::BackboneAbsent,
+                address: (host, port),
+            });
+        }
+        if let Some((host, port)) = hot_state
+            .ironcache_addr
             .as_deref()
             .and_then(split_host_port)
-            .map(|(host, port)| {
-                vec![OptionalComponent {
-                    tier: DegradedTier::BackboneAbsent,
-                    address: (host, port),
-                }]
-            })
-            .unwrap_or_default();
+        {
+            optional.push(OptionalComponent {
+                tier: DegradedTier::AcceleratorAbsent,
+                address: (host, port),
+            });
+        }
         Self {
             host,
             port: database.url.port().unwrap_or(5432),
@@ -296,7 +315,8 @@ mod tests {
         )
         .expect("valid")
         .config;
-        let probe = ReadinessProbe::from_config(&config.database, &config.outbox);
+        let probe =
+            ReadinessProbe::from_config(&config.database, &config.outbox, &config.hot_state);
         assert_eq!(probe.host, "db.internal");
         assert_eq!(probe.port, 6000);
     }
@@ -307,7 +327,8 @@ mod tests {
             Config::from_toml_str("[database]\nurl = \"postgres://[::1]/x\"\n", "<inline>")
                 .expect("valid")
                 .config;
-        let probe = ReadinessProbe::from_config(&config.database, &config.outbox);
+        let probe =
+            ReadinessProbe::from_config(&config.database, &config.outbox, &config.hot_state);
         assert_eq!(probe.host, "::1");
         assert_eq!(probe.port, 5432);
     }
@@ -462,7 +483,8 @@ mod wiring_tests {
             config.outbox.ironbus_addr.is_none(),
             "the shipped default has no backbone, or this test is measuring a changed default"
         );
-        let probe = ReadinessProbe::from_config(&config.database, &config.outbox);
+        let probe =
+            ReadinessProbe::from_config(&config.database, &config.outbox, &config.hot_state);
         assert!(
             probe.optional.is_empty(),
             "a Postgres-only deployment must declare nothing to probe"
@@ -477,7 +499,8 @@ mod wiring_tests {
         // it. This is the assertion that would have failed.
         let mut config = Config::default();
         config.outbox.ironbus_addr = Some("broker.internal:17654".to_owned());
-        let probe = ReadinessProbe::from_config(&config.database, &config.outbox);
+        let probe =
+            ReadinessProbe::from_config(&config.database, &config.outbox, &config.hot_state);
 
         assert_eq!(
             probe.optional.len(),
@@ -492,6 +515,79 @@ mod wiring_tests {
     }
 
     #[test]
+    fn a_configured_accelerator_becomes_a_declared_component() {
+        // THE VARIANT THIS FILE REMOVED, EARNED BACK. `AcceleratorAbsent` was deleted because
+        // no deployment could attach an accelerator, so the tier read as wired while being
+        // unreachable. `hot_state.ironcache_addr` is what changed: there is now something to
+        // probe, and this is the assertion that makes the variant honest rather than decorative.
+        let mut config = Config::default();
+        config.hot_state.ironcache_addr = Some("cache.internal:6379".to_owned());
+        let probe =
+            ReadinessProbe::from_config(&config.database, &config.outbox, &config.hot_state);
+
+        assert_eq!(probe.optional.len(), 1);
+        assert_eq!(probe.optional[0].tier, DegradedTier::AcceleratorAbsent);
+        assert_eq!(
+            probe.optional[0].address,
+            ("cache.internal".to_owned(), 6379)
+        );
+    }
+
+    #[test]
+    fn a_deployment_with_no_accelerator_declares_nothing_to_probe() {
+        // The shipped default. IronAuth is complete on Postgres alone, so a deployment that
+        // declares no accelerator can never be reported as missing one.
+        let config = Config::default();
+        assert!(config.hot_state.ironcache_addr.is_none());
+        let probe =
+            ReadinessProbe::from_config(&config.database, &config.outbox, &config.hot_state);
+        assert!(probe.optional.is_empty());
+    }
+
+    #[test]
+    fn the_backbone_is_reported_before_the_accelerator() {
+        // DECLARATION ORDER IS REPORT ORDER, and the order is a judgement: a queue that is not
+        // draining is a worse thing to be told about than a cache that is not answering. With
+        // both absent an operator should see the backbone.
+        let mut config = Config::default();
+        config.outbox.ironbus_addr = Some("broker.internal:17654".to_owned());
+        config.hot_state.ironcache_addr = Some("cache.internal:6379".to_owned());
+        let probe =
+            ReadinessProbe::from_config(&config.database, &config.outbox, &config.hot_state);
+
+        assert_eq!(probe.optional.len(), 2);
+        assert_eq!(probe.optional[0].tier, DegradedTier::BackboneAbsent);
+        assert_eq!(probe.optional[1].tier, DegradedTier::AcceleratorAbsent);
+    }
+
+    #[test]
+    fn a_malformed_accelerator_address_is_ignored_rather_than_fatal() {
+        // Same reasoning as the backbone: a readiness probe must not decide whether the
+        // process may run.
+        let mut config = Config::default();
+        config.hot_state.ironcache_addr = Some("cache.internal".to_owned());
+        let probe =
+            ReadinessProbe::from_config(&config.database, &config.outbox, &config.hot_state);
+        assert!(probe.optional.is_empty());
+    }
+
+    #[test]
+    fn every_tier_has_a_distinct_stable_token() {
+        // ALL and token() are a wire contract: an alert keyed on a token must not silently
+        // stop matching, and two tiers sharing one token would make a body ambiguous.
+        let tokens: Vec<&str> = DegradedTier::ALL.iter().map(|t| t.token()).collect();
+        let mut unique = tokens.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            tokens.len(),
+            unique.len(),
+            "two tiers share a token: {tokens:?}"
+        );
+        assert!(tokens.contains(&"accelerator_absent"));
+    }
+
+    #[test]
     fn a_malformed_backbone_address_is_ignored_rather_than_fatal() {
         // A READINESS PROBE MUST NOT DECIDE WHETHER THE PROCESS MAY RUN. The outbox worker is
         // what connects to the broker and is what should refuse a bad address; failing a boot
@@ -499,7 +595,8 @@ mod wiring_tests {
         for bad in ["no-port", "broker:not-a-number", ":17654", ""] {
             let mut config = Config::default();
             config.outbox.ironbus_addr = Some(bad.to_owned());
-            let probe = ReadinessProbe::from_config(&config.database, &config.outbox);
+            let probe =
+                ReadinessProbe::from_config(&config.database, &config.outbox, &config.hot_state);
             assert!(
                 probe.optional.is_empty(),
                 "{bad:?} was accepted as an address to probe"
@@ -511,7 +608,8 @@ mod wiring_tests {
     fn a_bracketed_ipv6_backbone_keeps_its_host() {
         let mut config = Config::default();
         config.outbox.ironbus_addr = Some("[::1]:17654".to_owned());
-        let probe = ReadinessProbe::from_config(&config.database, &config.outbox);
+        let probe =
+            ReadinessProbe::from_config(&config.database, &config.outbox, &config.hot_state);
         assert_eq!(
             probe.optional.first().map(|c| c.address.clone()),
             Some(("::1".to_owned(), 17654)),
