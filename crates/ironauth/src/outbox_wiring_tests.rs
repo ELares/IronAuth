@@ -824,6 +824,14 @@ async fn portal_write_consumers_are_registered_by_name() {
     // workspace stayed green -- 145 tests in this crate and 58 portal tests, the exact numbers
     // the PR offered as evidence that the wiring worked.
     //
+    // IT WENT STALE, which is the cost of the hand-written list and worth recording rather than
+    // hiding. #140 added three more consumers to the boot list (the SAML, SCIM and OIDC setup
+    // halves) and did not extend this expectation, so CI failed on every push to main for three
+    // days. The list is still written out literally, for the reason below -- but a stale
+    // expectation fails LOUDLY and in the right direction: it says the wiring changed and made
+    // someone look, which is exactly what it is for. A list read from the constants would have
+    // absorbed all three silently.
+    //
     // What that would ship is the failure `certificate_pin_inputs`'s own doc argues against: the
     // portal accepts a contact change, answers 303, writes a durable outbox row, and nothing ever
     // claims it. The holder is told "a change can take a moment to appear here" and it never
@@ -838,9 +846,18 @@ async fn portal_write_consumers_are_registered_by_name() {
     names.sort_unstable();
     assert_eq!(
         names,
-        vec!["org_contact.change", "saml_certificate.pin_request"],
-        "the portal write worker must register BOTH the certificate pin and the contact change; \
-         dropping either leaves a queue the portal fills and nothing drains"
+        vec![
+            // The SSO setup half of #140 criterion 1: the portal queues a connector and only
+            // the control plane may insert one.
+            "connector.setup_request",
+            "org_contact.change",
+            "saml_certificate.pin_request",
+            "saml_connection.setup_request",
+            "scim_connection.setup_request",
+        ],
+        "the portal write worker must register EVERY queue the portal fills; dropping one \
+         leaves a surface that accepts a change, answers 303, writes a durable outbox row, \
+         and nothing ever claims it"
     );
 }
 
