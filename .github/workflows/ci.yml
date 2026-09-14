@@ -366,62 +366,6 @@ jobs:
   # broker degrades to exactly the Postgres behaviour) and everything else about the
   # outbox is mode-independent and already covered above. Running the workspace twice
   # would double a 30-minute job to prove nothing extra.
-  ironcache-matrix:
-    name: hot state (ironcache mode)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    # ISSUE #146 CRITERION 6: "the full test suite passes in both modes (Postgres-only and
-    # IronCache-attached)". The Postgres-only half is every other job in this file, which runs
-    # with no accelerator and no IRONCACHE_ADDR; this job is the other half.
-    #
-    # WHAT IT CAN AND CANNOT SHOW. `crates/ironauth-hot/tests/ironcache.rs` SKIPS every case
-    # when IRONCACHE_ADDR is unset, printing why, so those tests are inert in every other lane
-    # and binding only here. That is the whole reason this job exists: without it the IronCache
-    # implementation would be code that compiles and that nothing ever runs.
-    env:
-      IRONCACHE_ADDR: 127.0.0.1:17379
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # Built from git rather than crates.io: IronCache publishes NO crate at all, client or
-      # server. Pinned to an exact COMMIT and not a branch, for the reason the IronBus lane
-      # below gives: a branch lets another repository silently change what this lane tests.
-      # This SHA is the revision the implementation was actually developed and verified
-      # against, locally, before this job existed.
-      - name: install the IronCache server
-        run: >-
-          cargo install --locked --git https://github.com/ELares/IronCache
-          --rev 4d97ddd927890b0590a5aeed2f9f80c388826378 ironcache
-      - name: start the cache
-        run: |
-          ironcache server --port 17379 --metrics-addr off &
-          # Wait for the listener rather than sleeping a guess: a fixed sleep is either flaky
-          # on a slow runner or wasted time on a fast one.
-          for _ in $(seq 1 60); do
-            if nc -z 127.0.0.1 17379; then echo "cache up"; exit 0; fi
-            sleep 1
-          done
-          echo "cache did not come up" >&2
-          exit 1
-      # THE SKIP GUARD IS ITSELF CHECKED, because a suite that skips silently is
-      # indistinguishable from one that passes. If the server were not actually reachable
-      # every test would skip and the job would still be green, so this fails the job on any
-      # SKIPPED line -- the one output that must not appear in the lane whose purpose is to
-      # stop them skipping.
-      - name: hot state against a real IronCache
-        run: |
-          cargo test -p ironauth-hot --features ironcache --test ironcache \
-            -- --nocapture 2>&1 | tee /tmp/ironcache-tests.log
-          if grep -q "SKIPPED" /tmp/ironcache-tests.log; then
-            echo "a test skipped in the lane that exists to run it" >&2
-            exit 1
-          fi
-      # The composition and the classification suites too: they are mode-independent by
-      # construction (they run against fakes), and this costs one already-cached binary.
-      - name: the seam's own suites, with the feature enabled
-        run: cargo test -p ironauth-hot --features ironcache
-
   ironbus-matrix:
     name: outbox (ironbus mode)
     runs-on: ubuntu-latest
@@ -521,6 +465,85 @@ jobs:
       # would have had. `ironauth-admin` has no `ironbus` feature either, and
       # `webhook_delivery` reads no `IRONBUS_ADDR`, so it too links no IronBus code. That is
       # issue #106's to decide on, not this issue's to quietly copy.
+
+  ironcache-matrix:
+    name: hot state (ironcache mode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # ISSUE #146 CRITERION 6: "the full test suite passes in both modes (Postgres-only and
+    # IronCache-attached)". The Postgres-only half is every other job in this file, which runs
+    # with no accelerator and no IRONCACHE_ADDR.
+    #
+    # THIS JOB IS NOT YET THE WHOLE OTHER HALF, and saying it is would be the easier sentence.
+    # It runs ONE CRATE with an accelerator attached, because `ironauth-hot` is the only crate
+    # that has an IronCache code path: nothing else in the workspace takes a `HotState`, so
+    # running the workspace here would execute the same Postgres-only code a second time and
+    # prove nothing. The lane grows to match the criterion when the registry's uses acquire
+    # call sites.
+    #
+    # WHAT IT CAN AND CANNOT SHOW. `crates/ironauth-hot/tests/ironcache.rs` SKIPS every case
+    # when IRONCACHE_ADDR is unset, printing why, so those tests are inert in every other lane
+    # and binding only here. That is the whole reason this job exists: without it the IronCache
+    # implementation would be code that compiles and that nothing ever runs.
+    env:
+      IRONCACHE_ADDR: 127.0.0.1:17379
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Built from git rather than crates.io: IronCache publishes NO crate at all, client or
+      # server. Pinned to an exact COMMIT and not a branch, for the reason the IronBus lane
+      # below gives: a branch lets another repository silently change what this lane tests.
+      # This SHA is the revision the implementation was actually developed and verified
+      # against, locally, before this job existed.
+      - name: install the IronCache server
+        run: >-
+          cargo install --locked --git https://github.com/ELares/IronCache
+          --rev 4d97ddd927890b0590a5aeed2f9f80c388826378 ironcache
+      - name: start the cache
+        run: |
+          ironcache server --port 17379 --metrics-addr off &
+          # Wait for the listener rather than sleeping a guess: a fixed sleep is either flaky
+          # on a slow runner or wasted time on a fast one.
+          for _ in $(seq 1 60); do
+            if nc -z 127.0.0.1 17379; then echo "cache up"; exit 0; fi
+            sleep 1
+          done
+          echo "cache did not come up" >&2
+          exit 1
+      # `set -o pipefail` IS LOAD-BEARING, not hygiene. GitHub runs each `run:` under
+      # `bash -e {0}` with no pipefail, so a pipeline reports the LAST command's status: without
+      # this line the step's exit code is `tee`'s, which is 0 whatever cargo did, and a suite
+      # where every test failed would report success. The pipe is here so the guard below can
+      # read the output; it must not also decide the step.
+      #
+      # WHAT THE SKIPPED GUARD DOES AND DOES NOT CATCH. Every case in the suite skips when
+      # IRONCACHE_ADDR is unset or empty, which is correct in every other lane and would make
+      # THIS one green while running nothing. The guard fires when that variable fails to reach
+      # the suite: this `env:` block removed, or the name changed on one side only.
+      #
+      # It does NOT catch an unreachable server, and an earlier version of this comment said it
+      # did. With the variable set and the cache down, `connect` returns within its own bound
+      # and the tests PANIC rather than skipping, so no SKIPPED line appears. That case is
+      # caught by the readiness loop above and by cargo's own exit status, which is why the
+      # pipefail line matters.
+      - name: hot state against a real IronCache
+        run: |
+          set -o pipefail
+          cargo test -p ironauth-hot --features ironcache --test ironcache \
+            -- --nocapture 2>&1 | tee /tmp/ironcache-tests.log
+          if grep -q "SKIPPED" /tmp/ironcache-tests.log; then
+            echo "a test skipped in the lane that exists to run it" >&2
+            exit 1
+          fi
+      # THE REST OF THE CRATE with the feature enabled: the classification, bounds and
+      # composition suites, which run against fakes and are mode-independent by construction.
+      #
+      # It re-runs the live-server suite too, because this crate declares no explicit test
+      # targets and a bare `cargo test -p` runs them all. That is not waste: it is the run whose
+      # exit status is not behind a pipe, and it costs one already-cached binary.
+      - name: the seam's own suites, with the feature enabled
+        run: cargo test -p ironauth-hot --features ironcache
 
   msrv:
     name: msrv (1.85)

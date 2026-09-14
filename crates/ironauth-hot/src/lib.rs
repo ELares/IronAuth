@@ -12,12 +12,14 @@
 //! tenant config, an introspection result, a one-time-use marker, a rate counter -- is meant to
 //! reach it through [`HotState`].
 //!
-//! THE POSTGRES IMPLEMENTATION SHIPS, in `ironauth-store` (`hot_state::PgHotState`), and it is
-//! what makes the covenant's "complete on PostgreSQL alone" true of this seam. The IronCache one
-//! it accelerates is still to come.
+//! BOTH IMPLEMENTATIONS SHIP. `ironauth-store`'s `hot_state::PgHotState` is the one that is
+//! always there and is what makes the covenant's "complete on PostgreSQL alone" true of this
+//! seam. [`ironcache::IronCacheHotState`] is the accelerator in front of it, behind the
+//! off-by-default `ironcache` feature, because a deployment that never attaches one should not
+//! compile a client for it. [`Tiered`] composes them.
 //!
 //! WHAT IS STILL ABSENT IS CALLERS. [`registry`] declares seven uses and no request path reaches
-//! any of them yet, so this crate is a contract with an implementation and no traffic. That is
+//! any of them yet, so this crate is a contract with two implementations and no traffic. That is
 //! worth stating here rather than discovering: a use added to the registry does not become live
 //! by being declared.
 //!

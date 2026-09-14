@@ -4,10 +4,16 @@
 //!
 //! # What this is, and what it is not
 //!
-//! It is the FAST tier of a [`crate::Tiered`], and nothing else. It is never the only copy of
-//! anything: every value it holds is also in the durable tier, every claim is settled there, and
-//! a deployment that never attaches one behaves identically and more slowly. If this file were
-//! deleted the product would still be correct, which is the property the whole seam exists for.
+//! It is MEANT to be the fast tier of a [`crate::Tiered`], and that composition is what makes
+//! every value it holds also present in the durable tier and every claim settled there. A
+//! deployment that never attaches one behaves identically and more slowly; delete this file and
+//! the product is still correct, which is the property the whole seam exists for.
+//!
+//! NOTHING IN THE TYPE SYSTEM CONFINES IT TO A `Tiered`, and it is worth saying so rather than
+//! writing "it is never the only copy of anything" as though it were an invariant. This is an
+//! ordinary [`HotState`]; a caller that constructed one and used it directly would have a cache
+//! that is the only copy, and single-use markers settled in a store that forgets them on
+//! restart. The composition is the contract, and it is a convention this file cannot enforce.
 //!
 //! # Why a Redis client and not an IronCache one
 //!
@@ -47,6 +53,26 @@ use crate::{Answer, HotError, HotState, HotUse, Ttl};
 ///
 /// Short, because it is paid on every key.
 const NAMESPACE: &str = "ira";
+
+/// What separates the components of a key.
+///
+/// A CONSTANT because two places depend on it being the same character: the key format, and the
+/// check in [`IronCacheHotState::new`] that no scope component contains it. Spelling it twice
+/// would let one of them change.
+const SEPARATOR: char = ':';
+
+/// # Two deployments sharing one IronCache will collide
+///
+/// [`NAMESPACE`] is a fixed literal, so two IronAuth deployments pointed at the same server use
+/// the same keyspace, and a tenant id that exists in both reads across them. That is not a
+/// tenant-isolation hole within a deployment -- it is two deployments that were configured to
+/// share a cache and were not told they must not.
+///
+/// IT IS UNFIXED ON PURPOSE, for now. A configurable namespace is a config key, a validation
+/// rule and a migration story for anyone who changes it, and #146 has no requirement that asks
+/// for one. Sharing a cache between deployments is also the sort of thing an operator does
+/// knowingly. Written down so the next person meets it here rather than in production.
+const _SHARED_SERVER_HAZARD: () = ();
 
 /// An IronCache (or any RESP server) used as the fast tier.
 ///
@@ -91,8 +117,32 @@ impl IronCacheHotState {
     /// The scope is BOUND HERE rather than passed per call for the same reason it is in the
     /// Postgres adapter: a caller holding one of these already knows which tenant it serves, and
     /// a per-call scope is a parameter a call site can get wrong.
+    /// # Panics
+    ///
+    /// If `tenant` or `environment` is empty, or contains the key separator.
+    ///
+    /// A PANIC AND NOT A `Result`, because there is no sensible recovery and the alternative is
+    /// worse than a crash. An empty scope builds `ira:::jwks:k`, identical for every tenant in
+    /// the deployment, and a component containing a colon makes the encoding ambiguous -- both
+    /// are silent cross-tenant reads, which is the failure this whole type is arranged to
+    /// prevent. A caller cannot handle that meaningfully at runtime; it is a wiring mistake, and
+    /// it should stop the process at the point it is made rather than serve wrong answers.
+    ///
+    /// Neither can happen with ids from `ironauth-store`, which render as a prefix and url-safe
+    /// base64. The check is here because this constructor takes `&str` and cannot insist on
+    /// that.
     #[must_use]
     pub fn new(connection: ConnectionManager, tenant: &str, environment: &str) -> Self {
+        assert!(
+            !tenant.is_empty() && !environment.is_empty(),
+            "a hot-state scope component is empty, which makes this key identical for every \
+             tenant in the deployment"
+        );
+        assert!(
+            !tenant.contains(SEPARATOR) && !environment.contains(SEPARATOR),
+            "a hot-state scope component contains {SEPARATOR:?}, which makes the key encoding \
+             ambiguous between tenants"
+        );
         Self {
             connection,
             tenant: tenant.to_owned(),
@@ -128,8 +178,21 @@ impl IronCacheHotState {
     /// connection reset than on a timeout than on a server error: all three mean this tier did
     /// not answer, and [`crate::Tiered`] responds to all three by going to the durable tier.
     /// Splitting them would be a distinction with no consumer.
-    fn unavailable(_error: &redis::RedisError) -> HotError {
-        HotError::Unavailable
+    fn unavailable(error: &redis::RedisError) -> HotError {
+        // THE SERVER ANSWERED SOMETHING THIS CANNOT USE is a different fact from IT DID NOT
+        // ANSWER, and `HotError` has a variant for each. `Parse` and `UnexpectedReturnType` are
+        // the two kinds `redis` 1.7 reports when a reply arrived and could not be turned into
+        // the type asked for -- a value that is not the bytes a `get` wants, a `SET` answering
+        // something other than a status. That is `Malformed`, and it is not fixed by retrying or
+        // by going to the durable tier for a second opinion about this tier's health.
+        //
+        // Everything else -- a connection reset, a timeout, a server error, an auth failure --
+        // means the tier did not answer. A caller cannot act differently on which, so they
+        // collapse into `Unavailable`, which is the value [`crate::Tiered`] treats as a miss.
+        match error.kind() {
+            redis::ErrorKind::Parse | redis::ErrorKind::UnexpectedReturnType => HotError::Malformed,
+            _ => HotError::Unavailable,
+        }
     }
 }
 
@@ -226,7 +289,10 @@ impl HotState for IronCacheHotState {
 /// # It is TIME-BOXED, because the client underneath is not
 ///
 /// `ConnectionManager::new` performs the first connection itself and RETRIES WITH BACKOFF before
-/// giving up. Measured against an address nothing listens on, that is about nine seconds. Nine
+/// giving up. Measured against an address nothing listens on, that was about nine seconds in the runs
+/// this was developed against. The backoff is retried and jittered, so that is an observation
+/// and not a constant -- which is itself the argument for a bound rather than for relying on
+/// the client to give up promptly. Nine
 /// seconds is not a failure -- it eventually returns the right answer -- but it is nine seconds
 /// of boot spent on a component this crate exists to make optional, which is the same "mandatory
 /// by the back door" the paragraph below is about, arriving as latency instead of as an error.
