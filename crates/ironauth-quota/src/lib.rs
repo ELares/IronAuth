@@ -79,6 +79,9 @@ use std::time::{Duration, Instant};
 use ironauth_config::{QuotaConfig, ScopeQuotaConfig};
 use ironauth_env::Clock;
 
+/// The five-layer request-plane limiter (issue #150), built on the buckets above.
+pub mod layered;
+
 /// A tenant identifier used as a quota bucket key.
 ///
 /// This is a lightweight opaque key, distinct from the store's scoped id types,
@@ -207,13 +210,24 @@ pub struct Limit {
 impl Limit {
     /// A limit with the given sustained per-second rate and burst capacity.
     ///
-    /// Both are clamped to be non-negative. A burst of zero is not a limit; use
+    /// Both are clamped to be non-negative AND finite. A burst of zero is not a limit; use
     /// [`ScopeLimits`] with `None` for an unlimited dimension instead.
+    ///
+    /// # Why non-finite is clamped rather than merely documented
+    ///
+    /// An infinite refill rate makes `elapsed * refill` evaluate to `NaN` whenever elapsed
+    /// is zero, and `NaN.min(burst)` returns `burst` -- so the bucket silently reads as
+    /// full on every request and the limiter stops limiting. That is a fail-OPEN laundered
+    /// through the arithmetic, with nothing in the type system to catch it, so it is
+    /// removed at the only door that builds a `Limit`.
     #[must_use]
     pub fn new(refill_per_sec: f64, burst: f64) -> Self {
+        // `NaN.max(0.0)` returns 0.0 (Rust's f64::max prefers the non-NaN operand), so NaN
+        // already lands safely; infinity is the case that needs the explicit guard.
+        let finite = |value: f64| if value.is_finite() { value } else { 0.0 };
         Self {
-            refill_per_sec: refill_per_sec.max(0.0),
-            burst: burst.max(0.0),
+            refill_per_sec: finite(refill_per_sec.max(0.0)),
+            burst: finite(burst.max(0.0)),
         }
     }
 
@@ -1014,7 +1028,7 @@ fn u64_to_f64(value: u64) -> f64 {
     clippy::cast_sign_loss,
     reason = "value is clamped non-negative and floored before the cast"
 )]
-fn f64_to_u64_floor(value: f64) -> u64 {
+pub(crate) fn f64_to_u64_floor(value: f64) -> u64 {
     value.max(0.0).floor() as u64
 }
 
@@ -1024,7 +1038,7 @@ fn f64_to_u64_floor(value: f64) -> u64 {
     clippy::cast_sign_loss,
     reason = "value is clamped non-negative and ceiled before the cast"
 )]
-fn f64_to_u64_ceil(value: f64) -> u64 {
+pub(crate) fn f64_to_u64_ceil(value: f64) -> u64 {
     value.max(0.0).ceil() as u64
 }
 
