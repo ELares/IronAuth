@@ -71,6 +71,20 @@ pub struct RekeyReport {
     /// `wrapped_kek` is an empty blob that no master can open, and rewrapping is meaningless
     /// for a key whose whole point is to be unrecoverable.
     pub skipped_destroyed: usize,
+    /// Rows that CHANGED between being read and being written, so the guarded write matched
+    /// nothing and left them alone.
+    ///
+    /// Almost always a concurrent crypto-shred, which is exactly the row a rotation must not
+    /// touch: writing back the bytes read before the shred would restore recoverable key
+    /// material for a tenant being erased. Counted rather than retried, because the right
+    /// response is for a human to look.
+    pub contended: usize,
+    /// Live KEKs still under the old master when the run finished, counted AFTER the loop.
+    ///
+    /// Non-zero means the rotation is incomplete: KEKs are provisioned lazily under whichever
+    /// master the inserting process holds, so a server still running during the rotation can
+    /// add rows the work set never saw. Re-running converges.
+    pub remaining_under_old: usize,
 }
 
 /// Rewrap every live tenant KEK from one platform master key to another.
@@ -143,15 +157,30 @@ impl<'a> Rekey<'a> {
                 &crate::repository::kek_wrap_aad(scope, row.version, self.to.id()),
                 &kek,
             );
-            crate::repository::store_rewrapped_kek(
+            // Guarded on the bytes and the master this row was READ with, and refusing a
+            // destroyed row outright. The status above is the SNAPSHOT's, and a shred that
+            // landed since would not be seen there; the predicate is what actually protects
+            // the erasure.
+            let written = crate::repository::store_rewrapped_kek(
                 self.pool,
                 &row.id,
+                &row.wrapped_kek,
+                self.from.id(),
                 resealed.as_bytes(),
                 self.to.id(),
             )
             .await?;
-            report.rewrapped += 1;
+            if written {
+                report.rewrapped += 1;
+            } else {
+                report.contended += 1;
+            }
         }
+
+        // The closing check the snapshot cannot give. Counted after the loop, so it sees rows
+        // that appeared during it.
+        report.remaining_under_old =
+            crate::repository::count_live_keks_under_master(self.pool, self.from.id()).await?;
         Ok(report)
     }
 

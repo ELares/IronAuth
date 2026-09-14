@@ -172,6 +172,103 @@ async fn an_interrupted_rekey_resumes_and_converges_without_redoing_finished_row
     assert_eq!(again.rewrapped, 0);
 }
 
+/// A CRYPTO-SHRED THAT LANDS MID-ROTATION MUST NOT BE UNDONE.
+///
+/// The rotation reads every row up front and writes them back one at a time. A shred that
+/// commits in between sets `wrapped_kek = ''` and `status = 'destroyed'`, and an unguarded
+/// write-back would restore recoverable key material derived from the bytes read BEFORE the
+/// shred -- while `status` and `destroyed_at`, columns the rotation does not touch, stayed as
+/// the shred left them. The row would read as destroyed and decrypt anyway, because the KEK
+/// read path filters on tenant, environment and version and NOT on status.
+///
+/// Simulated by shredding the row and then running: the snapshot the loop works from is taken
+/// inside `run`, so the guard on the WRITE is what has to refuse it, not the status check on
+/// the read.
+#[tokio::test]
+async fn a_shredded_kek_is_never_rewrapped_back_into_recoverable_material() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let scope = db.seed_scope(&env).await;
+    let old = master("master-old", 0x0001);
+    let new = master("master-new", 0x0002);
+    provision(&db, &env, scope, &old).await;
+
+    // The shred, exactly as the tenant-purge path writes it.
+    sqlx::query(
+        "UPDATE tenant_keks SET wrapped_kek = ''::bytea, status = 'destroyed' \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("shred the KEK");
+
+    let report = Rekey::new(db.owner_pool(), &old, &new, env.entropy())
+        .run()
+        .await
+        .expect("the rotation runs");
+    assert_eq!(
+        report.rewrapped, 0,
+        "a destroyed KEK must never be rewrapped"
+    );
+
+    // The blob is still empty: nothing was written back.
+    let blob: Vec<u8> = sqlx::query(
+        "SELECT wrapped_kek FROM tenant_keks WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read the blob")
+    .get("wrapped_kek");
+    assert!(
+        blob.is_empty(),
+        "the shredded blob must stay empty; rewrapping it would resurrect the tenant's data"
+    );
+}
+
+/// A row that appears AFTER the work set was read leaves the rotation incomplete, and the run
+/// must say so rather than report success.
+///
+/// KEKs are provisioned lazily under whichever master the inserting process holds, so a server
+/// still running during a rotation adds rows the snapshot never saw.
+#[tokio::test]
+async fn a_kek_created_after_the_snapshot_is_reported_as_remaining() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let old = master("master-old", 0x0001);
+    let new = master("master-new", 0x0002);
+
+    let first = db.seed_scope(&env).await;
+    provision(&db, &env, first, &old).await;
+
+    let done = Rekey::new(db.owner_pool(), &old, &new, env.entropy())
+        .run()
+        .await
+        .expect("the first rotation runs");
+    assert_eq!(done.rewrapped, 1);
+    assert_eq!(
+        done.remaining_under_old, 0,
+        "with nothing else present the rotation is complete"
+    );
+
+    // A live server provisions a new scope under the OLD master, as it would mid-rotation.
+    let late = db.seed_scope(&env).await;
+    provision(&db, &env, late, &old).await;
+
+    let after = Rekey::new(db.owner_pool(), &old, &new, env.entropy())
+        .run()
+        .await
+        .expect("the rotation runs again");
+    assert_eq!(
+        after.rewrapped, 1,
+        "the late row is picked up by the next run"
+    );
+    assert_eq!(after.remaining_under_old, 0);
+}
+
 /// The wrong old master must stop the run, not skip the row.
 ///
 /// A rekey that shrugged off a KEK it could not open would report success while leaving that

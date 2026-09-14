@@ -8162,6 +8162,34 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
                     "storage rekey: {} rewrapped, {} already current, {} destroyed and skipped.",
                     report.rewrapped, report.already_current, report.skipped_destroyed
                 );
+                if report.contended > 0 {
+                    println!(
+                        "\nstorage rekey: {} row(s) CHANGED while this ran and were left \
+                         alone.\n\
+                         \n\
+                         Each was read under the old master and no longer matched when the \
+                         write came round, which almost always means a crypto-shred landed \
+                         in between. Writing the pre-shred bytes back would have restored \
+                         recoverable key material for a tenant being erased, so the write \
+                         was refused. Check what changed before re-running.",
+                        report.contended
+                    );
+                }
+                // A rotation that leaves tenants on the old key is not done, and saying so
+                // matters more than an exit code an operator reads as "finished".
+                if report.remaining_under_old > 0 {
+                    println!(
+                        "\nstorage rekey: INCOMPLETE. {} live KEK(s) are still under {}.\n\
+                         \n\
+                         KEKs are provisioned lazily under whichever master the inserting \
+                         process holds, so a server still running during the rotation adds \
+                         rows this run never saw. Stop the fleet and run it again; it \
+                         resumes where it is, not where it started.",
+                        report.remaining_under_old,
+                        from.id()
+                    );
+                    return ExitCode::FAILURE;
+                }
                 if report.rewrapped == 0 && report.already_current > 0 {
                     println!("storage rekey: nothing to do; the rekey was already complete.");
                 }
