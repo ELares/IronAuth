@@ -103,6 +103,7 @@ pub mod promotion;
 pub mod rar;
 pub mod recovery;
 mod redirect;
+pub mod rekey;
 mod repository;
 pub mod risk;
 mod scope;
@@ -256,6 +257,7 @@ pub use recovery::{
     RecoveryState,
 };
 pub use redirect::{redirect_uri_is_registrable, redirect_uri_matches};
+pub use rekey::{Rekey, RekeyReport};
 pub use repository::{
     AbuseRepo, AcceptedInvitation, AccessDecision, AccessTokenResolution, AccountCredentialRepo,
     AccountCredentialSummary, AccountLinkMethod, AccountLinkRecord, AccountLinkRepo,

@@ -102,6 +102,27 @@ impl Store {
         Ok(row.get::<bool, _>("unrestricted"))
     }
 
+    /// Rewrap every live tenant KEK from one platform master key to another (issue #153).
+    ///
+    /// The pool stays private, as everywhere else on this type. See [`crate::rekey`] for what
+    /// the operation is, why it resumes without a cursor, and why it is offline.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if the connected role is subject to row-level security, if
+    /// the two master keys share an id, or if a KEK does not open under `from`;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn rekey_master(
+        &self,
+        from: &ironauth_jose::MasterKey,
+        to: &ironauth_jose::MasterKey,
+    ) -> Result<crate::rekey::RekeyReport, StoreError> {
+        let env = ironauth_env::Env::system();
+        crate::rekey::Rekey::new(&self.pool, from, to, env.entropy())
+            .run()
+            .await
+    }
+
     /// Connect to Postgres at `url` with a bounded pool.
     ///
     /// In production `url` should authenticate as the low-privilege

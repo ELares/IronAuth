@@ -142,6 +142,10 @@ fn main() -> ExitCode {
         // migration REMOVES the old shape, and the point of the expand-contract lifecycle
         // is that a human decides when that happens, not a pod restart.
         Some("migrate") => migrate(&mut args),
+        // Rotate the platform master key (issue #153). Operator-plane, like migrate and
+        // doctor: it reads and rewrites platform key material, so it connects as the role
+        // migrations run as rather than as the server's own credential.
+        Some("storage") => storage(&mut args),
         // The config-as-code subcommands (issue #51) dispatch into ironauth-apply.
         // The verb is re-prepended so that crate parses its own argument vector.
         Some(verb @ ("validate" | "plan" | "apply" | "drift")) => {
@@ -8055,12 +8059,179 @@ mod migrate_cli_tests {
     }
 }
 
+/// Run the `storage` subcommand family (issue #153). Today: `rekey`.
+///
+/// # Offline, and it says so
+///
+/// A server holds ONE master key. Between the first rewrapped KEK and the last, a running
+/// process cannot open both shapes, so this is an offline operation until the read path
+/// carries a master key ring. It refuses nothing on that account -- there is no way for it
+/// to tell -- so the help text and the banner say it plainly instead.
+#[allow(clippy::too_many_lines)]
+fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let verb = args.next();
+    if verb.as_deref() != Some("rekey") {
+        eprintln!("ironauth storage: expected a subcommand. The only one today is `rekey`.");
+        eprintln!(
+            "usage: ironauth storage rekey --url DSN --from-master-key ID:HEX --to-master-key ID:HEX"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let mut url: Option<String> = None;
+    let mut from: Option<String> = None;
+    let mut to: Option<String> = None;
+    while let Some(arg) = args.next() {
+        let mut take = |target: &mut Option<String>, flag: &str| -> bool {
+            if let Some(value) = args.next() {
+                *target = Some(value);
+                true
+            } else {
+                eprintln!("ironauth storage rekey: {flag} requires a value");
+                false
+            }
+        };
+        let ok = if let Some(v) = arg.strip_prefix("--url=") {
+            url = Some(v.to_owned());
+            true
+        } else if arg == "--url" {
+            take(&mut url, "--url")
+        } else if let Some(v) = arg.strip_prefix("--from-master-key=") {
+            from = Some(v.to_owned());
+            true
+        } else if arg == "--from-master-key" {
+            take(&mut from, "--from-master-key")
+        } else if let Some(v) = arg.strip_prefix("--to-master-key=") {
+            to = Some(v.to_owned());
+            true
+        } else if arg == "--to-master-key" {
+            take(&mut to, "--to-master-key")
+        } else {
+            eprintln!("ironauth storage rekey: unrecognized argument '{arg}'");
+            false
+        };
+        if !ok {
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let (Some(url), Some(from), Some(to)) = (url, from, to) else {
+        eprintln!(
+            "ironauth storage rekey: --url, --from-master-key and --to-master-key are all required"
+        );
+        return ExitCode::FAILURE;
+    };
+    let (Some(from), Some(to)) = (parse_master_key(&from), parse_master_key(&to)) else {
+        eprintln!(
+            "ironauth storage rekey: a master key is ID:HEX, where HEX is 64 hex characters \
+             (32 bytes). The id is bound into every wrapped KEK's AAD, so it is part of the \
+             key rather than a label."
+        );
+        return ExitCode::FAILURE;
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ironauth storage rekey: cannot start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    runtime.block_on(async move {
+        let store = match Store::connect(&url).await {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("ironauth storage rekey: cannot connect: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "storage rekey: rewrapping every live KEK from {} to {}.",
+            from.id(),
+            to.id()
+        );
+        println!(
+            "storage rekey: OFFLINE operation. A running server holds one master key and \n\
+             cannot open both shapes while this runs. Stop the fleet, or run it against a \n\
+             quiesced deployment."
+        );
+        match store.rekey_master(&from, &to).await {
+            Ok(report) => {
+                println!(
+                    "storage rekey: {} rewrapped, {} already current, {} destroyed and skipped.",
+                    report.rewrapped, report.already_current, report.skipped_destroyed
+                );
+                if report.contended > 0 {
+                    println!(
+                        "\nstorage rekey: {} row(s) CHANGED while this ran and were left \
+                         alone.\n\
+                         \n\
+                         Each was read under the old master and no longer matched when the \
+                         write came round, which almost always means a crypto-shred landed \
+                         in between. Writing the pre-shred bytes back would have restored \
+                         recoverable key material for a tenant being erased, so the write \
+                         was refused. Check what changed before re-running.",
+                        report.contended
+                    );
+                }
+                // A rotation that leaves tenants on the old key is not done, and saying so
+                // matters more than an exit code an operator reads as "finished".
+                if report.remaining_under_old > 0 {
+                    println!(
+                        "\nstorage rekey: INCOMPLETE. {} live KEK(s) are still under {}.\n\
+                         \n\
+                         KEKs are provisioned lazily under whichever master the inserting \
+                         process holds, so a server still running during the rotation adds \
+                         rows this run never saw. Stop the fleet and run it again; it \
+                         resumes where it is, not where it started.",
+                        report.remaining_under_old,
+                        from.id()
+                    );
+                    return ExitCode::FAILURE;
+                }
+                if report.rewrapped == 0 && report.already_current > 0 {
+                    println!("storage rekey: nothing to do; the rekey was already complete.");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("ironauth storage rekey: {error}");
+                eprintln!(
+                    "  Nothing was left half-written: each KEK commits on its own, and a row \
+                     still under the old master is simply picked up by the next run."
+                );
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+/// Parse `id:hex` into a master key. The id is bound into every wrapped KEK's AAD.
+fn parse_master_key(text: &str) -> Option<ironauth_jose::MasterKey> {
+    let (id, hex) = text.split_once(':')?;
+    if id.is_empty() || hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in hex.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(pair).ok()?;
+        bytes[index] = u8::from_str_radix(s, 16).ok()?;
+    }
+    Some(ironauth_jose::MasterKey::from_bytes(id, bytes))
+}
+
 fn print_help() {
     println!("ironauth {VERSION}");
     println!("A standards-first OpenID Connect identity platform.");
     println!();
     println!("USAGE:");
     println!("  ironauth serve [--config PATH]   Run the server until SIGTERM/SIGINT");
+    println!("  ironauth storage rekey --url DSN --from-master-key ID:HEX \\");
+    println!("               --to-master-key ID:HEX");
+    println!("                                   Rewrap every tenant KEK under a new platform");
+    println!("                                   master key. OFFLINE: a running server holds");
+    println!("                                   one master and cannot open both shapes");
     println!("  ironauth migrate [--config PATH] [--url DSN] [--contract | --soak DUR]");
     println!("                                   Apply the schema. Contract migrations are");
     println!("                                   DEFERRED on an upgrade: --contract is you");

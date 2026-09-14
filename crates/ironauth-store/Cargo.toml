@@ -151,6 +151,11 @@ path = "tests/contract_gate.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "rekey"
+path = "tests/rekey.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "hot_state_invalidation"
 path = "tests/hot_state_invalidation.rs"
 required-features = ["testing"]
