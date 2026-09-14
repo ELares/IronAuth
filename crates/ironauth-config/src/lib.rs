@@ -287,32 +287,6 @@ pub struct Config {
 /// this section still gets: bounded retries that end in a dead letter rather than an
 /// infinite redelivery loop, a visibility timeout longer than any handler the tree ships,
 /// and a worker count above one, because a pool of one is the singleton posture this
-/// The optional shared hot-state accelerator (issue #146).
-#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields, default)]
-pub struct HotStateConfig {
-    /// The optional IronCache accelerator: `host:port`, or [`None`] for Postgres-only.
-    ///
-    /// # What setting this does today, and what it does not
-    ///
-    /// It declares that a deployment HAS an accelerator, which is what lets readiness report
-    /// the accelerator tier: until this key existed there was nothing to probe and no state to
-    /// report, so `DegradedTier` had no variant for it.
-    ///
-    /// It does NOT yet put the cache in front of any read. `ironauth-hot` is a complete,
-    /// classified, outage-tested layer that no request path calls: it is not a dependency of
-    /// `ironauth-oidc`, `ironauth-server`, `ironauth-admin` or the binary. Wiring a first
-    /// consumer (JWKS or tenant config read-through) is the remaining #146 work, and this key
-    /// is the half of it a deployment can act on now.
-    ///
-    /// That distinction is written down rather than glossed because the alternative is a knob
-    /// that reads as "my cache is on" while nothing consults it, which is the defect this
-    /// codebase has removed once already.
-    ///
-    /// Unset is the shipped default. IronAuth is complete on Postgres alone.
-    pub ironcache_addr: Option<String>,
-}
-
 /// substrate exists to avoid.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -1378,6 +1352,32 @@ impl Default for OutboxConfig {
             metrics_sample_interval_secs: 15,
         }
     }
+}
+
+/// The optional shared hot-state accelerator (issue #146).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct HotStateConfig {
+    /// The optional IronCache accelerator: `host:port`, or [`None`] for Postgres-only.
+    ///
+    /// # What setting this does today, and what it does not
+    ///
+    /// It declares that a deployment HAS an accelerator, which is what lets readiness report
+    /// the accelerator tier: until this key existed there was nothing to probe and no state to
+    /// report, so `DegradedTier` had no variant for it.
+    ///
+    /// It does NOT yet put the cache in front of any read. `ironauth-hot` is a complete,
+    /// classified, outage-tested layer that no request path calls: it is not a dependency of
+    /// `ironauth-oidc`, `ironauth-server`, `ironauth-admin` or the binary. Wiring a first
+    /// consumer (JWKS or tenant config read-through) is the remaining #146 work, and this key
+    /// is the half of it a deployment can act on now.
+    ///
+    /// That distinction is written down rather than glossed because the alternative is a knob
+    /// that reads as "my cache is on" while nothing consults it, which is the defect this
+    /// codebase has removed once already.
+    ///
+    /// Unset is the shipped default. IronAuth is complete on Postgres alone.
+    pub ironcache_addr: Option<String>,
 }
 
 /// Headless flow API settings (issue #84).

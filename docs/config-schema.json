@@ -742,7 +742,7 @@
     },
     "HotStateConfig": {
       "additionalProperties": false,
-      "description": "Transactional outbox and job queue settings (issue #104).\n\nThese are the knobs of the shared dispatch substrate, not of any one consumer. Every\nvalue has a safe default, and the defaults are chosen so a deployment that never opens\nthis section still gets: bounded retries that end in a dead letter rather than an\ninfinite redelivery loop, a visibility timeout longer than any handler the tree ships,\nand a worker count above one, because a pool of one is the singleton posture this\nThe optional shared hot-state accelerator (issue #146).",
+      "description": "The optional shared hot-state accelerator (issue #146).",
       "properties": {
         "ironcache_addr": {
           "default": null,
@@ -1832,7 +1832,7 @@
     },
     "OutboxConfig": {
       "additionalProperties": false,
-      "description": "substrate exists to avoid.",
+      "description": "Transactional outbox and job queue settings (issue #104).\n\nThese are the knobs of the shared dispatch substrate, not of any one consumer. Every\nvalue has a safe default, and the defaults are chosen so a deployment that never opens\nthis section still gets: bounded retries that end in a dead letter rather than an\ninfinite redelivery loop, a visibility timeout longer than any handler the tree ships,\nand a worker count above one, because a pool of one is the singleton posture this\nsubstrate exists to avoid.",
       "properties": {
         "claim_batch": {
           "default": 64,

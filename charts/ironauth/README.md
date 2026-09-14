@@ -59,12 +59,16 @@ no service you have not deployed. Enabled, it writes `outbox.ironbus_addr`, whic
 is the key the server actually reads. `scripts/helm-chart.sh` asserts both
 directions against the rendered config.
 
-**There is no IronCache value, and its absence is deliberate.** `ironauth-hot`'s
-IronCache implementation has no address in config: no key exists for it, and
-nothing constructs one at boot, so a deployment cannot attach one however the
-chart is written. A values key here would render an endpoint nothing reads and
-tell you your cache was wired. It belongs here when #146 gives the accelerator a
-config surface.
+**There is still no IronCache value, and the reason has changed.** The config key
+now exists (`[hot_state] ironcache_addr`) and readiness probes it, so the earlier
+reason -- that a deployment could not attach one at all -- no longer holds. What
+still holds is that no read goes through the accelerator: `ironauth-hot` is not a
+dependency of any crate that serves a request. A values key would configure
+something that reports its own reachability and accelerates nothing.
+
+To get the readiness tier today, supply your own config through
+`database.existingConfigSecret` with a `[hot_state]` section. A first-class value
+belongs here when a read path consults the accelerator.
 
 ## What the gate checks
 
