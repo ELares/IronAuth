@@ -22405,7 +22405,15 @@ pub const SSF_LIFECYCLE_CONSUMER: &str = "ssf.lifecycle";
 /// (`status <> 'disabled'`), which is what lets both reads use that index.
 pub(crate) const SSF_RETAINING_PREDICATE: &str = "status IN ('enabled', 'paused')";
 
-/// The domain event types that become a RISC signal (issue #144 criterion 3).
+/// The domain event types that become an SSF signal -- RISC or CAEP (issue #144).
+///
+/// # It was RISC-only, and the name of the fact changed rather than the fact
+///
+/// Every entry was an account lifecycle transition, and the selection rule below is still
+/// exactly that for the RISC half. `user.updated` is the first entry that is NOT: it is on
+/// the list because a claim change is a CAEP `token-claims-change`, which asks a different
+/// question about the same stream. See `ironauth_oidc::caep::map_domain_event` for the split
+/// and for why a `user.updated` touching only traits emits nothing.
 ///
 /// THE PRODUCER'S SET, and the reason it lives in the store rather than beside the
 /// mapping that consumes it: [`enqueue_domain_event`] writes the trigger, and it runs
@@ -22442,6 +22450,10 @@ pub const SSF_LIFECYCLE_EVENT_TYPES: &[&str] = &[
     "user.deleted",
     "user.identifier_added",
     "user.identifier_removed",
+    // THE CAEP ENTRY. Not an account transition, and on this list for the reason the header
+    // gives: the consumer asks both vocabularies what a trigger means, and a type neither
+    // maps completes the message rather than dead-lettering it.
+    "user.updated",
 ];
 
 /// The registered consumer name a dead-letter REPLAY COMMAND drains under (issue #106).

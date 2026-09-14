@@ -577,16 +577,21 @@ async fn discovery_advertises_only_what_is_mounted() {
         doc.get("default_subjects").is_none(),
         "a default-subjects policy is advertised that no fan-out applies: {body}"
     );
-    // AND EXACTLY THE EVENT TYPES THIS BUILD EMITS: SSF's own verification event, and CAEP
-    // `session-revoked` now that the session-end fan-out produces it (issue #144). Still
-    // nothing else from CAEP and nothing from RISC. Asserting emptiness was right while
-    // nothing produced a SET; asserting only non-emptiness would pass the day a type nothing
-    // emits was added, which is the failure this exact-equality exists to prevent.
+    // AND EXACTLY THE EVENT TYPES THIS BUILD EMITS: SSF's own verification event, CAEP
+    // `session-revoked` from the session-end fan-out and `token-claims-change` from the claim
+    // change one, and the four RISC lifecycle types (issue #144). Asserting emptiness was right
+    // while nothing produced a SET; asserting only non-emptiness would pass the day a type
+    // nothing emits was added, which is the failure this exact-equality exists to prevent.
+    //
+    // IT GREW BY ONE when `caep::map_domain_event` gave `token-claims-change` a producer, and
+    // the growing is the point: this list is what a receiver may subscribe to, so a type that
+    // starts being emitted and is not here is a signal nobody can ask for.
     assert_eq!(
         doc["events_supported"],
         serde_json::json!([
             ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE,
             ironauth_oidc::caep::SESSION_REVOKED,
+            ironauth_oidc::caep::TOKEN_CLAIMS_CHANGE,
             ironauth_oidc::risc::ACCOUNT_DISABLED,
             ironauth_oidc::risc::ACCOUNT_ENABLED,
             ironauth_oidc::risc::ACCOUNT_PURGED,

@@ -601,3 +601,127 @@ async fn an_added_identifier_reaches_a_stream_without_the_identifier_in_it() {
         "the SET a receiver is handed republishes the changed identifier: {delivered}"
     );
 }
+
+/// Change a user's CLAIMS through the REAL store call, emitting the event an admin write emits.
+///
+/// `fields` IS WHAT THE MAPPING READS, so the fixture takes it: a test that always sent
+/// `["claims"]` could not tell a mapping keyed on the field group from one keyed on the type.
+async fn update_claims(harness: &Harness, user: &UserId, fields: &[&str], claims: &str) {
+    let env = harness.state().env().clone();
+    let scope = harness.scope();
+    let id = format!("evt_{user}_claims_{}", fields.join("_"));
+    let payload = serde_json::json!({
+        "user_id": user.to_string(),
+        "fields": fields,
+    });
+    let envelope =
+        ironauth_admin::events::envelope(&id, "user.updated", scope, 1_700_000_000_000, &payload);
+    store_of(harness)
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .update_claims(
+            &env,
+            user,
+            claims,
+            Some(&DomainEvent {
+                id: &id,
+                subject: &user.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("update the user's claims");
+}
+
+/// Every CAEP type this build emits, which is what a receiver would ask for.
+fn all_caep() -> Vec<String> {
+    vec![
+        ironauth_oidc::caep::SESSION_REVOKED.to_owned(),
+        ironauth_oidc::caep::TOKEN_CLAIMS_CHANGE.to_owned(),
+    ]
+}
+
+#[tokio::test]
+async fn a_claim_change_reaches_a_stream_as_caep_token_claims_change() {
+    // #144's CAEP half, end to end: a real `update_claims`, the real producer inside that store
+    // call, the real consumer, the real queue. Before this the type was defined in the
+    // vocabulary and emitted by nothing, which `ssf_set::EVENTS_SUPPORTED` said in so many
+    // words -- a receiver could not even ask for it.
+    let harness = Harness::start_store_backed().await;
+    provision_envelope(&harness).await;
+    let scope = harness.scope();
+    let client = a_client(&harness).await;
+    let stream = seed_stream(&harness, &client, &all_caep()).await;
+    let user = seed_user(&harness, "claims@example.test").await;
+
+    update_claims(&harness, &user, &["claims"], r#"{"department":"ops"}"#).await;
+    assert_eq!(lifecycle_pass(&harness, scope).await.completed, 1);
+
+    let owed = owed_claims(&harness, &stream).await;
+    assert_eq!(owed.len(), 1, "one claim change is one SET");
+    assert_eq!(
+        sole_event_type(&owed[0]),
+        ironauth_oidc::caep::TOKEN_CLAIMS_CHANGE
+    );
+    assert_eq!(
+        owed[0]["sub_id"]["id"].as_str(),
+        Some(user.to_string().as_str()),
+        "the SET names the wrong user"
+    );
+}
+
+#[tokio::test]
+async fn a_trait_only_update_reaches_no_stream() {
+    // THE NEGATIVE, and it is the whole reason the mapping reads `fields` rather than the type.
+    // A trait is something this deployment stores about a person and does not put in a token, so
+    // a receiver told its claims changed would re-read a token saying exactly what it said
+    // before -- every time anybody edited a profile.
+    //
+    // THE TRIGGER IS STILL WRITTEN, which is what separates "the mapping declined" from "the
+    // producer never fired": the whitelist is coarser than the mapping on purpose, and a type
+    // it lets through that maps to nothing must COMPLETE rather than dead-letter.
+    let harness = Harness::start_store_backed().await;
+    provision_envelope(&harness).await;
+    let scope = harness.scope();
+    let client = a_client(&harness).await;
+    let stream = seed_stream(&harness, &client, &all_caep()).await;
+    let user = seed_user(&harness, "traits@example.test").await;
+
+    update_claims(&harness, &user, &["traits"], r#"{"department":"ops"}"#).await;
+    // THE DRAIN'S OWN COUNT, not `trigger_count`, because that helper CLAIMS the queue and a
+    // claimed message is not there for the drain that follows. `completed: 1` says both halves
+    // at once: a trigger existed, and the consumer finished it rather than failing it.
+    let stats = lifecycle_pass(&harness, scope).await;
+    assert_eq!(
+        stats.completed, 1,
+        "the producer writes the trigger and the MAPPING declines; a message that was never \
+         written would be 0 here too, which is why the owed check below is not enough on its own"
+    );
+    assert_eq!(stats.dead_lettered, 0);
+    assert!(
+        owed_claims(&harness, &stream).await.is_empty(),
+        "a trait edit must not tell a receiver its claims changed"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_asking_only_for_risc_is_not_sent_the_caep_event() {
+    // THE TWO VOCABULARIES ARE SEPARATELY SUBSCRIBABLE, which is why the consumer delivers each
+    // mapped event as its own SET rather than one carrying both. A receiver that asked for the
+    // account lifecycle and not for claim changes must not be handed one.
+    let harness = Harness::start_store_backed().await;
+    provision_envelope(&harness).await;
+    let scope = harness.scope();
+    let client = a_client(&harness).await;
+    let risc_only = seed_stream(&harness, &client, &all_risc()).await;
+    let user = seed_user(&harness, "riskonly@example.test").await;
+
+    update_claims(&harness, &user, &["claims"], r#"{"department":"ops"}"#).await;
+    lifecycle_pass(&harness, scope).await;
+
+    assert!(
+        owed_claims(&harness, &risc_only).await.is_empty(),
+        "a RISC-only stream was sent a CAEP event"
+    );
+}

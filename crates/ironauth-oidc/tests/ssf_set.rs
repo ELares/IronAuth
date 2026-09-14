@@ -223,6 +223,7 @@ fn the_advertised_events_are_exactly_the_ones_this_build_emits() {
         [
             ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE,
             ironauth_oidc::caep::SESSION_REVOKED,
+            ironauth_oidc::caep::TOKEN_CLAIMS_CHANGE,
             ironauth_oidc::risc::ACCOUNT_DISABLED,
             ironauth_oidc::risc::ACCOUNT_ENABLED,
             ironauth_oidc::risc::ACCOUNT_PURGED,
@@ -231,11 +232,15 @@ fn the_advertised_events_are_exactly_the_ones_this_build_emits() {
         "the advertised event list is not the set this build can produce"
     );
     // Named absence beside the equality above, because the equality alone reads as an
-    // arbitrary list. These three are DEFINED in the vocabulary and have no producer, so a
+    // arbitrary list. These two are DEFINED in the vocabulary and have no producer, so a
     // build that starts advertising one has advertised a signal that never arrives.
+    //
+    // THE LIST WAS THREE. `token-claims-change` left it when `caep::map_domain_event` gave it
+    // a producer -- a `user.updated` whose `fields` name `claims` -- and moved into the
+    // equality above. The two directions are the same property from either side: a type with
+    // no producer must not be advertised, and a type with one must be.
     for unemitted in [
         ironauth_oidc::caep::CREDENTIAL_CHANGE,
-        ironauth_oidc::caep::TOKEN_CLAIMS_CHANGE,
         ironauth_oidc::caep::ASSURANCE_LEVEL_CHANGE,
     ] {
         assert!(

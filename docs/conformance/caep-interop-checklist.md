@@ -79,6 +79,34 @@ as covered and be worse than an empty cell.
 | 2.1 | TLS 1.2 or later on every endpoint, following RFC 9325 | Termination is the deployment's, not this process's: IronAuth is normally run behind a terminating proxy, so a test here would assert the harness's transport rather than production's. The operator's obligation is the proxy configuration. |
 | 2.6 | Events signed with `RS256`, minimum 2048-bit keys | The SET is signed under the ENVIRONMENT's registered signing policy, which this repository does not choose: `mint_set` uses the issuer entry's policy rather than pinning an algorithm, and the build supports Ed25519, ECDSA and RSA key material. EdDSA and ES256 are legal under SSF 1.0 and NOT under this profile, so an environment intending to interoperate must be configured with RSA key material and its effective `alg` confirmed against a minted token. This row states the obligation; it does not assert that any given environment meets it, and no test here can. |
 
+## Judged by an independent receiver
+
+The rows above are this build checking itself against the profile it read. Criterion 1 of
+issue #144 asks for something else: that a receiver which is not us accepts what we emit.
+
+`scripts/caep-receiver-validation.sh` mints one SET per CAEP event type this build emits --
+through the same mapping functions the fan-out calls, so it is the emitter's output rather
+than a fixture -- and hands them to `scripts/validate-caep-receiver.py`, which applies the
+profile's receiver-side rules in a second implementation. PyJWT does the signature;
+everything about the EVENT is checked by code sharing no line with the emitter: exactly one
+member under `events`, a type a receiver knows, an object body, a second-scale
+`event_timestamp`, and an RFC 9493 subject format with its required members present.
+
+Six negative controls run against every accepted event, because a checker misconfigured
+into accepting anything reports the same result a working one does. Each is a divergence
+somebody has shipped: two events in one SET, an unknown event type, a millisecond
+timestamp, a scalar body, a subject missing `sub`, and a subject format no receiver
+resolves.
+
+**The evidence is the report the validator writes and the gate prints**, so a CI log carries
+which event types were accepted, under which algorithm, and how many controls each
+rejected.
+
+**Why not the public service.** The criterion names caep.dev "or an equivalent". A gate that
+posted to somebody else's receiver would fail when that service was down, say nothing when
+it changed, and send this deployment's events to a third party on every pull request. What
+it would buy is an INDEPENDENT judgement, and that is what the validator is.
+
 ## Receiver requirements
 
 The profile's receiver requirements are not mapped here. This repository's receiver is the

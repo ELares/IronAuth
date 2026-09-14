@@ -500,17 +500,35 @@ impl SsfLifecycleFanOutConsumer {
         let subject = crate::risc::subject_of(payload)
             .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))?;
 
+        // BOTH VOCABULARIES ARE ASKED, because one trigger can be both, neither, or one and
+        // not the other. RISC answers "what happened to this account" and CAEP answers "what
+        // changed about the assertions I hold"; `crate::caep::map_domain_event` says why they
+        // are two functions rather than one returning a single event.
+        //
         // NOTHING TO SAY IS A SUCCESS, not a failure. The producer's whitelist is coarser
-        // than the mapping: `user.state_changed` is on it because SOME of its transitions
-        // are RISC events, and the ones that are not must complete the message rather
-        // than dead-letter it. Failing here would retry a transition that will never map
-        // until the attempts budget ran out.
-        let Some(event) = crate::risc::map_domain_event(event_type, payload, occurred) else {
-            return Ok(());
-        };
-        self.core
-            .deliver_to_streams(env, scope, subject, &event, trigger_jti)
-            .await
+        // than either mapping: `user.state_changed` is on it because SOME of its transitions
+        // are RISC events, and `user.updated` because SOME of them touch claims. The ones that
+        // are neither must complete the message rather than dead-letter it -- failing here
+        // would retry a trigger that will never map until the attempts budget ran out.
+        let mapped = [
+            crate::risc::map_domain_event(event_type, payload, occurred),
+            crate::caep::map_domain_event(event_type, payload, occurred),
+        ];
+        // EACH IS ITS OWN SET, delivered under its own `jti`. A receiver subscribing to one
+        // vocabulary and not the other must get the event it asked for and no more, and a
+        // single SET carrying two `events` members would arrive at both or neither.
+        for (index, event) in mapped.iter().enumerate() {
+            let Some(event) = event else { continue };
+            // THE INDEX DISAMBIGUATES the two SETs one trigger can produce. Every per-stream
+            // `jti` derives from this handle, and two events sharing it would look to a
+            // receiver's dedup like one event delivered twice -- so the second would be
+            // dropped, silently, and only for receivers that dedup correctly.
+            let handle = format!("{trigger_jti}-{index}");
+            self.core
+                .deliver_to_streams(env, scope, subject, event, &handle)
+                .await?;
+        }
+        Ok(())
     }
 }
 
