@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use ironauth_config::DatabaseConfig;
+use ironauth_config::{DatabaseConfig, OutboxConfig};
 use tokio::net::TcpStream;
 
 /// Maximum time to wait for the database TCP connect before reporting not
@@ -29,11 +29,26 @@ pub struct ReadinessProbe {
     timeout: Duration,
     /// The optional components this deployment attached, and how to ask whether each is there.
     ///
-    /// EMPTY IN A DEFAULT DEPLOYMENT, which is what makes `Degraded` unreachable there rather
-    /// than merely unused: a deployment that attached no accelerator cannot be degraded by one
-    /// being absent, and reporting otherwise would page an operator about a component they
+    /// EMPTY UNLESS THE DEPLOYMENT ATTACHED ONE. [`ReadinessProbe::from_config`] adds the async
+    /// backbone when `outbox.ironbus_addr` is set, and nothing else, so a deployment running
+    /// Postgres alone cannot be degraded and will never page an operator about a component it
     /// chose not to run.
     optional: Vec<OptionalComponent>,
+}
+
+/// Split `host:port`, returning [`None`] for anything this probe cannot connect to.
+///
+/// IPv6 in brackets is handled because an operator will eventually write one, and a naive
+/// `rsplit_once(':')` on `[::1]:17654` yields a host of `[::1]` only by accident of the port
+/// being last -- which is true here, so the bracket strip is what makes it deliberate rather
+/// than lucky.
+fn split_host_port(addr: &str) -> Option<(String, u16)> {
+    let (host, port) = addr.rsplit_once(':')?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_owned(), port.parse().ok()?))
 }
 
 /// An optional component whose absence degrades rather than stops the deployment.
@@ -89,12 +104,6 @@ pub enum Readiness {
 /// is a tier nobody wrote a runbook for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DegradedTier {
-    /// The hot-state accelerator is unreachable.
-    ///
-    /// Every flow completes on Postgres alone and reads are slower, which is the property
-    /// `ironauth_hot::Tiered` holds and its outage tests measure by running one script against a
-    /// working accelerator, a failing one, and none at all.
-    AcceleratorAbsent,
     /// The async backbone is unreachable.
     ///
     /// Outbox work accumulates and drains on recovery rather than being lost, because the drain
@@ -102,7 +111,23 @@ pub enum DegradedTier {
     BackboneAbsent,
 }
 
+// # Why there is no `AcceleratorAbsent`, though the accelerator is a degraded tier
+//
+// `ironauth_hot::Tiered`'s outage tests measure that every answer is identical with the
+// accelerator failing every call, so it IS a tier in the sense #149 means. It is not a variant
+// here because a deployment cannot attach one: `ironauth-hot`'s IronCache implementation has no
+// address in config, so there is nothing to probe and no state to report.
+//
+// The first version of this enum had the variant anyway. It was rendered by `readyz`, described
+// in a doc, named in a commit message, and reachable only from a unit test -- which is the
+// "reads as wired when it is not" defect, committed by someone who had spent the day finding it
+// in other people's work. It returns when the accelerator has a config surface, which is #146
+// work rather than this criterion's.
+
 impl DegradedTier {
+    /// Every tier, so a census reads the enum rather than a list somebody maintains beside it.
+    pub const ALL: &'static [Self] = &[Self::BackboneAbsent];
+
     /// The stable token a probe body and an alert match on.
     ///
     /// NOT the `Debug` rendering. A body an operator greps is a wire format, and deriving it
@@ -110,7 +135,6 @@ impl DegradedTier {
     #[must_use]
     pub const fn token(self) -> &'static str {
         match self {
-            Self::AcceleratorAbsent => "accelerator_absent",
             Self::BackboneAbsent => "backbone_absent",
         }
     }
@@ -157,18 +181,38 @@ impl ReadinessProbe {
     /// (IPv6 brackets stripped for connection); the port defaults to the
     /// Postgres default when the DSN omits it.
     #[must_use]
-    pub fn from_config(database: &DatabaseConfig) -> Self {
+    pub fn from_config(database: &DatabaseConfig, outbox: &OutboxConfig) -> Self {
         let raw_host = database.url.host();
         let host = raw_host
             .strip_prefix('[')
             .and_then(|rest| rest.strip_suffix(']'))
             .unwrap_or(raw_host)
             .to_owned();
+        // THE BACKBONE IS THE ONE COMPONENT A DEPLOYMENT CAN ATTACH TODAY, and this is where a
+        // tier stops being a seam and becomes something a running binary can report. Unset is
+        // the shipped default, so a Postgres-only deployment declares nothing and can never be
+        // degraded -- which is the behaviour it already had.
+        //
+        // A MALFORMED ADDRESS IS IGNORED RATHER THAN FATAL. The outbox worker is what actually
+        // connects to the broker and is what should refuse a bad address; a readiness probe
+        // that stopped a boot over one would be a health check deciding whether the process may
+        // run, which is the wrong way round.
+        let optional = outbox
+            .ironbus_addr
+            .as_deref()
+            .and_then(split_host_port)
+            .map(|(host, port)| {
+                vec![OptionalComponent {
+                    tier: DegradedTier::BackboneAbsent,
+                    address: (host, port),
+                }]
+            })
+            .unwrap_or_default();
         Self {
             host,
             port: database.url.port().unwrap_or(5432),
             timeout: PROBE_TIMEOUT,
-            optional: Vec::new(),
+            optional,
         }
     }
 
@@ -195,8 +239,18 @@ impl ReadinessProbe {
         // THE FIRST ABSENT COMPONENT NAMES THE TIER, in declaration order. Two absent at once is
         // a real state and this reports only the first, which is a deliberate simplification
         // rather than an oversight: a readiness body is read by an orchestrator and a pager, and
-        // both act on "is it serving" plus one thing to look at. The metrics carry per-component
-        // detail for the case where an operator wants the whole picture.
+        // both act on "is it serving" plus one thing to look at.
+        //
+        // AN EARLIER VERSION SENT THE READER TO THE METRICS for per-component detail. There is
+        // no such metric -- `metrics::CONTRACT` carries no readiness or component series at all
+        // -- so the sentence pointed at nothing. With one declarable component the question does
+        // not arise; it becomes real when a second can be declared, and the answer then is a
+        // gauge per component rather than a longer body.
+        //
+        // EACH COMPONENT COSTS ITS OWN FULL TIMEOUT, SERIALLY, and nothing bounds the total.
+        // One component is one timeout, which is why that is acceptable today and is worth
+        // measuring before a second arrives: a readiness probe that can take N times its timeout
+        // is one a liveness deadline eventually trips.
         for component in &self.optional {
             let reachable = tokio::time::timeout(
                 self.timeout,
@@ -213,12 +267,12 @@ impl ReadinessProbe {
 
     /// Declare an optional component whose absence is a degraded tier rather than an outage.
     ///
-    /// # Errors
+    /// # It cannot fail, and takes host and port already separated
     ///
-    /// None; a component whose address cannot be parsed is the CALLER's to reject, because only
-    /// the caller knows whether a malformed accelerator address should stop a boot or be
-    /// ignored. This takes host and port already separated so there is no parse here to get
-    /// wrong.
+    /// A component whose address cannot be parsed is the CALLER's to reject, because only the
+    /// caller knows whether a malformed address should stop a boot or be ignored. Taking the two
+    /// parts means there is no parse here to get wrong. (This carried an `# Errors` heading
+    /// while returning `Self`, which is a section for a function that has none.)
     #[must_use]
     pub fn with_optional(mut self, tier: DegradedTier, host: &str, port: u16) -> Self {
         self.optional.push(OptionalComponent {
@@ -242,7 +296,7 @@ mod tests {
         )
         .expect("valid")
         .config;
-        let probe = ReadinessProbe::from_config(&config.database);
+        let probe = ReadinessProbe::from_config(&config.database, &config.outbox);
         assert_eq!(probe.host, "db.internal");
         assert_eq!(probe.port, 6000);
     }
@@ -253,7 +307,7 @@ mod tests {
             Config::from_toml_str("[database]\nurl = \"postgres://[::1]/x\"\n", "<inline>")
                 .expect("valid")
                 .config;
-        let probe = ReadinessProbe::from_config(&config.database);
+        let probe = ReadinessProbe::from_config(&config.database, &config.outbox);
         assert_eq!(probe.host, "::1");
         assert_eq!(probe.port, 5432);
     }
@@ -311,12 +365,12 @@ mod degraded_tests {
         // still completes every flow.
         let (_database, port) = open_port().await;
         let probe = ReadinessProbe::new("127.0.0.1".to_owned(), port, Duration::from_millis(200))
-            .with_optional(DegradedTier::AcceleratorAbsent, "127.0.0.1", CLOSED_PORT);
+            .with_optional(DegradedTier::BackboneAbsent, "127.0.0.1", CLOSED_PORT);
 
         let outcome = probe.probe().await;
         assert_eq!(
             outcome,
-            Readiness::Degraded(DegradedTier::AcceleratorAbsent),
+            Readiness::Degraded(DegradedTier::BackboneAbsent),
             "an unreachable accelerator is a degraded tier"
         );
         assert!(
@@ -339,11 +393,7 @@ mod degraded_tests {
         let (_accelerator, accelerator_port) = open_port().await;
         let probe =
             ReadinessProbe::new("127.0.0.1".to_owned(), db_port, Duration::from_millis(200))
-                .with_optional(
-                    DegradedTier::AcceleratorAbsent,
-                    "127.0.0.1",
-                    accelerator_port,
-                );
+                .with_optional(DegradedTier::BackboneAbsent, "127.0.0.1", accelerator_port);
 
         assert_eq!(
             probe.probe().await,
@@ -362,11 +412,7 @@ mod degraded_tests {
             CLOSED_PORT,
             Duration::from_millis(200),
         )
-        .with_optional(
-            DegradedTier::AcceleratorAbsent,
-            "127.0.0.1",
-            accelerator_port,
-        );
+        .with_optional(DegradedTier::BackboneAbsent, "127.0.0.1", accelerator_port);
 
         let outcome = probe.probe().await;
         assert_eq!(outcome, Readiness::DatabaseUnreachable);
@@ -386,11 +432,10 @@ mod degraded_tests {
         // THE TOKEN IS A WIRE FORMAT. A runbook and an alert match on it, so two tiers sharing
         // one would make an alert fire for the wrong component, and deriving it from the variant
         // name would let a rename break every alert silently.
-        let tiers = [
-            DegradedTier::AcceleratorAbsent,
-            DegradedTier::BackboneAbsent,
-        ];
-        let mut tokens: Vec<&str> = tiers.iter().map(|tier| tier.token()).collect();
+        // FROM `ALL`, not from a list written here. A hand-built array stops being a census on
+        // the day somebody adds a variant and does not think of this test, which is the same
+        // reason `ironauth_hot::registry::ALL` exists.
+        let mut tokens: Vec<&str> = DegradedTier::ALL.iter().map(|tier| tier.token()).collect();
         let before = tokens.len();
         tokens.sort_unstable();
         tokens.dedup();
@@ -401,5 +446,76 @@ mod degraded_tests {
                 "{token:?} is not a stable lowercase token"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+    use ironauth_config::Config;
+
+    #[test]
+    fn a_deployment_with_no_backbone_declares_no_optional_component() {
+        // THE DEFAULT, and the reason `Degraded` cannot page anybody who runs Postgres alone.
+        let config = Config::default();
+        assert!(
+            config.outbox.ironbus_addr.is_none(),
+            "the shipped default has no backbone, or this test is measuring a changed default"
+        );
+        let probe = ReadinessProbe::from_config(&config.database, &config.outbox);
+        assert!(
+            probe.optional.is_empty(),
+            "a Postgres-only deployment must declare nothing to probe"
+        );
+    }
+
+    #[test]
+    fn a_configured_backbone_becomes_a_declared_component() {
+        // THE WIRING THIS FILE SHIPPED WITHOUT. `with_optional` had no caller outside tests, so
+        // `Readiness::Degraded` was unreachable in every real deployment and the `readyz` arm
+        // that renders it was dead -- a tier that read as wired because a unit test could reach
+        // it. This is the assertion that would have failed.
+        let mut config = Config::default();
+        config.outbox.ironbus_addr = Some("broker.internal:17654".to_owned());
+        let probe = ReadinessProbe::from_config(&config.database, &config.outbox);
+
+        assert_eq!(
+            probe.optional.len(),
+            1,
+            "a configured backbone must be declared, or no deployment can report its absence"
+        );
+        assert_eq!(probe.optional[0].tier, DegradedTier::BackboneAbsent);
+        assert_eq!(
+            probe.optional[0].address,
+            ("broker.internal".to_owned(), 17654)
+        );
+    }
+
+    #[test]
+    fn a_malformed_backbone_address_is_ignored_rather_than_fatal() {
+        // A READINESS PROBE MUST NOT DECIDE WHETHER THE PROCESS MAY RUN. The outbox worker is
+        // what connects to the broker and is what should refuse a bad address; failing a boot
+        // here would be a health check vetoing the thing it is meant to report on.
+        for bad in ["no-port", "broker:not-a-number", ":17654", ""] {
+            let mut config = Config::default();
+            config.outbox.ironbus_addr = Some(bad.to_owned());
+            let probe = ReadinessProbe::from_config(&config.database, &config.outbox);
+            assert!(
+                probe.optional.is_empty(),
+                "{bad:?} was accepted as an address to probe"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_backbone_keeps_its_host() {
+        let mut config = Config::default();
+        config.outbox.ironbus_addr = Some("[::1]:17654".to_owned());
+        let probe = ReadinessProbe::from_config(&config.database, &config.outbox);
+        assert_eq!(
+            probe.optional.first().map(|c| c.address.clone()),
+            Some(("::1".to_owned(), 17654)),
+            "the brackets must be stripped, or the connect is to a host that does not resolve"
+        );
     }
 }

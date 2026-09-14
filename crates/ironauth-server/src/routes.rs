@@ -46,9 +46,16 @@ pub async fn healthz() -> impl IntoResponse {
     )
 }
 
-/// `GET /readyz` on the management plane: 200 when the database address is
-/// TCP-reachable, 503 otherwise. Provisional until issue #7 replaces the TCP
-/// probe with a real pool health check.
+/// `GET /readyz` on the management plane: THREE outcomes across TWO status codes.
+///
+/// `200 ready` when the database is reachable and every optional component this deployment
+/// declared is answering. `200 degraded: <tier>` when one is not: a degraded tier still
+/// completes every flow, so the status code keeps the pod in its Service and the body is what
+/// tells an operator to look. `503` only when the database is unreachable, which is the one
+/// state that must not be routed to.
+///
+/// (This rustdoc described two outcomes after the handler grew a third, which is the shape a
+/// reader trusts and a reviewer has to catch.)
 pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     // THREE OUTCOMES, TWO STATUS CODES, and the asymmetry is deliberate (issue #149
     // criterion 6). Healthy and DEGRADED are both `200`, because a degraded tier still serves

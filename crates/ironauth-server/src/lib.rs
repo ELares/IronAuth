@@ -56,7 +56,7 @@ pub use error::ServerError;
 pub use proxy::{
     ClientContext, ClientResolution, FailClosedReason, ForwardDecision, ProxyPolicy, SiteContext,
 };
-pub use readiness::{Readiness, ReadinessProbe};
+pub use readiness::{DegradedTier, OptionalComponent, Readiness, ReadinessProbe};
 pub use redact::Redacted;
 
 /// Cheaply cloneable state shared by every handler on both planes.
@@ -99,7 +99,10 @@ impl Server {
     pub fn new(config: Config, env: Env) -> Result<Self, ServerError> {
         let site = Arc::new(SiteContext::derive(&config.server)?);
         let policy = ProxyPolicy::from_config(&config.proxy);
-        let readiness = Arc::new(ReadinessProbe::from_config(&config.database));
+        let readiness = Arc::new(ReadinessProbe::from_config(
+            &config.database,
+            &config.outbox,
+        ));
         let handle = metrics::recorder_handle();
         ::metrics::gauge!(metrics::UP).set(1.0);
         Ok(Self {
