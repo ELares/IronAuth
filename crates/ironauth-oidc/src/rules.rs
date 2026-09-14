@@ -423,9 +423,23 @@ impl Explanation {
     ///
     /// Three shapes, because an operator acts differently on each: a rule denied by name, no
     /// rule matched so the default refusal applied, or no rules exist at all.
+    ///
+    /// # A DENIAL, not "anything that is not an allow"
+    ///
+    /// This guarded `Action::Allow` first and let everything else fall through to "denied by
+    /// rule X". [`Action::StepUp`] is a third variant, and its own documentation says it is
+    /// distinct from `Deny` precisely because the caller can act on it, so reporting a
+    /// challenge as a denial tells an operator their rules refuse users the rules would in
+    /// fact merely challenge.
+    ///
+    /// That is the same explanation-contradicts-the-decision bug this type was created to
+    /// fix, surviving one variant over: the first fix special-cased `Allow` and stopped
+    /// there. Matching on `Deny` positively, rather than on the absence of `Allow`, is what
+    /// makes a fourth action a compile error here instead of a wrong sentence. Use
+    /// [`Explanation::reason`] when you want a line for every outcome.
     #[must_use]
     pub fn why_denied(&self) -> Option<String> {
-        if matches!(self.decision.action, Action::Allow) {
+        if !matches!(self.decision.action, Action::Deny) {
             return None;
         }
         if let Some(rule) = self.decision.matched.as_deref() {
@@ -453,6 +467,29 @@ impl Explanation {
             "denied because no rule matched: {}",
             attempts.join("; ")
         ))
+    }
+
+    /// One line describing the outcome, whatever it was.
+    ///
+    /// [`Explanation::why_denied`] answers criterion 5's question and is therefore `None`
+    /// for anything that is not a denial. An operator rehearsing a rollout still wants a
+    /// sentence for an admission or a challenge, and leaving them without one is how a
+    /// caller ends up reaching for `why_denied` and printing "no reason" next to a
+    /// step-up.
+    ///
+    /// Matches on the action exhaustively, so a new [`Action`] cannot be added without
+    /// deciding what this says about it.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match (&self.decision.action, self.decision.matched.as_deref()) {
+            (Action::Deny, _) => self.why_denied().unwrap_or_else(|| "denied".to_owned()),
+            (Action::Allow, Some(rule)) => format!("allowed by rule {rule}"),
+            (Action::Allow, None) => "allowed".to_owned(),
+            (Action::StepUp { acr }, Some(rule)) => {
+                format!("rule {rule} requires step-up to {acr}")
+            }
+            (Action::StepUp { acr }, None) => format!("step-up to {acr} required"),
+        }
     }
 }
 
@@ -506,6 +543,15 @@ impl DryRun {
     #[must_use]
     pub fn would_deny_because(&self) -> Option<String> {
         self.explanation.why_denied()
+    }
+
+    /// One line describing what the rehearsal would do, whatever that is.
+    ///
+    /// See [`Explanation::reason`]. This is the line to log for a dry-run rollout, because
+    /// [`DryRun::would_deny_because`] is deliberately empty for an admission or a challenge.
+    #[must_use]
+    pub fn would_because(&self) -> String {
+        self.explanation.reason()
     }
 }
 
@@ -731,6 +777,24 @@ mod tests {
                     Criterion::PathPrefix("/public".to_owned()),
                 ],
             ),
+            // A THIRD ACTION. Without a StepUp row, every test that branches on the action
+            // ran over two of three variants, which is how `why_denied` shipped calling a
+            // challenge a denial and `would_allow` went unpinned for it.
+            rule(
+                "payments-need-mfa",
+                vec![Criterion::PathPrefix("/payments".to_owned())],
+                Action::StepUp {
+                    acr: "mfa".to_owned(),
+                },
+            ),
+            // DELIBERATELY OVERLAPS the rule above: both match /payments. Until this row
+            // existed no corpus request matched more than ONE rule, so every assertion
+            // comparing "the rules marked Matched" against "the rule the decision names"
+            // compared at most one element, and could not tell first-match from last-match.
+            allow(
+                "payments-catch-all",
+                vec![Criterion::PathPrefix("/payments".to_owned())],
+            ),
         ])
     }
 
@@ -855,6 +919,17 @@ mod tests {
                 },
                 expect: None,
                 action: Action::Deny,
+            },
+            Case {
+                name: "a step-up is a third answer, and the FIRST of two matching rules wins",
+                facts: RequestFacts {
+                    path: "/payments/new".to_owned(),
+                    ..facts()
+                },
+                expect: Some("payments-need-mfa"),
+                action: Action::StepUp {
+                    acr: "mfa".to_owned(),
+                },
             },
         ]
     }
@@ -1756,9 +1831,15 @@ mod tests {
     /// So this is a SOURCE SCAN, and worth being honest about: it reads the text of the
     /// `impl DryRun` block and fails if anything there returns an owned `Decision`, or if a
     /// conversion into one appears. It catches the regression it is aimed at -- somebody
-    /// adding `into_decision` or `impl From<DryRun> for Decision` in a hurry -- and it would
-    /// not catch a cleverer route. The real guarantee is that the type exposes only borrows
-    /// and copies; this keeps that true by accident-proofing the obvious way to break it.
+    /// adding an owned accessor or a conversion in a hurry -- and it does not pretend to
+    /// catch a caller who deliberately rebuilds a `Decision` from the borrows on offer,
+    /// which is possible and documented on [`DryRun`].
+    ///
+    /// The needle was once the literal `-> Decision`, and a review walked past it with
+    /// `-> Option<Decision>`: precisely the regression the sentence above names, missed
+    /// because the check was written against one SPELLING of the property rather than the
+    /// property. It now rejects any owned return type mentioning `Decision` or
+    /// `Explanation`, the latter because its `decision` field is public.
     #[test]
     fn dry_run_exposes_no_owned_decision() {
         // Scan the PRODUCTION half only, cutting at the test module.
@@ -1783,11 +1864,25 @@ mod tests {
 
         for (offset, line) in block.lines().enumerate() {
             let line = line.trim();
-            assert!(
-                !line.contains("-> Decision"),
-                "DryRun line {offset} returns an owned Decision, which puts a rehearsal on \
-                 the enforcement path: {line}"
-            );
+            let Some((_, returns)) = line.split_once("->") else {
+                continue;
+            };
+            // ANY owned escape, not the literal "-> Decision".
+            //
+            // The needle was that literal, and a review walked straight past it with
+            // `-> Option<Decision>`, which is the very shape the comment here named as the
+            // thing to catch. A borrow is fine (a caller can clone what it sees anyway, see
+            // the note on `DryRun`); what must not exist is an accessor handing back an
+            // owned verdict, in a wrapper or otherwise. `Explanation` counts, because its
+            // `decision` field is public.
+            let owned = !returns.trim_start().starts_with('&');
+            for escape in ["Decision", "Explanation"] {
+                assert!(
+                    !(owned && returns.contains(escape)),
+                    "DryRun line {offset} returns an owned {escape}, which puts a rehearsal \
+                     on the enforcement path: {line}"
+                );
+            }
         }
 
         assert!(
@@ -1801,6 +1896,7 @@ mod tests {
             "pub fn would_act",
             "pub fn would_match",
             "pub fn would_deny_because",
+            "pub fn would_because",
         ] {
             assert!(
                 block.contains(expected),
@@ -1808,5 +1904,140 @@ mod tests {
                  reading what it thinks it is"
             );
         }
+    }
+
+    /// A STEP-UP IS NOT A DENIAL, and `why_denied` must not call it one.
+    ///
+    /// `why_denied` guarded `Action::Allow` and let everything else fall through to "denied
+    /// by rule X", so a challenge was reported as a refusal. That is the same
+    /// explanation-contradicts-the-decision bug this type exists to prevent, one variant
+    /// over, and it reached `DryRun` too: an operator rehearsing a rollout was told their
+    /// rules deny users the rules would merely challenge.
+    #[test]
+    fn a_step_up_is_not_reported_as_a_denial() {
+        let set = RuleSet::new(vec![rule(
+            "mfa-for-payments",
+            vec![Criterion::PathPrefix("/payments".to_owned())],
+            Action::StepUp {
+                acr: "mfa".to_owned(),
+            },
+        )]);
+        let request = RequestFacts {
+            path: "/payments/new".to_owned(),
+            ..facts()
+        };
+
+        let explained = set.explain(&request);
+        assert_eq!(
+            explained.decision.action,
+            Action::StepUp {
+                acr: "mfa".to_owned()
+            }
+        );
+        assert_eq!(
+            explained.why_denied(),
+            None,
+            "a challenge is not a denial, and saying it is misreports the rule set"
+        );
+        assert_eq!(
+            set.dry_run(&request).would_deny_because(),
+            None,
+            "and the rehearsal must not report one either"
+        );
+
+        // But the operator is not left without a sentence.
+        assert_eq!(
+            explained.reason(),
+            "rule mfa-for-payments requires step-up to mfa"
+        );
+        assert_eq!(set.dry_run(&request).would_because(), explained.reason());
+    }
+
+    /// `would_allow` IS ALLOW, not "anything that is not a denial".
+    ///
+    /// Reporting a step-up as "would allow" is the admitting direction of the mistake, and
+    /// the corpus had no third-action row to catch it.
+    #[test]
+    fn a_step_up_does_not_count_as_would_allow() {
+        let set = RuleSet::new(vec![rule(
+            "mfa",
+            vec![],
+            Action::StepUp {
+                acr: "mfa".to_owned(),
+            },
+        )]);
+        let dry = set.dry_run(&facts());
+        assert!(
+            !dry.would_allow(),
+            "a step-up is not an admission: a rollout told otherwise would under-count \
+             the users it is about to challenge"
+        );
+        assert_eq!(
+            dry.would_act(),
+            &Action::StepUp {
+                acr: "mfa".to_owned()
+            }
+        );
+    }
+
+    /// `reason` SPEAKS FOR EVERY OUTCOME, so no caller has to reach for `why_denied` and
+    /// print nothing next to an admission or a challenge.
+    #[test]
+    fn every_outcome_has_a_sentence() {
+        let cases = [
+            (Action::Allow, "allowed by rule r"),
+            (Action::Deny, "denied by rule r"),
+            (
+                Action::StepUp {
+                    acr: "mfa".to_owned(),
+                },
+                "rule r requires step-up to mfa",
+            ),
+        ];
+        for (action, expected) in cases {
+            let set = RuleSet::new(vec![rule("r", vec![], action)]);
+            assert_eq!(set.explain(&facts()).reason(), expected);
+        }
+
+        // And the two no-rule shapes, which name no rule at all.
+        assert_eq!(
+            RuleSet::default().explain(&facts()).reason(),
+            "denied because no rules are configured"
+        );
+    }
+
+    /// THE FIRST OF TWO MATCHING RULES DECIDES, and the trace says so.
+    ///
+    /// The corpus previously had no request matching more than one rule, so the assertion
+    /// that "the rules marked Matched" equals "the rule the decision names" compared at most
+    /// one element and could not distinguish first-match from last-match. This makes the
+    /// overlap explicit rather than relying on a corpus row to carry it.
+    #[test]
+    fn with_two_matching_rules_only_the_first_is_marked_matched() {
+        let set = RuleSet::new(vec![
+            deny("first", vec![Criterion::PathPrefix("/x".to_owned())]),
+            allow("second", vec![Criterion::PathPrefix("/x".to_owned())]),
+        ]);
+        let request = RequestFacts {
+            path: "/x/y".to_owned(),
+            ..facts()
+        };
+        let explained = set.explain(&request);
+
+        assert_eq!(explained.decision.matched.as_deref(), Some("first"));
+        assert_eq!(
+            explained.trace.rules,
+            vec![
+                RuleTrace {
+                    rule: "first".to_owned(),
+                    outcome: RuleOutcome::Matched,
+                },
+                RuleTrace {
+                    rule: "second".to_owned(),
+                    outcome: RuleOutcome::NotReached,
+                },
+            ],
+            "the second rule matches the path too, and must be NotReached rather than Matched"
+        );
     }
 }
