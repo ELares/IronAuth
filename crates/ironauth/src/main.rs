@@ -909,12 +909,14 @@ async fn assemble_planes(
     // be: an operator sees a healthy server serving no OIDC, rather than a refusal naming
     // the rule. Here the error reaches the `ExitCode::FAILURE` arm, the same one a malformed
     // `server.public_url` takes.
-    let forward_auth =
-        ironauth_oidc::forward_auth_rules::ForwardAuthRuntime::from_config(&config.forward_auth)
-            .map_err(|error| ServerError::InvalidAccessRules {
-                reason: error.to_string(),
-            })?
-            .map(std::sync::Arc::new);
+    let forward_auth = ironauth_oidc::forward_auth_rules::ForwardAuthRuntime::from_config(
+        &config.forward_auth,
+        env.clock_arc(),
+    )
+    .map_err(|error| ServerError::InvalidAccessRules {
+        reason: error.to_string(),
+    })?
+    .map(std::sync::Arc::new);
 
     let management = build_admin_state(config, env, &shared).await;
     let oidc = if config.oidc.enabled {

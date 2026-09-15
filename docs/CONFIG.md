@@ -65,6 +65,10 @@ at the top of the file, or map it in `.taplo.toml`).
 | `forward_auth` | table | see fields | Forward-auth access rules (issue #154). |
 | `forward_auth.dialect` | string | `"forward-auth"` | Which reverse proxy dialect the check request arrives in. |
 | `forward_auth.enabled` | boolean | `false` | Whether the forward-auth surface is served. |
+| `forward_auth.rate_limit` | table | see fields | Request-plane rate limits for the check endpoint (issue #150). |
+| `forward_auth.rate_limit.per_environment` | table or unset | unset | Bounds one environment within a tenant. |
+| `forward_auth.rate_limit.per_ip` | table or unset | unset | The only layer that applies before a caller is identified. |
+| `forward_auth.rate_limit.per_tenant` | table or unset | unset | Bounds the customer. |
 | `forward_auth.rules` | array | empty | The ordered rule list. FIRST MATCH WINS, so order is meaning, not presentation. |
 | `hosted_pages` | table | see fields | Hosted-page render app settings (issue #85): the in-process, server-rendered pages that render from the headless flow contract (login, registration, MFA, recovery, federation), plus the theme seam and the served stylesheet. Off by default and SEPARATE from `flows.enabled`: enabling the headless flow API for native SDKs does NOT also cut the browser login UI over to the flow engine, and vice versa. The actual cutover (retargeting the `/authorize` interaction redirects onto the flow render app) is a later, deliberate change; this toggle default-off ships the seam. |
 | `hosted_pages.enabled` | boolean | `false` | Whether the hosted flow render app is the live browser interaction surface. Off by default: the bootstrap login, consent, and register pages stay the live UI until an operator opts in. Enabling this is independent of `flows.enabled`. |

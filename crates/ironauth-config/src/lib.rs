@@ -1421,11 +1421,19 @@ pub struct HotStateConfig {
 /// `subject_in_group` and `subject_has_role` are the current cases: the forward-auth
 /// identity carries a subject and no memberships, so those checks would compare against an
 /// empty list and a `deny` rule keyed on a group would never bite.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+// No `Eq`: the rate limits carry f64 rates, and a float has no total equality. `PartialEq`
+// is what comparisons here need anyway.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ForwardAuthConfig {
     /// Whether the forward-auth surface is served.
     pub enabled: bool,
+    /// Request-plane rate limits for the check endpoint (issue #150).
+    ///
+    /// Every layer is unlimited by default, so a deployment that does not ask for limiting
+    /// is unchanged. A layer with no entry is skipped; per-IP is the exception and refuses a
+    /// request that presents no address, which is the decision issue #1260 settled.
+    pub rate_limit: RateLimitConfig,
     /// Which reverse proxy dialect the check request arrives in.
     ///
     /// A DEPLOYMENT PROPERTY, not a per-request one. Each proxy states the original
@@ -1507,6 +1515,53 @@ pub struct AccessRuleConfig {
     /// Whether the request must be authenticated or anonymous.
     #[serde(default)]
     pub subject_state: Option<SubjectStateConfig>,
+}
+
+/// Per-layer request-plane rate limits (issue #150 criterion 1).
+///
+/// The layers are enforced INDEPENDENTLY and a request is admitted only if every applicable
+/// one admits it, so these are separate budgets rather than a precedence list. A layer left
+/// unset is unlimited, which is the shipped default for all of them: a deployment that has
+/// not asked to be rate limited is not.
+///
+/// # Why there is no `per_user` or `per_client` here
+///
+/// The engine has both layers. The forward-auth check cannot KEY them: the limiter runs
+/// before the session is resolved, deliberately, so the identity it builds carries no subject,
+/// and a forward-auth check names no OAuth client at all.
+///
+/// They were offered here once. A configured `per_user` would have been accepted by
+/// validation, inserted into the limiter, and then skipped on every request because the key
+/// was absent, so an operator would have read a per-user budget in their own config file and
+/// had none. That is the failure `MissingIpPolicy` calls the worse one: a silently unlimited
+/// surface that looks healthy until it is found.
+///
+/// This is the same refusal `rule_from_config` makes for `subject_in_group` and the same one
+/// `ProxyDialectConfig` makes for Envoy `ext_authz`: a vocabulary must not offer what the
+/// runtime cannot honour. Adding them back means resolving the session before the limiter,
+/// which is a different ordering decision with its own consequences.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct RateLimitConfig {
+    /// The only layer that applies before a caller is identified.
+    pub per_ip: Option<LimitConfig>,
+    /// Bounds the customer.
+    pub per_tenant: Option<LimitConfig>,
+    /// Bounds one environment within a tenant.
+    pub per_environment: Option<LimitConfig>,
+}
+
+/// One token bucket: a sustained rate and the burst it can absorb.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LimitConfig {
+    /// Tokens added per second. This is the SUSTAINED rate.
+    pub per_second: f64,
+    /// Bucket capacity, which is the largest burst admitted at once.
+    ///
+    /// A burst smaller than a request's cost can never be paid, so such a request is refused
+    /// with no retry advertised: waiting does not produce tokens a bucket cannot hold.
+    pub burst: f64,
 }
 
 /// The reverse proxy dialect a forward-auth check request arrives in.
@@ -6598,6 +6653,31 @@ fn validate_forward_auth(
     oidc_enabled: bool,
 ) -> Result<(), ConfigError> {
     let invalid = |message: String| ConfigError::Invalid { message };
+
+    // EVERY CONFIGURED LIMIT MUST BE A RATE. A non-positive burst can never admit anything,
+    // and a negative rate is not a rate; both produce a layer that refuses every request
+    // while reading as a limit somebody chose.
+    for (name, limit) in [
+        ("per_ip", cfg.rate_limit.per_ip),
+        ("per_tenant", cfg.rate_limit.per_tenant),
+        ("per_environment", cfg.rate_limit.per_environment),
+    ] {
+        let Some(limit) = limit else { continue };
+        if !limit.burst.is_finite() || limit.burst <= 0.0 {
+            return Err(invalid(format!(
+                "forward_auth.rate_limit.{name}.burst is {}, which admits nothing: a bucket \
+                 that holds no tokens refuses every request while reading as a limit",
+                limit.burst
+            )));
+        }
+        if !limit.per_second.is_finite() || limit.per_second < 0.0 {
+            return Err(invalid(format!(
+                "forward_auth.rate_limit.{name}.per_second is {}: a negative or non-finite \
+                 refill is not a rate",
+                limit.per_second
+            )));
+        }
+    }
 
     // TWO CROSS-SECTION REFUSALS, both for the same reason: with either of these wrong the
     // surface boots, validates, reports healthy, and decides nothing. A silent deny-all on

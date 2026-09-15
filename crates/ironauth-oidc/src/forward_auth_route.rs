@@ -48,6 +48,15 @@ use crate::wellknown::parse_scope;
 /// to forge an identity, and an operator wants to know which without reproducing it.
 pub const MUST_DELETE_HEADER: &str = "x-ironauth-must-delete";
 
+/// Throttled forward-auth checks, by the layer that refused (issue #150 criterion 1).
+///
+/// The layer is the SAME stable string `LIMITING_LAYER_HEADER` carries, so a dashboard and a
+/// response cannot disagree about what a layer is called. The criterion asks for the limiting
+/// layer "in headers and metrics", and this is the metrics half: without it an operator can
+/// see that a caller was throttled and not which budget it hit, and the remedies differ
+/// (per-IP means slow down, per-tenant means the account is over its plan).
+pub const THROTTLED_TOTAL: &str = "ironauth_forward_auth_throttled_total";
+
 /// Answer a proxy's forward-auth check.
 ///
 /// Accepts ANY method: under `ext_authz` the check request carries the original request's
@@ -66,6 +75,57 @@ pub async fn check(
         return status(StatusCode::NOT_FOUND);
     };
 
+    // THE HOP CHECK COMES FIRST, BEFORE THE LIMITER CHARGES ANYTHING.
+    //
+    // It was the other way round, and that turned enabling the limiter into a denial of
+    // service. This route is on the public plane and takes any method, so anyone who can
+    // reach the issuer can call it directly. The per-tenant and per-environment buckets are
+    // keyed on the tenant and environment in the URL PATH, which an unauthenticated caller
+    // simply names: `rules.rs` says it in its own words, "the path is unauthenticated
+    // attacker input".
+    //
+    // So a flood of direct requests, every one of them answered 403 for an untrusted hop,
+    // drained the named tenant's budget on the way out. The legitimate proxy's checks then
+    // got 429 and the proxy denied every request to the protected application, while
+    // `ironauth_forward_auth_throttled_total{layer="per_tenant"}` told the operator the
+    // account was over its plan.
+    //
+    // The comment that justified the old order said the identity was "built from what the
+    // server resolved". That was true of the address and false of the scope, which is the
+    // half that carries the shared budget.
+    //
+    // Refusing first costs less, too: this is a header lookup and a string compare, against
+    // an `admit` that takes a mutex and clones keys.
+    let hop = hop_from_headers(&headers);
+    if hop == ProxyHop::Untrusted {
+        return status(StatusCode::FORBIDDEN);
+    }
+
+    // THE LIMITER, once the hop is trusted. A check that will be refused for rate should not
+    // cost a rule evaluation, and the limiter is what bounds a proxy that has started looping.
+    //
+    // The address is the policy-resolved peer IP the request middleware stamps, replaced on
+    // every request so a client cannot supply its own. The scope comes from the path, which is
+    // attacker-controlled in general and is only safe to key a shared budget on because the
+    // refusal above has already established that this request came through the proxy.
+    let identity = ironauth_quota::layered::RequestIdentity {
+        ip: headers
+            .get(ironauth_config::PEER_IP_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        user: None,
+        client: None,
+        tenant: Some(tenant_id.clone()),
+        environment: Some(environment_id.clone()),
+    };
+    let admitted = runtime.limiter().admit(&identity, 1.0);
+    if admitted.is_throttled() || admitted.is_unidentified() {
+        if let Some(layer) = admitted.metric_label() {
+            metrics::counter!(THROTTLED_TOTAL, "layer" => layer).increment(1);
+        }
+        return throttled(&admitted);
+    }
+
     let pairs: Vec<(String, String)> = headers
         .iter()
         .filter_map(|(name, value)| {
@@ -75,8 +135,6 @@ pub async fn check(
                 .map(|value| (name.as_str().to_owned(), value.to_owned()))
         })
         .collect();
-
-    let hop = hop_from_headers(&headers);
 
     // The check request's own path is this endpoint's, which is exactly what must NOT be
     // authorized. It is passed because `ext_authz` is the dialect where the check request
@@ -185,6 +243,29 @@ fn render(outcome: &ForwardAuthOutcome, must_delete: &[String]) -> Response {
     response
 }
 
+/// Render a refusal from the limiter.
+///
+/// 429 for a rate refusal and 403 for an unidentified one, which is the distinction
+/// `LayeredOutcome` draws: 429 advertises a remedy (wait) and waiting never produces an
+/// address, so telling an unattributable caller to retry would publish a remedy that cannot
+/// work.
+fn throttled(outcome: &ironauth_quota::layered::LayeredOutcome) -> Response {
+    let mut response = status(if outcome.is_unidentified() {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::TOO_MANY_REQUESTS
+    });
+    for (name, value) in outcome.headers() {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::from_bytes(name.as_bytes()),
+            axum::http::HeaderValue::from_str(&value),
+        ) {
+            response.headers_mut().insert(name, value);
+        }
+    }
+    response
+}
+
 /// An empty response with `code`.
 fn status(code: StatusCode) -> Response {
     let mut response = Response::new(axum::body::Body::empty());
@@ -203,6 +284,7 @@ mod tests {
     use axum::http::HeaderValue;
 
     use crate::rules::Decision;
+    use ironauth_quota::Decision as QuotaDecision;
 
     use super::*;
 
@@ -335,6 +417,51 @@ mod tests {
                 "a refusal must not hand the upstream an identity"
             );
         }
+    }
+
+    /// A RATE REFUSAL IS 429 AND AN UNIDENTIFIED ONE IS 403, and both carry the limiter's
+    /// headers so a client can act on them.
+    ///
+    /// The split is the one `LayeredOutcome` draws and the reason carries over: 429
+    /// advertises a remedy, and waiting never produces an address, so telling an
+    /// unattributable caller to retry would publish a remedy that cannot work.
+    #[test]
+    fn a_rate_refusal_and_an_unidentified_one_render_differently() {
+        use ironauth_quota::Limit;
+        use ironauth_quota::layered::{LayeredLimiter, LayeredLimits, RateLayer, RequestIdentity};
+
+        let clock = std::sync::Arc::new(ironauth_env::ManualClock::new(
+            std::time::SystemTime::UNIX_EPOCH,
+        ));
+        let limiter = LayeredLimiter::new(
+            LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.0, 1.0)),
+            clock,
+        );
+        let addressed = RequestIdentity {
+            ip: Some("198.51.100.7".to_owned()),
+            ..RequestIdentity::default()
+        };
+
+        assert_eq!(
+            limiter.admit(&addressed, 1.0).decision,
+            QuotaDecision::Admitted
+        );
+        let over_quota = throttled(&limiter.admit(&addressed, 1.0));
+        assert_eq!(over_quota.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            over_quota.headers().get("x-ratelimit-layer").is_some(),
+            "a rate refusal must name the layer that refused"
+        );
+
+        // No address, against a limiter that has a per-IP limit configured: the default
+        // policy refuses, and it is NOT a throttle.
+        let unidentified = throttled(&limiter.admit(&RequestIdentity::default(), 1.0));
+        assert_eq!(unidentified.status(), StatusCode::FORBIDDEN);
+        assert_ne!(
+            unidentified.status(),
+            over_quota.status(),
+            "the two refusals must be distinguishable: one can be waited out and one cannot"
+        );
     }
 
     /// The must-delete instruction reaches the proxy, and is absent when there is nothing

@@ -188,6 +188,7 @@ fn rule_from_config(cfg: &AccessRuleConfig) -> Result<Rule, ConversionError> {
 pub struct ForwardAuthRuntime {
     forward_auth: crate::forward_auth::ForwardAuth,
     dialect: crate::forward_auth::Dialect,
+    limiter: ironauth_quota::layered::LayeredLimiter,
 }
 
 impl ForwardAuthRuntime {
@@ -202,11 +203,15 @@ impl ForwardAuthRuntime {
     /// Surfaced at boot rather than at request time, because a rule that cannot be built is
     /// a rule that does not apply, and a missing rule on an ordered access list hands the
     /// request to whatever follows it.
-    pub fn from_config(cfg: &ForwardAuthConfig) -> Result<Option<Self>, ConversionError> {
+    pub fn from_config(
+        cfg: &ForwardAuthConfig,
+        clock: std::sync::Arc<dyn ironauth_env::Clock>,
+    ) -> Result<Option<Self>, ConversionError> {
         if !cfg.enabled {
             return Ok(None);
         }
         Ok(Some(Self {
+            limiter: limiter_from_config(&cfg.rate_limit, clock),
             forward_auth: crate::forward_auth::ForwardAuth::new(rule_set_from_config(cfg)?),
             dialect: match cfg.dialect {
                 ironauth_config::ProxyDialectConfig::ForwardAuth => {
@@ -233,6 +238,44 @@ impl ForwardAuthRuntime {
     pub fn dialect(&self) -> crate::forward_auth::Dialect {
         self.dialect
     }
+
+    /// The request-plane limiter this surface admits through.
+    #[must_use]
+    pub fn limiter(&self) -> &ironauth_quota::layered::LayeredLimiter {
+        &self.limiter
+    }
+}
+
+/// Build the five-layer limiter from configuration (issue #150 criterion 1).
+///
+/// A layer with no configured limit is left out, which the limiter treats as unlimited. All
+/// five absent is the shipped default, so a deployment that has not asked to be rate limited
+/// gets a limiter that admits everything rather than no limiter at all: one code path,
+/// whether or not limits are configured, so the admit call site cannot drift into being
+/// conditional and then being forgotten.
+fn limiter_from_config(
+    cfg: &ironauth_config::RateLimitConfig,
+    clock: std::sync::Arc<dyn ironauth_env::Clock>,
+) -> ironauth_quota::layered::LayeredLimiter {
+    use ironauth_quota::layered::{LayeredLimiter, LayeredLimits, RateLayer};
+
+    let mut limits = LayeredLimits::unlimited();
+    // THE THREE THE CHECK PATH CAN KEY. Per-user and per-client are absent from the config
+    // for the reason recorded beside `RateLimitConfig`: this surface resolves no subject
+    // before limiting and names no client, so those layers could be configured and never bind.
+    for (layer, configured) in [
+        (RateLayer::PerIp, cfg.per_ip),
+        (RateLayer::PerTenant, cfg.per_tenant),
+        (RateLayer::PerEnvironment, cfg.per_environment),
+    ] {
+        if let Some(limit) = configured {
+            limits = limits.with(
+                layer,
+                ironauth_quota::Limit::new(limit.per_second, limit.burst),
+            );
+        }
+    }
+    LayeredLimiter::new(limits, clock)
 }
 
 #[cfg(test)]
@@ -240,6 +283,12 @@ mod tests {
     use ironauth_config::{HeaderMatchConfig, ProxyDialectConfig, SubjectStateConfig};
 
     use super::*;
+
+    fn clock() -> std::sync::Arc<dyn ironauth_env::Clock> {
+        std::sync::Arc::new(ironauth_env::ManualClock::new(
+            std::time::SystemTime::UNIX_EPOCH,
+        ))
+    }
 
     fn rule(name: &str) -> AccessRuleConfig {
         AccessRuleConfig {
@@ -254,6 +303,7 @@ mod tests {
             enabled: true,
             dialect: ProxyDialectConfig::default(),
             rules,
+            ..ForwardAuthConfig::default()
         }
     }
 
@@ -445,7 +495,7 @@ mod tests {
         };
 
         assert!(
-            ForwardAuthRuntime::from_config(&cfg)
+            ForwardAuthRuntime::from_config(&cfg, clock())
                 .expect("a disabled section is not an error")
                 .is_none()
         );
@@ -473,11 +523,15 @@ mod tests {
         ];
 
         for (configured, expected) in pairs {
-            let runtime = ForwardAuthRuntime::from_config(&ForwardAuthConfig {
-                enabled: true,
-                dialect: configured,
-                rules: vec![rule("any")],
-            })
+            let runtime = ForwardAuthRuntime::from_config(
+                &ForwardAuthConfig {
+                    enabled: true,
+                    dialect: configured,
+                    rules: vec![rule("any")],
+                    ..ForwardAuthConfig::default()
+                },
+                clock(),
+            )
             .expect("converts")
             .expect("enabled builds a runtime");
 
@@ -485,6 +539,161 @@ mod tests {
                 runtime.dialect(),
                 expected,
                 "{configured:?} must map to its own dialect"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use ironauth_config::{ForwardAuthConfig, LimitConfig, RateLimitConfig};
+    use ironauth_quota::Decision;
+    use ironauth_quota::layered::{RateLayer, RequestIdentity};
+
+    use super::*;
+
+    fn clock() -> std::sync::Arc<dyn ironauth_env::Clock> {
+        std::sync::Arc::new(ironauth_env::ManualClock::new(
+            std::time::SystemTime::UNIX_EPOCH,
+        ))
+    }
+
+    /// EVERY CONFIGURED LAYER REACHES THE LIMITER, driven off the list rather than one case.
+    ///
+    /// The failure a single spot-check cannot see is two config fields mapping to one layer:
+    /// the build would still produce a limiter, the test would still pass, and one of the two
+    /// budgets would silently not exist.
+    ///
+    /// Three layers, not five. Per-user and per-client are deliberately absent from the
+    /// config because this surface cannot key them, and the assertion below pins that: if
+    /// someone adds either field back without also resolving a subject before the limiter,
+    /// the count stops matching and they have to confront the question rather than ship a
+    /// budget that never binds.
+    #[test]
+    fn each_configured_layer_becomes_its_own_budget() {
+        let one = Some(LimitConfig {
+            per_second: 0.0,
+            burst: 1.0,
+        });
+        let cases = [
+            (
+                RateLayer::PerIp,
+                RateLimitConfig {
+                    per_ip: one,
+                    ..RateLimitConfig::default()
+                },
+            ),
+            (
+                RateLayer::PerTenant,
+                RateLimitConfig {
+                    per_tenant: one,
+                    ..RateLimitConfig::default()
+                },
+            ),
+            (
+                RateLayer::PerEnvironment,
+                RateLimitConfig {
+                    per_environment: one,
+                    ..RateLimitConfig::default()
+                },
+            ),
+        ];
+
+        // The identity the HANDLER builds, which is the point: it presents an address and a
+        // scope and nothing else. Using an identity that presented a user would have let a
+        // per-user budget appear to work here while never binding in production.
+        let as_the_handler_builds_it = || RequestIdentity {
+            ip: Some("198.51.100.7".to_owned()),
+            user: None,
+            client: None,
+            tenant: Some("tnt_1".to_owned()),
+            environment: Some("env_1".to_owned()),
+        };
+        assert_eq!(
+            cases.len(),
+            3,
+            "three layers are keyable from this identity; a fourth case means the identity \
+             grew and the config should say so"
+        );
+
+        for (expected, cfg) in cases {
+            let limiter = limiter_from_config(&cfg, clock());
+            assert_eq!(
+                limiter.admit(&as_the_handler_builds_it(), 1.0).decision,
+                Decision::Admitted
+            );
+            let refused = limiter.admit(&as_the_handler_builds_it(), 1.0);
+
+            assert!(refused.is_throttled(), "{expected:?} must bind");
+            assert_eq!(
+                refused.limiting_layer,
+                Some(expected),
+                "{expected:?} was configured, so it must be the layer that refuses"
+            );
+        }
+    }
+
+    /// CRITERION 1's ACTUAL CLAIM: the limiting layer is identified in headers AND metrics,
+    /// and those two must be the SAME string.
+    ///
+    /// Asserted as an equality between the header value and the metric label rather than
+    /// against a literal, because the harm is not either being wrong on its own: it is a
+    /// dashboard and a response disagreeing about what a layer is called, which sends whoever
+    /// is holding the 429 and whoever is reading the graph to different answers.
+    #[test]
+    fn the_refusing_layer_is_the_same_string_in_the_header_and_the_metric() {
+        let limiter = limiter_from_config(
+            &RateLimitConfig {
+                per_tenant: Some(LimitConfig {
+                    per_second: 0.0,
+                    burst: 1.0,
+                }),
+                ..RateLimitConfig::default()
+            },
+            clock(),
+        );
+        let identity = RequestIdentity {
+            tenant: Some("tnt_1".to_owned()),
+            ..RequestIdentity::default()
+        };
+
+        assert_eq!(limiter.admit(&identity, 1.0).decision, Decision::Admitted);
+        let refused = limiter.admit(&identity, 1.0);
+
+        let label = refused.metric_label().expect("a refusal names its layer");
+        let headers = refused.headers();
+        let header = headers
+            .iter()
+            .find(|(name, _)| *name == ironauth_quota::layered::LIMITING_LAYER_HEADER)
+            .map(|(_, value)| value.as_str())
+            .expect("a refusal carries the layer header");
+
+        assert_eq!(
+            label, header,
+            "the metric label and the response header must be one string"
+        );
+        assert_eq!(label, "per_tenant");
+    }
+
+    /// The shipped default limits nothing, so a deployment that did not ask to be rate
+    /// limited is not.
+    ///
+    /// This is the contrast the table above needs: without it, a `limiter_from_config` that
+    /// returned a limiter refusing everything would satisfy every row.
+    #[test]
+    fn the_default_configuration_admits_everything() {
+        let limiter = limiter_from_config(&ForwardAuthConfig::default().rate_limit, clock());
+        let identity = RequestIdentity {
+            ip: Some("198.51.100.7".to_owned()),
+            tenant: Some("tnt_1".to_owned()),
+            ..RequestIdentity::default()
+        };
+
+        for spend in 0..50 {
+            assert_eq!(
+                limiter.admit(&identity, 1.0).decision,
+                Decision::Admitted,
+                "spend {spend}: an unconfigured limiter must not limit"
             );
         }
     }
