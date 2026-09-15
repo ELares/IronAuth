@@ -63,6 +63,16 @@ ironauth-oidc/device_posture
 # This entry exists because the scan went RED on main when #1258 merged and nobody noticed:
 # the merge ran five gates, not this one. Wiring the limiter removes the entry.
 ironauth-quota/layered
+# The access-rule engine, traces, dry-run and decision cache (issue #154 criteria 3, 5 and 6).
+# Callerless until criteria 1, 2 and 4 land: those are the forward-auth proxy dialects and the
+# integration that gates a real resource, and they need proxy containers.
+#
+# This entry was removed once, when `forward_auth` below started importing the engine, and
+# that was wrong: `forward_auth` is itself allowlisted as callerless, so the reference came
+# from something nothing calls. The scan now discounts references from allowlisted modules,
+# which restores the entry AND is the general fix -- see `dormant_module_files`.
+ironauth-oidc/rules
+
 # Trusted-header SSO for the forward-auth surface (issue #154 criterion 2). Callerless for the
 # same reason as the engine above: the proxy dialect endpoints are criteria 1 and 2's other
 # half and need real proxy containers, so nothing mounts this yet. The security properties it
@@ -115,6 +125,21 @@ allow() {
 #      too. The other four. Excluded by the cast suffix rather than by trying to detect a
 #      string literal, because the suffix is unambiguous: `::text`, `::jsonb` and friends are
 #      never module paths.
+# The files of every module the allowlist declares callerless.
+#
+# DORMANCY IS NOT TRANSITIVE, and treating it as if it were cost this scan a 3609-line module.
+# A new callerless module was added that imported the access-rule engine, and the engine's own
+# allowlist entry then read as stale and was removed -- so the only written record of an
+# unreachable engine disappeared, discharged by a module that is itself unreachable. A
+# reference from something nothing calls is not evidence that anything calls it.
+dormant_module_files() {
+  allowlist_entries | while IFS=/ read -r crate module; do
+    [ -n "$module" ] || continue
+    echo "crates/${crate}/src/${module}.rs:"
+    echo "crates/${crate}/src/${module}/"
+  done
+}
+
 refs_for() {
   # The FIXED-STRING grep stays first and walks the tree; the filters below run only on the
   # handful of lines it returns. Doing the boundary match as a tree-wide regex instead made
@@ -124,6 +149,7 @@ refs_for() {
     | grep -vE '^crates/[^/]+/guests/' \
     | grep -E "[^A-Za-z0-9_]${1}::" \
     | grep -vE "${1}::(text|jsonb|json|uuid|int|bigint|boolean|timestamptz)([^A-Za-z0-9_]|$)" \
+    | grep -vFf <(dormant_module_files) \
     | wc -l; } || true )"
   count="$(echo "$count" | tr -d ' ')"
   [ -n "$count" ] || count=0
