@@ -142,3 +142,58 @@ async fn public_root_and_security_txt_serve() {
         .unwrap_or_default();
     assert!(content_type.contains("text/plain"), "{content_type}");
 }
+
+/// THE DEGRADED ARM, which is the one issue #149 criterion 6 is actually about.
+///
+/// "Health endpoints report the active degraded tier DISTINCTLY from healthy and from hard
+/// down" is a claim about three outcomes, and two of them were covered: `healthz_is_always_ok`
+/// and `readyz_reports_503_when_database_unreachable`. The middle one, the whole point of the
+/// criterion, had no test at the HTTP layer at all. `readiness.rs` tests the probe's tier
+/// CONSTRUCTION thoroughly; nothing asserted what an operator reading `/readyz` sees.
+///
+/// A degraded state needs a REACHABLE database and an unreachable optional component. The
+/// database half is a bare TCP listener, which is sufficient because the probe connects and
+/// speaks no protocol -- the same property that makes readiness a weak signal in production is
+/// what makes this test cheap, and it is worth naming rather than relying on quietly.
+#[tokio::test]
+async fn readyz_reports_the_degraded_tier_distinctly() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to listen on");
+    let port = listener.local_addr().expect("a bound address").port();
+
+    let server = server_from(&format!(
+        "[database]\nurl = \"postgres://ironauth@127.0.0.1:{port}/ironauth\"\n\
+         \n[outbox]\n# TEST-NET-1 (RFC 5737), which is not reachable.\n\
+         ironbus_addr = \"192.0.2.1:4222\"\n"
+    ));
+    let (status, _, body) = get(server.management_app(), "/readyz").await;
+
+    // 200, NOT 503. A degraded tier still serves every flow, so answering 503 would have a
+    // Kubernetes readiness probe pull the pod out of its Service because an OPTIONAL component
+    // is down, turning an accelerator outage into an availability outage.
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body, "degraded: backbone_absent\n",
+        "the body is what carries the tier, as a stable token an operator and a dashboard can \
+         both match on"
+    );
+
+    // DISTINCT FROM HEALTHY, which is the word the criterion uses. Asserted as a contrast
+    // rather than by reading the degraded body alone: a handler that answered the same 200
+    // "ready" for both would satisfy the status assertion above and defeat the criterion.
+    assert_ne!(body, "ready\n");
+}
+
+/// The healthy arm, for the same reason: without it the contrast above has only one side.
+#[tokio::test]
+async fn readyz_reports_ready_when_nothing_is_degraded() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to listen on");
+    let port = listener.local_addr().expect("a bound address").port();
+
+    let server = server_from(&format!(
+        "[database]\nurl = \"postgres://ironauth@127.0.0.1:{port}/ironauth\"\n"
+    ));
+    let (status, _, body) = get(server.management_app(), "/readyz").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, "ready\n");
+}
