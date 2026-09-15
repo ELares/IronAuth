@@ -16,32 +16,62 @@
 # an attacker controls.
 set -euo pipefail
 
-# SELFCHECK: the docs quote the raw cosign invocation for consumers who are
-# verifying from somewhere this repository is not checked out, so the identity
-# pattern exists in two files. That is the shape that rots: the script changes,
-# the prose does not, and the published instructions quietly stop matching what
-# CI proved. This asserts the two agree, and CI runs it.
+repo="${IRONAUTH_REPO:-ELares/IronAuth}"
+issuer="${IRONAUTH_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
+# The literal path, for the exact-identity branch.
+workflow=".github/workflows/release.yml"
+# The same path with its dots escaped, for the regexp branch. Interpolating the
+# literal left `.github` and `release.yml` as wildcards, so the pattern the
+# script ran was strictly looser than the one the docs published: it also
+# accepted `/xgithub/workflows/release.yml` and `/release-yml`. No live bypass
+# came of it, because GitHub always writes that path segment literally, but a
+# supply-chain pattern that differs from its published form is worth nothing as
+# a published form.
+workflow_pattern='\.github/workflows/release\.yml'
+identity_regexp="^https://github\.com/${repo}/${workflow_pattern}@refs/tags/ironauth-v[0-9]+\.[0-9]+\.[0-9]+\$"
+
+# SELFCHECK: the docs quote the raw cosign invocation for consumers verifying
+# from somewhere this repository is not checked out, so the identity pattern
+# exists in two places.
+#
+# THE FIRST VERSION OF THIS GATE CHECKED THE WRONG SIDE. It grepped the doc for
+# three hard-coded literals and never opened the script, so the rot direction it
+# names -- "the script changes, the prose does not" -- was the one direction it
+# structurally could not see. A review showed four mutations surviving it: the
+# documented regexp repointed at another GitHub org, the script's own repo
+# default changed, its issuer default changed, and the digest guard deleted
+# outright. Each printed "selfcheck ok".
+#
+# It now asserts the doc contains the exact strings the script BUILDS, and
+# exercises the digest guard instead of trusting it to be there.
 if [ "${1:-}" = "--selfcheck" ]; then
     doc="$(dirname "$0")/../docs/RELEASING.md"
-    if [ ! -f "$doc" ]; then
-        echo "verify-image: selfcheck cannot find $doc" >&2
+    fail() {
+        echo "verify-image: selfcheck: $1" >&2
         exit 1
-    fi
-    # The literal the script builds its regexp from, as it appears in prose
-    # (the doc escapes it for the shell the reader will paste into).
-    if ! grep -q "certificate-oidc-issuer https://token.actions.githubusercontent.com" "$doc"; then
-        echo "verify-image: docs/RELEASING.md no longer documents the OIDC issuer this script uses" >&2
-        exit 1
-    fi
-    if ! grep -q "refs/tags/ironauth-v" "$doc"; then
-        echo "verify-image: docs/RELEASING.md no longer documents the signing identity pattern" >&2
-        exit 1
-    fi
-    if ! grep -q "by digest" "$doc"; then
-        echo "verify-image: docs/RELEASING.md no longer tells the reader to use a digest" >&2
-        exit 1
-    fi
-    echo "verify-image: selfcheck ok (docs and script agree on issuer, identity and digest rule)"
+    }
+    [ -f "$doc" ] || fail "cannot find $doc"
+
+    grep -qF -- "$issuer" "$doc" ||
+        fail "docs/RELEASING.md does not document the issuer this script uses ($issuer)"
+    grep -qF -- "$identity_regexp" "$doc" ||
+        fail "docs/RELEASING.md does not publish the identity pattern this script builds"
+    grep -q "by digest" "$doc" ||
+        fail "docs/RELEASING.md no longer tells the reader to use a digest"
+
+    # EXERCISED, NOT GREPPED. A grep for the guard's source text passes on a
+    # guard that has been commented out or made unreachable. Exit 2 is the
+    # guard's own code: if it were removed the script would fall through to
+    # cosign and exit 1 or 127, which this catches.
+    set +e
+    "$0" "ghcr.io/example/image:latest" >/dev/null 2>&1
+    guard_rc=$?
+    set -e
+    [ "$guard_rc" -eq 2 ] ||
+        fail "the digest guard no longer refuses a tag reference (exit $guard_rc, expected 2)"
+
+    echo "verify-image: selfcheck ok (docs publish the issuer and pattern this script builds,"
+    echo "verify-image: and the digest guard refuses a tag reference)"
     exit 0
 fi
 
@@ -66,18 +96,13 @@ case "$image" in
         ;;
 esac
 
-repo="${IRONAUTH_REPO:-ELares/IronAuth}"
-issuer="${IRONAUTH_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
-workflow=".github/workflows/release.yml"
-
 if [ -n "$tag" ]; then
     # The exact release that is supposed to have produced this image.
     identity=(--certificate-identity "https://github.com/${repo}/${workflow}@refs/tags/${tag}")
 else
     # Any tagged release of this repository, anchored at both ends so a
     # lookalike repository whose name merely CONTAINS ours cannot match.
-    identity=(--certificate-identity-regexp \
-        "^https://github\\.com/${repo}/${workflow}@refs/tags/ironauth-v[0-9]+\\.[0-9]+\\.[0-9]+\$")
+    identity=(--certificate-identity-regexp "$identity_regexp")
 fi
 
 echo "verify-image: verifying ${image}"

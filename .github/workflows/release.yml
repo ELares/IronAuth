@@ -179,6 +179,15 @@ jobs:
       # release rather than from any release.
       - name: Verify the signature we just published
         run: scripts/verify-image.sh "${{ steps.push.outputs.image }}@${{ steps.push.outputs.digest }}" "$GITHUB_REF_NAME"
+      # THE COMMAND THE DOCS HAND A CONSUMER, run against the same image.
+      #
+      # The step above passes the exact tag, which exercises the
+      # --certificate-identity branch. The default invocation in
+      # docs/RELEASING.md passes no tag and takes the --certificate-identity-regexp
+      # branch instead, and nothing ran it: the pattern a consumer is told to
+      # trust was the one path CI never took.
+      - name: Verify again the way a consumer is told to
+        run: scripts/verify-image.sh "${{ steps.push.outputs.image }}@${{ steps.push.outputs.digest }}"
       - name: Attest image provenance
         uses: actions/attest-build-provenance@v4
         with:

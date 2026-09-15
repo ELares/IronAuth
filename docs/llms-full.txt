@@ -8017,11 +8017,54 @@ silently included.
 2. Merge on green; tag `<artifact>-vX.Y.Z` on the merge commit; push the tag.
 3. The release workflow runs verify, build, SBOM, attest, release, and the
    image lane; check all lanes finished and the release page lists the
-   binary, SHA256SUMS, and SBOM.
+   binary, SHA256SUMS, and SBOM. The image lane verifies its own signature
+   before finishing (see "Verifying a published image" below), so a green
+   image lane means the published signature is checkable, not merely made.
 4. First-time note: the release lane is validated end to end by the first
    real release; until then treat it as authored but unproven.
 5. Record a HUMAN-TIMED quickstart run per guide in `docs/dx/timed-runs.md`.
    See below: this is DX evidence, and deliberately not a gate.
+
+## Verifying a published image
+
+The container images are signed with [cosign](https://docs.sigstore.dev/) in
+keyless mode, so there is no public key to distribute. What stands in for one is
+the signing IDENTITY: the release workflow of this repository, as attested by
+GitHub's OIDC issuer.
+
+```
+scripts/verify-image.sh ghcr.io/elares/ironauth@sha256:<digest>
+```
+
+To check that an image came from one SPECIFIC release rather than any release,
+pass the tag:
+
+```
+scripts/verify-image.sh ghcr.io/elares/ironauth@sha256:<digest> ironauth-v1.2.3
+```
+
+Without cosign installed, or to verify from somewhere this repository is not
+checked out, the script is a thin wrapper around:
+
+```
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/ELares/IronAuth/\.github/workflows/release\.yml@refs/tags/ironauth-v[0-9]+\.[0-9]+\.[0-9]+$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/elares/ironauth@sha256:<digest>
+```
+
+Both constraints are required. The issuer alone would accept a signature from
+any workflow in any repository on GitHub; the identity alone would accept a
+certificate minted by an issuer an attacker controls.
+
+**Reference the image by digest, not by tag.** The script refuses a tag for this
+reason: verifying `:latest` verifies whatever `latest` pointed at during the
+call, and a registry can move it afterwards. A digest names the bytes the
+signature covers.
+
+The release workflow runs this same script against each image immediately after
+signing it, so the command above is one CI has executed rather than one written
+down and assumed to work.
 
 ## Human-timed quickstart runs
 
