@@ -54,30 +54,23 @@ ironauth-oidc/device_posture
 # it ran.
 
 
-# The five-layer request limiter (issue #150 criterion 1, PR 1258). Callerless because the
-# first caller is a DECISION, not an oversight: an absent per-IP identity currently skips the
-# only layer that applies before anyone is identified, and whether that should fail closed
-# depends on whether the caller is an internet-facing forward-auth surface or an internal one.
-# Issue #1260 holds that decision and names this module.
+# The five-layer request limiter (issue #150 criterion 1, PR 1258). Still callerless: the
+# module exports eleven public items and not one of them is named anywhere outside
+# `layered.rs`.
 #
-# This entry exists because the scan went RED on main when #1258 merged and nobody noticed:
-# the merge ran five gates, not this one. Wiring the limiter removes the entry.
+# #1260 is closed, so the DECISION that blocked a first caller is made (a configured per-IP
+# limit refuses a request with no address, PR 1283). What remains is the wiring, and #150
+# criteria 1, 4 and 5 all wait on it.
+#
+# THIS ENTRY WAS REMOVED ONCE AND PUT BACK. The scan reported it INERT, meaning it had found
+# a reference and would not flag the module anyway. That reference was a rustdoc line in
+# `lib.rs` spelling `layered::tests::...`, added by PR 1284 two commits earlier, so a doc
+# comment had quietly discharged the claim. Removing the entry on that basis would have made
+# the module unflaggable forever: `refs_for` returns 1, the loop skips it before `allow` is
+# consulted, and the staleness check then refuses any attempt to re-add it. The doc line is
+# reworded to name the test without spelling a path, which restores the count to zero and
+# puts the claim back under this gate.
 ironauth-quota/layered
-# The access-rule engine, traces, dry-run and decision cache (issue #154 criteria 3, 5 and 6).
-# Callerless until criteria 1, 2 and 4 land: those are the forward-auth proxy dialects and the
-# integration that gates a real resource, and they need proxy containers.
-#
-# This entry was removed once, when `forward_auth` below started importing the engine, and
-# that was wrong: `forward_auth` is itself allowlisted as callerless, so the reference came
-# from something nothing calls. The scan now discounts references from allowlisted modules,
-# which restores the entry AND is the general fix -- see `dormant_module_files`.
-ironauth-oidc/rules
-
-# Trusted-header SSO for the forward-auth surface (issue #154 criterion 2). Callerless for the
-# same reason as the engine above: the proxy dialect endpoints are criteria 1 and 2's other
-# half and need real proxy containers, so nothing mounts this yet. The security properties it
-# enforces are unit-tested against the forgery cases the criterion names.
-ironauth-oidc/forward_auth
 
 ALLOWLIST
 }

@@ -432,9 +432,15 @@ impl RateLimitSnapshot {
     /// worth more than matching a convention that is not specified anywhere, so the two
     /// headers carry the same number in the same units.
     ///
-    /// That is enforced by `layered::tests::the_structured_and_legacy_headers_never_disagree`,
-    /// which asserts the structured field equals a string built from all three legacy headers
-    /// across a run of spends. It predates this section: the units decision was already held
+    /// That is enforced by the `the_structured_and_legacy_headers_never_disagree` test in
+    /// `layered.rs`, which asserts the structured field equals a string built from all three
+    /// legacy headers across a run of spends.
+    ///
+    /// Written as a file-and-test name rather than a Rust path deliberately. A doc comment
+    /// here that spelled the module path was counted by `dormant-module-scan` as a REFERENCE
+    /// to that module, which silently discharged its dormancy claim while it still had no
+    /// production caller. A doc comment should not be able to turn a gate green, so this one
+    /// names the test and the file and never writes a path. It predates this section: the units decision was already held
     /// in place here, it just was not written down as a decision.
     #[must_use]
     pub fn headers(&self) -> Vec<(&'static str, String)> {
