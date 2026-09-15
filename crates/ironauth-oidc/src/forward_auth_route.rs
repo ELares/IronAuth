@@ -33,7 +33,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
 
-use crate::forward_auth::{DialectError, Identity};
+use crate::forward_auth::{DialectError, ForwardAuthOutcome, Identity};
 use crate::forward_auth::{ProxyHop, trusted_header_names};
 use crate::rules::Action;
 use crate::state::OidcState;
@@ -76,11 +76,7 @@ pub async fn check(
         })
         .collect();
 
-    let hop = if state.proxy_hop_trusted() {
-        ProxyHop::Trusted
-    } else {
-        ProxyHop::Untrusted
-    };
+    let hop = hop_from_headers(&headers);
 
     // The check request's own path is this endpoint's, which is exactly what must NOT be
     // authorized. It is passed because `ext_authz` is the dialect where the check request
@@ -115,6 +111,36 @@ pub async fn check(
 
     let outcome = runtime.forward_auth().evaluate(facts, identity.as_ref());
 
+    render(&outcome, &must_delete)
+}
+
+/// Whether THIS request arrived through the configured trusted-proxy chain.
+///
+/// PER REQUEST, AND FAIL CLOSED. This was `state.proxy_hop_trusted()`, a boot-time boolean
+/// meaning "this deployment honours forwarding headers at all". That is a different question
+/// from "did this request arrive through the chain", and answering the second with the first
+/// treats a client that reached the endpoint directly as though it had come through the
+/// proxy. It could then state the original request itself, which is the entire thing the hop
+/// check exists to stop.
+///
+/// The verdict is stamped per request by the server's middleware, which REPLACES any value a
+/// client sent, exactly as it does for the resolved peer IP. Anything other than the honored
+/// value, the header being absent included, is untrusted: a deployment that has not wired
+/// the middleware refuses rather than admits.
+fn hop_from_headers(headers: &HeaderMap) -> ProxyHop {
+    if headers
+        .get(ironauth_config::FORWARD_DECISION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(ironauth_config::FORWARD_DECISION_HONORED)
+    {
+        ProxyHop::Trusted
+    } else {
+        ProxyHop::Untrusted
+    }
+}
+
+/// Turn a decision into the response a proxy acts on.
+fn render(outcome: &ForwardAuthOutcome, must_delete: &[String]) -> Response {
     let mut response = match outcome.decision.action {
         Action::Allow => status(StatusCode::OK),
         Action::Deny => status(StatusCode::FORBIDDEN),
@@ -170,4 +196,162 @@ fn status(code: StatusCode) -> Response {
 #[must_use]
 pub fn trusted_headers() -> Vec<&'static str> {
     trusted_header_names().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::HeaderValue;
+
+    use crate::rules::Decision;
+
+    use super::*;
+
+    fn outcome(action: Action, upstream: Vec<(String, String)>) -> ForwardAuthOutcome {
+        ForwardAuthOutcome {
+            decision: Decision {
+                action,
+                matched: Some("a rule".to_owned()),
+            },
+            upstream_headers: upstream,
+            must_delete: Vec::new(),
+            identity_rejected: None,
+        }
+    }
+
+    /// ONLY the stamped value means trusted (issue #154).
+    ///
+    /// The table drives what an ATTACKER sends, because this is the check that decides
+    /// whether the request is allowed to describe some other request. A client reaching the
+    /// endpoint directly sends no stamped header, or sends one it made up; both must be
+    /// untrusted, and the absent case must be untrusted too so a deployment that has not
+    /// wired the middleware refuses rather than admits.
+    #[test]
+    fn only_the_stamped_honored_value_is_a_trusted_hop() {
+        let mut trusted = HeaderMap::new();
+        trusted.insert(
+            axum::http::HeaderName::from_static(ironauth_config::FORWARD_DECISION_HEADER),
+            HeaderValue::from_static(ironauth_config::FORWARD_DECISION_HONORED),
+        );
+        assert_eq!(hop_from_headers(&trusted), ProxyHop::Trusted);
+
+        for forged in [
+            "",
+            "direct",
+            "failed-closed",
+            "HONORED",
+            "honored ",
+            "true",
+            "1",
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Ok(value) = HeaderValue::from_str(forged) {
+                headers.insert(
+                    axum::http::HeaderName::from_static(ironauth_config::FORWARD_DECISION_HEADER),
+                    value,
+                );
+            }
+            assert_eq!(
+                hop_from_headers(&headers),
+                ProxyHop::Untrusted,
+                "a client-supplied `{forged}` must not read as a trusted hop"
+            );
+        }
+
+        assert_eq!(
+            hop_from_headers(&HeaderMap::new()),
+            ProxyHop::Untrusted,
+            "absent is untrusted: an unwired deployment must refuse, not admit"
+        );
+    }
+
+    /// Each action renders the status a proxy can act on.
+    ///
+    /// The step-up case is the one worth pinning: RFC 9470 makes it a 401 CHALLENGE, and a
+    /// 403 would tell a caller who can reach a stronger authentication to stop trying.
+    #[test]
+    fn each_action_renders_its_own_status_and_challenge() {
+        assert_eq!(
+            render(&outcome(Action::Allow, Vec::new()), &[]).status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            render(&outcome(Action::Deny, Vec::new()), &[]).status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let stepped = render(
+            &outcome(
+                Action::StepUp {
+                    acr: "urn:example:mfa".to_owned(),
+                },
+                Vec::new(),
+            ),
+            &[],
+        );
+        assert_eq!(stepped.status(), StatusCode::UNAUTHORIZED);
+        let challenge = stepped
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .expect("a step-up carries a challenge")
+            .to_str()
+            .expect("the challenge is ASCII");
+        assert!(
+            challenge.contains("insufficient_user_authentication"),
+            "RFC 9470 names the error; got {challenge}"
+        );
+        assert!(
+            challenge.contains("urn:example:mfa"),
+            "the challenge must name the acr the caller has to reach; got {challenge}"
+        );
+    }
+
+    /// IDENTITY HEADERS ON AN ALLOW AND NOWHERE ELSE.
+    ///
+    /// The contrast is the assertion: the same upstream headers are handed to all three
+    /// actions, and only the allow may emit them. A refusal that still carried `Remote-User`
+    /// would hand the upstream an identity for a request it was told to refuse.
+    #[test]
+    fn upstream_identity_headers_are_emitted_only_on_an_allow() {
+        let upstream = vec![("remote-user".to_owned(), "usr_1".to_owned())];
+
+        let allowed = render(&outcome(Action::Allow, upstream.clone()), &[]);
+        assert_eq!(
+            allowed
+                .headers()
+                .get("remote-user")
+                .and_then(|v| v.to_str().ok()),
+            Some("usr_1")
+        );
+
+        for refused in [
+            Action::Deny,
+            Action::StepUp {
+                acr: "urn:example:mfa".to_owned(),
+            },
+        ] {
+            let response = render(&outcome(refused, upstream.clone()), &[]);
+            assert!(
+                response.headers().get("remote-user").is_none(),
+                "a refusal must not hand the upstream an identity"
+            );
+        }
+    }
+
+    /// The must-delete instruction reaches the proxy, and is absent when there is nothing
+    /// to delete rather than being an empty header nobody can act on.
+    #[test]
+    fn the_must_delete_instruction_is_present_only_when_there_is_one() {
+        let forged = vec!["remote-user".to_owned(), "remote-groups".to_owned()];
+        let response = render(&outcome(Action::Deny, Vec::new()), &forged);
+        assert_eq!(
+            response
+                .headers()
+                .get(MUST_DELETE_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("remote-user, remote-groups")
+        );
+
+        let clean = render(&outcome(Action::Deny, Vec::new()), &[]);
+        assert!(clean.headers().get(MUST_DELETE_HEADER).is_none());
+    }
 }

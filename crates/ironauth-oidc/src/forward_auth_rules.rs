@@ -180,6 +180,11 @@ fn rule_from_config(cfg: &AccessRuleConfig) -> Result<Rule, ConversionError> {
 /// Holds the compiled rules and the proxy dialect together, because reading a check request
 /// requires both and separating them would let a deployment end up with rules from one
 /// configuration and a dialect from another.
+///
+/// `Dialect::EnvoyExtAuthz` is deliberately unreachable from here: `ProxyDialectConfig` has
+/// no value for it, because this build serves the check from a fixed route and `ext_authz`
+/// carries the original PATH the way it carries the original method. See the note beside
+/// `ProxyDialectConfig`.
 pub struct ForwardAuthRuntime {
     forward_auth: crate::forward_auth::ForwardAuth,
     dialect: crate::forward_auth::Dialect,
@@ -209,9 +214,6 @@ impl ForwardAuthRuntime {
                 }
                 ironauth_config::ProxyDialectConfig::NginxAuthRequest => {
                     crate::forward_auth::Dialect::NginxAuthRequest
-                }
-                ironauth_config::ProxyDialectConfig::EnvoyExtAuthz => {
-                    crate::forward_auth::Dialect::EnvoyExtAuthz
                 }
                 ironauth_config::ProxyDialectConfig::Haproxy => {
                     crate::forward_auth::Dialect::Haproxy
@@ -324,12 +326,65 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].name, "own resource");
         assert!(matches!(rules[0].action, Action::Allow));
+
+        // BY CONTENT, NOT BY COUNT. This asserted `criteria.len() == 7`, which a review
+        // pointed out cannot see a criterion dropped when another is duplicated, and cannot
+        // see a criterion mapped to the WRONG variant at all.
+        let kinds: Vec<String> = rules[0]
+            .criteria
+            .iter()
+            .map(|criterion| match criterion {
+                Criterion::Method(methods) => format!("method:{}", methods.join("|")),
+                Criterion::Host(host) => format!("host:{host}"),
+                Criterion::PathPrefix(prefix) => format!("prefix:{prefix}"),
+                Criterion::PathMatches(pattern) => format!("pattern:{}", pattern.as_str()),
+                Criterion::Header { name, value } => format!("header:{name}={value}"),
+                Criterion::Subject(check) => format!("subject:{check:?}"),
+            })
+            .collect();
+
         assert_eq!(
-            rules[0].criteria.len(),
-            7,
-            "every configured criterion must reach the engine, not just the ones that are \
-             easy to map"
+            kinds,
+            vec![
+                "method:GET".to_owned(),
+                "host:app.example".to_owned(),
+                "prefix:/u".to_owned(),
+                "pattern:^/u/(?<user>[^/]+)/.*$".to_owned(),
+                "header:x-env=prod".to_owned(),
+                "subject:Authenticated".to_owned(),
+                "subject:EqualsCapture(\"user\")".to_owned(),
+            ],
+            "every configured criterion must reach the engine as the right variant, in the \
+             order the engine walks them"
         );
+    }
+
+    /// Both `subject_state` values map to their own check.
+    ///
+    /// A review found the mapping untested: inverting `Authenticated` and `Anonymous` left
+    /// every test green, and inverting THAT one turns "only signed-in callers" into "only
+    /// anonymous callers", which on an allow rule admits exactly the people it excluded.
+    #[test]
+    fn each_subject_state_maps_to_its_own_check() {
+        for (configured, expected) in [
+            (SubjectStateConfig::Authenticated, "Authenticated"),
+            (SubjectStateConfig::Anonymous, "Anonymous"),
+        ] {
+            let cfg = AccessRuleConfig {
+                name: "state".to_owned(),
+                action: AccessActionConfig::Deny,
+                subject_state: Some(configured),
+                ..AccessRuleConfig::default()
+            };
+
+            let set = rule_set_from_config(&enabled(vec![cfg])).expect("converts");
+            let rendered = format!("{:?}", set.rules()[0].criteria);
+
+            assert!(
+                rendered.contains(expected),
+                "{configured:?} must emit SubjectCheck::{expected}, got {rendered}"
+            );
+        }
     }
 
     /// THE PATTERN MUST PRECEDE THE SUBJECT CHECK THAT READS ITS CAPTURE.
@@ -410,10 +465,6 @@ mod tests {
             (
                 ProxyDialectConfig::NginxAuthRequest,
                 crate::forward_auth::Dialect::NginxAuthRequest,
-            ),
-            (
-                ProxyDialectConfig::EnvoyExtAuthz,
-                crate::forward_auth::Dialect::EnvoyExtAuthz,
             ),
             (
                 ProxyDialectConfig::Haproxy,

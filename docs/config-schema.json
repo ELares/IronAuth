@@ -2359,7 +2359,7 @@
       "type": "object"
     },
     "ProxyDialectConfig": {
-      "description": "The reverse proxy dialect a forward-auth check request arrives in.",
+      "description": "The reverse proxy dialect a forward-auth check request arrives in.\n\n# Why Envoy and Istio `ext_authz` is absent\n\nThe engine supports the dialect (`ironauth_oidc::forward_auth::Dialect::EnvoyExtAuthz`).\nWhat this build cannot do is SERVE it, and the reason is the route shape rather than the\nlogic.\n\nUnder `ext_authz` the check request carries the original method and path as its OWN,\nwhich is why the check route accepts any method. The PATH arrives the same way, and the\ncheck route is a fixed four-segment template, so the original path is not in it: an\n`ext_authz` check for `/admin/keys` either does not match the route at all, or matches\nonly when the operator points Envoy's `path_prefix` at the route, and is then authorized\nas the route's own path instead of `/admin/keys`. Every `path_prefix` and `path_matches`\ncriterion would be evaluated against a per-scope CONSTANT, so a rule denying `/admin`\nwould never fire and a later allow rule would admit the request.\n\nServing it needs a wildcard mount that carries the original path\n(`.../forward-auth/{*original}`) and the prefix-stripping that goes with it, with tests\nof its own. Offering the value here while the runtime could not honour it would be the\nsame defect the `subject_in_group` refusal exists to prevent, one level up.",
       "oneOf": [
         {
           "const": "forward-auth",
@@ -2369,11 +2369,6 @@
         {
           "const": "nginx-auth-request",
           "description": "nginx `auth_request`: `X-Original-Method`, `X-Original-URI`.",
-          "type": "string"
-        },
-        {
-          "const": "envoy-ext-authz",
-          "description": "Envoy and Istio `ext_authz` over HTTP: the check request carries the original\nmethod and path as its OWN method and path.",
           "type": "string"
         },
         {
@@ -3369,7 +3364,7 @@
         "enabled": false,
         "rules": []
       },
-      "description": "Forward-auth access rules (issue #154). Ships ahead of the surface that serves\nthem; a non-default value is refused at boot until that surface exists."
+      "description": "Forward-auth access rules (issue #154).\n\n`enabled` mounts the check endpoint at\n`/t/{tenant}/e/{environment}/forward-auth`, which a reverse proxy calls before\nserving a request. Off, that route is a uniform 404.\n\nA rule this build cannot evaluate refuses to BOOT rather than being skipped,\nbecause skipping one silently serves a different access policy than the file\ndescribes."
     },
     "hosted_pages": {
       "$ref": "#/$defs/HostedPagesConfig",

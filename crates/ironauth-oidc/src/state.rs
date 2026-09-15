@@ -250,13 +250,6 @@ pub struct OidcState {
     // rather than split into scalars like the SSF settings above, because the handler reads
     // most of it on one request and a five-field copy would be five chances to drop one.
     risc_receiver: ironauth_config::RiscReceiverConfig,
-    /// Whether the immediate peer is a trusted reverse proxy (issue #154).
-    ///
-    /// Derived at boot from `[proxy]`: forwarding headers are honoured only when
-    /// `trust_forwarded` is on AND `trusted_hops` is non-zero, which is the same pair the
-    /// rest of the server gates forwarding on. Kept as the resolved BOOLEAN rather than the
-    /// config so there is one place that decides what "trusted" means.
-    proxy_hop_trusted: bool,
     /// The forward-auth surface (issue #154), absent unless an operator enabled it.
     ///
     /// `None` is a uniform 404 on the check path, so a deployment that did not ask for a
@@ -1087,7 +1080,6 @@ impl OidcState {
             // again here, so a test asserting "off by default" pinned this copy and would have
             // kept passing if `SsfConfig::default()` had changed underneath it.
             risc_receiver: ironauth_config::RiscReceiverConfig::default(),
-            proxy_hop_trusted: false,
             forward_auth: None,
             ssf_enabled: ironauth_config::SsfConfig::default().enabled,
             ssf_max_streams_per_client: ironauth_config::SsfConfig::default()
@@ -1329,16 +1321,6 @@ impl OidcState {
     #[must_use]
     pub fn global_token_revocation_enabled(&self) -> bool {
         self.global_token_revocation_enabled
-    }
-
-    /// Record whether the immediate peer is a trusted reverse proxy (issue #154).
-    ///
-    /// Takes the `[proxy]` section and resolves it here, so the forward-auth check path and
-    /// the rest of the server cannot disagree about what a trusted hop is.
-    #[must_use]
-    pub fn with_proxy_trust(mut self, config: &ironauth_config::ProxyConfig) -> Self {
-        self.proxy_hop_trusted = config.trust_forwarded && config.trusted_hops > 0;
-        self
     }
 
     /// Install the forward-auth surface (issue #154).
@@ -2255,14 +2237,6 @@ impl OidcState {
         &self.inner.risk
     }
 
-    /// The Google Cross-Account Protection receiver settings (issue #144). Off by default,
-    /// so the receiver endpoint is a uniform 404 and no inbound SET is accepted.
-    #[must_use]
-    /// Whether the immediate peer is a trusted reverse proxy.
-    pub(crate) fn proxy_hop_trusted(&self) -> bool {
-        self.proxy_hop_trusted
-    }
-
     /// The forward-auth surface, or `None` when the deployment did not enable one.
     pub(crate) fn forward_auth(
         &self,
@@ -2270,6 +2244,9 @@ impl OidcState {
         self.forward_auth.as_ref()
     }
 
+    /// The Google Cross-Account Protection receiver settings (issue #144). Off by default,
+    /// so the receiver endpoint is a uniform 404 and no inbound SET is accepted.
+    #[must_use]
     pub(crate) fn risc_receiver_config(&self) -> &ironauth_config::RiscReceiverConfig {
         &self.risc_receiver
     }

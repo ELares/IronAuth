@@ -217,8 +217,15 @@ pub struct Config {
     /// which is the shipped default and fully supported.
     pub hot_state: HotStateConfig,
 
-    /// Forward-auth access rules (issue #154). Ships ahead of the surface that serves
-    /// them; a non-default value is refused at boot until that surface exists.
+    /// Forward-auth access rules (issue #154).
+    ///
+    /// `enabled` mounts the check endpoint at
+    /// `/t/{tenant}/e/{environment}/forward-auth`, which a reverse proxy calls before
+    /// serving a request. Off, that route is a uniform 404.
+    ///
+    /// A rule this build cannot evaluate refuses to BOOT rather than being skipped,
+    /// because skipping one silently serves a different access policy than the file
+    /// describes.
     pub forward_auth: ForwardAuthConfig,
 
     /// User lifecycle (issue #52): whether this process executes scheduled offboardings
@@ -1502,6 +1509,26 @@ pub struct AccessRuleConfig {
 }
 
 /// The reverse proxy dialect a forward-auth check request arrives in.
+///
+/// # Why Envoy and Istio `ext_authz` is absent
+///
+/// The engine supports the dialect (`ironauth_oidc::forward_auth::Dialect::EnvoyExtAuthz`).
+/// What this build cannot do is SERVE it, and the reason is the route shape rather than the
+/// logic.
+///
+/// Under `ext_authz` the check request carries the original method and path as its OWN,
+/// which is why the check route accepts any method. The PATH arrives the same way, and the
+/// check route is a fixed four-segment template, so the original path is not in it: an
+/// `ext_authz` check for `/admin/keys` either does not match the route at all, or matches
+/// only when the operator points Envoy's `path_prefix` at the route, and is then authorized
+/// as the route's own path instead of `/admin/keys`. Every `path_prefix` and `path_matches`
+/// criterion would be evaluated against a per-scope CONSTANT, so a rule denying `/admin`
+/// would never fire and a later allow rule would admit the request.
+///
+/// Serving it needs a wildcard mount that carries the original path
+/// (`.../forward-auth/{*original}`) and the prefix-stripping that goes with it, with tests
+/// of its own. Offering the value here while the runtime could not honour it would be the
+/// same defect the `subject_in_group` refusal exists to prevent, one level up.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProxyDialectConfig {
@@ -1510,9 +1537,6 @@ pub enum ProxyDialectConfig {
     ForwardAuth,
     /// nginx `auth_request`: `X-Original-Method`, `X-Original-URI`.
     NginxAuthRequest,
-    /// Envoy and Istio `ext_authz` over HTTP: the check request carries the original
-    /// method and path as its OWN method and path.
-    EnvoyExtAuthz,
     /// `HAProxy`: `X-Forwarded-Method`, `X-Forwarded-Host`, `X-Original-URI`.
     Haproxy,
 }
@@ -2873,6 +2897,28 @@ pub const OIDC_MAX_SESSION_TTL_SECS: u64 = 2_592_000;
 /// no resolvable peer IP does not resolve a bound session), so the binding cannot be
 /// bypassed by omitting the header either.
 pub const PEER_IP_HEADER: &str = "x-ironauth-peer-ip";
+
+/// The header carrying the trusted-proxy policy's PER-REQUEST verdict (issue #154).
+///
+/// Stamped by the server's request middleware exactly as [`PEER_IP_HEADER`] is, and for the
+/// same reason: `HeaderMap::insert` REPLACES every value already present, so a client that
+/// sends this header cannot spoof the verdict. What a downstream handler reads is always
+/// what the trusted-proxy policy resolved for THIS request.
+///
+/// It exists because "does this deployment trust forwarding headers at all" and "did THIS
+/// request arrive through the trusted chain" are different questions, and the forward-auth
+/// check path needs the second one. Answering it with the first treats a client that reached
+/// the endpoint directly as though it had come through the proxy, which hands that client
+/// the ability to state the original request itself.
+///
+/// The only value that means trusted is [`FORWARD_DECISION_HONORED`]. Anything else,
+/// including the header being absent, is untrusted: a handler that cannot tell must not
+/// guess in the direction that admits a request.
+pub const FORWARD_DECISION_HEADER: &str = "x-ironauth-forward-decision";
+
+/// The [`FORWARD_DECISION_HEADER`] value meaning the forwarding headers were honoured for
+/// this request, i.e. it arrived through the configured trusted-proxy chain.
+pub const FORWARD_DECISION_HONORED: &str = "honored";
 
 /// The minimum permitted JWKS `Cache-Control: max-age` (issue #19), in seconds.
 /// A shorter window would make relying parties refetch the key set too often and
@@ -6384,6 +6430,30 @@ fn validate_access_rule(at: &str, rule: &AccessRuleConfig) -> Result<(), ConfigE
             )));
         }
         _ => {}
+    }
+
+    // A PREFIX THAT MATCHES NOTHING, OR EVERYTHING, IS NOT A CONSTRAINT.
+    //
+    // `""` matches no path at all under the engine's segment-boundary rule, so the rule it
+    // constrains never fires. `"/"` is the opposite and worse: it reads as "the whole site"
+    // while a rule with no path constraint is written by OMITTING the field, so anyone
+    // writing `"/"` believed they were narrowing something.
+    if let Some(prefix) = &rule.path_prefix {
+        let trimmed = prefix.trim();
+        if trimmed.is_empty() || trimmed.trim_end_matches('/').is_empty() {
+            return Err(invalid(format!(
+                "{at}.path_prefix is `{prefix}`, which constrains nothing: an empty prefix \
+                 matches no path and `/` matches every one. A rule that applies to any path \
+                 is written by omitting path_prefix, so this one reads as a narrowing it \
+                 does not perform"
+            )));
+        }
+        if !trimmed.starts_with('/') {
+            return Err(invalid(format!(
+                "{at}.path_prefix is `{prefix}`, which does not start with `/`: request \
+                 paths always do, so this can never match"
+            )));
+        }
     }
 
     for (position, method) in rule.methods.iter().enumerate() {
@@ -10924,6 +10994,9 @@ mod tests {
                 deny("[[forward_auth.rules.headers]]\nname = \"x-env\"\nvalue = \"\"\n"),
                 "headers[0].value is empty",
             ),
+            (deny("path_prefix = \"/\"\n"), "constrains nothing"),
+            (deny("path_prefix = \"\"\n"), "constrains nothing"),
+            (deny("path_prefix = \"admin\"\n"), "does not start with"),
             ("[forward_auth]\nenabled = true\n".to_owned(), "no rules"),
         ] {
             let err = Config::from_toml_str(&input, "<inline>")

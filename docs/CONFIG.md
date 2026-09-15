@@ -62,7 +62,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `flow_targets.delivery_timeout_secs` | integer | `10` | The per-delivery HTTP budget, in seconds. |
 | `flows` | table | see fields | Headless flow API settings (issue #84): the machine readable flow contract (login, registration, MFA, recovery) served as one JSON flow object across the browser and native transports. Off by default (an experimental data plane gate like `oidc.enabled`): when off, the flow routes answer a uniform 404 and the bootstrap login, consent, and register pages are the only interactive surface. |
 | `flows.enabled` | boolean | `false` | Whether to serve the headless flow API. Off by default so the default boot exposes only the bootstrap login, consent, and register pages. When on, the flow routes (the native JSON transport and the engine driven browser transport) answer, sharing one flow object and one state machine. |
-| `forward_auth` | table | see fields | Forward-auth access rules (issue #154). Ships ahead of the surface that serves them; a non-default value is refused at boot until that surface exists. |
+| `forward_auth` | table | see fields | Forward-auth access rules (issue #154). |
 | `forward_auth.dialect` | string | `"forward-auth"` | Which reverse proxy dialect the check request arrives in. |
 | `forward_auth.enabled` | boolean | `false` | Whether the forward-auth surface is served. |
 | `forward_auth.rules` | array | empty | The ordered rule list. FIRST MATCH WINS, so order is meaning, not presentation. |

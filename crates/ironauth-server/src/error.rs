@@ -18,6 +18,15 @@ pub enum ServerError {
         /// A short reason; never echoes credentials.
         reason: String,
     },
+    /// A configured access policy could not be built for this server (issue #154).
+    ///
+    /// A boot refusal rather than a degraded start, because the alternative for an access
+    /// policy is to serve a DIFFERENT policy than the one configured, and an operator
+    /// reading their own config file would have no way to know.
+    InvalidAccessRules {
+        /// A short reason naming the rule and the criterion; never echoes credentials.
+        reason: String,
+    },
     /// A listener could not bind its socket (bad address or address in use).
     Bind {
         /// Which plane's address failed (`server.bind` or
@@ -36,6 +45,9 @@ impl fmt::Display for ServerError {
             ServerError::InvalidPublicUrl { reason } => {
                 write!(f, "invalid server.public_url: {reason}")
             }
+            ServerError::InvalidAccessRules { reason } => {
+                write!(f, "cannot build the configured access rules: {reason}")
+            }
             ServerError::Bind {
                 field,
                 addr,
@@ -51,7 +63,7 @@ impl std::error::Error for ServerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ServerError::Bind { source, .. } => Some(source),
-            ServerError::InvalidPublicUrl { .. } => None,
+            ServerError::InvalidPublicUrl { .. } | ServerError::InvalidAccessRules { .. } => None,
         }
     }
 }

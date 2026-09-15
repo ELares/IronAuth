@@ -15,10 +15,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::extract::{ConnectInfo, FromRequestParts, MatchedPath, Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
-use ironauth_config::PEER_IP_HEADER;
+use ironauth_config::{FORWARD_DECISION_HEADER, FORWARD_DECISION_HONORED, PEER_IP_HEADER};
 use tracing::Instrument;
 
 use crate::AppState;
@@ -79,6 +79,9 @@ pub async fn observe(State(state): State<AppState>, mut req: Request, next: Next
         .get::<MatchedPath>()
         .map_or_else(|| UNMATCHED_ROUTE.to_owned(), |m| m.as_str().to_owned());
 
+    // Read BEFORE the move below, because the stamp further down needs it too.
+    let forwarding_honored = resolution.decision == ForwardDecision::Honored;
+
     // Make the resolved context available to downstream handlers. Scheme and
     // host come from config, never from the request headers.
     req.extensions_mut().insert(ClientContext {
@@ -96,6 +99,28 @@ pub async fn observe(State(state): State<AppState>, mut req: Request, next: Next
         req.headers_mut().insert(PEER_IP_HEADER, value);
     } else {
         req.headers_mut().remove(PEER_IP_HEADER);
+    }
+
+    // Stamp the PER-REQUEST forwarding verdict for the forward-auth check path (issue
+    // #154), on the same terms as the peer IP above: `insert` REPLACES, so a client that
+    // sends this header cannot claim to have come through the proxy.
+    //
+    // The distinction this carries is the one a boot-time boolean cannot. "This deployment
+    // honours forwarding headers" is a property of the config; "this request arrived
+    // through the trusted chain" is a property of the request, and only the second one
+    // makes it safe to read what the request says about some OTHER request.
+    //
+    // Only `Honored` is stamped. `Direct` and `FailedClosed` leave the header ABSENT, which
+    // a reader must treat as untrusted, so a future code path that forgets to check gets the
+    // refusing answer rather than the admitting one.
+    if forwarding_honored {
+        req.headers_mut().insert(
+            HeaderName::from_static(FORWARD_DECISION_HEADER),
+            HeaderValue::from_static(FORWARD_DECISION_HONORED),
+        );
+    } else {
+        req.headers_mut()
+            .remove(HeaderName::from_static(FORWARD_DECISION_HEADER));
     }
 
     let span = tracing::info_span!(

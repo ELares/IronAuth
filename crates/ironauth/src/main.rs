@@ -890,6 +890,22 @@ async fn assemble_planes(
     // every shared value off it. There is no second carrier to hand a plane and no
     // argument here that could be filled from the wrong source.
     let shared = SharedPlaneInputs::capture(config, features, env)?;
+
+    // THE ACCESS RULES ARE BUILT HERE so a failure REFUSES TO BOOT (issue #154).
+    //
+    // It was inside `build_oidc_plane`, which answers `Option`, so a rule this build cannot
+    // evaluate returned `None` and the process carried on with the OIDC plane silently
+    // absent and readiness still green. That is a worse failure than the one it was meant to
+    // be: an operator sees a healthy server serving no OIDC, rather than a refusal naming
+    // the rule. Here the error reaches the `ExitCode::FAILURE` arm, the same one a malformed
+    // `server.public_url` takes.
+    let forward_auth =
+        ironauth_oidc::forward_auth_rules::ForwardAuthRuntime::from_config(&config.forward_auth)
+            .map_err(|error| ServerError::InvalidAccessRules {
+                reason: error.to_string(),
+            })?
+            .map(std::sync::Arc::new);
+
     let management = build_admin_state(config, env, &shared).await;
     let oidc = if config.oidc.enabled {
         build_oidc_plane(
@@ -897,6 +913,7 @@ async fn assemble_planes(
             env,
             DataPlaneSurfaces::resolve(features, config),
             &shared,
+            forward_auth,
         )
         .await
     } else {
@@ -1480,6 +1497,7 @@ async fn build_oidc_plane(
     env: &Env,
     surfaces: DataPlaneSurfaces,
     shared: &SharedPlaneInputs,
+    forward_auth: Option<std::sync::Arc<ironauth_oidc::forward_auth_rules::ForwardAuthRuntime>>,
 ) -> Option<OidcPlane> {
     let oidc_config = &config.oidc;
     let policy_config = &config.password_policy;
@@ -1722,9 +1740,6 @@ async fn build_oidc_plane(
     }
     .with_org_provisioning(org_provisioning)
     .with_global_token_revocation_enabled(surfaces.global_revocation)
-    // Resolved from `[proxy]` so the forward-auth check path and the rest of the server
-    // cannot disagree about what a trusted hop is (issue #154).
-    .with_proxy_trust(&config.proxy)
     .with_ssf(&config.ssf)
     .with_risc_receiver(&{
         // CHECKED HERE, where the JOSE core is reachable and the operator is still
@@ -1892,28 +1907,8 @@ async fn build_oidc_plane(
         state
     };
     // THE FORWARD-AUTH SURFACE (issue #154). Absent unless `[forward_auth] enabled` is set,
-    // in which case the check route answers a uniform 404.
-    //
-    // A CONVERSION FAILURE STOPS THE PLANE rather than disabling the surface. The rules are
-    // an access policy: if this build cannot honour one, the choices are to serve a policy
-    // that differs from the configured one, to 404 the check path (which leaves the
-    // proxy's own failure mode deciding, and some fail open), or to refuse. Only the last
-    // one cannot admit a request the operator meant to deny.
-    let forward_auth = match ironauth_oidc::forward_auth_rules::ForwardAuthRuntime::from_config(
-        &config.forward_auth,
-    ) {
-        Ok(runtime) => runtime.map(std::sync::Arc::new),
-        Err(error) => {
-            tracing::error!(
-                %error,
-                "forward_auth rules could not be built, so the OIDC plane is not \
-                 started: serving a different access policy than the one configured, \
-                 or leaving the proxy's own failure mode to decide, are both worse \
-                 than refusing to start"
-            );
-            return None;
-        }
-    };
+    // in which case the check route answers a uniform 404. Built in `assemble_planes`, where
+    // a rule this build cannot evaluate refuses to boot instead of quietly removing a plane.
     let state = match forward_auth {
         Some(runtime) => state.with_forward_auth(runtime),
         None => state,
