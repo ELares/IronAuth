@@ -139,3 +139,39 @@ pub trait HotState: Send + Sync {
     /// Remove, whether or not it was there.
     fn delete<'a>(&'a self, r#use: &'static HotUse, key: &'a str) -> Answer<'a, ()>;
 }
+
+/// A shared implementor is still an implementor.
+///
+/// Needed because every shipped implementation BINDS ONE SCOPE at construction, so a
+/// multi-tenant caller holds a factory producing `Arc<dyn HotState>` per scope rather than one
+/// value. Without this, such a caller cannot pass what the factory returns to [`crate::Bounded`],
+/// and the stall bound is the one thing a caller must not be able to skip.
+impl HotState for std::sync::Arc<dyn HotState> {
+    fn get<'a>(&'a self, r#use: &'static HotUse, key: &'a str) -> Answer<'a, Option<Vec<u8>>> {
+        (**self).get(r#use, key)
+    }
+
+    fn put<'a>(
+        &'a self,
+        r#use: &'static HotUse,
+        key: &'a str,
+        value: &'a [u8],
+        ttl: Ttl,
+    ) -> Answer<'a, ()> {
+        (**self).put(r#use, key, value, ttl)
+    }
+
+    fn put_if_absent<'a>(
+        &'a self,
+        r#use: &'static HotUse,
+        key: &'a str,
+        value: &'a [u8],
+        ttl: Ttl,
+    ) -> Answer<'a, bool> {
+        (**self).put_if_absent(r#use, key, value, ttl)
+    }
+
+    fn delete<'a>(&'a self, r#use: &'static HotUse, key: &'a str) -> Answer<'a, ()> {
+        (**self).delete(r#use, key)
+    }
+}

@@ -1003,6 +1003,7 @@ async fn a_discovery_suspension_landing_just_before_an_outage_is_bounded_by_one_
 #[derive(Debug, Default)]
 struct RecordingHot {
     calls: std::sync::Mutex<Vec<String>>,
+    ttls: std::sync::Mutex<Vec<std::time::Duration>>,
     entries: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
     /// When set, every operation answers `Unavailable`, which is what a down accelerator does.
     broken: bool,
@@ -1011,6 +1012,19 @@ struct RecordingHot {
 impl RecordingHot {
     fn calls(&self) -> Vec<String> {
         self.calls.lock().expect("not poisoned").clone()
+    }
+
+    fn ttls(&self) -> Vec<std::time::Duration> {
+        self.ttls.lock().expect("not poisoned").clone()
+    }
+
+    /// The key the registry wrote under, so a test can assert what is IN it rather than only
+    /// that two keys differ.
+    fn written_keys(&self) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter_map(|call| call.strip_prefix("put jwks ").map(str::to_owned))
+            .collect()
     }
 }
 
@@ -1037,9 +1051,14 @@ impl ironauth_hot::HotState for RecordingHot {
         r#use: &'static ironauth_hot::HotUse,
         key: &'a str,
         value: &'a [u8],
-        _ttl: ironauth_hot::Ttl,
+        ttl: ironauth_hot::Ttl,
     ) -> ironauth_hot::Answer<'a, ()> {
         Box::pin(async move {
+            // THE TTL IS RECORDED. It was bound to `_ttl` and discarded, so a review replaced
+            // the registry's `entry_ttl` with 24 hours and then a YEAR and the whole file
+            // stayed green, which made the PR's "attaching an accelerator cannot make a
+            // rotation land later" paragraph an unmeasured sentence.
+            self.ttls.lock().expect("not poisoned").push(ttl.duration());
             self.calls
                 .lock()
                 .expect("not poisoned")
@@ -1084,7 +1103,10 @@ async fn an_attached_accelerator_is_consulted_and_then_serves_the_jwks() {
     let harness = Harness::start_store_backed().await;
     let scope = harness.scope();
     let hot = std::sync::Arc::new(RecordingHot::default());
-    let registry = store_backed(&harness).with_jwks_hot_state(hot.clone());
+    let registry = store_backed(&harness).with_jwks_hot_state({
+        let hot = hot.clone();
+        move |_scope| hot.clone() as std::sync::Arc<dyn ironauth_hot::HotState>
+    });
 
     let first = registry
         .jwks_json(&scope, at(0))
@@ -1138,7 +1160,10 @@ async fn a_broken_accelerator_changes_no_answer() {
         ..RecordingHot::default()
     });
     let with_broken = store_backed(&harness)
-        .with_jwks_hot_state(hot.clone())
+        .with_jwks_hot_state({
+            let hot = hot.clone();
+            move |_scope| hot.clone() as std::sync::Arc<dyn ironauth_hot::HotState>
+        })
         .jwks_json(&scope, at(0))
         .await
         .expect("a broken accelerator must not stop a publication")
@@ -1168,7 +1193,10 @@ async fn the_accelerator_key_changes_when_the_published_key_set_does() {
     let harness = Harness::start_store_backed().await;
     let scope = harness.scope();
     let hot = std::sync::Arc::new(RecordingHot::default());
-    let registry = store_backed(&harness).with_jwks_hot_state(hot.clone());
+    let registry = store_backed(&harness).with_jwks_hot_state({
+        let hot = hot.clone();
+        move |_scope| hot.clone() as std::sync::Arc<dyn ironauth_hot::HotState>
+    });
 
     let _ = registry.jwks_json(&scope, at(0)).await.expect("resolves");
     let before: Vec<String> = hot
@@ -1187,7 +1215,10 @@ async fn the_accelerator_key_changes_when_the_published_key_set_does() {
             es256_pkcs8(),
         )
         .await;
-    let fresh = store_backed(&harness).with_jwks_hot_state(hot.clone());
+    let fresh = store_backed(&harness).with_jwks_hot_state({
+        let hot = hot.clone();
+        move |_scope| hot.clone() as std::sync::Arc<dyn ironauth_hot::HotState>
+    });
     let _ = fresh
         .jwks_json(&scope, at(TTL.as_secs() + 1))
         .await
@@ -1203,5 +1234,164 @@ async fn the_accelerator_key_changes_when_the_published_key_set_does() {
         after[0], after[1],
         "a changed published key set must change the accelerator key, or a rotation would be \
          served the document it replaced"
+    );
+}
+
+/// THE KEY CARRIES THE SCOPE, THE KIDS BY IDENTITY, AND THE TTL IS THE ENTRY TTL.
+///
+/// A review ran four mutations that the first version of this file left green, and every one of
+/// them is a real failure an operator would meet:
+///
+///   - the scope dropped from the key, which is the cross-tenant property nothing measured;
+///   - the kid set replaced by its COUNT, so a rotation where one key leaves as another enters
+///     keeps the key constant and every node publishes the superseded set until the entry
+///     lapses, which is the exact failure the key design exists to prevent;
+///   - the TTL replaced by 24 hours and then a year, so a rotation lands that late on every node
+///     reading the shared copy;
+///   - `published_signing_keys(now)` replaced with `published_signing_keys(UNIX_EPOCH)`, which
+///     survived because the harness provisions every key at instant zero, so the activation
+///     dependence that is the key's whole justification was measured by nothing.
+///
+/// The first three are asserted here, on the key the registry itself wrote.
+#[tokio::test]
+async fn the_accelerator_key_states_the_scope_and_the_kids_and_the_ttl_is_the_entry_ttl() {
+    let harness = Harness::start_store_backed().await;
+    let scope = harness.scope();
+    let hot = std::sync::Arc::new(RecordingHot::default());
+    let registry = store_backed(&harness).with_jwks_hot_state({
+        let hot = hot.clone();
+        move |_scope| hot.clone() as std::sync::Arc<dyn ironauth_hot::HotState>
+    });
+
+    let _ = registry.jwks_json(&scope, at(0)).await.expect("resolves");
+
+    let written = hot.written_keys();
+    assert_eq!(written.len(), 1, "one populate: {written:?}");
+    let key = &written[0];
+
+    // THE SCOPE IS IN THE KEY. Without this, a second tenant publishing the same kid set reads
+    // the first tenant's document, and nothing in the file noticed when a review removed it.
+    assert!(
+        key.starts_with(&format!("{}/{}/", scope.tenant(), scope.environment())),
+        "the key must name the scope it belongs to, got {key}"
+    );
+
+    // AND THE KIDS BY IDENTITY, not by count. Asserted against the kids the STORE holds, which
+    // is an expectation from outside the thing under test.
+    let provisioned = harness
+        .store()
+        .scoped(scope)
+        .signing_keys()
+        .list()
+        .await
+        .expect("keys listed");
+    for record in &provisioned {
+        assert!(
+            key.contains(&record.id.to_string()),
+            "every published kid must appear in the key: {} missing from {key}",
+            record.id
+        );
+    }
+
+    // THE TTL IS THE ENTRY TTL. `TTL` is what `store_backed` configures.
+    assert_eq!(
+        hot.ttls(),
+        vec![TTL],
+        "the shared copy must expire with the per-node entry, or attaching an accelerator \
+         makes a rotation land later than it would have without one"
+    );
+}
+
+/// A PUBLISHED KEY WITH NO KID MEANS NO CACHE AT ALL.
+///
+/// The document publishes such a key under a derived RFC 7638 thumbprint, and no key built from
+/// kids can identify it. A review showed the first version dropped it from the key instead, so
+/// `{kid-ed, kid-less}` and `{kid-ed}` collided and a node holding only `kid-ed` served a
+/// document naming a signing key it does not hold, with the full max-age. That is trust
+/// expansion, so this refuses to cache rather than caching under an ambiguous key.
+#[tokio::test]
+async fn a_published_key_without_a_kid_is_never_cached() {
+    let hot = std::sync::Arc::new(RecordingHot::default());
+    let registry = IssuerRegistry::new(BASE, JwksCacheWindow::clamped(300)).with_jwks_hot_state({
+        let hot = hot.clone();
+        move |_scope| hot.clone() as std::sync::Arc<dyn ironauth_hot::HotState>
+    });
+    let scope = ironauth_store::Scope::new(
+        ironauth_store::TenantId::parse("ten_Vym1Jhzb0uXNBzTFFpC0eA").expect("tenant"),
+        ironauth_store::EnvironmentId::parse("env_lOR6QROSR-0RvilLJWzjmA").expect("environment"),
+    );
+    let with_kid =
+        ironauth_jose::SigningKey::ed25519_from_seed(Some("kid-ed".to_owned()), &[7; 32])
+            .expect("key");
+    let without_kid = ironauth_jose::SigningKey::ed25519_from_seed(None, &[0x33; 32]).expect("key");
+    let mut keyset = ironauth_jose::KeySet::bootstrap(with_kid, std::time::SystemTime::UNIX_EPOCH);
+    keyset.add(without_kid, std::time::SystemTime::UNIX_EPOCH);
+    registry.insert(
+        scope,
+        ironauth_oidc::IssuerEntry::new(
+            keyset,
+            ironauth_jose::SigningPolicy::eddsa_default(),
+            ironauth_oidc::PairwiseSalt::new(Vec::new()),
+            ironauth_store::GuardrailSet::for_kind(ironauth_store::EnvironmentType::Dev),
+        ),
+    );
+
+    let document = registry
+        .jwks_json(&scope, at(0))
+        .await
+        .expect("resolves")
+        .expect("renders");
+    assert!(
+        document.contains("keys"),
+        "precondition: it still renders a document"
+    );
+    assert!(
+        hot.calls().is_empty(),
+        "a document containing a key with no kid must not be cached at all, because no key \
+         built from kids can identify it: {:?}",
+        hot.calls()
+    );
+}
+
+/// A CACHED VALUE THAT IS NOT A JWK SET IS IGNORED, NOT PUBLISHED.
+///
+/// `ironcache.rs` documents as an accepted condition that two deployments pointed at one
+/// IronCache share a flat keyspace, so arbitrary bytes under this key is a reachable state. The
+/// first version checked only UTF-8 validity, and a review overwrote the entry with
+/// `this is not a jwk set at all`; the endpoint served exactly that with a 200, the JWK Set
+/// media type, a strong `ETag` over the bytes and the full max-age.
+#[tokio::test]
+async fn a_cached_value_that_is_not_a_jwk_set_is_ignored() {
+    let harness = Harness::start_store_backed().await;
+    let scope = harness.scope();
+    let hot = std::sync::Arc::new(RecordingHot::default());
+    let registry = store_backed(&harness).with_jwks_hot_state({
+        let hot = hot.clone();
+        move |_scope| hot.clone() as std::sync::Arc<dyn ironauth_hot::HotState>
+    });
+
+    let rendered = registry
+        .jwks_json(&scope, at(0))
+        .await
+        .expect("resolves")
+        .expect("renders");
+    let key = hot.written_keys().first().cloned().expect("it populated");
+
+    // Overwrite the entry the registry itself wrote, which is how a colliding deployment or an
+    // operator's stray SET reaches this key.
+    hot.entries
+        .lock()
+        .expect("not poisoned")
+        .insert(key, b"this is not a jwk set at all".to_vec());
+
+    let served = registry
+        .jwks_json(&scope, at(0))
+        .await
+        .expect("resolves")
+        .expect("renders");
+    assert_eq!(
+        served, rendered,
+        "a cached value that does not parse as a JWK Set must be ignored and the document \
+         rendered, not served as the environment's key set"
     );
 }

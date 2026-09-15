@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
+use ironauth_hot::HotState as _;
 use ironauth_jose::{JwsAlgorithm, KeyFamily, KeySet, SigningKey, SigningKeyError, SigningPolicy};
 use ironauth_store::{GuardrailSet, Scope, SigningKeyMaterialKind, SigningKeyRecord, Store};
 
@@ -351,19 +352,43 @@ pub struct IssuerRegistry {
     // The CROSS-NODE accelerator for the published JWKS document (issue #146). `None` is the
     // shipped behaviour and the default: every node renders from its own entry cache.
     //
-    // WHY THIS IS AN `Option` AND NOT A REQUIRED FIELD. `ironauth-hot`'s whole argument is that
-    // "a deployment that never attaches one behaves identically and more slowly; delete this
-    // file and the product is still correct". A registry with no hot state must therefore take
-    // exactly the path it took before this field existed, which an `Option` makes structural
-    // rather than a promise.
+    // A FACTORY, NOT AN INSTANCE, and that is not a style choice. A review found the first
+    // version of this field took a single `Arc<dyn HotState>` for a registry that serves EVERY
+    // scope, while both shipped implementations bind ONE scope at construction:
+    // `PgHotState::new(store, scope, env)` and `IronCacheHotState::new(conn, tenant, env)`,
+    // whose `redis_key` is `{NAMESPACE}:{bound tenant}:{bound env}:{use}:{key}`. So a single
+    // instance would have written every tenant's document under one tenant's prefix, and
+    // `ironcache.rs` says that prefix IS the tenant isolation: "there is no backstop, nothing
+    // here filters, nothing checks". There was no value an operator could have passed
+    // correctly, which is the structural reason the first version had no production caller.
     //
-    // It is the FIRST caller the seam has had. An audit found the trait, the classification,
-    // the stall bounds, the tiering and the IronCache backend all built and tested, roughly
-    // 1800 lines of crate against 3800 of test, with `PgHotState::new` constructed only in test
-    // files and no data-plane path reading through any of the seven declared uses. Criterion 2,
-    // "with IronCache unreachable, all flows complete correctly on Postgres alone", was
-    // therefore true by construction and would have stayed true with the crate deleted.
-    jwks_hot: Option<Arc<dyn ironauth_hot::HotState>>,
+    // BOUNDED IS APPLIED HERE rather than asked of the caller. The first version awaited a bare
+    // `HotState`, and a review measured a single `jwks_json` call at 6.0 seconds against an
+    // accelerator that answered in 3, because it waited on the read and then on the populate.
+    // `ironauth-hot`'s own module doc states the rule that broke: "the one thing that must not
+    // happen is a request waiting on a cache". Wrapping inside the registry means a caller
+    // cannot forget it.
+    jwks_hot: Option<JwksAccelerator>,
+}
+
+/// Builds the scope-bound accelerator for one scope (issue #146).
+///
+/// See [`IssuerRegistry::jwks_hot`] for why this is a factory rather than a single value.
+type JwksAcceleratorFactory = Arc<dyn Fn(Scope) -> Arc<dyn ironauth_hot::HotState> + Send + Sync>;
+
+/// The accelerator as the registry holds it: a factory plus the stall bounds every call it
+/// makes is wrapped in.
+#[derive(Clone)]
+struct JwksAccelerator {
+    factory: JwksAcceleratorFactory,
+    bounds: ironauth_hot::Bounds,
+}
+
+impl JwksAccelerator {
+    /// The bounded hot state for `scope`.
+    fn for_scope(&self, scope: Scope) -> ironauth_hot::Bounded<Arc<dyn ironauth_hot::HotState>> {
+        ironauth_hot::Bounded::new((self.factory)(scope), self.bounds)
+    }
 }
 
 impl IssuerRegistry {
@@ -437,12 +462,39 @@ impl IssuerRegistry {
     ///
     /// It is [`ironauth_hot::registry::JWKS`], declared `Accelerator`, which is the class whose
     /// contract is "the caller must already be able to answer from the store". So every failure
-    /// mode here renders instead: a miss, a stall, an error, or a value that will not parse.
-    /// There is no path on which an unavailable accelerator changes an answer, which is what
-    /// makes attaching one safe to do by configuration rather than by redeployment.
+    /// mode here renders instead: a miss, a stall, an error, or a value that does not parse as
+    /// a JWK Set. There is no path on which an unavailable accelerator changes an answer.
+    ///
+    /// A STALL RENDERS BECAUSE THE REGISTRY BOUNDS IT, not because a caller remembered to. The
+    /// factory is wrapped in [`ironauth_hot::Bounded`] here; an earlier version awaited a bare
+    /// `HotState` and a review measured one request at 6.0 seconds against a 3-second
+    /// accelerator.
     #[must_use]
-    pub fn with_jwks_hot_state(mut self, hot: Arc<dyn ironauth_hot::HotState>) -> Self {
-        self.jwks_hot = Some(hot);
+    pub fn with_jwks_hot_state<F>(mut self, factory: F) -> Self
+    where
+        F: Fn(Scope) -> Arc<dyn ironauth_hot::HotState> + Send + Sync + 'static,
+    {
+        self.jwks_hot = Some(JwksAccelerator {
+            factory: Arc::new(factory),
+            bounds: ironauth_hot::Bounds::shipped(),
+        });
+        self
+    }
+
+    /// [`IssuerRegistry::with_jwks_hot_state`] with bounds an operator chose.
+    #[must_use]
+    pub fn with_jwks_hot_state_bounded<F>(
+        mut self,
+        factory: F,
+        bounds: ironauth_hot::Bounds,
+    ) -> Self
+    where
+        F: Fn(Scope) -> Arc<dyn ironauth_hot::HotState> + Send + Sync + 'static,
+    {
+        self.jwks_hot = Some(JwksAccelerator {
+            factory: Arc::new(factory),
+            bounds,
+        });
         self
     }
 
@@ -827,35 +879,69 @@ impl IssuerRegistry {
         // refused, a stale entry was not served, an absent scope returned `None`. This cache
         // only decides where the bytes of an already-permitted document come from.
         //
-        // THE KEY CARRIES WHAT THE DOCUMENT DEPENDS ON, which is the part that has to be right.
-        // `published_jwks` filters by activation instant, so the same scope renders differently
-        // as keys activate and retire, and a key of scope alone would serve one environment's
-        // document past a rotation. The key is the scope plus the published kid set at `now`,
-        // so a rotation changes the key rather than needing an invalidation to race the read.
-        // A stale entry under such a key cannot exist: the kids that produced it are in it.
-        let hot_key = self.jwks_hot.as_ref().map(|_| {
-            let mut kids: Vec<&str> = entry
+        // THE KEY IS A FUNCTION OF THE DOCUMENT, which the first version of this was not. It
+        // built the key from `published_signing_keys(now)` filtered through
+        // `filter_map(|key| key.kid())` while the document is `published_jwks(now, policy)`, so
+        // the two disagreed on two inputs and a review reproduced both:
+        //
+        //   THE POLICY. `published_jwks` applies `retains_in_jwks`; the key did not. Two nodes
+        //   with different policies over the same keys computed the SAME key, so whichever
+        //   populated first decided what both published. A narrow node winning withdrew a key
+        //   from every relying party; a wide node winning published a key the other node's
+        //   policy had withdrawn, defeating the point of `retains_in_jwks`.
+        //
+        //   A KID-LESS KEY. The key dropped it; the document publishes it under a derived
+        //   RFC 7638 thumbprint. So `{kid-ed, kidless}` and `{kid-ed}` produced the same key,
+        //   and a node holding only `kid-ed` served a document naming a signing key it does not
+        //   hold, with the full `Cache-Control: max-age`. That is trust expansion, not
+        //   staleness, and it is why this REFUSES to cache rather than dropping the key.
+        //
+        // `published_kids(now, policy)` is the renderer's own accessor and applies the policy.
+        // The count comparison against `published_keys` is what catches the kid-less case,
+        // because `published_kids` silently drops those too.
+        let hot_key = self.jwks_hot.as_ref().and_then(|_| {
+            let mut kids = entry.keyset().published_kids(now, entry.policy());
+            let published = entry
                 .keyset()
                 .published_signing_keys(now)
                 .iter()
-                .filter_map(|key| key.kid())
-                .collect();
-            kids.sort_unstable();
-            format!(
+                .filter(|key| entry.policy().retains_in_jwks(key.algorithm()))
+                .count();
+            if kids.len() != published {
+                // A published key has no kid, so no key built from kids can identify this
+                // document. Render, and cache nothing.
+                return None;
+            }
+            kids.sort();
+            Some(format!(
                 "{}/{}/{}",
                 scope.tenant(),
                 scope.environment(),
                 kids.join(",")
-            )
+            ))
         });
         if let (Some(hot), Some(key)) = (self.jwks_hot.as_ref(), hot_key.as_ref()) {
             // EVERY FAILURE RENDERS. `Accelerator` is the class whose contract is that the
-            // caller can already answer from the store, so a miss, a stall, an error and a
-            // value that will not decode are all the same thing here: fall through.
-            if let Ok(Some(bytes)) = hot.get(&ironauth_hot::registry::JWKS, key).await {
-                if let Ok(document) = String::from_utf8(bytes) {
-                    return Some(Ok(document));
-                }
+            // caller can already answer from the store, so a miss, a stall (the `Bounded`
+            // wrapper turns one into `Ok(None)` for this use), an error, and a value that is
+            // not a JWK Set are all the same thing here: fall through.
+            if let Ok(Some(bytes)) = hot.for_scope(*scope).get(&ironauth_hot::registry::JWKS, key).await
+                && let Ok(document) = String::from_utf8(bytes)
+                // PARSED, NOT JUST UTF-8 CHECKED. The first version served any UTF-8 bytes it
+                // found as the environment's JWK Set, with a 200, the JWK Set media type, a
+                // strong ETag over the bytes and the full max-age. `ironcache.rs` documents as
+                // an accepted condition that two deployments pointed at one IronCache share a
+                // flat keyspace, so "any UTF-8 bytes under that key" is a reachable state, not
+                // a hypothetical: a review overwrote the entry with `this is not a jwk set at
+                // all` and the endpoint served exactly that.
+                && serde_json::from_str::<serde_json::Value>(&document)
+                    .ok()
+                    .and_then(|value| {
+                        value.get("keys").map(serde_json::Value::is_array)
+                    })
+                    == Some(true)
+            {
+                return Some(Ok(document));
             }
         }
 
@@ -876,6 +962,7 @@ impl IssuerRegistry {
             // treating it as an error would make the accelerator able to fail a publication,
             // which is exactly what its class forbids.
             let _ = hot
+                .for_scope(*scope)
                 .put(
                     &ironauth_hot::registry::JWKS,
                     key,
