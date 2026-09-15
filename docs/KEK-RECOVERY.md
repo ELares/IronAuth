@@ -1,8 +1,6 @@
 # Recovering a wrapped KEK hierarchy
 
-Issue #153 criterion 6. The restore path below is exercised by
-`crates/ironauth-store/tests/kek_recovery.rs`: its steps are these steps, in this order, so a
-change to one that is not made to the other fails the suite.
+Issue #153 criteria 4 and 6.
 
 ## What the hierarchy is
 
@@ -25,29 +23,77 @@ different master and gets an error.
 
 ## Backup
 
-Export the whole row, not just the blob:
-
-```sql
-SELECT id, tenant_id, environment_id, version, master_key_id, wrapped_kek, status
-FROM tenant_keks ORDER BY id;
+```
+ironauth storage kek-backup --url DSN --out keks.json
 ```
 
-The wrap AAD binds the scope, the version and the master key id, so a restore that put the
-blob back under a different version produces a row that exists and cannot be opened. That
-failure looks like a successful restore until somebody reads a secret.
+It prints a MANIFEST line. Store it somewhere the backup file is not.
 
-Verify the export is not empty blobs before trusting it. A backup of zero-length
-`wrapped_kek` values restores rows, passes a row count, and recovers nothing.
+### Why this is a command and not a SELECT
+
+This section used to give you the SQL. An adversarial review pasted that SELECT into the three
+roles a deployment actually has and measured:
+
+```
+owner = Ok(3 rows)    app = Ok(0 rows)    control = Ok(0 rows)
+```
+
+`tenant_keks` has FORCE ROW LEVEL SECURITY, and the application role is the one your
+`database.url` names. The query returned **zero rows and no error**, and an empty export
+passes every downstream check there is: it matches its own row count, it digests to its own
+manifest, and "check the blobs are not empty" is vacuously true when there are no blobs. You
+would find out during the key loss the backup was taken for.
+
+`kek-backup` refuses that connection instead of exporting what it can see, and refuses to
+write an empty file at all.
+
+### Why the manifest is separate
+
+A manifest kept beside the rows it describes is damaged by the same transfer that damages
+them. Keeping it in a ticket, a password manager, or a different bucket is the whole point:
+it is a claim recorded at backup time and checked at restore time, against a file that
+travelled on its own.
+
+`kek-restore` will not run without it. A restore that checks a backup against a manifest
+computed from that same backup passes for any file, including one that lost every row.
+
+### What is in the file
+
+All NINE columns, not the seven an earlier version of this document listed. The two that were
+missing:
+
+- `created_at` has a `now()` DEFAULT, so an export that omits it stamps every KEK in the
+  deployment with the restore date.
+- `destroyed_at` is the crypto-shred instant, and the migration that added it calls the
+  destroyed row "retained as evidence". Without it a restored shredded row still says the key
+  was destroyed and no longer says WHEN, which is the answer an erasure attestation needs.
+
+The wrap AAD binds the scope, the version and the master key id, so a restore that put the
+blob back under a different version produces a row that exists and cannot be opened.
 
 ## Restore
 
-1. Confirm which master key id the rows name. `master_key_id` is in the export; the key
-   itself must be available to the process before the restore is worth starting.
-2. Insert the rows back exactly as exported, all seven columns.
-3. **Read a secret.** This is the step people skip. A restore is not verified by the rows
-   being present; it is verified by the hierarchy opening. `open_secret` on any scope that had
-   one is the cheapest possible check and it is the only one that distinguishes a recovered
-   database from a database full of unopenable blobs.
+```
+ironauth storage kek-restore --url DSN --in keks.json --manifest 'rows=42 sha256=...'
+```
+
+1. **Have the right master key.** `master_key_id` is in the file. The key itself must be
+   available to the process before the restore is worth starting.
+2. **Run the command.** It verifies before it writes anything, and then writes in ONE
+   transaction, so the database ends up in the old state or the new one and never in between.
+   A row already present and byte-identical is counted, not rewritten, so re-running an
+   interrupted restore converges. A row present with DIFFERENT contents stops the restore
+   without writing: the database may have moved on since the backup, and overwriting could
+   undo a crypto-shred.
+3. **Read a secret on EVERY scope you expected to recover, not one of them.** This is the step
+   people skip, and doing it on one scope is not the check. A review aborted a restore after
+   one row of four and then satisfied the old wording verbatim by picking the scope that
+   happened to land; the rest of the tenants stayed unreadable and surfaced one at a time as
+   each signed in.
+4. **Confirm nothing came back `destroyed` that you expected to recover.** A read consults
+   neither the completeness of the row set nor `tenant_keks.status`, so a restore whose rows
+   all say `destroyed` decrypts perfectly and then fails the next write with an encryption
+   error, because `active_kek_version()` returns `None`. A review demonstrated exactly that.
 
 ## What this does NOT recover
 
@@ -63,6 +109,18 @@ detail: a shred is only as final as the oldest backup that predates it.
 restoring the post-shred row does not make the data readable. The half it cannot control is
 yours: age out or re-key backups that predate a shred, and record that in whatever promises
 the deployment makes about erasure.
+
+### Empty blobs are not a corruption signal
+
+An earlier version of this document told you to distrust an export whose `wrapped_kek` values
+are empty. That was wrong and it was dangerous in both directions. An empty blob is the
+legitimate post-shred state, which this same document says two paragraphs above, and which
+`a_shredded_row_is_a_valid_thing_to_back_up` asserts. Acting on the old rule during an
+incident meant either discarding a correct backup, or reaching for an older one that predates
+the shred and resurrecting key material for a tenant the deployment promised to erase.
+
+If you want to know whether a backup is sound, check it against its manifest. That is what the
+manifest is for.
 
 ## After a master key rotation
 

@@ -64077,6 +64077,92 @@ pub(crate) async fn store_rewrapped_kek(
     Ok(result.rows_affected() == 1)
 }
 
+/// Every KEK row, whole, for a backup (issue #153 criteria 4 and 6).
+///
+/// Unscoped on purpose, like the rotation's work set beside it: a backup is a platform
+/// operation over every tenant, and the caller has already refused any connection row-level
+/// security applies to. See [`crate::kek_backup::export`] for why that refusal is the
+/// important half.
+///
+/// The two timestamps are rendered as text here rather than carried as `timestamptz`, so the
+/// backup file is a value an operator can read and a transport cannot reinterpret in another
+/// session's time zone.
+pub(crate) async fn all_keks_for_backup(
+    pool: &sqlx::PgPool,
+) -> Result<Vec<crate::kek_backup::BackedUpKek>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT id, tenant_id, environment_id, version, master_key_id, wrapped_kek, status, \
+                to_char(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.USOF') AS created_at, \
+                to_char(destroyed_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.USOF') AS destroyed_at \
+         FROM tenant_keks ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|row| crate::kek_backup::BackedUpKek {
+            id: row.get("id"),
+            tenant_id: row.get("tenant_id"),
+            environment_id: row.get("environment_id"),
+            version: row.get("version"),
+            master_key_id: row.get("master_key_id"),
+            wrapped_kek: row.get("wrapped_kek"),
+            status: row.get("status"),
+            created_at: row.get("created_at"),
+            destroyed_at: row.get("destroyed_at"),
+        })
+        .collect())
+}
+
+/// The three fields a restore compares to decide whether a row it is about to write is the
+/// one already there, or [`None`] if the id is absent.
+pub(crate) async fn kek_identity_for_restore(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> Result<Option<(String, Vec<u8>, String)>, StoreError> {
+    let row =
+        sqlx::query("SELECT master_key_id, wrapped_kek, status FROM tenant_keks WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(row.map(|row| {
+        (
+            row.get("master_key_id"),
+            row.get("wrapped_kek"),
+            row.get("status"),
+        )
+    }))
+}
+
+/// Write one backed-up KEK row, all nine columns.
+///
+/// All nine because the two an earlier export dropped are the ones with defaults: omitting
+/// `created_at` lets the column DEFAULT stamp every KEK with the restore date, and omitting
+/// `destroyed_at` returns a shredded row that says the key was destroyed and not when.
+pub(crate) async fn insert_backed_up_kek(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    row: &crate::kek_backup::BackedUpKek,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO tenant_keks \
+           (id, tenant_id, environment_id, version, master_key_id, wrapped_kek, status, \
+            created_at, destroyed_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9::timestamptz)",
+    )
+    .bind(&row.id)
+    .bind(&row.tenant_id)
+    .bind(&row.environment_id)
+    .bind(row.version)
+    .bind(&row.master_key_id)
+    .bind(&row.wrapped_kek)
+    .bind(&row.status)
+    .bind(&row.created_at)
+    .bind(row.destroyed_at.as_deref())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// How many KEKs are wrapped under `master_key_id`.
 pub(crate) async fn count_keks_under_master(
     pool: &sqlx::PgPool,

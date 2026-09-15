@@ -123,6 +123,34 @@ impl Store {
             .await
     }
 
+    /// Export every KEK row for a backup (issue #153 criteria 4 and 6).
+    ///
+    /// The pool stays private, as everywhere else on this type. See
+    /// [`crate::kek_backup::export`] for why it REFUSES a connection that row-level security
+    /// applies to rather than returning the zero rows such a connection can see.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Encryption`] if the connected role is subject to row-level security;
+    /// [`StoreError::Database`] on a read failure.
+    pub async fn export_keks(&self) -> Result<Vec<crate::kek_backup::BackedUpKek>, StoreError> {
+        crate::kek_backup::export(&self.pool).await
+    }
+
+    /// Verify a KEK backup and restore it in one transaction (issue #153 criterion 4).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::kek_backup::RestoreError`] naming what refused. Nothing is written unless all
+    /// of it is.
+    pub async fn restore_keks(
+        &self,
+        rows: &[crate::kek_backup::BackedUpKek],
+        manifest: &crate::kek_backup::Manifest,
+    ) -> Result<crate::kek_backup::RestoreReport, crate::kek_backup::RestoreError> {
+        crate::kek_backup::restore(&self.pool, rows, manifest).await
+    }
+
     /// Connect to Postgres at `url` with a bounded pool.
     ///
     /// In production `url` should authenticate as the low-privilege
