@@ -12,6 +12,7 @@
 
 use ironauth_env::Env;
 use ironauth_store::Scope;
+use ironauth_store::StoreError;
 use ironauth_store::test_support::TestDatabase;
 
 /// Write an override as the CONTROL plane does. The data plane cannot do this, which is the
@@ -126,16 +127,43 @@ async fn the_data_plane_cannot_raise_its_own_limit() {
     let scope = db.seed_scope(&env).await;
     set_override(&db, scope, "requests", 1.0, 2.0).await;
 
+    // IN ITS OWN SCOPE, with the GUCs set, which is the threat.
+    //
+    // This ran on a bare `app_pool()` with no scope set and an INSERT naming a FOREIGN
+    // tenant, so row-level security refused it whatever the grant said. A review granted
+    // INSERT to `ironauth_app`, watched all eight tests pass, and then drove a scoped
+    // data-plane transaction that raised its own limit to a billion. The fixture differed
+    // from the threat on two dimensions at once, role AND scope, so it measured RLS rather
+    // than the grant it is named for.
+    //
+    // Every real data-plane transaction goes through `begin_scoped`, which sets these GUCs to
+    // its own scope. That is the shape the grant has to refuse.
     for statement in [
         "UPDATE tenant_quota_limits SET burst = 1000000",
         "INSERT INTO tenant_quota_limits (tenant_id, environment_id, dimension, \
-          refill_per_sec, burst, updated_at) VALUES ('t', 'e', 'requests', 99.0, 99.0, now())",
+          refill_per_sec, burst, updated_at) VALUES ($1, $2, 'requests', 99.0, 99.0, now())",
         "DELETE FROM tenant_quota_limits",
     ] {
-        let result = sqlx::query(statement).execute(db.app_pool()).await;
+        let mut tx = db.app_pool().begin().await.expect("begin");
+        sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
+            .bind(scope.tenant().to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("set the tenant guc");
+        sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+            .bind(scope.environment().to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("set the environment guc");
+
+        let result = sqlx::query(statement)
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .execute(&mut *tx)
+            .await;
         assert!(
             result.is_err(),
-            "the data plane must not be able to run: {statement}"
+            "the data plane must not be able to run this IN ITS OWN SCOPE: {statement}"
         );
     }
 
@@ -185,8 +213,15 @@ async fn a_non_finite_or_negative_limit_is_refused_by_the_constraint() {
         assert!(result.is_err(), "{what} must be refused by the constraint");
     }
 
-    // Zero is allowed on both, and means something: a burst of zero denies everything, which
-    // is a legitimate way to stop a tenant without deleting them.
+    // Zero is ACCEPTED by the constraint, and what it MEANS is decided elsewhere. This
+    // comment said "a burst of zero denies everything, which is a legitimate way to stop a
+    // tenant", and that is backwards: `limit_from` in ironauth-quota maps a burst of zero to
+    // `None`, and `ScopeLimits` documents `None` as UNLIMITED. An operator following the
+    // sentence I wrote, to stop a tenant, would have unlimited it.
+    //
+    // The row is storable either way; the meaning belongs with the code that reads it, and
+    // that code does not exist yet. Nothing here should assert a meaning the enforcement path
+    // has not been written to honour.
     set_override(&db, scope, "requests", 0.0, 0.0).await;
 }
 
@@ -273,16 +308,31 @@ async fn clearing_a_limit_removes_the_override() {
         None,
         "a cleared override returns the scope to the configured default"
     );
-    let audited: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM audit_log WHERE action = 'quota.limit.set' \
-         AND tenant_id = $1 AND environment_id = $2",
+    // THE TWO ACTIONS MUST BE TOLD APART. This counted rows under one action name and
+    // asserted 2, which passed while a set and a clear -- opposite changes -- were both
+    // recorded as `quota.limit.set`. Anyone reading the log to answer "what happened to this
+    // tenant's limits" saw a column of identical rows, and a removal was indistinguishable
+    // from a raise.
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_log \
+         WHERE tenant_id = $1 AND environment_id = $2 AND action LIKE 'quota.%' \
+         ORDER BY action",
     )
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
-    .fetch_one(db.owner_pool())
+    .fetch_all(db.owner_pool())
     .await
-    .expect("count");
-    assert_eq!(audited, 2, "the clear is a change and is audited like one");
+    .expect("read the audit actions");
+    assert_eq!(
+        actions,
+        // Ordered BY ACTION rather than by time: the clock here is deterministic, so both
+        // rows carry the same `occurred_at` and a time ordering would be a coin flip.
+        vec![
+            "quota.limit.cleared".to_owned(),
+            "quota.limit.set".to_owned()
+        ],
+        "the clear is a change, is audited like one, and does not read as another set"
+    );
 }
 
 /// THE WRITER REFUSES A VALUE THE LIMITER COULD NOT SURVIVE, before the constraint does.
@@ -312,7 +362,16 @@ async fn the_writer_refuses_a_non_finite_or_negative_limit() {
             .quota_limits()
             .set(&env, "requests", refill, burst)
             .await;
-        assert!(result.is_err(), "{what} must be refused by the writer");
+        // NAMING THE VARIANT is what makes this test about the WRITER'S guard rather than
+        // about the CHECK constraint behind it. `is_err()` was true either way, so the guard
+        // could be deleted with all eight tests in this file still green -- the constraint
+        // would simply refuse the same values one layer down and hand back
+        // `StoreError::Database`. `Invalid` is reachable ONLY from the guard.
+        assert!(
+            matches!(result, Err(StoreError::Invalid)),
+            "{what} must be refused by the WRITER (StoreError::Invalid), not by the \
+             constraint behind it; got {result:?}"
+        );
     }
 
     // And nothing was written, so the refusal was a refusal rather than a partial write.

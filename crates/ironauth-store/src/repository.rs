@@ -88128,9 +88128,16 @@ impl ActingQuotaLimitsRepo<'_> {
     /// wanted: the constraint is the one that holds against any writer, and this one gives a
     /// caller an error it can turn into a 400 rather than a 500 from a constraint violation.
     ///
+    /// The distinction is OBSERVABLE, which is what makes this guard testable separately
+    /// from the constraint behind it: refused here the caller gets [`StoreError::Invalid`],
+    /// and refused by the constraint it gets [`StoreError::Database`]. An earlier revision
+    /// returned `StoreError::Encryption`, which was both the wrong meaning and, because no
+    /// test named the variant, deletable with every test still green.
+    ///
     /// # Errors
     ///
-    /// [`StoreError`] if the limit is negative or not finite, or the write fails.
+    /// [`StoreError::Invalid`] if the limit is negative or not finite; [`StoreError`]
+    /// otherwise if the write fails.
     pub async fn set(
         &self,
         env: &Env,
@@ -88145,7 +88152,7 @@ impl ActingQuotaLimitsRepo<'_> {
             // violation surfacing as a 500. Postgres float semantics are why the CHECK cannot
             // be the only one a reader trusts: NaN = NaN is TRUE there, so the obvious SQL
             // idiom does not catch it and the constraint has to name 'NaN' explicitly.
-            return Err(StoreError::Encryption);
+            return Err(StoreError::Invalid);
         }
         let scope = self.scope;
         let target = QuotaLimitTarget::new(dimension);
@@ -88197,7 +88204,7 @@ impl ActingQuotaLimitsRepo<'_> {
                 scope,
                 acting: &self.acting,
                 env,
-                action: Action::QuotaLimitSet,
+                action: Action::QuotaLimitCleared,
                 target: &target,
             },
             async move |tx| {

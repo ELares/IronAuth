@@ -145,7 +145,6 @@ mod project_grants;
 mod promotion;
 mod provision;
 mod queues;
-mod quota_limits;
 mod ratelimit;
 mod recovery_approvals;
 mod resource_servers;
@@ -814,16 +813,6 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/audit-retention",
             get(audit_retention::read_audit_retention),
-        )
-        // Per-tenant quota limits, changeable at runtime (issue #150 criterion 4). Adjusting
-        // one customer used to mean editing the config file and restarting every node.
-        .route(
-            "/v1/tenants/{tenant_id}/environments/{environment_id}/quota-limits",
-            get(quota_limits::list_quota_limits),
-        )
-        .route(
-            "/v1/tenants/{tenant_id}/environments/{environment_id}/quota-limits/{dimension}",
-            axum::routing::put(quota_limits::set_quota_limit),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/attestation",

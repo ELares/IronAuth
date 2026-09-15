@@ -81,7 +81,6 @@ use ironauth_env::Clock;
 
 /// The five-layer request-plane limiter (issue #150), built on the buckets above.
 pub mod layered;
-pub mod resolver;
 
 /// A tenant identifier used as a quota bucket key.
 ///
