@@ -845,15 +845,19 @@ mod tests {
              `hot_state.ironcache_addr` into an `OptionalComponent` carrying \
              `DegradedTier::AcceleratorAbsent`, so a deployment that declared an accelerator \
              is reported as degraded when it cannot be reached.\n\n\
-             THAT IS THE ONLY READ. The key declares that a deployment HAS an accelerator; it \
-             does not put the cache in front of anything. `ironauth-hot` is a complete, \
-             classified, outage-tested layer that no request path calls, and it is not a \
-             dependency of `ironauth-oidc`, `ironauth-server`, `ironauth-admin` or the binary. \
-             It is NOT classified `UnreadAtBoot` for that reason: readiness is a real boot \
-             read, and the distinction between a section nothing reads and one only readiness \
-             reads is exactly what this list exists to record.\n\n\
-             It reaches neither plane state, so wiring a first consumer (the remaining #146 \
-             work) lands in the plane that consumes it and this entry is revisited then.",
+             THAT IS THE ONLY READ OF THIS KEY, which is not the same as saying the \
+             accelerator has no consumer. `ironauth-hot` IS a direct, non-optional dependency \
+             of `ironauth-oidc` and `ironauth-store` and reaches the binary through both, and \
+             a request path calls it: `IssuerRegistry::jwks_hot` is read while serving the \
+             JWKS document. What is missing is the BOOT WIRING. Nothing outside tests calls \
+             `with_jwks_hot_state`, so `jwks_hot` is `None` in every shipped binary and this \
+             address is never turned into a `HotState`. That is why the key still reaches \
+             readiness and nothing else.\n\n\
+             It is NOT classified `UnreadAtBoot`: readiness is a real boot read, and the \
+             distinction between a section nothing reads and one only readiness reads is \
+             exactly what this list exists to record.\n\n\
+             It reaches neither plane state. Revisit this entry when a boot path INSTALLS the \
+             accelerator, not when a consumer is written, because the consumer already is.",
         ),
         (
             "outbox",

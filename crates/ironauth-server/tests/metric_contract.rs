@@ -135,7 +135,20 @@ fn workspace_sources() -> Vec<String> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if path.is_dir() {
-                if name != "target" && !name.starts_with('.') {
+                // A TEST EMIT IS NOT AN EXPORT, and this walk did not enforce that.
+                //
+                // `cfg_test_spans` below closes the in-`src` door: an emit inside
+                // `#[cfg(test)] mod tests` does not count. The OTHER door was open. Integration
+                // tests live in `tests/` and need no `cfg(test)` attribute, because the whole
+                // file is already a test target, so `cfg_test_spans` finds nothing to exclude
+                // and every line of them counted as a production emit site.
+                //
+                // That is the same hole the `ironauth_up` incident in `cfg_test_spans`'s doc
+                // describes, reached through a different directory: a contract metric emitted
+                // ONLY from a test would satisfy "every contract metric has an emit site"
+                // while the process never set it.
+                let skip = matches!(name.as_ref(), "target" | "tests" | "benches" | "examples" | "fuzz");
+                if !skip && !name.starts_with('.') {
                     walk(&path, out);
                 }
             } else if path.extension().is_some_and(|ext| ext == "rs") {
