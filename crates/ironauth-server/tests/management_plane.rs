@@ -7,6 +7,7 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{get, server_from};
+use ironauth_server::DegradedTier;
 
 const DB_ON_TEST_NET: &str = "[database]\nurl = \"postgres://ironauth@192.0.2.1:5432/ironauth\"\n";
 
@@ -145,55 +146,85 @@ async fn public_root_and_security_txt_serve() {
 
 /// THE DEGRADED ARM, which is the one issue #149 criterion 6 is actually about.
 ///
-/// "Health endpoints report the active degraded tier DISTINCTLY from healthy and from hard
-/// down" is a claim about three outcomes, and two of them were covered: `healthz_is_always_ok`
-/// and `readyz_reports_503_when_database_unreachable`. The middle one, the whole point of the
+/// "Health endpoints report the ACTIVE degraded tier distinctly from healthy and from hard
+/// down" is a claim about three outcomes, and two were covered: `healthz_is_always_ok` and
+/// `readyz_reports_503_when_database_unreachable`. The middle one, the whole point of the
 /// criterion, had no test at the HTTP layer at all. `readiness.rs` tests the probe's tier
-/// CONSTRUCTION thoroughly; nothing asserted what an operator reading `/readyz` sees.
+/// CONSTRUCTION across seventeen cases; nothing asserted what an operator reading `/readyz`
+/// actually sees.
 ///
-/// A degraded state needs a REACHABLE database and an unreachable optional component. The
-/// database half is a bare TCP listener, which is sufficient because the probe connects and
-/// speaks no protocol -- the same property that makes readiness a weak signal in production is
-/// what makes this test cheap, and it is worth naming rather than relying on quietly.
+/// # Every tier, because the criterion says ACTIVE
+///
+/// The first version of this test drove only `BackboneAbsent`, and a review measured what
+/// that leaves open: replacing `tier.token()` in the handler with the literal
+/// `"backbone_absent"` passed all eight tests here AND all forty-two lib tests. A handler
+/// that ignores the active tier and always prints one token would have shipped green, which
+/// is precisely the property the criterion names.
+///
+/// The concrete harm is a misrouted page: a deployment with an IronCache configured and down
+/// answers `degraded: backbone_absent`, and the on-call opens the message-broker runbook for
+/// a cache outage.
+///
+/// So the table drives both variants and asserts it covers `DegradedTier::ALL`, which makes a
+/// third variant added later an obvious omission rather than a silent one.
 #[tokio::test]
-async fn readyz_reports_the_degraded_tier_distinctly() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to listen on");
-    let port = listener.local_addr().expect("a bound address").port();
+async fn readyz_reports_each_degraded_tier_distinctly() {
+    // The healthy body, OBSERVED rather than written down, so the contrast below is between
+    // two things the handler actually produced.
+    let (healthy_status, healthy_body) = readyz_for("").await;
+    assert_eq!(healthy_status, StatusCode::OK);
+    assert_eq!(healthy_body, "ready\n");
 
-    let server = server_from(&format!(
-        "[database]\nurl = \"postgres://ironauth@127.0.0.1:{port}/ironauth\"\n\
-         \n[outbox]\n# TEST-NET-1 (RFC 5737), which is not reachable.\n\
-         ironbus_addr = \"192.0.2.1:4222\"\n"
-    ));
-    let (status, _, body) = get(server.management_app(), "/readyz").await;
-
-    // 200, NOT 503. A degraded tier still serves every flow, so answering 503 would have a
-    // Kubernetes readiness probe pull the pod out of its Service because an OPTIONAL component
-    // is down, turning an accelerator outage into an availability outage.
-    assert_eq!(status, StatusCode::OK, "{body}");
+    let cases = [
+        ("outbox", "ironbus_addr", "backbone_absent"),
+        ("hot_state", "ironcache_addr", "accelerator_absent"),
+    ];
     assert_eq!(
-        body, "degraded: backbone_absent\n",
-        "the body is what carries the tier, as a stable token an operator and a dashboard can \
-         both match on"
+        cases.len(),
+        DegradedTier::ALL.len(),
+        "every tier must be driven through the HANDLER, not just constructed in the probe: \
+         a tier with no case here is one the response body is never checked for"
     );
 
-    // DISTINCT FROM HEALTHY, which is the word the criterion uses. Asserted as a contrast
-    // rather than by reading the degraded body alone: a handler that answered the same 200
-    // "ready" for both would satisfy the status assertion above and defeat the criterion.
-    assert_ne!(body, "ready\n");
+    for (section, key, token) in cases {
+        // 127.0.0.1:1 rather than a TEST-NET-1 address: nothing can bind port 1 without root,
+        // so the connect is an immediate ECONNREFUSED instead of burning the full probe
+        // timeout, and the case stops depending on how the host network treats an unroutable
+        // destination. A network whose egress proxy completes connects to anywhere would make
+        // the TEST-NET version report Ready.
+        let (status, body) = readyz_for(&format!("\n[{section}]\n{key} = \"127.0.0.1:1\"\n")).await;
+
+        // 200, NOT 503. A degraded tier still serves every flow, so answering 503 would have a
+        // Kubernetes readiness probe pull the pod out of its Service because an OPTIONAL
+        // component is down, turning an accelerator outage into an availability outage.
+        assert_eq!(status, StatusCode::OK, "{section}: {body}");
+        assert_eq!(
+            body,
+            format!("degraded: {token}\n"),
+            "{section}: the body must name WHICH tier is active"
+        );
+        assert_ne!(
+            body, healthy_body,
+            "{section}: degraded must be distinguishable from healthy, which is the word the \
+             criterion uses"
+        );
+    }
 }
 
-/// The healthy arm, for the same reason: without it the contrast above has only one side.
-#[tokio::test]
-async fn readyz_reports_ready_when_nothing_is_degraded() {
+/// `/readyz` against a reachable database and no optional components.
+///
+/// The database half is a bare `TcpListener` that never accepts, which is enough because the
+/// probe connects and speaks no protocol. The same property that makes this cheap is what
+/// makes readiness a weak signal in production, and a reader should meet both facts in one
+/// place: a deployment with wrong credentials or an unmigrated schema also reports Ready.
+async fn readyz_for(extra: &str) -> (StatusCode, String) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to listen on");
     let port = listener.local_addr().expect("a bound address").port();
-
     let server = server_from(&format!(
-        "[database]\nurl = \"postgres://ironauth@127.0.0.1:{port}/ironauth\"\n"
+        "[database]\nurl = \"postgres://ironauth@127.0.0.1:{port}/ironauth\"\n{extra}"
     ));
     let (status, _, body) = get(server.management_app(), "/readyz").await;
-
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, "ready\n");
+    // Held until here so the port cannot be reused between bind and probe.
+    drop(listener);
+    (status, body)
 }
