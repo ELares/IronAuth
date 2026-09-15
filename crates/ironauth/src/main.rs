@@ -356,7 +356,12 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         let planes = match assemble_planes(&config, &env, &features).await {
             Ok(planes) => planes,
             Err(error) => {
-                tracing::error!(%error, "failed to derive the public site context");
+                // The message names the CATEGORY, not one cause. This read "failed to derive
+                // the public site context", which was accurate when `public_url` was the only
+                // way here and became misleading the moment an unbuildable access rule took
+                // the same arm: the refusal's whole value is that it names the rule, and the
+                // first line an operator reads would have pointed at the wrong section.
+                tracing::error!(%error, "refusing to boot: a plane input could not be resolved");
                 return ExitCode::FAILURE;
             }
         };
@@ -880,6 +885,11 @@ struct AssembledPlanes {
 /// [`ServerError::InvalidPublicUrl`] if `server.public_url` is set but is not a valid
 /// `http`/`https` base URL, which is the one input both planes need and neither can
 /// substitute for.
+///
+/// [`ServerError::InvalidAccessRules`] if a `[forward_auth]` rule is valid configuration
+/// this build cannot evaluate (issue #154). Built HERE rather than inside
+/// [`build_oidc_plane`] precisely so it can refuse: that function answers `Option`, so the
+/// same failure there removed the OIDC plane and let the process come up healthy.
 async fn assemble_planes(
     config: &Config,
     env: &Env,

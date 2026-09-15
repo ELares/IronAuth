@@ -829,10 +829,14 @@ mod tests {
             "forward_auth",
             Reach::OnePlaneOrNoState,
             "the forward-auth access rules and proxy dialect (issue #154). Read at boot in \
-             ONE place and it is the OIDC plane: `build_oidc_plane` turns the rule list into \
-             a `RuleSet` through `ForwardAuthRuntime::from_config` and installs it with \
+             ONE place and it reaches the OIDC plane: `assemble_planes` turns the rule list \
+             into a `RuleSet` through `ForwardAuthRuntime::from_config`, BEFORE either plane \
+             exists, and hands the result to `build_oidc_plane` to install with \
              `with_forward_auth`, which mounts the check endpoint at \
-             `/t/{tenant}/e/{environment}/forward-auth`.\n\n\
+             `/t/{tenant}/e/{environment}/forward-auth`. It is read there rather than inside \
+             the plane builder because that builder answers `Option`, so a rule this build \
+             cannot evaluate would have removed the plane silently instead of refusing to \
+             boot.\n\n\
              PUBLIC-PLANE ONLY, and it has to be: the caller is a reverse proxy asking \
              whether to serve a request, not an operator, and nothing under \
              `/v1/tenants/...` reads it. Off is a uniform 404 on the check path.\n\n\

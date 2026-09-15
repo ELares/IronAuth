@@ -413,13 +413,23 @@ pub enum Dialect {
     /// Traefik and Caddy forward-auth: `X-Forwarded-Method`, `X-Forwarded-Host`,
     /// `X-Forwarded-Uri`.
     ForwardAuth,
-    /// nginx `auth_request`: `X-Original-Method`, `X-Original-URI`, host from
-    /// `X-Forwarded-Host`.
+    /// nginx `auth_request`: `X-Original-Method`, `X-Original-URI`, host from the INHERITED
+    /// `Host`.
+    ///
+    /// Not `X-Forwarded-Host`: the subrequest inherits `Host`, and requiring the forwarded
+    /// one made correctly configured proxies refuse every request. See [`Self::host_header`].
+    /// Note that `proxy_pass` rewrites `Host` to `$proxy_host` unless the location sets
+    /// `proxy_set_header Host $host`.
     NginxAuthRequest,
     /// Envoy and Istio `ext_authz` over HTTP: the check request carries the original method
     /// and path as its OWN method and path, with the host on `X-Forwarded-Host`.
     EnvoyExtAuthz,
-    /// `HAProxy`: `X-Forwarded-Method`, `X-Forwarded-Host`, `X-Original-URI`.
+    /// `HAProxy`: `X-Forwarded-Method`, `X-Forwarded-Host`, `X-Forwarded-Uri`.
+    ///
+    /// NOT `X-Original-URI`. That is what this line used to say, and
+    /// [`Self::uri_header`] records why it changed: `HAProxy` neither sets nor strips
+    /// `X-Original-URI`, so reading it let a client supply one directly and choose its own
+    /// authorization path.
     Haproxy,
 }
 
