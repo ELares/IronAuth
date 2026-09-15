@@ -19,7 +19,8 @@ Current artifact lanes:
 
 - `ironauth-vX.Y.Z`: the server binary. Produces a static musl binary, a
   CycloneDX SBOM, GitHub build provenance attestations, a GitHub release with
-  the crate's changelog section, and a cosign-signed container image on GHCR
+  the crate's changelog section, a Helm chart with its own SBOM, and a cosign-signed container image on GHCR carrying both
+a provenance attestation and an SBOM
   (`.github/workflows/release.yml`).
 - Library crates (`ironauth-env`, and later crates) release to crates.io under
   their own `<crate>-vX.Y.Z` tags once their APIs stabilize; until then they
@@ -65,6 +66,22 @@ silently included.
    real release; until then treat it as authored but unproven.
 5. Record a HUMAN-TIMED quickstart run per guide in `docs/dx/timed-runs.md`.
    See below: this is DX evidence, and deliberately not a gate.
+
+## The Helm chart
+
+`helm package charts/ironauth` runs in the release lane and the tarball ships as a release
+asset with a provenance attestation, alongside a CycloneDX SBOM.
+
+THE CHART'S SBOM IS THE IMAGES IT DEPLOYS, derived from `helm template` rather than from a
+directory scan. A scan finds nothing: a chart is templates, and the only dependency it has is
+the image its rendered manifests reference. The first version of that step used a syft
+directory scan, which would have published a document with an empty `components` array as the
+chart's SBOM. The release refuses to publish an SBOM with no components, for that reason.
+
+`Chart.yaml` `appVersion` is checked against the crate version by `scripts/helm-chart.sh` on
+every push, and the release tag is checked against the crate version, so the published chart
+deploys the released image transitively. `Chart.yaml` `version` is the chart's OWN version and
+is bumped when the chart changes, independently: nothing ties it to the tag.
 
 ## The DEB
 
