@@ -161,6 +161,25 @@ pub async fn send(
     headers: HeaderMap,
     Json(body): Json<SendBody>,
 ) -> Response {
+    // RECORDED ON THE RESPONSE. A conversion rate is sends divided by verifies, so
+    // both halves have to count every attempt including the refused ones: a
+    // deployment whose codes mostly fail to send would otherwise report a healthy
+    // ratio over a numerator and denominator that both only counted successes
+    // (issue #152 criterion 5).
+    crate::funnel::record_otp(
+        crate::funnel::OtpChannel::Email,
+        crate::funnel::OtpStage::Send,
+        send_inner(state, tenant_id, environment_id, headers, body).await,
+    )
+}
+
+async fn send_inner(
+    state: OidcState,
+    tenant_id: String,
+    environment_id: String,
+    headers: HeaderMap,
+    body: SendBody,
+) -> Response {
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return not_found_json();
     };
@@ -328,6 +347,25 @@ pub async fn verify(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<VerifyBody>,
+) -> Response {
+    // RECORDED ON THE RESPONSE. A conversion rate is sends divided by verifies, so
+    // both halves have to count every attempt including the refused ones: a
+    // deployment whose codes mostly fail to send would otherwise report a healthy
+    // ratio over a numerator and denominator that both only counted successes
+    // (issue #152 criterion 5).
+    crate::funnel::record_otp(
+        crate::funnel::OtpChannel::Email,
+        crate::funnel::OtpStage::Verify,
+        verify_inner(state, tenant_id, environment_id, headers, body).await,
+    )
+}
+
+async fn verify_inner(
+    state: OidcState,
+    tenant_id: String,
+    environment_id: String,
+    headers: HeaderMap,
+    body: VerifyBody,
 ) -> Response {
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return not_found_json();
