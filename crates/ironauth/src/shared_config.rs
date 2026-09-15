@@ -826,6 +826,23 @@ mod tests {
              OIDC state only.",
         ),
         (
+            "forward_auth",
+            Reach::UnreadAtBoot {
+                config_type: "ForwardAuthConfig",
+            },
+            "inert: no boot path installs it into either plane's state (issue #154). The \
+             rule VOCABULARY exists and is validated, and nothing serves a forward-auth \
+             surface, so a rule written here is evaluated by nothing.\n\n\
+             As with `byok`, the one read that exists is a REFUSAL rather than an \
+             installation: `Config::validate` rejects any non-default value, so the section \
+             being unconsumed cannot be mistaken for it being in force. That matters more \
+             here than it does for `byok`, because a rule list misstates an access decision \
+             rather than a protection: an operator who writes `deny /admin to anonymous` and \
+             boots successfully would hold a specific false belief about who can reach what.\n\n\
+             Reclassify when the forward-auth endpoints land and a boot path turns these \
+             rules into a `RuleSet` on a plane.",
+        ),
+        (
             "byok",
             Reach::UnreadAtBoot {
                 config_type: "ByokConfig",
