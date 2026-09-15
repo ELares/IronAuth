@@ -1109,6 +1109,23 @@ jobs:
           sudo grep -q '^enabled = true$' /etc/ironauth/ironauth.toml
           sudo chown root:ironauth /etc/ironauth/ironauth.toml
           sudo chmod 640 /etc/ironauth/ironauth.toml
+      # THE THREE ROLES THE SCHEMA GRANTS TO, provisioned out of band exactly as an operator
+      # must. Migration 0001 GRANTs to `ironauth_app` and never creates it, because shipping
+      # a CREATE ROLE ... PASSWORD literal in a public repository would hand every reader a
+      # working credential for the isolation-boundary role. If the role is absent the GRANTs
+      # fail loudly, and that is intended.
+      #
+      # This step exists because the job FOUND the gap: without it `ironauth migrate` exits
+      # with "migration error" on a database the documented sequence had just created. The
+      # sequence was incomplete, and running it is what showed that.
+      - name: Provision the roles the schema grants to
+        env:
+          PGPASSWORD: postgres
+        run: |
+          for role in ironauth_app ironauth_control ironauth_audit_retention; do
+            psql -h 127.0.0.1 -U postgres -d ironauth -v ON_ERROR_STOP=1 \
+              -c "CREATE ROLE $role LOGIN PASSWORD '$role'"
+          done
       - name: Migrate and start, exactly as the config file documents
         run: |
           sudo -u ironauth /usr/bin/ironauth migrate --config /etc/ironauth/ironauth.toml

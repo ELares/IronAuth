@@ -6,7 +6,16 @@
 # in principle be one that is. That is the reason the package does not start the service on
 # install: not that nothing would happen, but that something might.
 #
-# Set the URL, run `ironauth migrate --config /etc/ironauth/ironauth.toml`, then
+# BEFORE MIGRATING, create the three roles the schema grants to. Migration 0001 GRANTs to
+# them and never creates them, because shipping a CREATE ROLE ... PASSWORD literal would hand
+# every reader of the source a working credential for the isolation-boundary role. If they are
+# absent the migration fails loudly, which is intended:
+#
+#   CREATE ROLE ironauth_app LOGIN PASSWORD '...';
+#   CREATE ROLE ironauth_control LOGIN PASSWORD '...';
+#   CREATE ROLE ironauth_audit_retention LOGIN PASSWORD '...';
+#
+# Then set the URL, run `ironauth migrate --config /etc/ironauth/ironauth.toml`, and
 # `systemctl enable --now ironauth`.
 #
 # The full reference is /usr/share/doc/ironauth/CONFIG.md, generated from the config schema.

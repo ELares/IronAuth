@@ -8046,9 +8046,21 @@ The documented sequence is:
 ```
 sudo dpkg -i ironauth_<version>_amd64.deb
 sudoedit /etc/ironauth/ironauth.toml          # uncomment and set database.url
+
+# The three roles the schema GRANTs to and never creates. Migration 0001 refuses
+# loudly if they are absent, which is intended: shipping a CREATE ROLE ... PASSWORD
+# literal would publish a working credential for the isolation-boundary role.
+psql "$ADMIN_DSN" -c "CREATE ROLE ironauth_app LOGIN PASSWORD '...'"
+psql "$ADMIN_DSN" -c "CREATE ROLE ironauth_control LOGIN PASSWORD '...'"
+psql "$ADMIN_DSN" -c "CREATE ROLE ironauth_audit_retention LOGIN PASSWORD '...'"
+
 sudo -u ironauth ironauth migrate --config /etc/ironauth/ironauth.toml
 sudo systemctl enable --now ironauth
 ```
+
+The role step is in this list because the CI job found it missing: without it `ironauth
+migrate` exits with `migration error` on a database that was just created, and the sequence
+as first written did not work.
 
 The config file is a dpkg **conffile**, so an upgrade preserves an operator's edits rather
 than overwriting the file that holds their database credential. `dpkg -r` leaves it in place
