@@ -314,11 +314,17 @@ async fn a_transient_store_error_does_not_negative_cache_a_real_scope() {
 /// Run `body` with the fence read AND the locale-bundle read broken, restoring both
 /// before returning (issue #1262).
 ///
-/// Renaming ONE table is narrower than the criterion. "Postgres is unreachable" is the
-/// fault this is standing in for, and a document can be byte-identical under a broken
-/// fence while still degrading under a broken `locale_bundles`, which is exactly the
-/// defect that kept discovery out of the JWKS change. Breaking both means a discovery
-/// document that survives has survived both reads it depends on.
+/// Renaming ONE table is narrower than the criterion: "Postgres is unreachable" is the fault
+/// this stands in for, and discovery depends on two reads, so a document that survives one
+/// broken table has not been shown to survive the outage.
+///
+/// BOTH RENAMES ARE LOAD-BEARING NOW, and a review showed they were not before. With only the
+/// fence broken, `resolve_with` returns the fresh cached entry and performs no further store
+/// reads, so the `locale_bundles` rename could not affect the path under test and the claim
+/// that breaking both proved something was decoration. Discovery now reads the bundles LIVE
+/// first and falls back to the entry's cached set, so with both tables broken the live read is
+/// the one that fails and the fallback is the one that answers. Neutralize either and the
+/// byte-identical assertion below goes red.
 async fn with_unreadable_store<F, Fut, T>(harness: &Harness, body: F) -> T
 where
     F: FnOnce() -> Fut,
@@ -728,22 +734,20 @@ async fn discovery_still_refuses_a_fenced_scope() {
         "precondition: it serves before the suspension"
     );
 
-    // UPSERT, NOT UPDATE, and then CHECK THE FIXTURE TOOK. `environment_state()` returns
-    // `Active` when the row is ABSENT, and the harness scope has no `environment_states`
-    // row, so a bare UPDATE matched zero rows and suspended nothing. The test then drove a
-    // perfectly healthy scope and asserted it was refused, which is a fixture that measures
-    // nothing dressed as a security assertion. The first run caught it (200 where 404 was
-    // asserted); had the arms been the other way round it would have passed forever.
+    // THE TYPED HARNESS HELPER, which upserts with bound parameters and carries the
+    // query-audit-allow marker. This hand-rolled a format!-interpolated INSERT ... ON CONFLICT
+    // that was byte-for-byte what `set_environment_serving_state` already does, and which the
+    // three neighbouring fenced tests in this file already call.
+    //
+    // It got there by a worse route than duplication: the first version was a bare UPDATE, and
+    // `environment_state()` returns `Active` when the row is ABSENT, which it was for the
+    // harness scope. The UPDATE matched zero rows, suspended nothing, and the test drove a
+    // perfectly healthy scope while asserting it was refused. The first run caught it (200
+    // where 404 was asserted); had the arms been the other way round it would have passed
+    // forever. The assertion below stays for the same reason.
     harness
         .db()
-        .execute_owner_sql(&format!(
-            "INSERT INTO environment_states (tenant_id, environment_id, serving_status) \
-             VALUES ('{}', '{}', 'suspended') \
-             ON CONFLICT (tenant_id, environment_id) \
-             DO UPDATE SET serving_status = 'suspended'",
-            scope.tenant(),
-            scope.environment()
-        ))
+        .set_environment_serving_state(scope, "suspended")
         .await;
     assert!(
         harness
@@ -765,22 +769,26 @@ async fn discovery_still_refuses_a_fenced_scope() {
     );
 }
 
-/// THE READ THAT MOVED: an unreadable `locale_bundles` is an ERROR on the cold load,
-/// never a silent default.
+/// THE COSMETIC TABLE MUST NOT BE LOAD-BEARING FOR THE MINT.
 ///
-/// `supported_ui_locales` ended in `unwrap_or_default()`, which cannot tell "no bundles
-/// installed" from "the read failed", and that conflation is what published `["en"]`
-/// during an outage. On the cold load a failed read is `LoadOutcome::Error`: nothing is
-/// cached, nothing is served, and the next request retries. This test breaks ONLY
-/// `locale_bundles`, leaving the fence readable, so what it measures is that one read's
-/// failure direction rather than the fence's.
+/// This test asserted the opposite until a review caught it. The first version of issue #1262
+/// returned `LoadOutcome::Error` when the `locale_bundles` read failed, and this test asserted
+/// that the entry did NOT load, as though that were the requirement. It is the defect:
+/// `load_issuer_entry` is the cold load behind `entry_for`, which is the TOKEN MINT seam, the
+/// JWKS load, the back-channel-logout and SSF push SET signers, and the admin console
+/// credential bridge. None of them render a locale. A review broke only `locale_bundles`,
+/// left the fence and the keys healthy, and measured `/token` returning 500, JWKS 404 and the
+/// console unable to log in: a fault confined to translations took down authentication.
+///
+/// So the entry LOADS, and carries the failed read as `None` rather than as a default. The one
+/// caller that cannot proceed without knowing refuses on its own behalf, which
+/// `discovery_refuses_rather_than_advertising_a_guessed_locale_set` pins.
 #[tokio::test]
-async fn a_cold_load_fails_rather_than_defaulting_when_the_bundles_cannot_be_read() {
+async fn a_failed_bundle_read_does_not_fail_the_entry_the_mint_depends_on() {
     let harness = Harness::start_store_backed().await;
     let scope = harness.scope();
     install_locale(&harness, "fr").await;
-    // A REGISTRY WITH NO WARM ENTRY, so this exercises the cold load rather than the
-    // publication path's cached fallback.
+    // A REGISTRY WITH NO WARM ENTRY, so this exercises the cold load.
     let registry = store_backed(&harness);
 
     harness
@@ -793,22 +801,187 @@ async fn a_cold_load_fails_rather_than_defaulting_when_the_bundles_cannot_be_rea
         .execute_owner_sql("ALTER TABLE locale_bundles_hidden RENAME TO locale_bundles")
         .await;
 
+    let during = during.expect(
+        "the entry must still load: the mint, JWKS, the SET signers and the admin bridge all \
+         resolve through here and none of them render a locale",
+    );
     assert!(
-        during.is_none(),
-        "a failed bundle read must fail the load, not default the locale set to ['en'] \
-         and cache that for a TTL"
+        !during.keyset().published_signing_keys(at(0)).is_empty(),
+        "and it carries the keys, so the mint can actually work during the fault"
+    );
+    assert_eq!(
+        during.ui_locales(),
+        None,
+        "the failed read is CARRIED as not-known, not defaulted to ['en']: defaulting is \
+         what let an outage publish a degraded document under the full max-age"
     );
 
-    // AND IT IS NOT NEGATIVE-CACHED: the very next request, at the SAME instant, loads.
-    // A transient read error that got negative-cached would turn a blip into a TTL-long
-    // outage for a real scope.
+    // AND IT IS NOT NEGATIVE-CACHED: the very next request, at the SAME instant, reloads and
+    // now knows the locales. A transient read error that got negative-cached would turn a
+    // blip into a TTL-long fault for a real scope.
     let entry = registry
-        .entry_for(&scope, at(0))
+        .entry_for(&scope, at(TTL.as_secs() + 1))
         .await
-        .expect("the scope self-heals on the next request");
+        .expect("the scope reloads once the entry goes stale");
     assert_eq!(
         entry.ui_locales(),
-        ["en".to_owned(), "fr".to_owned()],
-        "and the recovered entry carries the real locale set"
+        Some(["en".to_owned(), "fr".to_owned()].as_slice()),
+        "and the reloaded entry carries the real locale set"
+    );
+}
+
+/// DISCOVERY REFUSES RATHER THAN ADVERTISING A GUESSED LOCALE SET.
+///
+/// The other half of the test above: the entry survives a failed bundle read, so SOMETHING has
+/// to refuse, or the degraded document this whole issue is about ships anyway. Discovery is
+/// that something, and a 404 is the right refusal: it is what an unreadable store gave before
+/// this change, and it is transient in a way a cached wrong answer is not.
+///
+/// The fault here breaks ONLY `locale_bundles`, leaving the fence readable, so what this
+/// measures is that read's failure direction rather than the fence's.
+#[tokio::test]
+async fn discovery_refuses_rather_than_advertising_a_guessed_locale_set() {
+    let harness = Harness::start_store_backed().await;
+    install_locale(&harness, "fr").await;
+    let (router, url) = store_backed_discovery(&harness);
+
+    let (status, body) = get(&router, &url).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "precondition: it serves while the bundles are readable"
+    );
+    assert_eq!(ui_locales(&body), vec!["en".to_owned(), "fr".to_owned()]);
+
+    harness
+        .db()
+        .execute_owner_sql("ALTER TABLE locale_bundles RENAME TO locale_bundles_hidden")
+        .await;
+    // A COLD registry, so there is no cached entry to fall back to and the refusal is the
+    // only answer left. With a warm entry the cached set answers instead, which is the
+    // outage-safety half and is pinned by the byte-identical test above.
+    let (cold_router, cold_url) = store_backed_discovery(&harness);
+    let (status, body) = get(&cold_router, &cold_url).await;
+    harness
+        .db()
+        .execute_owner_sql("ALTER TABLE locale_bundles_hidden RENAME TO locale_bundles")
+        .await;
+
+    assert_eq!(
+        status,
+        axum::http::StatusCode::NOT_FOUND,
+        "with no live read and no cached set, discovery must refuse rather than advertise \
+         the ['en'] fallback as though it were the environment's real capability: {body}"
+    );
+}
+
+/// A REMOVED BUNDLE STOPS BEING ADVERTISED AT ONCE, NOT AFTER A TTL.
+///
+/// The regression the live-first ordering exists to prevent, and the one the first revision of
+/// this change introduced. `locale_bundles` is a MUTABLE config table with live set and delete
+/// routes, and the hosted pages resolve it per render, so a cached-only discovery would keep
+/// advertising a locale the pages had already stopped rendering, for the rest of the entry TTL
+/// plus another `max-age` at whichever relying party fetched last.
+#[tokio::test]
+async fn a_removed_locale_bundle_stops_being_advertised_immediately() {
+    let harness = Harness::start_store_backed().await;
+    let scope = harness.scope();
+    install_locale(&harness, "fr").await;
+    let (router, url) = store_backed_discovery(&harness);
+
+    let (status, body) = get(&router, &url).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(
+        ui_locales(&body),
+        vec!["en".to_owned(), "fr".to_owned()],
+        "precondition: the removable locale is advertised"
+    );
+
+    harness
+        .db()
+        .execute_owner_sql(&format!(
+            "DELETE FROM locale_bundles WHERE tenant_id = '{}' AND environment_id = '{}'",
+            scope.tenant(),
+            scope.environment()
+        ))
+        .await;
+
+    // THE SAME ROUTER, the same warm entry, the SAME instant: no TTL has elapsed.
+    let (status, body) = get(&router, &url).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(
+        ui_locales(&body),
+        vec!["en".to_owned()],
+        "a removed bundle must disappear from the advertised set on the NEXT request, \
+         because the pages stop rendering it on the next request too"
+    );
+}
+
+/// THE SUSPENSION WINDOW DISCOVERY OPENS IS BOUNDED BY THE ENTRY TTL, from both sides.
+///
+/// `a_suspension_landing_just_before_an_outage_is_invisible_for_at_most_one_ttl` pins this for
+/// JWKS and drives `jwks_json` only, so routing discovery through the same seam inherited the
+/// argument without inheriting the test. A review pointed that out, and the gap matters: the
+/// publication relaxation is defensible only because the window CLOSES on its own.
+///
+/// THREE WRONG VERSIONS PRECEDED THIS ONE, each caught by running it.
+///
+/// The first asserted that a fenced scope refuses during an outage. That is not what
+/// `resolve_for_publication` provides and not what it claims: with the fence unreadable there
+/// is no way to learn of a suspension, so a fresh cached entry keeps publishing. It returned
+/// 200 where it asserted 404, and the test was wrong rather than the code.
+///
+/// The second built a short-TTL registry but never warmed it, so its closing 404 came from
+/// having NO cached entry rather than from one expiring. It passed for a reason unrelated to
+/// the TTL, and a review's mutation freezing the discovery clock at the epoch left it green.
+///
+/// The third warmed the registry but relied on WALL TIME to age the entry out. The harness
+/// clock is a `ManualClock` frozen at a fixed instant, so no amount of real time advances what
+/// `DiscoveryState::now()` returns: the entry was permanently fresh and the closing assertion
+/// got 200. The clock is ADVANCED explicitly here, which is both what the seam exists for and
+/// the only thing that makes the frozen-clock mutation fail.
+#[tokio::test]
+async fn a_discovery_suspension_landing_just_before_an_outage_is_bounded_by_one_ttl() {
+    let harness = Harness::start_store_backed().await;
+    let scope = harness.scope();
+    let (router, url) = store_backed_discovery(&harness);
+
+    let (status, _) = get(&router, &url).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "precondition: it serves while healthy and unsuspended, and this WARMS the entry"
+    );
+
+    harness
+        .db()
+        .set_environment_serving_state(scope, "suspended")
+        .await;
+    let (status, _) = get(&router, &url).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::NOT_FOUND,
+        "precondition: the suspension takes effect at once while the store is readable"
+    );
+
+    // WITHIN THE TTL, the suspension is invisible: the fence cannot be read, the entry is
+    // fresh, and publication serves it. This is the documented cost, not a defect, and it is
+    // asserted so that anyone who widens it has to come here and change this line.
+    let (status, _) = with_unreadable_store(&harness, || get(&router, &url)).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "a suspension learned only after the outage began cannot be enforced during it"
+    );
+
+    // PAST THE TTL, the window closes ON ITS OWN, with the database still unreachable. Only
+    // the clock moved.
+    harness.clock().advance(TTL + Duration::from_secs(1));
+    let (status, body) = with_unreadable_store(&harness, || get(&router, &url)).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::NOT_FOUND,
+        "with no FRESH cached entry there is nothing to publish and no way to establish the \
+         scope is unfenced, so the window closes without the database returning: {body}"
     );
 }

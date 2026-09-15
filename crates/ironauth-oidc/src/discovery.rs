@@ -75,7 +75,7 @@ use axum::routing::get;
 use ironauth_config::OidcConfig;
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, SigningPolicy};
-use ironauth_store::Scope;
+use ironauth_store::{Scope, Store};
 use serde_json::{Value, json};
 
 use crate::client_auth::ClientAuthMethod;
@@ -778,6 +778,27 @@ fn to_strings<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
     values.map(ToOwned::to_owned).collect()
 }
 
+/// The `ui_locales_supported` set an environment can render (issue #86, PR 2): the installed
+/// locale-bundle tags unioned with `en` (the compiled fallback language), sorted and
+/// deduplicated. The data-plane role holds SELECT on `locale_bundles`, so this scoped read runs
+/// beneath forced row-level security.
+///
+/// [`None`] means the read FAILED, and that distinction is the whole point. This ended in
+/// `unwrap_or_default()`, which collapsed a failed read into "no bundles installed" and let an
+/// outage publish `["en"]` under the full `Cache-Control: max-age`. The caller falls back to
+/// the set cached on the issuer entry and, failing that, refuses.
+async fn supported_ui_locales(store: &Store, scope: &Scope) -> Option<Vec<String>> {
+    let installed = store
+        .scoped(*scope)
+        .locale_bundles()
+        .installed_locales()
+        .await
+        .ok()?;
+    let mut set: std::collections::BTreeSet<String> = installed.into_iter().collect();
+    set.insert("en".to_owned());
+    Some(set.into_iter().collect())
+}
+
 /// The shared state for the discovery surface.
 ///
 /// Holds the deployment base URL, the JWKS/discovery cache window, the
@@ -874,17 +895,55 @@ impl DiscoveryState {
         // second store read per request ending in `unwrap_or_default()`, so an outage
         // advertised `["en"]` instead of the real set and cached that answer at every relying
         // party for the full `max-age`. Reading it from the entry means the outage document is
-        // byte-identical to the healthy one, and the healthy path loses a round trip.
+        // byte-identical to the healthy one, and discovery's own hot path loses a round trip.
         //
-        // A store-free (pre-populated) registry has an empty set, so discovery advertises the
-        // minimal `["en"]`, byte-identical to before PR 2.
-        let capabilities = if entry.ui_locales().is_empty() {
-            self.capabilities.clone()
-        } else {
-            self.capabilities
-                .clone()
-                .with_supported_ui_locales(entry.ui_locales().to_vec())
+        // LIVE FIRST, CACHED ENTRY AS THE FALLBACK. Three failure modes have to be avoided at
+        // once, and only this ordering avoids all three.
+        //
+        // Reading LIVE and defaulting on error is what shipped before issue #1262: an outage
+        // published `["en"]` instead of the real set with a 300 to 900 second `max-age`, so a
+        // degraded document outlived the incident in every relying-party cache.
+        //
+        // Reading ONLY the cached entry, which is what the first revision of this change did,
+        // fixes that and introduces a worse one in the other direction: `locale_bundles` is a
+        // MUTABLE config table with live set and delete routes, and the hosted pages resolve
+        // it per render. An operator deleting a bundle for a mistranslation or a legal
+        // takedown would see the pages fall back to English on the next request while
+        // discovery kept advertising the removed locale for the rest of the entry TTL, plus
+        // another `max-age` at whichever relying party fetched last. A review measured the
+        // window. That is not "the staleness contract the signing keys already have": a stale
+        // key set still verifies real tokens, a stale locale set advertises a capability that
+        // no longer exists.
+        //
+        // So: the live read is authoritative when it answers, which keeps a removal immediate;
+        // the entry's cached set answers when it does not, which is what makes an outage
+        // document byte-identical to the healthy one; and if neither can answer, this refuses
+        // rather than guessing. A 404 is a transient failure a client retries. A wrong
+        // document is cached.
+        let ui_locales = match self.registry.store() {
+            Some(store) => match supported_ui_locales(store, scope).await {
+                Some(live) => live,
+                None => match entry.ui_locales() {
+                    Some(cached) => cached.to_vec(),
+                    None => return not_found(),
+                },
+            },
+            // A store-free (pre-populated) registry has nothing to read; the entry's set is
+            // the only answer there is, and it is `Some(empty)` rather than a failed read.
+            None => match entry.ui_locales() {
+                Some(cached) => cached.to_vec(),
+                None => return not_found(),
+            },
         };
+        // A store-free (pre-populated) registry has an empty set, so `discovery_document`
+        // renders the minimal `["en"]`, byte-identical to before PR 2. There is no branch on
+        // emptiness here: an earlier revision had one, and a review showed both arms produced
+        // the identical document because `discovery_document` already substitutes the fallback
+        // for an empty set and nothing in production ever pre-populates the capability.
+        let capabilities = self
+            .capabilities
+            .clone()
+            .with_supported_ui_locales(ui_locales);
         let document = discovery_document(
             &issuer,
             self.base(),
