@@ -1366,10 +1366,21 @@ pub struct HotStateConfig {
     /// the accelerator tier: until this key existed there was nothing to probe and no state to
     /// report, so `DegradedTier` had no variant for it.
     ///
-    /// It does NOT yet put the cache in front of any read. `ironauth-hot` is a complete,
+    /// It does NOT yet put the cache in front of any read, but the reason has changed and the
+    /// sentence that used to be here is now false. It read: "`ironauth-hot` is a complete,
     /// classified, outage-tested layer that no request path calls: it is not a dependency of
-    /// `ironauth-oidc`, `ironauth-server`, `ironauth-admin` or the binary. Wiring a first
-    /// consumer (JWKS or tenant config read-through) is the remaining #146 work, and this key
+    /// `ironauth-oidc`, `ironauth-server`, `ironauth-admin` or the binary."
+    ///
+    /// Both halves stopped being true when #1280 landed. `ironauth-hot` is a direct,
+    /// non-optional dependency of `ironauth-oidc` and `ironauth-store`, and reaches the binary
+    /// through both. A request path DOES call it: `IssuerRegistry::jwks_hot` is read while
+    /// serving the JWKS document and written on the miss, in production source on the public
+    /// plane.
+    ///
+    /// WHAT IS MISSING IS THE BOOT WIRING, which is a narrower gap than "no consumer". Nothing
+    /// outside tests calls `with_jwks_hot_state`, so `jwks_hot` is `None` in every shipped
+    /// binary and the accelerator is never consulted however this key is set. Constructing a
+    /// `HotState` from this address and installing it is the remaining #146 work, and this key
     /// is the half of it a deployment can act on now.
     ///
     /// That distinction is written down rather than glossed because the alternative is a knob
