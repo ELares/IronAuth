@@ -70,3 +70,12 @@ CREATE POLICY tenant_quota_limits_scope ON tenant_quota_limits
 -- one write that defeats the feature entirely (the #31 lesson, enforced by
 -- `the_data_plane_holds_no_table_wide_update_on_any_table`).
 GRANT SELECT ON tenant_quota_limits TO ironauth_app;
+
+-- The CONTROL plane writes. `routing_rules` is the model: the data plane reads the config it
+-- enforces, and the management surface is the only thing that changes it.
+--
+-- The first version of this migration granted the data plane SELECT and stopped, with a
+-- comment explaining why it must not write, and then the write path failed with `permission
+-- denied` because the acting store runs as `ironauth_app`. The reasoning was right and the
+-- grant was half finished: refusing the data plane is not the same as permitting anybody.
+GRANT SELECT, INSERT, UPDATE, DELETE ON tenant_quota_limits TO ironauth_control;

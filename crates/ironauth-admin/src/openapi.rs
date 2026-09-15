@@ -306,6 +306,8 @@ use crate::views::{
         crate::access_requests::raise_access_request,
         crate::access_requests::list_access_requests,
         crate::access_requests::decide_access_request,
+        crate::quota_limits::list_quota_limits,
+        crate::quota_limits::set_quota_limit,
         crate::audit_retention::read_audit_retention,
         crate::audit_retention::read_log_stream_attestation,
         crate::project_grants::list_project_grants,

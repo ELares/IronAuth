@@ -2713,6 +2713,18 @@ impl<'a> ActingStore<'a> {
         }
     }
 
+    /// The mutating per-tenant quota repository for this scope and actor (issue #150
+    /// criterion 4): set or clear one dimension's limit at runtime. The write and its audit
+    /// row land in one transaction, so a limit change is never unattributable.
+    #[must_use]
+    pub fn quota_limits(&self) -> ActingQuotaLimitsRepo<'a> {
+        ActingQuotaLimitsRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
     /// The mutating custom-domain repository for this scope and actor (issue #47):
     /// register a domain and open its ACME challenge, record a challenge result
     /// (verifying or failing the domain), and store an issued certificate (its
@@ -88070,5 +88082,138 @@ impl QuotaLimitsRepo<'_> {
             .into_iter()
             .find(|(name, _)| name == dimension)
             .map(|(_, limit)| limit))
+    }
+}
+
+/// The audit target for a quota limit change: the scope's dimension.
+///
+/// Its own type rather than reusing a scope id, so an audit row says WHICH limit moved. An
+/// operator reading the log after an incident is asking "who raised the request limit", and a
+/// row naming only the environment does not answer it.
+#[derive(Debug, Clone)]
+pub struct QuotaLimitTarget {
+    dimension: String,
+}
+
+impl QuotaLimitTarget {
+    /// The target for `dimension`.
+    #[must_use]
+    pub fn new(dimension: impl Into<String>) -> Self {
+        Self {
+            dimension: dimension.into(),
+        }
+    }
+}
+
+impl crate::id::AuditTarget for QuotaLimitTarget {
+    fn audit_target_kind(&self) -> &'static str {
+        "quota"
+    }
+    fn audit_target_id(&self) -> String {
+        self.dimension.clone()
+    }
+}
+
+/// Mutating per-tenant quota overrides (issue #150 criterion 4).
+pub struct ActingQuotaLimitsRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingQuotaLimitsRepo<'_> {
+    /// Set one dimension's limit for this scope, replacing any existing override.
+    ///
+    /// The values are checked here as well as by the table's CHECK constraint. Both are
+    /// wanted: the constraint is the one that holds against any writer, and this one gives a
+    /// caller an error it can turn into a 400 rather than a 500 from a constraint violation.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the limit is negative or not finite, or the write fails.
+    pub async fn set(
+        &self,
+        env: &Env,
+        dimension: &str,
+        refill_per_sec: f64,
+        burst: f64,
+    ) -> Result<(), StoreError> {
+        if !refill_per_sec.is_finite() || !burst.is_finite() || refill_per_sec < 0.0 || burst < 0.0
+        {
+            // The table's CHECK is the guard that holds against ANY writer; this one exists
+            // so a caller gets a typed error it can render as a 400 rather than a constraint
+            // violation surfacing as a 500. Postgres float semantics are why the CHECK cannot
+            // be the only one a reader trusts: NaN = NaN is TRUE there, so the obvious SQL
+            // idiom does not catch it and the constraint has to name 'NaN' explicitly.
+            return Err(StoreError::Encryption);
+        }
+        let scope = self.scope;
+        let target = QuotaLimitTarget::new(dimension);
+        let dimension = dimension.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::QuotaLimitSet,
+                target: &target,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO tenant_quota_limits \
+                       (tenant_id, environment_id, dimension, refill_per_sec, burst, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, now()) \
+                     ON CONFLICT (tenant_id, environment_id, dimension) DO UPDATE \
+                       SET refill_per_sec = EXCLUDED.refill_per_sec, \
+                           burst = EXCLUDED.burst, updated_at = EXCLUDED.updated_at",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&dimension)
+                .bind(refill_per_sec)
+                .bind(burst)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Clear one dimension's override, returning the scope to the configured default.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the write fails.
+    pub async fn clear(&self, env: &Env, dimension: &str) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let target = QuotaLimitTarget::new(dimension);
+        let dimension = dimension.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::QuotaLimitSet,
+                target: &target,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "DELETE FROM tenant_quota_limits \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND dimension = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&dimension)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
     }
 }

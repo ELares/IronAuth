@@ -189,3 +189,141 @@ async fn a_non_finite_or_negative_limit_is_refused_by_the_constraint() {
     // is a legitimate way to stop a tenant without deleting them.
     set_override(&db, scope, "requests", 0.0, 0.0).await;
 }
+
+/// A RUNTIME SET IS AUDITED, in the same transaction as the write.
+///
+/// Criterion 4 is about changing a limit without a restart, and a limit change nobody can
+/// attribute is the one an operator most needs to attribute: "who raised the request limit
+/// before the incident" is the question, and it is asked after the fact.
+#[tokio::test]
+async fn setting_a_limit_writes_the_override_and_its_audit_row() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let scope = db.seed_scope(&env).await;
+
+    db.control_store()
+        .scoped(scope)
+        .acting(
+            db.test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .quota_limits()
+        .set(&env, "requests", 2.5, 10.0)
+        .await
+        .expect("set the limit");
+
+    let got = db
+        .store()
+        .scoped(scope)
+        .quota_limits()
+        .get("requests")
+        .await
+        .expect("read")
+        .expect("the override is there");
+    assert!((got.refill_per_sec - 2.5).abs() < f64::EPSILON);
+    assert!((got.burst - 10.0).abs() < f64::EPSILON);
+
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'quota.limit.set' \
+         AND target_kind = 'quota' AND target_id = 'requests' \
+         AND tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count the audit rows");
+    assert_eq!(
+        audited, 1,
+        "the change must be attributable, and the row must name WHICH limit moved"
+    );
+}
+
+/// CLEARING RETURNS THE SCOPE TO THE CONFIGURED DEFAULT, and is audited too.
+#[tokio::test]
+async fn clearing_a_limit_removes_the_override() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let scope = db.seed_scope(&env).await;
+    let acting = || {
+        db.control_store().scoped(scope).acting(
+            db.test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+    };
+
+    acting()
+        .quota_limits()
+        .set(&env, "requests", 2.5, 10.0)
+        .await
+        .expect("set");
+    acting()
+        .quota_limits()
+        .clear(&env, "requests")
+        .await
+        .expect("clear");
+
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .quota_limits()
+            .get("requests")
+            .await
+            .expect("read"),
+        None,
+        "a cleared override returns the scope to the configured default"
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'quota.limit.set' \
+         AND tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count");
+    assert_eq!(audited, 2, "the clear is a change and is audited like one");
+}
+
+/// THE WRITER REFUSES A VALUE THE LIMITER COULD NOT SURVIVE, before the constraint does.
+///
+/// Both guards are wanted. The CHECK holds against any writer, including a future one nobody
+/// has written yet; this one gives a caller a typed error it can render as a 400 rather than
+/// a constraint violation surfacing as a 500.
+#[tokio::test]
+async fn the_writer_refuses_a_non_finite_or_negative_limit() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let scope = db.seed_scope(&env).await;
+
+    for (refill, burst, what) in [
+        (f64::NAN, 1.0, "a NaN refill"),
+        (1.0, f64::NAN, "a NaN burst"),
+        (f64::INFINITY, 1.0, "an infinite refill"),
+        (-1.0, 1.0, "a negative refill"),
+    ] {
+        let result = db
+            .control_store()
+            .scoped(scope)
+            .acting(
+                db.test_actor(&env),
+                ironauth_store::CorrelationId::generate(&env),
+            )
+            .quota_limits()
+            .set(&env, "requests", refill, burst)
+            .await;
+        assert!(result.is_err(), "{what} must be refused by the writer");
+    }
+
+    // And nothing was written, so the refusal was a refusal rather than a partial write.
+    assert!(
+        db.store()
+            .scoped(scope)
+            .quota_limits()
+            .all()
+            .await
+            .expect("read")
+            .is_empty(),
+        "a refused set must leave no row behind"
+    );
+}

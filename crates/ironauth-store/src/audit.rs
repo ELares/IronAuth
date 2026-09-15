@@ -927,6 +927,8 @@ pub enum Action {
     /// generated for new writes and the prior version was retired but stays
     /// readable for background re-encryption of old rows.
     EnvelopeDekRotate,
+    /// A tenant's quota limit was set or cleared at runtime (issue #150 criterion 4).
+    QuotaLimitSet,
     /// An encrypted secret value was written (issue #48): a plaintext secret was
     /// sealed under the scope's active DEK with its column context bound as
     /// associated data, and stored as ciphertext.
@@ -1908,6 +1910,7 @@ impl Action {
             Action::EnvelopeByokEnroll => "envelope.byok.enroll",
             Action::EnvelopeDekProvision => "envelope.dek.provision",
             Action::EnvelopeDekRotate => "envelope.dek.rotate",
+            Action::QuotaLimitSet => "quota.limit.set",
             Action::EncryptedSecretPut => "encrypted_secret.put",
             Action::EncryptedSecretReencrypt => "encrypted_secret.reencrypt",
             Action::CustomDomainRegister => "custom_domain.register",
