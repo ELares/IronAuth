@@ -370,6 +370,78 @@ fn cases() -> Vec<Case> {
 #[allow(clippy::too_many_lines)]
 fn excluded() -> BTreeMap<&'static str, &'static str> {
     let mut excluded = BTreeMap::new();
+    // SIXTEEN ROUTES THAT WERE NEITHER DRIVEN NOR EXCLUDED, which is why this test was
+    // failing on main. Each group's reason was verified by reading the handler's first
+    // statements, not inferred from the path.
+    //
+    // THE SELF-SERVICE PORTAL WRITES. `parse_scope` is SYNTAX only and a well-formed ghost
+    // scope passes it; then `interaction::same_origin_ok` refuses on headers alone; then
+    // `portal_route::resolve_session` returns `NotFound` the moment the portal cookie is
+    // absent, with no store call. None of the three can tell a live scope from a ghost.
+    for path in [
+        "/t/{tenant_id}/e/{environment_id}/portal/s/certificate-renewal/pin",
+        "/t/{tenant_id}/e/{environment_id}/portal/s/contacts/change",
+        "/t/{tenant_id}/e/{environment_id}/portal/s/scim/connections",
+        "/t/{tenant_id}/e/{environment_id}/portal/s/scim/test",
+        "/t/{tenant_id}/e/{environment_id}/portal/s/sso/oidc",
+        "/t/{tenant_id}/e/{environment_id}/portal/s/sso/saml",
+        "/t/{tenant_id}/e/{environment_id}/portal/s/sso/test",
+    ] {
+        excluded.insert(
+            path,
+            "same-origin gated on headers alone, then session gated: \
+             `portal_route::resolve_session` returns `NotFound` with no store call at all \
+             when the portal cookie is absent, so an unauthenticated caller is refused \
+             identically at every scope",
+        );
+    }
+
+    // THE PORTAL WIDGETS. `widget_session` refuses on `portal_widgets_enabled` FIRST, which
+    // is off by default, and then on `resolve_session_from_bearer`, which returns `NotFound`
+    // before any store call when the bearer is absent.
+    for path in [
+        "/t/{tenant_id}/e/{environment_id}/portal/w/scim",
+        "/t/{tenant_id}/e/{environment_id}/portal/w/sso",
+    ] {
+        excluded.insert(
+            path,
+            "feature gated (off by default) and then bearer-session gated: \
+             `resolve_session_from_bearer` returns `NotFound` with no store call when the \
+             bearer is absent, so neither refusal can tell a live scope from a ghost",
+        );
+    }
+
+    // THE SHARED SIGNALS STREAMS. These routes are mounted only inside
+    // `if state.ssf_enabled()`, which is off by default, so in this harness the paths do not
+    // exist and the router answers its own 404 at every scope. When enabled, every handler
+    // opens with `authenticated(..)`, which reads the Authorization header and returns
+    // `unauthorized()` before any scope-dependent lookup.
+    for path in [
+        "/t/{tenant_id}/e/{environment_id}/ssf/poll/{stream_id}",
+        "/t/{tenant_id}/e/{environment_id}/ssf/status",
+        "/t/{tenant_id}/e/{environment_id}/ssf/streams",
+        "/t/{tenant_id}/e/{environment_id}/ssf/subjects/add",
+        "/t/{tenant_id}/e/{environment_id}/ssf/subjects/remove",
+        "/t/{tenant_id}/e/{environment_id}/ssf/verify",
+    ] {
+        excluded.insert(
+            path,
+            "mounted only when `ssf.enabled` is on, which it is not here, so the path does \
+             not exist and the router answers one 404 at every scope; when it IS mounted \
+             each handler client-authenticates before any scope lookup",
+        );
+    }
+
+    // THE RISC RECEIVER. Mounted UNCONDITIONALLY so it stays in the RFC 9700 endpoint
+    // inventory, and `receive` returns `not_found()` on `!cfg.enabled` BEFORE it parses the
+    // scope. Off by default, so it is a uniform 404 here, and the ordering is what makes it
+    // one rather than a tenant oracle.
+    excluded.insert(
+        "/t/{tenant_id}/e/{environment_id}/risc/events",
+        "handler fails closed with a 404 on `risc_receiver.enabled` being off, checked \
+         BEFORE the scope is parsed, so a live and a ghost scope get the same answer",
+    );
+
     for path in [
         "/t/{tenant_id}/e/{environment_id}/account/consents",
         "/t/{tenant_id}/e/{environment_id}/account/consents/revoke",

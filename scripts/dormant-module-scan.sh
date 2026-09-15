@@ -57,27 +57,6 @@ ironauth-oidc/device_posture
 # The five-layer request limiter (issue #150 criterion 1, PR 1258). Callerless because the
 # first caller is a DECISION, not an oversight: an absent per-IP identity currently skips the
 # only layer that applies before anyone is identified, and whether that should fail closed
-# depends on whether the caller is an internet-facing forward-auth surface or an internal one.
-# Issue #1260 holds that decision and names this module.
-#
-# This entry exists because the scan went RED on main when #1258 merged and nobody noticed:
-# the merge ran five gates, not this one. Wiring the limiter removes the entry.
-ironauth-quota/layered
-# The access-rule engine, traces, dry-run and decision cache (issue #154 criteria 3, 5 and 6).
-# Callerless until criteria 1, 2 and 4 land: those are the forward-auth proxy dialects and the
-# integration that gates a real resource, and they need proxy containers.
-#
-# This entry was removed once, when `forward_auth` below started importing the engine, and
-# that was wrong: `forward_auth` is itself allowlisted as callerless, so the reference came
-# from something nothing calls. The scan now discounts references from allowlisted modules,
-# which restores the entry AND is the general fix -- see `dormant_module_files`.
-ironauth-oidc/rules
-
-# Trusted-header SSO for the forward-auth surface (issue #154 criterion 2). Callerless for the
-# same reason as the engine above: the proxy dialect endpoints are criteria 1 and 2's other
-# half and need real proxy containers, so nothing mounts this yet. The security properties it
-# enforces are unit-tested against the forgery cases the criterion names.
-ironauth-oidc/forward_auth
 
 ALLOWLIST
 }
