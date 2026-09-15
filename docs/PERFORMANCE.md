@@ -2,11 +2,15 @@
 
 Issue #152 criterion 3 asks for RSS idle and startup time against the stated targets, with
 methodology and hardware class stated. These are measured, not estimated, and reproduced by
-one command:
+the one command that runs the whole benchmark harness:
 
 ```
-PG_BIN=<postgresql bin dir> scripts/startup-rss-bench.sh
+PG_BIN=<postgresql bin dir> scripts/bench.sh
 ```
+
+That runs every benchmark and writes each one's output under `target/bench/`; the release
+workflow runs it per release and archives the results. To re-measure only this document's
+numbers, `scripts/startup-rss-bench.sh` is the startup and RSS benchmark on its own.
 
 ## Results
 
