@@ -1046,6 +1046,12 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_PASSWORD: postgres
+          # The image creates it at startup, so nothing here has to. The previous version
+          # shelled out to `createdb` with no credential, which cannot authenticate against
+          # this image's scram-sha-256 pg_hba, and swallowed the failure with
+          # `2>/dev/null || true`. The database was never created and the job hung, then
+          # failed, two steps later.
+          POSTGRES_DB: ironauth
         ports:
           - 5432:5432
         options: >-
@@ -1080,20 +1086,22 @@ jobs:
           fi
           test -f /etc/ironauth/ironauth.toml
           test -x /usr/bin/ironauth
+      # EDITED, NOT REPLACED. Overwriting the file tested a heredoc in this workflow and left
+      # the SHIPPED packaging/debian/ironauth.toml parsed by nothing, so a syntax error or a
+      # stale key in it would ship. This changes only the two lines the file itself tells an
+      # operator to change, so everything else in it is exercised by the boot below.
       - name: Configure it the way the file tells an operator to
         run: |
-          sudo createdb -h 127.0.0.1 -U postgres ironauth 2>/dev/null || true
-          sudo tee /etc/ironauth/ironauth.toml >/dev/null <<'CONF'
-          [server]
-          bind = "127.0.0.1:8443"
-          management_bind = "127.0.0.1:9443"
-
-          [database]
-          url = "postgres://postgres:postgres@127.0.0.1:5432/ironauth"
-
-          [oidc]
-          enabled = true
-          CONF
+          sudo sed -i 's|^# url = .*|url = "postgres://postgres:postgres@127.0.0.1:5432/ironauth"|' \
+            /etc/ironauth/ironauth.toml
+          sudo sed -i '/^\[oidc\]/,$ s|^enabled = false|enabled = true|' \
+            /etc/ironauth/ironauth.toml
+          # The edits must have LANDED. sed reports success when it matches nothing, so
+          # without this a renamed key would leave the file at its defaults and the boot
+          # below would prove something else.
+          grep -q '^url = "postgres://postgres:postgres@127.0.0.1:5432/ironauth"$' \
+            /etc/ironauth/ironauth.toml
+          grep -q '^enabled = true$' /etc/ironauth/ironauth.toml
           sudo chown root:ironauth /etc/ironauth/ironauth.toml
           sudo chmod 640 /etc/ironauth/ironauth.toml
       - name: Migrate and start, exactly as the config file documents

@@ -27,6 +27,14 @@ ExecStart=/usr/bin/ironauth serve --config /etc/ironauth/ironauth.toml
 # documented step once /etc/ironauth/ironauth.toml is filled in.
 Restart=on-failure
 RestartSec=5s
+# Above the largest `server.shutdown_grace_secs` the package expects to support. Without it
+# systemd's 90s default silently caps that setting, so a deployment could configure a longer
+# drain than it can ever take.
+TimeoutStopSec=120s
+# The standard Debian seam for secrets that must not live in a world-readable config, and the
+# counterpart to the environment variables the Helm chart supplies. The leading `-` keeps the
+# file optional, so a deployment that needs none does not have to create it.
+EnvironmentFile=-/etc/default/ironauth
 
 # THE HARDENING. Each line has a counterpart in charts/ironauth/templates/deployment.yaml.
 # ProtectSystem=strict makes / read-only, which is `readOnlyRootFilesystem: true`.

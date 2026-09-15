@@ -88,9 +88,11 @@ jobs:
         run: |
           cargo install cargo-cyclonedx --locked
           cargo cyclonedx --format json --spec-version 1.5
-      # THE DEB (issue #151 criteria 4 and 5). Built from the same musl binary the release
-      # ships, so the package and the tarball are the same bytes rather than two builds
-      # that happen to agree.
+      # THE DEB (issue #151 criteria 4 and 5). Built from the SAME BUILD as the tarball
+      # rather than a second compile, so the two cannot drift.
+      #
+      # Not byte-identical: cargo-deb strips the binary it packages, which is what a package
+      # should ship. The claim worth making is same-build, and that is the one made here.
       - name: Build the DEB
         run: |
           cargo install cargo-deb --locked --version '^2'
@@ -132,7 +134,7 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --notes-file dist/RELEASE_NOTES.md \
             dist/ironauth-x86_64-linux-musl dist/SHA256SUMS dist/config-schema.json dist/*.cdx.json \
-            dist/hook-latency.json
+            dist/hook-latency.json dist/ironauth_*.deb
 
   image:
     name: container image, signed

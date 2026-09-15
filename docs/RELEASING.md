@@ -69,17 +69,20 @@ silently included.
 ## The DEB
 
 `cargo deb -p ironauth` builds a package carrying the binary, a systemd unit, and an
-UNCONFIGURED `/etc/ironauth/ironauth.toml`. The release lane builds it from the same musl
-binary the tarball ships, so the two are the same bytes rather than two builds that happen
-to agree, and attests provenance for both.
+`/etc/ironauth/ironauth.toml` with `database.url` commented out. The release lane builds it
+from the same build as the tarball rather than a second compile, and attests provenance for
+both. The two are not byte-identical: cargo-deb strips the binary it packages, which is what
+a package should ship.
 
-Installing it does NOT start the service. The shipped config has no usable database URL, so
-a package that started on install would put a crash loop in the journal of every machine
-that unpacked it before being configured. The documented sequence is:
+Installing it does NOT start the service, and the reason is sharper than "nothing would
+happen". With `database.url` absent IronAuth falls back to its built-in default of
+`postgres://ironauth@localhost:5432/ironauth`, so an unconfigured server does not sit idle:
+it tries a local database that is probably not there, and could in principle be one that is.
+The documented sequence is:
 
 ```
 sudo dpkg -i ironauth_<version>_amd64.deb
-sudoedit /etc/ironauth/ironauth.toml          # set database.url
+sudoedit /etc/ironauth/ironauth.toml          # uncomment and set database.url
 sudo -u ironauth ironauth migrate --config /etc/ironauth/ironauth.toml
 sudo systemctl enable --now ironauth
 ```
@@ -94,6 +97,23 @@ chart's pod security context line for line where systemd has an equivalent: non-
 `ProtectSystem=strict` for the read-only root, `PrivateTmp` for the writable `/tmp` the
 chart gives as an emptyDir, and an empty capability set. A deployment should not get a
 weaker posture for choosing a package over a cluster.
+
+### Upgrading
+
+The package does NOT restart the service on upgrade (`restart-after-upgrade = false`). The
+default would stop the old binary and start the new one against the PRE-UPGRADE schema with
+no migrate step between them, and a new binary meeting an old schema is the failure the
+expand-contract discipline exists to avoid. Upgrade as:
+
+```
+sudo systemctl stop ironauth
+sudo dpkg -i ironauth_<version>_amd64.deb
+sudo -u ironauth ironauth migrate --config /etc/ironauth/ironauth.toml
+sudo systemctl start ironauth
+```
+
+Secrets that should not live in a config file go in `/etc/default/ironauth`, which the unit
+reads through an optional `EnvironmentFile`.
 
 CI installs the package on an ordinary runner, points it at Postgres, runs the migrate step
 and starts the unit, and requires `/readyz` to answer while the unit is still active (issue

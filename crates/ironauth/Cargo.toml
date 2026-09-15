@@ -161,9 +161,11 @@ workspace = true
 # THE DEB (issue #151 criterion 5). Built with `cargo deb -p ironauth`.
 #
 # The package installs the binary, a systemd unit whose hardening mirrors the Helm chart's
-# pod security context, and an UNCONFIGURED config file. It does not start the service:
-# the shipped config has no usable database URL, so starting on install would put a crash
-# loop in the journal of every machine that unpacked it before being configured.
+# pod security context, and a config file with `database.url` commented out. It does not
+# start the service, and the reason is not that nothing would happen: with the URL absent
+# IronAuth falls back to its built-in `postgres://ironauth@localhost:5432/ironauth`, so an
+# unconfigured server would reach for a local database that is probably not there and could
+# in principle be one that is.
 [package.metadata.deb]
 maintainer = "IronAuth maintainers <noreply@github.com>"
 copyright = "The IronAuth authors"
@@ -173,7 +175,11 @@ section = "net"
 priority = "optional"
 # postgresql-client is NOT a dependency: the database is normally remote, and depending on
 # a client the server does not invoke would pull a package onto every host for nothing.
-depends = "$auto"
+#
+# `adduser` IS, because postinst calls it. `$auto` expands in place, so the shlibdeps result
+# is kept alongside it. A maintainer script calling a binary the package does not depend on
+# fails on a minimal system, which is exactly where a server package is installed.
+depends = "$auto, adduser"
 assets = [
     # `target/release` and NOT the musl path, even though the release lane cross-compiles.
     # cargo-deb rewrites a `target/release` asset to the target-specific directory when
@@ -194,3 +200,9 @@ unit-scripts = "../../packaging/debian"
 # NOT enabled and NOT started on install, for the reason above.
 enable = false
 start = false
+# AND NOT RESTARTED ON UPGRADE. The default would stop the old binary and start the new one
+# against the PRE-UPGRADE schema, with no migrate step between them: a new binary meeting an
+# old schema is the failure the expand-contract discipline exists to avoid, and an automatic
+# restart is the one place it could happen without anybody choosing it. The upgrade sequence
+# is in docs/RELEASING.md: stop, migrate, start.
+restart-after-upgrade = false
