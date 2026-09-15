@@ -284,6 +284,10 @@ pub fn throttle_snapshot(
         remaining: Some(settings.soft_threshold.saturating_sub(count)),
         reset_secs: settings.window.as_secs(),
         retry_after_secs: Some(retry_after.as_secs()),
+        denied: true,
+        // The regulation window IS the policy window here: the soft threshold is a count
+        // per window, so it is already static rather than live bucket state.
+        policy_window_secs: Some(settings.window.as_secs()),
     }
 }
 
@@ -372,6 +376,11 @@ pub fn banned_snapshot(settings: &RegulationSettings) -> RateLimitSnapshot {
         remaining: Some(0),
         reset_secs: settings.window.as_secs(),
         retry_after_secs: Some(settings.max_delay.as_secs()),
+        denied: true,
+        // Identical to `throttle_snapshot`'s, which the anti-enumeration identity above
+        // requires: a banned present account and a throttled identifier must be
+        // indistinguishable, and a differing policy window would distinguish them.
+        policy_window_secs: Some(settings.window.as_secs()),
     }
 }
 
