@@ -168,6 +168,21 @@ struct Case {
 #[allow(clippy::too_many_lines)]
 fn cases() -> Vec<Case> {
     vec![
+        // THE FORWARD-AUTH CHECK (issue #154), driven with the surface OFF, which is the
+        // default and the only state this harness builds.
+        //
+        // The handler tests `state.forward_auth()` BEFORE it parses the scope, and that
+        // order is what this case pins. Parsing first would answer 404 for a ghost scope
+        // and something else for a live one with the surface off, which would turn the
+        // check path into a tenant oracle for anyone who can reach it.
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/forward-auth",
+            query: "",
+            method: "GET",
+            content_type: "",
+            body: "",
+            live_status: StatusCode::NOT_FOUND,
+        },
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/device",
             query: "",

@@ -1722,6 +1722,9 @@ async fn build_oidc_plane(
     }
     .with_org_provisioning(org_provisioning)
     .with_global_token_revocation_enabled(surfaces.global_revocation)
+    // Resolved from `[proxy]` so the forward-auth check path and the rest of the server
+    // cannot disagree about what a trusted hop is (issue #154).
+    .with_proxy_trust(&config.proxy)
     .with_ssf(&config.ssf)
     .with_risc_receiver(&{
         // CHECKED HERE, where the JOSE core is reachable and the operator is still
@@ -1887,6 +1890,33 @@ async fn build_oidc_plane(
             );
         }
         state
+    };
+    // THE FORWARD-AUTH SURFACE (issue #154). Absent unless `[forward_auth] enabled` is set,
+    // in which case the check route answers a uniform 404.
+    //
+    // A CONVERSION FAILURE STOPS THE PLANE rather than disabling the surface. The rules are
+    // an access policy: if this build cannot honour one, the choices are to serve a policy
+    // that differs from the configured one, to 404 the check path (which leaves the
+    // proxy's own failure mode deciding, and some fail open), or to refuse. Only the last
+    // one cannot admit a request the operator meant to deny.
+    let forward_auth = match ironauth_oidc::forward_auth_rules::ForwardAuthRuntime::from_config(
+        &config.forward_auth,
+    ) {
+        Ok(runtime) => runtime.map(std::sync::Arc::new),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "forward_auth rules could not be built, so the OIDC plane is not \
+                 started: serving a different access policy than the one configured, \
+                 or leaving the proxy's own failure mode to decide, are both worse \
+                 than refusing to start"
+            );
+            return None;
+        }
+    };
+    let state = match forward_auth {
+        Some(runtime) => state.with_forward_auth(runtime),
+        None => state,
     };
     // The outbound client sync HTTP flow targets are called through (issue #112). Its
     // `total_timeout` is the flow-target ceiling EXACTLY, because a per-request timeout only

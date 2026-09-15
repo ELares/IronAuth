@@ -334,6 +334,8 @@ pub mod token_hook {
 pub mod device_posture;
 /// The ordered access-rule engine (issue #154).
 pub mod forward_auth;
+pub mod forward_auth_route;
+pub mod forward_auth_rules;
 pub mod funnel;
 pub mod rules;
 mod tokens;
@@ -497,6 +499,20 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/authorize",
             get(authorize::scoped_authorize_get).post(authorize::scoped_authorize_post),
+        )
+        // THE FORWARD-AUTH CHECK (issue #154). Scope-routed because the rules, and the
+        // sessions they read a subject from, are per environment.
+        //
+        // ANY METHOD. Under Envoy's ext_authz the check request carries the ORIGINAL
+        // request's method as its own, so constraining this to GET would make every
+        // non-GET request unauthorizable on that dialect. On the other dialects the
+        // method is in a header and this one is whatever the proxy chose.
+        //
+        // Answers 404 unless `[forward_auth] enabled` is set, so a deployment that did not
+        // ask for this surface does not advertise one.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/forward-auth",
+            axum::routing::any(forward_auth_route::check),
         )
         // THE SAML HTTP POST BINDING (issue #139). Scope-routed and connection-routed, because
         // an assertion consumer service URL is per connection: the response is checked against

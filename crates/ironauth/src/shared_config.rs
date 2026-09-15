@@ -827,20 +827,19 @@ mod tests {
         ),
         (
             "forward_auth",
-            Reach::UnreadAtBoot {
-                config_type: "ForwardAuthConfig",
-            },
-            "inert: no boot path installs it into either plane's state (issue #154). The \
-             rule VOCABULARY exists and is validated, and nothing serves a forward-auth \
-             surface, so a rule written here is evaluated by nothing.\n\n\
-             As with `byok`, the one read that exists is a REFUSAL rather than an \
-             installation: `Config::validate` rejects any non-default value, so the section \
-             being unconsumed cannot be mistaken for it being in force. That matters more \
-             here than it does for `byok`, because a rule list misstates an access decision \
-             rather than a protection: an operator who writes `deny /admin to anonymous` and \
-             boots successfully would hold a specific false belief about who can reach what.\n\n\
-             Reclassify when the forward-auth endpoints land and a boot path turns these \
-             rules into a `RuleSet` on a plane.",
+            Reach::OnePlaneOrNoState,
+            "the forward-auth access rules and proxy dialect (issue #154). Read at boot in \
+             ONE place and it is the OIDC plane: `build_oidc_plane` turns the rule list into \
+             a `RuleSet` through `ForwardAuthRuntime::from_config` and installs it with \
+             `with_forward_auth`, which mounts the check endpoint at \
+             `/t/{tenant}/e/{environment}/forward-auth`.\n\n\
+             PUBLIC-PLANE ONLY, and it has to be: the caller is a reverse proxy asking \
+             whether to serve a request, not an operator, and nothing under \
+             `/v1/tenants/...` reads it. Off is a uniform 404 on the check path.\n\n\
+             RECLASSIFIED from `UnreadAtBoot`, which it was while the vocabulary shipped \
+             ahead of the surface. The reclassification is not a formality: the entry went \
+             stale the moment a boot path read the section, which is exactly the drift this \
+             list exists to catch.",
         ),
         (
             "byok",
