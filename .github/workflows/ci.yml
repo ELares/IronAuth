@@ -1037,6 +1037,100 @@ jobs:
         run: cargo test -p ironauth-fastly-verify
       - name: Build for the Compute target
         run: cargo check -p ironauth-fastly-verify --target wasm32-wasip2
+  deb:
+    name: DEB install boots against Postgres on a plain VM (issue #151 criterion 5)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked --version ^2
+      - name: Build the package
+        run: |
+          cargo build --release -p ironauth
+          cargo deb -p ironauth --no-build
+      # THE POINT OF THIS JOB. Everything above builds an artifact; everything below is
+      # the claim the criterion makes, which is that the artifact INSTALLS and BOOTS on a
+      # machine that is not a container image we control. The runner is that machine: it
+      # has systemd, it has dpkg, and it has none of this repository's build tree on the
+      # PATH the unit uses.
+      - name: Install it
+        run: |
+          sudo dpkg -i target/debian/ironauth_*.deb
+          # The package must not have started anything: the shipped config has no usable
+          # database and a crash loop in the journal is a worse first impression than a
+          # stopped unit. `is-active` exits non-zero for an inactive unit, so the negation
+          # is the assertion.
+          if systemctl is-active --quiet ironauth; then
+            echo "::error::the package started the service on install; it must not"
+            exit 1
+          fi
+          test -f /etc/ironauth/ironauth.toml
+          test -x /usr/bin/ironauth
+      - name: Configure it the way the file tells an operator to
+        run: |
+          sudo createdb -h 127.0.0.1 -U postgres ironauth 2>/dev/null || true
+          sudo tee /etc/ironauth/ironauth.toml >/dev/null <<'CONF'
+          [server]
+          bind = "127.0.0.1:8443"
+          management_bind = "127.0.0.1:9443"
+
+          [database]
+          url = "postgres://postgres:postgres@127.0.0.1:5432/ironauth"
+
+          [oidc]
+          enabled = true
+          CONF
+          sudo chown root:ironauth /etc/ironauth/ironauth.toml
+          sudo chmod 640 /etc/ironauth/ironauth.toml
+      - name: Migrate and start, exactly as the config file documents
+        run: |
+          sudo -u ironauth /usr/bin/ironauth migrate --config /etc/ironauth/ironauth.toml
+          sudo systemctl enable --now ironauth
+      - name: It answers /readyz
+        run: |
+          # The unit is what must be serving, so this fails if the unit died even when
+          # something else happens to answer the port (see the leaked-service trap: assert
+          # the process YOU started is alive).
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9443/readyz >/dev/null 2>&1; then
+              systemctl is-active --quiet ironauth || {
+                echo "::error::/readyz answered but the ironauth unit is not active"
+                exit 1
+              }
+              echo "deb: the installed unit is serving /readyz"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::the installed unit never answered /readyz"
+          systemctl status ironauth --no-pager || true
+          journalctl -u ironauth --no-pager -n 100 || true
+          exit 1
+      - name: Remove it cleanly
+        run: |
+          sudo systemctl disable --now ironauth
+          sudo dpkg -r ironauth
+          # A conffile survives `remove` by design; `purge` is what takes it. Asserted
+          # because an upgrade that silently replaced an operator's database credential is
+          # the failure `conf-files` exists to prevent, and nothing else checks it.
+          test -f /etc/ironauth/ironauth.toml
+          sudo dpkg -P ironauth
+          test ! -f /etc/ironauth/ironauth.toml
+
   invariants:
     name: invariant lints, dash scan, compat matrix
     runs-on: ubuntu-latest

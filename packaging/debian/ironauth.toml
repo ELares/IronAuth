@@ -1,0 +1,22 @@
+# IronAuth configuration. Installed to /etc/ironauth/ironauth.toml.
+#
+# SHIPPED UNCONFIGURED ON PURPOSE. `database.url` has no usable default: a package that
+# guessed one would either fail confusingly or, worse, reach a database it was not meant
+# to. Fill it in, run `ironauth migrate --config /etc/ironauth/ironauth.toml`, then
+# `systemctl enable --now ironauth`.
+#
+# The full reference is docs/CONFIG.md, generated from the config schema.
+
+[server]
+# Loopback by default. A package that bound 0.0.0.0 on install would expose an
+# unconfigured identity server to the network the moment it was unpacked.
+bind = "127.0.0.1:8443"
+management_bind = "127.0.0.1:9443"
+
+[database]
+# Required. Example:
+#   url = "postgres://ironauth@localhost:5432/ironauth"
+url = "postgres://ironauth@localhost:5432/ironauth"
+
+[oidc]
+enabled = false

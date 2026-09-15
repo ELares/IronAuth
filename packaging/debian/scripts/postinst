@@ -1,0 +1,28 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The service account the unit runs as (issue #151 criterion 5).
+#
+# A SYSTEM user with no login shell and no home: the unit runs non-root to match the
+# chart's `runAsNonRoot`, and an account that can be logged into is a larger surface than
+# the one thing it exists for.
+set -e
+
+if [ "$1" = "configure" ]; then
+    if ! getent passwd ironauth >/dev/null; then
+        adduser --system --group --no-create-home --home /nonexistent \
+            --shell /usr/sbin/nologin --quiet ironauth
+    fi
+
+    # The config carries a database credential, so it is readable by the service account
+    # and nobody else. 640 root:ironauth rather than 600 ironauth:ironauth, so an operator
+    # editing it as root does not have to become the service user first.
+    if [ -f /etc/ironauth/ironauth.toml ]; then
+        chown root:ironauth /etc/ironauth/ironauth.toml
+        chmod 640 /etc/ironauth/ironauth.toml
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

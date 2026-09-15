@@ -157,3 +157,40 @@ required-features = ["testing"]
 
 [lints]
 workspace = true
+
+# THE DEB (issue #151 criterion 5). Built with `cargo deb -p ironauth`.
+#
+# The package installs the binary, a systemd unit whose hardening mirrors the Helm chart's
+# pod security context, and an UNCONFIGURED config file. It does not start the service:
+# the shipped config has no usable database URL, so starting on install would put a crash
+# loop in the journal of every machine that unpacked it before being configured.
+[package.metadata.deb]
+maintainer = "IronAuth maintainers <noreply@github.com>"
+copyright = "The IronAuth authors"
+license-file = ["../../LICENSE-MIT", "0"]
+extended-description = """A standards-first OpenID Connect identity platform in one binary. Configure /etc/ironauth/ironauth.toml, run `ironauth migrate`, then start the service."""
+section = "net"
+priority = "optional"
+# postgresql-client is NOT a dependency: the database is normally remote, and depending on
+# a client the server does not invoke would pull a package onto every host for nothing.
+depends = "$auto"
+assets = [
+    # `target/release` and NOT the musl path, even though the release lane cross-compiles.
+    # cargo-deb rewrites a `target/release` asset to the target-specific directory when
+    # `--target` is given, so writing the musl path here would break the plain
+    # `cargo deb -p ironauth` the CI install job runs, and hard-coding either one breaks the
+    # other. Leave it as the host path.
+    ["target/release/ironauth", "usr/bin/", "755"],
+    # A CONFFILE (see conf-files below), so dpkg preserves an operator's edits across
+    # upgrades instead of overwriting the file that holds their database credential.
+    ["../../packaging/debian/ironauth.toml", "etc/ironauth/ironauth.toml", "640"],
+    ["../../docs/CONFIG.md", "usr/share/doc/ironauth/CONFIG.md", "644"],
+]
+conf-files = ["/etc/ironauth/ironauth.toml"]
+maintainer-scripts = "../../packaging/debian/scripts"
+
+[package.metadata.deb.systemd-units]
+unit-scripts = "../../packaging/debian"
+# NOT enabled and NOT started on install, for the reason above.
+enable = false
+start = false

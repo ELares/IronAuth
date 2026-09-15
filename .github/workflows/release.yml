@@ -88,10 +88,18 @@ jobs:
         run: |
           cargo install cargo-cyclonedx --locked
           cargo cyclonedx --format json --spec-version 1.5
+      # THE DEB (issue #151 criteria 4 and 5). Built from the same musl binary the release
+      # ships, so the package and the tarball are the same bytes rather than two builds
+      # that happen to agree.
+      - name: Build the DEB
+        run: |
+          cargo install cargo-deb --locked --version '^2'
+          cargo deb -p ironauth --target x86_64-unknown-linux-musl --no-build
       - name: Stage artifacts
         run: |
           mkdir -p dist
           cp target/x86_64-unknown-linux-musl/release/ironauth dist/ironauth-x86_64-linux-musl
+          cp target/x86_64-unknown-linux-musl/debian/ironauth_*.deb dist/
           find . -name '*.cdx.json' -not -path './dist/*' -exec cp {} dist/ \;
           # The config JSON schema drives editor autocomplete for operators and
           # is freshness-checked in CI (scripts/config-schema.sh); ship it as a
@@ -102,10 +110,15 @@ jobs:
           # verify -- which is a worse outcome than not publishing it.
           cp crates/ironauth-hooks/bench-baseline.json dist/hook-latency.json
           cd dist && sha256sum * > SHA256SUMS
+      # BOTH ARTIFACTS, not just the binary. #151 criterion 4 asks for provenance on every
+      # release artifact, and a DEB published beside an attested binary but carrying no
+      # attestation of its own is the asset a verifier cannot check.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: dist/ironauth-x86_64-linux-musl
+          subject-path: |
+            dist/ironauth-x86_64-linux-musl
+            dist/ironauth_*.deb
       - name: Extract changelog section
         run: |
           version="${GITHUB_REF_NAME#ironauth-v}"

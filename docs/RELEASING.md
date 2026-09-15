@@ -66,6 +66,40 @@ silently included.
 5. Record a HUMAN-TIMED quickstart run per guide in `docs/dx/timed-runs.md`.
    See below: this is DX evidence, and deliberately not a gate.
 
+## The DEB
+
+`cargo deb -p ironauth` builds a package carrying the binary, a systemd unit, and an
+UNCONFIGURED `/etc/ironauth/ironauth.toml`. The release lane builds it from the same musl
+binary the tarball ships, so the two are the same bytes rather than two builds that happen
+to agree, and attests provenance for both.
+
+Installing it does NOT start the service. The shipped config has no usable database URL, so
+a package that started on install would put a crash loop in the journal of every machine
+that unpacked it before being configured. The documented sequence is:
+
+```
+sudo dpkg -i ironauth_<version>_amd64.deb
+sudoedit /etc/ironauth/ironauth.toml          # set database.url
+sudo -u ironauth ironauth migrate --config /etc/ironauth/ironauth.toml
+sudo systemctl enable --now ironauth
+```
+
+The config file is a dpkg **conffile**, so an upgrade preserves an operator's edits rather
+than overwriting the file that holds their database credential. `dpkg -r` leaves it in place
+and `dpkg -P` removes it; CI asserts both, because a silent replacement is exactly the
+failure `conf-files` exists to prevent.
+
+The unit runs as a system user with no login shell, and its hardening mirrors the Helm
+chart's pod security context line for line where systemd has an equivalent: non-root,
+`ProtectSystem=strict` for the read-only root, `PrivateTmp` for the writable `/tmp` the
+chart gives as an emptyDir, and an empty capability set. A deployment should not get a
+weaker posture for choosing a package over a cluster.
+
+CI installs the package on an ordinary runner, points it at Postgres, runs the migrate step
+and starts the unit, and requires `/readyz` to answer while the unit is still active (issue
+#151 criterion 5). The active check matters: without it a stale listener on the port would
+answer for a unit that had already died.
+
 ## Verifying a published image
 
 The container images are signed with [cosign](https://docs.sigstore.dev/) in
