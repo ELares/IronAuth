@@ -1519,19 +1519,32 @@ pub struct AccessRuleConfig {
 
 /// Per-layer request-plane rate limits (issue #150 criterion 1).
 ///
-/// The five layers are enforced INDEPENDENTLY and a request is admitted only if every
-/// applicable one admits it, so these are five separate budgets rather than a precedence
-/// list. A layer left unset is unlimited, which is the shipped default for all five: a
-/// deployment that has not asked to be rate limited is not.
+/// The layers are enforced INDEPENDENTLY and a request is admitted only if every applicable
+/// one admits it, so these are separate budgets rather than a precedence list. A layer left
+/// unset is unlimited, which is the shipped default for all of them: a deployment that has
+/// not asked to be rate limited is not.
+///
+/// # Why there is no `per_user` or `per_client` here
+///
+/// The engine has both layers. The forward-auth check cannot KEY them: the limiter runs
+/// before the session is resolved, deliberately, so the identity it builds carries no subject,
+/// and a forward-auth check names no OAuth client at all.
+///
+/// They were offered here once. A configured `per_user` would have been accepted by
+/// validation, inserted into the limiter, and then skipped on every request because the key
+/// was absent, so an operator would have read a per-user budget in their own config file and
+/// had none. That is the failure `MissingIpPolicy` calls the worse one: a silently unlimited
+/// surface that looks healthy until it is found.
+///
+/// This is the same refusal `rule_from_config` makes for `subject_in_group` and the same one
+/// `ProxyDialectConfig` makes for Envoy `ext_authz`: a vocabulary must not offer what the
+/// runtime cannot honour. Adding them back means resolving the session before the limiter,
+/// which is a different ordering decision with its own consequences.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct RateLimitConfig {
     /// The only layer that applies before a caller is identified.
     pub per_ip: Option<LimitConfig>,
-    /// Bounds one end user across every client they use.
-    pub per_user: Option<LimitConfig>,
-    /// Bounds one integration across every user it acts for.
-    pub per_client: Option<LimitConfig>,
     /// Bounds the customer.
     pub per_tenant: Option<LimitConfig>,
     /// Bounds one environment within a tenant.
@@ -6646,8 +6659,6 @@ fn validate_forward_auth(
     // while reading as a limit somebody chose.
     for (name, limit) in [
         ("per_ip", cfg.rate_limit.per_ip),
-        ("per_user", cfg.rate_limit.per_user),
-        ("per_client", cfg.rate_limit.per_client),
         ("per_tenant", cfg.rate_limit.per_tenant),
         ("per_environment", cfg.rate_limit.per_environment),
     ] {

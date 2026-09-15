@@ -260,10 +260,11 @@ fn limiter_from_config(
     use ironauth_quota::layered::{LayeredLimiter, LayeredLimits, RateLayer};
 
     let mut limits = LayeredLimits::unlimited();
+    // THE THREE THE CHECK PATH CAN KEY. Per-user and per-client are absent from the config
+    // for the reason recorded beside `RateLimitConfig`: this surface resolves no subject
+    // before limiting and names no client, so those layers could be configured and never bind.
     for (layer, configured) in [
         (RateLayer::PerIp, cfg.per_ip),
-        (RateLayer::PerUser, cfg.per_user),
-        (RateLayer::PerClient, cfg.per_client),
         (RateLayer::PerTenant, cfg.per_tenant),
         (RateLayer::PerEnvironment, cfg.per_environment),
     ] {
@@ -562,6 +563,12 @@ mod limiter_tests {
     /// The failure a single spot-check cannot see is two config fields mapping to one layer:
     /// the build would still produce a limiter, the test would still pass, and one of the two
     /// budgets would silently not exist.
+    ///
+    /// Three layers, not five. Per-user and per-client are deliberately absent from the
+    /// config because this surface cannot key them, and the assertion below pins that: if
+    /// someone adds either field back without also resolving a subject before the limiter,
+    /// the count stops matching and they have to confront the question rather than ship a
+    /// budget that never binds.
     #[test]
     fn each_configured_layer_becomes_its_own_budget() {
         let one = Some(LimitConfig {
@@ -573,20 +580,6 @@ mod limiter_tests {
                 RateLayer::PerIp,
                 RateLimitConfig {
                     per_ip: one,
-                    ..RateLimitConfig::default()
-                },
-            ),
-            (
-                RateLayer::PerUser,
-                RateLimitConfig {
-                    per_user: one,
-                    ..RateLimitConfig::default()
-                },
-            ),
-            (
-                RateLayer::PerClient,
-                RateLimitConfig {
-                    per_client: one,
                     ..RateLimitConfig::default()
                 },
             ),
@@ -605,26 +598,31 @@ mod limiter_tests {
                 },
             ),
         ];
-        assert_eq!(
-            cases.len(),
-            RateLayer::all().len(),
-            "a layer with no case here is one whose config field is never exercised"
-        );
 
-        // An identity presenting a key to every layer, so the layer that refuses is decided by
-        // the configuration rather than by which key happens to be present.
-        let everyone = || RequestIdentity {
+        // The identity the HANDLER builds, which is the point: it presents an address and a
+        // scope and nothing else. Using an identity that presented a user would have let a
+        // per-user budget appear to work here while never binding in production.
+        let as_the_handler_builds_it = || RequestIdentity {
             ip: Some("198.51.100.7".to_owned()),
-            user: Some("usr_1".to_owned()),
-            client: Some("cli_1".to_owned()),
+            user: None,
+            client: None,
             tenant: Some("tnt_1".to_owned()),
             environment: Some("env_1".to_owned()),
         };
+        assert_eq!(
+            cases.len(),
+            3,
+            "three layers are keyable from this identity; a fourth case means the identity \
+             grew and the config should say so"
+        );
 
         for (expected, cfg) in cases {
             let limiter = limiter_from_config(&cfg, clock());
-            assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
-            let refused = limiter.admit(&everyone(), 1.0);
+            assert_eq!(
+                limiter.admit(&as_the_handler_builds_it(), 1.0).decision,
+                Decision::Admitted
+            );
+            let refused = limiter.admit(&as_the_handler_builds_it(), 1.0);
 
             assert!(refused.is_throttled(), "{expected:?} must bind");
             assert_eq!(
