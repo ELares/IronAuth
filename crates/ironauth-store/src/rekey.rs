@@ -79,12 +79,19 @@ pub struct RekeyReport {
     /// material for a tenant being erased. Counted rather than retried, because the right
     /// response is for a human to look.
     pub contended: usize,
-    /// Live KEKs still under the old master when the run finished, counted AFTER the loop.
+    /// Live KEKs NOT on the target master when the run finished, counted AFTER the loop.
     ///
     /// Non-zero means the rotation is incomplete: KEKs are provisioned lazily under whichever
     /// master the inserting process holds, so a server still running during the rotation can
     /// add rows the work set never saw. Re-running converges.
-    pub remaining_under_old: usize,
+    ///
+    /// Counted against the TARGET rather than the source (it was `remaining_under_old`, keyed
+    /// on `from`). Keyed on the source it could not see a row parked on a THIRD master, which
+    /// is what a retargeted rotation leaves: `old -> mid` stops part way, then `old -> new`
+    /// runs, and the rows on `mid` are outside both the work set and the count. The run said
+    /// it had converged, the operator destroyed `old`, and those tenants went dark. Keyed on
+    /// the target, a stray anywhere is still a stray.
+    pub remaining_off_target: usize,
 }
 
 /// Rewrap every live tenant KEK from one platform master key to another.
@@ -93,7 +100,25 @@ pub struct Rekey<'a> {
     from: &'a MasterKey,
     to: &'a MasterKey,
     entropy: &'a dyn Entropy,
+    /// A hook run ONCE, after the work set is read and before the first row is written.
+    ///
+    /// The compare-and-swap on the write exists for exactly one ordering: a row changes
+    /// between the snapshot and the write-back. Nothing could produce that ordering from
+    /// outside, because the snapshot is taken inside `run`, so the guard's own test
+    /// committed its shred BEFORE the call and was refused by the status check on the READ
+    /// instead, never reaching the write at all. A review traced the execution and found the
+    /// guard unreached; the test's doc claimed the opposite.
+    ///
+    /// `testing` only, so no production build can carry a seam into the middle of a
+    /// key-rotation write loop.
+    #[cfg(feature = "testing")]
+    after_snapshot: Option<Box<dyn Fn() -> BoxFuture<'a, ()> + 'a>>,
 }
+
+/// A boxed future, so the `testing` hook can be an async closure without a generic parameter
+/// leaking into [`Rekey`]'s public shape.
+#[cfg(feature = "testing")]
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 impl<'a> Rekey<'a> {
     /// Build a rekey from the old master to the new one.
@@ -112,7 +137,20 @@ impl<'a> Rekey<'a> {
             from,
             to,
             entropy,
+            #[cfg(feature = "testing")]
+            after_snapshot: None,
         }
+    }
+
+    /// Run `hook` once, after the work set is read and before the first row is written.
+    ///
+    /// The seam the compare-and-swap on the write needs in order to be testable at all: see
+    /// [`Rekey::after_snapshot`]. `testing` only.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn with_after_snapshot(mut self, hook: impl Fn() -> BoxFuture<'a, ()> + 'a) -> Self {
+        self.after_snapshot = Some(Box::new(hook));
+        self
     }
 
     /// Rewrap every live KEK, committing each row on its own.
@@ -145,6 +183,13 @@ impl<'a> Rekey<'a> {
         report.already_current =
             crate::repository::count_keks_under_master(self.pool, self.to.id()).await?;
 
+        // The work set is read; the writes have not started. This is the only point at which
+        // a test can produce the ordering the write guard exists for.
+        #[cfg(feature = "testing")]
+        if let Some(hook) = self.after_snapshot.as_ref() {
+            hook().await;
+        }
+
         for row in &rows {
             if row.status == "destroyed" {
                 report.skipped_destroyed += 1;
@@ -166,6 +211,11 @@ impl<'a> Rekey<'a> {
                 &row.id,
                 &row.wrapped_kek,
                 self.from.id(),
+                // The SNAPSHOT'S status, not the literal "active". Binding "active" refused
+                // every `'retired'` row, which is what `rotate_kek` leaves beside the version
+                // that replaced it, so such a row was counted as contention on every run and
+                // the rotation never converged.
+                &row.status,
                 resealed.as_bytes(),
                 self.to.id(),
             )
@@ -178,9 +228,10 @@ impl<'a> Rekey<'a> {
         }
 
         // The closing check the snapshot cannot give. Counted after the loop, so it sees rows
-        // that appeared during it.
-        report.remaining_under_old =
-            crate::repository::count_live_keks_under_master(self.pool, self.from.id()).await?;
+        // that appeared during it, and keyed on the TARGET so it also sees rows that are on
+        // neither master (a retargeted rotation leaves them on the one in between).
+        report.remaining_off_target =
+            crate::repository::count_live_keks_off_master(self.pool, self.to.id()).await?;
         Ok(report)
     }
 
