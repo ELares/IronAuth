@@ -1,0 +1,191 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Per-tenant quota overrides (issue #150, criterion 4).
+//!
+//! Criterion 4 asks that limits change at runtime per tenant via the management API without
+//! a restart. This is the store half: the override table, its scoping, and the grants that
+//! decide who may write it.
+//!
+//! The property that makes the table safe to ship before the API exists is that an EMPTY
+//! table changes nothing. A scope with no row uses the configured default, so adding this to
+//! a running deployment is a no-op until an operator sets something.
+
+use ironauth_env::Env;
+use ironauth_store::Scope;
+use ironauth_store::test_support::TestDatabase;
+
+/// Write an override as the CONTROL plane does. The data plane cannot do this, which is the
+/// subject of `the_data_plane_cannot_raise_its_own_limit` below.
+async fn set_override(db: &TestDatabase, scope: Scope, dimension: &str, refill: f64, burst: f64) {
+    sqlx::query(
+        "INSERT INTO tenant_quota_limits \
+           (tenant_id, environment_id, dimension, refill_per_sec, burst, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, now()) \
+         ON CONFLICT (tenant_id, environment_id, dimension) DO UPDATE \
+           SET refill_per_sec = EXCLUDED.refill_per_sec, burst = EXCLUDED.burst, \
+               updated_at = EXCLUDED.updated_at",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(dimension)
+    .bind(refill)
+    .bind(burst)
+    .execute(db.owner_pool())
+    .await
+    .expect("write an override");
+}
+
+/// NO ROW MEANS THE DEFAULT, which is what makes this table safe to add.
+#[tokio::test]
+async fn a_scope_with_no_override_reports_none() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let scope = db.seed_scope(&env).await;
+
+    let repo = db.store().scoped(scope);
+    assert!(repo.quota_limits().all().await.expect("read").is_empty());
+    assert_eq!(
+        repo.quota_limits().get("requests").await.expect("read"),
+        None
+    );
+}
+
+/// AN OVERRIDE READS BACK, and only for the scope that has it.
+#[tokio::test]
+async fn an_override_applies_to_its_own_scope_and_no_other() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let tuned = db.seed_scope(&env).await;
+    let untouched = db.seed_scope(&env).await;
+
+    set_override(&db, tuned, "requests", 12.5, 50.0).await;
+
+    let got = db
+        .store()
+        .scoped(tuned)
+        .quota_limits()
+        .get("requests")
+        .await
+        .expect("read")
+        .expect("the override is there");
+    assert!((got.refill_per_sec - 12.5).abs() < f64::EPSILON);
+    assert!((got.burst - 50.0).abs() < f64::EPSILON);
+
+    assert_eq!(
+        db.store()
+            .scoped(untouched)
+            .quota_limits()
+            .get("requests")
+            .await
+            .expect("read"),
+        None,
+        "one tenant's limit must not become another's"
+    );
+}
+
+/// A ROW NAMING AN UNKNOWN DIMENSION IS RETURNED, NOT REFUSED.
+///
+/// During a rolling upgrade a newer node writes a dimension an older node has never heard
+/// of. The older node must ignore it and keep serving; refusing to read the table at all
+/// would take the old nodes down in the middle of the upgrade, which is the opposite of what
+/// a runtime limit change is for.
+#[tokio::test]
+async fn a_dimension_this_binary_does_not_know_is_read_rather_than_refused() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let scope = db.seed_scope(&env).await;
+
+    set_override(&db, scope, "requests", 1.0, 2.0).await;
+    set_override(&db, scope, "a_dimension_from_the_future", 3.0, 4.0).await;
+
+    let all = db
+        .store()
+        .scoped(scope)
+        .quota_limits()
+        .all()
+        .await
+        .expect("read");
+    assert_eq!(all.len(), 2, "both rows come back");
+    assert!(
+        all.iter()
+            .any(|(name, _)| name == "a_dimension_from_the_future"),
+        "the caller decides what to do with a name it does not know"
+    );
+}
+
+/// THE DATA PLANE CANNOT RAISE ITS OWN LIMIT.
+///
+/// The one write that would defeat the feature: a compromised or buggy request path setting
+/// its own tenant's limit to something enormous. The migration grants `ironauth_app` SELECT
+/// and nothing else, so this is refused by Postgres rather than by a Rust check that a future
+/// caller could route around.
+#[tokio::test]
+async fn the_data_plane_cannot_raise_its_own_limit() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let scope = db.seed_scope(&env).await;
+    set_override(&db, scope, "requests", 1.0, 2.0).await;
+
+    for statement in [
+        "UPDATE tenant_quota_limits SET burst = 1000000",
+        "INSERT INTO tenant_quota_limits (tenant_id, environment_id, dimension, \
+          refill_per_sec, burst, updated_at) VALUES ('t', 'e', 'requests', 99.0, 99.0, now())",
+        "DELETE FROM tenant_quota_limits",
+    ] {
+        let result = sqlx::query(statement).execute(db.app_pool()).await;
+        assert!(
+            result.is_err(),
+            "the data plane must not be able to run: {statement}"
+        );
+    }
+
+    // And the value is unchanged, so the refusal was a refusal and not a silent no-op.
+    let still = db
+        .store()
+        .scoped(scope)
+        .quota_limits()
+        .get("requests")
+        .await
+        .expect("read")
+        .expect("still there");
+    assert!((still.burst - 2.0).abs() < f64::EPSILON);
+}
+
+/// A LIMIT THAT WOULD MAKE THE LIMITER STOP LIMITING IS REFUSED BY THE DATABASE.
+///
+/// A NaN or infinite refill reaching the token bucket makes every comparison against it
+/// false, so the bucket reads as full on every request. That is a fail-OPEN laundered
+/// through arithmetic, and it was a real defect in this crate's limiter, so the constraint
+/// is here rather than only in Rust: this table is writable by the control plane, and a bad
+/// value arriving through an API is exactly the path a Rust-side check would be bypassing.
+#[tokio::test]
+async fn a_non_finite_or_negative_limit_is_refused_by_the_constraint() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let scope = db.seed_scope(&env).await;
+
+    for (refill, burst, what) in [
+        (f64::NAN, 1.0, "a NaN refill"),
+        (1.0, f64::NAN, "a NaN burst"),
+        (f64::INFINITY, 1.0, "an infinite refill"),
+        (1.0, f64::INFINITY, "an infinite burst"),
+        (-1.0, 1.0, "a negative refill"),
+        (1.0, -1.0, "a negative burst"),
+    ] {
+        let result = sqlx::query(
+            "INSERT INTO tenant_quota_limits (tenant_id, environment_id, dimension, \
+               refill_per_sec, burst, updated_at) VALUES ($1, $2, 'requests', $3, $4, now())",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(refill)
+        .bind(burst)
+        .execute(db.owner_pool())
+        .await;
+        assert!(result.is_err(), "{what} must be refused by the constraint");
+    }
+
+    // Zero is allowed on both, and means something: a burst of zero denies everything, which
+    // is a legitimate way to stop a tenant without deleting them.
+    set_override(&db, scope, "requests", 0.0, 0.0).await;
+}

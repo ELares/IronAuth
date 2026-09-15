@@ -1718,6 +1718,20 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The per-tenant quota override repository for this scope (issue #150 criterion 4).
+    ///
+    /// READ ONLY here, deliberately. The request path consults a limit; the management API
+    /// writes one, and it runs as the control-plane role. The migration grants the data plane
+    /// `SELECT` and nothing else, so a compromised request path cannot raise its own tenant's
+    /// limit, which is the single write that would defeat the feature.
+    #[must_use]
+    pub fn quota_limits(&self) -> QuotaLimitsRepo<'a> {
+        QuotaLimitsRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The read-only custom-domain repository for this scope (issue #47): look a
     /// domain up by name or id, list an environment's domains, and read a domain's
     /// ACME challenges. Registration, challenge results, and certificate storage
@@ -87986,5 +88000,75 @@ mod effective_tail_drift_tests {
             timed.contains("JOIN access_grant_requests agr"),
             "and it must carry the disjunct it exists for"
         );
+    }
+}
+
+/// Per-tenant quota overrides (issue #150 criterion 4).
+///
+/// A scope with no row uses the configured default. That is what makes this table safe to
+/// add to a running deployment: an empty table changes nothing, and a limit appears only
+/// where an operator put one.
+pub struct QuotaLimitsRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+/// One dimension's override, as stored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuotaOverride {
+    /// Sustained rate, tokens per second.
+    pub refill_per_sec: f64,
+    /// Burst capacity.
+    pub burst: f64,
+}
+
+impl QuotaLimitsRepo<'_> {
+    /// Every override this scope has, keyed by the dimension label.
+    ///
+    /// Returns the labels as stored rather than a typed dimension, because a row naming a
+    /// dimension this binary does not know is not an error: during a rolling upgrade a newer
+    /// node writes one and an older node must ignore it rather than refuse to serve. The
+    /// caller matches the labels it knows and drops the rest.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the read fails.
+    pub async fn all(&self) -> Result<Vec<(String, QuotaOverride)>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT dimension, refill_per_sec, burst FROM tenant_quota_limits \
+             WHERE tenant_id = $1 AND environment_id = $2 ORDER BY dimension",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("dimension"),
+                    QuotaOverride {
+                        refill_per_sec: row.get::<f64, _>("refill_per_sec"),
+                        burst: row.get::<f64, _>("burst"),
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// The override for one dimension, or `None` when the scope uses the default.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the read fails.
+    pub async fn get(&self, dimension: &str) -> Result<Option<QuotaOverride>, StoreError> {
+        Ok(self
+            .all()
+            .await?
+            .into_iter()
+            .find(|(name, _)| name == dimension)
+            .map(|(_, limit)| limit))
     }
 }
