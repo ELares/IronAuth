@@ -97,6 +97,20 @@ oidc:
 # Unset means the management API is not mounted.
 admin:
   controlDatabaseUrl: ""
+  # The bootstrap operator bearer token that authorizes tenant CRUD on the
+  # operator plane. Unset leaves the operator plane unauthorized: the management
+  # API still mounts and every operator-plane request is rejected, which means a
+  # deployment cannot create its first tenant.
+  #
+  # BY SECRET REFERENCE ONLY, never a literal. The config schema's own words are
+  # "use the `file`/`env` secret indirection, never a literal, outside dev mode",
+  # and the chart offers no way to disobey: the value names a Secret, the rendered
+  # config carries `{ env = "IRONAUTH_BOOTSTRAP_OPERATOR_TOKEN" }`, and the token
+  # itself reaches the process through the environment without ever entering the
+  # config file. `database.masterKey` works the same way and for the same reason.
+  bootstrapOperatorToken:
+    existingSecret: ""
+    key: "bootstrap-operator-token"
 
 # ---------------------------------------------------------------------------
 # Optional accelerator: IronBus.

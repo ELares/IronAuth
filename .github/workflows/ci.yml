@@ -1172,6 +1172,14 @@ jobs:
             kubectl describe job/ironauth-migrate || true
             exit 1
           fi
+      # THE OPERATOR CREDENTIAL, as a Secret the chart REFERENCES. The chart offers no way
+      # to pass the token itself, deliberately: a literal would put an operator credential
+      # into `helm get manifest`, into any GitOps repository holding the values, and into
+      # this log.
+      - name: The operator credential
+        run: |
+          kubectl create secret generic operator-credentials \
+            --from-literal=token=ci-operator-token
       - name: helm install with the documented HA values
         run: |
           helm install ironauth charts/ironauth \
@@ -1181,6 +1189,9 @@ jobs:
             --set server.publicUrl=http://ironauth.default.svc.cluster.local:8443 \
             --set database.url="postgres://postgres:postgres@postgres:5432/ironauth" \
             --set oidc.enabled=true \
+            --set admin.controlDatabaseUrl="postgres://ironauth_control:ironauth_control@postgres:5432/ironauth" \
+            --set admin.bootstrapOperatorToken.existingSecret=operator-credentials \
+            --set admin.bootstrapOperatorToken.key=token \
             --wait --timeout 300s
       # THE CRITERION'S OWN WORDS: "a working MULTI-REPLICA deployment". The chart defaults to
       # three, and a rollout that reports success with one ready replica would satisfy
@@ -1216,6 +1227,51 @@ jobs:
         run: |
           kubectl get secret ironauth-config -o jsonpath='{.data.ironauth\.toml}' \
             | base64 -d | grep -q '^\[oidc\]'
+      # BOOTSTRAP A TENANT, which is the step everything else in this milestone was waiting
+      # on. Discovery, JWKS and every login flow are scope-routed, so until a tenant and an
+      # environment exist there is nothing to ask the deployment for: #151's smoke flow and
+      # #149's "continues to serve with Postgres down" were both blocked here, not on the
+      # chaos or the flow.
+      #
+      # The management plane is deliberately NOT in the Service (it carries health, readiness
+      # and metrics, which no in-cluster caller should reach), so this port-forwards to it,
+      # which is what an operator does.
+      - name: Bootstrap a tenant through the management API
+        run: |
+          kubectl port-forward deployment/ironauth 9443:9443 &
+          for _ in $(seq 1 30); do
+            curl -fsS --max-time 2 http://127.0.0.1:9443/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+          created=$(curl -fsS -X POST http://127.0.0.1:9443/v1/tenants \
+            -H "Authorization: Bearer ci-operator-token" \
+            -H "Idempotency-Key: ci-bootstrap-1" \
+            -H "Content-Type: application/json" \
+            -d '{"display_name":"CI"}')
+          echo "$created"
+          echo "TENANT=$(echo "$created" | jq -r '.tenant.id // .id')" >> "$GITHUB_ENV"
+          echo "ENVIRONMENT=$(echo "$created" | jq -r '.environment.id // .environments[0].id')" >> "$GITHUB_ENV"
+      # DISCOVERY, the first third of #151's smoke flow. It is the first request in this
+      # milestone that requires the server to have READ ITS DATABASE: the scope has to resolve
+      # to a tenant and an environment that a migration created and the management API wrote.
+      #
+      # That is what makes it worth more than the readiness probe beside it, which opens a TCP
+      # connection and speaks no protocol.
+      - name: Discovery answers for the bootstrapped scope
+        run: |
+          echo "tenant=$TENANT environment=$ENVIRONMENT"
+          test -n "$TENANT" && test "$TENANT" != "null"
+          test -n "$ENVIRONMENT" && test "$ENVIRONMENT" != "null"
+          doc=$(kubectl run discovery --rm -i --restart=Never --image=curlimages/curl:8.10.1 -- \
+            -fsS --max-time 10 \
+            "http://ironauth:8443/t/$TENANT/e/$ENVIRONMENT/.well-known/openid-configuration")
+          echo "$doc"
+          # The issuer it names must be the scope that was asked for, not merely a 200: a
+          # discovery document for the wrong environment is the shape that would let a client
+          # trust keys from somewhere else.
+          echo "$doc" | jq -e --arg t "$TENANT" --arg e "$ENVIRONMENT" \
+            '.issuer | contains("/t/" + $t + "/e/" + $e)'
+          echo "$doc" | jq -e '.jwks_uri and .authorization_endpoint and .token_endpoint'
       - name: Diagnostics on failure
         if: failure()
         run: |

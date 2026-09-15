@@ -112,7 +112,8 @@ rendered = sys.argv[1]
 # THE PROTOCOL SURFACE IS OFF BY DEFAULT TOO, and for the same reason as the accelerators:
 # a default install mounts nothing it was not asked to mount. Asserted in the config file
 # rather than by a flag name, because `[oidc]` absent is what makes `oidc.enabled` false.
-for needle in ("IRONBUS", "ironbus_addr", "[outbox]", "[oidc]"):
+for needle in ("IRONBUS", "ironbus_addr", "[outbox]", "[oidc]",
+              "bootstrap_operator_token", "IRONAUTH_BOOTSTRAP_OPERATOR_TOKEN"):
     assert needle not in rendered, (
         f"the default install mentions {needle!r}: an accelerator that is off must be absent, "
         "not merely disabled"
@@ -175,6 +176,49 @@ docs = [d for d in yaml.safe_load_all(sys.argv[1]) if d]
 toml = next(d for d in docs if d.get("kind") == "Secret")["stringData"]["ironauth.toml"]
 assert "[oidc]" in toml, f"no [oidc] section with oidc.enabled=true:\n{toml}"
 assert "enabled = true" in toml, f"[oidc] present but not enabled:\n{toml}"
+PY
+
+# --- the operator credential never appears in rendered output -----------------
+#
+# The bootstrap operator token authorizes tenant CRUD, so it is the one credential a
+# chart must never render. The config schema says so in its own words ("use the
+# `file`/`env` secret indirection, never a literal"), and a chart that offered a literal
+# would put an operator credential into `helm get manifest`, into any GitOps repository
+# holding the values, and into every CI log that renders the chart.
+#
+# So the value names a SECRET and the assertions below are in three parts: the rendered
+# config carries the indirection, the Deployment carries the env var pointing at the
+# named Secret, and the TOKEN ITSELF appears nowhere. The third is the one that matters;
+# the first two only describe the mechanism that makes it true.
+echo "helm-chart: rendering with a bootstrap operator token"
+BOOTSTRAP=$(helm template ironauth "$CHART" "${BASE[@]}" \
+    --set admin.controlDatabaseUrl=postgres://ironauth_control@db/ironauth \
+    --set admin.bootstrapOperatorToken.existingSecret=operator-credentials \
+    --set admin.bootstrapOperatorToken.key=token)
+python3 - "$BOOTSTRAP" <<'PY'
+import sys, yaml
+rendered = sys.argv[1]
+docs = [d for d in yaml.safe_load_all(rendered) if d]
+toml = next(d for d in docs if d.get("kind") == "Secret")["stringData"]["ironauth.toml"]
+assert 'bootstrap_operator_token = { env = "IRONAUTH_BOOTSTRAP_OPERATOR_TOKEN" }' in toml, (
+    f"the config must carry the indirection, not a literal:\n{toml}"
+)
+
+deployment = next(d for d in docs if d.get("kind") == "Deployment")
+container = deployment["spec"]["template"]["spec"]["containers"][0]
+env = {e["name"]: e for e in container.get("env", [])}
+ref = env.get("IRONAUTH_BOOTSTRAP_OPERATOR_TOKEN")
+assert ref is not None, f"no env var for the token: {list(env)}"
+source = ref["valueFrom"]["secretKeyRef"]
+assert source["name"] == "operator-credentials", source
+assert source["key"] == "token", source
+
+# THE ASSERTION THE OTHER TWO EXIST FOR. A `--set` of the token itself would be the
+# obvious convenience to add later, and this is what refuses it.
+assert "operator-credentials" in rendered, "the Secret name is expected to appear"
+for leak in ("bootstrapOperatorToken.value", "op-secret"):
+    assert leak not in rendered, f"a token literal reached the rendered manifests: {leak}"
+
 
 c = next(d for d in docs if d.get("kind") == "Deployment")["spec"]["template"]["spec"]["containers"][0]
 env = {e["name"] for e in (c.get("env") or []) if e["name"] != "IRONAUTH_MASTER_KEY"}
