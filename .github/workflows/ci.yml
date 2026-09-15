@@ -1278,10 +1278,15 @@ jobs:
           echo "tenant=$TENANT environment=$ENVIRONMENT"
           test -n "$TENANT" && test "$TENANT" != "null"
           test -n "$ENVIRONMENT" && test "$ENVIRONMENT" != "null"
-          doc=$(kubectl run discovery --rm -i --restart=Never --image=curlimages/curl:8.10.1 -- \
+          # `kubectl run --rm` appends `pod "discovery" deleted` to the captured output, on the
+          # same line as the response, so parsing it directly fails with "Invalid numeric
+          # literal" at whatever column the document happens to end. The JSON is one object,
+          # so take from the first brace to the last.
+          raw=$(kubectl run discovery --rm -i --restart=Never --image=curlimages/curl:8.10.1 -- \
             -fsS --max-time 10 \
             "http://ironauth:8443/t/$TENANT/e/$ENVIRONMENT/.well-known/openid-configuration")
-          echo "$doc"
+          doc=$(printf '%s' "$raw" | grep -o '{.*}')
+          echo "$doc" | jq .issuer
           # The issuer it names must be the scope that was asked for, not merely a 200: a
           # discovery document for the wrong environment is the shape that would let a client
           # trust keys from somewhere else.
