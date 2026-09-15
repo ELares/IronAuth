@@ -98,9 +98,16 @@ oidc:
 admin:
   controlDatabaseUrl: ""
   # The bootstrap operator bearer token that authorizes tenant CRUD on the
-  # operator plane. Unset leaves the operator plane unauthorized: the management
-  # API still mounts and every operator-plane request is rejected, which means a
-  # deployment cannot create its first tenant.
+  # operator plane.
+  #
+  # UNSET MEANS THE MANAGEMENT API IS NOT MOUNTED. Every /v1/* path on the
+  # management plane answers a uniform 404, so a deployment cannot create its
+  # first tenant, and without a tenant nothing scope-routed answers either:
+  # discovery, JWKS and every login flow live under /t/<tenant>/e/<environment>.
+  #
+  # An earlier version of this comment said the API "still mounts" and rejects
+  # requests, copied from a rustdoc that said the same and was also wrong. A 404
+  # reads as a wrong URL, which is exactly the wrong place to send someone.
   #
   # BY SECRET REFERENCE ONLY, never a literal. The config schema's own words are
   # "use the `file`/`env` secret indirection, never a literal, outside dev mode",

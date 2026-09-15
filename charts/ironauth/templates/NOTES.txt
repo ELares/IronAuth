@@ -4,8 +4,15 @@ IronAuth {{ .Chart.AppVersion }} installed as {{ include "ironauth.fullname" . }
   Public URL: {{ .Values.server.publicUrl }}
   Data plane: {{ include "ironauth.fullname" . }}:{{ .Values.service.port }} (in-cluster)
 
+{{- if .Values.admin.bootstrapOperatorToken.existingSecret }}
+The management plane ({{ .Values.server.managementBind }}) carries /healthz, /readyz,
+/metrics AND the management API (tenant CRUD under /v1), authorized by the bootstrap
+operator token. It is deliberately absent from the Service, so reach it with
+`kubectl port-forward` rather than exposing it in-cluster.
+{{- else }}
 The management plane ({{ .Values.server.managementBind }}) carries /healthz, /readyz
 and metrics. It has no Service on purpose: reach it on the pod IP.
+{{- end }}
 
 {{ if .Values.ironbus.enabled -}}
 IronBus is configured at {{ .Values.ironbus.addr }} through outbox.ironbus_addr. An

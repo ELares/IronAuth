@@ -176,6 +176,20 @@ docs = [d for d in yaml.safe_load_all(sys.argv[1]) if d]
 toml = next(d for d in docs if d.get("kind") == "Secret")["stringData"]["ironauth.toml"]
 assert "[oidc]" in toml, f"no [oidc] section with oidc.enabled=true:\n{toml}"
 assert "enabled = true" in toml, f"[oidc] present but not enabled:\n{toml}"
+
+# NO ENVIRONMENT VARIABLE THE SERVER DOES NOT READ. Asserted on THIS render, where the chart
+# is expected to set none, because that is the render where the property holds.
+#
+# A change to this file displaced these lines into the operator-token render, where the chart
+# sets IRONAUTH_BOOTSTRAP_OPERATOR_TOKEN on purpose. The assertion then failed, and had it
+# been "fixed" by widening the exclusion list it would have stopped asserting anything: an
+# exclusion per variable is a list that grows to match whatever the chart happens to set.
+c = next(d for d in docs if d.get("kind") == "Deployment")["spec"]["template"]["spec"]["containers"][0]
+env = {e["name"] for e in (c.get("env") or []) if e["name"] != "IRONAUTH_MASTER_KEY"}
+assert not env, (
+    f"the chart sets {env}, but the server reads its configuration from the TOML file "
+    "only. An environment variable named after a setting reaches nothing."
+)
 PY
 
 # --- the operator credential never appears in rendered output -----------------
@@ -191,13 +205,18 @@ PY
 # named Secret, and the TOKEN ITSELF appears nowhere. The third is the one that matters;
 # the first two only describe the mechanism that makes it true.
 echo "helm-chart: rendering with a bootstrap operator token"
+# The sentinel goes in through a values path the chart does not read, so it is inert today
+# and becomes the tripwire the moment one is added.
+SENTINEL="SENTINEL-OPERATOR-TOKEN-MUST-NOT-RENDER"
 BOOTSTRAP=$(helm template ironauth "$CHART" "${BASE[@]}" \
     --set admin.controlDatabaseUrl=postgres://ironauth_control@db/ironauth \
     --set admin.bootstrapOperatorToken.existingSecret=operator-credentials \
-    --set admin.bootstrapOperatorToken.key=token)
-python3 - "$BOOTSTRAP" <<'PY'
+    --set admin.bootstrapOperatorToken.key=token \
+    --set-string "admin.bootstrapOperatorToken.value=$SENTINEL")
+python3 - "$BOOTSTRAP" "$SENTINEL" <<'PY'
 import sys, yaml
 rendered = sys.argv[1]
+SENTINEL = sys.argv[2]
 docs = [d for d in yaml.safe_load_all(rendered) if d]
 toml = next(d for d in docs if d.get("kind") == "Secret")["stringData"]["ironauth.toml"]
 assert 'bootstrap_operator_token = { env = "IRONAUTH_BOOTSTRAP_OPERATOR_TOKEN" }' in toml, (
@@ -213,20 +232,30 @@ source = ref["valueFrom"]["secretKeyRef"]
 assert source["name"] == "operator-credentials", source
 assert source["key"] == "token", source
 
-# THE ASSERTION THE OTHER TWO EXIST FOR. A `--set` of the token itself would be the
-# obvious convenience to add later, and this is what refuses it.
+# EXACTLY THE ONE INTENDED VARIABLE on this render, rather than "not none". A bare
+# `assert ref is not None` would pass while the chart also set three others.
+assert set(env) == {"IRONAUTH_BOOTSTRAP_OPERATOR_TOKEN"}, env
+
+# THE ASSERTION THE OTHER TWO EXIST FOR, and the first version of it could not fail.
+#
+# It grepped the output for "bootstrapOperatorToken.value" and "op-secret". The first is a
+# VALUES KEY PATH, and helm renders values, never key paths, so it cannot appear under any
+# template. The second is a Rust unit-test literal that this render never supplies. Worse,
+# the render passed no token literal at all, so there was nothing in the input that could
+# have leaked into the output: vacuous on both axes, and it was the assertion the PR
+# description called the important one.
+#
+# The sentinel below is supplied through the exact path a future author would add
+# (`--set admin.bootstrapOperatorToken.value=...`). Today the chart ignores it and the
+# sentinel cannot appear. The day someone renders that value into the config or the
+# Deployment, this fails.
 assert "operator-credentials" in rendered, "the Secret name is expected to appear"
-for leak in ("bootstrapOperatorToken.value", "op-secret"):
-    assert leak not in rendered, f"a token literal reached the rendered manifests: {leak}"
-
-
-c = next(d for d in docs if d.get("kind") == "Deployment")["spec"]["template"]["spec"]["containers"][0]
-env = {e["name"] for e in (c.get("env") or []) if e["name"] != "IRONAUTH_MASTER_KEY"}
-assert not env, (
-    f"the chart sets {env}, but the server reads its configuration from the TOML file "
-    "only. An environment variable named after a setting reaches nothing."
+assert SENTINEL not in rendered, (
+    f"a token literal reached the rendered manifests: {SENTINEL!r} was supplied as "
+    "admin.bootstrapOperatorToken.value and the chart rendered it. The operator credential "
+    "must reach the process through the environment, never through a manifest."
 )
-print("  enabled install: ironbus wired through outbox.ironbus_addr")
+
 PY
 
 # --- the chart refuses configurations that cannot work -----------------------
