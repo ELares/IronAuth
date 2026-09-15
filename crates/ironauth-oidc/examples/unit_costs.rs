@@ -6,14 +6,18 @@
 //! cargo run --release -p ironauth-oidc --example unit_costs
 //! ```
 //!
-//! # Why password hashing is the only operation here
+//! # Why password hashing dominates, MEASURED rather than asserted
 //!
 //! A sizing guide answers "how many of these can one machine do", and that number is decided
-//! by whichever operation dominates. For an identity provider under load that is the password
-//! hash, by roughly three orders of magnitude: Argon2id at the OWASP defaults deliberately
-//! costs 19 MiB and tens of milliseconds, while a token mint is a signature over a few
-//! hundred bytes. Publishing a table where the interesting row is surrounded by rows that
-//! round to zero would suggest they are comparable.
+//! by whichever operation dominates. This said the password hash dominates "by roughly three
+//! orders of magnitude" and measured only the hash, so the claim that justified excluding
+//! everything else was the one figure never taken.
+//!
+//! A review took it: 3.1 orders for `EdDSA`, 3.0 for `ES256`, and 1.5 for `RS256`, which is not
+//! hypothetical, every fresh environment publishes an RS256 key from day one, and at 34x
+//! rather than 1000x it is a visible line item in a capacity model rather than a row rounding
+//! to zero. The token mint is measured here now, per algorithm, and the ratio is derived from
+//! the two measurements rather than written down.
 //!
 //! # The parameters are printed with the numbers, because they ARE the number
 //!
@@ -25,10 +29,39 @@
 //! accident.
 
 use ironauth_env::Env;
+use ironauth_jose::{JwsAlgorithm, SigningKey, generate_rsa_pkcs1_der, sign_detached};
 use ironauth_oidc::{Argon2Params, hash_password_with, verify_password};
 
 /// How many samples per measurement. Small because each one is deliberately expensive.
 const SAMPLES: u32 = 10;
+
+/// How many samples per SIGNATURE measurement. A mint is microseconds, so ten of them measure
+/// timer resolution rather than the operation.
+const SIGN_SAMPLES: u32 = 2_000;
+
+/// Warm-up signatures discarded before timing, so the first-call cost of a lazily initialised
+/// backend is not charged to the published figure.
+const SIGN_WARMUP: u32 = 50;
+
+/// The performance and efficiency core counts on a heterogeneous macOS CPU, or [`None`] when
+/// the host does not report them (a homogeneous machine, or not macOS).
+///
+/// Printed because "per core" means two different things on such a machine, and the published
+/// figure is whichever kind the scheduler happened to choose.
+fn core_split() -> Option<(u32, u32)> {
+    let read = |key: &str| -> Option<u32> {
+        std::process::Command::new("sysctl")
+            .args(["-n", key])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .and_then(|text| text.trim().parse().ok())
+    };
+    let performance = read("hw.perflevel0.logicalcpu")?;
+    let efficiency = read("hw.perflevel1.logicalcpu")?;
+    Some((performance, efficiency))
+}
 
 /// The CPU this ran on, so the numbers carry their hardware.
 fn cpu_brand() -> String {
@@ -45,6 +78,10 @@ fn cpu_brand() -> String {
         .unwrap_or_else(|| "unknown (sysctl unavailable on this host)".to_owned())
 }
 
+#[allow(clippy::too_many_lines)]
+// One linear measurement script: the host banner, the hashing table, the mint table and the
+// derived capacity line read top to bottom, and splitting them would scatter the order a
+// reader follows.
 fn main() {
     let env = Env::system();
 
@@ -66,14 +103,38 @@ fn main() {
         }
     );
     println!("  samples  {SAMPLES}");
+    // HETEROGENEOUS CPUs MAKE "PER CORE" AMBIGUOUS, and this ran unpinned. On an Apple
+    // performance-versus-efficiency machine the same binary measured 11.0 ms per verify on a
+    // P-core and 62 to 66 ms under background QoS on an E-core, a 5.7x spread, while the
+    // "cores" line above counts them as interchangeable. A review found the published
+    // per-core figure quoted without that caveat, which an operator would then multiply by
+    // the full pool width.
+    if let Some((performance, efficiency)) = core_split() {
+        println!("  core mix {performance} performance + {efficiency} efficiency");
+        println!(
+            "           NOT PINNED: a per-core figure below is whichever kind the scheduler \
+             chose"
+        );
+    }
 
     // Every parameter set worth publishing, so a reader can see the shape of the tradeoff
     // rather than one number with no context. The floor is what config load refuses to go
     // below; the default is what ships.
     let cases = [
         ("OWASP default (shipped)", Argon2Params::new(19_456, 2, 1)),
+        // THE TRUE FLOOR, derived from the validator rather than guessed. This row said
+        // "the weakest config load accepts" while using t=2, and config load only rejects
+        // `iterations < 1`: a review loaded m=8192, t=1, p=1 successfully and measured it at
+        // 2.24 ms, roughly half the figure published as the floor. The document exists to
+        // show the shape of the tradeoff so nobody weakens hashing by accident, and it was
+        // understating the cheap end by 2x, hiding exactly the configuration most tempting to
+        // a reader chasing throughput.
         (
-            "config floor (8 MiB, the weakest config load accepts)",
+            "config floor (the weakest config load accepts)",
+            Argon2Params::new(ironauth_config::PASSWORD_HASHING_MIN_MEMORY_KIB, 1, 1),
+        ),
+        (
+            "config floor at the default iterations",
             Argon2Params::new(8_192, 2, 1),
         ),
         ("double iterations", Argon2Params::new(19_456, 4, 1)),
@@ -123,6 +184,48 @@ fn main() {
         }
     }
 
+    // THE TOKEN MINT, so the "password hashing dominates" claim is derived rather than
+    // asserted. A review measured it and found the claim true for EdDSA and ES256 and false
+    // for RS256, which every fresh environment publishes from day one.
+    println!("\nunit-costs: token mint (one detached signature over a 186-byte JWT payload)");
+    println!(
+        "  {:<40} {:>12} {:>18}",
+        "algorithm", "mint us", "vs a verify"
+    );
+    let payload = vec![b'x'; 186];
+    let mut signing_keys: Vec<(&str, SigningKey)> = Vec::new();
+    if let Ok(key) = SigningKey::ed25519_from_seed(Some("ed".to_owned()), &[7_u8; 32]) {
+        signing_keys.push(("EdDSA", key));
+    }
+    if let Ok(der) = generate_rsa_pkcs1_der(env.entropy()) {
+        if let Ok(key) =
+            SigningKey::rsa_from_pkcs1_der(Some("rs".to_owned()), JwsAlgorithm::Rs256, &der)
+        {
+            signing_keys.push(("RS256 (published day one)", key));
+        }
+    }
+    for (label, key) in &signing_keys {
+        for _ in 0..SIGN_WARMUP {
+            let _ = sign_detached(key, &payload);
+        }
+        let started = env.clock().monotonic();
+        for _ in 0..SIGN_SAMPLES {
+            let _ = sign_detached(key, &payload);
+        }
+        let mint_us = started.elapsed().as_secs_f64() * 1_000_000.0 / f64::from(SIGN_SAMPLES);
+        // THE RATIO IS DIVIDED, not stated. This is the whole point: "three orders of
+        // magnitude" was a sentence, and one of the three algorithms is 34x.
+        let ratio = if mint_us > 0.0 {
+            shipped_verify_ms * 1000.0 / mint_us
+        } else {
+            0.0
+        };
+        println!(
+            "  {label:<40} {mint_us:>12.1} {:>18}",
+            format!("{ratio:.0}x cheaper")
+        );
+    }
+
     // DERIVED FROM THE MEASUREMENT, not written down. A capacity line is the sentence a
     // reader quotes, so it must move when the number under it moves.
     //
@@ -132,8 +235,9 @@ fn main() {
     // this is the ceiling arithmetic alone allows, and a deployment will do less.
     if shipped_verify_ms > 0.0 {
         println!(
-            "\nunit-costs: at the shipped parameters one core sustains at most {:.0} \
-             password logins per second ({:.1} ms each), before anything else a login does",
+            "\nunit-costs: at the shipped parameters ONE CORE OF THIS KIND sustains at most \
+             {:.0} password logins per second ({:.1} ms each), before anything else a login \
+             does, and on a heterogeneous CPU the other kind of core is several times slower",
             1000.0 / shipped_verify_ms,
             shipped_verify_ms
         );
