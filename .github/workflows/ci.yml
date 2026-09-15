@@ -1099,9 +1099,14 @@ jobs:
           # The edits must have LANDED. sed reports success when it matches nothing, so
           # without this a renamed key would leave the file at its defaults and the boot
           # below would prove something else.
-          grep -q '^url = "postgres://postgres:postgres@127.0.0.1:5432/ironauth"$' \
+          #
+          # `sudo grep`, not `grep`: postinst leaves the file 640 root:ironauth because it
+          # holds a database credential, so the unprivileged runner cannot read it. Without
+          # sudo this exits 2 (cannot open) rather than 1 (no match), which is a failure that
+          # looks like the assertion firing while measuring nothing at all.
+          sudo grep -q '^url = "postgres://postgres:postgres@127.0.0.1:5432/ironauth"$' \
             /etc/ironauth/ironauth.toml
-          grep -q '^enabled = true$' /etc/ironauth/ironauth.toml
+          sudo grep -q '^enabled = true$' /etc/ironauth/ironauth.toml
           sudo chown root:ironauth /etc/ironauth/ironauth.toml
           sudo chmod 640 /etc/ironauth/ironauth.toml
       - name: Migrate and start, exactly as the config file documents
