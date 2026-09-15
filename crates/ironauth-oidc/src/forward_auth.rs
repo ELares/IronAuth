@@ -266,6 +266,55 @@ impl ForwardAuth {
     }
 }
 
+/// Combine repeated header names per RFC 9110 rather than keeping the last.
+///
+/// ONE implementation, called by both adapters. It lived only inside `facts_from_proxy`, and
+/// the dialect path grew its own `collect()` that kept whichever entry came last, so the same
+/// request decided differently depending on which door it came through.
+fn combine_repeated<I>(headers: I) -> std::collections::HashMap<String, String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut combined: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (name, value) in headers {
+        combined
+            .entry(name)
+            .and_modify(|existing| {
+                existing.push_str(", ");
+                existing.push_str(&value);
+            })
+            .or_insert(value);
+    }
+    combined
+}
+
+/// The host with any port removed, refusing anything that is not one host.
+///
+/// `RequestFacts::host` documents itself as "the host, without port" and nothing enforced it.
+/// Traefik sets `X-Forwarded-Host` from the request Host, which carries a non-default port,
+/// so a host rule silently stopped matching; a chained proxy comma-appends, which makes the
+/// value ambiguous rather than merely decorated.
+///
+/// A port is STRIPPED, because the rule's contract says the host carries none and the proxy
+/// is not wrong to send one. A comma-joined list is REFUSED, because choosing among them is a
+/// guess and `Criterion::Host` is exact equality, so a wrong guess is a rule that matches the
+/// wrong deployment.
+fn host_without_port(host: &str) -> Result<String, DialectError> {
+    if host.is_empty() || host.contains(',') || host.chars().any(char::is_control) {
+        return Err(DialectError::MalformedHost);
+    }
+    let bare = match host.rsplit_once(':') {
+        Some((left, right)) if !right.is_empty() && right.chars().all(|c| c.is_ascii_digit()) => {
+            left
+        }
+        _ => host,
+    };
+    if bare.is_empty() {
+        return Err(DialectError::MalformedHost);
+    }
+    Ok(bare.to_owned())
+}
+
 /// Remove every reserved header the client sent, returning the sanitised facts and the names
 /// the adapter must delete.
 ///
@@ -325,16 +374,7 @@ pub fn facts_from_proxy<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    let mut combined: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for (name, value) in headers {
-        combined
-            .entry(name)
-            .and_modify(|existing| {
-                existing.push_str(", ");
-                existing.push_str(&value);
-            })
-            .or_insert(value);
-    }
+    let combined = combine_repeated(headers);
     strip_trusted_headers(RequestFacts {
         method: method.to_owned(),
         host: host.to_owned(),
@@ -342,6 +382,245 @@ where
         headers: combined,
         ..RequestFacts::default()
     })
+}
+
+// ===========================================================================
+// Proxy dialects (issue #154 criterion 1, the dialect-independent half).
+// ===========================================================================
+
+/// How a proxy describes the ORIGINAL request when it asks this surface to decide.
+///
+/// Each dialect names a different set of headers for the same three facts: the method, the
+/// host, and the path of the request the client actually made. The check request itself is
+/// addressed to the authenticator, so its own method and path say nothing about what is
+/// being authorised.
+///
+/// # The dialect IS a trust boundary
+///
+/// These headers decide which rule matches. A caller who sets `X-Forwarded-Uri: /public` on
+/// a request for `/admin` and reaches a surface that believes it has chosen its own
+/// authorization path. They are safe to read only when the request arrived through a hop the
+/// operator configured as trusted, which is what [`ProxyHop`] carries.
+///
+/// # Why the header NAMES are per dialect rather than a union
+///
+/// Reading any recognised original-URI header regardless of dialect is the smuggling case the
+/// criterion names: a deployment behind nginx, which sets `X-Original-URI`, would also honour
+/// an `X-Forwarded-Uri` that nginx never sets and never strips, so a client could supply one
+/// directly. A dialect reads its OWN names and ignores the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// Traefik and Caddy forward-auth: `X-Forwarded-Method`, `X-Forwarded-Host`,
+    /// `X-Forwarded-Uri`.
+    ForwardAuth,
+    /// nginx `auth_request`: `X-Original-Method`, `X-Original-URI`, host from
+    /// `X-Forwarded-Host`.
+    NginxAuthRequest,
+    /// Envoy and Istio `ext_authz` over HTTP: the check request carries the original method
+    /// and path as its OWN method and path, with the host on `X-Forwarded-Host`.
+    EnvoyExtAuthz,
+    /// `HAProxy`: `X-Forwarded-Method`, `X-Forwarded-Host`, `X-Original-URI`.
+    Haproxy,
+}
+
+/// Whether the check request arrived through a hop the operator trusts.
+///
+/// A separate type rather than a `bool` argument, so a call site cannot pass the wrong one by
+/// having the arguments in the wrong order. The decision itself belongs to the server's
+/// trusted-proxy policy, which already fails closed on any ambiguity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyHop {
+    /// The immediate peer is a configured proxy.
+    Trusted,
+    /// It is not, or the policy could not tell.
+    Untrusted,
+}
+
+/// Why a check request could not be turned into a decidable description.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialectError {
+    /// The request did not arrive through a trusted hop, so nothing it says about the
+    /// original request can be believed.
+    UntrustedHop,
+    /// A header this dialect needs is absent.
+    Missing {
+        /// The header name.
+        header: &'static str,
+    },
+    /// A header this dialect needs appeared more than once with different values.
+    ///
+    /// The smuggling case: a proxy sets one and a client supplies another, and whichever the
+    /// parser happens to pick decides the authorization. There is no safe pick, so this is a
+    /// refusal rather than a choice.
+    Conflicting {
+        /// The header name.
+        header: &'static str,
+    },
+    /// The original URI is not something a path rule can be evaluated against.
+    ///
+    /// Includes a percent-encoded path: this engine has no decoder, so a path it cannot read
+    /// is a path it cannot authorise.
+    MalformedUri,
+    /// The original host is not a single host a rule can be compared against.
+    MalformedHost,
+}
+
+impl Dialect {
+    /// The header this dialect reads the original METHOD from, if any.
+    #[must_use]
+    pub const fn method_header(self) -> Option<&'static str> {
+        match self {
+            Dialect::ForwardAuth | Dialect::Haproxy => Some("x-forwarded-method"),
+            Dialect::NginxAuthRequest => Some("x-original-method"),
+            // Envoy's check request IS the original method.
+            Dialect::EnvoyExtAuthz => None,
+        }
+    }
+
+    /// The header this dialect reads the original URI from, if any.
+    #[must_use]
+    pub const fn uri_header(self) -> Option<&'static str> {
+        match self {
+            // HAProxy sends X-Forwarded-URI, the same as Traefik and Caddy. This row said
+            // `x-original-uri`, a header HAProxy neither sets nor strips, so on a real
+            // deployment a client supplies it directly and chooses its own authorization
+            // path. That is this module's own argument aimed at its own row, and a review
+            // demonstrated the bypass end to end.
+            Dialect::ForwardAuth | Dialect::Haproxy => Some("x-forwarded-uri"),
+            Dialect::NginxAuthRequest => Some("x-original-uri"),
+            Dialect::EnvoyExtAuthz => None,
+        }
+    }
+
+    /// The header this dialect reads the original HOST from.
+    ///
+    /// NOT the same for every dialect, though it was. `x-forwarded-host` is what the
+    /// `X-Forwarded-*` family carries, and Envoy's `ext_authz` check request does not include
+    /// it: the proto includes `Host`, `Method`, `Path`, `Content-Length` and `Authorization`
+    /// and nothing else by default. nginx's `auth_request` sets no headers at all, so a
+    /// deployment following the nginx.org example sends `X-Original-URI` and the ordinary
+    /// `Host`.
+    ///
+    /// Requiring `x-forwarded-host` from all four made two of them refuse EVERY request from
+    /// a correctly configured proxy. Fail closed, so not a bypass, and invisible to every
+    /// test because each fixture supplied the header by construction.
+    #[must_use]
+    pub const fn host_header(self) -> &'static str {
+        match self {
+            // The X-Forwarded family carries the host in its own header.
+            Dialect::ForwardAuth | Dialect::Haproxy => "x-forwarded-host",
+            // Envoy's check request carries the original Host; nginx's auth_request
+            // subrequest inherits it.
+            Dialect::EnvoyExtAuthz | Dialect::NginxAuthRequest => "host",
+        }
+    }
+
+    /// Turn a check request into facts a rule can be evaluated against.
+    ///
+    /// `check_method` and `check_path` are the check request's own, which only
+    /// [`Dialect::EnvoyExtAuthz`] treats as the original.
+    ///
+    /// Reserved identity headers are stripped here as well, so no path exists that builds
+    /// facts from a proxy without sanitising them.
+    ///
+    /// # Errors
+    ///
+    /// [`DialectError`] when the hop is untrusted, a needed header is absent or conflicting,
+    /// or the URI cannot be read.
+    pub fn describe(
+        self,
+        hop: ProxyHop,
+        check_method: &str,
+        check_path: &str,
+        headers: &[(String, String)],
+    ) -> Result<(RequestFacts, Vec<String>), DialectError> {
+        // FIRST, before reading anything the request says about itself. An untrusted hop
+        // means every header below is attacker-supplied, and there is no subset of them worth
+        // reading: the answer is not "fall back to the check request's own path", because
+        // that is the authenticator's path and authorising it would authorise the wrong
+        // resource.
+        if hop == ProxyHop::Untrusted {
+            return Err(DialectError::UntrustedHop);
+        }
+
+        let one = |name: &'static str| -> Result<Option<String>, DialectError> {
+            let mut seen: Option<&str> = None;
+            for (key, value) in headers {
+                if !key.eq_ignore_ascii_case(name) {
+                    continue;
+                }
+                match seen {
+                    Some(first) if first != value => {
+                        return Err(DialectError::Conflicting { header: name });
+                    }
+                    _ => seen = Some(value),
+                }
+            }
+            Ok(seen.map(str::to_owned))
+        };
+
+        let method = match self.method_header() {
+            Some(name) => one(name)?.ok_or(DialectError::Missing { header: name })?,
+            None => check_method.to_owned(),
+        };
+        let path = match self.uri_header() {
+            Some(name) => one(name)?.ok_or(DialectError::Missing { header: name })?,
+            None => check_path.to_owned(),
+        };
+        let host = one(self.host_header())?.ok_or(DialectError::Missing {
+            header: self.host_header(),
+        })?;
+
+        // The URI may carry a query or a fragment, neither of which a path criterion should
+        // see. Both are split, and a test covers each: the fragment half was untested and a
+        // mutant removing it survived.
+        let path = path.split(['?', '#']).next().unwrap_or_default().to_owned();
+        if !path.starts_with('/') || path.contains("..") {
+            return Err(DialectError::MalformedUri);
+        }
+        // AN ENCODED PATH IS ONE THIS ENGINE CANNOT DECIDE.
+        //
+        // `contains("..")` is a literal byte scan, so `%2e%2e`, `%2E%2E`, `.%2e` and
+        // `%252e%252e` all walked past it, and a proxy delivers the encoded form verbatim
+        // (Traefik sets `X-Forwarded-Uri` from the raw request URI; nginx's `$request_uri`
+        // is documented as unmodified) while the origin decodes and normalises to `/admin`.
+        // A review took `/public/%2e%2e/admin/keys` through a rule allowing `/public` and got
+        // an admission.
+        //
+        // Decoding here would mean writing a normaliser that has to agree with whatever the
+        // ORIGIN does, which is a different program per upstream. Refusing is the honest
+        // answer: this engine has no decoder, so a path it cannot read is a path it cannot
+        // authorise, and a deployment that needs encoded paths needs a decision about whose
+        // normalisation wins before it needs a rule.
+        if path.contains('%') {
+            return Err(DialectError::MalformedUri);
+        }
+        // Control characters, which reach a trace, a log line, or a redirect parameter.
+        if path.chars().any(char::is_control) {
+            return Err(DialectError::MalformedUri);
+        }
+        // A bound, because nothing else imposes one and a rule engine is not the place to
+        // discover that a proxy will forward a megabyte of path.
+        if path.len() > 4096 {
+            return Err(DialectError::MalformedUri);
+        }
+
+        // COMBINED, not last-wins. `headers.iter().cloned().collect()` into a `HashMap`
+        // keeps whichever entry comes last, which is the exact defect `facts_from_proxy` was
+        // fixed for forty lines below and documents: an adapter's ordering decided which
+        // value a rule saw, so a rule denying on a header was evadable by sending it twice.
+        // This path reintroduced it while the PR claimed the dialect path was not a second
+        // way in that skips what the other one does. It stripped reserved headers and
+        // dropped the combine.
+        let facts = RequestFacts {
+            method,
+            host: host_without_port(&host)?,
+            path,
+            headers: combine_repeated(headers.iter().cloned()),
+            ..RequestFacts::default()
+        };
+        Ok(strip_trusted_headers(facts))
+    }
 }
 
 #[cfg(test)]
@@ -769,6 +1048,511 @@ mod tests {
             Some("billing, admin"),
             "neither value may be dropped: an exact-value rule then matches neither, \
              which is the refusing direction"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Criterion 1, the dialect-independent half: the header-trust attack cases.
+    // The container conformance matrix is the other half and needs real proxies.
+    // -----------------------------------------------------------------------
+
+    const ALL_DIALECTS: [Dialect; 4] = [
+        Dialect::ForwardAuth,
+        Dialect::NginxAuthRequest,
+        Dialect::EnvoyExtAuthz,
+        Dialect::Haproxy,
+    ];
+
+    /// A well-formed check request for `dialect`, describing `GET https://app/admin/keys`.
+    fn check_for(dialect: Dialect) -> Vec<(String, String)> {
+        let mut headers = vec![(
+            dialect.host_header().to_owned(),
+            "app.example.test".to_owned(),
+        )];
+        if let Some(name) = dialect.method_header() {
+            headers.push((name.to_owned(), "GET".to_owned()));
+        }
+        if let Some(name) = dialect.uri_header() {
+            headers.push((name.to_owned(), "/admin/keys".to_owned()));
+        }
+        headers
+    }
+
+    /// ATTACK 1: A CLIENT-CONTROLLED ORIGINAL-URI IS NEVER READ FROM AN UNTRUSTED HOP.
+    ///
+    /// This is the criterion's first named attack class. The refusal happens before any
+    /// header is read, and the alternative is worse than it looks: falling back to the CHECK
+    /// request's own path would authorise the authenticator's path rather than the resource,
+    /// so a caller asking about `/admin` would be judged on `/verify`.
+    #[test]
+    fn an_untrusted_hop_is_refused_before_any_header_is_read() {
+        for dialect in ALL_DIALECTS {
+            let mut headers = check_for(dialect);
+            // A caller claiming a harmless path for a request that is really for /admin.
+            if let Some(name) = dialect.uri_header() {
+                headers.retain(|(key, _)| key != name);
+                headers.push((name.to_owned(), "/public/logo.png".to_owned()));
+            }
+            assert_eq!(
+                dialect.describe(ProxyHop::Untrusted, "POST", "/verify", &headers),
+                Err(DialectError::UntrustedHop),
+                "{dialect:?}: an untrusted hop must be refused"
+            );
+        }
+    }
+
+    /// ATTACK 2: HEADER SMUGGLING THROUGH AN UNTRUSTED HOP.
+    ///
+    /// A proxy sets the original URI and a client supplies another. Whichever the parser
+    /// happens to pick decides the authorization, and there is no safe pick, so a conflict is
+    /// a refusal rather than a choice. Taking the first would trust the proxy on some
+    /// stacks and the client on others.
+    #[test]
+    fn a_conflicting_original_uri_is_refused_rather_than_resolved() {
+        for dialect in ALL_DIALECTS {
+            let Some(name) = dialect.uri_header() else {
+                continue;
+            };
+            let mut headers = check_for(dialect);
+            headers.push((name.to_owned(), "/public/logo.png".to_owned()));
+            assert_eq!(
+                dialect.describe(ProxyHop::Trusted, "GET", "/verify", &headers),
+                Err(DialectError::Conflicting { header: name }),
+                "{dialect:?}: two different original URIs must refuse"
+            );
+        }
+    }
+
+    /// A REPEATED HEADER WITH THE SAME VALUE IS NOT A CONFLICT.
+    ///
+    /// The counterweight: refusing on repetition alone would break a proxy chain that sets
+    /// the same value twice, which is ordinary, and an operator would disable the check.
+    #[test]
+    fn a_repeated_but_identical_header_is_accepted() {
+        for dialect in ALL_DIALECTS {
+            let Some(name) = dialect.uri_header() else {
+                continue;
+            };
+            let mut headers = check_for(dialect);
+            headers.push((name.to_owned(), "/admin/keys".to_owned()));
+            let (facts, _) = dialect
+                .describe(ProxyHop::Trusted, "GET", "/verify", &headers)
+                .expect("identical repeats are not a conflict");
+            assert_eq!(facts.path, "/admin/keys", "{dialect:?}");
+        }
+    }
+
+    /// EACH DIALECT READS ITS OWN NAMES AND IGNORES THE OTHERS.
+    ///
+    /// Reading any recognised original-URI header regardless of dialect is the smuggling case
+    /// in its most practical form: a deployment behind nginx, which sets `X-Original-URI`,
+    /// would also honour an `X-Forwarded-Uri` that nginx never sets and therefore never
+    /// strips, so a client could supply one directly.
+    #[test]
+    fn a_dialect_ignores_another_dialects_original_uri_header() {
+        let foreign = [
+            ("x-forwarded-uri", "/attacker/choice"),
+            ("x-original-uri", "/attacker/choice"),
+            ("x-forwarded-method", "DELETE"),
+            ("x-original-method", "DELETE"),
+        ];
+        for dialect in ALL_DIALECTS {
+            let mut headers = check_for(dialect);
+            for (name, value) in foreign {
+                if Some(name) == dialect.uri_header() || Some(name) == dialect.method_header() {
+                    continue;
+                }
+                headers.push(((*name).to_owned(), (*value).to_owned()));
+            }
+            let (facts, _) = dialect
+                .describe(ProxyHop::Trusted, "GET", "/admin/keys", &headers)
+                .expect("the dialect's own headers are well formed");
+            assert_eq!(
+                facts.path, "/admin/keys",
+                "{dialect:?}: another dialect's header must not decide the path"
+            );
+            assert_eq!(facts.method, "GET", "{dialect:?}: nor the method");
+        }
+    }
+
+    /// A MISSING HEADER IS A REFUSAL, not an empty string.
+    ///
+    /// An empty path would match a rule written with an empty prefix, and would be reported
+    /// in a trace as though the client had asked for it.
+    #[test]
+    fn a_missing_original_request_header_is_refused() {
+        for dialect in ALL_DIALECTS {
+            for name in [dialect.uri_header(), dialect.method_header()]
+                .into_iter()
+                .flatten()
+            {
+                let headers: Vec<(String, String)> = check_for(dialect)
+                    .into_iter()
+                    .filter(|(key, _)| key != name)
+                    .collect();
+                assert_eq!(
+                    dialect.describe(ProxyHop::Trusted, "GET", "/admin/keys", &headers),
+                    Err(DialectError::Missing { header: name }),
+                    "{dialect:?}: a missing {name} must refuse"
+                );
+            }
+            // And the host, which every dialect needs, under ITS OWN header name. This
+            // hard-coded `x-forwarded-host`, which is only two of the four.
+            let name = dialect.host_header();
+            let headers: Vec<(String, String)> = check_for(dialect)
+                .into_iter()
+                .filter(|(key, _)| key != name)
+                .collect();
+            assert_eq!(
+                dialect.describe(ProxyHop::Trusted, "GET", "/admin/keys", &headers),
+                Err(DialectError::Missing { header: name }),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    /// A URI A PATH RULE CANNOT BE EVALUATED AGAINST IS REFUSED.
+    ///
+    /// Traversal is the one that matters: `/public/../admin` is `/admin` to a server and
+    /// `/public/...` to a prefix rule, so admitting it authorises the wrong resource. A URI
+    /// that is not a path at all is refused for the same reason: a rule written about paths
+    /// cannot decide it.
+    #[test]
+    fn a_uri_a_path_rule_cannot_decide_is_refused() {
+        for dialect in ALL_DIALECTS {
+            for bad in [
+                "/public/../admin/keys",
+                "..",
+                "admin/keys",
+                "https://elsewhere.test/admin",
+                "",
+            ] {
+                let mut headers = check_for(dialect);
+                let (method, path) = ("GET", bad);
+                if let Some(name) = dialect.uri_header() {
+                    headers.retain(|(key, _)| key != name);
+                    headers.push((name.to_owned(), bad.to_owned()));
+                }
+                let got = dialect.describe(ProxyHop::Trusted, method, path, &headers);
+                assert_eq!(
+                    got,
+                    Err(DialectError::MalformedUri),
+                    "{dialect:?}: {bad:?} must be refused"
+                );
+            }
+        }
+    }
+
+    /// A QUERY STRING IS NOT PART OF THE PATH.
+    ///
+    /// A path criterion written for `/admin` must not be satisfied or defeated by what
+    /// follows a `?`, and a rule set has a query criterion for the cases that need one.
+    #[test]
+    fn a_query_string_does_not_reach_the_path() {
+        for dialect in ALL_DIALECTS {
+            let mut headers = check_for(dialect);
+            let with_query = "/admin/keys?next=/public";
+            if let Some(name) = dialect.uri_header() {
+                headers.retain(|(key, _)| key != name);
+                headers.push((name.to_owned(), with_query.to_owned()));
+            }
+            let (facts, _) = dialect
+                .describe(ProxyHop::Trusted, "GET", with_query, &headers)
+                .expect("a query is not malformed");
+            assert_eq!(facts.path, "/admin/keys", "{dialect:?}");
+        }
+    }
+
+    /// THE DIALECT PATH SANITISES RESERVED HEADERS TOO.
+    ///
+    /// Otherwise it would be a second way into the engine that skips the stripping
+    /// `ForwardAuth::evaluate` performs, which is the shape a review already found once in
+    /// this module.
+    #[test]
+    fn a_dialect_strips_reserved_identity_headers() {
+        for dialect in ALL_DIALECTS {
+            let mut headers = check_for(dialect);
+            headers.push(("Remote-User".to_owned(), "root".to_owned()));
+            let (facts, stripped) = dialect
+                .describe(ProxyHop::Trusted, "GET", "/admin/keys", &headers)
+                .expect("well formed");
+            assert_eq!(stripped, vec!["Remote-User".to_owned()], "{dialect:?}");
+            assert!(
+                !facts.headers.keys().any(|key| is_trusted_header(key)),
+                "{dialect:?}: no reserved header may survive into the facts"
+            );
+        }
+    }
+
+    /// EVERY DIALECT PRODUCES THE SAME FACTS for the same original request.
+    ///
+    /// The point of supporting four: an operator's rules must not have to know which proxy is
+    /// in front. A dialect that read a different path from an equivalent check request would
+    /// make a rule set mean different things on different stacks.
+    #[test]
+    fn every_dialect_describes_one_original_request_identically() {
+        let mut described = Vec::new();
+        for dialect in ALL_DIALECTS {
+            let (facts, _) = dialect
+                .describe(ProxyHop::Trusted, "GET", "/admin/keys", &check_for(dialect))
+                .expect("well formed");
+            described.push((facts.method, facts.host, facts.path));
+        }
+        for (index, got) in described.iter().enumerate() {
+            assert_eq!(
+                got, &described[0],
+                "dialect {index} describes the same request differently"
+            );
+        }
+        assert_eq!(
+            described[0],
+            (
+                "GET".to_owned(),
+                "app.example.test".to_owned(),
+                "/admin/keys".to_owned()
+            )
+        );
+    }
+
+    /// EACH DIALECT'S HEADER NAMES, PINNED TO LITERALS.
+    ///
+    /// Every other dialect test builds its fixture from `dialect.uri_header()` and
+    /// `dialect.method_header()`, so changing the mapping changes the fixture with it and the
+    /// suite stays green. A sweep proved it: pointing `NginxAuthRequest` at `x-forwarded-uri`
+    /// left all of them passing, and that is a deployment reading a header nginx never sets
+    /// and therefore never strips, which a client can supply directly.
+    ///
+    /// These are the names each proxy is conventionally configured to send. What the test
+    /// fixes is not the convention but the SET: a dialect must read its own and no others.
+    #[test]
+    fn the_dialect_header_names_are_the_documented_ones() {
+        assert_eq!(
+            Dialect::ForwardAuth.method_header(),
+            Some("x-forwarded-method")
+        );
+        assert_eq!(Dialect::ForwardAuth.uri_header(), Some("x-forwarded-uri"));
+
+        assert_eq!(
+            Dialect::NginxAuthRequest.method_header(),
+            Some("x-original-method")
+        );
+        assert_eq!(
+            Dialect::NginxAuthRequest.uri_header(),
+            Some("x-original-uri"),
+            "nginx sets x-original-uri; reading x-forwarded-uri here would honour a header \
+             nginx never sets and never strips"
+        );
+
+        assert_eq!(
+            Dialect::EnvoyExtAuthz.method_header(),
+            None,
+            "the ext_authz check request carries the original method as its own"
+        );
+        assert_eq!(Dialect::EnvoyExtAuthz.uri_header(), None);
+
+        assert_eq!(Dialect::Haproxy.method_header(), Some("x-forwarded-method"));
+        assert_eq!(
+            Dialect::Haproxy.uri_header(),
+            Some("x-forwarded-uri"),
+            "HAProxy forward-auth sets X-Forwarded-Method, X-Forwarded-Host and \
+             X-Forwarded-URI. This row said x-original-uri, which HAProxy neither sets nor \
+             strips, so a client supplied it and chose its own path"
+        );
+
+        // The host header is NOT the same for every dialect, though it was, and requiring
+        // x-forwarded-host from all four made Envoy and nginx refuse every real request.
+        assert_eq!(Dialect::ForwardAuth.host_header(), "x-forwarded-host");
+        assert_eq!(Dialect::Haproxy.host_header(), "x-forwarded-host");
+        assert_eq!(
+            Dialect::EnvoyExtAuthz.host_header(),
+            "host",
+            "ext_authz includes Host, Method, Path, Content-Length and Authorization by \
+             default and nothing else"
+        );
+        assert_eq!(
+            Dialect::NginxAuthRequest.host_header(),
+            "host",
+            "auth_request sets no headers; the subrequest inherits Host"
+        );
+    }
+
+    /// A CONFLICT REFUSES ON EVERY HEADER IT GUARDS, not just the URI.
+    ///
+    /// `one()` is applied to the method, the host and the URI alike, and only the URI was
+    /// tested: mutants turning the check off for the method and for the host both survived.
+    #[test]
+    fn a_conflict_on_any_original_request_header_is_refused() {
+        for dialect in ALL_DIALECTS {
+            // The host, which every dialect reads.
+            let mut headers = check_for(dialect);
+            headers.push((
+                dialect.host_header().to_owned(),
+                "elsewhere.test".to_owned(),
+            ));
+            assert_eq!(
+                dialect.describe(ProxyHop::Trusted, "GET", "/admin/keys", &headers),
+                Err(DialectError::Conflicting {
+                    header: dialect.host_header()
+                }),
+                "{dialect:?}: two hosts must refuse"
+            );
+
+            if let Some(name) = dialect.method_header() {
+                let mut headers = check_for(dialect);
+                headers.push((name.to_owned(), "DELETE".to_owned()));
+                assert_eq!(
+                    dialect.describe(ProxyHop::Trusted, "GET", "/admin/keys", &headers),
+                    Err(DialectError::Conflicting { header: name }),
+                    "{dialect:?}: two methods must refuse"
+                );
+            }
+        }
+    }
+
+    /// A PERCENT-ENCODED PATH IS REFUSED.
+    ///
+    /// `contains("..")` is a literal byte scan. A proxy forwards the encoded form verbatim
+    /// and the origin decodes it, so `/public/%2e%2e/admin/keys` reached a rule allowing
+    /// `/public` and was admitted. This engine has no decoder, so a path it cannot read is a
+    /// path it cannot authorise.
+    #[test]
+    fn a_percent_encoded_path_is_refused_because_nothing_here_can_decode_it() {
+        for dialect in ALL_DIALECTS {
+            for encoded in [
+                "/public/%2e%2e/admin/keys",
+                "/public/%2E%2E/admin/keys",
+                "/public/%2e%2e%2fadmin/keys",
+                "/public/.%2e/admin/keys",
+                "/public/%252e%252e/admin/keys",
+                // Not traversal, but still undecidable by a rule written on decoded text.
+                "/public/a%20b",
+            ] {
+                let mut headers = check_for(dialect);
+                if let Some(name) = dialect.uri_header() {
+                    headers.retain(|(key, _)| key != name);
+                    headers.push((name.to_owned(), encoded.to_owned()));
+                }
+                assert_eq!(
+                    dialect.describe(ProxyHop::Trusted, "GET", encoded, &headers),
+                    Err(DialectError::MalformedUri),
+                    "{dialect:?}: {encoded} must be refused"
+                );
+            }
+        }
+    }
+
+    /// A CONTROL CHARACTER OR AN ABSURD LENGTH IS REFUSED.
+    ///
+    /// A newline in a path reaches a trace, a log line and a redirect parameter. Nothing
+    /// bounded the length at all.
+    #[test]
+    fn a_path_that_cannot_safely_be_logged_or_bounded_is_refused() {
+        let long = format!("/{}", "a".repeat(5000));
+        for bad in [
+            "/admin\u{0}/keys",
+            "/admin\n/keys",
+            "/admin\r\n/keys",
+            &long,
+        ] {
+            let dialect = Dialect::ForwardAuth;
+            let mut headers = check_for(dialect);
+            headers.retain(|(key, _)| key != "x-forwarded-uri");
+            headers.push(("x-forwarded-uri".to_owned(), bad.to_owned()));
+            assert_eq!(
+                dialect.describe(ProxyHop::Trusted, "GET", bad, &headers),
+                Err(DialectError::MalformedUri),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// A FRAGMENT IS SPLIT OFF THE PATH, like a query.
+    ///
+    /// The `'#'` half of the split was untested and a mutant removing it survived.
+    #[test]
+    fn a_fragment_does_not_reach_the_path() {
+        for dialect in ALL_DIALECTS {
+            let with_fragment = "/admin/keys#section";
+            let mut headers = check_for(dialect);
+            if let Some(name) = dialect.uri_header() {
+                headers.retain(|(key, _)| key != name);
+                headers.push((name.to_owned(), with_fragment.to_owned()));
+            }
+            let (facts, _) = dialect
+                .describe(ProxyHop::Trusted, "GET", with_fragment, &headers)
+                .expect("a fragment is not malformed");
+            assert_eq!(facts.path, "/admin/keys", "{dialect:?}");
+        }
+    }
+
+    /// THE HOST LOSES ITS PORT AND A COMMA-JOINED LIST IS REFUSED.
+    ///
+    /// `RequestFacts::host` says "the host, without port" and nothing enforced it. Traefik
+    /// sets `X-Forwarded-Host` from the request Host, which carries a non-default port, so a
+    /// host rule silently stopped matching; a chained proxy comma-appends, which is ambiguous
+    /// rather than merely decorated.
+    #[test]
+    fn a_host_is_normalised_to_one_host_without_a_port() {
+        let dialect = Dialect::ForwardAuth;
+        for (sent, expected) in [
+            ("app.example.test", "app.example.test"),
+            ("app.example.test:8443", "app.example.test"),
+            ("[2001:db8::1]:8443", "[2001:db8::1]"),
+        ] {
+            let mut headers = check_for(dialect);
+            headers.retain(|(key, _)| key != "x-forwarded-host");
+            headers.push(("x-forwarded-host".to_owned(), sent.to_owned()));
+            let (facts, _) = dialect
+                .describe(ProxyHop::Trusted, "GET", "/admin/keys", &headers)
+                .expect("a port is not a refusal");
+            assert_eq!(facts.host, expected, "{sent}");
+        }
+
+        for ambiguous in ["inner.test, app.example.test", ""] {
+            let mut headers = check_for(dialect);
+            headers.retain(|(key, _)| key != "x-forwarded-host");
+            headers.push(("x-forwarded-host".to_owned(), ambiguous.to_owned()));
+            let got = dialect.describe(ProxyHop::Trusted, "GET", "/admin/keys", &headers);
+            assert!(
+                matches!(
+                    got,
+                    Err(DialectError::MalformedHost | DialectError::Missing { .. })
+                ),
+                "{ambiguous:?} must not become a host a rule is compared against: {got:?}"
+            );
+        }
+    }
+
+    /// BOTH ADAPTERS COMBINE A REPEATED HEADER THE SAME WAY.
+    ///
+    /// The dialect path collected into a `HashMap`, which keeps the last entry, so the same
+    /// request decided differently depending on which door it came through: a rule denying on
+    /// a header was evadable by sending it twice.
+    #[test]
+    fn the_two_adapters_agree_about_a_repeated_header() {
+        let dialect = Dialect::ForwardAuth;
+        let mut headers = check_for(dialect);
+        headers.push(("x-internal".to_owned(), "no".to_owned()));
+        headers.push(("x-internal".to_owned(), "yes".to_owned()));
+
+        let (via_dialect, _) = dialect
+            .describe(ProxyHop::Trusted, "GET", "/admin/keys", &headers)
+            .expect("well formed");
+        let (via_adapter, _) = facts_from_proxy(
+            "GET",
+            "app.example.test",
+            "/admin/keys",
+            headers.iter().cloned(),
+        );
+        assert_eq!(
+            via_dialect.headers.get("x-internal"),
+            via_adapter.headers.get("x-internal"),
+            "the two doors into the engine must not disagree"
+        );
+        assert_eq!(
+            via_dialect.headers.get("x-internal").map(String::as_str),
+            Some("no, yes"),
+            "neither value may be dropped"
         );
     }
 }
