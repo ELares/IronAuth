@@ -675,3 +675,322 @@ async fn a_rotated_away_session_cookie_mints_nothing() {
         "the rotated-to session must still mint: {successor_body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1279: the template JWKS during a store outage.
+//
+// This surface is what criterion 1 rests on: a verifier fetches it, caches it, and checks a
+// tokenized session JWT against it with no database call. Until now it read the store twice per
+// request with no cache and returned 500 on any error, so a verifier whose cache expired
+// mid-incident could not refetch and tokens that were still perfectly valid stopped validating.
+// The environment's JWKS has been protected from exactly that since #1261.
+// ---------------------------------------------------------------------------
+
+/// Run `body` with the session-token template reads broken, restoring before returning.
+///
+/// BOTH TABLES, because the handler makes two reads and a fix that only covered one would look
+/// identical from outside for the first request and then fail on the second.
+async fn with_unreadable_templates<F, Fut, T>(harness: &Harness, body: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    for statement in [
+        "ALTER TABLE session_token_templates RENAME TO session_token_templates_hidden",
+        "ALTER TABLE session_token_template_keys RENAME TO session_token_template_keys_hidden",
+    ] {
+        harness.db().execute_owner_sql(statement).await;
+    }
+    let out = body().await;
+    for statement in [
+        "ALTER TABLE session_token_templates_hidden RENAME TO session_token_templates",
+        "ALTER TABLE session_token_template_keys_hidden RENAME TO session_token_template_keys",
+    ] {
+        harness.db().execute_owner_sql(statement).await;
+    }
+    out
+}
+
+/// THE CRITERION: a warm template JWKS still publishes while the store cannot answer.
+///
+/// Byte-identical to the healthy document rather than merely present, and pinned against the
+/// KEYS THE STORE HOLDS rather than only against the earlier response, so the assertion has an
+/// expectation from outside the thing it checks.
+#[tokio::test]
+async fn a_template_jwks_serves_a_fresh_cached_document_when_the_store_cannot_be_read() {
+    let harness = Harness::start_store_backed().await;
+    harness
+        .install_session_token_template(
+            "orders",
+            AUDIENCE,
+            60,
+            r#"[{"kind":"static","name":"tier","value":"gold"}]"#,
+        )
+        .await;
+
+    let (status, warm) = fetch(&harness, &template_jwks_path(&harness, "orders")).await;
+    assert_eq!(status, StatusCode::OK, "precondition: it serves healthy");
+    let warm_kids: Vec<String> = serde_json::from_str::<Value>(&warm).expect("valid JSON")["keys"]
+        .as_array()
+        .expect("a keys array")
+        .iter()
+        .filter_map(|key| key["kid"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        !warm_kids.is_empty(),
+        "precondition: the template publishes at least one key, or the outage assertion below \
+         would be satisfied by an empty document"
+    );
+
+    let path = template_jwks_path(&harness, "orders");
+    let (status, during) = with_unreadable_templates(&harness, || fetch(&harness, &path)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a verifier must still be able to refetch during a store outage: {during}"
+    );
+    assert_eq!(
+        during, warm,
+        "and the document must be byte-identical to the healthy one, not a degraded variant \
+         cached at every verifier for the full max-age"
+    );
+}
+
+/// A COLD TEMPLATE STILL FAILS, because there is nothing to publish.
+///
+/// The relaxation serves what was already public; it does not invent a document. Without this
+/// the test above would pass against a handler that returned an empty key set on any error,
+/// which is the "publishes no keys" outage its own comment warns about.
+#[tokio::test]
+async fn a_template_never_served_before_fails_rather_than_publishing_an_empty_set() {
+    let harness = Harness::start_store_backed().await;
+    harness
+        .install_session_token_template(
+            "orders",
+            AUDIENCE,
+            60,
+            r#"[{"kind":"static","name":"tier","value":"gold"}]"#,
+        )
+        .await;
+
+    // NOT fetched while healthy: this process has never rendered it.
+    let path = template_jwks_path(&harness, "orders");
+    let (status, body) = with_unreadable_templates(&harness, || fetch(&harness, &path)).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "with nothing cached there is nothing to publish, and an empty key set would be worse \
+         than an error: a verifier caches it and rejects every token for the window: {body}"
+    );
+}
+
+/// AN ABSENT TEMPLATE IS STILL A 404, even when another one is cached.
+///
+/// Only an UNREADABLE store is softened. A read that succeeded and reported "no such template"
+/// is a known answer and keeps its own.
+#[tokio::test]
+async fn an_absent_template_is_still_not_found_while_another_is_cached() {
+    let harness = Harness::start_store_backed().await;
+    harness
+        .install_session_token_template(
+            "orders",
+            AUDIENCE,
+            60,
+            r#"[{"kind":"static","name":"tier","value":"gold"}]"#,
+        )
+        .await;
+    let (status, _) = fetch(&harness, &template_jwks_path(&harness, "orders")).await;
+    assert_eq!(status, StatusCode::OK, "precondition: one template is warm");
+
+    let (status, body) = fetch(&harness, &template_jwks_path(&harness, "typo")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a misspelled template must not be answered from another template's cache: {body}"
+    );
+}
+
+/// A STALE CACHED DOCUMENT IS NEVER SERVED, even during an outage.
+///
+/// This test exists because its absence was measured: a review-style mutation removing the
+/// freshness comparison entirely left all twenty tests in this file green, because none of them
+/// advanced the clock past the window. The "stale is never served" sentence in the handler was
+/// therefore decoration.
+///
+/// The bound matters for the reason #204 gives about the entry cache: serving a stale key set
+/// extends the window in which a rotated-out key is still trusted by every verifier. An outage
+/// that outlasts the window has to CLOSE the surface rather than widen that window, which is
+/// why this asserts a 500 rather than a document.
+#[tokio::test]
+async fn a_stale_cached_template_document_is_not_served_during_an_outage() {
+    let harness = Harness::start_store_backed().await;
+    harness
+        .install_session_token_template(
+            "orders",
+            AUDIENCE,
+            60,
+            r#"[{"kind":"static","name":"tier","value":"gold"}]"#,
+        )
+        .await;
+    let path = template_jwks_path(&harness, "orders");
+
+    let (status, _) = fetch(&harness, &path).await;
+    assert_eq!(status, StatusCode::OK, "precondition: the document is warm");
+
+    // WITHIN the window it still publishes during an outage, which is the other half of the
+    // bound and is what makes the assertion below about staleness rather than about the cache
+    // never working.
+    let (status, _) = with_unreadable_templates(&harness, || fetch(&harness, &path)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "precondition: a FRESH cached document publishes during an outage"
+    );
+
+    // PAST the window, with the store still unreachable. Only the clock moved.
+    harness.clock().advance(std::time::Duration::from_secs(601));
+    let (status, body) = with_unreadable_templates(&harness, || fetch(&harness, &path)).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a cached document older than the publication window must not be served: that would \
+         extend the window in which a rotated-out key is trusted, for as long as the outage \
+         lasts: {body}"
+    );
+}
+
+/// A MALFORMED STORED KEY IS A 500, NOT A CACHED 200.
+///
+/// `published_keys` returns `Err` for two different things, and its own rustdoc says so: "on a
+/// persistence fault, OR if a stored row fails to decode". The first version of this change
+/// routed both to the cache, so a review corrupted a key row's `id`, got a 200 serving the last
+/// good document, and noted that `main` had returned 500. That converts a surfaced data fault
+/// into a healthy-looking success with a full max-age: an operator watching 5xx sees nothing
+/// while the template's material is unreadable.
+#[tokio::test]
+async fn a_malformed_stored_key_is_an_error_even_with_a_warm_cache() {
+    let harness = Harness::start_store_backed().await;
+    harness
+        .install_session_token_template(
+            "orders",
+            AUDIENCE,
+            60,
+            r#"[{"kind":"static","name":"tier","value":"gold"}]"#,
+        )
+        .await;
+    let path = template_jwks_path(&harness, "orders");
+
+    let (status, _) = fetch(&harness, &path).await;
+    assert_eq!(status, StatusCode::OK, "precondition: the cache is warm");
+
+    // An id that no longer decodes in scope. The column is `text` with no format CHECK, so a
+    // botched clone or restore reaches this state.
+    harness
+        .db()
+        .execute_owner_sql("UPDATE session_token_template_keys SET id = 'stk_broken'")
+        .await;
+
+    let (status, body) = fetch(&harness, &path).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the store ANSWERED and what it said is that this template's material is broken; \
+         serving the cached document would hide a real fault behind a stale success: {body}"
+    );
+}
+
+/// A ROTATED-OUT KEY IS NOT PUBLISHED FROM THE CACHE, even inside the freshness window.
+///
+/// The cache holds the published ROWS and the window is re-applied at request time. Caching the
+/// rendered document froze the filter into the bytes instead, and a review advanced the clock
+/// past a key's `expire_at` while still inside the window and got a 200 naming the withdrawn
+/// kid, against a live store answering with an empty set.
+///
+/// That is the harm #204 names as the reason a STALE set is refused, delivered on the FRESH
+/// path, which is why it needed its own fix rather than a shorter TTL.
+#[tokio::test]
+async fn a_key_past_its_expiry_is_not_published_from_the_cache() {
+    let harness = Harness::start_store_backed().await;
+    harness
+        .install_session_token_template(
+            "orders",
+            AUDIENCE,
+            60,
+            r#"[{"kind":"static","name":"tier","value":"gold"}]"#,
+        )
+        .await;
+    let path = template_jwks_path(&harness, "orders");
+
+    // THE EXPIRY IS STAMPED BEFORE THE CACHE IS WARMED, which is the scenario that matters and
+    // is the one an earlier version of this test got wrong. A rotation sets `expire_at` when it
+    // happens, so the read that fills the cache CARRIES it. Setting it afterwards tests
+    // something else: whether a cache can learn about a change made during an outage, which it
+    // cannot and which nothing here claims.
+    //
+    // 100 seconds from the epoch, INSIDE the 600 second freshness window, so a cache keyed on
+    // time alone still calls its entry fresh and only re-applying the window can withdraw it.
+    harness
+        .db()
+        .execute_owner_sql(
+            "UPDATE session_token_template_keys \
+             SET expire_at = TIMESTAMPTZ 'epoch' + interval '100 seconds'",
+        )
+        .await;
+
+    let (status, warm) = fetch(&harness, &path).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "precondition: it still publishes before the expiry passes"
+    );
+    let warm_kid = serde_json::from_str::<Value>(&warm).expect("valid JSON")["keys"][0]["kid"]
+        .as_str()
+        .expect("a kid")
+        .to_owned();
+
+    harness.clock().advance(std::time::Duration::from_secs(200));
+
+    let (status, body) = with_unreadable_templates(&harness, || fetch(&harness, &path)).await;
+    assert!(
+        !body.contains(&warm_kid),
+        "a key past its expiry must not be published from the cache, or every verifier keeps \
+         trusting a rotated-out key for the rest of the window: {status} {body}"
+    );
+}
+
+/// AN EMPTY PUBLISHED SET IS NEVER CACHED, AND NEVER SERVED.
+///
+/// `JwkSet::from_signing_keys(empty)` is `Ok`, so `{"keys":[]}` would otherwise be a legitimate
+/// cached document. A verifier caches that as "this issuer publishes no keys" and rejects every
+/// token against it for the window, which is the outage the handler's own 404-on-missing
+/// comment exists to avoid.
+#[tokio::test]
+async fn an_empty_published_set_is_an_error_rather_than_a_document() {
+    let harness = Harness::start_store_backed().await;
+    harness
+        .install_session_token_template(
+            "orders",
+            AUDIENCE,
+            60,
+            r#"[{"kind":"static","name":"tier","value":"gold"}]"#,
+        )
+        .await;
+    let path = template_jwks_path(&harness, "orders");
+
+    // Push the key's publication into the future: the template exists, and nothing is published.
+    harness
+        .db()
+        .execute_owner_sql(
+            "UPDATE session_token_template_keys \
+             SET publish_at = TIMESTAMPTZ 'epoch' + interval '10000 seconds'",
+        )
+        .await;
+
+    let (status, body) = fetch(&harness, &path).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an empty key set is not a document: a verifier caches it as 'publishes no keys' and \
+         rejects every token for the window, which is worse than an error it retries: {body}"
+    );
+}
