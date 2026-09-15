@@ -169,6 +169,25 @@ jobs:
         uses: sigstore/cosign-installer@v3
       - name: Sign image (keyless)
         run: cosign sign --yes "${{ steps.push.outputs.image }}@${{ steps.push.outputs.digest }}"
+      # THE SIGNATURE IS CHECKED HERE, by the same script docs/RELEASING.md tells a
+      # consumer to run (issue #151 criterion 3). Signing without ever verifying
+      # publishes a signature nobody has confirmed is checkable: a wrong identity, a
+      # misconfigured issuer or an unpushed signature all look identical from the
+      # signing side, and the first person to find out would be a user.
+      #
+      # It runs the exact tag, so this asserts the image carries a signature from THIS
+      # release rather than from any release.
+      - name: Verify the signature we just published
+        run: scripts/verify-image.sh "${{ steps.push.outputs.image }}@${{ steps.push.outputs.digest }}" "$GITHUB_REF_NAME"
+      # THE COMMAND THE DOCS HAND A CONSUMER, run against the same image.
+      #
+      # The step above passes the exact tag, which exercises the
+      # --certificate-identity branch. The default invocation in
+      # docs/RELEASING.md passes no tag and takes the --certificate-identity-regexp
+      # branch instead, and nothing ran it: the pattern a consumer is told to
+      # trust was the one path CI never took.
+      - name: Verify again the way a consumer is told to
+        run: scripts/verify-image.sh "${{ steps.push.outputs.image }}@${{ steps.push.outputs.digest }}"
       - name: Attest image provenance
         uses: actions/attest-build-provenance@v4
         with:
