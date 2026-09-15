@@ -146,7 +146,7 @@ pub struct Rule {
 }
 
 /// What the engine was told about a request.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RequestFacts {
     /// The request method.
     pub method: String,
