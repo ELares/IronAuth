@@ -219,6 +219,180 @@ pub const CONTRACT: &[MetricSpec] = &[
         labels: &["sink_type"],
         help: "Log stream dead letters awaiting replay, by sink type",
     },
+    // ---------------------------------------------------------------------------------
+    // METRICS DECLARED OUTSIDE THIS MODULE (issue #152 criterion 1).
+    //
+    // The contract covered only what this module declares, so twenty-seven metrics emitted
+    // from other crates were promised to nobody and checked by nothing. They are named by
+    // literal here rather than by constant because the constants live in their own crates,
+    // and `ironauth-server` does not depend on all of them.
+    //
+    // `the_contract_covers_every_metric_the_workspace_emits` is what keeps this list
+    // honest in the other direction: a metric added anywhere in the workspace fails until
+    // it has a row here.
+    // ---------------------------------------------------------------------------------
+    MetricSpec {
+        name: "ironauth_connector_healthy",
+        kind: MetricKind::Gauge,
+        labels: &["connector"],
+        help: "Whether an upstream connector's last probe succeeded",
+    },
+    MetricSpec {
+        name: "ironauth_connector_upstream_error_total",
+        kind: MetricKind::Counter,
+        labels: &["connector", "kind"],
+        help: "Upstream connector calls that failed, by failure kind",
+    },
+    MetricSpec {
+        name: "ironauth_connector_upstream_success_total",
+        kind: MetricKind::Counter,
+        labels: &["connector"],
+        help: "Upstream connector calls that succeeded",
+    },
+    MetricSpec {
+        name: "ironauth_factor_downgrade_recovery_permitted_total",
+        kind: MetricKind::Counter,
+        labels: &["factor", "surface"],
+        help: "Recovery flows permitted to use a weaker factor",
+    },
+    MetricSpec {
+        name: "ironauth_factor_downgrade_refused_total",
+        kind: MetricKind::Counter,
+        labels: &["factor", "path"],
+        help: "Authentications refused for attempting a weaker factor than the policy allows",
+    },
+    MetricSpec {
+        name: "ironauth_lazy_migration_breaker_state",
+        kind: MetricKind::Gauge,
+        labels: &[],
+        help: "Lazy password-migration breaker state, as a number a dashboard can threshold",
+    },
+    MetricSpec {
+        name: "ironauth_lazy_migration_breaker_transitions_total",
+        kind: MetricKind::Counter,
+        labels: &["to"],
+        help: "Lazy-migration breaker transitions, by the state entered",
+    },
+    MetricSpec {
+        name: "ironauth_lazy_migration_hook_latency_seconds",
+        kind: MetricKind::Histogram,
+        labels: &[],
+        help: "Wall time of a lazy-migration verification hook",
+    },
+    MetricSpec {
+        name: "ironauth_lazy_migration_hook_total",
+        kind: MetricKind::Counter,
+        labels: &["outcome"],
+        help: "Lazy-migration hook invocations, by outcome",
+    },
+    MetricSpec {
+        name: "ironauth_lazy_migration_migrated_total",
+        kind: MetricKind::Counter,
+        labels: &[],
+        help: "Credentials rehashed into the current scheme by a lazy migration",
+    },
+    MetricSpec {
+        name: "ironauth_oidc_code_reuse_total",
+        kind: MetricKind::Counter,
+        labels: &[],
+        help: "Authorization codes presented more than once, which is a replay signal",
+    },
+    MetricSpec {
+        name: "ironauth_oidc_redeem_error_total",
+        kind: MetricKind::Counter,
+        labels: &[],
+        help: "Token redemptions that failed",
+    },
+    MetricSpec {
+        name: "ironauth_oidc_refresh_reuse_total",
+        kind: MetricKind::Counter,
+        labels: &[],
+        help: "Refresh tokens presented after rotation, which is a theft signal",
+    },
+    MetricSpec {
+        name: "ironauth_outbound_fetch_blocked_total",
+        kind: MetricKind::Counter,
+        labels: &["purpose", "reason"],
+        help: "Outbound fetches refused by the destination policy",
+    },
+    MetricSpec {
+        name: "ironauth_outbound_fetch_requests_total",
+        kind: MetricKind::Counter,
+        labels: &["outcome", "purpose"],
+        help: "Outbound fetches attempted, by purpose and outcome",
+    },
+    MetricSpec {
+        name: "ironauth_password_breached_at_login_total",
+        kind: MetricKind::Counter,
+        labels: &[],
+        help: "Logins where the presented password matched a breach corpus",
+    },
+    MetricSpec {
+        name: "ironauth_password_hash_admission_rejected_total",
+        kind: MetricKind::Counter,
+        labels: &["reason"],
+        help: "Hash requests refused before reaching the pool, by reason",
+    },
+    MetricSpec {
+        name: "ironauth_password_hash_duration_seconds",
+        kind: MetricKind::Histogram,
+        labels: &["op"],
+        help: "Wall time of a password hash or verify",
+    },
+    MetricSpec {
+        name: "ironauth_password_hash_pool_active_workers",
+        kind: MetricKind::Gauge,
+        labels: &[],
+        help: "Hash pool workers currently running a job",
+    },
+    MetricSpec {
+        name: "ironauth_password_hash_pool_queue_depth",
+        kind: MetricKind::Gauge,
+        labels: &[],
+        help: "Hash requests waiting for a pool worker",
+    },
+    MetricSpec {
+        name: "ironauth_password_hash_pool_threads",
+        kind: MetricKind::Gauge,
+        labels: &[],
+        help: "Hash pool worker threads configured",
+    },
+    MetricSpec {
+        name: "ironauth_password_screen_total",
+        kind: MetricKind::Counter,
+        labels: &["outcome"],
+        help: "Password screening checks, by outcome",
+    },
+    MetricSpec {
+        name: "ironauth_quota_decisions_total",
+        kind: MetricKind::Counter,
+        labels: &["decision", "dimension"],
+        help: "Quota decisions, by dimension and admitted or denied",
+    },
+    MetricSpec {
+        name: "ironauth_sms_route_throttled_total",
+        kind: MetricKind::Counter,
+        labels: &["route"],
+        help: "SMS sends refused by a per-route throttle",
+    },
+    MetricSpec {
+        name: "ironauth_sms_send_hash_rejected_total",
+        kind: MetricKind::Counter,
+        labels: &[],
+        help: "SMS sends refused because the recipient hash was rejected",
+    },
+    MetricSpec {
+        name: "ironauth_sms_send_refused_total",
+        kind: MetricKind::Counter,
+        labels: &["reason"],
+        help: "SMS sends refused, by reason",
+    },
+    MetricSpec {
+        name: "ironauth_verification_send_suppressed_total",
+        kind: MetricKind::Counter,
+        labels: &["purpose"],
+        help: "Verification sends suppressed, by purpose",
+    },
 ];
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();

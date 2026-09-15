@@ -159,6 +159,191 @@ fn workspace_sources() -> Vec<String> {
     out
 }
 
+/// Byte ranges of every `#[cfg(test)]` item in `source`.
+///
+/// A TEST EMIT IS NOT AN EXPORT, and this file already believed that: `workspace_sources`
+/// exists to read the whole tree, and the intent was always that tests do not count. But in
+/// this repository tests live in two places, and only `tests/` directories were excluded.
+/// An emit inside `#[cfg(test)] mod tests` in a `src/` file counted as production.
+///
+/// A review deleted BOTH production emits of `ironauth_up` -- the process no longer set its
+/// liveness gauge at all -- and every check stayed green, propped up by a single emit inside
+/// a test module. An `absent(ironauth_up)` alert would never have fired.
+fn cfg_test_spans(source: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(at) = source[from..].find("#[cfg(test)]") {
+        let start = from + at;
+        // Find the item's opening brace, then its matching close.
+        let Some(open_offset) = source[start..].find('{') else {
+            break;
+        };
+        let open = start + open_offset;
+        let mut depth = 0usize;
+        let mut close = open;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = open + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        spans.push((start, close));
+        from = close.max(start + 1);
+    }
+    spans
+}
+
+/// Every `pub const NAME: &str = "ironauth_..."` ANYWHERE in the workspace.
+///
+/// The sibling `value_of` reads only this crate's metrics module, which is correct for the
+/// constants declared there and blind to the ones other crates declare. A metric named by a
+/// constant in `ironauth-fetch` was invisible to every check here.
+fn workspace_metric_consts() -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for source in workspace_sources() {
+        // SPAN-BASED, not line-based. `pub const NAME: &str =` wraps onto the next line when
+        // the value is long, and a line-based read missed exactly those: the first version of
+        // this scan could not see
+        // `ironauth_lazy_migration_breaker_transitions_total`, whose declaration wraps.
+        let mut from = 0;
+        while let Some(at) = source[from..].find("const ") {
+            let start = from + at;
+            from = start + "const ".len();
+            let Some(rest) = source.get(from..) else {
+                break;
+            };
+            let Some((ident, tail)) = rest.split_once(':') else {
+                continue;
+            };
+            let ident = ident.trim();
+            if ident.is_empty()
+                || !ident
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            {
+                continue;
+            }
+            // The value must follow within this declaration, so stop at the terminating
+            // semicolon rather than running on into the next item.
+            let Some((decl, _)) = tail.split_once(';') else {
+                continue;
+            };
+            // Split on the `=` and then take the first string, rather than matching `= "`:
+            // a long value wraps onto the next line, putting a newline between them. That is
+            // exactly how `ironauth_lazy_migration_breaker_transitions_total` is written, and
+            // it was the last metric this scan could not see.
+            let Some((_, value)) = decl.split_once('=') else {
+                continue;
+            };
+            let Some((_, value)) = value.split_once('"') else {
+                continue;
+            };
+            let Some((value, _)) = value.split_once('"') else {
+                continue;
+            };
+            if value.starts_with("ironauth_") {
+                out.insert(ident.to_owned(), value.to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// Every metric name the workspace emits from PRODUCTION code.
+///
+/// Accepts both spellings of the first macro argument: a bare string literal and a constant.
+/// The sibling `emit_sites` accepts only an all-uppercase identifier, so every
+/// literal-named metric was skipped -- which is why the contract covered eleven of the
+/// thirty-eight this workspace emits.
+fn workspace_emitted_metrics() -> std::collections::BTreeSet<String> {
+    let consts = workspace_metric_consts();
+    let mut names = std::collections::BTreeSet::new();
+    for source in workspace_sources() {
+        let skip = cfg_test_spans(&source);
+        for macro_name in ["counter", "gauge", "histogram"] {
+            let needle = format!("{macro_name}!(");
+            let mut from = 0;
+            while let Some(at) = source[from..].find(&needle) {
+                let start = from + at;
+                let open = start + needle.len();
+                from = open;
+                // Anchored, so `describe_gauge!(` does not read as `gauge!(`.
+                if start > 0
+                    && source[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                if skip.iter().any(|(lo, hi)| start >= *lo && start <= *hi) {
+                    continue;
+                }
+                let Some(first) = source[open..]
+                    .split(',')
+                    .next()
+                    .and_then(|first| first.split(')').next())
+                else {
+                    continue;
+                };
+                let first = first.trim();
+                let name = if let Some(literal) = first
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.split('"').next())
+                {
+                    literal.to_owned()
+                } else {
+                    let ident = first.rsplit("::").next().unwrap_or("").trim();
+                    match consts.get(ident) {
+                        Some(value) => value.clone(),
+                        None => continue,
+                    }
+                };
+                if name.starts_with("ironauth_") {
+                    names.insert(name);
+                }
+            }
+        }
+    }
+    names
+}
+
+/// THE OTHER BOUNDARY: every metric the WORKSPACE emits is in the contract.
+///
+/// `the_contract_covers_every_metric_this_module_declares` covers what this module declares,
+/// which was eleven. The workspace emits thirty-eight, so twenty-seven were promised to
+/// nobody and checked by nothing: not their kind, not their labels, not whether they still
+/// exist. A dashboard built on one of them had no contract behind it at all.
+#[test]
+fn the_contract_covers_every_metric_the_workspace_emits() {
+    let emitted = workspace_emitted_metrics();
+    assert!(
+        emitted.len() >= 30,
+        "the scan found {} emitted metrics, too few to be reading the workspace; the \
+         assertion below would pass by covering almost nothing",
+        emitted.len()
+    );
+
+    let promised: std::collections::HashSet<&str> =
+        metrics::CONTRACT.iter().map(|spec| spec.name).collect();
+    let missing: Vec<&String> = emitted
+        .iter()
+        .filter(|name| !promised.contains(name.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these metrics are emitted and not in the contract, so nothing checks their kind, \
+         their labels, or whether they still exist: {missing:?}"
+    );
+}
+
 /// The value of a `pub const NAME: &str = "..."` in the metrics module.
 fn value_of(ident: &str) -> Option<String> {
     include_str!("../src/metrics.rs")
@@ -244,28 +429,26 @@ fn every_contract_metric_has_an_emit_site() {
     // needs the metric to be produced by exercising the server, which is the integration shape
     // rather than this one. What this rules out is the case that actually happens -- a contract
     // entry whose emits were deleted, renamed, or never written.
-    let sites = emit_sites();
-    let emitted: std::collections::HashSet<String> = sites
-        .iter()
-        .filter_map(|(ident, _, _)| value_of(ident))
-        .collect();
+    // WIDENED (issue #152 criterion 1). This resolved names only through this module's own
+    // constants, so it could not see a literal-named metric or one named by a constant in
+    // another crate -- which is every one of the twenty-seven the contract did not cover. It
+    // would have passed over them in silence.
+    let emitted = workspace_emitted_metrics();
     assert!(
-        !emitted.is_empty(),
-        "the scan found no emitted metric at all, so the assertion below would hold vacuously"
+        emitted.len() >= 30,
+        "the scan found {} emitted metrics, too few to be reading the workspace; the \
+         assertion below would pass by covering almost nothing",
+        emitted.len()
     );
 
     for spec in metrics::CONTRACT {
         assert!(
             emitted.contains(spec.name),
-            "the contract promises {}, and no emit site this scan can read produces it.\n\
-             A promised metric nobody emits is a dashboard that renders empty and an alert that \
-             never fires. Emitted: {:?}",
+            "the contract promises {}, and no PRODUCTION emit site produces it.\n\
+             A promised metric nobody emits is a dashboard that renders empty and an alert \
+             that never fires. Emitted: {:?}",
             spec.name,
-            {
-                let mut names: Vec<&str> = emitted.iter().map(String::as_str).collect();
-                names.sort_unstable();
-                names
-            }
+            emitted
         );
     }
 }
