@@ -348,6 +348,22 @@ pub struct IssuerRegistry {
     // `with_entry_ttl`. This is the interim mechanism that bounds rotation-pickup
     // latency until M16 wires event-driven invalidation on the rotation write path.
     entry_ttl: Duration,
+    // The CROSS-NODE accelerator for the published JWKS document (issue #146). `None` is the
+    // shipped behaviour and the default: every node renders from its own entry cache.
+    //
+    // WHY THIS IS AN `Option` AND NOT A REQUIRED FIELD. `ironauth-hot`'s whole argument is that
+    // "a deployment that never attaches one behaves identically and more slowly; delete this
+    // file and the product is still correct". A registry with no hot state must therefore take
+    // exactly the path it took before this field existed, which an `Option` makes structural
+    // rather than a promise.
+    //
+    // It is the FIRST caller the seam has had. An audit found the trait, the classification,
+    // the stall bounds, the tiering and the IronCache backend all built and tested, roughly
+    // 1800 lines of crate against 3800 of test, with `PgHotState::new` constructed only in test
+    // files and no data-plane path reading through any of the seven declared uses. Criterion 2,
+    // "with IronCache unreachable, all flows complete correctly on Postgres alone", was
+    // therefore true by construction and would have stayed true with the crate deleted.
+    jwks_hot: Option<Arc<dyn ironauth_hot::HotState>>,
 }
 
 impl IssuerRegistry {
@@ -368,6 +384,7 @@ impl IssuerRegistry {
             // so a rotation is picked up within the same window a relying party may
             // cache the JWKS for (issue #204). Tunable through `with_entry_ttl`.
             entry_ttl: cache.max_age(),
+            jwks_hot: None,
         }
     }
 
@@ -392,6 +409,7 @@ impl IssuerRegistry {
             // Same default as `new`: the positive-cache staleness ceiling is the
             // JWKS cache window (issue #204), tunable through `with_entry_ttl`.
             entry_ttl: cache.max_age(),
+            jwks_hot: None,
         }
     }
 
@@ -405,6 +423,26 @@ impl IssuerRegistry {
     #[must_use]
     pub fn with_entry_ttl(mut self, ttl: Duration) -> Self {
         self.entry_ttl = ttl;
+        self
+    }
+
+    /// Attach the cross-node accelerator for the published JWKS document (issue #146).
+    ///
+    /// # What attaching one changes, and what it deliberately does not
+    ///
+    /// It changes only where a RENDERED document may come from. The fence still runs on every
+    /// resolution, a `Fenced` scope is still refused, a stale entry is still never served, and
+    /// an absent scope still 404s: every one of those decisions happens before this cache is
+    /// consulted, because the cache is keyed on a scope that has already resolved.
+    ///
+    /// It is [`ironauth_hot::registry::JWKS`], declared `Accelerator`, which is the class whose
+    /// contract is "the caller must already be able to answer from the store". So every failure
+    /// mode here renders instead: a miss, a stall, an error, or a value that will not parse.
+    /// There is no path on which an unavailable accelerator changes an answer, which is what
+    /// makes attaching one safe to do by configuration rather than by redeployment.
+    #[must_use]
+    pub fn with_jwks_hot_state(mut self, hot: Arc<dyn ironauth_hot::HotState>) -> Self {
+        self.jwks_hot = Some(hot);
         self
     }
 
@@ -783,12 +821,70 @@ impl IssuerRegistry {
             IssuerResolution::Ready(entry) => entry,
             IssuerResolution::Fenced | IssuerResolution::Absent => return None,
         };
-        Some(
-            entry
+
+        // THE ACCELERATOR IS CONSULTED HERE AND NOWHERE EARLIER (issue #146). Everything that
+        // decides WHETHER to publish has already happened: the fence ran, a `Fenced` scope was
+        // refused, a stale entry was not served, an absent scope returned `None`. This cache
+        // only decides where the bytes of an already-permitted document come from.
+        //
+        // THE KEY CARRIES WHAT THE DOCUMENT DEPENDS ON, which is the part that has to be right.
+        // `published_jwks` filters by activation instant, so the same scope renders differently
+        // as keys activate and retire, and a key of scope alone would serve one environment's
+        // document past a rotation. The key is the scope plus the published kid set at `now`,
+        // so a rotation changes the key rather than needing an invalidation to race the read.
+        // A stale entry under such a key cannot exist: the kids that produced it are in it.
+        let hot_key = self.jwks_hot.as_ref().map(|_| {
+            let mut kids: Vec<&str> = entry
                 .keyset()
-                .published_jwks(now, entry.policy())
-                .and_then(|jwks| jwks.to_json()),
-        )
+                .published_signing_keys(now)
+                .iter()
+                .filter_map(|key| key.kid())
+                .collect();
+            kids.sort_unstable();
+            format!(
+                "{}/{}/{}",
+                scope.tenant(),
+                scope.environment(),
+                kids.join(",")
+            )
+        });
+        if let (Some(hot), Some(key)) = (self.jwks_hot.as_ref(), hot_key.as_ref()) {
+            // EVERY FAILURE RENDERS. `Accelerator` is the class whose contract is that the
+            // caller can already answer from the store, so a miss, a stall, an error and a
+            // value that will not decode are all the same thing here: fall through.
+            if let Ok(Some(bytes)) = hot.get(&ironauth_hot::registry::JWKS, key).await {
+                if let Ok(document) = String::from_utf8(bytes) {
+                    return Some(Ok(document));
+                }
+            }
+        }
+
+        let rendered = entry
+            .keyset()
+            .published_jwks(now, entry.policy())
+            .and_then(|jwks| jwks.to_json());
+        if let (Some(hot), Some(key), Ok(document)) =
+            (self.jwks_hot.as_ref(), hot_key.as_ref(), rendered.as_ref())
+        {
+            // POPULATED WITH THE ENTRY TTL, not the `Cache-Control` window. The two answer
+            // different questions: `max_age` is how long a RELYING PARTY may reuse a document,
+            // and this is how long a NODE may. Bounding the shared copy by the same ceiling the
+            // per-node entry already carries means attaching an accelerator cannot make a
+            // rotation land later than it would have without one.
+            //
+            // The result is discarded on purpose: a failed write is a slower next request, and
+            // treating it as an error would make the accelerator able to fail a publication,
+            // which is exactly what its class forbids.
+            let _ = hot
+                .put(
+                    &ironauth_hot::registry::JWKS,
+                    key,
+                    document.as_bytes(),
+                    ironauth_hot::Ttl::of(self.entry_ttl),
+                )
+                .await;
+        }
+        Some(rendered)
     }
 }
 

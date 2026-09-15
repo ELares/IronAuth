@@ -2350,6 +2350,7 @@ dependencies = [
  "ironauth-env",
  "ironauth-fetch",
  "ironauth-hooks",
+ "ironauth-hot",
  "ironauth-import",
  "ironauth-jose",
  "ironauth-journey",

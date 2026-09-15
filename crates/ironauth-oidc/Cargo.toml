@@ -53,6 +53,9 @@ ironauth-cel.workspace = true
 regex.workspace = true
 ironauth-store.workspace = true
 ironauth-jose.workspace = true
+# The cross-node hot-state seam (#146). OPTIONAL at runtime, not at compile time: the registry
+# holds an `Option<Arc<dyn HotState>>`, and `None` is exactly the behaviour that shipped before.
+ironauth-hot.workspace = true
 # The declarative journey engine (issue #92): the pure artifact model, its load-time
 # validator, the predicate evaluator + typed EvalContext, and the compile-to-table
 # lowering. The flow engine's ADDITIVE custom-journey path (PR 4) compiles a validated

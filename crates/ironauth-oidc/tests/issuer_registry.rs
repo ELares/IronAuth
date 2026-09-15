@@ -985,3 +985,223 @@ async fn a_discovery_suspension_landing_just_before_an_outage_is_bounded_by_one_
          scope is unfenced, so the window closes without the database returning: {body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #146: the JWKS accelerator, the hot-state seam's first data-plane caller.
+//
+// An audit found the seam complete and unreached: the trait, the classification, the stall
+// bounds, the tiering and the IronCache backend all built and tested, with `PgHotState::new`
+// constructed only in test files and no production path reading through any of the seven
+// declared uses. Criterion 2, "with IronCache unreachable, all flows complete correctly on
+// Postgres alone", was true by construction and would have stayed true with the crate deleted.
+//
+// These tests are about the two halves that makes real: that an attached accelerator is
+// actually consulted, and that an absent or broken one changes no answer.
+// ---------------------------------------------------------------------------
+
+/// A hot state that records every call and can be told to fail.
+#[derive(Debug, Default)]
+struct RecordingHot {
+    calls: std::sync::Mutex<Vec<String>>,
+    entries: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    /// When set, every operation answers `Unavailable`, which is what a down accelerator does.
+    broken: bool,
+}
+
+impl RecordingHot {
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().expect("not poisoned").clone()
+    }
+}
+
+impl ironauth_hot::HotState for RecordingHot {
+    fn get<'a>(
+        &'a self,
+        r#use: &'static ironauth_hot::HotUse,
+        key: &'a str,
+    ) -> ironauth_hot::Answer<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .expect("not poisoned")
+                .push(format!("get {} {key}", r#use.name()));
+            if self.broken {
+                return Err(ironauth_hot::HotError::Unavailable);
+            }
+            Ok(self.entries.lock().expect("not poisoned").get(key).cloned())
+        })
+    }
+
+    fn put<'a>(
+        &'a self,
+        r#use: &'static ironauth_hot::HotUse,
+        key: &'a str,
+        value: &'a [u8],
+        _ttl: ironauth_hot::Ttl,
+    ) -> ironauth_hot::Answer<'a, ()> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .expect("not poisoned")
+                .push(format!("put {} {key}", r#use.name()));
+            if self.broken {
+                return Err(ironauth_hot::HotError::Unavailable);
+            }
+            self.entries
+                .lock()
+                .expect("not poisoned")
+                .insert(key.to_owned(), value.to_vec());
+            Ok(())
+        })
+    }
+
+    fn put_if_absent<'a>(
+        &'a self,
+        _use: &'static ironauth_hot::HotUse,
+        _key: &'a str,
+        _value: &'a [u8],
+        _ttl: ironauth_hot::Ttl,
+    ) -> ironauth_hot::Answer<'a, bool> {
+        Box::pin(async move { Err(ironauth_hot::HotError::Unavailable) })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        _use: &'static ironauth_hot::HotUse,
+        _key: &'a str,
+    ) -> ironauth_hot::Answer<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+/// THE SEAM HAS A CALLER: an attached accelerator is read, populated, and then served from.
+///
+/// The assertion that matters is the THIRD one. A test that only checked the document came back
+/// would pass against a registry that ignored the accelerator entirely, which is exactly the
+/// state the audit found: the whole crate was reachable only from its own tests.
+#[tokio::test]
+async fn an_attached_accelerator_is_consulted_and_then_serves_the_jwks() {
+    let harness = Harness::start_store_backed().await;
+    let scope = harness.scope();
+    let hot = std::sync::Arc::new(RecordingHot::default());
+    let registry = store_backed(&harness).with_jwks_hot_state(hot.clone());
+
+    let first = registry
+        .jwks_json(&scope, at(0))
+        .await
+        .expect("resolves")
+        .expect("renders");
+
+    // A MISS THEN A POPULATE, in that order: the accelerator was asked before the render and
+    // written after it.
+    let calls = hot.calls();
+    assert_eq!(calls.len(), 2, "one get and one put: {calls:?}");
+    assert!(calls[0].starts_with("get jwks "), "{calls:?}");
+    assert!(calls[1].starts_with("put jwks "), "{calls:?}");
+
+    let second = registry
+        .jwks_json(&scope, at(0))
+        .await
+        .expect("resolves")
+        .expect("renders");
+    assert_eq!(second, first, "the served document is the same document");
+
+    // AND THE SECOND READ WAS A HIT, so it did not render again. Without this the test passes
+    // against a registry that writes to the accelerator and never reads it.
+    let calls = hot.calls();
+    assert_eq!(
+        calls.len(),
+        3,
+        "the second request must be answered by the accelerator, not re-rendered: {calls:?}"
+    );
+    assert!(calls[2].starts_with("get jwks "), "{calls:?}");
+}
+
+/// A BROKEN ACCELERATOR CHANGES NO ANSWER, which is the class's whole contract.
+///
+/// `Accelerator` means "the caller must already be able to answer from the store", so a miss, a
+/// stall, an error and an undecodable value are all the same thing: render. This drives the
+/// error arm against the SAME scope a healthy registry serves, and compares the two documents.
+#[tokio::test]
+async fn a_broken_accelerator_changes_no_answer() {
+    let harness = Harness::start_store_backed().await;
+    let scope = harness.scope();
+
+    let without = store_backed(&harness)
+        .jwks_json(&scope, at(0))
+        .await
+        .expect("resolves")
+        .expect("renders");
+
+    let hot = std::sync::Arc::new(RecordingHot {
+        broken: true,
+        ..RecordingHot::default()
+    });
+    let with_broken = store_backed(&harness)
+        .with_jwks_hot_state(hot.clone())
+        .jwks_json(&scope, at(0))
+        .await
+        .expect("a broken accelerator must not stop a publication")
+        .expect("renders");
+
+    assert_eq!(
+        with_broken, without,
+        "an unavailable accelerator must produce the byte-identical document a registry with \
+         none produces"
+    );
+    // AND IT WAS ACTUALLY ASKED, so the equality above is not the equality of two paths that
+    // both ignored it.
+    assert!(
+        hot.calls().iter().any(|call| call.starts_with("get jwks ")),
+        "the broken accelerator must have been consulted: {:?}",
+        hot.calls()
+    );
+}
+
+/// THE KEY CARRIES THE PUBLISHED KID SET, so a rotation cannot be served a pre-rotation document.
+///
+/// This is the property that lets the cache be populated without an invalidation racing the
+/// read: the kids that produced a document are IN its key, so a document rendered from a
+/// different set is stored under a different key and the old one simply goes unread.
+#[tokio::test]
+async fn the_accelerator_key_changes_when_the_published_key_set_does() {
+    let harness = Harness::start_store_backed().await;
+    let scope = harness.scope();
+    let hot = std::sync::Arc::new(RecordingHot::default());
+    let registry = store_backed(&harness).with_jwks_hot_state(hot.clone());
+
+    let _ = registry.jwks_json(&scope, at(0)).await.expect("resolves");
+    let before: Vec<String> = hot
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("get jwks "))
+        .collect();
+    assert_eq!(before.len(), 1);
+
+    // Provision a SECOND key and let the entry go stale so the registry reloads it.
+    harness
+        .provision_signing_key(
+            scope,
+            "ES256",
+            SigningKeyMaterialKind::EcdsaPkcs8,
+            es256_pkcs8(),
+        )
+        .await;
+    let fresh = store_backed(&harness).with_jwks_hot_state(hot.clone());
+    let _ = fresh
+        .jwks_json(&scope, at(TTL.as_secs() + 1))
+        .await
+        .expect("resolves");
+
+    let after: Vec<String> = hot
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("get jwks "))
+        .collect();
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert_ne!(
+        after[0], after[1],
+        "a changed published key set must change the accelerator key, or a rotation would be \
+         served the document it replaced"
+    );
+}
