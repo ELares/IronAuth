@@ -64010,18 +64010,6 @@ pub(crate) async fn keks_under_master(
         .collect())
 }
 
-/// # The `master_key_id` term of the compare-and-swap is redundant, deliberately
-///
-/// A sweep found that dropping `AND master_key_id = $3` leaves every test green, and that is
-/// the honest answer rather than a coverage gap: rewrapping necessarily changes the blob, so
-/// `AND wrapped_kek = $2` already fails for any row that has moved. Two rows cannot share a
-/// ciphertext under different masters short of an AEAD collision.
-///
-/// It stays because it costs nothing and it states the intent at the point of the write: this
-/// row is expected to be on the OLD master. A future caller that rewraps without changing the
-/// blob, or a schema that stores the wrapped key elsewhere, would make it load-bearing again,
-/// and by then nobody would think to add it.
-///
 /// Write a rewrapped KEK and the master that now wraps it, in ONE statement, and ONLY if the
 /// row is still exactly as it was read.
 ///
@@ -64041,8 +64029,27 @@ pub(crate) async fn keks_under_master(
 /// and nothing would record it.
 ///
 /// So this is a compare-and-swap on the bytes that were read, plus the master they were read
-/// under, plus a refusal to touch a destroyed row at all. The caller must treat "no row
-/// updated" as contention to re-examine, never as success.
+/// under, plus THE STATUS THEY WERE READ WITH. The caller must treat "no row updated" as
+/// contention to re-examine, never as success.
+///
+/// # `expected_status` is the row's own, not the literal "active"
+///
+/// This bound `status = 'active'` and refused every other status. The caller skips only
+/// `'destroyed'`, so a `'retired'` row -- exactly what `rotate_kek` leaves behind beside the
+/// version that replaced it -- was read, unwrapped, rewrapped in memory, refused HERE, and
+/// counted as contention. The closing count treats every non-destroyed row as work left
+/// undone, so the run reported `remaining_under_old: 1` and a `FAILURE` exit, on the first
+/// run and on every rerun. The operator was told to stop the fleet and run it again, advice
+/// that could never succeed, and the old master could never be decommissioned, which is the
+/// entire point of the rotation. A review reproduced it: three consecutive passes after one
+/// `rotate_kek` each reported `contended: 1, remaining_under_old: 1`.
+///
+/// Binding the SNAPSHOT'S status is what the compare-and-swap meant all along: refuse if this
+/// row changed since it was read. It still refuses a concurrent shred, because a shred sets
+/// `status = 'destroyed'`, which no longer equals the snapshot value. And the separate
+/// `status <> 'destroyed'` term is gone with it: given `status = $4` and a caller that never
+/// passes `'destroyed'`, it could not refuse a row the first term admitted, so it was a
+/// sentence rather than a check.
 ///
 /// Returns whether the row was updated.
 pub(crate) async fn store_rewrapped_kek(
@@ -64050,18 +64057,19 @@ pub(crate) async fn store_rewrapped_kek(
     id: &str,
     expected_wrapped_kek: &[u8],
     from_master_key_id: &str,
+    expected_status: &str,
     wrapped_kek: &[u8],
     master_key_id: &str,
 ) -> Result<bool, StoreError> {
     let result = sqlx::query(
         "UPDATE tenant_keks SET wrapped_kek = $5, master_key_id = $6 \
          WHERE id = $1 AND wrapped_kek = $2 AND master_key_id = $3 \
-           AND status = $4 AND status <> 'destroyed'",
+           AND status = $4",
     )
     .bind(id)
     .bind(expected_wrapped_kek)
     .bind(from_master_key_id)
-    .bind("active")
+    .bind(expected_status)
     .bind(wrapped_kek)
     .bind(master_key_id)
     .execute(pool)
@@ -64082,20 +64090,37 @@ pub(crate) async fn count_keks_under_master(
     Ok(usize::try_from(n).unwrap_or(0))
 }
 
-/// How many LIVE KEKs are still wrapped under `master_key_id`.
+/// How many LIVE KEKs are NOT yet wrapped under `master_key_id`.
 ///
 /// Destroyed rows are excluded because a shredded KEK is an empty blob no master can open, so
 /// it is not work left undone. Used as a rotation's closing check: a row inserted after the
 /// work set was read (KEKs are provisioned lazily, by whichever master the inserting process
 /// holds) is invisible to that snapshot, and without this the run would report success with
-/// tenants still on the old key.
-pub(crate) async fn count_live_keks_under_master(
+/// tenants still off the target key.
+///
+/// # It asks about the TARGET, not about the source
+///
+/// This counted rows still under the OLD master, which answers "is anything left behind?" and
+/// never "is everything where it should be?". Those differ the moment a THIRD master id
+/// exists, and one exists as soon as a rotation is retargeted: run `old -> mid`, have it stop
+/// part way (a row that will not open aborts the run, or the operator interrupts it), then run
+/// `old -> new`. The rows already moved to `mid` are outside the work set, which selects
+/// `master_key_id = old`, AND outside a closing count keyed on `old`. The run reported
+/// `remaining_under_old: 0` and exited SUCCESS, the operator decommissioned `old`, and every
+/// read for those tenants returned an encryption error with no key left that could open them.
+/// A review reproduced exactly that: after an abandoned `old -> mid` pass, `old -> new`
+/// reported `rewrapped: 1, contended: 0, remaining_under_old: 0` with a row sitting on
+/// `master-mid`.
+///
+/// Keyed on the target, a stray on any master answers the question the operator is actually
+/// asking before they destroy a key.
+pub(crate) async fn count_live_keks_off_master(
     pool: &sqlx::PgPool,
     master_key_id: &str,
 ) -> Result<usize, StoreError> {
     let row = sqlx::query(
         "SELECT count(*) AS n FROM tenant_keks \
-         WHERE master_key_id = $1 AND status <> 'destroyed'",
+         WHERE master_key_id <> $1 AND status <> 'destroyed'",
     )
     .bind(master_key_id)
     .fetch_one(pool)

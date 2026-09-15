@@ -181,9 +181,16 @@ async fn an_interrupted_rekey_resumes_and_converges_without_redoing_finished_row
 /// the shred left them. The row would read as destroyed and decrypt anyway, because the KEK
 /// read path filters on tenant, environment and version and NOT on status.
 ///
-/// Simulated by shredding the row and then running: the snapshot the loop works from is taken
-/// inside `run`, so the guard on the WRITE is what has to refuse it, not the status check on
-/// the read.
+/// WHICH GUARD THIS TEST ACTUALLY REACHES. The shred commits BEFORE `run()` is called, so the
+/// snapshot taken inside `run` already reads `status = 'destroyed'` and the `continue` in the
+/// loop refuses the row; `store_rewrapped_kek` is never called. This said the opposite ("the
+/// guard on the WRITE is what has to refuse it, not the status check on the read"), and a
+/// review traced the execution and found the write guard unreached. The sentence mattered
+/// because a later doc block built an argument on top of it.
+///
+/// The write guard is covered by `a_shred_landing_after_the_snapshot_is_refused_by_the_write`
+/// below, which commits the shred AFTER the snapshot is taken, which is the ordering the write
+/// guard exists for.
 #[tokio::test]
 async fn a_shredded_kek_is_never_rewrapped_back_into_recoverable_material() {
     let db = TestDatabase::start().await;
@@ -229,6 +236,164 @@ async fn a_shredded_kek_is_never_rewrapped_back_into_recoverable_material() {
     );
 }
 
+/// THE ORDERING THE WRITE GUARD ACTUALLY EXISTS FOR: a shred that lands AFTER the snapshot.
+///
+/// The test above commits its shred before `run` is called, so the loop's own status check
+/// refuses the row and `store_rewrapped_kek` is never reached. That leaves the guard on the
+/// write, which the code documents as "what actually protects the erasure", with nothing
+/// behind it. A review traced the execution and found it unreached while its test's doc
+/// claimed the opposite.
+///
+/// Producing the ordering needs a seam, because the snapshot is taken INSIDE `run`:
+/// `with_after_snapshot` (testing only) runs the shred between the read and the first write.
+/// The loop's status check sees `'active'` from the snapshot and lets the row through; only
+/// the compare-and-swap can refuse it now.
+#[tokio::test]
+async fn a_shred_landing_after_the_snapshot_is_refused_by_the_write() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let scope = db.seed_scope(&env).await;
+    let old = master("master-old", 0x0001);
+    let new = master("master-new", 0x0002);
+    provision(&db, &env, scope, &old).await;
+
+    let pool = db.owner_pool().clone();
+    let tenant = scope.tenant().to_string();
+    let environment = scope.environment().to_string();
+    let report = Rekey::new(db.owner_pool(), &old, &new, env.entropy())
+        .with_after_snapshot(move || {
+            let pool = pool.clone();
+            let tenant = tenant.clone();
+            let environment = environment.clone();
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE tenant_keks SET wrapped_kek = ''::bytea, status = 'destroyed' \
+                     WHERE tenant_id = $1 AND environment_id = $2",
+                )
+                .bind(tenant)
+                .bind(environment)
+                .execute(&pool)
+                .await
+                .expect("shred the KEK between the snapshot and the write");
+            })
+        })
+        .run()
+        .await
+        .expect("the rotation runs");
+
+    assert_eq!(
+        report.rewrapped, 0,
+        "the write must refuse a row the snapshot read as active and the shred has since \
+         destroyed"
+    );
+    assert_eq!(
+        report.contended, 1,
+        "and report it as contention, which is the signal the operator is told to examine"
+    );
+
+    let (blob, status): (Vec<u8>, String) = sqlx::query(
+        "SELECT wrapped_kek, status FROM tenant_keks \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .map(|row| (row.get("wrapped_kek"), row.get("status")))
+    .expect("read the row back");
+    assert!(
+        blob.is_empty(),
+        "the erasure stands: restoring the blob under the new master while status and \
+         destroyed_at stayed as the shred left them is the silent un-erasure this guards"
+    );
+    assert_eq!(status, "destroyed", "and the row still reads as destroyed");
+}
+
+/// THE STATUS TERM OF THE COMPARE-AND-SWAP, ON ITS OWN.
+///
+/// The shred test above does not measure it. A shred writes `wrapped_kek = ''` as well as
+/// `status = 'destroyed'`, so `wrapped_kek = $2` refuses the row by itself and the whole
+/// `AND status = $4` term can be deleted with every test in this file green. A review made
+/// exactly that point about the term this PR originally shipped, and the first version of the
+/// test above reproduced it.
+///
+/// So vary ONLY the status: retire the row between the snapshot and the write, leaving the
+/// blob byte-identical. Now nothing except `status = $4` can refuse it.
+///
+/// Refusing is the correct answer and it is convergent, not a stall: the row is counted as
+/// contention, the closing check sees it is not on the target, and the next pass reads it as
+/// retired and rewraps it under the status it now has.
+#[tokio::test]
+async fn a_status_change_after_the_snapshot_is_refused_by_the_write() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let scope = db.seed_scope(&env).await;
+    let old = master("master-old", 0x0001);
+    let new = master("master-new", 0x0002);
+    provision(&db, &env, scope, &old).await;
+
+    let blob_before = wrapped_kek_of(&db, scope).await;
+    let pool = db.owner_pool().clone();
+    let tenant = scope.tenant().to_string();
+    let environment = scope.environment().to_string();
+    let report = Rekey::new(db.owner_pool(), &old, &new, env.entropy())
+        .with_after_snapshot(move || {
+            let pool = pool.clone();
+            let tenant = tenant.clone();
+            let environment = environment.clone();
+            Box::pin(async move {
+                // THE BLOB IS NOT TOUCHED. That is the whole point: `wrapped_kek = $2` still
+                // matches, so only the status term can refuse this write.
+                sqlx::query(
+                    "UPDATE tenant_keks SET status = 'retired' \
+                     WHERE tenant_id = $1 AND environment_id = $2",
+                )
+                .bind(tenant)
+                .bind(environment)
+                .execute(&pool)
+                .await
+                .expect("retire the KEK between the snapshot and the write");
+            })
+        })
+        .run()
+        .await
+        .expect("the rotation runs");
+
+    assert_eq!(
+        blob_before,
+        wrapped_kek_of(&db, scope).await,
+        "precondition: the hook changed the status and NOTHING else, so this test measures \
+         the status term rather than the blob term beside it"
+    );
+    assert_eq!(
+        report.rewrapped, 0,
+        "a row whose status changed since the snapshot is not still as it was read"
+    );
+    assert_eq!(report.contended, 1, "and it is reported as contention");
+
+    // CONVERGENT, not stalled: the next pass reads the row as retired and moves it.
+    let next = Rekey::new(db.owner_pool(), &old, &new, env.entropy())
+        .run()
+        .await
+        .expect("the next pass runs");
+    assert_eq!(
+        next.rewrapped, 1,
+        "the next pass picks it up with its new status"
+    );
+    assert_eq!(next.remaining_off_target, 0, "and the rotation converges");
+}
+
+/// The wrapped blob recorded for `scope`, so a fixture can prove it changed nothing else.
+async fn wrapped_kek_of(db: &TestDatabase, scope: Scope) -> Vec<u8> {
+    sqlx::query("SELECT wrapped_kek FROM tenant_keks WHERE tenant_id = $1 AND environment_id = $2")
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("read the blob")
+        .get("wrapped_kek")
+}
+
 /// A row that appears AFTER the work set was read leaves the rotation incomplete, and the run
 /// must say so rather than report success.
 ///
@@ -250,7 +415,7 @@ async fn a_kek_created_after_the_snapshot_is_reported_as_remaining() {
         .expect("the first rotation runs");
     assert_eq!(done.rewrapped, 1);
     assert_eq!(
-        done.remaining_under_old, 0,
+        done.remaining_off_target, 0,
         "with nothing else present the rotation is complete"
     );
 
@@ -266,7 +431,7 @@ async fn a_kek_created_after_the_snapshot_is_reported_as_remaining() {
         after.rewrapped, 1,
         "the late row is picked up by the next run"
     );
-    assert_eq!(after.remaining_under_old, 0);
+    assert_eq!(after.remaining_off_target, 0);
 }
 
 /// The wrong old master must stop the run, not skip the row.
@@ -344,12 +509,38 @@ async fn a_role_row_level_security_applies_to_is_refused() {
 
 /// Open a sealed secret, so a read proves the KEK-to-DEK-to-ciphertext chain still works.
 async fn open_secret(db: &TestDatabase, scope: Scope, master: &MasterKey) -> Vec<u8> {
+    open_secret_result(db, scope, master)
+        .await
+        .expect("open the sealed secret")
+}
+
+/// [`open_secret`] without the unwrap, for the assertions that need the REFUSAL.
+async fn open_secret_result(
+    db: &TestDatabase,
+    scope: Scope,
+    master: &MasterKey,
+) -> Result<Vec<u8>, ironauth_store::StoreError> {
     db.store()
         .scoped(scope)
         .envelope()
         .open_secret(master, "email")
         .await
-        .expect("open the sealed secret")
+}
+
+/// Every KEK status recorded for `scope`, so a fixture can prove it built the state it claims.
+async fn kek_statuses(db: &TestDatabase, scope: Scope) -> Vec<String> {
+    sqlx::query(
+        "SELECT status FROM tenant_keks \
+         WHERE tenant_id = $1 AND environment_id = $2 ORDER BY version",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the recorded statuses")
+    .iter()
+    .map(|row| row.get::<String, _>("status"))
+    .collect()
 }
 
 /// THE OTHER HALF OF CRITERION 3: "reads and writes correct IN THE MIXED-KEY STATE".
@@ -424,8 +615,34 @@ async fn reads_and_writes_are_correct_while_the_rotation_is_half_done() {
         assert_eq!(open_secret(&db, *scope, &old).await, b"pending-during");
     }
 
-    // Finish the rotation. Everything written during the mixed state survives it, which is
-    // the property that makes the mid-rotation window safe to serve traffic in.
+    // AND THE OTHER DIRECTION, which is the half that says what the mixed window COSTS.
+    //
+    // Everything above hands each scope the master its own row records, so nothing above
+    // depends on the mixture it just built. This comment used to read "the property that
+    // makes the mid-rotation window safe to serve traffic in", and a review showed that is
+    // false and that the test could not have caught it: a running IronAuth process builds
+    // exactly ONE master key (`resolve_master_key` in the binary derives "master-1" and the
+    // config exposes a single `master_key`), so a fleet held up during the window has one of
+    // these two keys and NOT the other. The module doc and the CLI banner both say so, in
+    // those words: OFFLINE operation, stop the fleet.
+    //
+    // So the honest property is the opposite one, and it is asserted rather than described: a
+    // process holding ONE master cannot open the other side. That is why the rotation is
+    // offline, and it is the assertion that would go red if someone made the window look
+    // serveable without first landing the master key RING the module doc names as the
+    // prerequisite.
+    assert!(
+        open_secret_result(&db, rotated, &old).await.is_err(),
+        "a process holding only the OLD master cannot read a rotated scope"
+    );
+    for scope in &pending {
+        assert!(
+            open_secret_result(&db, *scope, &new).await.is_err(),
+            "and a process holding only the NEW master cannot read a scope still pending"
+        );
+    }
+
+    // Finish the rotation.
     let report = Rekey::new(db.owner_pool(), &old, &new, env.entropy())
         .run()
         .await
@@ -435,18 +652,162 @@ async fn reads_and_writes_are_correct_while_the_rotation_is_half_done() {
         "only the two that were still on the old master"
     );
     assert_eq!(report.already_current, 1);
-    assert_eq!(report.remaining_under_old, 0, "the rotation converged");
+    assert_eq!(report.remaining_off_target, 0, "the rotation converged");
 
-    assert_eq!(
-        open_secret(&db, rotated, &new).await,
-        b"rotated-during",
-        "a write made during the mixed state is readable after convergence"
-    );
+    // ONLY THE PENDING SCOPES MEASURE THE CLAIM. The rotated scope was asserted 20 lines
+    // above and the converging pass selects `master_key_id = old`, so it provably never
+    // touched that row: re-reading it here carried the message "a write made during the
+    // mixed state is readable after convergence" over an assertion that could not fail
+    // unless the earlier one already had.
     for scope in &pending {
         assert_eq!(
             open_secret(&db, *scope, &new).await,
             b"pending-during",
-            "including on a scope that was rotated AFTER the write was made"
+            "a write made during the mixed state, on a scope rotated AFTER that write, is \
+             readable under the new master once the rotation converges"
         );
     }
+}
+
+/// THE UNWRAP CONTEXT COMES FROM THE ROW, NOT FROM THE KEY THE CALLER HOLDS.
+///
+/// This is the one production line that lets two rows on two different master generations
+/// coexist, and until this test nothing pinned it: `fetch_active_kek` and `fetch_kek_by_version`
+/// build the unwrap AAD from the `master_key_id` recorded ON THE ROW. Replacing that with the
+/// caller's own `master.id()` left all fourteen rekey and envelope tests green, because every
+/// other test hands a scope the master its row already names, so the two expressions are equal
+/// everywhere they are evaluated.
+///
+/// Separating them needs two master keys with the SAME key material and DIFFERENT ids, which
+/// `MasterKey::derive` allows: it derives the key from the ikm alone and carries the id beside
+/// it. The material opens the blob either way, so the ONLY thing that can refuse the read is
+/// the AAD, and the AAD is the thing under test.
+#[tokio::test]
+async fn the_unwrap_context_is_the_rows_master_generation_not_the_callers() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let scope = db.seed_scope(&env).await;
+
+    // Same material, two ids. `derive` keys off the ikm only.
+    let material = [0x42_u8; 32];
+    let recorded = MasterKey::derive("master-recorded", &material);
+    let twin = MasterKey::derive("master-twin", &material);
+    assert_ne!(
+        recorded.id(),
+        twin.id(),
+        "precondition: the two keys differ in the only way that matters here"
+    );
+
+    provision(&db, &env, scope, &recorded).await;
+    put_secret(&db, &env, scope, &recorded, b"under-recorded").await;
+    assert_eq!(master_of(&db, scope).await, "master-recorded");
+
+    // The twin's MATERIAL unwraps the blob. If the AAD were built from the caller's id this
+    // would fail, because the wrap bound "master-recorded" and the caller names "master-twin".
+    assert_eq!(
+        open_secret(&db, scope, &twin).await,
+        b"under-recorded",
+        "the read binds the master generation the ROW records, so a key with the right \
+         material opens it whatever id that key carries; deriving the context from the \
+         caller's own id instead is the change that breaks every mixed-generation read the \
+         day a master key ring lands"
+    );
+}
+
+/// A RETIRED KEK VERSION MUST NOT STRAND THE ROTATION.
+///
+/// `rotate_kek` leaves the superseded version beside the new one with `status = 'retired'`.
+/// The rewrap loop skips only `'destroyed'`, so a retired row is read and rewrapped in memory,
+/// and the write used to bind `status = 'active'` and refuse it. The row was counted as
+/// contention, the closing count counted it as work left undone, and the CLI exited FAILURE
+/// telling the operator to stop the fleet and run it again, on this run and on every rerun.
+/// The old master could never be decommissioned, which is the point of the rotation.
+///
+/// Three consecutive passes, because "forever" is the part that matters: a defect that clears
+/// on the second run is an inconvenience, one that does not is a deployment that cannot finish.
+#[tokio::test]
+async fn a_retired_kek_version_is_rewrapped_rather_than_stranding_the_rotation() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let scope = db.seed_scope(&env).await;
+    let old = master("master-old", 1);
+    let new = master("master-new", 2);
+
+    provision(&db, &env, scope, &old).await;
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .envelope()
+        .rotate_kek(&env, &old)
+        .await
+        .expect("rotate the KEK, leaving the previous version retired");
+
+    let statuses = kek_statuses(&db, scope).await;
+    assert!(
+        statuses.iter().any(|status| status == "retired"),
+        "precondition: the rotation really left a retired version behind, got {statuses:?}"
+    );
+
+    for pass in 1..=3 {
+        let report = Rekey::new(db.owner_pool(), &old, &new, env.entropy())
+            .run()
+            .await
+            .expect("the pass runs");
+        assert_eq!(
+            report.contended, 0,
+            "pass {pass}: a retired row is ordinary work, not contention"
+        );
+        assert_eq!(
+            report.remaining_off_target, 0,
+            "pass {pass}: the rotation converged, so the old master can be destroyed"
+        );
+    }
+}
+
+/// A ROW ON A THIRD MASTER MUST NOT READ AS CONVERGED.
+///
+/// The closing check counted rows still under the SOURCE master, which answers "is anything
+/// left behind?" and never "is everything where it should be?". Those differ as soon as a
+/// rotation is retargeted: `old -> mid` stops part way, then `old -> new` runs, and the rows
+/// already on `mid` are outside the work set (it selects `master_key_id = old`) AND outside a
+/// count keyed on `old`. The run reported converged, the operator destroyed `old`, and those
+/// tenants were unreadable with no key left that could open them.
+#[tokio::test]
+async fn a_kek_parked_on_a_third_master_is_not_reported_as_converged() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let old = master("master-old", 1);
+    let mid = master("master-mid", 2);
+    let new = master("master-new", 3);
+
+    let stranded = db.seed_scope(&env).await;
+    provision(&db, &env, stranded, &old).await;
+    put_secret(&db, &env, stranded, &old, b"stranded").await;
+
+    // The abandoned retarget: this scope moves to `mid` and the operator then aims elsewhere.
+    Rekey::new(db.owner_pool(), &old, &mid, env.entropy())
+        .run()
+        .await
+        .expect("the abandoned pass runs");
+    assert_eq!(master_of(&db, stranded).await, "master-mid");
+
+    let ordinary = db.seed_scope(&env).await;
+    provision(&db, &env, ordinary, &old).await;
+
+    let report = Rekey::new(db.owner_pool(), &old, &new, env.entropy())
+        .run()
+        .await
+        .expect("the retargeted pass runs");
+    assert_eq!(report.rewrapped, 1, "it moves the row it can see");
+    assert!(
+        report.remaining_off_target > 0,
+        "and it must NOT report convergence while a live KEK sits on a master that is \
+         neither the source nor the target: reporting success here is what lets an operator \
+         destroy the only key that could still open it"
+    );
+    assert_eq!(
+        open_secret(&db, stranded, &mid).await,
+        b"stranded",
+        "the stranded row is still readable, but only by a key this rotation never named"
+    );
 }

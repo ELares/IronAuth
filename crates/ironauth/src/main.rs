@@ -8177,16 +8177,19 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 }
                 // A rotation that leaves tenants on the old key is not done, and saying so
                 // matters more than an exit code an operator reads as "finished".
-                if report.remaining_under_old > 0 {
+                if report.remaining_off_target > 0 {
                     println!(
-                        "\nstorage rekey: INCOMPLETE. {} live KEK(s) are still under {}.\n\
+                        "\nstorage rekey: INCOMPLETE. {} live KEK(s) are NOT under {}.\n\
                          \n\
                          KEKs are provisioned lazily under whichever master the inserting \
                          process holds, so a server still running during the rotation adds \
-                         rows this run never saw. Stop the fleet and run it again; it \
-                         resumes where it is, not where it started.",
-                        report.remaining_under_old,
-                        from.id()
+                         rows this run never saw. A row can also be on neither key, if an \
+                         earlier rotation to a DIFFERENT target was retargeted part way; \
+                         such a row is outside this run's work set, so re-running this \
+                         same pair will not move it. Check which master those rows name \
+                         before destroying any key.",
+                        report.remaining_off_target,
+                        to.id()
                     );
                     return ExitCode::FAILURE;
                 }
