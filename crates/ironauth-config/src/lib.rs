@@ -1430,8 +1430,8 @@ pub struct ForwardAuthConfig {
 /// A container-level `default` made both optional, so a rule that omitted `action`
 /// deserialized to `AccessActionConfig::Allow` and validated clean. On an ordered access
 /// list a typo in the key `action` would have turned a deny into an allow, which is the
-/// fail-open this section exists to prevent. Serde now reports `missing field `action``,
-/// and the genuinely optional fields carry their own defaults.
+/// fail-open this section exists to prevent. Serde now reports a missing-field error for
+/// `action`, and the genuinely optional fields carry their own defaults.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AccessRuleConfig {
@@ -6399,6 +6399,27 @@ fn validate_access_rule(at: &str, rule: &AccessRuleConfig) -> Result<(), ConfigE
         },
         None => None,
     };
+
+    validate_rule_subject(at, rule, compiled.as_ref())?;
+    Ok(())
+}
+
+/// Validate the subject checks on one rule (issue #154).
+///
+/// Split out because these are the only checks that read more than one field at a time: a
+/// capture name is meaningless without the pattern that binds it, and `anonymous` is
+/// meaningless beside a check on the subject. Everything else on a rule is checked field by
+/// field.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] naming the field and why the rule could never match.
+fn validate_rule_subject(
+    at: &str,
+    rule: &AccessRuleConfig,
+    compiled: Option<&regex::Regex>,
+) -> Result<(), ConfigError> {
+    let invalid = |message: String| ConfigError::Invalid { message };
 
     // THE CAPTURE HAS TO EXIST, and this is the check the rules engine's own docs name
     // as the failure it fears: a typo in a capture name. `subject_equals_capture`

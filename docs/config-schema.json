@@ -23,7 +23,7 @@
     },
     "AccessRuleConfig": {
       "additionalProperties": false,
-      "description": "One ordered access rule.\n\nEvery criterion set on a rule must hold for it to match. A rule with no criteria\nmatches everything, which is how a catch-all is written and why order matters.\n`name` and `action` are REQUIRED AT PARSE TIME, and that is load-bearing.\n\nA container-level `default` made both optional, so a rule that omitted `action`\ndeserialized to `AccessActionConfig::Allow` and validated clean. On an ordered access\nlist a typo in the key `action` would have turned a deny into an allow, which is the\nfail-open this section exists to prevent. Serde now reports `missing field `action``,\nand the genuinely optional fields carry their own defaults.",
+      "description": "One ordered access rule.\n\nEvery criterion set on a rule must hold for it to match. A rule with no criteria\nmatches everything, which is how a catch-all is written and why order matters.\n`name` and `action` are REQUIRED AT PARSE TIME, and that is load-bearing.\n\nA container-level `default` made both optional, so a rule that omitted `action`\ndeserialized to `AccessActionConfig::Allow` and validated clean. On an ordered access\nlist a typo in the key `action` would have turned a deny into an allow, which is the\nfail-open this section exists to prevent. Serde now reports a missing-field error for\n`action`, and the genuinely optional fields carry their own defaults.",
       "properties": {
         "acr": {
           "default": null,
