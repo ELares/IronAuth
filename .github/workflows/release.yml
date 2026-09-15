@@ -320,3 +320,52 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           sbom-path: image.cdx.json
           push-to-registry: true
+
+  bench:
+    name: benchmark harness
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # THE HARNESS IS ONE COMMAND. Issue #152 criterion 2 asks that the published numbers
+      # reproduce from a clean checkout with one documented command and that CI run it per
+      # release. Before this job, two of the three benchmarks ran nowhere at all: the
+      # unit-costs example was compiled by CI and never executed, and the startup/RSS script
+      # appeared in no workflow and no gate. This job runs the one command, on a release.
+      #
+      # It does not gate the release on the numbers. See scripts/bench.sh: a benchmark is not
+      # reproducible across hardware, so a threshold checked here would either fail on a
+      # runner that is not the machine the table was written on, or be widened until it means
+      # nothing. The harness fails only when a benchmark could not RUN.
+      #
+      # Hook latency is the one benchmark that also carries a threshold, and it stays gated by
+      # the `hook-bench` job in ci.yml, which runs the same script on every push and does take
+      # its verdict. This job records its numbers without re-judging them.
+      - name: Locate the runner's Postgres binaries
+        id: pg
+        run: |
+          set -euo pipefail
+          # The image ships a client and at least one server version; take the newest bin
+          # directory that actually has initdb, since with-test-db.sh initdb's a throwaway
+          # cluster and a client-only directory would fail at that step rather than here.
+          for d in $(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -Vr); do
+            if [ -x "$d/initdb" ]; then echo "dir=$d" >> "$GITHUB_OUTPUT"; exit 0; fi
+          done
+          echo "::error::no Postgres bin directory with initdb on the runner"
+          exit 1
+      - name: Run the benchmark harness
+        run: PG_BIN='${{ steps.pg.outputs.dir }}' scripts/bench.sh
+      # PUBLISHED SEPARATELY FROM THE RELEASE ASSETS. These are measurements of one runner,
+      # not artifacts anyone should install, and the sizing guide criterion 4 asks for has to
+      # be measured on the instance classes it recommends rather than on a shared CI VM.
+      - name: Archive the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: target/bench/
+          retention-days: 90
