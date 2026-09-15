@@ -161,6 +161,11 @@ path = "tests/quota_limits.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "kek_recovery"
+path = "tests/kek_recovery.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "hot_state_invalidation"
 path = "tests/hot_state_invalidation.rs"
 required-features = ["testing"]
