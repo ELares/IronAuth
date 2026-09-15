@@ -348,9 +348,28 @@ pub struct RateLimitSnapshot {
     pub remaining: Option<u64>,
     /// Seconds until the binding bucket is fully replenished.
     pub reset_secs: u64,
-    /// Seconds the client should wait before retrying, present only on a denied
-    /// spend.
+    /// Seconds the client should wait before retrying.
+    ///
+    /// Present only on a denial the client can actually wait out. Absent when no amount of
+    /// waiting produces the tokens: a bucket that never refills, or a cost larger than the
+    /// burst. Advertising a wait in those cases invites a client to retry forever at the
+    /// cadence the server published.
     pub retry_after_secs: Option<u64>,
+    /// Whether the spend was refused.
+    ///
+    /// Carried explicitly because the block signal must appear on EVERY refusal. It was
+    /// gated on `retry_after_secs.is_some()`, so exactly the permanent blocks an edge most
+    /// wants to offload were the ones that carried no machine-readable signal.
+    pub denied: bool,
+    /// The CONFIGURED quota window in seconds: how long a full burst takes to accrue.
+    ///
+    /// Static, a property of the policy. `reset_secs` is live state. The draft's
+    /// `RateLimit-Policy` describes the policy, and rendering live state there told a client
+    /// on its first request that it had a quota of four per two seconds when the real
+    /// sustained rate was four per eight. A self-pacing client believes that.
+    ///
+    /// `None` when there is no window to describe, i.e. nothing refills.
+    pub policy_window_secs: Option<u64>,
 }
 
 impl RateLimitSnapshot {
@@ -362,6 +381,8 @@ impl RateLimitSnapshot {
             remaining: None,
             reset_secs: 0,
             retry_after_secs: None,
+            denied: false,
+            policy_window_secs: None,
         }
     }
 
@@ -383,13 +404,21 @@ impl RateLimitSnapshot {
                     self.reset_secs
                 ),
             ),
-            ("ratelimit-policy", format!("{limit};w={}", self.reset_secs)),
             ("x-ratelimit-limit", limit.to_string()),
             ("x-ratelimit-remaining", remaining.to_string()),
             ("x-ratelimit-reset", self.reset_secs.to_string()),
         ];
+        // The POLICY window, not the live reset. Omitted when nothing refills, because a
+        // zero-second window is not a rate and `N;w=0` reads as one.
+        if let Some(window) = self.policy_window_secs {
+            headers.push(("ratelimit-policy", format!("{limit};w={window}")));
+        }
         if let Some(retry_after) = self.retry_after_secs {
             headers.push(("retry-after", retry_after.to_string()));
+        }
+        // On EVERY refusal, whether or not it can be waited out. A permanent block is the
+        // one an edge most wants to offload.
+        if self.denied {
             headers.push((BLOCK_SIGNAL_HEADER, BLOCK_SIGNAL_VALUE.to_owned()));
         }
         headers
@@ -932,6 +961,17 @@ fn bucket_mut<'s>(state: &'s mut State, eval: &Eval) -> &'s mut Bucket {
 /// binding bucket is the one without capacity; when admitted, it is the
 /// most-constrained bucket (least remaining fraction), so the client sees the
 /// limit that will bite first.
+/// The configured quota window: how long a full burst takes to accrue.
+///
+/// `None` when nothing refills, because there is then no window to describe.
+#[must_use]
+pub(crate) fn policy_window(burst: f64, refill_per_sec: f64) -> Option<u64> {
+    if refill_per_sec <= 0.0 || !refill_per_sec.is_finite() || burst <= 0.0 {
+        return None;
+    }
+    Some(f64_to_u64_ceil(burst / refill_per_sec))
+}
+
 fn binding_snapshot(evals: &[Eval], admitted: bool) -> RateLimitSnapshot {
     let binding = if admitted {
         evals.iter().min_by(|a, b| {
@@ -970,8 +1010,19 @@ fn binding_snapshot(evals: &[Eval], admitted: bool) -> RateLimitSnapshot {
     let retry_after_secs = if admitted {
         None
     } else {
-        let needed = (0.0 - eval.tokens_after).max(0.0);
-        Some(seconds_to_refill(needed, eval.limit.refill_per_sec).max(1))
+        // A bucket that never refills, or a cost larger than the burst, cannot be waited
+        // out. This read `.max(1)`, which turned "never" into "one second" and invited a
+        // client to retry forever at exactly the cadence this header published.
+        // `Eval` carries the balance either side of the spend, so the cost is their
+        // difference. A cost larger than the burst can never be satisfied: the bucket is
+        // capped at `burst`, so no amount of waiting produces it.
+        let cost = eval.tokens_before - eval.tokens_after;
+        if eval.limit.refill_per_sec <= 0.0 || cost > burst {
+            None
+        } else {
+            let needed = (0.0 - eval.tokens_after).max(0.0);
+            Some(seconds_to_refill(needed, eval.limit.refill_per_sec).max(1))
+        }
     };
 
     RateLimitSnapshot {
@@ -979,6 +1030,8 @@ fn binding_snapshot(evals: &[Eval], admitted: bool) -> RateLimitSnapshot {
         remaining: Some(f64_to_u64_floor(remaining_tokens)),
         reset_secs,
         retry_after_secs,
+        denied: !admitted,
+        policy_window_secs: policy_window(burst, eval.limit.refill_per_sec),
     }
 }
 

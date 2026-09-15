@@ -493,10 +493,33 @@ impl LayeredLimiter {
             .map(|(layer, _, limit, tokens)| (*layer, *limit, *tokens));
 
         if let Some((layer, limit, tokens)) = denier {
+            // THE LABEL IS THE NARROWEST REFUSING LAYER; THE WAIT IS THE REQUEST'S.
+            //
+            // These are different questions and this answered both with the narrow one. A
+            // review drained a per-IP bucket refilling at 1/s and a per-tenant bucket at
+            // 0.01/s: the response named per_ip and advertised a one second wait, the client
+            // obeyed it, and was refused again by per_tenant, which needed ninety-nine more.
+            // The advertised wait was short by a factor of a hundred, which is precisely the
+            // harm a retry-after exists to prevent.
+            //
+            // So the wait is the LONGEST across every layer that lacks capacity. An
+            // unsatisfiable layer contributes nothing rather than winning, because `None`
+            // there means "waiting will not help", and a satisfiable wait elsewhere is still
+            // the honest answer for when the request could next succeed.
+            let mut snapshot = snapshot_for(limit, tokens, tokens, cost, false);
+            let longest = evaluated
+                .iter()
+                .filter(|(_, _, _, other_tokens)| *other_tokens < cost)
+                .filter_map(|(_, _, other_limit, other_tokens)| {
+                    snapshot_for(*other_limit, *other_tokens, *other_tokens, cost, false)
+                        .retry_after_secs
+                })
+                .max();
+            snapshot.retry_after_secs = longest;
             return LayeredOutcome {
                 decision: Decision::Denied,
                 limiting_layer: Some(layer),
-                snapshot: snapshot_for(limit, tokens, tokens, cost, false),
+                snapshot,
             };
         }
 
@@ -535,6 +558,8 @@ impl LayeredLimiter {
                     remaining: None,
                     reset_secs: 0,
                     retry_after_secs: None,
+                    denied: false,
+                    policy_window_secs: None,
                 },
             },
         }
@@ -571,6 +596,12 @@ fn snapshot_for(
     };
     let retry_after = if admitted {
         None
+    } else if cost > limit.burst() {
+        // UNSATISFIABLE. The bucket is capped at `burst`, so no amount of waiting produces
+        // `cost` tokens. Advertising one is an infinite retry loop at exactly the cadence
+        // this header publishes: a review waited the advertised time five times running and
+        // was refused every time, then waited 10000s more and was refused again.
+        None
     } else if refill > 0.0 {
         // `ceil` alone is the floor of one second. This read `.ceil().max(1.0)` until a
         // mutation sweep showed the `max` was inert: the denial path is reached only when
@@ -585,9 +616,20 @@ fn snapshot_for(
     };
     RateLimitSnapshot {
         limit: Some(f64_to_u64_floor(limit.burst())),
-        remaining: Some(f64_to_u64_floor(tokens_after)),
+        // A REFUSAL REPORTS ZERO REMAINING. It reported the uncharged balance, so a cost of
+        // five against a full burst of four answered "remaining=4" on a 429: the client is
+        // told it has its whole budget while being refused. The crate root already forced
+        // zero here and this renderer did not, which is two rules for one header family in
+        // one crate.
+        remaining: Some(if admitted {
+            f64_to_u64_floor(tokens_after)
+        } else {
+            0
+        }),
         reset_secs: f64_to_u64_ceil(to_full),
         retry_after_secs: retry_after,
+        denied: !admitted,
+        policy_window_secs: crate::policy_window(limit.burst(), limit.refill_per_sec()),
     }
 }
 
@@ -1392,5 +1434,183 @@ mod tests {
                 "spend {spend}: the two families must describe one budget"
             );
         }
+    }
+
+    /// THE ADVERTISED WAIT IS THE REQUEST'S, NOT THE NARROWEST LAYER'S.
+    ///
+    /// A review drained a per-IP bucket refilling at 1/s and a per-tenant bucket at 0.01/s.
+    /// The response named `per_ip` and advertised one second; the client obeyed it and was
+    /// refused again by per-tenant, which needed ninety-nine more. Short by a factor of a
+    /// hundred, which is exactly the harm a retry-after exists to prevent.
+    ///
+    /// No previous multi-layer fixture used a non-zero refill, so `retry_after` was `None`
+    /// on all of them and the interaction could not appear.
+    #[test]
+    fn the_advertised_wait_covers_every_exhausted_layer() {
+        let (limiter, clock) = limiter(
+            LayeredLimits::unlimited()
+                .with(RateLayer::PerIp, Limit::new(1.0, 1.0))
+                .with(RateLayer::PerTenant, Limit::new(0.01, 1.0)),
+        );
+        assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+
+        let denied = limiter.admit(&everyone(), 1.0);
+        assert_eq!(denied.decision, Decision::Denied);
+        assert_eq!(
+            denied.limiting_layer,
+            Some(RateLayer::PerIp),
+            "the LABEL is still the narrowest refusing layer"
+        );
+        assert_eq!(
+            denied.snapshot.retry_after_secs,
+            Some(100),
+            "but the WAIT must cover per-tenant, which needs 100s for one token at 0.01/s"
+        );
+
+        // And obeying it works, which is the whole promise.
+        clock.advance(Duration::from_secs(100));
+        assert_eq!(
+            limiter.admit(&everyone(), 1.0).decision,
+            Decision::Admitted,
+            "a client that waits the advertised time must be admitted"
+        );
+    }
+
+    /// A WAIT THAT CAN NEVER SUFFICE IS NOT ADVERTISED.
+    ///
+    /// A cost larger than the burst can never be satisfied: the bucket is capped at the
+    /// burst. Advertising a wait is an infinite retry loop at the cadence the server
+    /// publishes, and a review rode it five times before giving up.
+    #[test]
+    fn an_unsatisfiable_cost_advertises_no_wait() {
+        for (refill, burst, cost) in [(0.5, 4.0, 5.0), (1.0, 1.0, 10.0), (10.0, 1.0, 5.0)] {
+            let (limiter, clock) = limiter(
+                LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(refill, burst)),
+            );
+            let denied = limiter.admit(&everyone(), cost);
+            assert_eq!(
+                denied.decision,
+                Decision::Denied,
+                "cost {cost} exceeds burst {burst}"
+            );
+            assert_eq!(
+                denied.snapshot.retry_after_secs, None,
+                "refill {refill} burst {burst} cost {cost}: no wait produces a cost above the burst"
+            );
+
+            // Proof it really is unsatisfiable: a long wait does not help.
+            clock.advance(Duration::from_secs(100_000));
+            assert_eq!(limiter.admit(&everyone(), cost).decision, Decision::Denied);
+        }
+    }
+
+    /// A REFUSAL REPORTS ZERO REMAINING.
+    ///
+    /// It reported the uncharged balance, so a cost of five against a full burst of four
+    /// answered `remaining=4` on a refusal: the client is told it has its whole budget while
+    /// being refused. Every previous denial fixture used a cost of exactly 1.0, so nothing
+    /// could see it.
+    #[test]
+    fn a_refusal_never_reports_a_budget_the_caller_cannot_spend() {
+        let (limiter, _clock) =
+            limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.5, 4.0)));
+        let denied = limiter.admit(&everyone(), 5.0);
+        assert_eq!(denied.decision, Decision::Denied);
+        assert_eq!(
+            denied.snapshot.remaining,
+            Some(0),
+            "a 429 that says remaining=4 contradicts itself"
+        );
+    }
+
+    /// THE POLICY WINDOW IS THE POLICY, not the live reset.
+    ///
+    /// `RateLimit-Policy`'s window describes the configured quota. Rendering the bucket's
+    /// current time-to-full told a client on its first request that it had four per two
+    /// seconds, when the real sustained rate is four per eight. A self-pacing client
+    /// believes that and runs at four times the rate it is allowed.
+    #[test]
+    fn the_policy_window_does_not_change_between_requests() {
+        let (limiter, _clock) =
+            limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.5, 4.0)));
+
+        let mut windows = Vec::new();
+        for _ in 0..5 {
+            let outcome = limiter.admit(&everyone(), 1.0);
+            windows.push(header(&outcome.headers(), "ratelimit-policy").map(str::to_owned));
+        }
+        assert_eq!(
+            windows,
+            vec![Some("4;w=8".to_owned()); 5],
+            "4 tokens at 0.5/s is 8 seconds, on every request, whatever the balance"
+        );
+    }
+
+    /// EVERY LAYER LABEL IS PINNED TO A LITERAL.
+    ///
+    /// The header-and-metric test compares both sides against `as_str`, so corrupting
+    /// `as_str` corrupts the expectation with it: a review swapped `per_tenant` and
+    /// `per_environment` and the whole suite stayed green, which would relabel every
+    /// per-tenant throttle on the wire and on every dashboard keyed on it. `as_str`'s own
+    /// doc says it exists to stop exactly that.
+    #[test]
+    fn the_layer_labels_are_the_documented_strings() {
+        assert_eq!(RateLayer::PerIp.as_str(), "per_ip");
+        assert_eq!(RateLayer::PerUser.as_str(), "per_user");
+        assert_eq!(RateLayer::PerClient.as_str(), "per_client");
+        assert_eq!(RateLayer::PerTenant.as_str(), "per_tenant");
+        assert_eq!(RateLayer::PerEnvironment.as_str(), "per_environment");
+    }
+
+    /// A PERMANENT BLOCK STILL CARRIES THE MACHINE-READABLE SIGNAL.
+    ///
+    /// The block signal was gated on a retry-after being present, so the refusals an edge
+    /// most wants to offload (the ones that will never lift) were exactly the ones carrying
+    /// no signal.
+    #[test]
+    fn a_block_that_never_lifts_still_signals_to_the_edge() {
+        let (limiter, _clock) =
+            limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.0, 1.0)));
+        assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+
+        let denied = limiter.admit(&everyone(), 1.0);
+        let headers = denied.headers();
+        assert_eq!(
+            header(&headers, "retry-after"),
+            None,
+            "it cannot be waited out"
+        );
+        assert_eq!(
+            header(&headers, crate::BLOCK_SIGNAL_HEADER),
+            Some(crate::BLOCK_SIGNAL_VALUE),
+            "and that is precisely when an edge wants the signal"
+        );
+        assert_eq!(
+            header(&headers, "ratelimit-policy"),
+            None,
+            "nothing refills, so there is no window to describe and `1;w=0` is not a rate"
+        );
+    }
+
+    /// THE WAIT IS MEASURED FROM THE BALANCE, not from the whole cost.
+    ///
+    /// Every denial fixture drained to exactly zero tokens, so the `- tokens_before` term
+    /// was never exercised and a mutant dropping it survived. A partial balance separates
+    /// them: 0.5 tokens, cost 1, refill 0.5 needs 1 second, not 2.
+    #[test]
+    fn the_wait_accounts_for_the_tokens_already_in_the_bucket() {
+        let (limiter, clock) =
+            limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.5, 2.0)));
+        // Drain, then refill exactly half a token.
+        assert_eq!(limiter.admit(&everyone(), 2.0).decision, Decision::Admitted);
+        clock.advance(Duration::from_secs(1));
+
+        let denied = limiter.admit(&everyone(), 1.0);
+        assert_eq!(denied.decision, Decision::Denied);
+        assert_eq!(
+            denied.snapshot.retry_after_secs,
+            Some(1),
+            "half a token is already there, so only half a token is owed: 1s at 0.5/s"
+        );
     }
 }
