@@ -391,6 +391,42 @@ impl RateLimitSnapshot {
     ///
     /// An unlimited snapshot produces no headers (there is no limit to report).
     /// Names are lowercase, matching the management API's header discipline.
+    ///
+    /// # The pinned draft revision (#1268, and #150's "pin the implemented revision")
+    ///
+    /// This renders the **dictionary grammar** of `draft-ietf-httpapi-ratelimit-headers`:
+    ///
+    /// ```text
+    /// RateLimit: limit=4, remaining=0, reset=8
+    /// RateLimit-Policy: 4;w=8
+    /// ```
+    ///
+    /// Later revisions of the draft use a policy-name structured field instead
+    /// (`RateLimit: "name";r=4;t=8`, `RateLimit-Policy: "name";q=4;w=8`). A client written
+    /// against one does not parse the other, so the revision is a wire contract and is
+    /// recorded here rather than left to be inferred from the format.
+    ///
+    /// The dictionary grammar is pinned because it is ALREADY SERVED. `headers` is not
+    /// reached only by the layered limiter (which has no production caller yet): it is also
+    /// the renderer behind `ironauth_oidc::abuse::stamp_rate_limit_headers`, which stamps
+    /// every throttled login, registration, TOTP, email and SMS OTP, magic link, recovery,
+    /// WebAuthn and proof-of-work response. Moving to the later grammar is a BREAKING wire
+    /// change for anything parsing those, and it needs a deprecation window rather than a
+    /// silent reformat.
+    ///
+    /// # `reset` is delta-seconds in BOTH families, deliberately
+    ///
+    /// The draft's `reset` is delta-seconds. The legacy `X-RateLimit-Reset` has no
+    /// specification, and a large part of the ecosystem (Auth0 and GitHub among them) sends
+    /// an epoch timestamp there instead.
+    ///
+    /// Both families stay delta here. Matching the ecosystem on the legacy header would put
+    /// two different reset semantics on ONE response: `ratelimit` saying `reset=8` and
+    /// `x-ratelimit-reset` saying 1789000000. A client reading both cannot reconcile them,
+    /// and a client reading an epoch as a delta sleeps for decades. Internal agreement is
+    /// worth more than matching a convention that is not specified anywhere, so the two
+    /// headers carry the same number in the same units, and
+    /// `the_two_header_families_report_reset_in_the_same_units` holds them together.
     #[must_use]
     pub fn headers(&self) -> Vec<(&'static str, String)> {
         let (Some(limit), Some(remaining)) = (self.limit, self.remaining) else {
@@ -1690,6 +1726,85 @@ mod tests {
             enforcer.bucket_count(),
             2,
             "the opportunistic reap drops the idle scope, keeping only the active one"
+        );
+    }
+
+    /// #1268, the decision this enforces: `reset` is delta-seconds in BOTH header families.
+    ///
+    /// The legacy `X-RateLimit-Reset` is unspecified and much of the ecosystem sends an
+    /// epoch there. If someone follows that convention, this fails, which is the point: the
+    /// harm is not picking the wrong one, it is a single response carrying both at once.
+    ///
+    /// Asserted as an EQUALITY between the two headers rather than against a literal, so it
+    /// keeps holding when the underlying number changes.
+    #[test]
+    fn the_two_header_families_report_reset_in_the_same_units() {
+        let snapshot = RateLimitSnapshot {
+            limit: Some(4),
+            remaining: Some(0),
+            reset_secs: 8,
+            retry_after_secs: Some(8),
+            denied: true,
+            policy_window_secs: Some(8),
+        };
+
+        let headers = snapshot.headers();
+        let find = |name: &str| {
+            headers
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map_or_else(|| panic!("{name} missing"), |(_, v)| v.clone())
+        };
+
+        let legacy = find("x-ratelimit-reset");
+        let structured = find("ratelimit");
+
+        assert_eq!(
+            legacy, "8",
+            "the legacy reset is a delta, not an epoch: an epoch here would read as a \
+             50-year sleep to a client that expects a delta"
+        );
+        assert!(
+            structured.contains(&format!("reset={legacy}")),
+            "the structured field and the legacy header must carry the SAME number: \
+             got structured {structured} against legacy {legacy}"
+        );
+    }
+
+    /// #1268 and #150: the pinned draft revision, asserted as the exact bytes it produces.
+    ///
+    /// The doc comment on `headers` names the dictionary grammar of
+    /// draft-ietf-httpapi-ratelimit-headers. Prose alone does not stop a reformat, and the
+    /// later policy-name grammar (`"name";r=4;t=8`) is a silent break for every client
+    /// parsing a throttled login response. This is what turns that sentence into a gate.
+    #[test]
+    fn the_pinned_draft_revision_renders_the_dictionary_grammar() {
+        let snapshot = RateLimitSnapshot {
+            limit: Some(4),
+            remaining: Some(1),
+            reset_secs: 8,
+            retry_after_secs: None,
+            denied: false,
+            policy_window_secs: Some(8),
+        };
+
+        let headers = snapshot.headers();
+        let find = |name: &str| {
+            headers
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map_or_else(|| panic!("{name} missing"), |(_, v)| v.clone())
+        };
+
+        assert_eq!(
+            find("ratelimit"),
+            "limit=4, remaining=1, reset=8",
+            "dictionary grammar, not the later `\"name\";r=1;t=8` structured field"
+        );
+        assert_eq!(
+            find("ratelimit-policy"),
+            "4;w=8",
+            "dictionary grammar, not the later `\"name\";q=4;w=8` structured field"
         );
     }
 }
