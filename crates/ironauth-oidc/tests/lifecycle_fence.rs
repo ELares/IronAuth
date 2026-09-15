@@ -1478,7 +1478,14 @@ async fn a_fence_read_error_stops_the_mint_while_publication_continues() {
     // narrower than that sentence in three ways, each of which is pinned by a test in
     // `issuer_registry.rs`:
     //
-    //   - only PUBLICATION. The mint below still refuses, in this very test.
+    //   - only PUBLICATION, which since issue #1262 means DISCOVERY as well as JWKS, both
+    //     asserted below. The mint below still refuses, in this very test. Discovery was
+    //     held back from #149 because its document was rendered with a second store read
+    //     that failed open to `["en"]`, so publishing it during an outage would have cached
+    //     a DEGRADED document at every relying party for the full max-age. That read now
+    //     happens on the cold load, where a failure is a retry rather than a guess, and
+    //     `discovery_serves_a_byte_identical_document_when_the_store_cannot_be_read` pins
+    //     the document served during an outage as byte-identical to the healthy one.
     //   - only a scope whose cache is FRESH, so a scope suspended longer ago than the entry
     //     TTL cannot publish even during an outage
     //     (`a_suspension_landing_just_before_an_outage_is_invisible_for_at_most_one_ttl`).
@@ -1496,6 +1503,11 @@ async fn a_fence_read_error_stops_the_mint_while_publication_continues() {
         jwks_status(&harness, &scope).await,
         StatusCode::OK,
         "a fence read error no longer stops PUBLICATION of an already-loaded key set (#149)"
+    );
+    assert_eq!(
+        discovery_status(&harness, &scope).await,
+        StatusCode::OK,
+        "and since issue #1262 discovery publishes on the same terms, from the same entry"
     );
     let (status, body) = exchange(&harness, &code).await;
     assert_eq!(

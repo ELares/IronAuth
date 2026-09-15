@@ -133,6 +133,26 @@ pub struct IssuerEntry {
     // environments level table it has no grant on. The kind never changes after
     // creation, so caching the derived set on the entry cannot go stale.
     guardrails: GuardrailSet,
+    // The environment's renderable UI locales (issue #1262): the installed locale-bundle tags
+    // unioned with `en`, sorted and deduplicated. It rides the entry for the same reason the
+    // guardrails do, but for a sharper reason than convenience: discovery used to make a
+    // SECOND store read per request to build this set, and that read ended in
+    // `unwrap_or_default()`, which cannot tell "no bundles installed" from "the read failed".
+    // During an outage the document therefore advertised `["en"]` instead of the real set and
+    // served it with the full `Cache-Control: max-age`, so a DEGRADED document outlived the
+    // outage in every relying-party cache. That is worse than the 404 it replaced: a 404 is a
+    // transient failure a client retries, a cached wrong answer persists past recovery.
+    //
+    // Loading it HERE means the failure direction is the entry's, which is already correct: a
+    // read error is `LoadOutcome::Error` (retry, never cache, never serve a guess), and the
+    // publication path serves the fresh cached entry with the locale set it was loaded with,
+    // byte-identical to the healthy document.
+    //
+    // The cost, stated: locale pickup becomes TTL-bounded rather than immediate. A newly
+    // installed bundle appears within the entry TTL instead of on the next request. That is
+    // the staleness contract the signing keys already have, and the trade is worth it because
+    // the alternative failure is a wrong answer cached at every relying party.
+    ui_locales: Vec<String>,
 }
 
 impl IssuerEntry {
@@ -150,7 +170,28 @@ impl IssuerEntry {
             policy,
             salt,
             guardrails,
+            // Empty is the honest default for a pre-populated (store-free) registry: it has no
+            // store to have read bundles from. Discovery renders an empty set as `["en"]`, the
+            // compiled fallback, which is exactly what that path advertised before.
+            ui_locales: Vec::new(),
         }
+    }
+
+    /// The same entry carrying the environment's renderable UI locales (issue #1262).
+    ///
+    /// Separate from [`IssuerEntry::new`] so a pre-populated registry, which has no store to
+    /// read bundles from, keeps compiling and keeps advertising the compiled fallback.
+    #[must_use]
+    pub fn with_ui_locales(mut self, ui_locales: Vec<String>) -> Self {
+        self.ui_locales = ui_locales;
+        self
+    }
+
+    /// The environment's renderable UI locales (issue #1262): the installed locale-bundle tags
+    /// unioned with `en`, sorted and deduplicated. Empty only for a store-free registry.
+    #[must_use]
+    pub fn ui_locales(&self) -> &[String] {
+        &self.ui_locales
     }
 
     /// The environment's key set.
@@ -887,7 +928,30 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> LoadOutcome {
     else {
         return LoadOutcome::Error;
     };
-    LoadOutcome::Loaded(IssuerEntry::new(keyset, policy, salt, guardrails))
+    // The environment's renderable UI locales (issue #1262), read on the SAME cold load as the
+    // keys and the guardrails so discovery needs no second store round trip per request.
+    //
+    // A read failure is `LoadOutcome::Error`, NOT a default: this is the whole point of moving
+    // the read here. `supported_ui_locales` in discovery.rs ended in `unwrap_or_default()`,
+    // which collapsed a failed read into "no bundles installed" and published the collapsed
+    // answer with a 300 to 900 second `max-age`. Erroring here retries on the next request and
+    // publishes nothing wrong in the meantime; on the publication path the fresh cached entry
+    // is served instead, carrying the locale set it was loaded with.
+    let Ok(installed) = store
+        .scoped(*scope)
+        .locale_bundles()
+        .installed_locales()
+        .await
+    else {
+        return LoadOutcome::Error;
+    };
+    // Unioned with `en` (the compiled fallback language), sorted and deduplicated by the set.
+    let mut locales: std::collections::BTreeSet<String> = installed.into_iter().collect();
+    locales.insert("en".to_owned());
+    let ui_locales: Vec<String> = locales.into_iter().collect();
+    LoadOutcome::Loaded(
+        IssuerEntry::new(keyset, policy, salt, guardrails).with_ui_locales(ui_locales),
+    )
 }
 
 /// Order an environment's present signing algorithms by IronAuth's CANONICAL

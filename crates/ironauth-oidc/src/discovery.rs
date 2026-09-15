@@ -75,12 +75,12 @@ use axum::routing::get;
 use ironauth_config::OidcConfig;
 use ironauth_env::Env;
 use ironauth_jose::{JwsAlgorithm, SigningPolicy};
-use ironauth_store::{Scope, Store};
+use ironauth_store::Scope;
 use serde_json::{Value, json};
 
 use crate::client_auth::ClientAuthMethod;
 use crate::hints::Display;
-use crate::issuer::{IssuerRegistry, JwksCacheWindow};
+use crate::issuer::{IssuerRegistry, IssuerResolution, JwksCacheWindow};
 use crate::registry::{GrantType, PkceMethod, PromptValue, ResponseMode, ResponseType};
 use crate::subject::SubjectType;
 use crate::wellknown::{cacheable_response, not_found, parse_scope};
@@ -778,24 +778,6 @@ fn to_strings<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
     values.map(ToOwned::to_owned).collect()
 }
 
-/// The `ui_locales_supported` set an environment can render (issue #86, PR 2): the installed
-/// locale-bundle tags unioned with `en` (the compiled fallback language), sorted and
-/// deduplicated. A store read failure fails safe to just `["en"]`, so a store hiccup never
-/// advertises a locale the pages cannot render and never errors discovery. The data-plane role
-/// holds SELECT on `locale_bundles`, so this scoped read runs beneath forced row-level
-/// security.
-async fn supported_ui_locales(store: &Store, scope: &Scope) -> Vec<String> {
-    let installed = store
-        .scoped(*scope)
-        .locale_bundles()
-        .installed_locales()
-        .await
-        .unwrap_or_default();
-    let mut set: std::collections::BTreeSet<String> = installed.into_iter().collect();
-    set.insert("en".to_owned());
-    set.into_iter().collect()
-}
-
 /// The shared state for the discovery surface.
 ///
 /// Holds the deployment base URL, the JWKS/discovery cache window, the
@@ -871,22 +853,37 @@ impl DiscoveryState {
     /// not-found the caller returns for a malformed scope, so the two are
     /// indistinguishable and match the JWKS surface.
     async fn respond(&self, scope: &Scope, headers: &HeaderMap) -> Response {
-        let Some(entry) = self.registry.entry_for(scope, self.now()).await else {
-            return not_found();
+        // RESOLVED FOR PUBLICATION (issue #1262), not `entry_for`, so an unreadable fence
+        // publishes a still-fresh cached entry rather than 404ing, matching JWKS. A discovery
+        // document is public metadata every relying party already holds for the `max-age`
+        // window, so serving a fresh cached copy during an outage gives an attacker nothing
+        // they did not have; a `Fenced` scope, where the read SUCCEEDED and reports an
+        // operator suspension, still 404s here exactly as everywhere else.
+        let entry = match self
+            .registry
+            .resolve_for_publication(scope, self.now())
+            .await
+        {
+            IssuerResolution::Ready(entry) => entry,
+            IssuerResolution::Fenced | IssuerResolution::Absent => return not_found(),
         };
         let issuer = self.issuer_for(scope);
         let jwks_uri = format!("{issuer}/jwks.json");
-        // Populate the per-environment `ui_locales_supported` from the installed locale bundles
-        // (issue #86, PR 2): the installed tags unioned with `en`, so discovery advertises
-        // exactly what THIS environment can render (the honest set). A store-free (pre-populated)
-        // registry, or a store read that fails, leaves the capability unset, so discovery
-        // advertises the minimal `["en"]`, byte-identical to before PR 2.
-        let capabilities = match self.registry.store() {
-            Some(store) => self
-                .capabilities
+        // The per-environment `ui_locales_supported` (issue #86, PR 2) comes off the ENTRY,
+        // which loaded it on the same cold load as the keys (issue #1262). It used to be a
+        // second store read per request ending in `unwrap_or_default()`, so an outage
+        // advertised `["en"]` instead of the real set and cached that answer at every relying
+        // party for the full `max-age`. Reading it from the entry means the outage document is
+        // byte-identical to the healthy one, and the healthy path loses a round trip.
+        //
+        // A store-free (pre-populated) registry has an empty set, so discovery advertises the
+        // minimal `["en"]`, byte-identical to before PR 2.
+        let capabilities = if entry.ui_locales().is_empty() {
+            self.capabilities.clone()
+        } else {
+            self.capabilities
                 .clone()
-                .with_supported_ui_locales(supported_ui_locales(store, scope).await),
-            None => self.capabilities.clone(),
+                .with_supported_ui_locales(entry.ui_locales().to_vec())
         };
         let document = discovery_document(
             &issuer,
