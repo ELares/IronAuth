@@ -1128,6 +1128,8 @@ jobs:
       # directions against the emit sites and runs in the workspace test job. It is not
       # duplicated here: re-adding a step for it would rebuild the workspace a second time to
       # re-run a test that already ran.
+      - name: image verification docs match the script CI runs (issue #151 criterion 3)
+        run: scripts/verify-image.sh --selfcheck
       - name: diagnostics redaction corpus (a sentinel in any free-form diagnostic field would be seen)
         run: scripts/diagnostics-redaction-scan.sh
       - name: canonicalization seam (every identifier comparison routes through the one seam)
