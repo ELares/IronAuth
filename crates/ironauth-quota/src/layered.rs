@@ -1784,7 +1784,10 @@ mod tests {
             Decision::Denied,
             "a configured per-IP limit is the only control an unidentified request has"
         );
-        assert!(outcome.missing_identity, "refused for identity, not for rate");
+        assert!(
+            outcome.missing_identity,
+            "refused for identity, not for rate"
+        );
         assert_eq!(outcome.limiting_layer, Some(RateLayer::PerIp));
         assert_eq!(outcome.unenforced, vec![RateLayer::PerIp]);
         assert!(
