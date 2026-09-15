@@ -927,6 +927,18 @@ pub enum Action {
     /// generated for new writes and the prior version was retired but stays
     /// readable for background re-encryption of old rows.
     EnvelopeDekRotate,
+    /// A tenant's quota limit override was written at runtime (issue #150 criterion 4).
+    ///
+    /// Distinct from [`QuotaLimitCleared`]: the two are the opposite change and one action
+    /// covering both made the log unreadable. A reviewer asked the log what happened to a
+    /// tenant's limits and got a column of identical `quota.limit.set` rows that could each
+    /// be a raise, a lowering, or a removal.
+    ///
+    /// [`QuotaLimitCleared`]: Action::QuotaLimitCleared
+    QuotaLimitSet,
+    /// A tenant's quota limit override was removed, returning the scope to the configured
+    /// default (issue #150 criterion 4).
+    QuotaLimitCleared,
     /// An encrypted secret value was written (issue #48): a plaintext secret was
     /// sealed under the scope's active DEK with its column context bound as
     /// associated data, and stored as ciphertext.
@@ -1908,6 +1920,8 @@ impl Action {
             Action::EnvelopeByokEnroll => "envelope.byok.enroll",
             Action::EnvelopeDekProvision => "envelope.dek.provision",
             Action::EnvelopeDekRotate => "envelope.dek.rotate",
+            Action::QuotaLimitSet => "quota.limit.set",
+            Action::QuotaLimitCleared => "quota.limit.cleared",
             Action::EncryptedSecretPut => "encrypted_secret.put",
             Action::EncryptedSecretReencrypt => "encrypted_secret.reencrypt",
             Action::CustomDomainRegister => "custom_domain.register",

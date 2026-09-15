@@ -1944,6 +1944,16 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0228_hot_state_column_scoped_updates.sql"),
         },
+        // Per-tenant quota overrides (issue #150 criterion 4). EXPAND: it adds a table and
+        // nothing reads it until a caller asks, so an older node rolling alongside a newer
+        // one is unaffected. An empty table is the configured default, which is what makes
+        // this safe to apply ahead of the management API that writes to it.
+        Migration {
+            version: 229,
+            name: "tenant_quota_limits",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0229_tenant_quota_limits.sql"),
+        },
     ]
 }
 

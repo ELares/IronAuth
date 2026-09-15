@@ -308,6 +308,16 @@ const ENTITY_MANAGEMENT_DOMAINS: &[&str] = &[
     "environment_secret",
     "environment_variable",
     "flow_target",
+    // A per-tenant QUOTA override (issue #150 criterion 4) is configuration: it changes how
+    // much of this environment a tenant may consume, and grants nobody a way in and no new
+    // right. It sits beside `environment` rather than on the access-management list for the
+    // reason the `scim_push_connection` note below gives: what an operator changes when they
+    // touch it is a setting, not an authorisation.
+    //
+    // It is worth an audit row precisely because it is a setting somebody raises under
+    // pressure. "Who lifted the request limit before the incident" is asked after the fact,
+    // and the target records WHICH dimension moved so the log can answer it.
+    "quota",
     // An OUTBOUND SCIM connection (issue #137) is CONFIGURATION, not a credential, and that is
     // why it is here while `scim_connection` is on the access-management list one screen up.
     //
