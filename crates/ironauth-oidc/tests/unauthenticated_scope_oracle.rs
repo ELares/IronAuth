@@ -168,6 +168,25 @@ struct Case {
 #[allow(clippy::too_many_lines)]
 fn cases() -> Vec<Case> {
     vec![
+        // THE FORWARD-AUTH CHECK (issue #154), driven with the surface OFF, which is the
+        // default and the only state this harness builds.
+        //
+        // WHAT THIS PINS, precisely: with `[forward_auth]` at its default the check path
+        // answers the same 404 at a live scope and at one that never existed.
+        //
+        // It does NOT pin the handler's internal ordering, and an earlier version of this
+        // comment claimed it did. With the surface off both orderings answer 404 either
+        // way, so the case cannot tell them apart; the ordering is a property only an
+        // ENABLED surface could exhibit, and this harness does not build one. Pinning it
+        // needs a handler-level test, which lives beside the handler.
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/forward-auth",
+            query: "",
+            method: "GET",
+            content_type: "",
+            body: "",
+            live_status: StatusCode::NOT_FOUND,
+        },
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/device",
             query: "",

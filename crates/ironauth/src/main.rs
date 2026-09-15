@@ -356,7 +356,12 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         let planes = match assemble_planes(&config, &env, &features).await {
             Ok(planes) => planes,
             Err(error) => {
-                tracing::error!(%error, "failed to derive the public site context");
+                // The message names the CATEGORY, not one cause. This read "failed to derive
+                // the public site context", which was accurate when `public_url` was the only
+                // way here and became misleading the moment an unbuildable access rule took
+                // the same arm: the refusal's whole value is that it names the rule, and the
+                // first line an operator reads would have pointed at the wrong section.
+                tracing::error!(%error, "refusing to boot: a plane input could not be resolved");
                 return ExitCode::FAILURE;
             }
         };
@@ -880,6 +885,11 @@ struct AssembledPlanes {
 /// [`ServerError::InvalidPublicUrl`] if `server.public_url` is set but is not a valid
 /// `http`/`https` base URL, which is the one input both planes need and neither can
 /// substitute for.
+///
+/// [`ServerError::InvalidAccessRules`] if a `[forward_auth]` rule is valid configuration
+/// this build cannot evaluate (issue #154). Built HERE rather than inside
+/// [`build_oidc_plane`] precisely so it can refuse: that function answers `Option`, so the
+/// same failure there removed the OIDC plane and let the process come up healthy.
 async fn assemble_planes(
     config: &Config,
     env: &Env,
@@ -890,6 +900,22 @@ async fn assemble_planes(
     // every shared value off it. There is no second carrier to hand a plane and no
     // argument here that could be filled from the wrong source.
     let shared = SharedPlaneInputs::capture(config, features, env)?;
+
+    // THE ACCESS RULES ARE BUILT HERE so a failure REFUSES TO BOOT (issue #154).
+    //
+    // It was inside `build_oidc_plane`, which answers `Option`, so a rule this build cannot
+    // evaluate returned `None` and the process carried on with the OIDC plane silently
+    // absent and readiness still green. That is a worse failure than the one it was meant to
+    // be: an operator sees a healthy server serving no OIDC, rather than a refusal naming
+    // the rule. Here the error reaches the `ExitCode::FAILURE` arm, the same one a malformed
+    // `server.public_url` takes.
+    let forward_auth =
+        ironauth_oidc::forward_auth_rules::ForwardAuthRuntime::from_config(&config.forward_auth)
+            .map_err(|error| ServerError::InvalidAccessRules {
+                reason: error.to_string(),
+            })?
+            .map(std::sync::Arc::new);
+
     let management = build_admin_state(config, env, &shared).await;
     let oidc = if config.oidc.enabled {
         build_oidc_plane(
@@ -897,6 +923,7 @@ async fn assemble_planes(
             env,
             DataPlaneSurfaces::resolve(features, config),
             &shared,
+            forward_auth,
         )
         .await
     } else {
@@ -1480,6 +1507,7 @@ async fn build_oidc_plane(
     env: &Env,
     surfaces: DataPlaneSurfaces,
     shared: &SharedPlaneInputs,
+    forward_auth: Option<std::sync::Arc<ironauth_oidc::forward_auth_rules::ForwardAuthRuntime>>,
 ) -> Option<OidcPlane> {
     let oidc_config = &config.oidc;
     let policy_config = &config.password_policy;
@@ -1887,6 +1915,13 @@ async fn build_oidc_plane(
             );
         }
         state
+    };
+    // THE FORWARD-AUTH SURFACE (issue #154). Absent unless `[forward_auth] enabled` is set,
+    // in which case the check route answers a uniform 404. Built in `assemble_planes`, where
+    // a rule this build cannot evaluate refuses to boot instead of quietly removing a plane.
+    let state = match forward_auth {
+        Some(runtime) => state.with_forward_auth(runtime),
+        None => state,
     };
     // The outbound client sync HTTP flow targets are called through (issue #112). Its
     // `total_timeout` is the flow-target ceiling EXACTLY, because a per-request timeout only

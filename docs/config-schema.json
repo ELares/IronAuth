@@ -861,8 +861,13 @@
     },
     "ForwardAuthConfig": {
       "additionalProperties": false,
-      "description": "Forward-auth access rules (issue #154).\n\nA reverse proxy asks the forward-auth surface whether to admit a request, and this\nsection is where the answer is written down: an ORDERED list of rules, first match\nwins. `ironauth_oidc::rules` evaluates them; this is the vocabulary an operator uses\nto express them.\n\n# This section ships AHEAD of the surface that serves it\n\nThere is no forward-auth endpoint yet (issue #154 criteria 1, 2 and 4), so a rule\nwritten here is evaluated by nothing. `check_forward_auth_unconsumed` refuses to boot\non any non-default value for exactly the reason `[byok]` does: a rule list reads as\n\"these are the access rules protecting my applications\", and a silent no-op there is\nworse than the section not existing.",
+      "description": "Forward-auth access rules (issue #154).\n\nA reverse proxy asks the forward-auth surface whether to admit a request, and this\nsection is where the answer is written down: an ORDERED list of rules, first match\nwins. `ironauth_oidc::rules` evaluates them; this is the vocabulary an operator uses\nto express them.\n\n# What enabling this serves\n\n`enabled = true` mounts the check endpoint at\n`/t/{tenant}/e/{environment}/forward-auth`, which a reverse proxy calls before serving a\nrequest. Off, that route answers a uniform 404, so a deployment that did not ask for the\nsurface does not advertise one.\n\nA rule this build cannot evaluate REFUSES TO BOOT rather than being skipped: the error\nreaches the same non-zero exit a malformed `server.public_url` takes.\n`subject_in_group` and `subject_has_role` are the current cases: the forward-auth\nidentity carries a subject and no memberships, so those checks would compare against an\nempty list and a `deny` rule keyed on a group would never bite.",
       "properties": {
+        "dialect": {
+          "$ref": "#/$defs/ProxyDialectConfig",
+          "default": "forward-auth",
+          "description": "Which reverse proxy dialect the check request arrives in.\n\nA DEPLOYMENT PROPERTY, not a per-request one. Each proxy states the original\nrequest in its own headers (`X-Forwarded-Uri` against `X-Original-URI` against\nEnvoy's own method and path), and reading the wrong dialect means reading the\nauthenticator's own URL instead of the one being authorized, which authorizes the\nwrong thing. Naming it once is what makes that unambiguous."
+        },
         "enabled": {
           "default": false,
           "description": "Whether the forward-auth surface is served.",
@@ -2353,6 +2358,26 @@
       },
       "type": "object"
     },
+    "ProxyDialectConfig": {
+      "description": "The reverse proxy dialect a forward-auth check request arrives in.\n\n# Why Envoy and Istio `ext_authz` is absent\n\nThe engine supports the dialect (`ironauth_oidc::forward_auth::Dialect::EnvoyExtAuthz`).\nWhat this build cannot do is SERVE it, and the reason is the route shape rather than the\nlogic.\n\nUnder `ext_authz` the check request carries the original method and path as its OWN,\nwhich is why the check route accepts any method. The PATH arrives the same way, and the\ncheck route is a fixed four-segment template, so the original path is not in it: an\n`ext_authz` check for `/admin/keys` either does not match the route at all, or matches\nonly when the operator points Envoy's `path_prefix` at the route, and is then authorized\nas the route's own path instead of `/admin/keys`. Every `path_prefix` and `path_matches`\ncriterion would be evaluated against a per-scope CONSTANT, so a rule denying `/admin`\nwould never fire and a later allow rule would admit the request.\n\nServing it needs a wildcard mount that carries the original path\n(`.../forward-auth/{*original}`) and the prefix-stripping that goes with it, with tests\nof its own. Offering the value here while the runtime could not honour it would be the\nsame defect the `subject_in_group` refusal exists to prevent, one level up.",
+      "oneOf": [
+        {
+          "const": "forward-auth",
+          "description": "Traefik and Caddy: `X-Forwarded-Method`, `X-Forwarded-Host`, `X-Forwarded-Uri`.",
+          "type": "string"
+        },
+        {
+          "const": "nginx-auth-request",
+          "description": "nginx `auth_request`: `X-Original-Method`, `X-Original-URI`, host from the\nINHERITED `Host` (not `X-Forwarded-Host`).\n\n`proxy_pass` rewrites `Host` to `$proxy_host` unless the `auth_request` location sets\n`proxy_set_header Host $host`, so that line is required for host rules to see the\nhost a client asked for.",
+          "type": "string"
+        },
+        {
+          "const": "haproxy",
+          "description": "`HAProxy`: `X-Forwarded-Method`, `X-Forwarded-Host`, `X-Forwarded-Uri`.\n\nNOT `X-Original-URI`. `HAProxy` neither sets nor strips that header, so a server\nreading it would let a client supply one directly and choose its own authorization\npath. This description said `X-Original-URI` because it was copied from a rustdoc\nthat was itself stale, which is how a corrected bypass gets republished as guidance.",
+          "type": "string"
+        }
+      ]
+    },
     "QuarantineConfig": {
       "additionalProperties": false,
       "description": "The signup-quarantine sensitive-scope policy (issue #82, PR 2): which OAuth scopes a\nQUARANTINED account may NEVER receive. A quarantined signup can authenticate, but with\nlimited privileges: at the shared authorize choke point every requested scope that\nmatches this denylist is DROPPED from the grant, so a quarantined account is usable but\npowerless until an admin releases it. Non-sensitive baseline scopes (`openid`,\n`profile`, `email`) are never on the denylist, so a quarantined user still gets a basic\nidentity token. The denylist is tunable per environment (the tunability principle) with\na CONSERVATIVE default: an operator can add more sensitive scopes (a payment-class scope\nfor example) but the shipped default already strips the classes that most obviously\ngrant power (offline access and admin/management scopes).",
@@ -3335,10 +3360,11 @@
     "forward_auth": {
       "$ref": "#/$defs/ForwardAuthConfig",
       "default": {
+        "dialect": "forward-auth",
         "enabled": false,
         "rules": []
       },
-      "description": "Forward-auth access rules (issue #154). Ships ahead of the surface that serves\nthem; a non-default value is refused at boot until that surface exists."
+      "description": "Forward-auth access rules (issue #154).\n\n`enabled` mounts the check endpoint at\n`/t/{tenant}/e/{environment}/forward-auth`, which a reverse proxy calls before\nserving a request. Off, that route is a uniform 404.\n\nA rule this build cannot evaluate refuses to BOOT rather than being skipped,\nbecause skipping one silently serves a different access policy than the file\ndescribes."
     },
     "hosted_pages": {
       "$ref": "#/$defs/HostedPagesConfig",

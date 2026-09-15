@@ -217,8 +217,15 @@ pub struct Config {
     /// which is the shipped default and fully supported.
     pub hot_state: HotStateConfig,
 
-    /// Forward-auth access rules (issue #154). Ships ahead of the surface that serves
-    /// them; a non-default value is refused at boot until that surface exists.
+    /// Forward-auth access rules (issue #154).
+    ///
+    /// `enabled` mounts the check endpoint at
+    /// `/t/{tenant}/e/{environment}/forward-auth`, which a reverse proxy calls before
+    /// serving a request. Off, that route is a uniform 404.
+    ///
+    /// A rule this build cannot evaluate refuses to BOOT rather than being skipped,
+    /// because skipping one silently serves a different access policy than the file
+    /// describes.
     pub forward_auth: ForwardAuthConfig,
 
     /// User lifecycle (issue #52): whether this process executes scheduled offboardings
@@ -1402,18 +1409,31 @@ pub struct HotStateConfig {
 /// wins. `ironauth_oidc::rules` evaluates them; this is the vocabulary an operator uses
 /// to express them.
 ///
-/// # This section ships AHEAD of the surface that serves it
+/// # What enabling this serves
 ///
-/// There is no forward-auth endpoint yet (issue #154 criteria 1, 2 and 4), so a rule
-/// written here is evaluated by nothing. `check_forward_auth_unconsumed` refuses to boot
-/// on any non-default value for exactly the reason `[byok]` does: a rule list reads as
-/// "these are the access rules protecting my applications", and a silent no-op there is
-/// worse than the section not existing.
+/// `enabled = true` mounts the check endpoint at
+/// `/t/{tenant}/e/{environment}/forward-auth`, which a reverse proxy calls before serving a
+/// request. Off, that route answers a uniform 404, so a deployment that did not ask for the
+/// surface does not advertise one.
+///
+/// A rule this build cannot evaluate REFUSES TO BOOT rather than being skipped: the error
+/// reaches the same non-zero exit a malformed `server.public_url` takes.
+/// `subject_in_group` and `subject_has_role` are the current cases: the forward-auth
+/// identity carries a subject and no memberships, so those checks would compare against an
+/// empty list and a `deny` rule keyed on a group would never bite.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ForwardAuthConfig {
     /// Whether the forward-auth surface is served.
     pub enabled: bool,
+    /// Which reverse proxy dialect the check request arrives in.
+    ///
+    /// A DEPLOYMENT PROPERTY, not a per-request one. Each proxy states the original
+    /// request in its own headers (`X-Forwarded-Uri` against `X-Original-URI` against
+    /// Envoy's own method and path), and reading the wrong dialect means reading the
+    /// authenticator's own URL instead of the one being authorized, which authorizes the
+    /// wrong thing. Naming it once is what makes that unambiguous.
+    pub dialect: ProxyDialectConfig,
     /// The ordered rule list. FIRST MATCH WINS, so order is meaning, not presentation.
     ///
     /// An empty list with `enabled = true` denies nothing and allows nothing to be
@@ -1487,6 +1507,49 @@ pub struct AccessRuleConfig {
     /// Whether the request must be authenticated or anonymous.
     #[serde(default)]
     pub subject_state: Option<SubjectStateConfig>,
+}
+
+/// The reverse proxy dialect a forward-auth check request arrives in.
+///
+/// # Why Envoy and Istio `ext_authz` is absent
+///
+/// The engine supports the dialect (`ironauth_oidc::forward_auth::Dialect::EnvoyExtAuthz`).
+/// What this build cannot do is SERVE it, and the reason is the route shape rather than the
+/// logic.
+///
+/// Under `ext_authz` the check request carries the original method and path as its OWN,
+/// which is why the check route accepts any method. The PATH arrives the same way, and the
+/// check route is a fixed four-segment template, so the original path is not in it: an
+/// `ext_authz` check for `/admin/keys` either does not match the route at all, or matches
+/// only when the operator points Envoy's `path_prefix` at the route, and is then authorized
+/// as the route's own path instead of `/admin/keys`. Every `path_prefix` and `path_matches`
+/// criterion would be evaluated against a per-scope CONSTANT, so a rule denying `/admin`
+/// would never fire and a later allow rule would admit the request.
+///
+/// Serving it needs a wildcard mount that carries the original path
+/// (`.../forward-auth/{*original}`) and the prefix-stripping that goes with it, with tests
+/// of its own. Offering the value here while the runtime could not honour it would be the
+/// same defect the `subject_in_group` refusal exists to prevent, one level up.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyDialectConfig {
+    /// Traefik and Caddy: `X-Forwarded-Method`, `X-Forwarded-Host`, `X-Forwarded-Uri`.
+    #[default]
+    ForwardAuth,
+    /// nginx `auth_request`: `X-Original-Method`, `X-Original-URI`, host from the
+    /// INHERITED `Host` (not `X-Forwarded-Host`).
+    ///
+    /// `proxy_pass` rewrites `Host` to `$proxy_host` unless the `auth_request` location sets
+    /// `proxy_set_header Host $host`, so that line is required for host rules to see the
+    /// host a client asked for.
+    NginxAuthRequest,
+    /// `HAProxy`: `X-Forwarded-Method`, `X-Forwarded-Host`, `X-Forwarded-Uri`.
+    ///
+    /// NOT `X-Original-URI`. `HAProxy` neither sets nor strips that header, so a server
+    /// reading it would let a client supply one directly and choose its own authorization
+    /// path. This description said `X-Original-URI` because it was copied from a rustdoc
+    /// that was itself stale, which is how a corrected bypass gets republished as guidance.
+    Haproxy,
 }
 
 /// What a matching rule decides.
@@ -2845,6 +2908,28 @@ pub const OIDC_MAX_SESSION_TTL_SECS: u64 = 2_592_000;
 /// no resolvable peer IP does not resolve a bound session), so the binding cannot be
 /// bypassed by omitting the header either.
 pub const PEER_IP_HEADER: &str = "x-ironauth-peer-ip";
+
+/// The header carrying the trusted-proxy policy's PER-REQUEST verdict (issue #154).
+///
+/// Stamped by the server's request middleware exactly as [`PEER_IP_HEADER`] is, and for the
+/// same reason: `HeaderMap::insert` REPLACES every value already present, so a client that
+/// sends this header cannot spoof the verdict. What a downstream handler reads is always
+/// what the trusted-proxy policy resolved for THIS request.
+///
+/// It exists because "does this deployment trust forwarding headers at all" and "did THIS
+/// request arrive through the trusted chain" are different questions, and the forward-auth
+/// check path needs the second one. Answering it with the first treats a client that reached
+/// the endpoint directly as though it had come through the proxy, which hands that client
+/// the ability to state the original request itself.
+///
+/// The only value that means trusted is [`FORWARD_DECISION_HONORED`]. Anything else,
+/// including the header being absent, is untrusted: a handler that cannot tell must not
+/// guess in the direction that admits a request.
+pub const FORWARD_DECISION_HEADER: &str = "x-ironauth-forward-decision";
+
+/// The [`FORWARD_DECISION_HEADER`] value meaning the forwarding headers were honoured for
+/// this request, i.e. it arrived through the configured trusted-proxy chain.
+pub const FORWARD_DECISION_HONORED: &str = "honored";
 
 /// The minimum permitted JWKS `Cache-Control: max-age` (issue #19), in seconds.
 /// A shorter window would make relying parties refetch the key set too often and
@@ -6081,8 +6166,7 @@ impl Config {
         validate_scim(&self.scim)?;
         validate_ssf(&self.ssf)?;
         validate_risc_receiver(&self.risc_receiver)?;
-        validate_forward_auth(&self.forward_auth)?;
-        check_forward_auth_unconsumed(&self.forward_auth)?;
+        validate_forward_auth(&self.forward_auth, &self.proxy, self.oidc.enabled)?;
         validate_scim_push(&self.scim_push)?;
         validate_certificate_expiry(&self.certificate_expiry)?;
         check_oidc_lifetime(
@@ -6359,6 +6443,30 @@ fn validate_access_rule(at: &str, rule: &AccessRuleConfig) -> Result<(), ConfigE
         _ => {}
     }
 
+    // A PREFIX THAT MATCHES NOTHING, OR EVERYTHING, IS NOT A CONSTRAINT.
+    //
+    // `""` matches no path at all under the engine's segment-boundary rule, so the rule it
+    // constrains never fires. `"/"` is the opposite and worse: it reads as "the whole site"
+    // while a rule with no path constraint is written by OMITTING the field, so anyone
+    // writing `"/"` believed they were narrowing something.
+    if let Some(prefix) = &rule.path_prefix {
+        let trimmed = prefix.trim();
+        if trimmed.is_empty() || trimmed.trim_end_matches('/').is_empty() {
+            return Err(invalid(format!(
+                "{at}.path_prefix is `{prefix}`, which constrains nothing: an empty prefix \
+                 matches no path and `/` matches every one. A rule that applies to any path \
+                 is written by omitting path_prefix, so this one reads as a narrowing it \
+                 does not perform"
+            )));
+        }
+        if !trimmed.starts_with('/') {
+            return Err(invalid(format!(
+                "{at}.path_prefix is `{prefix}`, which does not start with `/`: request \
+                 paths always do, so this can never match"
+            )));
+        }
+    }
+
     for (position, method) in rule.methods.iter().enumerate() {
         if method.trim().is_empty() {
             return Err(invalid(format!(
@@ -6473,45 +6581,43 @@ fn validate_rule_subject(
     Ok(())
 }
 
-/// Refuse a `[forward_auth]` section set away from its defaults (issue #154).
-///
-/// The section ships AHEAD of the surface that serves it: there is no forward-auth
-/// endpoint, so a rule written here is evaluated by nothing. This is the same treatment
-/// `[byok]` gets and for a sharper reason. `[byok]` misstates a protection; a rule list
-/// misstates an ACCESS DECISION, so an operator who writes "deny /admin to anonymous"
-/// and boots successfully holds a specific false belief about who can reach what.
-///
-/// The rules are still VALIDATED before this refusal, deliberately. An operator removing
-/// the section should learn that their rules were also malformed, rather than discover it
-/// when the surface lands and the refusal lifts.
-///
-/// # Errors
-///
-/// [`ConfigError::Invalid`] naming the offending field.
-fn check_forward_auth_unconsumed(cfg: &ForwardAuthConfig) -> Result<(), ConfigError> {
-    let field = if cfg.enabled {
-        "forward_auth.enabled"
-    } else if !cfg.rules.is_empty() {
-        "forward_auth.rules"
-    } else {
-        return Ok(());
-    };
-    Err(ConfigError::Invalid {
-        message: format!(
-            "{field} is set, but no forward-auth surface is served yet: the rules are \
-             evaluated by nothing, so they decide no access (issue #154). Remove the \
-             [forward_auth] section rather than rely on rules this build does not enforce."
-        ),
-    })
-}
-
 /// Validate the forward-auth rule list (issue #154).
 ///
 /// # Errors
 ///
 /// [`ConfigError::Invalid`] naming the first offending rule and why.
-fn validate_forward_auth(cfg: &ForwardAuthConfig) -> Result<(), ConfigError> {
+fn validate_forward_auth(
+    cfg: &ForwardAuthConfig,
+    proxy: &ProxyConfig,
+    oidc_enabled: bool,
+) -> Result<(), ConfigError> {
     let invalid = |message: String| ConfigError::Invalid { message };
+
+    // TWO CROSS-SECTION REFUSALS, both for the same reason: with either of these wrong the
+    // surface boots, validates, reports healthy, and decides nothing. A silent deny-all on
+    // an access-control surface is indistinguishable from a `deny` rule biting, so an
+    // operator debugging it has no signal to follow.
+    if cfg.enabled {
+        if !(proxy.trust_forwarded && proxy.trusted_hops > 0) {
+            return Err(invalid(
+                "forward_auth.enabled is true but [proxy] does not honour forwarding \
+                 headers (proxy.trust_forwarded is false or proxy.trusted_hops is 0). The \
+                 check path reads the ORIGINAL request only from a request the \
+                 trusted-proxy policy honoured, so with forwarding off every check answers \
+                 403 and the proxy denies everything it guards. Set both, or turn \
+                 forward_auth off"
+                    .to_owned(),
+            ));
+        }
+        if !oidc_enabled {
+            return Err(invalid(
+                "forward_auth.enabled is true but oidc.enabled is false: the check endpoint \
+                 is mounted on the OIDC plane, so it would answer a uniform 404 and no rule \
+                 written here would be in force"
+                    .to_owned(),
+            ));
+        }
+    }
 
     if cfg.enabled && cfg.rules.is_empty() {
         return Err(invalid(
@@ -10860,7 +10966,12 @@ mod tests {
     /// Every path the validator can take now has a row.
     #[test]
     fn every_forward_auth_rule_defect_is_named() {
-        let with = |rule: &str| format!("[forward_auth]\nenabled = true\n{rule}");
+        // The prerequisites `forward_auth.enabled` now carries. Stated once here so each row
+        // below exercises the RULE defect it names rather than tripping a cross-section
+        // refusal, which would make every row pass for the wrong reason.
+        let prereq = "[oidc]\nenabled = true\n\
+                      [proxy]\ntrust_forwarded = true\ntrusted_hops = 1\n";
+        let with = |rule: &str| format!("{prereq}[forward_auth]\nenabled = true\n{rule}");
         let deny = |extra: &str| {
             with(&format!(
                 "[[forward_auth.rules]]\nname = \"a\"\naction = \"deny\"\n{extra}"
@@ -10929,7 +11040,10 @@ mod tests {
                 deny("[[forward_auth.rules.headers]]\nname = \"x-env\"\nvalue = \"\"\n"),
                 "headers[0].value is empty",
             ),
-            ("[forward_auth]\nenabled = true\n".to_owned(), "no rules"),
+            (deny("path_prefix = \"/\"\n"), "constrains nothing"),
+            (deny("path_prefix = \"\"\n"), "constrains nothing"),
+            (deny("path_prefix = \"admin\"\n"), "does not start with"),
+            (with(""), "no rules"),
         ] {
             let err = Config::from_toml_str(&input, "<inline>")
                 .expect_err("a malformed forward-auth rule is refused");
@@ -10969,27 +11083,25 @@ mod tests {
             );
         }
 
-        // The direction that must not change: a rule naming both still parses, and is then
-        // stopped by the unconsumed guard rather than by serde.
-        let err = Config::from_toml_str(
+        // The direction that must not change, and without it a parser that refused every
+        // rule would satisfy the loop above: a rule naming both parses.
+        Config::from_toml_str(
             "[forward_auth]\n[[forward_auth.rules]]\nname = \"a\"\naction = \"deny\"\n",
             "<inline>",
         )
-        .expect_err("nothing serves these rules yet");
-        assert!(
-            format!("{err}").contains("no forward-auth surface is served yet"),
-            "a complete rule must get past serde, got: {err}"
-        );
+        .expect("a complete rule parses");
     }
 
     /// The contrast that keeps the defect table from passing vacuously.
     ///
-    /// If validation refused EVERY rule list, every row would pass while saying nothing. A
-    /// well-formed list must get past validation and be stopped by the unconsumed guard
-    /// instead, and the two refusals must be distinguishable.
+    /// If validation refused EVERY rule list, every row of
+    /// `every_forward_auth_rule_defect_is_named` would pass while saying nothing. A
+    /// well-formed list has to be accepted.
     #[test]
-    fn a_well_formed_rule_list_is_refused_only_because_nothing_serves_it() {
-        let input = "[forward_auth]\nenabled = true\n\
+    fn a_well_formed_rule_list_is_accepted() {
+        let input = "[oidc]\nenabled = true\n\
+                     [proxy]\ntrust_forwarded = true\ntrusted_hops = 1\n\
+                     [forward_auth]\nenabled = true\ndialect = \"nginx-auth-request\"\n\
                      [[forward_auth.rules]]\nname = \"own resource only\"\n\
                      action = \"allow\"\nmethods = [\"GET\"]\n\
                      path_matches = \"^/u/(?<user>[^/]+)/.*$\"\n\
@@ -10999,50 +11111,89 @@ mod tests {
                      path_prefix = \"/admin\"\n\
                      [[forward_auth.rules]]\nname = \"deny the rest\"\naction = \"deny\"\n";
 
-        let err =
-            Config::from_toml_str(input, "<inline>").expect_err("nothing serves these rules yet");
-        let rendered = format!("{err}");
+        let config = Config::from_toml_str(input, "<inline>")
+            .expect("a valid rule list boots")
+            .config;
 
-        assert!(
-            rendered.contains("no forward-auth surface is served yet"),
-            "a VALID list must reach the unconsumed guard, not a validation error: {rendered}"
+        assert!(config.forward_auth.enabled);
+        assert_eq!(config.forward_auth.rules.len(), 3);
+        assert_eq!(
+            config.forward_auth.dialect,
+            ProxyDialectConfig::NginxAuthRequest,
+            "the dialect is a deployment property and must survive the round trip"
         );
-        assert!(
-            rendered.contains("#154"),
-            "the refusal must point at the tracking issue, got: {rendered}"
+        assert_eq!(
+            config.forward_auth.rules[2].action,
+            AccessActionConfig::Deny,
+            "order is the policy, so the catch-all must still be last"
         );
     }
 
-    /// Both fields of the unconsumed guard, and the direction that must not change.
+    /// Enabling the surface without what it depends on is refused (issue #154).
     ///
-    /// A review found the `enabled` row never reached the guard: `enabled = true` with no
-    /// rules is a VALIDATION error, so the row passed on wording validation produces and the
-    /// guard arm could be deleted with the suite still green. Each row now carries a
-    /// well-formed rule list so validation has nothing to say, and asserts on wording only
-    /// the guard emits.
+    /// Both of these boot, validate and report healthy while deciding nothing, and a silent
+    /// deny-all on an access-control surface is indistinguishable from a `deny` rule biting.
+    ///
+    /// The `[proxy]` one is the sharper of the two, and it is a consequence of the trust fix
+    /// rather than something that was always true: the check path reads the original request
+    /// only from a request the trusted-proxy policy honoured, so with forwarding off every
+    /// check answers 403 and the proxy denies everything it guards.
     #[test]
-    fn forward_auth_is_refused_field_by_field_and_its_absence_still_boots() {
+    fn enabling_forward_auth_without_its_prerequisites_is_refused() {
         let rule = "[[forward_auth.rules]]\nname = \"a\"\naction = \"deny\"\n";
         for (input, expected) in [
             (
-                format!("[forward_auth]\nenabled = true\n{rule}"),
-                "forward_auth.enabled is set, but no forward-auth surface is served yet",
+                format!("[oidc]\nenabled = true\n[forward_auth]\nenabled = true\n{rule}"),
+                "does not honour forwarding headers",
             ),
             (
-                format!("[forward_auth]\n{rule}"),
-                "forward_auth.rules is set, but no forward-auth surface is served yet",
+                format!(
+                    "[proxy]\ntrust_forwarded = true\ntrusted_hops = 1\n\
+                     [forward_auth]\nenabled = true\n{rule}"
+                ),
+                "oidc.enabled is false",
             ),
         ] {
             let err = Config::from_toml_str(&input, "<inline>")
-                .expect_err("a non-default forward_auth field is refused");
+                .expect_err("an unusable forward-auth surface is refused");
             let rendered = format!("{err}");
             assert!(
                 rendered.contains(expected),
-                "the guard must name the offending field, got: {rendered}"
+                "the refusal must explain `{expected}`, got: {rendered}"
             );
         }
 
-        Config::from_toml_str("", "<inline>").expect("an absent section boots");
+        // The direction that must not change: with BOTH prerequisites the same rule list is
+        // accepted, so the refusals above are about the prerequisites and not about the rule.
+        Config::from_toml_str(
+            &format!(
+                "[oidc]\nenabled = true\n\
+                 [proxy]\ntrust_forwarded = true\ntrusted_hops = 1\n\
+                 [forward_auth]\nenabled = true\n{rule}"
+            ),
+            "<inline>",
+        )
+        .expect("both prerequisites present, so the surface is usable");
+    }
+
+    /// An absent section boots and serves nothing.
+    ///
+    /// The default has to be OFF rather than "on with no rules", because a forward-auth
+    /// surface that answers is one a proxy can be pointed at, and an empty rule list decides
+    /// every request the same way.
+    #[test]
+    fn forward_auth_is_off_by_default() {
+        let config = Config::from_toml_str("", "<inline>")
+            .expect("an absent section boots")
+            .config;
+        assert!(!config.forward_auth.enabled);
+        assert!(config.forward_auth.rules.is_empty());
+        assert_eq!(
+            config.forward_auth.dialect,
+            ProxyDialectConfig::ForwardAuth,
+            "a default that differed per build would make the shipped behaviour unstated"
+        );
+
         Config::from_toml_str("[forward_auth]\n", "<inline>")
             .expect("a section written out at its defaults boots");
     }
