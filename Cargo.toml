@@ -74,7 +74,7 @@ regex = { version = "1", default-features = false, features = ["std", "unicode-p
 # on every future caller remembering to make it. See the crate's own note.
 #
 # No other version of this crate was in the tree; nothing else here parses XML.
-quick-xml = { version = "0.41", default-features = false }
+quick-xml = { version = "0.42", default-features = false }
 # The IronBus client (issue #104): the OPTIONAL notification backbone for the
 # transactional outbox. Optional in the strict sense the issue requires: Postgres alone
 # is a complete, supported mode, and this crate is behind the `ironbus` feature so a
