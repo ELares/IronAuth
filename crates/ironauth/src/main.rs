@@ -1523,11 +1523,15 @@ async fn build_oidc_plane(
     // The ONE shared registry: store-backed and lazy. The Store is cheap to clone
     // (it wraps a reference-counted pool), so the mint (via OidcState) and the
     // JWKS/discovery serving (via IssuerState) share one registry Arc.
-    let registry = Arc::new(IssuerRegistry::store_backed(
-        issuer_base.clone(),
-        cache,
-        store.clone(),
-    ));
+    // THE CROSS-NODE JWKS ACCELERATOR (issue #146 criterion 2), attached only when an operator
+    // configured one. This is the site that SERVES JWKS and discovery, which is why it gets the
+    // accelerator and the two signing workers do not: they resolve the registry to SIGN, and
+    // never call `jwks_json`, so attaching one there would open a connection nothing reads.
+    let registry = IssuerRegistry::store_backed(issuer_base.clone(), cache, store.clone());
+    let registry = Arc::new(match jwks_accelerator(&config.hot_state).await {
+        Some(factory) => registry.with_jwks_hot_state(factory),
+        None => registry,
+    });
 
     // The discovery surface (both well-known forms) resolves the per-environment
     // signing policy from the SAME store-backed registry the mint and the JWKS read
@@ -8432,6 +8436,64 @@ fn kek_restore_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
             }
         }
     })
+}
+
+/// The JWKS accelerator factory from config, or [`None`] when there is nothing to attach.
+///
+/// # The failure story, stated because the class decides it
+///
+/// `registry::JWKS` is `Class::Accelerator`, whose contract is that the caller can already
+/// answer from the store. So an address that is set and unreachable is NOT a boot failure: it
+/// logs and returns `None`, and every JWKS request renders exactly as it would with no
+/// accelerator configured. Refusing to boot would turn an optional cache into a hard dependency,
+/// which is the opposite of what the class means.
+///
+/// # Why a factory
+///
+/// Both shipped implementations bind ONE scope at construction, and `IronCacheHotState`'s key is
+/// `{NAMESPACE}:{bound tenant}:{bound environment}:{use}:{key}`, which IS the tenant isolation:
+/// `ironcache.rs` says "there is no backstop, nothing here filters, nothing checks". A single
+/// instance handed to a registry that serves every scope would write every tenant's document
+/// under one tenant's prefix. The connection is shared; the binding is per scope.
+#[cfg(feature = "ironcache")]
+async fn jwks_accelerator(
+    config: &ironauth_config::HotStateConfig,
+) -> Option<impl Fn(ironauth_store::Scope) -> Arc<dyn ironauth_hot::HotState> + Send + Sync + 'static>
+{
+    let addr = config.ironcache_addr.as_deref()?;
+    let Ok(connection) = ironauth_hot::ironcache::connect(&format!("redis://{addr}")).await else {
+        tracing::warn!(
+            accelerator = addr,
+            "the configured hot-state accelerator could not be reached; serving without one. \
+             Every read renders from the store, which is what an Accelerator-class use means: \
+             this is slower, never wrong."
+        );
+        return None;
+    };
+    tracing::info!(
+        accelerator = addr,
+        "hot-state accelerator attached for JWKS"
+    );
+    Some(move |scope: ironauth_store::Scope| {
+        Arc::new(ironauth_hot::ironcache::IronCacheHotState::new(
+            connection.clone(),
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+        )) as Arc<dyn ironauth_hot::HotState>
+    })
+}
+
+/// Without the `ironcache` feature there is no accelerator to build.
+///
+/// A deployment that never attaches one must not carry the `redis` client, and the feature is
+/// what keeps that true. The signature matches the real one so the call site is identical.
+#[cfg(not(feature = "ironcache"))]
+#[allow(clippy::unused_async)]
+async fn jwks_accelerator(
+    _config: &ironauth_config::HotStateConfig,
+) -> Option<impl Fn(ironauth_store::Scope) -> Arc<dyn ironauth_hot::HotState> + Send + Sync + 'static>
+{
+    None::<fn(ironauth_store::Scope) -> Arc<dyn ironauth_hot::HotState>>
 }
 
 /// Parse `id:hex` into a master key. The id is bound into every wrapped KEK's AAD.

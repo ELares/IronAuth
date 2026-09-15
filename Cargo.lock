@@ -2072,6 +2072,7 @@ dependencies = [
  "ironauth-env",
  "ironauth-fetch",
  "ironauth-hooks",
+ "ironauth-hot",
  "ironauth-jose",
  "ironauth-oidc",
  "ironauth-quota",

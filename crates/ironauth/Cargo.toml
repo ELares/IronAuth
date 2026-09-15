@@ -33,6 +33,8 @@ ironauth-admin.workspace = true
 # cranelift declare 1.95 and this binary publishes 1.85. The default artifact is unchanged.
 ironauth-hooks = { workspace = true, optional = true }
 ironauth-oidc.workspace = true
+# The hot-state seam, for the JWKS accelerator the binary attaches from config (#146).
+ironauth-hot.workspace = true
 # The admin console SPA (issue #90) is embedded and mounted on the PUBLIC plane
 # under /admin when admin_spa.enabled is set. It embeds its assets with
 # rust-embed and owns no store connection, so the musl static lane holds.
@@ -81,6 +83,9 @@ serde_json.workspace = true
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 
 [features]
+# The IronCache accelerator, forwarded so a released binary can attach one from config
+# WITHOUT a rebuild, which is the whole point of `hot_state.ironcache_addr` (#146).
+ironcache = ["ironauth-oidc/ironcache", "ironauth-hot/ironcache"]
 # The WASM token hooks dispatch (issue #114). OFF by default: it pulls wasmtime and cranelift,
 # whose MSRV is 1.95 against this binary's published 1.85 (docs/COMPATIBILITY.md). A deployment
 # that wants hooks builds with this and accepts 1.95 for that artifact.

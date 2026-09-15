@@ -1366,15 +1366,22 @@ pub struct HotStateConfig {
     /// the accelerator tier: until this key existed there was nothing to probe and no state to
     /// report, so `DegradedTier` had no variant for it.
     ///
-    /// It does NOT yet put the cache in front of any read. `ironauth-hot` is a complete,
-    /// classified, outage-tested layer that no request path calls: it is not a dependency of
-    /// `ironauth-oidc`, `ironauth-server`, `ironauth-admin` or the binary. Wiring a first
-    /// consumer (JWKS or tenant config read-through) is the remaining #146 work, and this key
-    /// is the half of it a deployment can act on now.
+    /// It now ALSO puts the cache in front of one read: the published JWKS document. Setting
+    /// this attaches a cross-node accelerator to the registry that serves JWKS and discovery, so
+    /// a document rendered on one node is served from the shared cache on the others.
     ///
-    /// That distinction is written down rather than glossed because the alternative is a knob
-    /// that reads as "my cache is on" while nothing consults it, which is the defect this
-    /// codebase has removed once already.
+    /// Until #1280 and its wiring this key reached nothing but the readiness probe, and the
+    /// paragraph here said so, because the alternative is a knob that reads as "my cache is on"
+    /// while nothing consults it. That is no longer the case for JWKS. It is still the case for
+    /// the other six declared uses in `ironauth_hot::registry`, which have no caller yet.
+    ///
+    /// SETTING IT AND BEING WRONG IS NOT A BOOT FAILURE. An address that cannot be reached logs
+    /// and the deployment serves without an accelerator, because `registry::JWKS` is
+    /// `Class::Accelerator`, whose contract is that the caller can already answer from the
+    /// store. Refusing to boot would turn an optional cache into a hard dependency.
+    ///
+    /// It requires a binary built with the `ironcache` feature. Without it the client is not
+    /// compiled in, and a deployment that never attaches an accelerator does not carry it.
     ///
     /// Unset is the shipped default. IronAuth is complete on Postgres alone.
     pub ironcache_addr: Option<String>,
