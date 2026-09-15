@@ -133,6 +133,26 @@ pub struct IssuerEntry {
     // environments level table it has no grant on. The kind never changes after
     // creation, so caching the derived set on the entry cannot go stale.
     guardrails: GuardrailSet,
+    // The environment's renderable UI locales (issue #1262): the installed locale-bundle tags
+    // unioned with `en`, sorted and deduplicated. It rides the entry for the same reason the
+    // guardrails do, but for a sharper reason than convenience: discovery used to make a
+    // SECOND store read per request to build this set, and that read ended in
+    // `unwrap_or_default()`, which cannot tell "no bundles installed" from "the read failed".
+    // During an outage the document therefore advertised `["en"]` instead of the real set and
+    // served it with the full `Cache-Control: max-age`, so a DEGRADED document outlived the
+    // outage in every relying-party cache. That is worse than the 404 it replaced: a 404 is a
+    // transient failure a client retries, a cached wrong answer persists past recovery.
+    //
+    // Loading it HERE means the failure direction is the entry's, which is already correct: a
+    // read error is `LoadOutcome::Error` (retry, never cache, never serve a guess), and the
+    // publication path serves the fresh cached entry with the locale set it was loaded with,
+    // byte-identical to the healthy document.
+    //
+    // The cost, stated: locale pickup becomes TTL-bounded rather than immediate. A newly
+    // installed bundle appears within the entry TTL instead of on the next request. That is
+    // the staleness contract the signing keys already have, and the trade is worth it because
+    // the alternative failure is a wrong answer cached at every relying party.
+    ui_locales: Option<Vec<String>>,
 }
 
 impl IssuerEntry {
@@ -150,7 +170,43 @@ impl IssuerEntry {
             policy,
             salt,
             guardrails,
+            // `Some(empty)`, not `None`: a pre-populated (store-free) registry has no store to
+            // have read bundles from, and that is a KNOWN answer rather than a failed read.
+            // Discovery renders an empty set as `["en"]`, the compiled fallback, which is
+            // exactly what that path advertised before.
+            ui_locales: Some(Vec::new()),
         }
+    }
+
+    /// The same entry carrying the environment's renderable UI locales (issue #1262).
+    ///
+    /// Separate from [`IssuerEntry::new`] so a pre-populated registry, which has no store to
+    /// read bundles from, keeps compiling and keeps advertising the compiled fallback.
+    ///
+    /// [`None`] means the read FAILED, which is a different thing from an environment with no
+    /// bundles installed. Only discovery cares about the difference, and it must never publish
+    /// a document built on a failed read.
+    #[must_use]
+    pub fn with_ui_locales(mut self, ui_locales: Option<Vec<String>>) -> Self {
+        self.ui_locales = ui_locales;
+        self
+    }
+
+    /// The environment's renderable UI locales (issue #1262): the installed locale-bundle tags
+    /// unioned with `en`, sorted and deduplicated.
+    ///
+    /// [`None`] means the `locale_bundles` read failed on the cold load. It is NOT an error for
+    /// the entry: a review found the first version of this returning `LoadOutcome::Error` on
+    /// that read, which made a purely cosmetic i18n table load-bearing for the TOKEN MINT, for
+    /// `jwks_json`, for the back-channel-logout and SSF push signers, and for the admin console
+    /// credential bridge, none of which render a locale. A fault confined to translations took
+    /// down authentication.
+    ///
+    /// So the failure is carried rather than raised, and the ONE caller that cannot proceed
+    /// without it, discovery, refuses on its own behalf.
+    #[must_use]
+    pub fn ui_locales(&self) -> Option<&[String]> {
+        self.ui_locales.as_deref()
     }
 
     /// The environment's key set.
@@ -395,10 +451,15 @@ impl IssuerRegistry {
     }
 
     /// The data-plane store this registry loads through, or [`None`] for a pre-populated
-    /// (loader-less) registry. The store-backed discovery path reads a scope's installed locale
-    /// bundles through it (issue #86, PR 2) so discovery advertises exactly the UI locales the
-    /// environment can render; a loader-less test registry has no store and advertises the
-    /// minimal `["en"]`.
+    /// (loader-less) registry.
+    ///
+    /// The store-backed discovery path reads a scope's installed locale bundles through it
+    /// (issue #86, PR 2) so discovery advertises exactly the UI locales the environment can
+    /// render; a loader-less test registry has no store and advertises the minimal `["en"]`.
+    /// Since issue #1262 that read is no longer the only source: it is tried first, so a
+    /// removed bundle stops being advertised immediately, and the set cached on the issuer
+    /// entry answers when the read fails, so an outage publishes the real set rather than the
+    /// fallback.
     #[must_use]
     pub fn store(&self) -> Option<&Store> {
         self.loader.as_ref()
@@ -426,8 +487,9 @@ impl IssuerRegistry {
     /// open.
     ///
     /// The one exception is [`IssuerRegistry::resolve_for_publication`], which softens
-    /// the store-error case alone -- not the fenced case -- for JWKS. Everything reached
-    /// through `entry_for`, which is every minting, signing and admin path, keeps the
+    /// the store-error case alone -- not the fenced case -- for the two PUBLICATION
+    /// surfaces, JWKS and, since issue #1262, discovery. Everything reached through
+    /// `entry_for`, which is every minting, signing and admin path, keeps the
     /// fail-closed behaviour described above.
     ///
     /// The positive keyset cache now carries a bounded TTL (issue #204, default =
@@ -469,8 +531,9 @@ impl IssuerRegistry {
     /// transient store error). The token endpoint has to tell them apart, because a
     /// suspension is an operator state that a relying party should wait out, while a
     /// missing signing key is a genuine server fault. Discovery answers a uniform 404
-    /// either way and keeps using `entry_for`; JWKS resolves through
-    /// [`IssuerRegistry::resolve_for_publication`] instead (issue #149).
+    /// either way; BOTH publication surfaces, JWKS and discovery, resolve through
+    /// [`IssuerRegistry::resolve_for_publication`] instead (issue #149, and issue #1262
+    /// for the discovery half).
     ///
     /// Every caching, fencing, and negative-caching rule documented on
     /// [`IssuerRegistry::entry_for`] applies here unchanged; this is the same code
@@ -523,8 +586,18 @@ impl IssuerRegistry {
     /// no way to learn of the suspension. The window is bounded by the entry TTL and
     /// closes on its own without the database returning;
     /// `a_suspension_landing_just_before_an_outage_is_invisible_for_at_most_one_ttl`
-    /// pins it from both sides. What leaks is public key material, for at most one
-    /// TTL, while minting is refused throughout.
+    /// pins it from both sides for JWKS, and
+    /// `discovery_still_refuses_a_fenced_scope_during_an_outage` pins the fenced arm for
+    /// discovery.
+    ///
+    /// WHAT LEAKS IS WIDER THAN KEY MATERIAL SINCE ISSUE #1262, and this section said
+    /// otherwise until a review caught it. Discovery is the second caller, so the window
+    /// also publishes a suspended scope's metadata document: its issuer, its authorization,
+    /// token, registration and end-session endpoints, its signable algorithm set, and its
+    /// installed locale list. All of it is public metadata that any client which talked to
+    /// the scope before the suspension already holds, and minting is refused throughout, so
+    /// the trade stands. But an operator weighing it should read the real list rather than
+    /// "public key material".
     pub async fn resolve_for_publication(
         &self,
         scope: &Scope,
@@ -794,9 +867,15 @@ enum LoadOutcome {
 /// [`LoadOutcome::Empty`]: a self-consistent bogus issuer can never resolve.
 ///
 /// A TRANSIENT store read error (a pool timeout, a reset connection, a statement
-/// timeout) on either the keys or the guardrails SELECT returns
-/// [`LoadOutcome::Error`], distinct from a confirmed absence, so the caller can
-/// retry it on the next request instead of caching it as a 404.
+/// timeout) on the keys or the guardrails SELECT returns [`LoadOutcome::Error`],
+/// distinct from a confirmed absence, so the caller can retry it on the next request
+/// instead of caching it as a 404.
+///
+/// THE THIRD READ IS DELIBERATELY NOT IN THAT LIST. The `locale_bundles` SELECT added by
+/// issue #1262 carries its failure on the entry as `ui_locales: None` instead of failing
+/// the load, because this function is the cold load behind the token mint, the JWKS load,
+/// the SET signers and the admin credential bridge, and none of them render a locale.
+/// Discovery, which does, refuses on its own behalf.
 async fn load_issuer_entry(store: &Store, scope: &Scope) -> LoadOutcome {
     // The data-plane suspension fence (issue #46) is enforced by the caller,
     // `IssuerRegistry::resolve`, on EVERY resolution (see `fence_state`), so it
@@ -887,7 +966,46 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> LoadOutcome {
     else {
         return LoadOutcome::Error;
     };
-    LoadOutcome::Loaded(IssuerEntry::new(keyset, policy, salt, guardrails))
+    // The environment's renderable UI locales (issue #1262), read on the SAME cold load as the
+    // keys and the guardrails so discovery needs no second store round trip per request.
+    //
+    // A FAILED READ IS CARRIED, NOT RAISED. The first version of this returned
+    // `LoadOutcome::Error` here, and a review showed what that actually does: this function is
+    // the cold load behind `entry_for`, which is the TOKEN MINT seam (authorize, token,
+    // token-exchange, device, CIBA, client credentials, jwt-bearer, DCR, FedCM), the JWKS
+    // load, the back-channel-logout and SSF push SET signers, and the admin console credential
+    // bridge. None of them render a locale. Failing the entry on this read made a purely
+    // cosmetic i18n table load-bearing for authentication: a fault confined to translations
+    // took down the mint.
+    //
+    // It is still NOT defaulted, which was the original defect: `unwrap_or_default()` in
+    // discovery.rs collapsed a failed read into "no bundles installed" and published the
+    // collapsed answer with a 300 to 900 second `max-age`. `None` says "not known", and the
+    // one caller that cannot proceed without knowing, discovery, refuses on its own behalf.
+    let ui_locales = match store
+        .scoped(*scope)
+        .locale_bundles()
+        .installed_locales()
+        .await
+    {
+        Ok(installed) => {
+            // Unioned with `en` (the compiled fallback language), sorted and deduplicated.
+            let mut locales: std::collections::BTreeSet<String> = installed.into_iter().collect();
+            locales.insert("en".to_owned());
+            Some(locales.into_iter().collect())
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "the locale-bundle read failed; the entry still serves and discovery will \
+                 refuse rather than advertise a guessed locale set"
+            );
+            None
+        }
+    };
+    LoadOutcome::Loaded(
+        IssuerEntry::new(keyset, policy, salt, guardrails).with_ui_locales(ui_locales),
+    )
 }
 
 /// Order an environment's present signing algorithms by IronAuth's CANONICAL
