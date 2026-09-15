@@ -25,6 +25,10 @@
 //! identity to key on is skipped rather than defaulted to some shared bucket, which would
 //! make every anonymous caller share one budget and turn a limiter into an outage.
 //!
+//! PER-IP IS THE EXCEPTION. It is the only layer that applies before anyone is identified, so
+//! a configured per-IP limit meeting a request with no address refuses by default rather than
+//! skipping. See [`MissingIpPolicy`], which is also where the other answer lives.
+//!
 //! # Nothing is charged unless everything admits
 //!
 //! The crate root's `admit` is fail-closed and atomic: if any bucket on the path lacks
@@ -213,6 +217,9 @@ pub enum LayerKey {
 impl RequestIdentity {
     /// The key this identity presents to `layer`, or `None` when the layer does not apply.
     ///
+    /// `None` means the layer is skipped, with one exception: a CONFIGURED per-IP limit
+    /// refuses a `None` here by default. See [`MissingIpPolicy`].
+    ///
     /// The environment key carries the tenant, so two tenants' environments named `prod`
     /// are different buckets. Getting that wrong would let one customer's traffic exhaust
     /// another's, which is the exact failure the crate root exists to prevent.
@@ -378,6 +385,32 @@ impl LayeredOutcome {
     #[must_use]
     pub fn is_unidentified(&self) -> bool {
         self.missing_identity
+    }
+
+    /// The refusal a configured per-IP limit produces for a request with no address.
+    ///
+    /// No bucket exists, so there are no numbers to report and no wait to advertise, and
+    /// inventing a limit and a remaining for a bucket that was never created would be a worse
+    /// answer than silence.
+    ///
+    /// `denied` is still true, and it is load-bearing: `RateLimitSnapshot::headers` emits the
+    /// block signal for a denied snapshot even when it carries no budget numbers, so an edge
+    /// that offloads refusals still sees this one.
+    fn refused_for_missing_ip(unenforced: Vec<RateLayer>) -> Self {
+        Self {
+            decision: Decision::Denied,
+            limiting_layer: Some(RateLayer::PerIp),
+            snapshot: RateLimitSnapshot {
+                limit: None,
+                remaining: None,
+                reset_secs: 0,
+                retry_after_secs: None,
+                denied: true,
+                policy_window_secs: None,
+            },
+            unenforced,
+            missing_identity: true,
+        }
     }
 }
 
@@ -547,6 +580,7 @@ impl LayeredLimiter {
 
         let mut evaluated: Vec<(RateLayer, LayerKey, Limit, f64)> = Vec::new();
         let mut unenforced: Vec<RateLayer> = Vec::new();
+        let mut refuse_for_missing_ip = false;
         for layer in LAYER_ORDER {
             // TWO DIFFERENT REASONS TO SKIP A LAYER, no longer collapsed into one `continue`.
             //
@@ -563,32 +597,32 @@ impl LayeredLimiter {
                 // an anonymous request, and denying those would refuse every unauthenticated
                 // caller on any deployment that limits by user. Per-IP is the exception
                 // because it is the only layer that applies before anyone is identified.
+                //
+                // The refusal is decided here but RETURNED AFTER THE LOOP. Returning here
+                // stopped at the narrowest layer, so `unenforced` reported only per_ip even
+                // when the whole identity-extraction path had broken and four layers were
+                // going unenforced. An operator graphing that field would have watched three
+                // of them appear later as a fresh regression.
                 if layer == RateLayer::PerIp && self.missing_ip == MissingIpPolicy::Deny {
-                    return LayeredOutcome {
-                        decision: Decision::Denied,
-                        limiting_layer: Some(RateLayer::PerIp),
-                        // No bucket exists, so there are no numbers to report and no wait to
-                        // advertise. `denied` is still true so the block signal reaches an
-                        // edge that offloads refusals.
-                        snapshot: RateLimitSnapshot {
-                            limit: None,
-                            remaining: None,
-                            reset_secs: 0,
-                            retry_after_secs: None,
-                            denied: true,
-                            policy_window_secs: None,
-                        },
-                        unenforced,
-                        missing_identity: true,
-                    };
+                    refuse_for_missing_ip = true;
                 }
                 continue;
             };
+            // Decided to refuse: keep walking to finish the `unenforced` census, but touch no
+            // bucket. `or_insert_with` below would otherwise create state for a request that
+            // is not being admitted, and count against the bucket ceiling.
+            if refuse_for_missing_ip {
+                continue;
+            }
             let bucket = state
                 .entry((layer, key.clone()))
                 .or_insert_with(|| LayerBucket::full(limit, now));
             bucket.refill(limit, now);
             evaluated.push((layer, key, limit, bucket.tokens));
+        }
+
+        if refuse_for_missing_ip {
+            return LayeredOutcome::refused_for_missing_ip(unenforced);
         }
 
         let denier = evaluated
@@ -1758,9 +1792,114 @@ mod tests {
             "429 advertises a remedy that cannot work: waiting never produces an address"
         );
         assert!(outcome.is_unidentified(), "the caller renders this as 403");
+
+        // THE WHOLE SNAPSHOT, not one field. A review pointed out that asserting only
+        // `retry_after_secs` leaves a mutant free to fill in a limit, a remaining and a reset,
+        // which would ship 429-shaped budget headers on a 403.
         assert_eq!(
-            outcome.snapshot.retry_after_secs, None,
-            "no wait is honest, because no bucket is involved"
+            outcome.snapshot,
+            RateLimitSnapshot {
+                limit: None,
+                remaining: None,
+                reset_secs: 0,
+                retry_after_secs: None,
+                denied: true,
+                policy_window_secs: None,
+            },
+            "a refusal with no bucket has no numbers to report and no wait to advertise"
+        );
+
+        // The block signal is the whole reason `denied` is true on a snapshot that carries no
+        // numbers. Four review lenses found this shipping as a comment claiming something the
+        // code did not do, so it is asserted rather than described.
+        let headers = outcome.headers();
+        assert_eq!(
+            header(&headers, crate::BLOCK_SIGNAL_HEADER),
+            Some(crate::BLOCK_SIGNAL_VALUE),
+            "an edge that offloads blocks must see this refusal"
+        );
+        assert_eq!(
+            header(&headers, "ratelimit"),
+            None,
+            "no budget headers: there is no bucket, and inventing one is worse than silence"
+        );
+        assert_eq!(header(&headers, "x-ratelimit-limit"), None);
+        assert_eq!(header(&headers, "retry-after"), None);
+    }
+
+    /// The `unenforced` census must cover EVERY layer, not stop at the one that refused.
+    ///
+    /// Raised by review: `LAYER_ORDER` starts at per-IP, so returning from inside the loop
+    /// reported only `per_ip` even when the whole identity-extraction path had broken. An
+    /// operator graphing the field would have seen three more layers appear later and read
+    /// them as a new regression.
+    ///
+    /// The contrast against `Skip` is the assertion that matters: both policies now see the
+    /// same four layers going unenforced, and they disagree only about the decision.
+    #[test]
+    fn the_unenforced_census_covers_every_layer_even_when_per_ip_refuses() {
+        let limits = || {
+            LayeredLimits::unlimited()
+                .with(RateLayer::PerIp, Limit::new(1.0, 10.0))
+                .with(RateLayer::PerUser, Limit::new(1.0, 10.0))
+                .with(RateLayer::PerTenant, Limit::new(1.0, 10.0))
+                .with(RateLayer::PerEnvironment, Limit::new(1.0, 10.0))
+        };
+        let nobody = RequestIdentity::default();
+        let expected = vec![
+            RateLayer::PerIp,
+            RateLayer::PerUser,
+            RateLayer::PerTenant,
+            RateLayer::PerEnvironment,
+        ];
+
+        let (refusing, _c1) = limiter(limits());
+        let refused = refusing.admit(&nobody, 1.0);
+
+        let (skipping, _c2) = limiter(limits());
+        let skipped = skipping
+            .with_missing_ip_policy(MissingIpPolicy::Skip)
+            .admit(&nobody, 1.0);
+
+        assert!(refused.missing_identity);
+        assert_eq!(skipped.decision, Decision::Admitted);
+        assert_eq!(
+            refused.unenforced, expected,
+            "the refusal must still finish counting what went unenforced"
+        );
+        assert_eq!(
+            skipped.unenforced, expected,
+            "and the two policies must agree about the census they report"
+        );
+    }
+
+    /// Finishing the census must not leave bucket state behind for a request that was refused.
+    ///
+    /// The loop keeps walking after the refusal is decided, and the layers it walks past have
+    /// keys. If it called `or_insert_with` on them it would create buckets for a request that
+    /// was never admitted, and those count against the ceiling that exists to survive a flood.
+    #[test]
+    fn a_refused_request_leaves_no_bucket_behind_for_the_layers_it_walked_past() {
+        let (limiter, _clock) = limiter(
+            LayeredLimits::unlimited()
+                .with(RateLayer::PerIp, Limit::new(1.0, 10.0))
+                .with(RateLayer::PerTenant, Limit::new(1.0, 10.0)),
+        );
+        // Tenant IS present, so the per-tenant layer would insert a bucket if the walk
+        // evaluated it rather than merely passing over it.
+        let no_address = RequestIdentity {
+            ip: None,
+            tenant: Some("tnt_1".to_owned()),
+            ..RequestIdentity::default()
+        };
+
+        let outcome = limiter.admit(&no_address, 1.0);
+
+        assert!(outcome.missing_identity);
+        assert_eq!(
+            limiter.bucket_count(),
+            0,
+            "a refused request must not populate the map it is being refused to protect"
         );
     }
 

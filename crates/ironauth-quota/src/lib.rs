@@ -394,7 +394,18 @@ impl RateLimitSnapshot {
     #[must_use]
     pub fn headers(&self) -> Vec<(&'static str, String)> {
         let (Some(limit), Some(remaining)) = (self.limit, self.remaining) else {
-            return Vec::new();
+            // A REFUSAL WITH NO BUCKET STILL SIGNALS. This returned an empty vector for every
+            // numberless snapshot, which was harmless while no denied snapshot lacked numbers
+            // and became wrong the moment one did: the block signal is the one header an edge
+            // offloads on, and `denied`'s own contract is that it appears on EVERY refusal.
+            //
+            // No budget headers accompany it, because there is no bucket to describe and
+            // inventing a limit and a remaining for one would be a worse answer than silence.
+            return if self.denied {
+                vec![(BLOCK_SIGNAL_HEADER, BLOCK_SIGNAL_VALUE.to_owned())]
+            } else {
+                Vec::new()
+            };
         };
         let mut headers = vec![
             (
