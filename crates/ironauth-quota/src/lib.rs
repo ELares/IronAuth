@@ -394,6 +394,11 @@ impl RateLimitSnapshot {
     ///
     /// # The pinned draft revision (#1268, and #150's "pin the implemented revision")
     ///
+    /// The BYTES were already pinned before this section existed: `layered.rs` asserts
+    /// `limit=4, remaining=0, reset=8` and `4;w=8` through `LayeredOutcome::headers`. What was
+    /// missing is the part a byte assertion cannot carry, which is WHICH REVISION those bytes
+    /// are and why they are not the later grammar.
+    ///
     /// This renders the **dictionary grammar** of `draft-ietf-httpapi-ratelimit-headers`:
     ///
     /// ```text
@@ -425,8 +430,12 @@ impl RateLimitSnapshot {
     /// `x-ratelimit-reset` saying 1789000000. A client reading both cannot reconcile them,
     /// and a client reading an epoch as a delta sleeps for decades. Internal agreement is
     /// worth more than matching a convention that is not specified anywhere, so the two
-    /// headers carry the same number in the same units, and
-    /// `the_two_header_families_report_reset_in_the_same_units` holds them together.
+    /// headers carry the same number in the same units.
+    ///
+    /// That is enforced by `layered::tests::the_structured_and_legacy_headers_never_disagree`,
+    /// which asserts the structured field equals a string built from all three legacy headers
+    /// across a run of spends. It predates this section: the units decision was already held
+    /// in place here, it just was not written down as a decision.
     #[must_use]
     pub fn headers(&self) -> Vec<(&'static str, String)> {
         let (Some(limit), Some(remaining)) = (self.limit, self.remaining) else {
@@ -1726,48 +1735,6 @@ mod tests {
             enforcer.bucket_count(),
             2,
             "the opportunistic reap drops the idle scope, keeping only the active one"
-        );
-    }
-
-    /// #1268, the decision this enforces: `reset` is delta-seconds in BOTH header families.
-    ///
-    /// The legacy `X-RateLimit-Reset` is unspecified and much of the ecosystem sends an
-    /// epoch there. If someone follows that convention, this fails, which is the point: the
-    /// harm is not picking the wrong one, it is a single response carrying both at once.
-    ///
-    /// Asserted as an EQUALITY between the two headers rather than against a literal, so it
-    /// keeps holding when the underlying number changes.
-    #[test]
-    fn the_two_header_families_report_reset_in_the_same_units() {
-        let snapshot = RateLimitSnapshot {
-            limit: Some(4),
-            remaining: Some(0),
-            reset_secs: 8,
-            retry_after_secs: Some(8),
-            denied: true,
-            policy_window_secs: Some(8),
-        };
-
-        let headers = snapshot.headers();
-        let find = |name: &str| {
-            headers
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map_or_else(|| panic!("{name} missing"), |(_, v)| v.clone())
-        };
-
-        let legacy = find("x-ratelimit-reset");
-        let structured = find("ratelimit");
-
-        assert_eq!(
-            legacy, "8",
-            "the legacy reset is a delta, not an epoch: an epoch here would read as a \
-             50-year sleep to a client that expects a delta"
-        );
-        assert!(
-            structured.contains(&format!("reset={legacy}")),
-            "the structured field and the legacy header must carry the SAME number: \
-             got structured {structured} against legacy {legacy}"
         );
     }
 
