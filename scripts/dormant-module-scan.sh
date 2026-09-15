@@ -54,9 +54,23 @@ ironauth-oidc/device_posture
 # it ran.
 
 
-# The five-layer request limiter (issue #150 criterion 1, PR 1258). Callerless because the
-# first caller is a DECISION, not an oversight: an absent per-IP identity currently skips the
-# only layer that applies before anyone is identified, and whether that should fail closed
+# The five-layer request limiter (issue #150 criterion 1, PR 1258). Still callerless: the
+# module exports eleven public items and not one of them is named anywhere outside
+# `layered.rs`.
+#
+# #1260 is closed, so the DECISION that blocked a first caller is made (a configured per-IP
+# limit refuses a request with no address, PR 1283). What remains is the wiring, and #150
+# criteria 1, 4 and 5 all wait on it.
+#
+# THIS ENTRY WAS REMOVED ONCE AND PUT BACK. The scan reported it INERT, meaning it had found
+# a reference and would not flag the module anyway. That reference was a rustdoc line in
+# `lib.rs` spelling `layered::tests::...`, added by PR 1284 two commits earlier, so a doc
+# comment had quietly discharged the claim. Removing the entry on that basis would have made
+# the module unflaggable forever: `refs_for` returns 1, the loop skips it before `allow` is
+# consulted, and the staleness check then refuses any attempt to re-add it. The doc line is
+# reworded to name the test without spelling a path, which restores the count to zero and
+# puts the claim back under this gate.
+ironauth-quota/layered
 
 ALLOWLIST
 }
