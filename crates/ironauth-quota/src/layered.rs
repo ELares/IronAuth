@@ -278,6 +278,50 @@ pub struct LayeredOutcome {
     pub snapshot: RateLimitSnapshot,
 }
 
+/// The header naming the layer that refused a request.
+///
+/// Custom rather than a field inside `ratelimit`: the structured header is a standards-track
+/// format and stuffing a vendor key into it makes a conforming client's parse ambiguous. A
+/// caller that hits a limit needs to know WHICH one, because the remedy differs: a per-IP
+/// refusal means slow down, a per-tenant refusal means the account is over its plan, and a
+/// client cannot tell those apart from a 429 alone.
+pub const LIMITING_LAYER_HEADER: &str = "x-ratelimit-layer";
+
+impl LayeredOutcome {
+    /// The response headers for this outcome.
+    ///
+    /// The structured `ratelimit` and `ratelimit-policy` headers, the legacy `x-ratelimit-*`
+    /// trio, `retry-after` on a denial, and [`LIMITING_LAYER_HEADER`] naming the layer that
+    /// refused.
+    ///
+    /// The layer header appears ONLY on a denial, because on an admission no layer refused
+    /// anything: the snapshot describes the bucket closest to exhaustion, which is a
+    /// different fact and naming it here would read as "this is what stopped you".
+    #[must_use]
+    pub fn headers(&self) -> Vec<(&'static str, String)> {
+        let mut headers = self.snapshot.headers();
+        if let Some(layer) = self.limiting_layer {
+            headers.push((LIMITING_LAYER_HEADER, layer.as_str().to_owned()));
+        }
+        headers
+    }
+
+    /// The metric label for the layer that refused, or `None` on an admission.
+    ///
+    /// The same stable string the header carries, so a dashboard and a response cannot
+    /// disagree about what a layer is called.
+    #[must_use]
+    pub fn metric_label(&self) -> Option<&'static str> {
+        self.limiting_layer.map(RateLayer::as_str)
+    }
+
+    /// Whether this outcome should be rendered as `429 Too Many Requests`.
+    #[must_use]
+    pub fn is_throttled(&self) -> bool {
+        matches!(self.decision, Decision::Denied)
+    }
+}
+
 /// One layer's bucket state.
 #[derive(Debug, Clone, Copy)]
 struct LayerBucket {
@@ -1181,5 +1225,172 @@ mod tests {
             retained <= 4,
             "a sweep of refilled buckets should free nearly all of them, retained {retained}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Criterion 3: structured and legacy headers on a throttled response, with
+    // Retry-After, and criterion 1's "limiting layer identified in headers and
+    // metrics".
+    // -----------------------------------------------------------------------
+
+    fn header<'a>(headers: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(actual, _)| *actual == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// A THROTTLED RESPONSE CARRIES BOTH HEADER FAMILIES AND A RETRY-AFTER.
+    ///
+    /// Asserted on VALUES, not on presence. A header set that is present and wrong sends a
+    /// client back at the wrong time, which is worse than sending none: a client that trusts
+    /// `retry-after` and retries too early is refused again and may treat it as an outage.
+    #[test]
+    fn a_throttled_outcome_carries_both_header_families_and_a_retry_after() {
+        // Half a token per second into a burst of four, so every number below is derived
+        // rather than round: reset is 4/0.5 = 8s, and one token is 2s away.
+        let (limiter, _clock) =
+            limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.5, 4.0)));
+        for _ in 0..4 {
+            assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+        }
+
+        let denied = limiter.admit(&everyone(), 1.0);
+        assert_eq!(denied.decision, Decision::Denied);
+        assert!(
+            denied.is_throttled(),
+            "this is the outcome a 429 is rendered from"
+        );
+
+        let headers = denied.headers();
+        assert_eq!(
+            header(&headers, "ratelimit"),
+            Some("limit=4, remaining=0, reset=8"),
+            "the structured header carries the whole state in one line"
+        );
+        assert_eq!(header(&headers, "ratelimit-policy"), Some("4;w=8"));
+        assert_eq!(header(&headers, "x-ratelimit-limit"), Some("4"));
+        assert_eq!(header(&headers, "x-ratelimit-remaining"), Some("0"));
+        assert_eq!(header(&headers, "x-ratelimit-reset"), Some("8"));
+        assert_eq!(
+            header(&headers, "retry-after"),
+            Some("2"),
+            "one token at 0.5/s is 2s away, and a client sent back at 1s would be refused again"
+        );
+    }
+
+    /// THE REFUSING LAYER IS NAMED, in the header and in the metric label, with one string.
+    ///
+    /// Criterion 1 asks for the limiting layer in "headers and metrics". Two separate
+    /// renderings would let a dashboard and a response disagree about what a layer is called,
+    /// which is the kind of difference nobody notices until an incident.
+    #[test]
+    fn the_refusing_layer_is_named_identically_in_the_header_and_the_metric() {
+        for layer in RateLayer::all() {
+            let (limiter, _clock) =
+                limiter(LayeredLimits::unlimited().with(layer, Limit::new(0.0, 1.0)));
+            assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+
+            let denied = limiter.admit(&everyone(), 1.0);
+            assert_eq!(denied.limiting_layer, Some(layer));
+
+            let headers = denied.headers();
+            assert_eq!(
+                header(&headers, LIMITING_LAYER_HEADER),
+                Some(layer.as_str()),
+                "{layer:?}: the refusing layer must be named in the response"
+            );
+            assert_eq!(
+                denied.metric_label(),
+                Some(layer.as_str()),
+                "{layer:?}: and the metric must use the same string"
+            );
+        }
+    }
+
+    /// AN ADMISSION NAMES NO LAYER.
+    ///
+    /// The snapshot on an admission describes the bucket closest to exhaustion, which is a
+    /// useful fact and NOT the same one. Naming it in the layer header would read as "this is
+    /// what stopped you" on a request nothing stopped.
+    #[test]
+    fn an_admission_does_not_name_a_limiting_layer() {
+        let (limiter, _clock) =
+            limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.0, 10.0)));
+        let admitted = limiter.admit(&everyone(), 1.0);
+        assert_eq!(admitted.decision, Decision::Admitted);
+        assert!(!admitted.is_throttled());
+
+        let headers = admitted.headers();
+        assert_eq!(header(&headers, LIMITING_LAYER_HEADER), None);
+        assert_eq!(admitted.metric_label(), None);
+        // But the budget headers are still there, which is what lets a client pace itself
+        // before it is ever refused.
+        assert_eq!(header(&headers, "x-ratelimit-remaining"), Some("9"));
+        assert_eq!(
+            header(&headers, "retry-after"),
+            None,
+            "nothing to retry: the request was served"
+        );
+    }
+
+    /// AN UNLIMITED REQUEST CARRIES NO BUDGET HEADERS AT ALL.
+    ///
+    /// Emitting `limit=0, remaining=0` for a dimension with no limit would tell a client it
+    /// is out of budget when it has no budget to be out of.
+    #[test]
+    fn an_unlimited_request_advertises_no_budget() {
+        let (limiter, _clock) = limiter(LayeredLimits::unlimited());
+        let admitted = limiter.admit(&everyone(), 1.0);
+        assert_eq!(admitted.decision, Decision::Admitted);
+        assert!(
+            admitted.headers().is_empty(),
+            "no limit configured means nothing to say about a budget"
+        );
+    }
+
+    /// A NON-REFILLING LIMIT ADVERTISES NO RETRY-AFTER.
+    ///
+    /// A bucket that never refills cannot be waited out, and a `retry-after` would invite a
+    /// client to retry forever. The rest of the budget headers still describe the state.
+    #[test]
+    fn a_limit_that_never_refills_sends_no_retry_after() {
+        let (limiter, _clock) =
+            limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.0, 1.0)));
+        assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+
+        let denied = limiter.admit(&everyone(), 1.0);
+        let headers = denied.headers();
+        assert_eq!(header(&headers, "retry-after"), None);
+        assert_eq!(
+            header(&headers, LIMITING_LAYER_HEADER),
+            Some("per_ip"),
+            "the layer is still named: the caller can act on which limit they hit"
+        );
+        assert_eq!(header(&headers, "x-ratelimit-remaining"), Some("0"));
+    }
+
+    /// THE TWO FAMILIES AGREE WITH EACH OTHER.
+    ///
+    /// They are rendered from one snapshot, but that is an arrangement a refactor can undo,
+    /// and a client reading the legacy trio while a proxy reads the structured line would
+    /// then be told two different budgets.
+    #[test]
+    fn the_structured_and_legacy_headers_never_disagree() {
+        let (limiter, _clock) =
+            limiter(LayeredLimits::unlimited().with(RateLayer::PerUser, Limit::new(3.0, 7.0)));
+        for spend in 0..8 {
+            let outcome = limiter.admit(&everyone(), 1.0);
+            let headers = outcome.headers();
+            let structured = header(&headers, "ratelimit").expect("structured header");
+            let limit = header(&headers, "x-ratelimit-limit").expect("legacy limit");
+            let remaining = header(&headers, "x-ratelimit-remaining").expect("legacy remaining");
+            let reset = header(&headers, "x-ratelimit-reset").expect("legacy reset");
+            assert_eq!(
+                structured,
+                format!("limit={limit}, remaining={remaining}, reset={reset}"),
+                "spend {spend}: the two families must describe one budget"
+            );
+        }
     }
 }
