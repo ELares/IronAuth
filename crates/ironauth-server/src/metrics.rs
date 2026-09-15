@@ -339,6 +339,15 @@ pub const CONTRACT: &[MetricSpec] = &[
         labels: &[],
         help: "Logins where the presented password matched a breach corpus",
     },
+    // Issue #150 criterion 1: "the limiting layer identified in headers and metrics". The
+    // layer label carries the same stable string the `x-ratelimit-layer` header does, so a
+    // dashboard and a response cannot disagree about what a layer is called.
+    MetricSpec {
+        name: "ironauth_forward_auth_throttled_total",
+        kind: MetricKind::Counter,
+        labels: &["layer"],
+        help: "Forward-auth checks refused by the request-plane limiter, by refusing layer",
+    },
     MetricSpec {
         name: "ironauth_password_hash_admission_rejected_total",
         kind: MetricKind::Counter,

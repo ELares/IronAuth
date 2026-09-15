@@ -873,6 +873,17 @@
           "description": "Whether the forward-auth surface is served.",
           "type": "boolean"
         },
+        "rate_limit": {
+          "$ref": "#/$defs/RateLimitConfig",
+          "default": {
+            "per_client": null,
+            "per_environment": null,
+            "per_ip": null,
+            "per_tenant": null,
+            "per_user": null
+          },
+          "description": "Request-plane rate limits for the check endpoint (issue #150).\n\nEvery layer is unlimited by default, so a deployment that does not ask for limiting\nis unchanged. A layer with no entry is skipped; per-IP is the exception and refuses a\nrequest that presents no address, which is the decision issue #1260 settled."
+        },
         "rules": {
           "default": [],
           "description": "The ordered rule list. FIRST MATCH WINS, so order is meaning, not presentation.\n\nAn empty list with `enabled = true` denies nothing and allows nothing to be\ndecided; validation refuses it rather than leave the default unstated.",
@@ -1092,6 +1103,27 @@
           "type": "integer"
         }
       },
+      "type": "object"
+    },
+    "LimitConfig": {
+      "additionalProperties": false,
+      "description": "One token bucket: a sustained rate and the burst it can absorb.",
+      "properties": {
+        "burst": {
+          "description": "Bucket capacity, which is the largest burst admitted at once.\n\nA burst smaller than a request's cost can never be paid, so such a request is refused\nwith no retry advertised: waiting does not produce tokens a bucket cannot hold.",
+          "format": "double",
+          "type": "number"
+        },
+        "per_second": {
+          "description": "Tokens added per second. This is the SUSTAINED rate.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "per_second",
+        "burst"
+      ],
       "type": "object"
     },
     "LogFormat": {
@@ -2453,6 +2485,73 @@
       },
       "type": "object"
     },
+    "RateLimitConfig": {
+      "additionalProperties": false,
+      "description": "Per-layer request-plane rate limits (issue #150 criterion 1).\n\nThe five layers are enforced INDEPENDENTLY and a request is admitted only if every\napplicable one admits it, so these are five separate budgets rather than a precedence\nlist. A layer left unset is unlimited, which is the shipped default for all five: a\ndeployment that has not asked to be rate limited is not.",
+      "properties": {
+        "per_client": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LimitConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Bounds one integration across every user it acts for."
+        },
+        "per_environment": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LimitConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Bounds one environment within a tenant."
+        },
+        "per_ip": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LimitConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The only layer that applies before a caller is identified."
+        },
+        "per_tenant": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LimitConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Bounds the customer."
+        },
+        "per_user": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LimitConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Bounds one end user across every client they use."
+        }
+      },
+      "type": "object"
+    },
     "RegistrationAbuseConfig": {
       "additionalProperties": false,
       "description": "The registration abuse defenses (issue #80): proof-of-work challenges, the disposable\nemail defense, and the waitlist gate. Every sub-feature is independently toggleable per\nenvironment and OFF by default, and the whole struct promotes with the config snapshot\n(only a named reference to an adapter secret ever travels, never the value).",
@@ -3362,6 +3461,13 @@
       "default": {
         "dialect": "forward-auth",
         "enabled": false,
+        "rate_limit": {
+          "per_client": null,
+          "per_environment": null,
+          "per_ip": null,
+          "per_tenant": null,
+          "per_user": null
+        },
         "rules": []
       },
       "description": "Forward-auth access rules (issue #154).\n\n`enabled` mounts the check endpoint at\n`/t/{tenant}/e/{environment}/forward-auth`, which a reverse proxy calls before\nserving a request. Off, that route is a uniform 404.\n\nA rule this build cannot evaluate refuses to BOOT rather than being skipped,\nbecause skipping one silently serves a different access policy than the file\ndescribes."
