@@ -147,7 +147,10 @@ fn workspace_sources() -> Vec<String> {
                 // describes, reached through a different directory: a contract metric emitted
                 // ONLY from a test would satisfy "every contract metric has an emit site"
                 // while the process never set it.
-                let skip = matches!(name.as_ref(), "target" | "tests" | "benches" | "examples" | "fuzz");
+                let skip = matches!(
+                    name.as_ref(),
+                    "target" | "tests" | "benches" | "examples" | "fuzz"
+                );
                 if !skip && !name.starts_with('.') {
                     walk(&path, out);
                 }

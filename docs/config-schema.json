@@ -23,7 +23,7 @@
     },
     "AccessRuleConfig": {
       "additionalProperties": false,
-      "description": "One ordered access rule.\n\nEvery criterion set on a rule must hold for it to match. A rule with no criteria\nmatches everything, which is how a catch-all is written and why order matters.",
+      "description": "One ordered access rule.\n\nEvery criterion set on a rule must hold for it to match. A rule with no criteria\nmatches everything, which is how a catch-all is written and why order matters.\n`name` and `action` are REQUIRED AT PARSE TIME, and that is load-bearing.\n\nA container-level `default` made both optional, so a rule that omitted `action`\ndeserialized to `AccessActionConfig::Allow` and validated clean. On an ordered access\nlist a typo in the key `action` would have turned a deny into an allow, which is the\nfail-open this section exists to prevent. Serde now reports `missing field `action``,\nand the genuinely optional fields carry their own defaults.",
       "properties": {
         "acr": {
           "default": null,
@@ -35,8 +35,7 @@
         },
         "action": {
           "$ref": "#/$defs/AccessActionConfig",
-          "default": "allow",
-          "description": "What this rule decides when it matches."
+          "description": "What this rule decides when it matches. Required: there is no safe default for an\naccess decision, and guessing one turns an omission into a silent allow."
         },
         "headers": {
           "default": [],
@@ -63,7 +62,6 @@
           "type": "array"
         },
         "name": {
-          "default": "",
           "description": "Operator-facing name, reported in a decision trace so a denial traces to a line.\n\nRequired and unique: a trace naming a rule that appears twice does not identify\nwhich one fired, which defeats the trace.",
           "type": "string"
         },
@@ -77,7 +75,7 @@
         },
         "path_prefix": {
           "default": null,
-          "description": "The request path must start with this.",
+          "description": "The request path must lie under this prefix ON A SEGMENT BOUNDARY: `/public`\nmatches `/public` and `/public/logo.png`, and does NOT match `/publicsecrets`.\n\nStated as the boundary rule rather than \"starts with\", because the raw-prefix\nreading is the one that leaks a rule into a longer sibling segment.",
           "type": [
             "string",
             "null"
@@ -128,6 +126,10 @@
           "description": "Whether the request must be authenticated or anonymous."
         }
       },
+      "required": [
+        "name",
+        "action"
+      ],
       "type": "object"
     },
     "AdapterFailPolicy": {
@@ -879,22 +881,21 @@
     },
     "HeaderMatchConfig": {
       "additionalProperties": false,
-      "description": "A header a rule requires.",
+      "description": "A header a rule requires, with the exact value it must carry.\n\n# There is no presence-only form, deliberately\n\n`value` was `Option<String>`, documented as \"absent means the header need only be\nPRESENT\". The engine cannot express that: `ironauth_oidc::rules::Criterion::Header`\ncarries a required `value: String` and has no presence-only variant. The vocabulary\nadvertised a match that could never be built, and a rule relying on it would have had\nto be silently dropped or silently widened when converted.\n\nPresence-only matching is worth having and it belongs in the engine first, as a\ncriterion that declares what it reads and how it renders in a trace.",
       "properties": {
         "name": {
-          "default": "",
           "description": "The header name, compared case-insensitively.",
           "type": "string"
         },
         "value": {
-          "default": null,
-          "description": "The exact value it must carry. Absent means the header need only be PRESENT.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "The exact value it must carry.",
+          "type": "string"
         }
       },
+      "required": [
+        "name",
+        "value"
+      ],
       "type": "object"
     },
     "HostedPagesConfig": {

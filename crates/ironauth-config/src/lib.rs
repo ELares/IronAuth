@@ -1425,44 +1425,67 @@ pub struct ForwardAuthConfig {
 ///
 /// Every criterion set on a rule must hold for it to match. A rule with no criteria
 /// matches everything, which is how a catch-all is written and why order matters.
+/// `name` and `action` are REQUIRED AT PARSE TIME, and that is load-bearing.
+///
+/// A container-level `default` made both optional, so a rule that omitted `action`
+/// deserialized to `AccessActionConfig::Allow` and validated clean. On an ordered access
+/// list a typo in the key `action` would have turned a deny into an allow, which is the
+/// fail-open this section exists to prevent. Serde now reports `missing field `action``,
+/// and the genuinely optional fields carry their own defaults.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields, default)]
+#[serde(deny_unknown_fields)]
 pub struct AccessRuleConfig {
     /// Operator-facing name, reported in a decision trace so a denial traces to a line.
     ///
     /// Required and unique: a trace naming a rule that appears twice does not identify
     /// which one fired, which defeats the trace.
     pub name: String,
-    /// What this rule decides when it matches.
+    /// What this rule decides when it matches. Required: there is no safe default for an
+    /// access decision, and guessing one turns an omission into a silent allow.
     pub action: AccessActionConfig,
     /// The authentication context class a `step-up` action requires.
     ///
     /// Required for `step-up` and REFUSED for the others, because an `acr` beside an
     /// `allow` reads as a constraint and is not one.
+    #[serde(default)]
     pub acr: Option<String>,
     /// The request method must be one of these (compared case-insensitively). Empty
     /// means the rule does not constrain the method.
+    #[serde(default)]
     pub methods: Vec<String>,
     /// The request host, without port.
+    #[serde(default)]
     pub host: Option<String>,
-    /// The request path must start with this.
+    /// The request path must lie under this prefix ON A SEGMENT BOUNDARY: `/public`
+    /// matches `/public` and `/public/logo.png`, and does NOT match `/publicsecrets`.
+    ///
+    /// Stated as the boundary rule rather than "starts with", because the raw-prefix
+    /// reading is the one that leaks a rule into a longer sibling segment.
+    #[serde(default)]
     pub path_prefix: Option<String>,
     /// The request path must match this regex WHOLE. Named groups become captures that
     /// `subject_equals_capture` can read in the same rule.
+    #[serde(default)]
     pub path_matches: Option<String>,
     /// Headers that must be present, optionally with an exact value.
+    #[serde(default)]
     pub headers: Vec<HeaderMatchConfig>,
     /// The authenticated subject must equal this.
+    #[serde(default)]
     pub subject_is: Option<String>,
     /// The subject must be in this group.
+    #[serde(default)]
     pub subject_in_group: Option<String>,
     /// The subject must hold this role.
+    #[serde(default)]
     pub subject_has_role: Option<String>,
     /// The subject must equal a named capture bound by `path_matches` in THIS rule.
     ///
     /// This is what expresses "a user may reach their own resource and nobody else's".
+    #[serde(default)]
     pub subject_equals_capture: Option<String>,
     /// Whether the request must be authenticated or anonymous.
+    #[serde(default)]
     pub subject_state: Option<SubjectStateConfig>,
 }
 
@@ -1489,14 +1512,25 @@ pub enum SubjectStateConfig {
     Anonymous,
 }
 
-/// A header a rule requires.
+/// A header a rule requires, with the exact value it must carry.
+///
+/// # There is no presence-only form, deliberately
+///
+/// `value` was `Option<String>`, documented as "absent means the header need only be
+/// PRESENT". The engine cannot express that: `ironauth_oidc::rules::Criterion::Header`
+/// carries a required `value: String` and has no presence-only variant. The vocabulary
+/// advertised a match that could never be built, and a rule relying on it would have had
+/// to be silently dropped or silently widened when converted.
+///
+/// Presence-only matching is worth having and it belongs in the engine first, as a
+/// criterion that declares what it reads and how it renders in a trace.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields, default)]
+#[serde(deny_unknown_fields)]
 pub struct HeaderMatchConfig {
     /// The header name, compared case-insensitively.
     pub name: String,
-    /// The exact value it must carry. Absent means the header need only be PRESENT.
-    pub value: Option<String>,
+    /// The exact value it must carry.
+    pub value: String,
 }
 
 /// Headless flow API settings (issue #84).
@@ -6340,6 +6374,13 @@ fn validate_access_rule(at: &str, rule: &AccessRuleConfig) -> Result<(), ConfigE
                  so the rule it constrains can never fire"
             )));
         }
+        if header.value.is_empty() {
+            return Err(invalid(format!(
+                "{at}.headers[{position}].value is empty: that matches a header whose \
+                 value is the empty string, which is almost certainly not what was meant. \
+                 There is no presence-only form; name the value"
+            )));
+        }
     }
 
     // The pattern has to COMPILE here rather than at request time. A rule that fails
@@ -10793,12 +10834,20 @@ mod tests {
     /// Table-driven over the failures that MATTER, which are the ones a rule can carry
     /// while looking correct: a rule that silently never fires is worse than a rejected
     /// one, because an access list reads as enforcing something it does not.
+    ///
+    /// A review found this table named ten of the validator's error paths and missed two.
+    /// Every path the validator can take now has a row.
     #[test]
     fn every_forward_auth_rule_defect_is_named() {
         let with = |rule: &str| format!("[forward_auth]\nenabled = true\n{rule}");
+        let deny = |extra: &str| {
+            with(&format!(
+                "[[forward_auth.rules]]\nname = \"a\"\naction = \"deny\"\n{extra}"
+            ))
+        };
         for (input, expected) in [
             (
-                with("[[forward_auth.rules]]\naction = \"deny\"\n"),
+                with("[[forward_auth.rules]]\nname = \"\"\naction = \"deny\"\n"),
                 "name is empty",
             ),
             (
@@ -10820,10 +10869,7 @@ mod tests {
                 "which ignores it",
             ),
             (
-                with(
-                    "[[forward_auth.rules]]\nname = \"a\"\naction = \"deny\"\n\
-                     path_matches = \"^/u/(?<user\"\n",
-                ),
+                deny("path_matches = \"^/u/(?<user\"\n"),
                 "is not a valid regex",
             ),
             (
@@ -10843,19 +10889,26 @@ mod tests {
             ),
             (
                 with(
-                    "[[forward_auth.rules]]\nname = \"a\"\naction = \"deny\"\n\
-                     subject_state = \"anonymous\"\nsubject_in_group = \"admins\"\n",
+                    "[[forward_auth.rules]]\nname = \"a\"\naction = \"allow\"\n\
+                     path_matches = \"^/u/(?<owner>[^/]+)$\"\n\
+                     subject_equals_capture = \"\"\n",
                 ),
+                "it names no capture",
+            ),
+            (
+                deny("subject_state = \"anonymous\"\nsubject_in_group = \"admins\"\n"),
                 "can never match",
             ),
+            (deny("methods = [\"\"]\n"), "matches no method"),
             (
-                with("[[forward_auth.rules]]\nname = \"a\"\naction = \"deny\"\nmethods = [\"\"]\n"),
-                "matches no method",
+                deny("[[forward_auth.rules.headers]]\nname = \"\"\nvalue = \"x\"\n"),
+                "headers[0].name is empty",
             ),
             (
-                "[forward_auth]\nenabled = true\n".to_owned(),
-                "no rules",
+                deny("[[forward_auth.rules.headers]]\nname = \"x-env\"\nvalue = \"\"\n"),
+                "headers[0].value is empty",
             ),
+            ("[forward_auth]\nenabled = true\n".to_owned(), "no rules"),
         ] {
             let err = Config::from_toml_str(&input, "<inline>")
                 .expect_err("a malformed forward-auth rule is refused");
@@ -10867,10 +10920,51 @@ mod tests {
         }
     }
 
-    /// The contrast that keeps the table above from passing vacuously.
+    /// A rule that omits `action` must not parse (issue #154).
     ///
-    /// If validation refused EVERY rule list, every row would pass while saying nothing.
-    /// A well-formed list must get past validation and be stopped by the unconsumed guard
+    /// This is the fail-open a review found: with a container-level serde `default`, a rule
+    /// missing `action` deserialized to `allow` and validated clean, so a typo in that one
+    /// key turned a deny into an allow on an ordered access list. The refusal has to come
+    /// from SERDE, because by the time validation runs the omission is indistinguishable
+    /// from a deliberate `allow`.
+    #[test]
+    fn a_rule_that_omits_its_action_or_name_does_not_parse() {
+        for (input, missing) in [
+            (
+                "[forward_auth]\n[[forward_auth.rules]]\nname = \"a\"\n",
+                "action",
+            ),
+            (
+                "[forward_auth]\n[[forward_auth.rules]]\naction = \"deny\"\n",
+                "name",
+            ),
+        ] {
+            let err = Config::from_toml_str(input, "<inline>")
+                .expect_err("a rule missing a required key is refused");
+            let rendered = format!("{err}");
+            assert!(
+                rendered.contains(missing),
+                "the parse error must name the missing key `{missing}`, got: {rendered}"
+            );
+        }
+
+        // The direction that must not change: a rule naming both still parses, and is then
+        // stopped by the unconsumed guard rather than by serde.
+        let err = Config::from_toml_str(
+            "[forward_auth]\n[[forward_auth.rules]]\nname = \"a\"\naction = \"deny\"\n",
+            "<inline>",
+        )
+        .expect_err("nothing serves these rules yet");
+        assert!(
+            format!("{err}").contains("no forward-auth surface is served yet"),
+            "a complete rule must get past serde, got: {err}"
+        );
+    }
+
+    /// The contrast that keeps the defect table from passing vacuously.
+    ///
+    /// If validation refused EVERY rule list, every row would pass while saying nothing. A
+    /// well-formed list must get past validation and be stopped by the unconsumed guard
     /// instead, and the two refusals must be distinguishable.
     #[test]
     fn a_well_formed_rule_list_is_refused_only_because_nothing_serves_it() {
@@ -10884,8 +10978,8 @@ mod tests {
                      path_prefix = \"/admin\"\n\
                      [[forward_auth.rules]]\nname = \"deny the rest\"\naction = \"deny\"\n";
 
-        let err = Config::from_toml_str(input, "<inline>")
-            .expect_err("nothing serves these rules yet");
+        let err =
+            Config::from_toml_str(input, "<inline>").expect_err("nothing serves these rules yet");
         let rendered = format!("{err}");
 
         assert!(
@@ -10898,26 +10992,32 @@ mod tests {
         );
     }
 
-    /// Both directions of the unconsumed guard, and the one that must not change.
+    /// Both fields of the unconsumed guard, and the direction that must not change.
     ///
-    /// `rules` is refused on its own, because a list with `enabled = false` still reads as
-    /// the access policy of this deployment. And an absent section still boots, without
-    /// which a guard that refused every config would satisfy the rest.
+    /// A review found the `enabled` row never reached the guard: `enabled = true` with no
+    /// rules is a VALIDATION error, so the row passed on wording validation produces and the
+    /// guard arm could be deleted with the suite still green. Each row now carries a
+    /// well-formed rule list so validation has nothing to say, and asserts on wording only
+    /// the guard emits.
     #[test]
     fn forward_auth_is_refused_field_by_field_and_its_absence_still_boots() {
+        let rule = "[[forward_auth.rules]]\nname = \"a\"\naction = \"deny\"\n";
         for (input, expected) in [
-            ("[forward_auth]\nenabled = true\n", "forward_auth.enabled"),
             (
-                "[forward_auth]\n[[forward_auth.rules]]\nname = \"a\"\naction = \"deny\"\n",
-                "forward_auth.rules",
+                format!("[forward_auth]\nenabled = true\n{rule}"),
+                "forward_auth.enabled is set, but no forward-auth surface is served yet",
+            ),
+            (
+                format!("[forward_auth]\n{rule}"),
+                "forward_auth.rules is set, but no forward-auth surface is served yet",
             ),
         ] {
-            let err = Config::from_toml_str(input, "<inline>")
+            let err = Config::from_toml_str(&input, "<inline>")
                 .expect_err("a non-default forward_auth field is refused");
             let rendered = format!("{err}");
             assert!(
                 rendered.contains(expected),
-                "the refusal must name the offending field, got: {rendered}"
+                "the guard must name the offending field, got: {rendered}"
             );
         }
 
