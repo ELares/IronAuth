@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The systemd unit the DEB ships (issue #151 criterion 5).
+#
+# The hardening here mirrors the Helm chart's pod security context, deliberately and
+# line for line where systemd has an equivalent: non-root, a read-only root filesystem,
+# no capabilities, no privilege escalation. A deployment should not get a weaker posture
+# for choosing a package over a cluster, and the two drifting apart is how that happens
+# without anyone deciding it.
+[Unit]
+Description=IronAuth identity platform
+Documentation=https://github.com/ELares/IronAuth
+# The server needs its database before it can serve, and answers /readyz accordingly.
+# Ordering only: a remote database is the normal case and there is nothing local to Want.
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=ironauth
+Group=ironauth
+ExecStart=/usr/bin/ironauth serve --config /etc/ironauth/ironauth.toml
+
+# NOT started automatically on install. The shipped config has no database URL, so a
+# package that started the service would put a crash loop in the journal of every machine
+# that installed it before being configured. `systemctl enable --now ironauth` is the
+# documented step once /etc/ironauth/ironauth.toml is filled in.
+Restart=on-failure
+RestartSec=5s
+# Above the largest `server.shutdown_grace_secs` the package expects to support. Without it
+# systemd's 90s default silently caps that setting, so a deployment could configure a longer
+# drain than it can ever take.
+TimeoutStopSec=120s
+# The standard Debian seam for secrets that must not live in a world-readable config, and the
+# counterpart to the environment variables the Helm chart supplies. The leading `-` keeps the
+# file optional, so a deployment that needs none does not have to create it.
+EnvironmentFile=-/etc/default/ironauth
+
+# THE HARDENING. Each line has a counterpart in charts/ironauth/templates/deployment.yaml.
+# ProtectSystem=strict makes / read-only, which is `readOnlyRootFilesystem: true`.
+ProtectSystem=strict
+ProtectHome=yes
+# The chart mounts an emptyDir at /tmp for the same reason: the process writes temporary
+# files, not state, and a read-only root still needs somewhere to put them.
+PrivateTmp=yes
+NoNewPrivileges=yes
+# `capabilities: drop: [ALL]`. The server binds 8443 and 9443, both above 1024, so it
+# needs no capability to listen.
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

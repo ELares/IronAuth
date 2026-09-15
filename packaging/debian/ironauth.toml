@@ -1,0 +1,34 @@
+# IronAuth configuration. Installed to /etc/ironauth/ironauth.toml.
+#
+# `database.url` IS DELIBERATELY ABSENT, and absent is not the same as harmless. IronAuth's
+# built-in default is `postgres://ironauth@localhost:5432/ironauth`, so a server started
+# without editing this file targets a local database that is probably not there, and could
+# in principle be one that is. That is the reason the package does not start the service on
+# install: not that nothing would happen, but that something might.
+#
+# BEFORE MIGRATING, create the three roles the schema grants to. Migration 0001 GRANTs to
+# them and never creates them, because shipping a CREATE ROLE ... PASSWORD literal would hand
+# every reader of the source a working credential for the isolation-boundary role. If they are
+# absent the migration fails loudly, which is intended:
+#
+#   CREATE ROLE ironauth_app LOGIN PASSWORD '...';
+#   CREATE ROLE ironauth_control LOGIN PASSWORD '...';
+#   CREATE ROLE ironauth_audit_retention LOGIN PASSWORD '...';
+#
+# Then set the URL, run `ironauth migrate --config /etc/ironauth/ironauth.toml`, and
+# `systemctl enable --now ironauth`.
+#
+# The full reference is /usr/share/doc/ironauth/CONFIG.md, generated from the config schema.
+
+[server]
+# Loopback by default. A package that bound 0.0.0.0 on install would expose an
+# unconfigured identity server to the network the moment it was unpacked.
+bind = "127.0.0.1:8443"
+management_bind = "127.0.0.1:9443"
+
+[database]
+# REQUIRED. Uncomment and set before starting the service.
+# url = "postgres://ironauth:PASSWORD@db.example:5432/ironauth"
+
+[oidc]
+enabled = false
