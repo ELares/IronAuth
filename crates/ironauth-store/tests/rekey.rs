@@ -341,3 +341,112 @@ async fn a_role_row_level_security_applies_to_is_refused() {
     );
     assert_eq!(master_of(&db, scope).await, "master-old");
 }
+
+/// Open a sealed secret, so a read proves the KEK-to-DEK-to-ciphertext chain still works.
+async fn open_secret(db: &TestDatabase, scope: Scope, master: &MasterKey) -> Vec<u8> {
+    db.store()
+        .scoped(scope)
+        .envelope()
+        .open_secret(master, "email")
+        .await
+        .expect("open the sealed secret")
+}
+
+/// THE OTHER HALF OF CRITERION 3: "reads and writes correct IN THE MIXED-KEY STATE".
+///
+/// `an_interrupted_rekey_resumes_and_converges_without_redoing_finished_rows` covers the
+/// resume and the convergence, and it asserts counts and recorded master ids. It never reads
+/// or writes a secret while the rotation is half-done, so the half of the criterion about
+/// data being usable mid-rotation had nothing behind it.
+///
+/// That is the half an operator actually feels. A rotation that converges perfectly while
+/// the deployment cannot read a tenant's secrets is an outage, and it is an outage that
+/// looks like a successful migration in every report the rotation produces.
+///
+/// The mixed state here is real rather than simulated: one scope is on the new master and
+/// two are still on the old, which is exactly what a run killed after one row leaves behind.
+#[tokio::test]
+async fn reads_and_writes_are_correct_while_the_rotation_is_half_done() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let old = master("master-old", 0x0001);
+    let new = master("master-new", 0x0002);
+
+    // Scope A exists first and gets rotated; B and C arrive afterwards on the old master.
+    let rotated = db.seed_scope(&env).await;
+    provision(&db, &env, rotated, &old).await;
+    put_secret(&db, &env, rotated, &old, b"rotated-before").await;
+
+    let first = Rekey::new(db.owner_pool(), &old, &new, env.entropy())
+        .run()
+        .await
+        .expect("the first pass runs");
+    assert_eq!(
+        first.rewrapped, 1,
+        "precondition: exactly one scope is rotated"
+    );
+
+    let mut pending = Vec::new();
+    for _ in 0..2 {
+        let scope = db.seed_scope(&env).await;
+        provision(&db, &env, scope, &old).await;
+        put_secret(&db, &env, scope, &old, b"pending-before").await;
+        pending.push(scope);
+    }
+
+    // The database is now genuinely mixed.
+    assert_eq!(master_of(&db, rotated).await, "master-new");
+    for scope in &pending {
+        assert_eq!(master_of(&db, *scope).await, "master-old");
+    }
+
+    // READ, both sides of the rotation, each under the master its KEK is wrapped with.
+    assert_eq!(
+        open_secret(&db, rotated, &new).await,
+        b"rotated-before",
+        "a secret sealed BEFORE the rotation must still open on a rotated scope"
+    );
+    for scope in &pending {
+        assert_eq!(
+            open_secret(&db, *scope, &old).await,
+            b"pending-before",
+            "and an unrotated scope must still open under the old master"
+        );
+    }
+
+    // WRITE, on both sides, while the rotation is still half-done.
+    put_secret(&db, &env, rotated, &new, b"rotated-during").await;
+    for scope in &pending {
+        put_secret(&db, &env, *scope, &old, b"pending-during").await;
+    }
+    assert_eq!(open_secret(&db, rotated, &new).await, b"rotated-during");
+    for scope in &pending {
+        assert_eq!(open_secret(&db, *scope, &old).await, b"pending-during");
+    }
+
+    // Finish the rotation. Everything written during the mixed state survives it, which is
+    // the property that makes the mid-rotation window safe to serve traffic in.
+    let report = Rekey::new(db.owner_pool(), &old, &new, env.entropy())
+        .run()
+        .await
+        .expect("the resumed pass runs");
+    assert_eq!(
+        report.rewrapped, 2,
+        "only the two that were still on the old master"
+    );
+    assert_eq!(report.already_current, 1);
+    assert_eq!(report.remaining_under_old, 0, "the rotation converged");
+
+    assert_eq!(
+        open_secret(&db, rotated, &new).await,
+        b"rotated-during",
+        "a write made during the mixed state is readable after convergence"
+    );
+    for scope in &pending {
+        assert_eq!(
+            open_secret(&db, *scope, &new).await,
+            b"pending-during",
+            "including on a scope that was rotated AFTER the write was made"
+        );
+    }
+}

@@ -64010,6 +64010,18 @@ pub(crate) async fn keks_under_master(
         .collect())
 }
 
+/// # The `master_key_id` term of the compare-and-swap is redundant, deliberately
+///
+/// A sweep found that dropping `AND master_key_id = $3` leaves every test green, and that is
+/// the honest answer rather than a coverage gap: rewrapping necessarily changes the blob, so
+/// `AND wrapped_kek = $2` already fails for any row that has moved. Two rows cannot share a
+/// ciphertext under different masters short of an AEAD collision.
+///
+/// It stays because it costs nothing and it states the intent at the point of the write: this
+/// row is expected to be on the OLD master. A future caller that rewraps without changing the
+/// blob, or a schema that stores the wrapped key elsewhere, would make it load-bearing again,
+/// and by then nobody would think to add it.
+///
 /// Write a rewrapped KEK and the master that now wraps it, in ONE statement, and ONLY if the
 /// row is still exactly as it was read.
 ///
