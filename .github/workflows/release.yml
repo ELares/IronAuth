@@ -5,8 +5,10 @@
 # Cargo.toml version (the job verifies and refuses on mismatch). Other
 # artifacts (SDKs, SPA) get their own "<artifact>-vX.Y.Z" lanes when they
 # land. Produces: a static musl binary, a CycloneDX SBOM, GitHub build
-# provenance attestations, a GitHub release with the crate changelog section,
-# and a cosign-signed container image on GHCR. First real release validates
+# provenance attestations, a packaged Helm chart with an SBOM of the images it
+# deploys, a DEB with its SBOM bound to it, a GitHub release with the crate
+# changelog section, and a cosign-signed container image on GHCR carrying both a
+# provenance attestation and an SBOM. First real release validates
 # this lane end to end; see docs/RELEASING.md.
 name: release
 
@@ -31,6 +33,17 @@ jobs:
           crate_version=$(grep -m1 '^version' crates/ironauth/Cargo.toml | cut -d'"' -f2)
           echo "tag=$tag_version crate=$crate_version"
           test "$tag_version" = "$crate_version"
+      # NO SEPARATE CHART-VERSION CHECK, deliberately, and this is where someone would add
+      # one. `scripts/helm-chart.sh` already fails on main when Chart.yaml `appVersion`
+      # differs from the crate version, and the tag equals the crate version by the step
+      # above, so tag == appVersion holds transitively with nothing new to run. The chart's
+      # default image tag falls back to appVersion, so that is the field that decides which
+      # server a chart installs.
+      #
+      # Chart.yaml `version` is NOT tied to the tag: its own comment says it is bumped when
+      # the chart changes, independently of the appVersion it deploys, and that is ordinary
+      # Helm practice. A release-time assertion that it equals the tag would fail a release
+      # AFTER the tag was pushed, for following the instruction the file itself gives.
       # Issue #114 criterion 4 asks for the hook latency numbers to be "published per release".
       # Checked HERE rather than beside the asset copy, and the reason is what happens if it is
       # not: the build job attests build provenance to a public transparency log BEFORE it
@@ -88,6 +101,58 @@ jobs:
         run: |
           cargo install cargo-cyclonedx --locked
           cargo cyclonedx --format json --spec-version 1.5
+      # THE CHART, packaged as a release artifact (issue #151 criterion 4). It was not
+      # published at all, so "every release artifact has an SBOM and provenance" was vacuous
+      # for it: there was no artifact to attest.
+      # PINNED TO THE VERSION THE GATE USES. `scripts/helm-chart.sh` runs under v3.16.3 in
+      # ci.yml, and an unpinned action would package the shipped chart with whatever major is
+      # current, so the binary that validates the chart and the binary that packages it could
+      # differ across a major release boundary.
+      - name: Install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - name: Package the Helm chart
+        run: helm package charts/ironauth --destination .
+      # THE CHART'S COMPONENTS ARE THE IMAGES IT DEPLOYS, and nothing else in it is a
+      # dependency: the rest is templates.
+      #
+      # A syft directory scan was the first version of this step and it was wrong. Syft has
+      # no cataloger that matches a Helm chart, so it would have emitted a CycloneDX document
+      # with an empty `components` array, published it as the chart's SBOM, and satisfied
+      # "every artifact has an SBOM" with a file that says nothing. An empty SBOM is worse
+      # than an absent one: it answers the question a consumer asks.
+      #
+      # So the components come from the RENDERED chart, which is the only place the image
+      # reference is resolved (`values.image.tag` defaults to `.Chart.AppVersion`).
+      - name: SBOM for the chart
+        run: |
+          helm template ironauth charts/ironauth \
+            | grep -oE '^[[:space:]]+image: "?[^"]+"?' \
+            | sed -E 's/^[[:space:]]+image: "?//; s/"?$//' \
+            | sort -u > chart-images.txt
+          test -s chart-images.txt
+          python3 - <<'SBOM'
+          import json, pathlib
+          images = [l.strip() for l in pathlib.Path("chart-images.txt").read_text().splitlines() if l.strip()]
+          doc = {
+              "bomFormat": "CycloneDX",
+              "specVersion": "1.5",
+              "version": 1,
+              "metadata": {"component": {"type": "application", "name": "ironauth-chart"}},
+              "components": [
+                  {"type": "container", "name": i.rsplit(":", 1)[0],
+                   "version": i.rsplit(":", 1)[1] if ":" in i else "unknown",
+                   "purl": f"pkg:oci/{i.rsplit('/', 1)[-1]}"}
+                  for i in images
+              ],
+          }
+          pathlib.Path("ironauth-chart.cdx.json").write_text(json.dumps(doc, indent=2))
+          SBOM
+          # AN SBOM WITH NO COMPONENTS MUST NOT SHIP. This is the assertion the syft version
+          # would have failed, and the reason this step is written out rather than delegated.
+          python3 -c "import json,sys; d=json.load(open('ironauth-chart.cdx.json')); sys.exit(0 if d['components'] else 1)"
+          cat ironauth-chart.cdx.json
       # THE DEB (issue #151 criteria 4 and 5). Built from the SAME BUILD as the tarball
       # rather than a second compile, so the two cannot drift.
       #
@@ -102,6 +167,13 @@ jobs:
           mkdir -p dist
           cp target/x86_64-unknown-linux-musl/release/ironauth dist/ironauth-x86_64-linux-musl
           cp target/x86_64-unknown-linux-musl/debian/ironauth_*.deb dist/
+          cp ironauth-*.tgz dist/
+          # NOT copied explicitly: the `find` below already stages every *.cdx.json in the
+          # workspace, this one included. Copying it here AND listing it in the release args
+          # handed `gh release create` the same basename twice, and GitHub rejects a
+          # duplicate asset name with a 422 that is not retried. That failure would land on
+          # the LAST step of this job, after the release exists and the provenance
+          # attestations are already in the public transparency log.
           find . -name '*.cdx.json' -not -path './dist/*' -exec cp {} dist/ \;
           # The config JSON schema drives editor autocomplete for operators and
           # is freshness-checked in CI (scripts/config-schema.sh); ship it as a
@@ -121,6 +193,17 @@ jobs:
           subject-path: |
             dist/ironauth-x86_64-linux-musl
             dist/ironauth_*.deb
+            dist/ironauth-*.tgz
+      # THE DEB'S SBOM, BOUND TO THE DEB. The PR that added the package said its SBOM was
+      # covered "via the binary's", which was an argument rather than a link: nothing
+      # associated the crate document with the .deb, so a consumer holding the package had no
+      # attestation to check. The package contains that binary plus a unit file and a config,
+      # neither of which is a dependency, so the crate graph IS its component list.
+      - name: Attest the DEB SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-path: dist/ironauth_*.deb
+          sbom-path: crates/ironauth/ironauth.cdx.json
       - name: Extract changelog section
         run: |
           version="${GITHUB_REF_NAME#ironauth-v}"
@@ -134,7 +217,7 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --notes-file dist/RELEASE_NOTES.md \
             dist/ironauth-x86_64-linux-musl dist/SHA256SUMS dist/config-schema.json dist/*.cdx.json \
-            dist/hook-latency.json dist/ironauth_*.deb
+            dist/hook-latency.json dist/ironauth_*.deb dist/ironauth-*.tgz
 
   image:
     name: container image, signed
@@ -208,4 +291,35 @@ jobs:
         with:
           subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      # AN SBOM FOR THE IMAGE (issue #151 criterion 4), and it is the BINARY'S dependency
+      # graph rather than a container scan.
+      #
+      # The first version of this step ran syft against the pushed digest and justified it by
+      # saying the image "carries whatever its base layer brings". The image is `FROM scratch`
+      # forty lines above: there is no base layer, and the only thing in it is one static
+      # binary with no package metadata for syft to catalog. That scan would have produced a
+      # CycloneDX document with an empty `components` array and attested it to the registry as
+      # the image's SBOM. An empty SBOM is worse than an absent one, because it answers the
+      # question a consumer asks.
+      #
+      # This job already compiles the same binary the image contains, so the accurate answer
+      # is the crate graph, generated here rather than passed between jobs.
+      - name: SBOM for the image
+        run: |
+          cargo install cargo-cyclonedx --locked
+          # No package filter: `cargo cyclonedx` takes none, and `-- -p ironauth` exits 2.
+          # It writes one document per crate, named `<crate>.cdx.json` beside that crate's
+          # manifest. Verified locally: crates/ironauth/ironauth.cdx.json, 349 components.
+          cargo cyclonedx --format json --spec-version 1.5
+          cp crates/ironauth/ironauth.cdx.json image.cdx.json
+          # AN SBOM WITH NO COMPONENTS MUST NOT BE ATTESTED. This is the assertion the syft
+          # version would have failed.
+          python3 -c "import json,sys; d=json.load(open('image.cdx.json')); sys.exit(0 if d.get('components') else 1)"
+      - name: Attest the image SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ steps.push.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: image.cdx.json
           push-to-registry: true
