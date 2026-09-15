@@ -31,6 +31,22 @@ jobs:
           crate_version=$(grep -m1 '^version' crates/ironauth/Cargo.toml | cut -d'"' -f2)
           echo "tag=$tag_version crate=$crate_version"
           test "$tag_version" = "$crate_version"
+      # THE CHART SHIPS WITH THIS RELEASE (issue #151 criterion 4), so its version has to
+      # agree with the tag. Both fields, and they mean different things: `version` is the
+      # chart's own, and `appVersion` is the IronAuth it deploys. A chart published at the
+      # release version while its appVersion points at an older image would install the
+      # wrong server, and the chart is the artifact fewest people read before applying.
+      #
+      # Checked HERE for the same reason the baseline below is: this job runs before anything
+      # is signed, and a precondition of releasing belongs ahead of the attestations.
+      - name: chart version and appVersion equal the tag
+        run: |
+          tag_version="${GITHUB_REF_NAME#ironauth-v}"
+          chart_version=$(grep -m1 '^version:' charts/ironauth/Chart.yaml | awk '{print $2}' | tr -d '"')
+          app_version=$(grep -m1 '^appVersion:' charts/ironauth/Chart.yaml | awk '{print $2}' | tr -d '"')
+          echo "tag=$tag_version chart=$chart_version app=$app_version"
+          test "$tag_version" = "$chart_version"
+          test "$tag_version" = "$app_version"
       # Issue #114 criterion 4 asks for the hook latency numbers to be "published per release".
       # Checked HERE rather than beside the asset copy, and the reason is what happens if it is
       # not: the build job attests build provenance to a public transparency log BEFORE it
@@ -88,6 +104,23 @@ jobs:
         run: |
           cargo install cargo-cyclonedx --locked
           cargo cyclonedx --format json --spec-version 1.5
+      # THE CHART, packaged as a release artifact (issue #151 criterion 4). It was not
+      # published at all, so "every release artifact has an SBOM and provenance" was vacuous
+      # for it: there was no artifact to attest.
+      - name: Package the Helm chart
+        uses: azure/setup-helm@v4
+      - name: helm package
+        run: helm package charts/ironauth --destination .
+      # Syft rather than cargo-cyclonedx, because a chart's contents are templates and an
+      # image reference, not a Rust dependency graph. Two tools because there are two kinds
+      # of artifact, not because one was easier.
+      - name: SBOM for the chart
+        uses: anchore/sbom-action@v0
+        with:
+          path: charts/ironauth
+          format: cyclonedx-json
+          output-file: ironauth-chart.cdx.json
+          upload-artifact: false
       # THE DEB (issue #151 criteria 4 and 5). Built from the SAME BUILD as the tarball
       # rather than a second compile, so the two cannot drift.
       #
@@ -102,6 +135,8 @@ jobs:
           mkdir -p dist
           cp target/x86_64-unknown-linux-musl/release/ironauth dist/ironauth-x86_64-linux-musl
           cp target/x86_64-unknown-linux-musl/debian/ironauth_*.deb dist/
+          cp ironauth-*.tgz dist/
+          cp ironauth-chart.cdx.json dist/
           find . -name '*.cdx.json' -not -path './dist/*' -exec cp {} dist/ \;
           # The config JSON schema drives editor autocomplete for operators and
           # is freshness-checked in CI (scripts/config-schema.sh); ship it as a
@@ -121,6 +156,7 @@ jobs:
           subject-path: |
             dist/ironauth-x86_64-linux-musl
             dist/ironauth_*.deb
+            dist/ironauth-*.tgz
       - name: Extract changelog section
         run: |
           version="${GITHUB_REF_NAME#ironauth-v}"
@@ -134,7 +170,8 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --notes-file dist/RELEASE_NOTES.md \
             dist/ironauth-x86_64-linux-musl dist/SHA256SUMS dist/config-schema.json dist/*.cdx.json \
-            dist/hook-latency.json dist/ironauth_*.deb
+            dist/hook-latency.json dist/ironauth_*.deb dist/ironauth-*.tgz \
+            dist/ironauth-chart.cdx.json
 
   image:
     name: container image, signed
@@ -208,4 +245,24 @@ jobs:
         with:
           subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      # AN SBOM FOR THE IMAGE ITSELF (issue #151 criterion 4). The binary's SBOM describes
+      # the Rust dependency graph; the image also carries whatever its base layer brings, and
+      # that is the half a consumer scanning a container actually asks about.
+      #
+      # Scanned from the pushed DIGEST rather than the local build, so what is attested is
+      # the artifact a consumer pulls.
+      - name: SBOM for the image
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.push.outputs.image }}@${{ steps.push.outputs.digest }}
+          format: cyclonedx-json
+          output-file: image.cdx.json
+          upload-artifact: false
+      - name: Attest the image SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ steps.push.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: image.cdx.json
           push-to-registry: true
