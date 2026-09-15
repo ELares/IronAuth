@@ -1037,6 +1037,152 @@ jobs:
         run: cargo test -p ironauth-fastly-verify
       - name: Build for the Compute target
         run: cargo check -p ironauth-fastly-verify --target wasm32-wasip2
+  helm-install:
+    name: helm install into a disposable cluster (issue #151 criterion 1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install musl target and tools
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update && sudo apt-get install -y musl-tools
+      # THE IMAGE THE RELEASE SHIPS, built the same way. A debian-based test image would
+      # install faster and would not be the artifact the chart deploys: `FROM scratch` with a
+      # static binary is what a probe, a security context and a read-only root filesystem are
+      # actually applied to, and those are what this job exists to exercise.
+      - name: Build the image the chart deploys
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl -p ironauth
+          mkdir -p image-build
+          cp target/x86_64-unknown-linux-musl/release/ironauth image-build/ironauth
+          cat > image-build/Dockerfile <<'DOCKER'
+          FROM scratch
+          COPY ironauth /ironauth
+          ENTRYPOINT ["/ironauth"]
+          DOCKER
+          docker build -t ironauth:ci image-build
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: ironauth
+      - name: Load the image into the cluster
+        run: kind load docker-image ironauth:ci --name ironauth
+      # Postgres as a plain manifest rather than a chart dependency: this job is testing OUR
+      # chart, and a dependency would make a failure ambiguous between the two.
+      - name: Postgres
+        run: |
+          kubectl apply -f - <<'PG'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: postgres
+          spec:
+            selector:
+              app: postgres
+            ports:
+              - port: 5432
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: postgres
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: postgres
+            template:
+              metadata:
+                labels:
+                  app: postgres
+              spec:
+                containers:
+                  - name: postgres
+                    image: postgres:16
+                    env:
+                      - name: POSTGRES_PASSWORD
+                        value: postgres
+                      - name: POSTGRES_DB
+                        value: ironauth
+                    ports:
+                      - containerPort: 5432
+                    readinessProbe:
+                      exec:
+                        command: ["pg_isready", "-U", "postgres"]
+                      periodSeconds: 5
+          PG
+          kubectl rollout status deployment/postgres --timeout=300s
+      # THE THREE ROLES THE SCHEMA GRANTS TO, and then the migration. The chart runs NEITHER,
+      # which is a real gap in its story rather than an omission in this job: a `helm install`
+      # against a fresh database leaves every pod failing readiness until someone migrates out
+      # of band, and nothing in the chart or its README says so. Recorded on issue #151.
+      - name: Provision roles and migrate
+        run: |
+          POD=$(kubectl get pod -l app=postgres -o jsonpath='{.items[0].metadata.name}')
+          for role in ironauth_app ironauth_control ironauth_audit_retention; do
+            kubectl exec "$POD" -- psql -U postgres -d ironauth -v ON_ERROR_STOP=1 \
+              -c "CREATE ROLE $role LOGIN PASSWORD '$role'"
+          done
+          # The migrate Job reads the same config shape the chart mounts, so a config the
+          # chart would reject is rejected here too rather than at pod start.
+          kubectl create secret generic ironauth-migrate-config \
+            --from-literal=ironauth.toml="$(printf '%s\n' \
+              '[database]' \
+              'url = "postgres://postgres:postgres@postgres:5432/ironauth"')"
+          kubectl apply -f - <<'JOB'
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ironauth-migrate
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: migrate
+                    image: ironauth:ci
+                    imagePullPolicy: Never
+                    args: ["migrate", "--config", "/etc/ironauth/ironauth.toml"]
+                    volumeMounts:
+                      - name: config
+                        mountPath: /etc/ironauth
+                volumes:
+                  - name: config
+                    secret:
+                      secretName: ironauth-migrate-config
+          JOB
+          kubectl wait --for=condition=complete job/ironauth-migrate --timeout=300s
+      - name: helm install with the documented HA values
+        run: |
+          helm install ironauth charts/ironauth \
+            --set image.repository=ironauth \
+            --set image.tag=ci \
+            --set image.pullPolicy=Never \
+            --set server.publicUrl=http://ironauth.default.svc.cluster.local:8443 \
+            --set database.url="postgres://postgres:postgres@postgres:5432/ironauth" \
+            --wait --timeout 300s
+      # THE CRITERION'S OWN WORDS: "a working MULTI-REPLICA deployment". The chart defaults to
+      # three, and a rollout that reports success with one ready replica would satisfy
+      # `--wait` while proving nothing about the multi-replica half, so the count is asserted
+      # rather than inferred.
+      - name: It is a working multi-replica deployment
+        run: |
+          kubectl rollout status deployment/ironauth --timeout=300s
+          ready=$(kubectl get deployment ironauth -o jsonpath='{.status.readyReplicas}')
+          desired=$(kubectl get deployment ironauth -o jsonpath='{.spec.replicas}')
+          echo "ready=$ready desired=$desired"
+          test "$desired" -ge 2
+          test "$ready" = "$desired"
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -o wide || true
+          kubectl describe deployment/ironauth || true
+          kubectl logs -l app.kubernetes.io/name=ironauth --tail=100 --all-containers || true
+          kubectl get events --sort-by=.lastTimestamp | tail -40 || true
+
   deb:
     name: DEB install boots against Postgres on a plain VM (issue #151 criterion 5)
     runs-on: ubuntu-latest
