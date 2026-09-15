@@ -1117,6 +1117,8 @@ jobs:
         run: scripts/event-ordering-audit.sh
       - name: classification lint (every resource type is classified; all three classes used)
         run: scripts/classification-lint.sh
+      - name: metric contract (drift in either direction fails; a documented metric nothing emits never alerts)
+        run: scripts/metric-contract.py
       - name: diagnostics redaction corpus (a sentinel in any free-form diagnostic field would be seen)
         run: scripts/diagnostics-redaction-scan.sh
       - name: canonicalization seam (every identifier comparison routes through the one seam)
