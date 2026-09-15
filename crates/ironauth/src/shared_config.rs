@@ -838,6 +838,24 @@ mod tests {
              is the general treatment for a section that ships ahead of its consumer.",
         ),
         (
+            "hot_state",
+            Reach::OnePlaneOrNoState,
+            "the optional IronCache accelerator address (issue #146). Read at boot in ONE \
+             place and it is neither plane: `ironauth_server::readiness` maps \
+             `hot_state.ironcache_addr` into an `OptionalComponent` carrying \
+             `DegradedTier::AcceleratorAbsent`, so a deployment that declared an accelerator \
+             is reported as degraded when it cannot be reached.\n\n\
+             THAT IS THE ONLY READ. The key declares that a deployment HAS an accelerator; it \
+             does not put the cache in front of anything. `ironauth-hot` is a complete, \
+             classified, outage-tested layer that no request path calls, and it is not a \
+             dependency of `ironauth-oidc`, `ironauth-server`, `ironauth-admin` or the binary. \
+             It is NOT classified `UnreadAtBoot` for that reason: readiness is a real boot \
+             read, and the distinction between a section nothing reads and one only readiness \
+             reads is exactly what this list exists to record.\n\n\
+             It reaches neither plane state, so wiring a first consumer (the remaining #146 \
+             work) lands in the plane that consumes it and this entry is revisited then.",
+        ),
+        (
             "outbox",
             Reach::OnePlaneOrNoState,
             "the transactional outbox and job queue tuning (issue #104). RECLASSIFIED in \

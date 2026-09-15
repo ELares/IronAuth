@@ -1117,8 +1117,17 @@ jobs:
         run: scripts/event-ordering-audit.sh
       - name: classification lint (every resource type is classified; all three classes used)
         run: scripts/classification-lint.sh
-      - name: metric contract (drift in either direction fails; a documented metric nothing emits never alerts)
-        run: scripts/metric-contract.py
+      # THE METRIC CONTRACT GATE IS A RUST TEST, not a script here.
+      #
+      # This step ran `scripts/metric-contract.py`, which was never committed, so it exited 127
+      # on every run from the day it landed (PR #1269) and main was red on this job the whole
+      # time. Worse than the red: the criterion it claimed to enforce (#152 criterion 1) was
+      # enforced by nothing here, because a step that cannot start cannot fail on drift.
+      #
+      # The real gate is `crates/ironauth-server/tests/metric_contract.rs`, which checks BOTH
+      # directions against the emit sites and runs in the workspace test job. It is not
+      # duplicated here: re-adding a step for it would rebuild the workspace a second time to
+      # re-run a test that already ran.
       - name: diagnostics redaction corpus (a sentinel in any free-form diagnostic field would be seen)
         run: scripts/diagnostics-redaction-scan.sh
       - name: canonicalization seam (every identifier comparison routes through the one seam)
