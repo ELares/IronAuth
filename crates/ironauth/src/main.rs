@@ -8059,7 +8059,7 @@ mod migrate_cli_tests {
     }
 }
 
-/// Run the `storage` subcommand family (issue #153). Today: `rekey`.
+/// Run the `storage` subcommand family (issue #153): `rekey`, `kek-backup`, `kek-restore`.
 ///
 /// # Offline, and it says so
 ///
@@ -8070,12 +8070,22 @@ mod migrate_cli_tests {
 #[allow(clippy::too_many_lines)]
 fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
     let verb = args.next();
-    if verb.as_deref() != Some("rekey") {
-        eprintln!("ironauth storage: expected a subcommand. The only one today is `rekey`.");
-        eprintln!(
-            "usage: ironauth storage rekey --url DSN --from-master-key ID:HEX --to-master-key ID:HEX"
-        );
-        return ExitCode::FAILURE;
+    match verb.as_deref() {
+        Some("rekey") => {}
+        Some("kek-backup") => return kek_backup_command(args),
+        Some("kek-restore") => return kek_restore_command(args),
+        _ => {
+            eprintln!(
+                "ironauth storage: expected a subcommand: rekey, kek-backup, or kek-restore."
+            );
+            eprintln!(
+                "usage: ironauth storage rekey --url DSN --from-master-key ID:HEX \
+                 --to-master-key ID:HEX"
+            );
+            eprintln!("       ironauth storage kek-backup --url DSN --out FILE");
+            eprintln!("       ironauth storage kek-restore --url DSN --in FILE");
+            return ExitCode::FAILURE;
+        }
     }
 
     let mut url: Option<String> = None;
@@ -8210,6 +8220,220 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
     })
 }
 
+/// Take one flag's value off `args`, or complain about the missing value.
+fn take_flag(
+    args: &mut impl Iterator<Item = String>,
+    command: &str,
+    flag: &str,
+    target: &mut Option<String>,
+) -> bool {
+    if let Some(value) = args.next() {
+        *target = Some(value);
+        true
+    } else {
+        eprintln!("ironauth storage {command}: {flag} requires a value");
+        false
+    }
+}
+
+/// `ironauth storage kek-backup --url DSN --out FILE` (issue #153 criteria 4 and 6).
+///
+/// Writes the rows as JSON and prints the MANIFEST, which the operator stores somewhere the
+/// rows are not. `kek-restore` refuses without it.
+fn kek_backup_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let mut url: Option<String> = None;
+    let mut out: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => {
+                if !take_flag(args, "kek-backup", "--url", &mut url) {
+                    return ExitCode::FAILURE;
+                }
+            }
+            "--out" => {
+                if !take_flag(args, "kek-backup", "--out", &mut out) {
+                    return ExitCode::FAILURE;
+                }
+            }
+            other => {
+                eprintln!("ironauth storage kek-backup: unrecognized argument '{other}'");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let (Some(url), Some(out)) = (url, out) else {
+        eprintln!("ironauth storage kek-backup: --url and --out are both required");
+        return ExitCode::FAILURE;
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ironauth storage kek-backup: cannot start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async move {
+        let store = match Store::connect(&url).await {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("ironauth storage kek-backup: cannot connect: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        // THE REFUSAL THIS COMMAND EXISTS FOR. The KEK table is FORCE ROW LEVEL SECURITY,
+        // so on the application role the export returns zero rows and no error, and an empty
+        // backup passes every check downstream of it.
+        let Ok(rows) = store.export_keks().await else {
+            eprintln!(
+                "ironauth storage kek-backup: this connection is subject to row-level \n\
+                 security, so it CANNOT SEE every KEK row. Reading anyway would export \n\
+                 zero rows with no error, and the empty file would verify against its \n\
+                 own manifest. Connect as the database owner or a role with BYPASSRLS."
+            );
+            return ExitCode::FAILURE;
+        };
+        if rows.is_empty() {
+            eprintln!(
+                "ironauth storage kek-backup: the database holds NO KEK rows. Refusing to \n\
+                 write an empty backup: it would verify, restore cleanly, and recover nothing."
+            );
+            return ExitCode::FAILURE;
+        }
+        let manifest = ironauth_store::kek_backup::manifest_for(&rows);
+        let json = match serde_json::to_string_pretty(&rows) {
+            Ok(json) => json,
+            Err(error) => {
+                eprintln!("ironauth storage kek-backup: cannot encode the backup: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(error) = std::fs::write(&out, json) {
+            eprintln!("ironauth storage kek-backup: cannot write {out}: {error}");
+            return ExitCode::FAILURE;
+        }
+        println!(
+            "storage kek-backup: {} row(s) written to {out}.",
+            rows.len()
+        );
+        println!("\nMANIFEST (store this somewhere the backup file is NOT):");
+        println!("  {}", manifest.encode());
+        println!(
+            "\nkek-restore refuses without it. A manifest kept beside the rows it \n\
+             describes is damaged by the same transfer that damages them."
+        );
+        ExitCode::SUCCESS
+    })
+}
+
+/// `ironauth storage kek-restore --url DSN --in FILE --manifest LINE`.
+///
+/// Verifies before writing anything, then writes in ONE transaction.
+fn kek_restore_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let mut url: Option<String> = None;
+    let mut input: Option<String> = None;
+    let mut manifest: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => {
+                if !take_flag(args, "kek-restore", "--url", &mut url) {
+                    return ExitCode::FAILURE;
+                }
+            }
+            "--in" => {
+                if !take_flag(args, "kek-restore", "--in", &mut input) {
+                    return ExitCode::FAILURE;
+                }
+            }
+            "--manifest" => {
+                if !take_flag(args, "kek-restore", "--manifest", &mut manifest) {
+                    return ExitCode::FAILURE;
+                }
+            }
+            other => {
+                eprintln!("ironauth storage kek-restore: unrecognized argument '{other}'");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let (Some(url), Some(input), Some(manifest)) = (url, input, manifest) else {
+        eprintln!(
+            "ironauth storage kek-restore: --url, --in and --manifest are all required.\n\
+             The manifest is the line kek-backup printed. Without it this would be a \n\
+             restore that checks the backup against itself, which passes for any file."
+        );
+        return ExitCode::FAILURE;
+    };
+    let manifest = match ironauth_store::kek_backup::Manifest::decode(&manifest) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!("ironauth storage kek-restore: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let json = match std::fs::read_to_string(&input) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("ironauth storage kek-restore: cannot read {input}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rows: Vec<ironauth_store::kek_backup::BackedUpKek> = match serde_json::from_str(&json) {
+        Ok(rows) => rows,
+        Err(error) => {
+            eprintln!("ironauth storage kek-restore: cannot parse {input}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ironauth storage kek-restore: cannot start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async move {
+        let store = match Store::connect(&url).await {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("ironauth storage kek-restore: cannot connect: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match store.restore_keks(&rows, &manifest).await {
+            Ok(report) => {
+                println!(
+                    "storage kek-restore: {} row(s) restored, {} already present and \
+                     identical.",
+                    report.restored, report.already_present
+                );
+                println!(
+                    "\nNOW READ A SECRET on a scope that had one, for EVERY scope you \n\
+                     expected to recover. Rows being present is not the check; the \n\
+                     hierarchy opening is. A read also does not consult status, so confirm \n\
+                     no scope you expected to recover came back destroyed."
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("ironauth storage kek-restore: {error}");
+                eprintln!(
+                    "\nNothing was written: the restore runs in one transaction, so the \n\
+                     database is exactly as it was."
+                );
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
 /// Parse `id:hex` into a master key. The id is bound into every wrapped KEK's AAD.
 fn parse_master_key(text: &str) -> Option<ironauth_jose::MasterKey> {
     let (id, hex) = text.split_once(':')?;
@@ -8235,6 +8459,13 @@ fn print_help() {
     println!("                                   Rewrap every tenant KEK under a new platform");
     println!("                                   master key. OFFLINE: a running server holds");
     println!("                                   one master and cannot open both shapes");
+    println!("  ironauth storage kek-backup --url DSN --out FILE");
+    println!("                                   Export every wrapped KEK and print the");
+    println!("                                   manifest. REFUSES a connection row-level");
+    println!("                                   security applies to: it would see no rows");
+    println!("  ironauth storage kek-restore --url DSN --in FILE --manifest LINE");
+    println!("                                   Verify against the manifest, then restore in");
+    println!("                                   ONE transaction. See docs/KEK-RECOVERY.md");
     println!("  ironauth migrate [--config PATH] [--url DSN] [--contract | --soak DUR]");
     println!("                                   Apply the schema. Contract migrations are");
     println!("                                   DEFERRED on an upgrade: --contract is you");
