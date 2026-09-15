@@ -174,7 +174,7 @@
             }
           ],
           "default": null,
-          "description": "The bootstrap operator bearer token that authorizes the operator plane\n(tenant CRUD) in M1, presented as `Authorization: Bearer <token>`. Unset\nleaves the operator plane unauthorized (the management API still mounts,\nbut every operator-plane request is rejected). Use the `file`/`env` secret\nindirection, never a literal, outside dev mode. The full operator-plane\ncredential class lands in M5."
+          "description": "The bootstrap operator bearer token that authorizes the operator plane\n(tenant CRUD) in M1, presented as `Authorization: Bearer <token>`.\n\nUNSET MEANS THE MANAGEMENT API IS NOT MOUNTED AT ALL. This said \"the management API\nstill mounts, but every operator-plane request is rejected\", which is not what the\nboot path does: `build_admin_state` returns `None` on an unset token and logs\n\"management API not mounted\", so every `/v1/*` path on the management plane is a\nuniform 404. The difference matters to anyone diagnosing one: a 404 reads as a wrong\nURL, and this sentence would have sent them looking for one.\n\nUse the `file`/`env` secret indirection, never a literal, outside dev mode. The full\noperator-plane credential class lands in M5."
         },
         "control_database_url": {
           "anyOf": [

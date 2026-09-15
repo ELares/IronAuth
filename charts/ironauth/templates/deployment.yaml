@@ -80,13 +80,22 @@ spec:
             overlay, so an env var named after a setting reaches nothing. IronBus
             goes through outbox.ironbus_addr in the rendered Secret instead.
           */}}
-          {{- if .Values.database.masterKey.existingSecret }}
+          {{- if or .Values.database.masterKey.existingSecret .Values.admin.bootstrapOperatorToken.existingSecret }}
           env:
+          {{- if .Values.database.masterKey.existingSecret }}
             - name: IRONAUTH_MASTER_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.database.masterKey.existingSecret }}
                   key: {{ .Values.database.masterKey.key }}
+          {{- end }}
+          {{- if .Values.admin.bootstrapOperatorToken.existingSecret }}
+            - name: IRONAUTH_BOOTSTRAP_OPERATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.admin.bootstrapOperatorToken.existingSecret }}
+                  key: {{ .Values.admin.bootstrapOperatorToken.key }}
+          {{- end }}
           {{- end }}
           # Both probes hit the MANAGEMENT plane: that is where /healthz and
           # /readyz are served, and the data plane never exposes them.

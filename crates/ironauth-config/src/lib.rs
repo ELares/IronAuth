@@ -2637,11 +2637,17 @@ pub const MANAGEMENT_MAX_AUTHZEN_BATCH_CEILING: u32 = 10_000;
 #[serde(deny_unknown_fields, default)]
 pub struct AdminConfig {
     /// The bootstrap operator bearer token that authorizes the operator plane
-    /// (tenant CRUD) in M1, presented as `Authorization: Bearer <token>`. Unset
-    /// leaves the operator plane unauthorized (the management API still mounts,
-    /// but every operator-plane request is rejected). Use the `file`/`env` secret
-    /// indirection, never a literal, outside dev mode. The full operator-plane
-    /// credential class lands in M5.
+    /// (tenant CRUD) in M1, presented as `Authorization: Bearer <token>`.
+    ///
+    /// UNSET MEANS THE MANAGEMENT API IS NOT MOUNTED AT ALL. This said "the management API
+    /// still mounts, but every operator-plane request is rejected", which is not what the
+    /// boot path does: `build_admin_state` returns `None` on an unset token and logs
+    /// "management API not mounted", so every `/v1/*` path on the management plane is a
+    /// uniform 404. The difference matters to anyone diagnosing one: a 404 reads as a wrong
+    /// URL, and this sentence would have sent them looking for one.
+    ///
+    /// Use the `file`/`env` secret indirection, never a literal, outside dev mode. The full
+    /// operator-plane credential class lands in M5.
     pub bootstrap_operator_token: Option<Secret>,
 
     /// The database connection string the management (control) plane connects
