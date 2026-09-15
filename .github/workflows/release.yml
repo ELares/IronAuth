@@ -251,12 +251,9 @@ jobs:
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ironauth"
           mkdir -p image-build
           cp target/x86_64-unknown-linux-musl/release/ironauth image-build/
-          cat > image-build/Dockerfile <<'EOF'
-          FROM scratch
-          COPY ironauth /ironauth
-          USER 65532:65532
-          ENTRYPOINT ["/ironauth"]
-          EOF
+          # ONE COMMITTED DOCKERFILE, shared with the cluster job in ci.yml. These were two
+          # heredocs and they had drifted: the other copy omitted `USER 65532:65532`.
+          cp deploy/Dockerfile image-build/Dockerfile
           docker build -t "$image:$version" -t "$image:latest" image-build
           docker push "$image:$version"
           docker push "$image:latest"

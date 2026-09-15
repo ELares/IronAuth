@@ -77,6 +77,22 @@ database:
     existingSecret: ""
     key: "master-key"
 
+# THE OIDC PROVIDER. Off by default, matching the server's own default and the
+# principle the accelerator values follow: a default install mounts nothing it was
+# not asked to mount.
+#
+# It is here because without it the chart COULD NOT MOUNT THE PROVIDER AT ALL. The
+# rendered config emitted no [oidc] section, so `oidc.enabled` stayed at its false
+# default and a chart install produced three replicas that answered /healthz,
+# /readyz and /metrics and served no protocol surface. A chart for an identity
+# platform that cannot deploy the identity platform is the gap this closes.
+#
+# Note what readiness does NOT tell you here: `/readyz` opens a TCP connection to
+# the database address and speaks no protocol, so pods report Ready whether or not
+# the schema is migrated. See the chart README on running `ironauth migrate` first.
+oidc:
+  enabled: false
+
 # The management (control) plane connects as a SEPARATE least-privilege role.
 # Unset means the management API is not mounted.
 admin:

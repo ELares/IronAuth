@@ -1057,11 +1057,12 @@ jobs:
           cargo build --release --target x86_64-unknown-linux-musl -p ironauth
           mkdir -p image-build
           cp target/x86_64-unknown-linux-musl/release/ironauth image-build/ironauth
-          cat > image-build/Dockerfile <<'DOCKER'
-          FROM scratch
-          COPY ironauth /ironauth
-          ENTRYPOINT ["/ironauth"]
-          DOCKER
+          # THE COMMITTED DOCKERFILE the release lane builds. This was a second heredoc and
+          # it had already drifted: it omitted `USER 65532:65532`, so this job proved the
+          # chart runs under `runAsNonRoot` against an image whose default user is root. The
+          # chart's securityContext forces the uid anyway, which is why the drift was
+          # invisible: the job passed for a reason unrelated to the image it was testing.
+          cp deploy/Dockerfile image-build/Dockerfile
           docker build -t ironauth:ci image-build
       - uses: helm/kind-action@v1
         with:
@@ -1113,10 +1114,18 @@ jobs:
                       periodSeconds: 5
           PG
           kubectl rollout status deployment/postgres --timeout=300s
-      # THE THREE ROLES THE SCHEMA GRANTS TO, and then the migration. The chart runs NEITHER,
-      # which is a real gap in its story rather than an omission in this job: a `helm install`
-      # against a fresh database leaves every pod failing readiness until someone migrates out
-      # of band, and nothing in the chart or its README says so. Recorded on issue #151.
+      # THE THREE ROLES THE SCHEMA GRANTS TO, and then the migration. The chart runs neither.
+      #
+      # THE GAP IS WORSE THAN "PODS FAIL READINESS", which is what an earlier version of this
+      # comment claimed. `/readyz` opens a TCP connection to the database address and speaks
+      # no protocol (`readiness.rs`: "no bytes are exchanged and no database protocol is
+      # spoken"), so a `helm install` against a fresh, unmigrated, role-less database brings
+      # every pod up READY. The missing migration is SILENT, not loud, and an operator gets
+      # three replicas Kubernetes reports as healthy.
+      #
+      # So this step is not load-bearing for the install: deleting it leaves the job green.
+      # It is here because it is what an operator has to do, and because it proves `ironauth
+      # migrate` runs from the FROM-scratch image against a real Postgres.
       - name: Provision roles and migrate
         run: |
           POD=$(kubectl get pod -l app=postgres -o jsonpath='{.items[0].metadata.name}')
@@ -1124,8 +1133,10 @@ jobs:
             kubectl exec "$POD" -- psql -U postgres -d ironauth -v ON_ERROR_STOP=1 \
               -c "CREATE ROLE $role LOGIN PASSWORD '$role'"
           done
-          # The migrate Job reads the same config shape the chart mounts, so a config the
-          # chart would reject is rejected here too rather than at pod start.
+          # A MINIMAL CONFIG, not the chart's rendered one. An earlier comment here claimed
+          # it was "the same config shape the chart mounts"; it is two hand-written lines.
+          # What it proves is that the migrate subcommand reads a config at the mounted path
+          # and connects, which is all this step needs.
           kubectl create secret generic ironauth-migrate-config \
             --from-literal=ironauth.toml="$(printf '%s\n' \
               '[database]' \
@@ -1153,7 +1164,14 @@ jobs:
                     secret:
                       secretName: ironauth-migrate-config
           JOB
-          kubectl wait --for=condition=complete job/ironauth-migrate --timeout=300s
+          # BOTH TERMINAL CONDITIONS. `--for=condition=complete` does not return on a Job that
+          # FAILED, so a migration error would have hung here for the full timeout and then
+          # failed with "timed out" rather than with the reason.
+          if ! kubectl wait --for=condition=complete job/ironauth-migrate --timeout=300s; then
+            kubectl logs job/ironauth-migrate --tail=100 || true
+            kubectl describe job/ironauth-migrate || true
+            exit 1
+          fi
       - name: helm install with the documented HA values
         run: |
           helm install ironauth charts/ironauth \
@@ -1162,6 +1180,7 @@ jobs:
             --set image.pullPolicy=Never \
             --set server.publicUrl=http://ironauth.default.svc.cluster.local:8443 \
             --set database.url="postgres://postgres:postgres@postgres:5432/ironauth" \
+            --set oidc.enabled=true \
             --wait --timeout 300s
       # THE CRITERION'S OWN WORDS: "a working MULTI-REPLICA deployment". The chart defaults to
       # three, and a rollout that reports success with one ready replica would satisfy
@@ -1175,6 +1194,28 @@ jobs:
           echo "ready=$ready desired=$desired"
           test "$desired" -ge 2
           test "$ready" = "$desired"
+      # READINESS IS NOT EVIDENCE OF WORK. `/readyz` opens a TCP connection to the database
+      # address and speaks no protocol, so all three replicas report Ready whether the schema
+      # is migrated, the credential is right, or the database even exists. An assertion that
+      # stopped at the replica count would pass against
+      # `postgres://wrong:wrong@postgres:5432/does_not_exist`.
+      #
+      # So the job asks the deployment a question only a served request can answer, through
+      # the Service, which also proves the Service selects the pods.
+      - name: The data plane answers through the Service
+        run: |
+          kubectl run smoke --rm -i --restart=Never --image=curlimages/curl:8.10.1 -- \
+            -fsS --max-time 10 http://ironauth:8443/ | tee /tmp/smoke.txt
+          grep -q "IronAuth" /tmp/smoke.txt
+      # AND THE PROVIDER IS MOUNTED. With `oidc.enabled` false the server answers health,
+      # readiness and metrics and nothing else, so without this the job would pass against a
+      # deployment serving no protocol surface at all. The chart could not even express this
+      # until now: values.yaml had no `oidc` key, so the rendered config never carried an
+      # `[oidc]` section.
+      - name: The OIDC provider is mounted
+        run: |
+          kubectl get secret ironauth-config -o jsonpath='{.data.ironauth\.toml}' \
+            | base64 -d | grep -q '^\[oidc\]'
       - name: Diagnostics on failure
         if: failure()
         run: |
