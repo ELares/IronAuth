@@ -1,32 +1,20 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 #
-# Two-stage build producing a static musl `ironauth` binary. The default path
-# is pure Rust with no TLS or C dependency; the `otlp` feature is enabled here
-# so the compose stack can export traces to the bundled collector (it stays
-# protoc-free: opentelemetry-proto ships pre-generated code).
-
-FROM rust:1.97-bookworm AS builder
-WORKDIR /src
-# musl-tools provides the musl cross-linker; the target is added through rustup
-# so it honors the toolchain pinned by rust-toolchain.toml.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends musl-tools \
-    && rm -rf /var/lib/apt/lists/* \
-    && rustup target add x86_64-unknown-linux-musl
-COPY . .
-RUN cargo build --release --target x86_64-unknown-linux-musl -p ironauth --features otlp \
-    && strip target/x86_64-unknown-linux-musl/release/ironauth
-
-# Runtime: debian-slim (not scratch) so the compose healthcheck has curl. The
-# static binary itself needs nothing from the base image.
-FROM debian:bookworm-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 ironauth
-COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/ironauth /usr/local/bin/ironauth
-USER ironauth
-# Public data plane only; the management plane binds to loopback (see config).
-EXPOSE 8443
-ENTRYPOINT ["/usr/local/bin/ironauth"]
-CMD ["serve", "--config", "/etc/ironauth/ironauth.toml"]
+# THE IMAGE IRONAUTH SHIPS. One file, built by the release lane and by the CI cluster job,
+# because they were two heredocs and they had already drifted: the CI copy omitted
+# `USER 65532:65532`, so the job that proves the chart runs under `runAsNonRoot` was
+# proving it against an image whose default user is root. The chart's securityContext
+# would still have forced the uid, which is exactly why the drift was invisible.
+#
+# `FROM scratch` because the binary is statically linked against musl. There is no shell,
+# no package manager and no libc in the image, which is the point: the attack surface is
+# the binary, and `docker exec` into it is not a debugging path anyone can take.
+#
+# Build context expects the binary at ./ironauth.
+FROM scratch
+COPY ironauth /ironauth
+# A non-root uid in the image itself, not only in the pod spec. A deployment that forgets
+# `runAsNonRoot` still does not get root, and `docker run` outside Kubernetes matches what
+# the chart asks for.
+USER 65532:65532
+ENTRYPOINT ["/ironauth"]

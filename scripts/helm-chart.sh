@@ -109,7 +109,10 @@ assert spec.get("topologySpreadConstraints"), "replicas must be spread across no
 
 # --- criterion 6: accelerators ABSENT by default ------------------------------
 rendered = sys.argv[1]
-for needle in ("IRONBUS", "ironbus_addr", "[outbox]"):
+# THE PROTOCOL SURFACE IS OFF BY DEFAULT TOO, and for the same reason as the accelerators:
+# a default install mounts nothing it was not asked to mount. Asserted in the config file
+# rather than by a flag name, because `[oidc]` absent is what makes `oidc.enabled` false.
+for needle in ("IRONBUS", "ironbus_addr", "[outbox]", "[oidc]"):
     assert needle not in rendered, (
         f"the default install mentions {needle!r}: an accelerator that is off must be absent, "
         "not merely disabled"
@@ -150,6 +153,28 @@ docs = [d for d in yaml.safe_load_all(sys.argv[1]) if d]
 toml = next(d for d in docs if d.get("kind") == "Secret")["stringData"]["ironauth.toml"]
 assert "[outbox]" in toml, f"no [outbox] section in the rendered config:\n{toml}"
 assert 'ironbus_addr = "bus.svc:4222"' in toml, f"ironbus_addr not set:\n{toml}"
+PY
+
+# --- the OIDC provider, both directions --------------------------------------
+#
+# This exists because the chart COULD NOT MOUNT THE PROVIDER AT ALL: values.yaml had no
+# `oidc` key, so the rendered config never carried an `[oidc]` section, `oidc.enabled`
+# stayed at its false default, and a chart install produced replicas that answered
+# /healthz, /readyz and /metrics and served no protocol surface.
+#
+# Nothing caught it. This script asserted properties of what the chart DOES render, and
+# the defect was a section it never rendered; the kind install job then reported three
+# Ready replicas, because `/readyz` opens a TCP connection to the database and speaks no
+# protocol. A gate that only checks what is present cannot see what is missing, so the
+# absence is now named above and the presence is asserted here.
+echo "helm-chart: rendering with the OIDC provider enabled"
+OIDC=$(helm template ironauth "$CHART" "${BASE[@]}" --set oidc.enabled=true)
+python3 - "$OIDC" <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.argv[1]) if d]
+toml = next(d for d in docs if d.get("kind") == "Secret")["stringData"]["ironauth.toml"]
+assert "[oidc]" in toml, f"no [oidc] section with oidc.enabled=true:\n{toml}"
+assert "enabled = true" in toml, f"[oidc] present but not enabled:\n{toml}"
 
 c = next(d for d in docs if d.get("kind") == "Deployment")["spec"]["template"]["spec"]["containers"][0]
 env = {e["name"] for e in (c.get("env") or []) if e["name"] != "IRONAUTH_MASTER_KEY"}
