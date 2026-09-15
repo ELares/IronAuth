@@ -234,6 +234,36 @@ impl RequestIdentity {
     }
 }
 
+/// What a CONFIGURED per-IP limit does when the request presents no address.
+///
+/// # Why this is a policy and not a default
+///
+/// Per-IP is the only layer that applies before a caller is identified, so when a limit is
+/// configured for it and the address is absent, an unauthenticated request carries no limit
+/// at all. The absence is not benign: it means an unparseable `X-Forwarded-For`, a proxy
+/// dialect nobody taught us, or a hop that was supposed to set the header and did not.
+///
+/// Both answers are right for somebody, which is why this is configuration rather than a
+/// constant. An internet-facing forward-auth surface should refuse, because a request whose
+/// origin cannot be established is exactly the one a pre-identity limit exists to stop. An
+/// internal caller over a unix socket has no address to present and never will, and refusing
+/// it turns a legitimate path into a hard outage.
+///
+/// The default is [`MissingIpPolicy::Deny`], because the failure modes are not symmetric: a
+/// wrong `Deny` is loud and immediate, and a wrong `Skip` is a silently unlimited surface
+/// that looks healthy until it is found. A deployment that legitimately has no address sets
+/// `Skip` explicitly, which records the decision in configuration instead of inheriting it
+/// from a `continue`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MissingIpPolicy {
+    /// Refuse the request. The outcome carries `missing_identity`, not a quota refusal.
+    #[default]
+    Deny,
+    /// Evaluate the remaining layers as though no per-IP limit were configured. The outcome
+    /// still records the layer in `unenforced`, so the gap is visible in a metric.
+    Skip,
+}
+
 /// The limit for each layer. A layer with no entry is UNLIMITED and is skipped.
 #[derive(Debug, Clone, Default)]
 pub struct LayeredLimits {
@@ -276,6 +306,21 @@ pub struct LayeredOutcome {
     /// closest-to-exhaustion layer's on an admission, so the headers a client reads always
     /// describe the budget that will stop them first.
     pub snapshot: RateLimitSnapshot,
+    /// Layers that HAVE a configured limit which this request presented no key for.
+    ///
+    /// Distinct from a layer with no limit configured, which is deliberate and is not
+    /// recorded here. Without this an operator cannot tell a deliberately unlimited
+    /// deployment from one whose addresses stopped parsing, because both admit with an
+    /// empty snapshot. Graph it: a non-empty `unenforced` on a surface that expects to be
+    /// limited is a misconfiguration, and it should be found on a dashboard rather than
+    /// during the incident it causes.
+    pub unenforced: Vec<RateLayer>,
+    /// Whether this refusal is because a required identity was absent, not because a bucket
+    /// was empty. See [`MissingIpPolicy`].
+    ///
+    /// Kept apart from an over-quota denial because the remedies have nothing in common: an
+    /// over-quota caller should wait, and an unidentified one will never succeed by waiting.
+    pub missing_identity: bool,
 }
 
 /// The header naming the layer that refused a request.
@@ -316,9 +361,23 @@ impl LayeredOutcome {
     }
 
     /// Whether this outcome should be rendered as `429 Too Many Requests`.
+    ///
+    /// A missing-identity refusal is deliberately NOT throttled: 429 tells a client to slow
+    /// down and retry, and no amount of waiting produces an address. Rendering it as a
+    /// throttle would publish a remedy that cannot work, which is the same harm the absent
+    /// `retry-after` on an unsatisfiable bucket exists to prevent.
     #[must_use]
     pub fn is_throttled(&self) -> bool {
-        matches!(self.decision, Decision::Denied)
+        matches!(self.decision, Decision::Denied) && !self.missing_identity
+    }
+
+    /// Whether this outcome was refused because the request presented no address.
+    ///
+    /// Render as `403`, not `429`: the request is unattributable, which is a property of the
+    /// request rather than of its rate.
+    #[must_use]
+    pub fn is_unidentified(&self) -> bool {
+        self.missing_identity
     }
 }
 
@@ -353,6 +412,7 @@ pub struct LayeredLimiter {
     clock: std::sync::Arc<dyn Clock>,
     state: std::sync::Mutex<HashMap<(RateLayer, LayerKey), LayerBucket>>,
     max_buckets: usize,
+    missing_ip: MissingIpPolicy,
 }
 
 /// How many buckets a limiter retains before it reclaims.
@@ -371,7 +431,17 @@ impl LayeredLimiter {
             clock,
             state: std::sync::Mutex::new(HashMap::new()),
             max_buckets: DEFAULT_MAX_BUCKETS,
+            missing_ip: MissingIpPolicy::default(),
         }
+    }
+
+    /// Choose what a configured per-IP limit does when a request presents no address.
+    ///
+    /// See [`MissingIpPolicy`] for why this is a deployment decision.
+    #[must_use]
+    pub fn with_missing_ip_policy(mut self, missing_ip: MissingIpPolicy) -> Self {
+        self.missing_ip = missing_ip;
+        self
     }
 
     /// Override the bucket ceiling. Mainly for tests, which cannot afford to drive
@@ -476,8 +546,42 @@ impl LayeredLimiter {
         }
 
         let mut evaluated: Vec<(RateLayer, LayerKey, Limit, f64)> = Vec::new();
+        let mut unenforced: Vec<RateLayer> = Vec::new();
         for layer in LAYER_ORDER {
-            let (Some(limit), Some(key)) = (self.limits.get(layer), identity.key_for(layer)) else {
+            // TWO DIFFERENT REASONS TO SKIP A LAYER, no longer collapsed into one `continue`.
+            //
+            // No configured limit means the dimension is deliberately unlimited. A missing
+            // KEY means a limit is configured and this request slipped past it. Reading both
+            // as "skip" is what made an absent address indistinguishable from an unlimited
+            // deployment, in the outcome AND in every metric derived from it.
+            let Some(limit) = self.limits.get(layer) else {
+                continue;
+            };
+            let Some(key) = identity.key_for(layer) else {
+                unenforced.push(layer);
+                // ONLY per-IP refuses. A missing user or client key is the ordinary shape of
+                // an anonymous request, and denying those would refuse every unauthenticated
+                // caller on any deployment that limits by user. Per-IP is the exception
+                // because it is the only layer that applies before anyone is identified.
+                if layer == RateLayer::PerIp && self.missing_ip == MissingIpPolicy::Deny {
+                    return LayeredOutcome {
+                        decision: Decision::Denied,
+                        limiting_layer: Some(RateLayer::PerIp),
+                        // No bucket exists, so there are no numbers to report and no wait to
+                        // advertise. `denied` is still true so the block signal reaches an
+                        // edge that offloads refusals.
+                        snapshot: RateLimitSnapshot {
+                            limit: None,
+                            remaining: None,
+                            reset_secs: 0,
+                            retry_after_secs: None,
+                            denied: true,
+                            policy_window_secs: None,
+                        },
+                        unenforced,
+                        missing_identity: true,
+                    };
+                }
                 continue;
             };
             let bucket = state
@@ -520,6 +624,8 @@ impl LayeredLimiter {
                 decision: Decision::Denied,
                 limiting_layer: Some(layer),
                 snapshot,
+                unenforced,
+                missing_identity: false,
             };
         }
 
@@ -548,6 +654,8 @@ impl LayeredLimiter {
                 decision: Decision::Admitted,
                 limiting_layer: None,
                 snapshot: snapshot_for(limit, after + cost, after, cost, true),
+                unenforced,
+                missing_identity: false,
             },
             // No layer applied at all: unlimited by configuration.
             None => LayeredOutcome {
@@ -561,6 +669,8 @@ impl LayeredLimiter {
                     denied: false,
                     policy_window_secs: None,
                 },
+                unenforced,
+                missing_identity: false,
             },
         }
     }
@@ -1225,7 +1335,12 @@ mod tests {
                 // Never refills, so this one keeps its deficit forever.
                 .with(RateLayer::PerClient, Limit::new(0.0, 1.0)),
         );
-        let limiter = limiter.with_max_buckets(16);
+        // This test measures RECLAMATION. Its sticky identity carries no address, which
+        // under the default per-IP policy is a refusal before any client bucket is touched
+        // (see `MissingIpPolicy`). Opting out keeps the test measuring what it names.
+        let limiter = limiter
+            .with_max_buckets(16)
+            .with_missing_ip_policy(MissingIpPolicy::Skip);
 
         // Exhaust the client bucket. It can never come back.
         let client = RequestIdentity {
@@ -1611,6 +1726,160 @@ mod tests {
             denied.snapshot.retry_after_secs,
             Some(1),
             "half a token is already there, so only half a token is owed: 1s at 0.5/s"
+        );
+    }
+
+    /// #1260, the decision this pins: a CONFIGURED per-IP limit meeting a request that
+    /// presents no address REFUSES by default.
+    ///
+    /// The default is asserted through `LayeredLimiter::new` rather than by naming the
+    /// policy, because the point of the decision is what an operator gets without choosing.
+    #[test]
+    fn a_configured_per_ip_limit_refuses_a_request_that_presents_no_address() {
+        let (limiter, _clock) =
+            limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(1.0, 10.0)));
+        let anonymous = RequestIdentity {
+            ip: None,
+            ..everyone()
+        };
+
+        let outcome = limiter.admit(&anonymous, 1.0);
+
+        assert_eq!(
+            outcome.decision,
+            Decision::Denied,
+            "a configured per-IP limit is the only control an unidentified request has"
+        );
+        assert!(outcome.missing_identity, "refused for identity, not for rate");
+        assert_eq!(outcome.limiting_layer, Some(RateLayer::PerIp));
+        assert_eq!(outcome.unenforced, vec![RateLayer::PerIp]);
+        assert!(
+            !outcome.is_throttled(),
+            "429 advertises a remedy that cannot work: waiting never produces an address"
+        );
+        assert!(outcome.is_unidentified(), "the caller renders this as 403");
+        assert_eq!(
+            outcome.snapshot.retry_after_secs, None,
+            "no wait is honest, because no bucket is involved"
+        );
+    }
+
+    /// The other half of the decision: `Skip` is available and does what it says.
+    ///
+    /// Without this the default would be untestable as a CHOICE, because a policy with one
+    /// reachable value is a constant.
+    #[test]
+    fn the_skip_policy_admits_the_same_request_and_still_records_the_gap() {
+        let (limiter, _clock) =
+            limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(1.0, 10.0)));
+        let limiter = limiter.with_missing_ip_policy(MissingIpPolicy::Skip);
+        let anonymous = RequestIdentity {
+            ip: None,
+            ..everyone()
+        };
+
+        let outcome = limiter.admit(&anonymous, 1.0);
+
+        assert_eq!(outcome.decision, Decision::Admitted);
+        assert!(!outcome.missing_identity);
+        assert_eq!(
+            outcome.unenforced,
+            vec![RateLayer::PerIp],
+            "admitted, but the operator can still see the limit did not apply"
+        );
+    }
+
+    /// The distinction #1260 asks for, stated as the contrast it is: an unlimited deployment
+    /// and one whose addresses stopped parsing must not look the same.
+    ///
+    /// Both admit. Only one reports an unenforced layer. Asserting only the decision would
+    /// pass with the field permanently empty.
+    #[test]
+    fn an_unlimited_deployment_is_distinguishable_from_one_that_lost_the_address() {
+        let anonymous = RequestIdentity {
+            ip: None,
+            ..everyone()
+        };
+
+        let (unlimited, _c1) = limiter(LayeredLimits::unlimited());
+        let no_limit_configured = unlimited.admit(&anonymous, 1.0);
+
+        let (configured, _c2) =
+            limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(1.0, 10.0)));
+        let address_missing = configured
+            .with_missing_ip_policy(MissingIpPolicy::Skip)
+            .admit(&anonymous, 1.0);
+
+        assert_eq!(no_limit_configured.decision, Decision::Admitted);
+        assert_eq!(address_missing.decision, Decision::Admitted);
+        assert_eq!(
+            no_limit_configured.unenforced,
+            Vec::<RateLayer>::new(),
+            "nothing was configured, so nothing went unenforced"
+        );
+        assert_eq!(
+            address_missing.unenforced,
+            vec![RateLayer::PerIp],
+            "a limit was configured and did not apply, which is the fact to alert on"
+        );
+    }
+
+    /// The policy is scoped to per-IP, and this is the test that keeps it there.
+    ///
+    /// Widening it to every layer would refuse every anonymous request on any deployment
+    /// that limits by user, which is ordinary traffic rather than a misconfiguration.
+    #[test]
+    fn a_missing_user_key_is_ordinary_and_does_not_refuse() {
+        let (limiter, _clock) =
+            limiter(LayeredLimits::unlimited().with(RateLayer::PerUser, Limit::new(1.0, 10.0)));
+        let unauthenticated = RequestIdentity {
+            user: None,
+            ..everyone()
+        };
+
+        let outcome = limiter.admit(&unauthenticated, 1.0);
+
+        assert_eq!(
+            outcome.decision,
+            Decision::Admitted,
+            "an anonymous request is the normal case for a per-user limit"
+        );
+        assert!(!outcome.missing_identity);
+        assert_eq!(
+            outcome.unenforced,
+            vec![RateLayer::PerUser],
+            "still recorded, because a per-user limit that never applies is worth seeing"
+        );
+    }
+
+    /// A refusal must not bill anything, including the layers it never reached.
+    ///
+    /// The early return sits before the charging loop, and this is what would catch it being
+    /// moved after it: the identified request that follows finds a full bucket.
+    #[test]
+    fn a_missing_address_refusal_charges_no_bucket() {
+        let (limiter, _clock) = limiter(
+            LayeredLimits::unlimited()
+                .with(RateLayer::PerIp, Limit::new(1.0, 10.0))
+                .with(RateLayer::PerTenant, Limit::new(1.0, 2.0)),
+        );
+
+        for _ in 0..5 {
+            let refused = limiter.admit(
+                &RequestIdentity {
+                    ip: None,
+                    ..everyone()
+                },
+                1.0,
+            );
+            assert!(refused.missing_identity);
+        }
+
+        let identified = limiter.admit(&everyone(), 2.0);
+        assert_eq!(
+            identified.decision,
+            Decision::Admitted,
+            "the per-tenant burst of 2 was never spent by the five refusals"
         );
     }
 }
