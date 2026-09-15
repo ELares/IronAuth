@@ -103,12 +103,32 @@ pub struct VerifyBody {
 /// existence / allowlist / scoring oracle.
 // One linear guard pipeline; splitting it across helpers would obscure the ordering the
 // anti-enumeration and pumping guarantees depend on.
-#[allow(clippy::too_many_lines)]
 pub async fn send(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
     _headers: HeaderMap,
     Json(body): Json<SendBody>,
+) -> Response {
+    // RECORDED ON THE RESPONSE. A conversion rate is sends divided by verifies, so
+    // both halves have to count every attempt including the refused ones: a
+    // deployment whose codes mostly fail to send would otherwise report a healthy
+    // ratio over a numerator and denominator that both only counted successes
+    // (issue #152 criterion 5).
+    crate::funnel::record_otp(
+        crate::funnel::OtpChannel::Sms,
+        crate::funnel::OtpStage::Send,
+        // The headers are not passed on: this handler never read them, and forwarding an
+        // underscore-prefixed binding just to keep the shapes matching is a lint and a lie.
+        send_inner(state, tenant_id, environment_id, body).await,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+async fn send_inner(
+    state: OidcState,
+    tenant_id: String,
+    environment_id: String,
+    body: SendBody,
 ) -> Response {
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return not_found_json();
@@ -129,8 +149,9 @@ pub async fn send(
         .map(str::trim)
         .unwrap_or_default();
     if raw.is_empty() {
-        // No recipient: the uniform ack, no send, no oracle.
-        return ack();
+        // No recipient: the uniform ack, no send, no oracle. MARKED as a refusal so the
+        // funnel does not count it as a delivered code (issue #152 criterion 5).
+        return crate::funnel::mark_refused(ack());
     }
     let canonical = canonicalize_identifier(IdentifierType::Phone, raw);
     let phone = canonical.as_str().to_owned();
@@ -224,7 +245,8 @@ pub async fn send(
             ttl_secs: state.sms_otp_code_ttl().as_secs(),
         };
         state.deliver_sms_otp(&message, false);
-        return ack();
+        // Suppressed: nothing was delivered, so it is a refusal for funnel purposes.
+        return crate::funnel::mark_refused(ack());
     };
 
     // A permitted send to a known recipient: issue the hashed code and deliver it.
@@ -245,7 +267,7 @@ pub async fn send(
                 "SMS OTP hashing rejected under pool back-pressure; uniform ack (no oracle)"
             );
             metrics::counter!("ironauth_sms_send_hash_rejected_total").increment(1);
-            return ack();
+            return crate::funnel::mark_refused(ack());
         }
     };
     let ttl = state.sms_otp_code_ttl();
@@ -275,7 +297,7 @@ pub async fn send(
         // suppressed send returns (anti-enumeration), recorded on the observability
         // plane only.
         tracing::error!(target: "ironauth.verification", "SMS OTP issue failed");
-        return ack();
+        return crate::funnel::mark_refused(ack());
     }
     let message = SmsOtpMessage {
         scope,
@@ -298,12 +320,31 @@ pub async fn send(
 /// through the hashing pool, attempt-bounded, single-use, abuse-throttled, and gated by
 /// the no-silent-downgrade invariant.
 // One linear verify pipeline; splitting it would scatter the uniform-response ordering.
-#[allow(clippy::too_many_lines)]
 pub async fn verify(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<VerifyBody>,
+) -> Response {
+    // RECORDED ON THE RESPONSE. A conversion rate is sends divided by verifies, so
+    // both halves have to count every attempt including the refused ones: a
+    // deployment whose codes mostly fail to send would otherwise report a healthy
+    // ratio over a numerator and denominator that both only counted successes
+    // (issue #152 criterion 5).
+    crate::funnel::record_otp(
+        crate::funnel::OtpChannel::Sms,
+        crate::funnel::OtpStage::Verify,
+        verify_inner(state, tenant_id, environment_id, headers, body).await,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+async fn verify_inner(
+    state: OidcState,
+    tenant_id: String,
+    environment_id: String,
+    headers: HeaderMap,
+    body: VerifyBody,
 ) -> Response {
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return not_found_json();
@@ -630,7 +671,11 @@ async fn refuse_uniform(
         "reason" => reason,
     )
     .increment(1);
-    ack()
+    // MARKED, because the status cannot say it. This returns the same uniform 200 as a real
+    // send, by design, so the funnel would otherwise record every guard refusal as a delivered
+    // code: a review measured three sends, one delivered and two refused, recorded as three
+    // `result="ok"` samples and zero errors (issue #152 criterion 5).
+    crate::funnel::mark_refused(ack())
 }
 
 /// The UNIFORM send acknowledgment (issue #70): the SAME body and status whether the

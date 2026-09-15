@@ -250,6 +250,18 @@ pub const CONTRACT: &[MetricSpec] = &[
         help: "Upstream connector calls that succeeded",
     },
     MetricSpec {
+        name: "ironauth_passkey_funnel_total",
+        kind: MetricKind::Counter,
+        labels: &["stage", "result"],
+        help: "Passkey ceremony outcomes by funnel stage",
+    },
+    MetricSpec {
+        name: "ironauth_otp_funnel_total",
+        kind: MetricKind::Counter,
+        labels: &["channel", "stage", "result"],
+        help: "One-time-code outcomes by channel and funnel stage",
+    },
+    MetricSpec {
         name: "ironauth_factor_downgrade_recovery_permitted_total",
         kind: MetricKind::Counter,
         labels: &["factor", "surface"],

@@ -161,6 +161,25 @@ pub async fn send(
     headers: HeaderMap,
     Json(body): Json<SendBody>,
 ) -> Response {
+    // RECORDED ON THE RESPONSE. A conversion rate is sends divided by verifies, so
+    // both halves have to count every attempt including the refused ones: a
+    // deployment whose codes mostly fail to send would otherwise report a healthy
+    // ratio over a numerator and denominator that both only counted successes
+    // (issue #152 criterion 5).
+    crate::funnel::record_otp(
+        crate::funnel::OtpChannel::Email,
+        crate::funnel::OtpStage::Send,
+        send_inner(state, tenant_id, environment_id, headers, body).await,
+    )
+}
+
+async fn send_inner(
+    state: OidcState,
+    tenant_id: String,
+    environment_id: String,
+    headers: HeaderMap,
+    body: SendBody,
+) -> Response {
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return not_found_json();
     };
@@ -179,8 +198,9 @@ pub async fn send(
         .map(str::trim)
         .unwrap_or_default();
     if identifier.is_empty() {
-        // No recipient: the uniform ack, no send, no oracle.
-        return ack();
+        // No recipient: the uniform ack, no send, no oracle. MARKED so the funnel counts
+        // it as the refusal it is (issue #152 criterion 5).
+        return crate::funnel::mark_refused(ack());
     }
 
     // Proof-of-work gate (issue #80), conditioned on the #79 risk level. Runs BEFORE the
@@ -222,8 +242,13 @@ pub async fn send(
     // Issue (or anti-enumeration-suppress) the code through the shared core, then the uniform
     // acknowledgment. The core is the ONE place the issue/suppress sequence lives, so the
     // headless recovery flow (issue #84) reuses it rather than re-deriving the send.
-    issue_email_code(&state, scope, purpose, identifier).await;
-    ack()
+    // MARKED WHEN NOTHING WAS DELIVERED, because the status cannot say it: this returns the
+    // same uniform 200 either way, by anti-enumeration design, so the funnel would otherwise
+    // record a suppressed send as a delivered code (issue #152 criterion 5).
+    match issue_email_code(&state, scope, purpose, identifier).await {
+        SendOutcome::Delivered => ack(),
+        SendOutcome::NotDelivered => crate::funnel::mark_refused(ack()),
+    }
 }
 
 /// Issue and deliver (or anti-enumeration-SUPPRESS) an email-OTP code for `identifier` on
@@ -232,12 +257,32 @@ pub async fn send(
 /// (`verify_absent`, so the response time cannot distinguish a real from an unknown recipient)
 /// and the send is suppressed. Side-effect only; the caller owns the throttle and the uniform
 /// acknowledgment, so the send stays anti-enumeration-uniform on every surface that drives it.
+/// Whether a send actually delivered, for the funnel ONLY.
+///
+/// The handler cannot tell otherwise: every branch below returns the same uniform
+/// acknowledgment by anti-enumeration design, so a suppressed send, a pool rejection and a
+/// failed issue are indistinguishable from a delivered code at the call site. A review
+/// measured what that does to the conversion metric on the SMS twin, where three sends, one
+/// delivered and two refused, recorded as three successes and zero errors.
+///
+/// THIS IS NOT AN ORACLE. The value never reaches the response, the body, the status, the
+/// headers or the timing; it selects a Prometheus label on a scrape an unauthenticated caller
+/// cannot read. The SMS module has counted the same distinction as
+/// `ironauth_sms_send_refused_total` with a reason label since issue #70.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendOutcome {
+    /// A code was stored and handed to the delivery seam.
+    Delivered,
+    /// Nothing was delivered: an unknown recipient, a pool rejection, or a failed issue.
+    NotDelivered,
+}
+
 pub(crate) async fn issue_email_code(
     state: &OidcState,
     scope: ironauth_store::Scope,
     purpose: EmailFactorPurpose,
     identifier: &str,
-) {
+) -> SendOutcome {
     // Resolve the recipient ONLY to decide whether the send is permitted; the lookup runs
     // for both present and absent identifiers, so the ack is uniform.
     let user = state
@@ -257,7 +302,7 @@ pub(crate) async fn issue_email_code(
             // A pool rejection means no code was stored: for anti-enumeration this stays the
             // SAME uniform (no delivery) outcome a suppressed send produces, never a
             // distinguishable difference.
-            Err(_rejection) => return,
+            Err(_rejection) => return SendOutcome::NotDelivered,
         };
         let ttl = state.email_otp_code_ttl();
         let now = epoch_micros(state.now());
@@ -289,7 +334,7 @@ pub(crate) async fn issue_email_code(
             // difference that would distinguish a present from an absent recipient. Recorded
             // on the observability plane only.
             tracing::error!(target: "ironauth.verification", "email OTP issue failed");
-            return;
+            return SendOutcome::NotDelivered;
         }
         let message = EmailOtpMessage {
             scope,
@@ -299,6 +344,7 @@ pub(crate) async fn issue_email_code(
             ttl_secs: ttl.as_secs(),
         };
         state.deliver_email_otp(&message, true);
+        SendOutcome::Delivered
     } else {
         // Unknown recipient: SUPPRESS the send (no code stored, no delivery), identical ack.
         //
@@ -317,6 +363,7 @@ pub(crate) async fn issue_email_code(
             ttl_secs: state.email_otp_code_ttl().as_secs(),
         };
         state.deliver_email_otp(&message, false);
+        SendOutcome::NotDelivered
     }
 }
 
@@ -328,6 +375,25 @@ pub async fn verify(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<VerifyBody>,
+) -> Response {
+    // RECORDED ON THE RESPONSE. A conversion rate is sends divided by verifies, so
+    // both halves have to count every attempt including the refused ones: a
+    // deployment whose codes mostly fail to send would otherwise report a healthy
+    // ratio over a numerator and denominator that both only counted successes
+    // (issue #152 criterion 5).
+    crate::funnel::record_otp(
+        crate::funnel::OtpChannel::Email,
+        crate::funnel::OtpStage::Verify,
+        verify_inner(state, tenant_id, environment_id, headers, body).await,
+    )
+}
+
+async fn verify_inner(
+    state: OidcState,
+    tenant_id: String,
+    environment_id: String,
+    headers: HeaderMap,
+    body: VerifyBody,
 ) -> Response {
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return not_found_json();

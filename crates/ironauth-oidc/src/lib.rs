@@ -334,6 +334,7 @@ pub mod token_hook {
 pub mod device_posture;
 /// The ordered access-rule engine (issue #154).
 pub mod forward_auth;
+pub mod funnel;
 pub mod rules;
 mod tokens;
 mod totp;

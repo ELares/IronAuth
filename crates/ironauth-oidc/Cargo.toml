@@ -734,6 +734,11 @@ required-features = ["testing"]
 # the same authenticator cannot register twice (database dedupe), and a wrong-origin
 # ceremony is refused. Needs a real database (DATABASE_URL).
 [[test]]
+name = "funnel_metrics"
+path = "tests/funnel_metrics.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "webauthn_ceremony"
 path = "tests/webauthn_ceremony.rs"
 required-features = ["testing"]

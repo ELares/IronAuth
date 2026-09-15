@@ -370,7 +370,10 @@ pub(super) async fn advance_start(
     // `/otp/send` uses: a known recipient gets a fresh single active code, an unknown one burns
     // the SAME single Argon2 spend with the send suppressed. This is what the completion verify
     // step later checks, and it keeps the known and unknown Argon2 op counts identical.
-    email_otp::issue_email_code(state, scope, EmailFactorPurpose::Recovery, identifier).await;
+    // The outcome is for the send funnel only; this flow's own response is uniform either
+    // way and must stay so.
+    let _ =
+        email_otp::issue_email_code(state, scope, EmailFactorPurpose::Recovery, identifier).await;
 
     Ok(RecoveryStartStep::Ack {
         identifier: identifier.to_owned(),

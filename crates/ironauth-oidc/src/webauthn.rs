@@ -94,6 +94,23 @@ pub async fn register_options(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
+    // RECORDED ON THE RESPONSE, not on the success path. Every early return below --
+    // the factor disabled, no relying party, an unrelated origin, an unauthenticated
+    // caller, a missing or expired challenge, a refused attestation -- is a ceremony
+    // that was offered and did not complete, and leaving those out would make the
+    // conversion ratio wrong in the flattering direction (issue #152 criterion 5).
+    crate::funnel::record_passkey(
+        crate::funnel::PasskeyStage::RegisterChallenge,
+        register_options_inner(state, tenant_id, environment_id, headers).await,
+    )
+}
+
+async fn register_options_inner(
+    state: OidcState,
+    tenant_id: String,
+    environment_id: String,
+    headers: HeaderMap,
+) -> Response {
     if !state.webauthn_enabled() {
         return not_found();
     }
@@ -169,6 +186,24 @@ pub async fn register_verify(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<RegisterVerifyBody>,
+) -> Response {
+    // RECORDED ON THE RESPONSE, not on the success path. Every early return below --
+    // the factor disabled, no relying party, an unrelated origin, an unauthenticated
+    // caller, a missing or expired challenge, a refused attestation -- is a ceremony
+    // that was offered and did not complete, and leaving those out would make the
+    // conversion ratio wrong in the flattering direction (issue #152 criterion 5).
+    crate::funnel::record_passkey(
+        crate::funnel::PasskeyStage::RegisterComplete,
+        register_verify_inner(state, tenant_id, environment_id, headers, body).await,
+    )
+}
+
+async fn register_verify_inner(
+    state: OidcState,
+    tenant_id: String,
+    environment_id: String,
+    headers: HeaderMap,
+    body: RegisterVerifyBody,
 ) -> Response {
     if !state.webauthn_enabled() {
         return not_found();
@@ -388,6 +423,23 @@ pub async fn authenticate_options(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
+    // RECORDED ON THE RESPONSE, not on the success path. Every early return below --
+    // the factor disabled, no relying party, an unrelated origin, an unauthenticated
+    // caller, a missing or expired challenge, a refused attestation -- is a ceremony
+    // that was offered and did not complete, and leaving those out would make the
+    // conversion ratio wrong in the flattering direction (issue #152 criterion 5).
+    crate::funnel::record_passkey(
+        crate::funnel::PasskeyStage::AuthenticateChallenge,
+        authenticate_options_inner(state, tenant_id, environment_id, headers).await,
+    )
+}
+
+async fn authenticate_options_inner(
+    state: OidcState,
+    tenant_id: String,
+    environment_id: String,
+    headers: HeaderMap,
+) -> Response {
     if !state.webauthn_enabled() {
         return not_found();
     }
@@ -433,12 +485,30 @@ pub async fn authenticate_options(
 // A linear ceremony handler: consume the challenge, resolve the credential, verify,
 // apply the clone policy, and establish the session. Splitting it would scatter the
 // fail-closed early returns that are the point.
-#[allow(clippy::too_many_lines)]
 pub async fn authenticate_verify(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<AuthenticateVerifyBody>,
+) -> Response {
+    // RECORDED ON THE RESPONSE, not on the success path. Every early return below --
+    // the factor disabled, no relying party, an unrelated origin, an unauthenticated
+    // caller, a missing or expired challenge, a refused attestation -- is a ceremony
+    // that was offered and did not complete, and leaving those out would make the
+    // conversion ratio wrong in the flattering direction (issue #152 criterion 5).
+    crate::funnel::record_passkey(
+        crate::funnel::PasskeyStage::AuthenticateComplete,
+        authenticate_verify_inner(state, tenant_id, environment_id, headers, body).await,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+async fn authenticate_verify_inner(
+    state: OidcState,
+    tenant_id: String,
+    environment_id: String,
+    headers: HeaderMap,
+    body: AuthenticateVerifyBody,
 ) -> Response {
     if !state.webauthn_enabled() {
         return not_found();
