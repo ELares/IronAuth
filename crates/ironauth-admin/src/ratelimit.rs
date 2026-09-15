@@ -68,3 +68,82 @@ fn set(headers: &mut HeaderMap, name: HeaderName, value: &str) {
         headers.insert(name, value);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stamped() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        stamp(&mut headers);
+        headers
+    }
+
+    fn value(headers: &HeaderMap, name: &str) -> String {
+        headers
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} missing"))
+            .to_str()
+            .expect("header value is not valid UTF-8")
+            .to_owned()
+    }
+
+    /// THE SECOND RENDERER OF ONE WIRE CONTRACT, pinned to the same revision as the first.
+    ///
+    /// `ironauth-quota`'s `RateLimitSnapshot::headers` renders these fields for the data
+    /// plane and this module renders them independently for the management plane. Nothing
+    /// tied the two together, so this one could drift to the later policy-name grammar
+    /// (`"name";r=999;t=60`) while the other kept the dictionary form, and a client talking to
+    /// both planes would need two parsers for one header name.
+    ///
+    /// The revision is pinned in `ironauth_quota::RateLimitSnapshot::headers`'s doc comment
+    /// (issue #1268). This is the assertion that keeps this copy on it.
+    #[test]
+    fn the_management_plane_renders_the_same_pinned_draft_revision() {
+        let headers = stamped();
+
+        assert_eq!(
+            value(&headers, "ratelimit"),
+            format!("limit={LIMIT}, remaining={REMAINING}, reset={RESET_SECONDS}"),
+            "dictionary grammar, not the later `\"name\";r=..;t=..` structured field"
+        );
+        assert_eq!(
+            value(&headers, "ratelimit-policy"),
+            format!("{LIMIT};w={RESET_SECONDS}"),
+            "dictionary grammar, not the later `\"name\";q=..;w=..` structured field"
+        );
+    }
+
+    /// `x-ratelimit-reset` is DELTA-SECONDS here too (issue #1268).
+    ///
+    /// The legacy header is unspecified and much of the ecosystem sends an epoch. If this
+    /// renderer followed that convention while the data plane sent a delta, one deployment
+    /// would answer the same question two ways depending on which plane was asked.
+    ///
+    /// Asserted as an equality against the structured field's own `reset=` parameter rather
+    /// than against the constant, so it keeps meaning the same thing if the placeholder
+    /// budget changes.
+    #[test]
+    fn the_management_plane_reset_is_a_delta_and_agrees_with_the_structured_field() {
+        let headers = stamped();
+        let structured = value(&headers, "ratelimit");
+        let legacy = value(&headers, "x-ratelimit-reset");
+
+        let structured_reset = structured
+            .split(", ")
+            .find_map(|part| part.strip_prefix("reset="))
+            .expect("the structured field must carry a reset= parameter");
+
+        assert_eq!(
+            structured_reset, legacy,
+            "the two families must carry the same number in the same units: \
+             got structured {structured} against legacy {legacy}"
+        );
+        assert_eq!(
+            legacy,
+            RESET_SECONDS.to_string(),
+            "a delta, not an epoch: an epoch here reads as a 50-year sleep to a client \
+             that expects a delta"
+        );
+    }
+}
