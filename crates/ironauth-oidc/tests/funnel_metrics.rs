@@ -133,10 +133,22 @@ async fn post_json(
 
 /// The value of one labeled counter series in the rendered exposition, or 0 if absent.
 ///
-/// ZERO FOR ABSENT rather than a panic, because an absent series is a real answer this test
-/// needs to be able to assert about: a stage that never fired is indistinguishable from one
-/// whose label set is wrong, and both are failures the assertions below have to name.
+/// ZERO FOR ABSENT, which is why [`series_present`] exists beside it. A review pointed out that
+/// an assertion of `series(...) == 0` is satisfied by the series not existing at all, so
+/// deleting a whole wrapper left the suite green: the stage vanished and the test read the
+/// vanishing as a legitimate zero. Any assertion here that a stage did NOT fire has to say
+/// whether it expects the series ABSENT or present-and-zero.
 fn series(rendered: &str, name: &str, labels: &[(&str, &str)]) -> u64 {
+    series_value(rendered, name, labels).unwrap_or(0)
+}
+
+/// Whether the series exists in the exposition at all, regardless of its value.
+fn series_present(rendered: &str, name: &str, labels: &[(&str, &str)]) -> bool {
+    series_value(rendered, name, labels).is_some()
+}
+
+/// The value of one labeled counter series, or [`None`] when the series is absent.
+fn series_value(rendered: &str, name: &str, labels: &[(&str, &str)]) -> Option<u64> {
     let mut wanted: Vec<String> = labels
         .iter()
         .map(|(key, value)| format!("{key}=\"{value}\""))
@@ -159,10 +171,27 @@ fn series(rendered: &str, name: &str, labels: &[(&str, &str)]) -> u64 {
             .collect();
         found.sort();
         if found == wanted {
-            return value.trim().parse().unwrap_or(0);
+            return Some(value.trim().parse().unwrap_or(0));
         }
     }
-    0
+    None
+}
+
+/// A well-formed credential body that will be refused by the HANDLER rather than by the
+/// extractor. A body that does not deserialize is rejected inside axum's Json extractor, before
+/// the wrapper runs, so it records nothing.
+fn credential_for_refusal() -> Json {
+    json!({
+        "id": b64(CRED_ID),
+        "rawId": b64(CRED_ID),
+        "type": "public-key",
+        "response": {
+            "clientDataJSON": b64(&client_data("webauthn.get", "bm90LWEtY2hhbGxlbmdl")),
+            "authenticatorData": b64(&auth_data(0b0001_1101, 1, false)),
+            "signature": b64(&[0_u8; 64]),
+            "userHandle": b64(b"nobody"),
+        },
+    })
 }
 
 /// Drive three passkey registration ceremonies: one complete, one abandoned after the
@@ -248,6 +277,191 @@ async fn drive_passkey_ceremonies(harness: &Harness, cookie: &str, base: &str) {
     );
 }
 
+/// Drive one authenticate challenge and one refused assertion, so both authenticate stages
+/// exist. A review deleted both authenticate wrappers and the suite stayed green, because
+/// nothing asserted those series were present while the test's own doc claimed it covered
+/// "BOTH FUNNELS ... AT BOTH STAGES".
+async fn drive_authenticate_ceremony(harness: &Harness, scope_base: &str) {
+    let (status, opts) = post_json(
+        harness,
+        &format!("{scope_base}/webauthn/authenticate/options"),
+        None,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "authenticate options: {opts}");
+    let status = post(
+        harness,
+        &format!("{scope_base}/webauthn/authenticate/verify"),
+        None,
+        &json!({ "challengeId": "chl_nope", "credential": credential_for_refusal() }),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "an assertion against an unknown challenge must be refused, got {status}"
+    );
+}
+
+/// Drive one email verify, one email send and one SMS send.
+///
+/// THE EMAIL SEND IS THE SHARPEST CASE IN THE FILE. It goes to an unknown recipient and is
+/// acknowledged with the SAME uniform 200 a delivered code gets, by anti-enumeration design, so
+/// it is the sample that catches a funnel keying its result label on the status. A review
+/// measured the first version recording exactly that as a success.
+///
+/// THE SMS SEND IS WHAT MAKES THE CHANNEL LABEL LOAD-BEARING. SMS OTP is off by default and the
+/// kill switch answers from the HANDLER rather than the router, so the wrapper still runs and
+/// records one sms sample. Without it, folding `OtpChannel::Sms` into `Email` left the suite
+/// green, because the test drove no SMS traffic and its "no sms sample" assertion was satisfied
+/// by absence.
+async fn drive_otp_attempts(harness: &Harness, scope_base: &str) {
+    let status = post(
+        harness,
+        // `/otp/verify`, which is where the email OTP verify is actually mounted. This said
+        // `/otp/email/verify`, a path that does not exist, so the request 404'd at the ROUTER
+        // and the handler never ran: the counter stayed at zero and the test read that as a
+        // missing metric rather than as its own wrong URL.
+        &format!("{scope_base}/otp/verify"),
+        None,
+        &json!({ "identifier": "nobody@example.test", "code": "000000" }),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "a code that was never sent must not verify, got {status}"
+    );
+
+    let status = post(
+        harness,
+        &format!("{scope_base}/otp/send"),
+        None,
+        &json!({ "identifier": "nobody@example.test" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "precondition: the send is acknowledged uniformly, which is exactly why the status \
+         cannot be what the funnel keys on"
+    );
+
+    let status = post(
+        harness,
+        &format!("{scope_base}/otp/sms/send"),
+        None,
+        &json!({ "identifier": "+15555550100" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "precondition: SMS OTP is off by default and the kill switch answers from the \
+         handler, which is what puts a sample on the sms channel"
+    );
+}
+
+/// Assert the OTP half of the exposition.
+///
+/// Split out only so the test body stays under the line cap; every assertion here is about the
+/// same rendered snapshot the passkey assertions read.
+fn assert_otp_funnel(rendered: &str) {
+    let otp = "ironauth_otp_funnel_total";
+    // THE SEND STAGE EXISTS AND THE REFUSED SEND IS AN ERROR. This is the finding that made
+    // the whole metric wrong: the send returned a uniform 200, the label keyed on the status,
+    // and a refused send was recorded as a delivered code.
+    assert_eq!(
+        series(
+            rendered,
+            otp,
+            &[("channel", "email"), ("stage", "send"), ("result", "error")]
+        ),
+        1,
+        "a send to an unknown recipient delivered nothing and must be counted as an \
+         error, whatever status the anti-enumeration design returns:\n{rendered}"
+    );
+    assert!(
+        !series_present(
+            rendered,
+            otp,
+            &[("channel", "email"), ("stage", "send"), ("result", "ok")]
+        ),
+        "and nothing was actually delivered, so there must be no ok sample at all:\n{rendered}"
+    );
+    let verified = series(
+        rendered,
+        otp,
+        &[
+            ("channel", "email"),
+            ("stage", "verify"),
+            ("result", "error"),
+        ],
+    );
+    assert_eq!(
+        verified, 1,
+        "the refused verify is counted, on the email channel, at the verify stage:\n{rendered}"
+    );
+
+    // AND THE TWO STAGES ARE DISTINCT: exactly one send sample and exactly one verify sample
+    // were produced, so neither handler is incrementing both. If it were, every conversion
+    // rate would be exactly 1 by construction and nothing else here would notice.
+    //
+    // This used to assert the send stage was ABSENT, which was true only because the test
+    // never sent anything, and was satisfied by absence rather than by a count. It now drives
+    // a real send and checks the two stages independently.
+    let send_total: u64 = ["ok", "error"]
+        .iter()
+        .map(|result| {
+            series(
+                rendered,
+                otp,
+                &[("channel", "email"), ("stage", "send"), ("result", result)],
+            )
+        })
+        .sum();
+    let verify_total: u64 = ["ok", "error"]
+        .iter()
+        .map(|result| {
+            series(
+                rendered,
+                otp,
+                &[
+                    ("channel", "email"),
+                    ("stage", "verify"),
+                    ("result", result),
+                ],
+            )
+        })
+        .sum();
+    assert_eq!(
+        (send_total, verify_total),
+        (1, 1),
+        "one send and one verify were driven, so each stage must hold exactly one \
+         sample:\n{rendered}"
+    );
+
+    // THE CHANNEL LABEL IS THE CHANNEL. One SMS send was driven and it must land on the sms
+    // series, not the email one. Asserting only that no sms sample exists would be satisfied
+    // by a mislabelled sample going to email, which is exactly the slip this guards.
+    assert_eq!(
+        series(
+            rendered,
+            otp,
+            &[("channel", "sms"), ("stage", "send"), ("result", "error")]
+        ),
+        1,
+        "the SMS send must be recorded on the SMS channel:\n{rendered}"
+    );
+    assert!(
+        !series_present(
+            rendered,
+            otp,
+            &[("channel", "sms"), ("stage", "verify"), ("result", "error")]
+        ),
+        "and no sms VERIFY was driven, so that stage must not exist:\n{rendered}"
+    );
+}
+
 /// BOTH FUNNELS POPULATE FROM SYNTHETIC FLOWS, AT BOTH STAGES, WITH BOTH OUTCOMES.
 ///
 /// ONE test rather than two, because `metrics` installs a single recorder per PROCESS and a
@@ -273,24 +487,8 @@ async fn the_passkey_and_otp_funnels_populate_from_synthetic_flows() {
 
     drive_passkey_ceremonies(&harness, &cookie, &format!("{scope_base}/webauthn")).await;
 
-    // THE OTP HALF: a verify against a code that was never sent. Driven with NO preceding
-    // send on purpose, so a recorder that incremented both stages from one handler would show
-    // a send it never made.
-    let status = post(
-        &harness,
-        // `/otp/verify`, which is where the email OTP verify is actually mounted. This said
-        // `/otp/email/verify`, a path that does not exist, so the request 404'd at the ROUTER
-        // and the handler never ran: the counter stayed at zero and the test read that as a
-        // missing metric rather than as its own wrong URL.
-        &format!("{scope_base}/otp/verify"),
-        None,
-        &json!({ "identifier": "nobody@example.test", "code": "000000" }),
-    )
-    .await;
-    assert!(
-        !status.is_success(),
-        "a code that was never sent must not verify, got {status}"
-    );
+    drive_authenticate_ceremony(&harness, &scope_base).await;
+    drive_otp_attempts(&harness, &scope_base).await;
 
     let rendered = handle.render();
     let passkey = "ironauth_passkey_funnel_total";
@@ -323,33 +521,32 @@ async fn the_passkey_and_otp_funnels_populate_from_synthetic_flows() {
          rate is always 1: offered={offered} completed={completed}"
     );
 
-    let otp = "ironauth_otp_funnel_total";
-    let verified = series(
-        &rendered,
-        otp,
-        &[
-            ("channel", "email"),
-            ("stage", "verify"),
-            ("result", "error"),
-        ],
-    );
-    assert_eq!(
-        verified, 1,
-        "the refused verify is counted, on the email channel, at the verify stage:\n{rendered}"
-    );
-
-    // AND THE STAGES ARE DISTINCT. No send was made, so the send stage must be absent
-    // entirely. This is the assertion that fails if both stages are incremented from one
-    // place, which would make every conversion rate exactly 1 by construction.
-    for result in ["ok", "error"] {
-        assert_eq!(
-            series(
-                &rendered,
-                otp,
-                &[("channel", "email"), ("stage", "send"), ("result", result)]
-            ),
-            0,
-            "no code was sent, so the send stage must not have counted ({result}):\n{rendered}"
+    // THE AUTHENTICATE STAGES EXIST. Asserted by PRESENCE, not by value: deleting either
+    // wrapper makes the series vanish, and a value assertion against a vanished series reads
+    // its absence as a zero.
+    for (stage, result) in [
+        ("authenticate_challenge", "ok"),
+        ("authenticate_complete", "error"),
+    ] {
+        assert!(
+            series_present(&rendered, passkey, &[("stage", stage), ("result", result)]),
+            "the {stage} stage must be recorded, or every dashboard dividing by it divides \
+             by an absent series:\n{rendered}"
         );
     }
+    // AND THEY ARE NOT THE REGISTER STAGES WEARING THE WRONG LABEL. Relabelling an
+    // authenticate wrapper as a register one is a one-token slip the four near-identical
+    // wrapper blocks invite, and it would silently inflate the published enrollment rate with
+    // sign-in traffic.
+    assert_eq!(
+        series(
+            &rendered,
+            passkey,
+            &[("stage", "register_challenge"), ("result", "ok")]
+        ),
+        2,
+        "the authenticate challenge must not have been counted as a register one:\n{rendered}"
+    );
+
+    assert_otp_funnel(&rendered);
 }

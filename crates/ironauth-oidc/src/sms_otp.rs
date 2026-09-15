@@ -149,8 +149,9 @@ async fn send_inner(
         .map(str::trim)
         .unwrap_or_default();
     if raw.is_empty() {
-        // No recipient: the uniform ack, no send, no oracle.
-        return ack();
+        // No recipient: the uniform ack, no send, no oracle. MARKED as a refusal so the
+        // funnel does not count it as a delivered code (issue #152 criterion 5).
+        return crate::funnel::mark_refused(ack());
     }
     let canonical = canonicalize_identifier(IdentifierType::Phone, raw);
     let phone = canonical.as_str().to_owned();
@@ -244,7 +245,8 @@ async fn send_inner(
             ttl_secs: state.sms_otp_code_ttl().as_secs(),
         };
         state.deliver_sms_otp(&message, false);
-        return ack();
+        // Suppressed: nothing was delivered, so it is a refusal for funnel purposes.
+        return crate::funnel::mark_refused(ack());
     };
 
     // A permitted send to a known recipient: issue the hashed code and deliver it.
@@ -265,7 +267,7 @@ async fn send_inner(
                 "SMS OTP hashing rejected under pool back-pressure; uniform ack (no oracle)"
             );
             metrics::counter!("ironauth_sms_send_hash_rejected_total").increment(1);
-            return ack();
+            return crate::funnel::mark_refused(ack());
         }
     };
     let ttl = state.sms_otp_code_ttl();
@@ -295,7 +297,7 @@ async fn send_inner(
         // suppressed send returns (anti-enumeration), recorded on the observability
         // plane only.
         tracing::error!(target: "ironauth.verification", "SMS OTP issue failed");
-        return ack();
+        return crate::funnel::mark_refused(ack());
     }
     let message = SmsOtpMessage {
         scope,
@@ -669,7 +671,11 @@ async fn refuse_uniform(
         "reason" => reason,
     )
     .increment(1);
-    ack()
+    // MARKED, because the status cannot say it. This returns the same uniform 200 as a real
+    // send, by design, so the funnel would otherwise record every guard refusal as a delivered
+    // code: a review measured three sends, one delivered and two refused, recorded as three
+    // `result="ok"` samples and zero errors (issue #152 criterion 5).
+    crate::funnel::mark_refused(ack())
 }
 
 /// The UNIFORM send acknowledgment (issue #70): the SAME body and status whether the
