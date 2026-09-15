@@ -13,14 +13,29 @@
 # publishing the wrong one is how a target gets met on paper:
 #
 #   startup  = wall time from exec() to the FIRST /readyz that answers ready.
-#              Not to "the process exists", which is microseconds and says
-#              nothing, and not to the first listening socket, which precedes
-#              migrations and the first database round trip.
+#
+#              WHAT THAT ACTUALLY PROVES, stated precisely because this comment
+#              said the opposite. It claimed readiness came after "the first
+#              database round trip". It does not: `ReadinessProbe::probe` is a
+#              bare TcpStream::connect to the configured Postgres address, and
+#              its own doc says "no bytes are exchanged and no database protocol
+#              is spoken". Since this harness starts Postgres before the loop,
+#              that connect always succeeds at once, so readiness fires when the
+#              management listener binds. A review confirmed it live: /readyz
+#              answered `ready` against a database holding zero tables, with
+#              log_statement=all recording no SQL from the server at all.
+#
+#              So this measures process start to listener-up, with the Postgres
+#              address proven TCP-reachable. That is a real and useful number,
+#              and it is NOT time-to-serving-traffic. A reader sizing a rollout
+#              on it should know the pool has not yet spoken a byte of protocol.
 #   rss      = resident set size after readiness plus a settle period, with NO
 #              traffic. Idle means idle: a number taken under load is a
 #              different measurement wearing the same name.
 #
-# It reports the MEDIAN of N runs and also the max. A single sample on a shared
+# It reports the MEDIAN of N runs and also the max, over ONE population: there is
+# no cold-versus-warm split, because with the binary already exec'd and the schema
+# already applied there is no difference to report. A single sample on a shared
 # laptop is not a measurement, and the max is printed because a target stated as
 # a median hides the tail an operator actually waits for.
 set -euo pipefail
@@ -36,6 +51,26 @@ cargo build -q --release -p ironauth
 
 BIN="target/release/ironauth"
 [ -x "$BIN" ] || { echo "no release binary at $BIN" >&2; exit 1; }
+
+# EXEC IT ONCE, BEFORE ANY MEASUREMENT, AND THROW THAT AWAY.
+#
+# The build above re-creates the binary at a NEW INODE every invocation, and macOS validates a
+# binary on first exec from a given inode. That validation cost about 0.85 s and was charged
+# entirely to whichever `serve` ran first, which was the sample this script labelled COLD and
+# published. A review measured the mechanism directly: three consecutive no-op release builds
+# produced three different inodes, and the first `ironauth --version` after each cost 0.87,
+# 0.81 and 0.83 s at user 0.00 and sys 0.00 (blocked in validation, burning no CPU), while the
+# very next exec cost 0.00 s. With this one line the same harness against the same database
+# reported 237 ms instead of 1194 ms.
+#
+# So the published headline, "cold start 1191 ms, over the sub-second target", was measuring
+# the operating system inspecting a file the harness had just written. `--version` opens no
+# config and never touches Postgres, so it pays the validation and nothing else.
+#
+# It also would not have reproduced on the Linux runner criterion 2 asks CI to use, where
+# there is no such validation at all, which is its own warning about publishing a number whose
+# cause was never identified.
+"$BIN" --version >/dev/null 2>&1 || true
 
 # Hardware class, printed with the numbers so a result is never quoted without it.
 echo "startup-rss-bench: host"
@@ -102,6 +137,20 @@ stop_pg() { "$PG_BIN/pg_ctl" -D "$PGDATA" -m immediate stop >/dev/null 2>&1 || t
 trap stop_pg EXIT
 "$PG_BIN/createdb" -h 127.0.0.1 -p "$PGPORT" -U ironauth_super ironauth >/dev/null
 
+# THE THREE ROLES THE SCHEMA GRANTS TO, provisioned out of band.
+#
+# Migration 0001 says so explicitly: it GRANTs to `ironauth_app` and never creates it, because
+# shipping a CREATE ROLE ... PASSWORD literal in a public repository would hand every reader a
+# working credential for the isolation-boundary role. "If the role is absent when this runs,
+# the GRANTs below fail loudly: that fail-closed behavior is intended."
+#
+# So a benchmark that wants a migrated database has to do what an operator does. Throwaway
+# passwords on a throwaway cluster that is torn down on exit.
+for role in ironauth_app ironauth_control ironauth_audit_retention; do
+  "$PG_BIN/psql" -h 127.0.0.1 -p "$PGPORT" -U ironauth_super -d ironauth -v ON_ERROR_STOP=1 \
+    -c "CREATE ROLE $role LOGIN PASSWORD '$role'" >/dev/null 2>&1 || true
+done
+
 DATA_PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 MGMT_PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 CONFIG="$WORK/ironauth.toml"
@@ -117,6 +166,24 @@ master_key = { env = "IRONAUTH_MASTER_KEY" }
 control_database_url = "postgres://ironauth_super@127.0.0.1:${PGPORT}/ironauth"
 TOML
 export IRONAUTH_MASTER_KEY="${IRONAUTH_MASTER_KEY:-$(python3 -c 'import base64,os;print(base64.b64encode(os.urandom(32)).decode())')}"
+
+# APPLY THE SCHEMA, because `serve` does not.
+#
+# This script printed "startup COLD (fresh database, migrations run)" and the doc attributed
+# the cold cost to migrations. A review queried the benchmarked database afterwards and found
+# ZERO tables: `migrate` is a separate subcommand, dispatched beside `serve` rather than by it,
+# and nothing here ever invoked it. With `log_statement=all`, the whole session logged four
+# statements, all from createdb and psql, and none from the server.
+#
+# So every figure this script produced described a server booted against an empty database,
+# which is a configuration no deployment runs. Migrating first makes the measured shape the
+# real one, and it removes the cold-versus-warm framing entirely: with the schema already
+# applied and the binary already exec'd, every run measures the same thing.
+echo "startup-rss-bench: applying the schema (serve does not migrate; migrate is its own command)"
+"$BIN" migrate --config "$CONFIG" >/dev/null 2>&1 || {
+  echo "startup-rss-bench: the schema could not be applied" >&2
+  exit 1
+}
 
 echo "startup-rss-bench: measuring"
 starts=(); rsses=()
@@ -146,37 +213,43 @@ runs = int(sys.argv[1])
 starts = [float(v) for v in sys.argv[2:2+runs]]
 rsses = [float(v) / 1024 for v in sys.argv[2+runs:2+2*runs]]
 
-cold, warm = starts[0], starts[1:]
 TARGET_MS, TARGET_MIB = 1000.0, 100.0
 
+# ONE POPULATION, NOT A COLD AND A WARM ONE.
+#
+# This reported `starts[0]` as COLD and the rest as WARM, and published the COLD figure as the
+# headline. Two reviews showed the split was an artifact rather than a property: the first
+# sample was expensive because macOS was validating a freshly-written binary, and with that
+# charged to a throwaway exec the samples are indistinguishable. A control run with an
+# already-exec'd binary gave 322, 359 and 276 ms, with no ordering at all.
+#
+# The split was also a statistics problem on its own terms. COLD was n=1 while the doc claimed
+# "a MEDIAN and a MAX over five runs", and the verdict turned on that single unreplicated
+# sample sitting either side of the threshold: three unmodified invocations gave 1194, 1005 and
+# 1068 ms, so one more draw would have flipped the published conclusion with no change to the
+# code being measured.
 print("startup-rss-bench: results")
-print(f"  startup COLD (fresh database, migrations run)   {cold:.0f} ms" 
-      f"{'' if cold < TARGET_MS else '   OVER the < 1000 ms target'}")
-if warm:
-    print(f"  startup WARM (already migrated, the restart    "
-          f"  median {statistics.median(warm):.0f} ms   max {max(warm):.0f} ms"
-          f"{'' if max(warm) < TARGET_MS else '   OVER the < 1000 ms target'}")
-    print( "               and rolling-upgrade case)")
-print(f"  rss idle                                        median {statistics.median(rsses):.1f} MiB"
-      f"   max {max(rsses):.1f} MiB"
-      f"{'' if max(rsses) < TARGET_MIB else '   OVER the < 100 MiB target'}")
+print(f"  startup to ready   median {statistics.median(starts):.0f} ms   max {max(starts):.0f} ms"
+      f"   over {runs} run(s)"
+      f"{'' if max(starts) < TARGET_MS else '   MAX IS OVER the < 1000 ms target'}")
+print(f"  rss idle           median {statistics.median(rsses):.1f} MiB   max {max(rsses):.1f} MiB"
+      f"{'' if max(rsses) < TARGET_MIB else '   MAX IS OVER the < 100 MiB target'}")
 
-warm_ok = not warm or max(warm) < TARGET_MS
-cold_ok = cold < TARGET_MS
+# THE MAX, NOT THE MEDIAN, DECIDES. The first version of this file chose the median and
+# printed "within both targets" on a run whose own max exceeded one of them. A published
+# number that passes by choosing the convenient statistic is worse than no number, because it
+# is quoted. Reporting both and judging on the worse one is the whole point.
+start_ok = max(starts) < TARGET_MS
 rss_ok = max(rsses) < TARGET_MIB
 print()
-if cold_ok and warm_ok and rss_ok:
-    print("startup-rss-bench: within every stated target, cold and warm")
+if runs < 3:
+    print(f"  NOTE: {runs} run(s) is not enough to report a median. Re-run with RUNS>=3.")
+if start_ok and rss_ok:
+    print("startup-rss-bench: within every stated target, on the WORST sample of each")
 else:
     print("startup-rss-bench: a stated target is NOT met:")
-    if not cold_ok:
-        print(f"  cold startup {cold:.0f} ms exceeds {TARGET_MS:.0f} ms. This is the fresh-install")
-        print( "  case: every migration runs before the first readiness. A deployment restarting")
-        print( "  an already-migrated database gets the warm number instead.")
-    if not warm_ok:
-        print(f"  warm startup max {max(warm):.0f} ms exceeds {TARGET_MS:.0f} ms")
+    if not start_ok:
+        print(f"  startup max {max(starts):.0f} ms exceeds {TARGET_MS:.0f} ms")
     if not rss_ok:
         print(f"  idle rss max {max(rsses):.1f} MiB exceeds {TARGET_MIB:.0f} MiB")
-    # Reported, not hidden. Whether a fresh install is in scope for the target is a
-    # product decision; publishing only the half that passes is not.
 PY
