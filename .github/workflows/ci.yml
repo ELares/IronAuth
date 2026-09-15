@@ -1109,8 +1109,12 @@ jobs:
                     ports:
                       - containerPort: 5432
                     readinessProbe:
+                      # -h 127.0.0.1 so the probe cannot pass against the entrypoint's
+                      # temporary init server, which listens on the unix socket only. Without
+                      # the host this reports ready during initialisation and the socket then
+                      # vanishes underneath whatever connected.
                       exec:
-                        command: ["pg_isready", "-U", "postgres"]
+                        command: ["pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
                       periodSeconds: 5
           PG
           kubectl rollout status deployment/postgres --timeout=300s
@@ -1129,8 +1133,20 @@ jobs:
       - name: Provision roles and migrate
         run: |
           POD=$(kubectl get pod -l app=postgres -o jsonpath='{.items[0].metadata.name}')
+          # OVER TCP, NOT THE UNIX SOCKET, and the difference is a race this job actually hit.
+          #
+          # The postgres image's entrypoint runs a TEMPORARY server during initialisation that
+          # listens on the socket only. `pg_isready -U postgres` with no host reaches it, so
+          # the readiness probe can pass while the real server has not started; the socket
+          # then disappears when the init server shuts down. A `psql -U postgres` landing in
+          # that window dies with "connection to server on socket ... No such file or
+          # directory", which is what happened after two green runs.
+          #
+          # The init server does not listen on TCP, so connecting to 127.0.0.1 inside the pod
+          # reaches the real one or nothing.
           for role in ironauth_app ironauth_control ironauth_audit_retention; do
-            kubectl exec "$POD" -- psql -U postgres -d ironauth -v ON_ERROR_STOP=1 \
+            kubectl exec "$POD" -- env PGPASSWORD=postgres \
+              psql -h 127.0.0.1 -U postgres -d ironauth -v ON_ERROR_STOP=1 \
               -c "CREATE ROLE $role LOGIN PASSWORD '$role'"
           done
           # A MINIMAL CONFIG, not the chart's rendered one. An earlier comment here claimed
