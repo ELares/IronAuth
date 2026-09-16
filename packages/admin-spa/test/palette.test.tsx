@@ -77,7 +77,6 @@ describe("command palette keyboard flow", () => {
     const root = mount(<CommandPalette commands={[]} />);
     await tick();
     const trigger = root.querySelector(".console-search") as HTMLButtonElement;
-    trigger.focus();
     trigger.click();
     await tick();
     const input = root.querySelector(".cmdk-input") as HTMLInputElement;
