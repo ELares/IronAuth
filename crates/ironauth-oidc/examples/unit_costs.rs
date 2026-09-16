@@ -30,7 +30,8 @@
 
 use ironauth_env::Env;
 use ironauth_jose::{
-    JwsAlgorithm, KeySet, SigningKey, SigningPolicy, generate_rsa_pkcs1_der, sign_detached,
+    JwsAlgorithm, KeySet, SigningKey, SigningPolicy, generate_ecdsa_p256_pkcs8_der,
+    generate_rsa_pkcs1_der, sign_detached,
 };
 use ironauth_oidc::{Argon2Params, hash_password_with, verify_password};
 
@@ -244,50 +245,129 @@ fn main() {
     // So a cache hop is worth taking only if the hop is cheaper than the figure below. Publish
     // it rather than reasoning about it: a reader can compare it against their own accelerator
     // round trip and decide, which is what a sizing guide is for.
-    println!("\nunit-costs: JWKS render (the cost a hot-state hit in front of the document saves)");
-    println!("  {:<40} {:>12}", "published keys", "render us");
+    // THE JWKS RENDER AND WHAT A CACHE HIT ACTUALLY COSTS, because the difference between them
+    // is what an accelerator in front of this document would save, and that difference is the
+    // number issue #146's wiring question turns on.
+    //
+    // `IssuerRegistry::jwks_json` consults its hot state AFTER `resolve_for_publication` has
+    // returned the entry, deliberately: everything deciding WHETHER to publish runs first. So a
+    // hit cannot save a database read. What it saves is the render.
+    //
+    // WHAT IT ADDS IS MEASURED HERE TOO, because the first version of this benchmark said a hit
+    // "saves the render and nothing else" and that was wrong in the expensive direction. On a
+    // hit the path runs `String::from_utf8` and then a full `serde_json` validation parse of the
+    // returned document, which `issuer.rs` keeps deliberately: without it the endpoint served
+    // any UTF-8 bytes under that key as the environment's JWK Set. A miss never pays it. So the
+    // saving is the render MINUS that parse, not the render.
+    println!("\nunit-costs: JWKS render against what a cache hit costs to accept");
+    println!(
+        "  {:<52} {:>10} {:>9} {:>12}",
+        "published keys", "render us", "parse us", "net saved us"
+    );
     let now = env.clock().now_utc();
-    // BUILT FRESH rather than reused from the mint loop: `SigningKey` is deliberately not
-    // `Clone`, and a keyset takes ownership.
+    // A FRESH ENVIRONMENT PUBLISHES THREE ALGORITHMS, not two. `DayOneSigningKeys::generate`
+    // mints EdDSA, ES256 and RS256 and marks all three published from the environment's creation
+    // instant, and the derived policy retains every algorithm present. The first version of this
+    // row measured two keys and labelled them "a fresh environment", which no environment is.
+    // The six-key row is one rotation of each, whose predecessors stay published for a window.
     let mut rendered_any = false;
-    for (label, with_rsa) in [
-        ("EdDSA only", false),
-        ("EdDSA + RS256 (a fresh environment)", true),
+    for (label, algorithms, rotations) in [
+        ("EdDSA only", &[JwsAlgorithm::EdDsa][..], 0_u32),
+        (
+            "EdDSA + ES256 + RS256 (a fresh environment)",
+            &[
+                JwsAlgorithm::EdDsa,
+                JwsAlgorithm::Es256,
+                JwsAlgorithm::Rs256,
+            ][..],
+            0,
+        ),
+        (
+            "the same three, one rotation each (six published)",
+            &[
+                JwsAlgorithm::EdDsa,
+                JwsAlgorithm::Es256,
+                JwsAlgorithm::Rs256,
+            ][..],
+            1,
+        ),
     ] {
-        let Ok(ed) = SigningKey::ed25519_from_seed(Some("ed".to_owned()), &[7_u8; 32]) else {
-            continue;
-        };
-        let mut algorithms = vec![JwsAlgorithm::EdDsa];
-        let mut keyset = KeySet::bootstrap(ed, now);
-        if with_rsa {
-            let Ok(der) = generate_rsa_pkcs1_der(env.entropy()) else {
-                continue;
-            };
-            let Ok(rsa) =
-                SigningKey::rsa_from_pkcs1_der(Some("rs".to_owned()), JwsAlgorithm::Rs256, &der)
-            else {
-                continue;
-            };
-            keyset.add(rsa, now);
-            algorithms.push(JwsAlgorithm::Rs256);
+        let mut keyset: Option<KeySet> = None;
+        let mut built = Vec::new();
+        // GENERATED PER SLOT so each key is distinct, as a real environment's are. Reusing one
+        // key would understate the document: kid strings and moduli both land in the bytes.
+        for round in 0..=rotations {
+            for algorithm in algorithms {
+                let kid = format!("k{round}{}", built.len());
+                let key = match algorithm {
+                    JwsAlgorithm::EdDsa => {
+                        let mut seed = [0_u8; 32];
+                        env.entropy().fill_bytes(&mut seed);
+                        SigningKey::ed25519_from_seed(Some(kid.clone()), &seed).ok()
+                    }
+                    JwsAlgorithm::Es256 => generate_ecdsa_p256_pkcs8_der(env.entropy())
+                        .ok()
+                        .and_then(|der| {
+                            SigningKey::ecdsa_p256_from_pkcs8(Some(kid.clone()), &der).ok()
+                        }),
+                    _ => generate_rsa_pkcs1_der(env.entropy()).ok().and_then(|der| {
+                        SigningKey::rsa_from_pkcs1_der(Some(kid.clone()), JwsAlgorithm::Rs256, &der)
+                            .ok()
+                    }),
+                };
+                let Some(key) = key else { continue };
+                built.push(*algorithm);
+                match keyset.as_mut() {
+                    None => keyset = Some(KeySet::bootstrap(key, now)),
+                    Some(set) => set.add(key, now),
+                }
+            }
         }
-        let Ok(policy) = SigningPolicy::new(algorithms) else {
+        let (Some(keyset), Ok(policy)) = (keyset, SigningPolicy::new(built)) else {
             continue;
         };
-        // WARMED like the signature loop, so a lazily built projection is not charged here.
-        for _ in 0..SIGN_WARMUP {
-            let _ = keyset
+        let render = || {
+            keyset
                 .published_jwks(now, &policy)
-                .and_then(|jwks| jwks.to_json());
+                .and_then(|jwks| jwks.to_json())
+                .ok()
+        };
+        let Some(document) = render() else { continue };
+
+        for _ in 0..SIGN_WARMUP {
+            let _ = render();
         }
         let started = env.clock().monotonic();
         for _ in 0..RENDER_SAMPLES {
-            let _ = keyset
-                .published_jwks(now, &policy)
-                .and_then(|jwks| jwks.to_json());
+            let _ = render();
         }
         let render_us = started.elapsed().as_secs_f64() * 1_000_000.0 / f64::from(RENDER_SAMPLES);
-        println!("  {label:<40} {render_us:>12.1}");
+
+        // EXACTLY WHAT THE HIT PATH RUNS on the bytes it got back, in the same order: the UTF-8
+        // check, the parse, and the `keys` array test that decides whether to serve them.
+        let bytes = document.clone().into_bytes();
+        let accept = || {
+            String::from_utf8(bytes.clone()).ok().and_then(|text| {
+                serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|value| value.get("keys").map(serde_json::Value::is_array))
+            })
+        };
+        for _ in 0..SIGN_WARMUP {
+            let _ = accept();
+        }
+        let started = env.clock().monotonic();
+        for _ in 0..RENDER_SAMPLES {
+            let _ = accept();
+        }
+        let parse_us = started.elapsed().as_secs_f64() * 1_000_000.0 / f64::from(RENDER_SAMPLES);
+
+        // SUBTRACTED, NOT ASSERTED. A negative net means a hit costs more CPU than rendering
+        // from the entry the caller already holds, before any hop is paid for at all.
+        println!(
+            "  {label:<52} {render_us:>10.2} {parse_us:>9.2} {:>12.2}",
+            render_us - parse_us
+        );
         rendered_any = true;
     }
     if !rendered_any {

@@ -325,8 +325,9 @@ jobs:
     name: benchmark harness
     needs: verify
     runs-on: ubuntu-latest
-    # The two benchmarks here are release builds with no warm cache. ci.yml budgets 60 for the
-    # hook benchmark alone, so 45 was optimistic.
+    # The benchmarks here are release builds with no warm cache, and two of the three start a
+    # throwaway Postgres cluster of their own. ci.yml budgets 60 for the hook benchmark alone,
+    # so 45 was optimistic.
     timeout-minutes: 60
     permissions:
       contents: read
@@ -336,7 +337,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # THE HARNESS IS ONE COMMAND. Issue #152 criterion 2 asks that the published numbers
       # reproduce from a clean checkout with one documented command and that CI run it per
-      # release. Before this job, both benchmarks backing the published documents ran nowhere:
+      # release. Before this job, the benchmarks backing the published documents ran nowhere:
       # the unit-costs example was compiled by `--all-targets` and never executed, and the
       # startup/RSS script appeared in no workflow and no gate.
       #

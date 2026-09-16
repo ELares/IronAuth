@@ -94,36 +94,54 @@ sentence told an operator not to model it.
 A sizing guide needs the cost of asking something else, not only the cost of doing the work,
 because that is what decides whether a cache in front of an operation pays for itself.
 
-| operation | measured |
-|---|---|
-| render the published JWKS, EdDSA only | 0.5 us |
-| render the published JWKS, EdDSA and RS256 (a fresh environment) | 1.3 us |
-| one socket round trip, the FLOOR on this machine | 20 to 21 us |
+| published keys | render | parse on a hit | net saved by a hit |
+|---|---|---|---|
+| EdDSA only | 0.55 us | 0.55 to 0.57 us | -0.02 to 0.00 us |
+| EdDSA + ES256 + RS256 (a fresh environment) | 1.97 to 1.98 us | 1.36 to 1.38 us | 0.59 to 0.62 us |
+| the same three, one rotation each (six published) | 3.51 to 3.70 us | 2.69 to 2.77 us | 0.74 to 1.01 us |
 
-The round trip is `SELECT 1` over loopback TCP to a Postgres on the same machine, through
-pgbench, with no disk in the path and nothing to plan. It is a floor rather than an estimate:
-a real accelerator read queries a real table or crosses a real network, so every actual hop is
-slower. Both figures come from `scripts/bench.sh`.
+| asking another process | measured |
+|---|---|
+| one Postgres round trip, `SELECT 1`, loopback TCP, same machine | 20 us |
+
+Three algorithms is what a fresh environment publishes, not two: provisioning mints EdDSA,
+ES256 and RS256 and publishes all three from the environment's creation instant. The six-key row
+is one rotation of each, whose predecessors stay published for a window.
+
+The round trip is a MEAN over the run, not a floor, and it includes Postgres parsing, planning
+and executing the statement, so a bare socket exchange on this hardware is cheaper. It is also
+not a figure for a Redis-shaped accelerator, which speaks a lighter protocol; nothing here
+measures one. It is offered as a concrete example of what a hop costs on the most favourable
+topology there is, where the other process is on the same machine.
 
 **That settles an open question in issue #146.** `IssuerRegistry` holds an optional hot-state
-accelerator for the published JWKS document, and it has no production caller. The natural
-reading is that the boot wiring was simply never finished. The measurement says otherwise.
+accelerator for the published JWKS document, and no shipped binary installs one. The natural
+reading is that the boot wiring was never finished. The measurement says otherwise.
 
 `jwks_json` consults the accelerator only AFTER `resolve_for_publication` has returned the
-entry, and deliberately: everything that decides WHETHER to publish has to run first, so that a
+entry, and deliberately: everything that decides WHETHER to publish has to run first, so a
 fenced scope is refused and a stale entry is never served. The safety ordering is right. Its
-consequence is that a cache hit saves the render and nothing else, because the read that
-produced the entry has already happened.
+consequence is that a hit cannot save a database read, because the read that produced the entry
+has already happened.
 
-So the accelerator would have to make a 20 us round trip to avoid 1.3 us of work, roughly
-sixteen times the cost of the thing it replaces, at the best figure this machine can produce
-and against a database sitting on it. Wiring it at this call site would make the JWKS endpoint
-slower, and "not wired" is the faster configuration rather than the unfinished one.
+What a hit saves is the render, and what it ADDS is the cost of accepting the bytes: a UTF-8
+check and a full JSON validation parse that `issuer.rs` keeps deliberately, because without it
+the endpoint served any UTF-8 bytes found under that key as the environment's JWK Set. A miss
+never pays that. So the saving is the render minus the parse, which is the last column above,
+and for a fresh environment it is about 0.6 us.
+
+Against a 20 us round trip that is roughly thirty times the cost of the thing it replaces, on
+the most favourable topology, with the database on the same machine. At one published key the
+net saving is NEGATIVE: accepting a cache hit costs marginally more CPU than rendering from the
+entry the caller is already holding, before any hop is paid for at all.
+
+Wiring the accelerator at this call site would make the JWKS endpoint slower. "Not wired" is
+the faster configuration rather than the unfinished one.
 
 This does not say the hot-state seam is not worth having. It says this USE is not, and the
 distinction is where the seam pays: a hop is worth taking when the alternative is a database
-read, not a microsecond of serialization. The uses whose alternative is a query, rather than a
-render off an already-resolved entry, are the ones to wire.
+read, not a microsecond of serialization off an entry already in hand. The uses whose
+alternative is a query are the ones to wire.
 
 ## What this does not yet cover
 
@@ -131,8 +149,8 @@ Criterion 4 also asks that the sizing guide be GENERATED from CI benchmark outpu
 on release. It is not. This table is still hand-transcribed, and it has drifted.
 
 Re-running the harness on the hardware class the table names (Apple M4 Pro, 10 performance and 4
-efficiency cores, release build) put six of the ten measured figures published above outside
-their own ranges:
+efficiency cores, release build) put six of the ten figures in the password-hashing and
+token-mint tables outside their own ranges:
 
 | figure | published | re-measured |
 |---|---|---|

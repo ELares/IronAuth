@@ -26,11 +26,14 @@
 //! remaining six uses have no call site at all.
 //!
 //! For the JWKS use, inert is now a measured decision rather than an unfinished one. The
-//! accelerator is consulted after the entry is already resolved, so a hit saves the render and
-//! cannot save a database read. `docs/UNIT-COSTS.md` measures both sides: the render is 1.3 us
-//! and the cheapest socket round trip on that machine is 20 us, so installing an implementation
-//! there would trade a microsecond of serialization for sixteen times as much waiting. The seam
-//! pays where the alternative to a hop is a QUERY, which is what the other uses are.
+//! accelerator is consulted after the entry is already resolved, so a hit cannot save a database
+//! read; it saves the render, and it ADDS the UTF-8 check and JSON validation parse that
+//! accepting the bytes requires. `docs/UNIT-COSTS.md` measures both sides. For a fresh
+//! environment's three published keys the net saving is about 0.6 us, against a 20 us Postgres
+//! round trip on the same machine, so installing an implementation there would trade well under
+//! a microsecond for roughly thirty times as much waiting. At one published key the net saving
+//! is negative before any hop is paid at all. The seam pays where the alternative to a hop is a
+//! QUERY, which is what the other uses are.
 //!
 //! The general rule still holds and is why this paragraph exists: a use added to the registry
 //! does not become live by being declared, and a call site does not become live by being written.

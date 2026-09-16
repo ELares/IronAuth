@@ -16,10 +16,11 @@
 # section now records the size of it: re-running the example put six of its ten published
 # figures outside their own ranges.
 #
-# It is also how a measurement nobody had taken decided an open design question. The JWKS render
-# and the socket round trip below bracket the value of a cache in front of the published JWKS
-# document, and running them answered issue #146's wiring question in the opposite direction
-# from the one the code was heading.
+# It is also how a measurement nobody had taken settled an open design question. Reading
+# `issuer.rs` is what establishes WHAT a cache hit in front of the published JWKS document can
+# save, which is a render minus a validation parse and never a database read. Only measuring
+# says whether that is worth a hop, and the render and round-trip benchmarks below are the two
+# sides of it. They came out roughly thirty to one against, which docs/UNIT-COSTS.md records.
 #
 # # Every benchmark reports RAN, SKIPPED, or FAILED, and a SKIP IS NOT SILENT
 #
