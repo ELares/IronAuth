@@ -27,13 +27,18 @@
 //!
 //! For the JWKS use, inert is now a measured decision rather than an unfinished one. The
 //! accelerator is consulted after the entry is already resolved, so a hit cannot save a database
-//! read; it saves the render, and it ADDS the UTF-8 check and JSON validation parse that
-//! accepting the bytes requires. `docs/UNIT-COSTS.md` measures both sides. For a fresh
-//! environment's three published keys the net saving is about 0.6 us, against a 20 us Postgres
-//! round trip on the same machine, so installing an implementation there would trade well under
-//! a microsecond for roughly thirty times as much waiting. At one published key the net saving
-//! is negative before any hop is paid at all. The seam pays where the alternative to a hop is a
-//! QUERY, which is what the other uses are.
+//! read of any shape; it saves the render, and it ADDS the UTF-8 check and JSON validation parse
+//! that accepting the bytes requires. `docs/UNIT-COSTS.md` measures both sides. For a fresh
+//! environment's three published keys the net saving is about 0.6 us, against a 20 us round trip
+//! on the same machine, and it is negative at one published key.
+//!
+//! THAT IS SPECIFIC TO THIS USE, and an earlier version of this paragraph generalised it wrongly.
+//! It said the seam pays "where the alternative to a hop is a QUERY", which a review showed is
+//! too coarse: a cache hit costs a round trip, so it returns only what the operation costs ABOVE
+//! one round trip. The JWKS read is unusual in costing almost nothing above it, because the
+//! entry is already in hand. A SCOPED read is the opposite: `begin_scoped` pays BEGIN, an
+//! isolation level, two `set_config` calls and a COMMIT around a query under row-level security,
+//! measured at 158 us against a 20 us hop. Those uses are worth accelerating several times over.
 //!
 //! The general rule still holds and is why this paragraph exists: a use added to the registry
 //! does not become live by being declared, and a call site does not become live by being written.

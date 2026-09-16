@@ -17,8 +17,10 @@
 #
 # # What this measures, stated exactly, because the first version overclaimed it twice
 #
-# ONE POSTGRES ROUND TRIP running `SELECT 1` over loopback TCP to a cluster on this same
-# machine. That is the whole claim.
+# THREE STATEMENTS against a cluster on this same machine over loopback TCP: a bare `SELECT 1`,
+# one autocommit indexed lookup, and one SCOPED read shaped exactly as `begin_scoped` plus a
+# join issues it, under row-level security. Each is a strict superset of the one before, which
+# is what lets a reader see where the cost sits instead of taking a ratio on trust.
 #
 # It was previously labelled "the FLOOR for any accelerator hop", which was wrong in two
 # separate ways that a review caught. It is not a floor: the figure is a MEAN over the run, and
@@ -31,10 +33,14 @@
 # should substitute their own hop cost; this number is offered as a concrete example of what a
 # hop costs, not as a bound on what every hop costs.
 #
-# What it IS good for is the comparison in docs/UNIT-COSTS.md: rendering the published JWKS
-# document costs under a microsecond of net saving, and this shows what asking another process
-# instead costs on the most favourable topology there is, one where the other process is on the
-# same machine.
+# NOR IS IT "the most favourable topology there is", which this header used to claim. A unix
+# socket is cheaper than loopback TCP, and the hot-state seam admits an in-process tier that
+# costs no socket at all. Loopback TCP is the topology an accelerator in a separate process on
+# the same host has, which is the one worth pricing, not a lower bound over all of them.
+#
+# What these ARE good for is the comparison in docs/UNIT-COSTS.md: what a cache hit can save is
+# whatever an operation costs ABOVE one round trip, and these price that for the two shapes of
+# read this codebase actually performs.
 set -uo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)" || {
@@ -130,11 +136,18 @@ measure_latency() {
         "$statement" "$statements" > "$WORK/stmt.sql" || return 1
     python3 -c "import sys;print((sys.argv[1]+'\n')*500)" "$statement" > "$WORK/warm.sql" || return 1
     "${PG_BIN}/psql" -h 127.0.0.1 -p "$PORT" -U ironauth_super -q -t -A \
-        -f "$WORK/warm.sql" postgres >/dev/null 2>&1
+        -v ON_ERROR_STOP=1 -f "$WORK/warm.sql" postgres >/dev/null 2>&1 || {
+        echo "::error::socket-rtt-bench: psql failed during warm-up" >&2
+        return 1
+    }
     started="$(python3 -c 'import time;print(time.monotonic())')"
+    # ON_ERROR_STOP=1, because psql exits 0 after a failed statement without it. A typo in the
+    # SQL, or a table the seed did not create, would otherwise have every iteration error out
+    # fast and the timing published as a plausible-looking low number. A benchmark that cannot
+    # tell "ran quickly" from "failed quickly" reports the failure as a good result.
     "${PG_BIN}/psql" -h 127.0.0.1 -p "$PORT" -U ironauth_super -q -t -A \
-        -f "$WORK/stmt.sql" postgres >/dev/null 2>&1 || {
-        echo "::error::socket-rtt-bench: psql failed" >&2
+        -v ON_ERROR_STOP=1 -f "$WORK/stmt.sql" postgres >/dev/null 2>&1 || {
+        echo "::error::socket-rtt-bench: psql failed while measuring" >&2
         return 1
     }
     ended="$(python3 -c 'import time;print(time.monotonic())')"
@@ -144,44 +157,90 @@ measure_latency() {
         "$started" "$ended" "$statements"
 }
 
-# THE SECOND MEASUREMENT IS THE ONE THE ACCELERATOR QUESTION ACTUALLY NEEDS.
+# WHAT AN ACCELERATOR WOULD ACTUALLY REPLACE, which is not one statement.
 #
-# `SELECT 1` prices the round trip and nothing else. What an accelerator would replace is not a
-# round trip: it is a REAL single-row lookup by key, which is what a token introspection, a
-# client load or a tenant config read does. If that lookup costs about what a bare round trip
-# costs, then putting a cache on the same machine in front of it saves nothing, and the seam
-# only pays where the accelerator is genuinely faster than the database rather than merely
-# closer.
+# The first version of this script measured `SELECT 1` against one autocommit indexed lookup and
+# concluded a cache could save only the difference. A review measured the real thing and the
+# conclusion inverted. NO READ IN THIS CODEBASE IS AN AUTOCOMMIT STATEMENT: every scoped read
+# goes through `begin_scoped`, which issues BEGIN, `SET TRANSACTION ISOLATION LEVEL READ
+# COMMITTED`, and two `SELECT set_config(...)` calls to bind the row-level-security scope, then
+# the query, then COMMIT. Six sequential round trips, and the query itself is a join against
+# tables under FORCE ROW LEVEL SECURITY whose policies re-read those settings.
 #
-# A NARROW TABLE WITH A UNIQUE INDEX and a row that exists, because that is the shape of the
-# reads in question and a miss would measure something else. Seeded small on purpose: this is
-# the cost of the round trip plus an index descent, not a benchmark of Postgres under volume.
-"${PG_BIN}/psql" -h 127.0.0.1 -p "$PORT" -U ironauth_super -q -f - postgres >/dev/null 2>&1 <<'SEED' || {
-CREATE TABLE lookup_probe (k text PRIMARY KEY, v text NOT NULL);
-INSERT INTO lookup_probe
-SELECT 'k' || g, repeat('v', 64) FROM generate_series(1, 10000) AS g;
-ANALYZE lookup_probe;
+# It is 550 call sites against 16 direct-pool reads, so this is the shape of essentially every
+# read the accelerator question is about, and the autocommit figure describes none of them.
+#
+# So three statements are measured, each a strict superset of the one before, and publishing all
+# three is what lets a reader see where the cost actually sits rather than taking a ratio on
+# trust.
+"${PG_BIN}/psql" -h 127.0.0.1 -p "$PORT" -U ironauth_super -q -v ON_ERROR_STOP=1 \
+    -f - postgres >/dev/null 2>&1 <<'SEED' || {
+CREATE TABLE probe_grants (
+    tenant_id text NOT NULL,
+    environment_id text NOT NULL,
+    grant_id text PRIMARY KEY,
+    subject text NOT NULL
+);
+CREATE TABLE probe_tokens (
+    tenant_id text NOT NULL,
+    environment_id text NOT NULL,
+    token_hash text PRIMARY KEY,
+    grant_id text NOT NULL,
+    expires_at timestamptz NOT NULL,
+    scope text NOT NULL
+);
+INSERT INTO probe_grants
+SELECT 't1', 'e1', 'g' || g, 's' || g FROM generate_series(1, 10000) AS g;
+INSERT INTO probe_tokens
+SELECT 't1', 'e1', encode(sha256(('t' || g)::bytea), 'hex'), 'g' || g,
+       now() + interval '1 hour', 'openid profile'
+FROM generate_series(1, 10000) AS g;
+-- FORCE, and as a non-owner role, because a policy the connecting role bypasses costs nothing
+-- and would measure a read this codebase does not perform.
+ALTER TABLE probe_tokens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE probe_tokens FORCE ROW LEVEL SECURITY;
+ALTER TABLE probe_grants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE probe_grants FORCE ROW LEVEL SECURITY;
+CREATE POLICY probe_tokens_scope ON probe_tokens USING (
+    tenant_id = current_setting('ironauth.tenant_id', true)
+    AND environment_id = current_setting('ironauth.environment_id', true)
+);
+CREATE POLICY probe_grants_scope ON probe_grants USING (
+    tenant_id = current_setting('ironauth.tenant_id', true)
+    AND environment_id = current_setting('ironauth.environment_id', true)
+);
+CREATE ROLE probe_app LOGIN;
+GRANT SELECT ON probe_tokens, probe_grants TO probe_app;
+ANALYZE probe_tokens;
+ANALYZE probe_grants;
 SEED
-    echo "::error::socket-rtt-bench: could not seed the lookup table" >&2
+    echo "::error::socket-rtt-bench: could not seed the lookup tables" >&2
     exit 1
 }
 
-LATENCY="$(measure_latency "SELECT 1;")" || exit 1
-LOOKUP="$(measure_latency "SELECT v FROM lookup_probe WHERE k = 'k5000';")" || exit 1
+# ON_ERROR_STOP=1 ABOVE IS LOAD-BEARING. Without it psql exits 0 after a failed statement, so
+# the guard could not fire and the script would go on to measure against tables that do not
+# exist, publishing whatever the error path happened to produce.
+PROBE_KEY="$("${PG_BIN}/psql" -h 127.0.0.1 -p "$PORT" -U ironauth_super -q -t -A \
+    -c "SELECT encode(sha256('t5000'::bytea), 'hex')" postgres 2>/dev/null)"
+if [ -z "$PROBE_KEY" ]; then
+    echo "::error::socket-rtt-bench: could not compute the probe key" >&2
+    exit 1
+fi
 
-# THE HOST IS NAMED, because an archived latency that cannot be attributed to a machine is a
-# number nobody can compare anything against. The block used to be titled "host" and identify
-# none.
-echo "socket-rtt-bench: host"
-echo "  cpu       $(sysctl -n machdep.cpu.brand_string 2>/dev/null \
-    || sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -1 \
-    || echo unknown)"
-echo "  kernel    $(uname -smr 2>/dev/null || echo unknown)"
-echo "  postgres  $("${PG_BIN}/postgres" --version 2>/dev/null || echo unknown)"
-echo "  seconds   $SECONDS_TO_RUN"
-echo "  path      loopback TCP to 127.0.0.1"
-echo "  method    $METHOD"
-echo
+LATENCY="$(measure_latency "SELECT 1;")" || exit 1
+LOOKUP="$(measure_latency "SELECT scope FROM probe_tokens WHERE token_hash = '$PROBE_KEY';")" || exit 1
+# THE SCOPED READ, statement for statement as `begin_scoped` plus one join issues it. pgbench
+# sends each line separately and reports per-ITERATION latency, so this is the full sequence.
+SCOPED="$(measure_latency "BEGIN;
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SELECT set_config('ironauth.tenant_id', 't1', true);
+SELECT set_config('ironauth.environment_id', 'e1', true);
+SELECT t.scope, t.grant_id, g.subject, EXTRACT(EPOCH FROM t.expires_at)::bigint
+  FROM probe_tokens t LEFT JOIN probe_grants g ON g.grant_id = t.grant_id
+ WHERE t.token_hash = '$PROBE_KEY';
+COMMIT;")" || exit 1
+
 # MICROSECONDS, because the figures these are compared against are quoted in microseconds and a
 # reader should not have to convert one side by hand.
 #
@@ -200,16 +259,41 @@ to_micros() {
 # warns about, in the guard written to prevent it.
 RTT_US="$(to_micros "$LATENCY")"
 LOOKUP_US="$(to_micros "$LOOKUP")"
-if [ -z "$RTT_US" ] || [ -z "$LOOKUP_US" ]; then
+SCOPED_US="$(to_micros "$SCOPED")"
+if [ -z "$RTT_US" ] || [ -z "$LOOKUP_US" ] || [ -z "$SCOPED_US" ]; then
     echo "::error::socket-rtt-bench: could not convert a latency to microseconds" >&2
     exit 1
 fi
 
-echo "socket-rtt-bench: what asking the database costs, on this machine"
-printf '  %-46s %8s us\n' "bare round trip (SELECT 1)" "$RTT_US"
-printf '  %-46s %8s us\n' "one indexed single-row lookup by key" "$LOOKUP_US"
+# THE HOST IS NAMED, because an archived latency that cannot be attributed to a machine is a
+# number nobody can compare anything against. (This block was lost in a rewrite of the section
+# below and is restored here.)
+echo "socket-rtt-bench: host"
+echo "  cpu       $(sysctl -n machdep.cpu.brand_string 2>/dev/null \
+    || sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -1 \
+    || echo unknown)"
+echo "  kernel    $(uname -smr 2>/dev/null || echo unknown)"
+echo "  postgres  $("${PG_BIN}/postgres" --version 2>/dev/null || echo unknown)"
+echo "  path      loopback TCP to 127.0.0.1"
+echo "  method    $METHOD"
+if [ -x "${PG_BIN}/pgbench" ]; then
+    echo "  duration  ${SECONDS_TO_RUN}s per statement"
+else
+    # NOT "seconds", which the header printed on both paths while psql times a fixed COUNT and
+    # never reads SECONDS_TO_RUN. A run parameter that does not apply is worse than none.
+    echo "  duration  ${RTT_STATEMENTS:-20000} iterations per statement"
+fi
 echo
-echo "socket-rtt-bench: both are MEANS, not floors, and both include Postgres parse, plan and"
-echo "socket-rtt-bench: execute. The gap between them is what an index descent and a row fetch"
-echo "socket-rtt-bench: cost ON TOP of the round trip, which is the number that decides whether"
-echo "socket-rtt-bench: a same-machine cache in front of such a read can save anything at all."
+echo "socket-rtt-bench: what asking the database costs, on this machine"
+printf '  %-52s %8s us\n' "bare round trip (SELECT 1)" "$RTT_US"
+printf '  %-52s %8s us\n' "one autocommit indexed lookup" "$LOOKUP_US"
+printf '  %-52s %8s us\n' "one SCOPED read (begin_scoped + a join, under RLS)" "$SCOPED_US"
+echo
+echo "socket-rtt-bench: all three are MEANS over the run, not floors, taken by one client with"
+echo "socket-rtt-bench: no other load. A contended database is slower and the gaps widen."
+echo "socket-rtt-bench: THE THIRD ROW IS THE ONE TO SIZE AN ACCELERATOR AGAINST. No read in"
+echo "socket-rtt-bench: IronAuth is an autocommit statement: every scoped read pays BEGIN, an"
+echo "socket-rtt-bench: isolation level, two set_config calls and a COMMIT around its query."
+echo "socket-rtt-bench: A cache hit replaces that whole sequence with one round trip of its own,"
+echo "socket-rtt-bench: so what it saves is the third row minus a hop, not the second minus the"
+echo "socket-rtt-bench: first."

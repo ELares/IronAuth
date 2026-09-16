@@ -8950,76 +8950,64 @@ sentence told an operator not to model it.
 A sizing guide needs the cost of asking something else, not only the cost of doing the work,
 because that is what decides whether a cache in front of an operation pays for itself.
 
-| published keys | render | parse on a hit | net saved by a hit |
-|---|---|---|---|
-| EdDSA only | 0.55 us | 0.55 to 0.57 us | -0.02 to 0.00 us |
-| EdDSA + ES256 + RS256 (a fresh environment) | 1.97 to 1.98 us | 1.36 to 1.38 us | 0.59 to 0.62 us |
-| the same three, one rotation each (six published) | 3.51 to 3.70 us | 2.69 to 2.77 us | 0.74 to 1.01 us |
-
-| asking another process, loopback TCP, same machine | measured |
+| operation | measured |
 |---|---|
-| bare round trip (`SELECT 1`) | 21 us |
-| one indexed single-row lookup by key | 29 us |
-| **the query work alone** (the difference) | **8 us** |
+| render the published JWKS, EdDSA only | 0.55 us |
+| render the published JWKS, three keys (a fresh environment) | 1.97 to 1.98 us |
+| parse and accept a cached JWKS on a hit, three keys | 1.36 to 1.38 us |
+| **net saved by a JWKS cache hit, three keys** | **0.59 to 0.62 us** |
 
-Three algorithms is what a fresh environment publishes, not two: provisioning mints EdDSA,
-ES256 and RS256 and publishes all three from the environment's creation instant. The six-key row
-is one rotation of each, whose predecessors stay published for a window.
+| asking the database, loopback TCP, same machine | measured |
+|---|---|
+| bare round trip (`SELECT 1`) | 20 us |
+| one autocommit indexed lookup | 32 us |
+| **one SCOPED read: `begin_scoped` plus a join, under RLS** | **158 us** |
 
-Both are MEANS over the run, not floors, and both include Postgres parsing, planning and
-executing, so a bare socket exchange on this hardware is cheaper than either. Neither is a figure
-for a Redis-shaped accelerator, which speaks a lighter protocol; nothing here measures one. They
-are offered as a concrete example of what asking another process costs on the most favourable
-topology there is, where that process is on the same machine.
+All are MEANS over a run by one client with no other load. A contended database is slower and
+the gaps widen. They are not figures for a Redis-shaped accelerator, which speaks a lighter
+protocol; nothing here measures one.
 
-The third row is the one that generalises. **A CACHE SAVES THE WORK, NEVER THE HOP**: a hit
-still pays a round trip to the cache, so the most it can return is the difference between the
-two. On this machine a single-row indexed read is 29 us, of which 21 us is the round trip and
-8 us is the index descent and row fetch. An accelerator co-located with the application cannot
-save the 21 us, because it costs its own.
+### The third row is the one to size an accelerator against
 
-So the seam pays when one of three things is true, and not otherwise: the WORK is large (a
-complex query, a join, a scan, an Argon2 verification), the DATABASE IS FAR and the cache is
-near, or the database is CONTENDED and the cache is not. A single-row lookup against a
-co-located database is none of those, and putting a same-machine cache in front of one saves
-at most 8 us against a 21 us hop.
+An earlier revision of this section published the middle row as what a cache would replace and
+concluded that the seam could save only the 12 us between it and a bare round trip. That was
+wrong, and wrong in the direction that suppresses the work.
 
-**That settles an open question in issue #146.** `IssuerRegistry` holds an optional hot-state
-accelerator for the published JWKS document, and no shipped binary installs one. The natural
-reading is that the boot wiring was never finished. The measurement says otherwise.
+NO READ IN IRONAUTH IS AN AUTOCOMMIT STATEMENT. Every scoped read goes through `begin_scoped`,
+which issues `BEGIN`, `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`, and two
+`SELECT set_config(...)` calls binding the row-level-security scope, then the query, then
+`COMMIT`. Six sequential round trips, around a query whose tables are under FORCE ROW LEVEL
+SECURITY with policies that re-read those settings. It is 550 call sites against 16 direct-pool
+reads, so the autocommit figure describes essentially nothing this codebase does.
 
-`jwks_json` consults the accelerator only AFTER `resolve_for_publication` has returned the
-entry, and deliberately: everything that decides WHETHER to publish has to run first, so a
-fenced scope is refused and a stale entry is never served. The safety ordering is right. Its
-consequence is that a hit cannot save a database read, because the read that produced the entry
-has already happened.
+A cache hit replaces that whole sequence with one round trip of its own. So the saving is the
+third row minus a hop, about **138 us against a 20 us hop, roughly seven to one in favour of the
+accelerator**, and more on a contended database.
 
-What a hit saves is the render, and what it ADDS is the cost of accepting the bytes: a UTF-8
-check and a full JSON validation parse that `issuer.rs` keeps deliberately, because without it
-the endpoint served any UTF-8 bytes found under that key as the environment's JWK Set. A miss
-never pays that. So the saving is the render minus the parse, which is the last column above,
-and for a fresh environment it is about 0.6 us.
+### What that means, use by use
 
-Against a 20 us round trip that is roughly thirty times the cost of the thing it replaces, on
-the most favourable topology, with the database on the same machine. At one published key the
-net saving is NEGATIVE: accepting a cache hit costs marginally more CPU than rendering from the
-entry the caller is already holding, before any hop is paid for at all.
+**Scoped reads are worth accelerating.** Introspection resolves an opaque access token through
+`resolve_opaque_access_token`, which is one of those six-round-trip sequences. A tenant config
+read would be another. For these the hop is bought back several times over, and the earlier
+conclusion here said the opposite.
 
-Wiring the accelerator at this call site would make the JWKS endpoint slower. "Not wired" is
-the faster configuration rather than the unfinished one.
+**The JWKS document is still not**, and for a reason that has nothing to do with the figures
+above. `jwks_json` consults its hot state only AFTER `resolve_for_publication` has returned the
+entry, deliberately, so that a fenced scope is refused and a stale entry never served. The entry
+is already in hand by then, so a hit cannot save a read of any shape: it saves the render, and it
+adds the validation parse a hit must pay. That is the first table, netting about 0.6 us against a
+20 us hop, and it is negative at one published key.
 
-This does not say the hot-state seam is not worth having. It says this USE is not, and it
-sharpens what an earlier version of this section offered as the rule. That rule was "a hop pays
-when the alternative is a database read", which the third row above shows is too generous: the
-alternative has to be a database read whose WORK exceeds a hop, and a single-row lookup on the
-same machine is not one.
+**The rate counter is a different question entirely.** Sharing it across nodes buys fleet-wide
+correctness that no local answer provides at any speed, so the hop is not being traded against
+latency at all.
 
-By that measure the remaining registry uses split cleanly. The ones keyed on a single indexed
-read, such as a tenant config or an introspection result, save about 8 us on a co-located
-deployment and are not worth a hop there, though they become worth one as soon as the database
-is remote or contended. The rate counter is the different case, and the strongest: sharing it
-across nodes buys fleet-wide correctness that no local answer provides at any speed, so the hop
-is not being traded against latency at all.
+### The rule, restated
+
+A cache hit costs a round trip, so it can only return what the operation costs ABOVE one round
+trip. The question is never "is the alternative a database read" but "how much work does that
+read do beyond a single hop". A six-round-trip scoped transaction does a great deal; a render off
+an entry already resolved does almost none.
 
 ## What this does not yet cover
 

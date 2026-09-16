@@ -16,11 +16,14 @@
 # section now records the size of it: re-running the example put six of its ten published
 # figures outside their own ranges.
 #
-# It is also how a measurement nobody had taken settled an open design question. Reading
-# `issuer.rs` is what establishes WHAT a cache hit in front of the published JWKS document can
-# save, which is a render minus a validation parse and never a database read. Only measuring
-# says whether that is worth a hop, and the render and round-trip benchmarks below are the two
-# sides of it. They came out roughly thirty to one against, which docs/UNIT-COSTS.md records.
+# It is also how a measurement nobody had taken settled an open design question, and then how a
+# better one reversed half of the answer. Reading `issuer.rs` establishes WHAT a cache hit in
+# front of the published JWKS document can save, which is a render minus a validation parse and
+# never a database read; measured, that is about 0.6 us against a 20 us hop, so the JWKS
+# accelerator stays unwired. The first version of the round-trip benchmark then generalised that
+# to every use by measuring an autocommit lookup, and a review found no read in this codebase is
+# one: a scoped read pays six round trips around a query under row-level security and measures
+# 158 us, which a hit is very much worth replacing. Both figures are below.
 #
 # # Every benchmark reports RAN, SKIPPED, or FAILED, and a SKIP IS NOT SILENT
 #
