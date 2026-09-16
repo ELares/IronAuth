@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `/readyz` now SPEAKS THE DATABASE PROTOCOL rather than opening a socket (issue #149).
+  `ReadinessProbe::with_database_probe` takes a `DatabaseProbe` and readiness asks it for a
+  real query; without one the socket check remains and the body reports `probe=socket-only`
+  so the weaker answer cannot pass for the stronger.
+
+  BREAKING for direct users of the enum: `Readiness::Ready` now carries a `ProbeDepth` and
+  `Readiness::Degraded` carries one alongside its tier. A new `Readiness::SchemaNotReady`
+  answers 503 with `not ready: schema not migrated`, kept separate from
+  `not ready: database unreachable` because the two page different people. The healthy body
+  is unchanged (`ready`), and `not ready: database address unreachable (provisional check
+  until #7)` loses its stale reference to a long-closed issue.
+
 - The observability middleware now stamps the POLICY-RESOLVED client IP on
   `PEER_IP_HEADER` for the off-by-default peer-IP session binding (issue #32). It
   `insert`s (never appends), REPLACING any value a client supplied, so the downstream

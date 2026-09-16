@@ -1120,14 +1120,14 @@ jobs:
           kubectl rollout status deployment/postgres --timeout=300s
       # THE THREE ROLES THE SCHEMA GRANTS TO, and then the migration. The chart runs neither.
       #
-      # THE GAP IS WORSE THAN "PODS FAIL READINESS", which is what an earlier version of this
-      # comment claimed. `/readyz` opens a TCP connection to the database address and speaks
-      # no protocol (`readiness.rs`: "no bytes are exchanged and no database protocol is
-      # spoken"), so a `helm install` against a fresh, unmigrated, role-less database brings
-      # every pod up READY. The missing migration is SILENT, not loud, and an operator gets
-      # three replicas Kubernetes reports as healthy.
+      # THE GAP USED TO BE SILENT AND IS NOW LOUD, which is the third thing this comment has
+      # said and the first that matches the code. It first claimed pods would fail readiness;
+      # that was false while `/readyz` was a TCP connect that spoke no protocol, so a `helm
+      # install` against a fresh, unmigrated, role-less database brought every pod up READY.
       #
-      # So this step is not load-bearing for the install: deleting it leaves the job green.
+      # Issue #149 made readiness query the serving pool, so an unmigrated database now answers
+      # 503 `not ready: schema not migrated` and the pods stay out of the Service. This step is
+      # therefore load-bearing again: without it the rollout below never becomes ready.
       # It is here because it is what an operator has to do, and because it proves `ironauth
       # migrate` runs from the FROM-scratch image against a real Postgres.
       - name: Provision roles and migrate
@@ -1221,11 +1221,15 @@ jobs:
           echo "ready=$ready desired=$desired"
           test "$desired" -ge 2
           test "$ready" = "$desired"
-      # READINESS IS NOT EVIDENCE OF WORK. `/readyz` opens a TCP connection to the database
-      # address and speaks no protocol, so all three replicas report Ready whether the schema
-      # is migrated, the credential is right, or the database even exists. An assertion that
-      # stopped at the replica count would pass against
-      # `postgres://wrong:wrong@postgres:5432/does_not_exist`.
+      # READINESS IS STILL NOT EVIDENCE OF WORK, though it is now evidence of a database.
+      # `/readyz` used to open a TCP connection and speak no protocol, so all three replicas
+      # reported Ready whether the schema was migrated, the credential was right, or the
+      # database even existed, and an assertion stopping at the replica count would have passed
+      # against `postgres://wrong:wrong@postgres:5432/does_not_exist`.
+      #
+      # Issue #149 closed that specific hole: readiness runs a query on the serving pool, so
+      # those three cases now fail the probe. What a green probe still does not prove is that
+      # any PROTOCOL SURFACE works, which is what this job is checking.
       #
       # So the job asks the deployment a question only a served request can answer, through
       # the Service, which also proves the Service selects the pods.

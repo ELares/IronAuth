@@ -7934,14 +7934,20 @@ conclusion with no change to the code being measured.
 
 **startup to ready** is wall time from `exec()` to the FIRST `/readyz` that answers ready.
 
-What that proves is narrower than an earlier version of this document claimed. It said readiness
-came after "the first database round trip". It does not: `ReadinessProbe::probe` is a bare
-`TcpStream::connect` to the configured Postgres address, and its own doc comment says "no bytes
-are exchanged and no database protocol is spoken". The harness starts Postgres before the loop,
-so that connect succeeds immediately and readiness fires when the management listener binds. The
-review confirmed it live: `/readyz` answered `ready` against a database holding zero tables.
+What that proves has changed, and this paragraph has now been wrong in both directions, so it is
+worth being exact. It first claimed readiness came after "the first database round trip", which
+was false: the probe was a bare `TcpStream::connect` whose own comment said "no bytes are
+exchanged and no database protocol is spoken", and a review confirmed `/readyz` answering `ready`
+against a database holding zero tables.
 
-So this is process start to listener-up, with the Postgres address proven TCP-reachable. That is
+Issue #149 replaced that. `ReadinessProbe` now asks a `DatabaseProbe` for a real query on the
+serving pool, so the first `ready` does come after a completed round trip, and a pod whose schema
+is unmigrated answers 503 instead. THE FIGURES BELOW PREDATE THAT and were measured against the
+socket check, so they are process start to listener-up rather than to first-query. They are a
+floor for the current build, and re-measuring them is what the release benchmark lane is for.
+
+So the numbers below are process start to listener-up, with the Postgres address proven
+TCP-reachable. That is
 a real number and it is NOT time-to-serving-traffic. An operator sizing a rollout on it should
 know the pool has not yet spoken a byte of protocol.
 

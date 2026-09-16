@@ -208,7 +208,12 @@ impl ScimState {
     }
 
     /// The store the resource handlers read and write through.
-    pub(crate) fn store(&self) -> &Store {
+    ///
+    /// PUBLIC so the binary can hand readiness a pool that a request would actually wait on
+    /// (issue #149). A SCIM-only deployment holds this and no other, and before it was reachable
+    /// such a deployment kept the socket check `/readyz` is moving away from.
+    #[must_use]
+    pub fn store(&self) -> &Store {
         &self.inner.store
     }
 
