@@ -412,6 +412,24 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // GIVE READINESS A DATABASE IT CAN SPEAK TO (issue #149). Until this, `/readyz` opened a
+        // socket to the configured address and called that ready, which reported a deployment
+        // with wrong credentials, no such database, a role missing its grants, or an unmigrated
+        // schema as healthy. In Kubernetes terms `readyReplicas == desired` against a pod that
+        // could not answer one query.
+        //
+        // `readiness_store` is `None` only when NO plane mounted, which is a server offering
+        // health, readiness and metrics alone. There is no pool to ask then, and the probe keeps
+        // the socket check and prints `probe=socket-only` rather than claiming a query.
+        if let Some(store) = planes.readiness_store.clone() {
+            server = server.with_database_probe(std::sync::Arc::new(StoreReadinessProbe { store }));
+            tracing::info!("readiness probes the database with a query on the serving pool");
+        } else {
+            tracing::warn!(
+                "readiness has NO database probe: no plane mounted, so there is no serving pool \
+                 to ask. /readyz falls back to a socket check and reports probe=socket-only."
+            );
+        }
         // Mount the management API (issue #11) on the management plane. The state was
         // assembled above; mounting is all this adds, which is why the assembly is a
         // separate step the boot-wiring harness can observe.
@@ -858,6 +876,57 @@ impl DataPlaneSurfaces {
 /// what each plane actually holds. Mounting turns both into opaque `Router`s, which is
 /// why deleting an install, or handing one plane a different value than the other, used
 /// to build with zero warnings.
+/// The database check `/readyz` asks, backed by the serving store (issue #149).
+///
+/// # Why this holds the SERVING store rather than opening its own
+///
+/// `ironauth_server::readiness::DatabaseProbe` requires a pooled connection, and the reason is
+/// the whole point of the change: a probe that dials a fresh connection reports whether a NEW
+/// connection can be made, while the pool requests are actually served from could be exhausted
+/// or holding handles to a server that has since restarted. This is a clone of the handle the
+/// data plane serves from, so it shares that pool.
+#[derive(Clone)]
+struct StoreReadinessProbe {
+    store: Store,
+}
+
+// HAND-WRITTEN, because `Store` is not `Debug` and should not become so for this: it holds a
+// pool and a master key, and the second must never reach a log line. This prints the type and
+// nothing it wraps.
+impl std::fmt::Debug for StoreReadinessProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StoreReadinessProbe")
+    }
+}
+
+impl ironauth_server::readiness::DatabaseProbe for StoreReadinessProbe {
+    fn check(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = ironauth_server::readiness::DatabaseHealth>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            use ironauth_server::readiness::DatabaseHealth;
+            match self.store.probe_readiness().await {
+                Ok(ironauth_store::SchemaReadiness::Serving) => DatabaseHealth::Serving,
+                Ok(ironauth_store::SchemaReadiness::NotMigrated) => DatabaseHealth::SchemaNotReady,
+                // LOGGED HERE, because `DatabaseHealth::Unreachable` deliberately collapses
+                // every cause into one state for the orchestrator. The error text is the only
+                // thing that tells an operator WHICH cause, so it must not be dropped on the
+                // floor between the store and the probe.
+                Err(error) => {
+                    tracing::warn!(%error, "readiness: the database did not answer");
+                    DatabaseHealth::Unreachable
+                }
+            }
+        })
+    }
+}
+
 struct AssembledPlanes {
     /// The management plane's state, or `None` when the management API does not mount.
     management: Option<AdminState>,
@@ -865,6 +934,12 @@ struct AssembledPlanes {
     oidc: Option<OidcPlane>,
     /// The SCIM inbound plane, or `None` when it is disabled or cannot mount.
     scim: Option<ScimPlane>,
+    /// A serving store handle for the readiness probe (issue #149), when any plane opened one.
+    ///
+    /// `None` when NO plane mounted, which is a deployment serving only health, readiness and
+    /// metrics. Readiness then keeps the socket check and says so in its body, because there is
+    /// no pool to ask and claiming a query was run would be the false report this replaced.
+    readiness_store: Option<Store>,
 }
 
 /// Assemble BOTH planes from the one loaded config (issue #414).
@@ -960,10 +1035,24 @@ async fn assemble_planes(
         }
         (management, _) => management,
     };
+    // THE STORE READINESS WILL ASK, taken from the plane that serves requests (issue #149).
+    //
+    // `OidcState::store()` is the handle the data plane serves from, so the probe shares its
+    // pool rather than opening a second one. That is the property the probe's contract asks
+    // for: a fresh connection can succeed while the pool a request would wait on is exhausted
+    // or holding handles to a server that has since restarted.
+    //
+    // NO FALLBACK TO A NEWLY OPENED STORE when no plane mounted. Opening one here would answer
+    // a question about a pool nothing serves from, which is the same class of wrong answer as
+    // the socket check this replaces. Readiness keeps the socket check in that case and prints
+    // that it did.
+    let readiness_store = oidc.as_ref().map(|plane| plane.state.store().clone());
+
     Ok(AssembledPlanes {
         management,
         oidc,
         scim,
+        readiness_store,
     })
 }
 

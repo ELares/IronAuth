@@ -1954,6 +1954,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0229_tenant_quota_limits.sql"),
         },
+        // EXPAND, and it has to be: this grants a read the NEW binary's readiness probe needs,
+        // and during a rolling upgrade the migration lands before that binary serves. An old
+        // replica is unaffected, because nothing it runs reads the ledger.
+        Migration {
+            version: 230,
+            name: "readiness_can_read_the_ledger",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0230_readiness_can_read_the_ledger.sql"),
+        },
     ]
 }
 

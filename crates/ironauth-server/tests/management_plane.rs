@@ -220,11 +220,146 @@ async fn readyz_reports_each_degraded_tier_distinctly() {
 async fn readyz_for(extra: &str) -> (StatusCode, String) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to listen on");
     let port = listener.local_addr().expect("a bound address").port();
+    // A SERVING DATABASE PROBE, so these cases have the shape a real deployment has: the
+    // database answers and an OPTIONAL component is what went missing. Without one the server
+    // falls back to the socket check and every case here would be measuring that instead,
+    // which is not what a degraded tier is about (issue #149).
     let server = server_from(&format!(
         "[database]\nurl = \"postgres://ironauth@127.0.0.1:{port}/ironauth\"\n{extra}"
-    ));
+    ))
+    .with_database_probe(std::sync::Arc::new(FixedProbe(
+        ironauth_server::DatabaseHealth::Serving,
+    )));
     let (status, _, body) = get(server.management_app(), "/readyz").await;
     // Held until here so the port cannot be reused between bind and probe.
     drop(listener);
     (status, body)
+}
+
+/// A database probe that answers whatever the test needs, so the readiness contract can be
+/// driven through every state without a real Postgres in the loop (issue #149).
+#[derive(Debug)]
+struct FixedProbe(ironauth_server::DatabaseHealth);
+
+impl ironauth_server::DatabaseProbe for FixedProbe {
+    fn check(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = ironauth_server::DatabaseHealth> + Send + '_>,
+    > {
+        let health = self.0;
+        Box::pin(async move { health })
+    }
+}
+
+/// A probe that never answers, so the readiness timeout can be exercised.
+#[derive(Debug)]
+struct HangingProbe;
+
+impl ironauth_server::DatabaseProbe for HangingProbe {
+    fn check(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = ironauth_server::DatabaseHealth> + Send + '_>,
+    > {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// `/readyz` with a database probe installed, against a REACHABLE address.
+///
+/// The address matters: it is a live listener, so the socket check this replaced would say
+/// ready for every case below. Anything other than `ready` therefore proves the probe's answer
+/// reached the endpoint rather than the socket's.
+async fn readyz_with_probe(
+    probe: std::sync::Arc<dyn ironauth_server::DatabaseProbe>,
+) -> (StatusCode, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to listen on");
+    let port = listener.local_addr().expect("a bound address").port();
+    let server = server_from(&format!(
+        "[database]\nurl = \"postgres://ironauth@127.0.0.1:{port}/ironauth\"\n"
+    ))
+    .with_database_probe(probe);
+    let (status, _, body) = get(server.management_app(), "/readyz").await;
+    drop(listener);
+    (status, body)
+}
+
+/// THE DEFECT THIS CLOSES, stated as a test: a reachable socket in front of a database that
+/// cannot answer used to be `ready`.
+///
+/// Every case here points at a LIVE listener. Before the probe existed all four returned
+/// `200 ready`, which is how `readyReplicas == desired` could hold against a pod that could not
+/// complete a single query.
+#[tokio::test]
+async fn readyz_asks_the_database_rather_than_the_socket() {
+    use ironauth_server::DatabaseHealth;
+
+    // A database that refuses to answer is NOT ready, even though its socket accepts.
+    let (status, body) =
+        readyz_with_probe(std::sync::Arc::new(FixedProbe(DatabaseHealth::Unreachable))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body, "not ready: database unreachable\n");
+
+    // An unmigrated schema is NOT ready, and says so in its OWN words: it pages whoever owns
+    // the rollout rather than whoever owns the database.
+    let (status, body) = readyz_with_probe(std::sync::Arc::new(FixedProbe(
+        DatabaseHealth::SchemaNotReady,
+    )))
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body, "not ready: schema not migrated\n");
+
+    // A serving database is ready, and the body is UNCHANGED from before this seam existed, so
+    // nothing parsing `/readyz` moves when a deployment gains a probe.
+    let (status, body) =
+        readyz_with_probe(std::sync::Arc::new(FixedProbe(DatabaseHealth::Serving))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, "ready\n");
+}
+
+/// The two not-ready states are DISTINGUISHABLE, which is the whole reason they are separate.
+///
+/// Asserting each body in isolation would pass if both rendered the same string. This asserts
+/// they differ, so a later edit that collapses them fails here rather than silently sending an
+/// operator to the wrong runbook.
+#[tokio::test]
+async fn the_two_not_ready_states_do_not_render_alike() {
+    use ironauth_server::DatabaseHealth;
+    let (_, unreachable) =
+        readyz_with_probe(std::sync::Arc::new(FixedProbe(DatabaseHealth::Unreachable))).await;
+    let (_, unmigrated) = readyz_with_probe(std::sync::Arc::new(FixedProbe(
+        DatabaseHealth::SchemaNotReady,
+    )))
+    .await;
+    assert_ne!(unreachable, unmigrated);
+}
+
+/// A probe that never returns is bounded by the readiness timeout, and reports UNREACHABLE.
+///
+/// Not schema-not-ready: a check that did not finish learned nothing about the schema, and
+/// guessing the friendlier state is how a hung database reads as a rollout in progress.
+#[tokio::test]
+async fn a_hanging_probe_times_out_as_unreachable() {
+    let (status, body) = readyz_with_probe(std::sync::Arc::new(HangingProbe)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body, "not ready: database unreachable\n");
+}
+
+/// WITHOUT a probe the socket check remains, and the body ANNOUNCES that it is the weaker one.
+///
+/// This is the case the module header calls out: a fallback that renders identically to the
+/// real check lets the weaker pass for the stronger. A live listener is ready here, which is
+/// exactly the false positive the probe exists to remove, so the body must not read `ready`.
+#[tokio::test]
+async fn without_a_probe_readiness_says_it_only_checked_the_socket() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to listen on");
+    let port = listener.local_addr().expect("a bound address").port();
+    let server = server_from(&format!(
+        "[database]\nurl = \"postgres://ironauth@127.0.0.1:{port}/ironauth\"\n"
+    ));
+    let (status, _, body) = get(server.management_app(), "/readyz").await;
+    drop(listener);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, "ready: probe=socket-only\n");
 }

@@ -14,7 +14,7 @@ use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 
 use crate::AppState;
-use crate::readiness::Readiness;
+use crate::readiness::{ProbeDepth, Readiness};
 
 /// The repository's RFC 9116 `security.txt`, embedded so the binary is
 /// self-contained. Its validity and expiry are checked in CI.
@@ -68,22 +68,39 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     // the tier while the orchestrator keeps routing. It is a stable token rather than prose:
     // `degraded: accelerator_absent`.
     match state.readiness.probe().await {
-        Readiness::Ready => (
+        // `ready` UNCHANGED for the real check, so nothing that parses this body moves when a
+        // deployment gains a database probe. The weaker socket-only answer is the one that has
+        // to look different, because that is the one that could be mistaken for this.
+        Readiness::Ready(ProbeDepth::Query) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
             std::borrow::Cow::Borrowed("ready\n"),
+        ),
+        Readiness::Ready(depth) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            std::borrow::Cow::Owned(format!("ready: probe={}\n", depth.as_str())),
         ),
         Readiness::Degraded(tier) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
             std::borrow::Cow::Owned(format!("degraded: {}\n", tier.token())),
         ),
+        // THE PARENTHETICAL IS GONE. It read "(provisional check until #7)", and #7 closed
+        // long ago: a stale forward reference in an HTTP body an operator reads during an
+        // outage is worse than no explanation, because it sends them to a finished issue.
         Readiness::DatabaseUnreachable => (
             StatusCode::SERVICE_UNAVAILABLE,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            std::borrow::Cow::Borrowed(
-                "not ready: database address unreachable (provisional check until #7)\n",
-            ),
+            std::borrow::Cow::Borrowed("not ready: database unreachable\n"),
+        ),
+        // SEPARATE TOKEN, SEPARATE RUNBOOK. Unreachable pages whoever owns the database;
+        // schema-not-ready pages whoever owns the rollout, and is the expected transient state
+        // midway through one.
+        Readiness::SchemaNotReady => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            std::borrow::Cow::Borrowed("not ready: schema not migrated\n"),
         ),
     }
 }
