@@ -7873,12 +7873,16 @@ Source: docs/PERFORMANCE.md
 # Measured startup and idle footprint
 
 Issue #152 criterion 3 asks for RSS idle and startup time against the stated targets, with
-methodology and hardware class stated. These are measured, not estimated, and reproduced by
-one command:
+methodology and hardware class stated. These are measured, not estimated. Re-measure them with
+the one command that runs the whole benchmark harness:
 
 ```
-PG_BIN=<postgresql bin dir> scripts/startup-rss-bench.sh
+PG_BIN=<postgresql bin dir> scripts/bench.sh
 ```
+
+That runs every benchmark and writes each one's output under `target/bench/`; the release
+workflow runs it per release and archives the results. To re-measure only this document's
+numbers, `scripts/startup-rss-bench.sh` is the startup and RSS benchmark on its own.
 
 ## Results
 
@@ -7951,9 +7955,16 @@ and printed "within both targets" on a run whose own max exceeded one of them.
 
 ## What this does not yet cover
 
-Criterion 2 asks that CI run the harness per release, which needs a release pipeline. The
-harness has never run on Linux, and the defect above is a direct warning about that: a platform
-effect dominated the headline figure for an entire revision of this document.
+Criterion 2 asks that CI run the harness per release. It now does: the `bench` job in
+`.github/workflows/release.yml` runs `scripts/bench.sh` on every tag and archives the results,
+and on CI a benchmark that skips rather than runs fails the job, so a partial result set cannot
+report success.
+
+What that pipeline has not yet produced is a Linux number to publish. The figures below are still
+from a development machine, and the defect above is a direct warning about reading them as
+portable: a platform effect dominated the headline figure for an entire revision of this
+document. The first archived results from a release run are the ones to check this table
+against.
 
 The hardware class above is a development machine. A published sizing guide should be measured on
 the instance classes it recommends, and these numbers should be read as a floor rather than as a
@@ -8840,11 +8851,21 @@ Source: docs/UNIT-COSTS.md
 # Per-operation unit costs
 
 Issue #152 criterion 4 asks for per-operation unit costs with the Argon2id parameters stated.
-Measured, reproduced by one command:
+These are measured. RE-MEASURE THEM WITH THE ONE COMMAND THAT RUNS THE WHOLE BENCHMARK HARNESS:
 
 ```
-cargo run --release -p ironauth-oidc --example unit_costs
+PG_BIN=<postgresql bin dir> scripts/bench.sh
 ```
+
+It runs every benchmark and writes each one's output under `target/bench/`; the release workflow
+runs it per release and archives the results. To re-measure only this document's numbers,
+`cargo run --release -p ironauth-oidc --example unit_costs` is that benchmark on its own, and it
+needs no database, so it needs no `PG_BIN`.
+
+Re-measure, not reproduce. The ranges below were transcribed from two runs, and a single
+invocation produces single values rather than a range. More to the point, running that command
+today does not return these figures: see "what this does not yet cover" at the end, which records
+the comparison and why the example cannot yet be pinned to a repeatable number.
 
 ## Password hashing
 
@@ -8921,10 +8942,52 @@ sentence told an operator not to model it.
 ## What this does not yet cover
 
 Criterion 4 also asks that the sizing guide be GENERATED from CI benchmark output and regenerate
-on release. It is not: this table is hand-transcribed from the example's output, CI compiles the
-example but never runs it, and no gate compares the two. A review re-ran it and found the
-published figures off by 0.5 to 1.4 ms against a run-to-run spread of about 0.2 ms, which is how
-a hand-transcribed table drifts. Closing that needs the release pipeline criterion 2 asks for.
+on release. It is not. This table is still hand-transcribed, and it has drifted.
+
+Re-running the harness on the hardware class the table names (Apple M4 Pro, 10 performance and 4
+efficiency cores, release build) put six of the ten measured figures published above outside
+their own ranges:
+
+| figure | published | re-measured |
+|---|---|---|
+| OWASP default, verify | 10.4 to 10.6 ms | 11.3 ms |
+| config floor, verify | 2.2 ms | 2.3 ms |
+| config floor at the default iterations, verify | 4.3 ms | 4.4 ms |
+| double iterations, hash | 21.1 to 22.0 ms | 23.3 ms |
+| double iterations, verify | 21.0 to 21.8 ms | 22.9 ms |
+| RS256 mint | 317 to 318 us | 323.5 us |
+
+Of the four that landed inside their published range, three landed at the top of it. The
+derived headline above the tables moved with them: **94 to 96 logins per second per core
+published, 87 to 88 re-measured**.
+
+WHAT THIS DOES AND DOES NOT SHOW. Every gap above is a few percent: each re-measured figure sits
+between 1.7 and 6.6 percent past the TOP of its published range, all in the same direction. That is NOT the unpinned-core effect the section above measures. An
+efficiency core costs 62 to 66 ms per verify, a 5.7x spread, so a run that landed on one would be
+off by a factor rather than by a percent. Whatever moved these figures, it was not the scheduler
+handing the example a different kind of core.
+
+A few percent in one direction is what an ordinarily busy machine looks like, which is the point:
+these ranges are written to a precision that a developer machine does not hold still to, and the
+document says as much two sections up, that a single value "implies a precision these do not
+have". Two consecutive runs of the harness here reported 88 and 87 logins per second, at 11.3 and
+11.5 ms, without changing anything between them.
+
+So what this shows is narrow and worth stating exactly: the documented command does not return
+the documented numbers, which is the property criterion 2 asks for, and the published ranges are
+tighter than the measurement is repeatable. It does not show the code got slower, and the
+login-rate comparison is the one to be most careful with, because the table says one PERFORMANCE
+core while the harness reports whichever core it was given; those are not the same quantity.
+
+What criterion 2 added is the half that can be mechanical: the example now RUNS on every release
+rather than only being compiled, under one command, with its output archived.
+
+Generation needs two things this does not have. The first is core pinning, without which a
+generated table would reproduce the same unrepeatable figure more confidently. The second is
+hardware: a table generated from a shared CI runner would be reproducible and wrong for the
+instance classes this guide recommends. Closing criterion 4 needs a pinned run on the named
+instance classes, and the archived results from that run are what the table should be generated
+from.
 
 The hardware class above is a development machine. A published sizing guide should be measured on
 the instance classes it recommends.

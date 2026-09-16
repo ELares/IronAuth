@@ -1,12 +1,16 @@
 # Measured startup and idle footprint
 
 Issue #152 criterion 3 asks for RSS idle and startup time against the stated targets, with
-methodology and hardware class stated. These are measured, not estimated, and reproduced by
-one command:
+methodology and hardware class stated. These are measured, not estimated. Re-measure them with
+the one command that runs the whole benchmark harness:
 
 ```
-PG_BIN=<postgresql bin dir> scripts/startup-rss-bench.sh
+PG_BIN=<postgresql bin dir> scripts/bench.sh
 ```
+
+That runs every benchmark and writes each one's output under `target/bench/`; the release
+workflow runs it per release and archives the results. To re-measure only this document's
+numbers, `scripts/startup-rss-bench.sh` is the startup and RSS benchmark on its own.
 
 ## Results
 
@@ -79,9 +83,16 @@ and printed "within both targets" on a run whose own max exceeded one of them.
 
 ## What this does not yet cover
 
-Criterion 2 asks that CI run the harness per release, which needs a release pipeline. The
-harness has never run on Linux, and the defect above is a direct warning about that: a platform
-effect dominated the headline figure for an entire revision of this document.
+Criterion 2 asks that CI run the harness per release. It now does: the `bench` job in
+`.github/workflows/release.yml` runs `scripts/bench.sh` on every tag and archives the results,
+and on CI a benchmark that skips rather than runs fails the job, so a partial result set cannot
+report success.
+
+What that pipeline has not yet produced is a Linux number to publish. The figures below are still
+from a development machine, and the defect above is a direct warning about reading them as
+portable: a platform effect dominated the headline figure for an entire revision of this
+document. The first archived results from a release run are the ones to check this table
+against.
 
 The hardware class above is a development machine. A published sizing guide should be measured on
 the instance classes it recommends, and these numbers should be read as a floor rather than as a
