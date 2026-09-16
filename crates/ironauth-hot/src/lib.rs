@@ -38,7 +38,15 @@
 //! one round trip. The JWKS read is unusual in costing almost nothing above it, because the
 //! entry is already in hand. A SCOPED read is the opposite: `begin_scoped` pays BEGIN, an
 //! isolation level, two `set_config` calls and a COMMIT around a query under row-level security,
-//! measured at 158 us against a 20 us hop. Those uses are worth accelerating several times over.
+//! measured at 160 us against a 22 us hop. Those uses are worth accelerating several times over.
+//!
+//! BY A TIER THAT IS ACTUALLY A DIFFERENT STORE, which the Postgres one is not.
+//! `HotStateRepo::get` goes through `begin_scoped` as well, so a hit against `PgHotState` pays
+//! the same six round trips as the read it stands in front of: 131 us against 160 us, an
+//! eighteen per cent saving bought with a write on every miss and an invalidation feed to keep
+//! correct. In Postgres-only mode this seam is a SHARED-STATE mechanism and not a faster one,
+//! which is a real job -- flow state that survives the node that created it -- but it is not
+//! acceleration, and no wiring choice changes that.
 //!
 //! The general rule still holds and is why this paragraph exists: a use added to the registry
 //! does not become live by being declared, and a call site does not become live by being written.

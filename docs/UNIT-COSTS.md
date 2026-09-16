@@ -103,9 +103,10 @@ because that is what decides whether a cache in front of an operation pays for i
 
 | asking the database, loopback TCP, same machine | measured |
 |---|---|
-| bare round trip (`SELECT 1`) | 20 us |
+| bare round trip (`SELECT 1`) | 22 us |
 | one autocommit indexed lookup | 32 us |
-| **one SCOPED read: `begin_scoped` plus a join, under RLS** | **158 us** |
+| **one SCOPED read: `begin_scoped` plus a join, under RLS** | **160 us** |
+| a SCOPED single-key read, which is what `PgHotState::get` costs | 131 us |
 
 All are MEANS over a run by one client with no other load. A contended database is slower and
 the gaps widen. They are not figures for a Redis-shaped accelerator, which speaks a lighter
@@ -128,12 +129,33 @@ A cache hit replaces that whole sequence with one round trip of its own. So the 
 third row minus a hop, about **138 us against a 20 us hop, roughly seven to one in favour of the
 accelerator**, and more on a contended database.
 
+### The Postgres tier cannot accelerate anything, by construction
+
+The fourth row is the one that explains why this seam has no callers.
+
+`HotStateRepo::get` goes through `begin_scoped` like every other scoped read. So a hit against
+the Postgres-backed tier pays the same `BEGIN`, isolation level, two `set_config` calls and
+`COMMIT` as the read it is standing in front of; only the query inside is cheaper, a single-key
+lookup instead of a join. Measured, that is 131 us against the 160 us read it replaces: an 18
+per cent saving, bought with a write on every miss and an invalidation feed to keep correct.
+
+IN POSTGRES-ONLY MODE THE SEAM IS A SHARED-STATE MECHANISM, NOT A FASTER ONE. That is not a
+defect in `PgHotState`: holding flow state that survives the loss of the node that created it is
+a real job, and it is the job the covenant's "complete on PostgreSQL alone" needs done. It is
+simply not acceleration, and a deployment that attaches nothing gets no speed from this seam no
+matter which use is wired.
+
+Acceleration needs a tier that is genuinely a different store. `IronCacheHotState` is that tier,
+and the figures above do not measure it: pricing it is what would tell an operator whether
+attaching one repays the operational cost, and this document cannot answer that yet.
+
 ### What that means, use by use
 
-**Scoped reads are worth accelerating.** Introspection resolves an opaque access token through
-`resolve_opaque_access_token`, which is one of those six-round-trip sequences. A tenant config
-read would be another. For these the hop is bought back several times over, and the earlier
-conclusion here said the opposite.
+**Scoped reads are worth accelerating, BY A REAL ACCELERATOR.** Introspection resolves an opaque
+access token through `resolve_opaque_access_token`, which is one of those six-round-trip
+sequences. A tenant config read would be another. For these the hop is bought back several times
+over, provided the thing at the other end of the hop is not itself a scoped read, which is the
+previous section's point.
 
 **The JWKS document is still not**, and for a reason that has nothing to do with the figures
 above. `jwks_json` consults its hot state only AFTER `resolve_for_publication` has returned the

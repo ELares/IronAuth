@@ -240,6 +240,19 @@ SELECT t.scope, t.grant_id, g.subject, EXTRACT(EPOCH FROM t.expires_at)::bigint
   FROM probe_tokens t LEFT JOIN probe_grants g ON g.grant_id = t.grant_id
  WHERE t.token_hash = '$PROBE_KEY';
 COMMIT;")" || exit 1
+# WHAT THE POSTGRES-BACKED HOT STATE COSTS TO READ, which is the row that decides whether the
+# accelerator seam can do anything at all in the default configuration.
+#
+# `HotStateRepo::get` goes through `begin_scoped` like every other scoped read, so a cache hit
+# against the Postgres tier pays the same BEGIN, isolation level, two set_config calls and
+# COMMIT as the read it is standing in front of. Only the query inside differs: a single-table
+# lookup by key instead of a join. This measures that shape.
+HOTGET="$(measure_latency "BEGIN;
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SELECT set_config('ironauth.tenant_id', 't1', true);
+SELECT set_config('ironauth.environment_id', 'e1', true);
+SELECT scope FROM probe_tokens WHERE token_hash = '$PROBE_KEY';
+COMMIT;")" || exit 1
 
 # MICROSECONDS, because the figures these are compared against are quoted in microseconds and a
 # reader should not have to convert one side by hand.
@@ -260,7 +273,8 @@ to_micros() {
 RTT_US="$(to_micros "$LATENCY")"
 LOOKUP_US="$(to_micros "$LOOKUP")"
 SCOPED_US="$(to_micros "$SCOPED")"
-if [ -z "$RTT_US" ] || [ -z "$LOOKUP_US" ] || [ -z "$SCOPED_US" ]; then
+HOTGET_US="$(to_micros "$HOTGET")"
+if [ -z "$RTT_US" ] || [ -z "$LOOKUP_US" ] || [ -z "$SCOPED_US" ] || [ -z "$HOTGET_US" ]; then
     echo "::error::socket-rtt-bench: could not convert a latency to microseconds" >&2
     exit 1
 fi
@@ -288,6 +302,7 @@ echo "socket-rtt-bench: what asking the database costs, on this machine"
 printf '  %-52s %8s us\n' "bare round trip (SELECT 1)" "$RTT_US"
 printf '  %-52s %8s us\n' "one autocommit indexed lookup" "$LOOKUP_US"
 printf '  %-52s %8s us\n' "one SCOPED read (begin_scoped + a join, under RLS)" "$SCOPED_US"
+printf '  %-52s %8s us\n' "a SCOPED single-key read (what PgHotState::get costs)" "$HOTGET_US"
 echo
 echo "socket-rtt-bench: all three are MEANS over the run, not floors, taken by one client with"
 echo "socket-rtt-bench: no other load. A contended database is slower and the gaps widen."
@@ -297,3 +312,9 @@ echo "socket-rtt-bench: isolation level, two set_config calls and a COMMIT aroun
 echo "socket-rtt-bench: A cache hit replaces that whole sequence with one round trip of its own,"
 echo "socket-rtt-bench: so what it saves is the third row minus a hop, not the second minus the"
 echo "socket-rtt-bench: first."
+echo
+echo "socket-rtt-bench: THE FOURTH ROW IS WHY THE POSTGRES TIER CANNOT ACCELERATE. PgHotState"
+echo "socket-rtt-bench: reads through begin_scoped too, so a hit against it pays the same six"
+echo "socket-rtt-bench: round trips as the read it stands in front of. In Postgres-only mode the"
+echo "socket-rtt-bench: seam is a SHARED-STATE mechanism, not a faster one; acceleration needs a"
+echo "socket-rtt-bench: tier that is genuinely a different store."
