@@ -15,15 +15,21 @@
 #   startup  = wall time from exec() to the FIRST /readyz that answers ready.
 #
 #              WHAT THAT ACTUALLY PROVES, stated precisely because this comment
-#              said the opposite. It claimed readiness came after "the first
-#              database round trip". It does not: `ReadinessProbe::probe` is a
-#              bare TcpStream::connect to the configured Postgres address, and
-#              its own doc says "no bytes are exchanged and no database protocol
-#              is spoken". Since this harness starts Postgres before the loop,
-#              that connect always succeeds at once, so readiness fires when the
-#              management listener binds. A review confirmed it live: /readyz
-#              answered `ready` against a database holding zero tables, with
-#              log_statement=all recording no SQL from the server at all.
+#              has been wrong in both directions. It first claimed readiness came
+#              after "the first database round trip", which was false: the probe
+#              was a bare TcpStream::connect whose own doc said "no bytes are
+#              exchanged and no database protocol is spoken", and a review
+#              confirmed /readyz answering `ready` against a database holding zero
+#              tables, with log_statement=all recording no SQL at all.
+#
+#              Issue #149 made readiness run a real query on the serving pool, so
+#              on a build carrying that change the first `ready` DOES follow a
+#              completed round trip. Which one this harness measures depends on
+#              whether the binary under test mounts a plane: with none configured
+#              there is no pool to ask and the socket check still runs, and the
+#              body says `ready: probe=socket-only` when it does. The figures in
+#              docs/PERFORMANCE.md were taken before the change and record the
+#              socket path.
 #
 #              So this measures process start to listener-up, with the Postgres
 #              address proven TCP-reachable. That is a real and useful number,

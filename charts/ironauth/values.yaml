@@ -87,9 +87,11 @@ database:
 # /readyz and /metrics and served no protocol surface. A chart for an identity
 # platform that cannot deploy the identity platform is the gap this closes.
 #
-# Note what readiness does NOT tell you here: `/readyz` opens a TCP connection to
-# the database address and speaks no protocol, so pods report Ready whether or not
-# the schema is migrated. See the chart README on running `ironauth migrate` first.
+# Readiness now ASKS THE DATABASE (issue #149). `/readyz` runs a query on the pool
+# requests are served from, so a pod whose schema is not migrated answers 503
+# `not ready: schema not migrated` and stays out of its Service until it is. This
+# used to be a bare TCP connect that reported Ready whether or not the schema was
+# migrated. Run `ironauth migrate` first; the chart README has the sequence.
 oidc:
   enabled: false
 

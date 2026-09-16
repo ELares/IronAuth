@@ -72,6 +72,19 @@ impl Store {
         crate::preflight::run(&self.pool, chain).await
     }
 
+    /// Close this handle's pool, so a caller can observe what a dead database looks like.
+    ///
+    /// TEST-ONLY, behind the `testing` feature, because nothing in production should close a
+    /// pool out from under the requests using it. It exists so a readiness test can assert the
+    /// UNREACHABLE arm against the real probe rather than against a fixture: without a way to
+    /// reach that arm, a probe hard-wired to report the schema state would pass every other
+    /// test, and the arm that decides whether a fleet leaves rotation would be the one nothing
+    /// covers.
+    #[cfg(feature = "testing")]
+    pub async fn close_pool_for_test(&self) {
+        self.pool.close().await;
+    }
+
     /// Answer a readiness probe on a POOLED connection (issue #149).
     ///
     /// `/readyz` used to open a bare TCP socket to the configured address and call that ready.
@@ -96,10 +109,27 @@ impl Store {
     ///
     /// # What "schema ready" means here
     ///
-    /// Every version in `chain()` is present in the `_schema_migrations` ledger. Deliberately
-    /// NOT "the ledger's highest version is at least the chain's highest": that would pass a
-    /// database with a gap in the middle, which is the exact state a partially applied rollout
-    /// leaves behind, and the runner itself refuses to proceed from it.
+    /// EVERY UNAPPLIED MIGRATION IS A `Phase::Contract` ONE. That is the rule, and the reason it
+    /// is not the simpler "every version in the chain is present" is that the simpler one
+    /// disagrees with the runner about when a database is finished.
+    ///
+    /// `ContractPolicy::Deferred` is the DEFAULT: the runner stops before the first pending
+    /// contract migration and applies nothing after it, because a removal is a one-way door an
+    /// operator opens on purpose rather than by restarting a pod. In its own words, until they
+    /// do, "a deployment sits in a state where the new binary and the old one can BOTH serve,
+    /// which is what makes a minor release rollback-safe". A readiness check that called that
+    /// state unready would 503 every replica of a correctly upgraded deployment.
+    ///
+    /// THIS IS ALIGNMENT, NOT A BUG FIX, and the distinction is worth keeping. The runner defers
+    /// only when everything pending after the contract migration is ALSO contract
+    /// (`pending_after_contract_is_all_removal`), and today's chain has non-contract versions
+    /// after its last contract one, so no deployment can currently reach the deferred state. The
+    /// two predicates still disagree, nothing guards the disagreement, and appending a trailing
+    /// contract migration would arm it. Matching the runner costs one phase comparison.
+    ///
+    /// An unapplied EXPAND or MIGRATE version is not ready, and deliberately NOT "the highest
+    /// applied version is high enough": a gap in the middle is what a rollout that failed
+    /// midway leaves behind, and the runner itself refuses to proceed from it.
     ///
     /// A database RUNNING AHEAD of this build is ready. During a rolling upgrade the new
     /// version migrates first and old pods keep serving; if this reported not-ready for the
@@ -122,10 +152,44 @@ impl Store {
         // failed query". It does not: Postgres parses the whole statement before evaluating any
         // of it, so the reference to a missing table raises 42P01 at parse time and the guard
         // never runs. The guard is gone; the code is checked instead.
+        // A BUSY POOL IS A SERVING POOL, AND MUST NOT READ AS A BROKEN DATABASE.
+        //
+        // This is the failure a readiness probe causes rather than detects. The pool is fixed at
+        // 16 connections and nothing caps in-flight work below it, so a load spike, a slow
+        // query, or a failover can leave every connection busy for longer than the probe's
+        // timeout. Waiting on the queue would then time out, report the database unreachable,
+        // and take EVERY replica out of its Service at once -- while the database was fine and
+        // the pod was merely working. Removing the endpoints does not shed the load, so the
+        // fleet flaps: drain, come back, get re-loaded, drop out again.
+        //
+        // So the probe NEVER QUEUES. `try_acquire` takes a connection if one is free and
+        // returns immediately if none is, and a saturated pool is itself evidence that
+        // connections exist and queries are running on them.
+        //
+        // THE ERROR DIRECTION IS CHOSEN DELIBERATELY. This can report serving for a pool whose
+        // connections are all hung against a black-holed database. That failure is bounded by
+        // the liveness probe and by request timeouts, both of which act on the same symptom.
+        // The opposite error takes down a healthy fleet under load and amplifies the overload
+        // that caused it. Between a check that misses a hang and a check that manufactures an
+        // outage, the second is worse.
+        let mut connection = match self.pool.try_acquire() {
+            Some(connection) => connection,
+            // SATURATED BUT ALIVE. Connections exist and every one is in use, which is itself
+            // evidence that the database is answering. Report serving without queueing.
+            None if !self.pool.is_closed() && self.pool.size() > 0 => {
+                return Ok(SchemaReadiness::Serving);
+            }
+            // NO POOLED CONNECTION AT ALL, or a closed pool. `try_acquire` returns `None` for
+            // both, and a check that stopped at it would report a DEAD pool as serving, which a
+            // test of exactly that case caught. So this arm asks properly and lets the error
+            // surface: a closed pool, a refused connection, wrong credentials and a missing
+            // database all land here. The caller bounds this call, so it cannot hang.
+            None => self.pool.acquire().await?,
+        };
         let applied: Vec<i64> = match sqlx::query_scalar(
             "SELECT COALESCE(ARRAY(SELECT version FROM _schema_migrations), '{}'::bigint[])",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *connection)
         .await
         {
             Ok(applied) => applied,
@@ -146,10 +210,13 @@ impl Store {
             }
             Err(error) => return Err(error.into()),
         };
-        let missing = crate::migrate::chain()
-            .iter()
-            .any(|migration| !applied.contains(&migration.version));
-        Ok(if missing {
+        // A PENDING CONTRACT MIGRATION IS NOT A REASON TO LEAVE ROTATION. See this method's
+        // doc: deferring them is the default and the rollback-safe state, so the only unapplied
+        // versions that mean "not ready" are the ones the runner would have applied.
+        let blocking = crate::migrate::chain().into_iter().any(|migration| {
+            !applied.contains(&migration.version) && migration.phase != crate::Phase::Contract
+        });
+        Ok(if blocking {
             SchemaReadiness::NotMigrated
         } else {
             SchemaReadiness::Serving

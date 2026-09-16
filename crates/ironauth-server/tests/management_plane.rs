@@ -271,6 +271,9 @@ impl ironauth_server::DatabaseProbe for HangingProbe {
 /// The address matters: it is a live listener, so the socket check this replaced would say
 /// ready for every case below. Anything other than `ready` therefore proves the probe's answer
 /// reached the endpoint rather than the socket's.
+///
+/// The listener is held until after the request and then dropped, so the port cannot be reused
+/// between binding it and probing it.
 async fn readyz_with_probe(
     probe: std::sync::Arc<dyn ironauth_server::DatabaseProbe>,
 ) -> (StatusCode, String) {

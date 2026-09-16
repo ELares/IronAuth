@@ -86,6 +86,15 @@ mod shared_config;
 #[cfg(all(test, feature = "testing"))]
 mod boot_wiring_tests;
 
+/// The readiness probe the binary installs (issue #149), driven against a real database.
+///
+/// `StoreReadinessProbe` is the only implementation of `DatabaseProbe` that ships, and the
+/// server-side tests all use a fixture that answers whatever they ask. So nothing exercised the
+/// mapping from a real store's answer to the health the endpoint renders, which is where a
+/// serving database could have been reported as unreachable and taken a fleet out of rotation.
+#[cfg(all(test, feature = "testing"))]
+mod readiness_wiring_tests;
+
 /// The outbox boot seam (issue #104, PR 2): drives the REAL `spawn_consumer_pools` and
 /// `outbox_worker_settings` against a real database, because a pool loop that covers a
 /// subset of the registry compiles, lints and tests clean. DB-backed, so it rides the
@@ -414,20 +423,36 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         };
         // GIVE READINESS A DATABASE IT CAN SPEAK TO (issue #149). Until this, `/readyz` opened a
         // socket to the configured address and called that ready, which reported a deployment
-        // with wrong credentials, no such database, a role missing its grants, or an unmigrated
-        // schema as healthy. In Kubernetes terms `readyReplicas == desired` against a pod that
-        // could not answer one query.
+        // with wrong credentials, no such database, or an unmigrated schema as healthy. In
+        // Kubernetes terms `readyReplicas == desired` against a pod that could not answer one
+        // query.
         //
-        // `readiness_store` is `None` only when NO plane mounted, which is a server offering
-        // health, readiness and metrics alone. There is no pool to ask then, and the probe keeps
-        // the socket check and prints `probe=socket-only` rather than claiming a query.
+        // `readiness_store` is `None` when NO plane holds a pool, and the two ways that happens
+        // are worth naming because they are not the same deployment. One is a server configured
+        // to mount nothing, offering health, readiness and metrics alone, which is a legitimate
+        // thing to run. The other is a plane that was CONFIGURED and could not open its store:
+        // `build_oidc_plane` logs and returns `None` on a failed connect, and serving continues
+        // without it.
+        //
+        // The second must not read as healthy, and this is exactly the failure being fixed
+        // arriving through the fix's own path: the socket connect still succeeds, because
+        // Postgres is listening, so a pod that mounted nothing would answer `ready`. A plane
+        // that was asked for and is absent is a pod that cannot do its job.
         if let Some(store) = planes.readiness_store.clone() {
             server = server.with_database_probe(std::sync::Arc::new(StoreReadinessProbe { store }));
             tracing::info!("readiness probes the database with a query on the serving pool");
+        } else if planes.a_plane_was_configured {
+            server = server.with_database_probe(std::sync::Arc::new(UnreachableReadinessProbe));
+            tracing::error!(
+                "readiness reports NOT READY: a plane was configured but could not open its \
+                 store, so this instance serves none of what it was asked to serve. /readyz \
+                 answers 503 rather than reporting the socket as healthy."
+            );
         } else {
             tracing::warn!(
-                "readiness has NO database probe: no plane mounted, so there is no serving pool \
-                 to ask. /readyz falls back to a socket check and reports probe=socket-only."
+                "readiness has NO database probe: this instance is configured to mount no \
+                 plane, so there is no serving pool to ask. /readyz falls back to a socket \
+                 check and reports probe=socket-only."
             );
         }
         // Mount the management API (issue #11) on the management plane. The state was
@@ -876,6 +901,31 @@ impl DataPlaneSurfaces {
 /// what each plane actually holds. Mounting turns both into opaque `Router`s, which is
 /// why deleting an install, or handing one plane a different value than the other, used
 /// to build with zero warnings.
+/// The readiness answer for an instance whose configured plane could not open its store.
+///
+/// NOT the socket fallback, and that is the point. A plane that was asked for and is absent is
+/// an instance that cannot do its job, while its database socket very likely still accepts: the
+/// causes are wrong credentials, a missing database, absent grants, or a Postgres still in
+/// recovery, none of which close the port. Falling back to the socket check there would answer
+/// `ready` for a pod serving nothing, which is precisely the failure issue #149 is about,
+/// arriving through this change's own path.
+#[derive(Debug, Clone, Copy)]
+struct UnreachableReadinessProbe;
+
+impl ironauth_server::readiness::DatabaseProbe for UnreachableReadinessProbe {
+    fn check(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = ironauth_server::readiness::DatabaseHealth>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { ironauth_server::readiness::DatabaseHealth::Unreachable })
+    }
+}
+
 /// The database check `/readyz` asks, backed by the serving store (issue #149).
 ///
 /// # Why this holds the SERVING store rather than opening its own
@@ -918,8 +968,14 @@ impl ironauth_server::readiness::DatabaseProbe for StoreReadinessProbe {
                 // every cause into one state for the orchestrator. The error text is the only
                 // thing that tells an operator WHICH cause, so it must not be dropped on the
                 // floor between the store and the probe.
+                // `?error` AND NOT `%error`. This line is the ONLY thing that tells an
+                // operator which of the collapsed causes they have, and `Display` for
+                // `StoreError::Database` renders the literal string "database error": the sqlx
+                // error, with its SQLSTATE and message, hangs off `source()`, which `%` does
+                // not walk. The justification for collapsing every cause into one variant is
+                // that the text survives in the log, so the text has to actually survive.
                 Err(error) => {
-                    tracing::warn!(%error, "readiness: the database did not answer");
+                    tracing::warn!(error = ?error, "readiness: the database did not answer");
                     DatabaseHealth::Unreachable
                 }
             }
@@ -936,10 +992,18 @@ struct AssembledPlanes {
     scim: Option<ScimPlane>,
     /// A serving store handle for the readiness probe (issue #149), when any plane opened one.
     ///
-    /// `None` when NO plane mounted, which is a deployment serving only health, readiness and
-    /// metrics. Readiness then keeps the socket check and says so in its body, because there is
-    /// no pool to ask and claiming a query was run would be the false report this replaced.
+    /// `None` when no plane holds a pool. Read with [`AssembledPlanes::a_plane_was_configured`]
+    /// to tell the two reasons apart: an instance asked to mount nothing, and an instance whose
+    /// plane was asked for and could not connect.
     readiness_store: Option<Store>,
+    /// Whether this instance was CONFIGURED to mount a plane, whatever the outcome (issue #149).
+    ///
+    /// Separate from `readiness_store` being `Some` because the interesting case is exactly
+    /// where they disagree: configured and absent. A plane's builder logs and returns `None` on
+    /// a failed connect while serving continues, so without this the instance would be
+    /// indistinguishable from one that was never asked to mount anything, and readiness would
+    /// report it healthy.
+    a_plane_was_configured: bool,
 }
 
 /// Assemble BOTH planes from the one loaded config (issue #414).
@@ -1035,24 +1099,36 @@ async fn assemble_planes(
         }
         (management, _) => management,
     };
-    // THE STORE READINESS WILL ASK, taken from the plane that serves requests (issue #149).
+    // THE STORE READINESS WILL ASK, taken from WHICHEVER plane serves requests (issue #149).
     //
-    // `OidcState::store()` is the handle the data plane serves from, so the probe shares its
-    // pool rather than opening a second one. That is the property the probe's contract asks
+    // EVERY PLANE, NOT JUST OIDC. The first version read only `oidc`, and a review found what
+    // that leaves out: the chart's default install sets `oidc.enabled = false`, and a
+    // management-only or SCIM-only deployment holds a perfectly good pool. All of those kept
+    // the socket check this change exists to remove, so the default Helm install got none of
+    // the fix.
+    //
+    // Each of these is a `Store` handle over a pool the plane serves from, so the probe shares
+    // those connections rather than opening its own. That is what the probe's contract asks
     // for: a fresh connection can succeed while the pool a request would wait on is exhausted
     // or holding handles to a server that has since restarted.
-    //
-    // NO FALLBACK TO A NEWLY OPENED STORE when no plane mounted. Opening one here would answer
-    // a question about a pool nothing serves from, which is the same class of wrong answer as
-    // the socket check this replaces. Readiness keeps the socket check in that case and prints
-    // that it did.
-    let readiness_store = oidc.as_ref().map(|plane| plane.state.store().clone());
+    let readiness_store = oidc
+        .as_ref()
+        .map(|plane| plane.state.store().clone())
+        .or_else(|| scim.as_ref().map(|plane| plane.state.store().clone()))
+        .or_else(|| management.as_ref().map(|state| state.store().clone()));
+
+    // ASKED FOR, not mounted. Read off the CONFIG rather than off the built planes, because
+    // the whole point is to catch the case where a plane was requested and is not here.
+    let a_plane_was_configured = config.oidc.enabled
+        || config.scim.enabled
+        || config.admin.bootstrap_operator_token.is_some();
 
     Ok(AssembledPlanes {
         management,
         oidc,
         scim,
         readiness_store,
+        a_plane_was_configured,
     })
 }
 

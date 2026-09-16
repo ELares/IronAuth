@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add `Store::probe_readiness` (issue #149): the query `/readyz` asks, on the pool requests
+  are served from rather than a fresh connection. Reports whether the schema is one this
+  build can serve, treating a pending `Phase::Contract` migration as healthy because
+  deferring those is the default and the rollback-safe state.
+
+  It NEVER QUEUES for a connection: a saturated pool is reported as serving, because a
+  readiness check that turns load into 503s takes a healthy fleet out of rotation and
+  amplifies the overload that caused it.
+
+  Migration 0230 grants `SELECT` on `_schema_migrations` to `ironauth_app`, which no earlier
+  migration did; without it the probe would fail on every healthy deployment.
+
 - **`scim_connections`, the inbound SCIM credential table (issue #135).** One row per identity
   provider connection, bound to exactly ONE organization: the organization comes off the
   CREDENTIAL rather than off the request path, so the SCIM surface has no caller-supplied

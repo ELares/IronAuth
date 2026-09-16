@@ -12,8 +12,9 @@
 --
 -- The replacement asks the database, on the pool requests are served from, and part of that
 -- answer is whether the schema is one this build can serve. That is what `_schema_migrations`
--- records, and `ironauth_app` could not read it: every grant this chain issues names an
--- application table, and the ledger is the runner's own bookkeeping, created outside them.
+-- records, and `ironauth_app` could not read it. The chain's grants name application tables and
+-- (in 0001 and 0003) schema usage; none of them names the ledger, which is the migration
+-- runner's own bookkeeping, created by the runner outside every migration it then applies.
 --
 -- Without this grant the probe gets SQLSTATE 42501 on a perfectly healthy database, which is
 -- indistinguishable at the driver from a connection problem. A readiness check that fails on
@@ -31,12 +32,13 @@
 -- the deployment's own upgrade state, held by a role that already reads every application
 -- table in the database, so it widens nothing an operator would care about.
 --
--- # IF EXISTS, because a database can reach this migration without the table
+-- # IF EXISTS, and it is belt-and-braces rather than a case anyone has hit
 --
--- The ledger is created by the runner before it applies anything, so in every ordinary path it
--- is present. `pg_class` is checked rather than assumed so that a hand-assembled database, or a
--- chain driven by `MigrationRunner::from_migrations` over a custom list, does not fail here on
--- a table it never made.
+-- The runner creates the ledger before it applies anything, so on every path that reaches this
+-- migration through `MigrationRunner` the table is present and the check is always true. It is
+-- here so that applying this file by hand, or through a harness that drives the SQL without the
+-- runner, fails to grant rather than failing to run. That is a cheap guard on a one-line
+-- migration, not a state the shipped code can produce.
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_class WHERE relname = '_schema_migrations' AND relkind = 'r') THEN

@@ -81,10 +81,22 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
             std::borrow::Cow::Owned(format!("ready: probe={}\n", depth.as_str())),
         ),
-        Readiness::Degraded(tier) => (
+        // The tier alone when a real query backed the answer, which is the shipped shape and
+        // leaves `degraded: <tier>` exactly as it was. The weaker answer is marked, for the
+        // same reason `ready` is: nothing should render identically to a stronger check.
+        Readiness::Degraded(tier, ProbeDepth::Query) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
             std::borrow::Cow::Owned(format!("degraded: {}\n", tier.token())),
+        ),
+        Readiness::Degraded(tier, depth) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            std::borrow::Cow::Owned(format!(
+                "degraded: {} probe={}\n",
+                tier.token(),
+                depth.as_str()
+            )),
         ),
         // THE PARENTHETICAL IS GONE. It read "(provisional check until #7)", and #7 closed
         // long ago: a stale forward reference in an HTTP body an operator reads during an
