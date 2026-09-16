@@ -16,11 +16,14 @@
 # section now records the size of it: re-running the example put six of its ten published
 # figures outside their own ranges.
 #
-# It is also how a measurement nobody had taken settled an open design question. Reading
-# `issuer.rs` is what establishes WHAT a cache hit in front of the published JWKS document can
-# save, which is a render minus a validation parse and never a database read. Only measuring
-# says whether that is worth a hop, and the render and round-trip benchmarks below are the two
-# sides of it. They came out roughly thirty to one against, which docs/UNIT-COSTS.md records.
+# It is also how a measurement nobody had taken settled an open design question, and then how a
+# better one reversed half of the answer. Reading `issuer.rs` establishes WHAT a cache hit in
+# front of the published JWKS document can save, which is a render minus a validation parse and
+# never a database read; measured, that is about 0.6 us against a 20 us hop, so the JWKS
+# accelerator stays unwired. The first version of the round-trip benchmark then generalised that
+# to every use by measuring an autocommit lookup, and a review found no read in this codebase is
+# one: a scoped read pays six round trips around a query under row-level security and measures
+# 158 us, which a hit is very much worth replacing. Both figures are below.
 #
 # # Every benchmark reports RAN, SKIPPED, or FAILED, and a SKIP IS NOT SILENT
 #
@@ -123,9 +126,10 @@ else
     skip startup-rss "PG_BIN unset; set it to the postgresql bin directory" optional
 fi
 
-# The cost of one socket round trip, which is what decides whether a cache in front of an
-# operation pays for itself. Backs the accelerator section of docs/UNIT-COSTS.md. Needs a
-# Postgres bin directory for pgbench, and starts its own throwaway cluster.
+# What asking the database costs: a bare round trip, and a real indexed single-row lookup. The
+# DIFFERENCE between them is the query work, and that is what decides whether a cache in front
+# of such a read can save anything, since a hit pays a round trip of its own. Backs the
+# accelerator section of docs/UNIT-COSTS.md. Starts its own throwaway cluster from $PG_BIN.
 if [ -n "${PG_BIN:-}" ]; then
     run socket-rtt scripts/socket-rtt-bench.sh
 elif [ "$on_ci" = true ]; then

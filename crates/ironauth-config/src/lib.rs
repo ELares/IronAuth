@@ -1395,9 +1395,15 @@ pub struct HotStateConfig {
     /// THAT IS NOW A MEASURED DECISION FOR THE JWKS USE rather than the remaining work, which is
     /// what this paragraph used to call it. `docs/UNIT-COSTS.md` measures both sides: a hit
     /// there saves a render and adds a validation parse, netting about 0.6 us for a fresh
-    /// environment's three keys, against a 20 us Postgres round trip on the same machine. So
-    /// installing one behind this key would make the JWKS endpoint slower, and leaving it unset
-    /// is the faster configuration. The seam pays where the alternative to a hop is a query.
+    /// environment's three keys, against a 20 us round trip on the same machine. So installing
+    /// one behind this key would make the JWKS endpoint slower, and leaving it unset is the
+    /// faster configuration.
+    ///
+    /// IT DOES NOT GENERALISE TO THE OTHER USES, which an earlier version of this paragraph
+    /// implied by saying the seam pays wherever the alternative is a query. A cache hit costs a
+    /// round trip and so returns only what an operation costs ABOVE one. The JWKS read is
+    /// unusual in costing almost nothing above it; a scoped read pays six round trips and a
+    /// query under row-level security, measured at 158 us, and is worth accelerating.
     ///
     /// That distinction is written down rather than glossed because the alternative is a knob
     /// that reads as "my cache is on" while nothing consults it, which is the defect this
