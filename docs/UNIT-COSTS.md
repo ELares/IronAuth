@@ -100,19 +100,33 @@ because that is what decides whether a cache in front of an operation pays for i
 | EdDSA + ES256 + RS256 (a fresh environment) | 1.97 to 1.98 us | 1.36 to 1.38 us | 0.59 to 0.62 us |
 | the same three, one rotation each (six published) | 3.51 to 3.70 us | 2.69 to 2.77 us | 0.74 to 1.01 us |
 
-| asking another process | measured |
+| asking another process, loopback TCP, same machine | measured |
 |---|---|
-| one Postgres round trip, `SELECT 1`, loopback TCP, same machine | 20 us |
+| bare round trip (`SELECT 1`) | 21 us |
+| one indexed single-row lookup by key | 29 us |
+| **the query work alone** (the difference) | **8 us** |
 
 Three algorithms is what a fresh environment publishes, not two: provisioning mints EdDSA,
 ES256 and RS256 and publishes all three from the environment's creation instant. The six-key row
 is one rotation of each, whose predecessors stay published for a window.
 
-The round trip is a MEAN over the run, not a floor, and it includes Postgres parsing, planning
-and executing the statement, so a bare socket exchange on this hardware is cheaper. It is also
-not a figure for a Redis-shaped accelerator, which speaks a lighter protocol; nothing here
-measures one. It is offered as a concrete example of what a hop costs on the most favourable
-topology there is, where the other process is on the same machine.
+Both are MEANS over the run, not floors, and both include Postgres parsing, planning and
+executing, so a bare socket exchange on this hardware is cheaper than either. Neither is a figure
+for a Redis-shaped accelerator, which speaks a lighter protocol; nothing here measures one. They
+are offered as a concrete example of what asking another process costs on the most favourable
+topology there is, where that process is on the same machine.
+
+The third row is the one that generalises. **A CACHE SAVES THE WORK, NEVER THE HOP**: a hit
+still pays a round trip to the cache, so the most it can return is the difference between the
+two. On this machine a single-row indexed read is 29 us, of which 21 us is the round trip and
+8 us is the index descent and row fetch. An accelerator co-located with the application cannot
+save the 21 us, because it costs its own.
+
+So the seam pays when one of three things is true, and not otherwise: the WORK is large (a
+complex query, a join, a scan, an Argon2 verification), the DATABASE IS FAR and the cache is
+near, or the database is CONTENDED and the cache is not. A single-row lookup against a
+co-located database is none of those, and putting a same-machine cache in front of one saves
+at most 8 us against a 21 us hop.
 
 **That settles an open question in issue #146.** `IssuerRegistry` holds an optional hot-state
 accelerator for the published JWKS document, and no shipped binary installs one. The natural
@@ -138,10 +152,18 @@ entry the caller is already holding, before any hop is paid for at all.
 Wiring the accelerator at this call site would make the JWKS endpoint slower. "Not wired" is
 the faster configuration rather than the unfinished one.
 
-This does not say the hot-state seam is not worth having. It says this USE is not, and the
-distinction is where the seam pays: a hop is worth taking when the alternative is a database
-read, not a microsecond of serialization off an entry already in hand. The uses whose
-alternative is a query are the ones to wire.
+This does not say the hot-state seam is not worth having. It says this USE is not, and it
+sharpens what an earlier version of this section offered as the rule. That rule was "a hop pays
+when the alternative is a database read", which the third row above shows is too generous: the
+alternative has to be a database read whose WORK exceeds a hop, and a single-row lookup on the
+same machine is not one.
+
+By that measure the remaining registry uses split cleanly. The ones keyed on a single indexed
+read, such as a tenant config or an introspection result, save about 8 us on a co-located
+deployment and are not worth a hop there, though they become worth one as soon as the database
+is remote or contended. The rate counter is the different case, and the strongest: sharing it
+across nodes buys fleet-wide correctness that no local answer provides at any speed, so the hop
+is not being traded against latency at all.
 
 ## What this does not yet cover
 

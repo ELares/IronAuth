@@ -123,9 +123,10 @@ else
     skip startup-rss "PG_BIN unset; set it to the postgresql bin directory" optional
 fi
 
-# The cost of one socket round trip, which is what decides whether a cache in front of an
-# operation pays for itself. Backs the accelerator section of docs/UNIT-COSTS.md. Needs a
-# Postgres bin directory for pgbench, and starts its own throwaway cluster.
+# What asking the database costs: a bare round trip, and a real indexed single-row lookup. The
+# DIFFERENCE between them is the query work, and that is what decides whether a cache in front
+# of such a read can save anything, since a hit pays a round trip of its own. Backs the
+# accelerator section of docs/UNIT-COSTS.md. Starts its own throwaway cluster from $PG_BIN.
 if [ -n "${PG_BIN:-}" ]; then
     run socket-rtt scripts/socket-rtt-bench.sh
 elif [ "$on_ci" = true ]; then
