@@ -30,7 +30,12 @@ import {
   revokeOrgApiKey,
   rotateOrgApiKey,
 } from "../api/client";
-import { AsyncBoundary, ConfirmButton, MutationFeedback } from "./ResourceView";
+import {
+  AsyncBoundary,
+  ConfirmButton,
+  MutationFeedback,
+  SecretCopyButton,
+} from "./ResourceView";
 import { type OrgScope, inputValue, sudoFor } from "./orgPanels";
 import { useAsyncResource, useMutation } from "./useResource";
 
@@ -59,7 +64,9 @@ export function OrgApiKeysPanel({
   // server on every reload, and a key held there would either vanish inconsistently
   // or, worse, survive in the DOM long after the operator stopped looking at it. The
   // server cannot return it again, so the panel must not behave as though it could.
-  const [issued, setIssued] = useState<{ id: string; key: string } | null>(null);
+  const [issued, setIssued] = useState<{ id: string; key: string } | null>(
+    null,
+  );
   const [name, setName] = useState("");
   const reloadClearingKey = () => {
     setIssued(null);
@@ -68,11 +75,11 @@ export function OrgApiKeysPanel({
 
   return (
     <div class="resource-subsection">
-      <h3>API keys</h3>
+      <h2 id="organization-keys">API keys</h2>
       <p class="resource-note">
-        The keys that authenticate as this organization. The key itself is shown once,
-        when it is created, and is never recoverable afterwards: this list carries only
-        the handle. Revoked keys stay listed so a rotation is legible.
+        Keys authenticate as this organization. Save each key when it is
+        created; it cannot be retrieved later. Revoked keys stay visible for
+        reference.
       </p>
       <form
         class="resource-form"
@@ -106,26 +113,34 @@ export function OrgApiKeysPanel({
             });
         }}
       >
-        <label>
+        <label class="resource-field">
           New key name
           <input
             type="text"
+            required
+            placeholder="Production integration"
             value={name}
             disabled={mutation.state.pending}
             onInput={(event) => setName(inputValue(event))}
           />
         </label>
-        <button type="submit" disabled={mutation.state.pending}>
+        <button
+          class="resource-btn resource-btn-primary"
+          type="submit"
+          disabled={mutation.state.pending || name.trim() === ""}
+        >
           Create key
         </button>
       </form>
       {issued === null ? null : (
         <div class="resource-callout">
+          <h3>Save your new API key</h3>
           <p>
-            Copy this key now. It is shown once and cannot be recovered, including by
-            reloading this page.
+            Copy this key now. It is shown once and cannot be recovered,
+            including by reloading this page.
           </p>
           <code class="resource-secret">{issued.key}</code>
+          <SecretCopyButton value={issued.key} label="Copy key" />
         </div>
       )}
       <AsyncBoundary
@@ -134,9 +149,7 @@ export function OrgApiKeysPanel({
         empty={{
           when: (keys) => keys.length === 0,
           render: () => (
-            <p class="resource-empty">
-              This organization has no API keys.
-            </p>
+            <p class="resource-empty">This organization has no API keys.</p>
           ),
         }}
       >
@@ -153,67 +166,67 @@ export function OrgApiKeysPanel({
                 {key.revoked_at_unix_ms === undefined ||
                 key.revoked_at_unix_ms === null ? (
                   <>
-                  <ConfirmButton
-                    label="Rotate"
-                    prompt="Rotate this key? The current key stops authenticating immediately and a replacement is issued in the same transaction, inheriting this key's name and expiry. The new key is shown ONCE and cannot be recovered."
-                    confirmLabel="Confirm rotate"
-                    disabled={mutation.state.pending}
-                    onConfirm={() =>
-                      void mutation
-                        .run(async () => {
-                          const created = await rotateOrgApiKey(
-                            tenantId,
-                            environmentId,
-                            organizationId,
-                            key.id,
-                          );
-                          // Same display-once rule as create, and the same replay
-                          // case: a replay answers with no key, and showing an empty
-                          // secret box would claim material the operator does not
-                          // have.
-                          setIssued(
-                            created.key === undefined || created.key === null
-                              ? null
-                              : { id: created.id, key: created.key },
-                          );
-                        }, "Key rotated.")
-                        .then((ok) => {
-                          if (ok) {
-                            // Plain `reload`, NOT `reloadClearingKey`: the
-                            // replacement key must survive the reload its own
-                            // rotation triggers, exactly as on create.
-                            reload();
-                          }
-                        })
-                    }
-                  />
-                  <ConfirmButton
-                    label="Revoke"
-                    prompt="Revoke this key? Anything using it stops authenticating on its very next request, and the key cannot be recovered or un-revoked. The row stays listed so the revocation is legible."
-                    confirmLabel="Confirm revoke"
-                    danger
-                    disabled={mutation.state.pending}
-                    onConfirm={() =>
-                      void mutation
-                        .run(async () => {
-                          await revokeOrgApiKey(
-                            tenantId,
-                            environmentId,
-                            organizationId,
-                            key.id,
-                          );
-                        }, "Key revoked.")
-                        // Reload only on SUCCESS. Reloading after a failure would
-                        // replace the error the boundary is showing with a fresh
-                        // render of the unchanged list, which reads as though the
-                        // revoke worked.
-                        .then((ok) => {
-                          if (ok) {
-                            reloadClearingKey();
-                          }
-                        })
-                    }
-                  />
+                    <ConfirmButton
+                      label="Rotate"
+                      prompt="Rotate this key? The current key stops working immediately. Save the replacement now; it keeps the same name and expiry and is shown only once."
+                      confirmLabel="Confirm rotate"
+                      disabled={mutation.state.pending}
+                      onConfirm={() =>
+                        void mutation
+                          .run(async () => {
+                            const created = await rotateOrgApiKey(
+                              tenantId,
+                              environmentId,
+                              organizationId,
+                              key.id,
+                            );
+                            // Same display-once rule as create, and the same replay
+                            // case: a replay answers with no key, and showing an empty
+                            // secret box would claim material the operator does not
+                            // have.
+                            setIssued(
+                              created.key === undefined || created.key === null
+                                ? null
+                                : { id: created.id, key: created.key },
+                            );
+                          }, "Key rotated.")
+                          .then((ok) => {
+                            if (ok) {
+                              // Plain `reload`, NOT `reloadClearingKey`: the
+                              // replacement key must survive the reload its own
+                              // rotation triggers, exactly as on create.
+                              reload();
+                            }
+                          })
+                      }
+                    />
+                    <ConfirmButton
+                      label="Revoke"
+                      prompt="Revoke this key? It stops authenticating on the next request. This cannot be undone."
+                      confirmLabel="Confirm revoke"
+                      danger
+                      disabled={mutation.state.pending}
+                      onConfirm={() =>
+                        void mutation
+                          .run(async () => {
+                            await revokeOrgApiKey(
+                              tenantId,
+                              environmentId,
+                              organizationId,
+                              key.id,
+                            );
+                          }, "Key revoked.")
+                          // Reload only on SUCCESS. Reloading after a failure would
+                          // replace the error the boundary is showing with a fresh
+                          // render of the unchanged list, which reads as though the
+                          // revoke worked.
+                          .then((ok) => {
+                            if (ok) {
+                              reloadClearingKey();
+                            }
+                          })
+                      }
+                    />
                   </>
                 ) : null}
               </li>

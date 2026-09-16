@@ -11,6 +11,7 @@
 // update operation in the management contract, so this surface has none.
 
 import { useLocation } from "preact-iso";
+import { consoleHref } from "./routing";
 import { useState } from "preact/hooks";
 import {
   type CreateEnvironmentRequest,
@@ -22,7 +23,15 @@ import {
 } from "../api/client";
 import { activeScope, selectTenant } from "../scope/store";
 import type { SudoRecovery } from "./ErrorView";
-import { AsyncBoundary, ConfirmButton, MutationFeedback } from "./ResourceView";
+import {
+  AsyncBoundary,
+  ConfirmButton,
+  MutationFeedback,
+  ResourceHeading,
+  ResourceFormIntro,
+  ResourceCollection,
+  resourceLabel,
+} from "./ResourceView";
 import { useAsyncResource, useMutation } from "./useResource";
 
 const ENV_KINDS = ["dev", "staging", "prod"] as const;
@@ -40,7 +49,11 @@ export function EnvironmentsList() {
   if (tenantId === null) {
     return (
       <section class="resource" aria-labelledby="environments-heading">
-        <h2 id="environments-heading">Environments</h2>
+        <ResourceHeading
+          id="environments-heading"
+          title="Environments"
+          description="Keep development, staging and production identities separate."
+        />
         <p class="resource-empty">Select a tenant to view its environments.</p>
       </section>
     );
@@ -62,7 +75,11 @@ function EnvironmentsForTenant({ tenantId }: { tenantId: string }) {
   }
   return (
     <section class="resource" aria-labelledby="environments-heading">
-      <h2 id="environments-heading">Environments</h2>
+      <ResourceHeading
+        id="environments-heading"
+        title="Environments"
+        description="Keep development, staging and production identities separate."
+      />
       <EnvironmentCreateForm tenantId={tenantId} onCreated={onChanged} />
       <AsyncBoundary
         state={state}
@@ -77,17 +94,35 @@ function EnvironmentsForTenant({ tenantId }: { tenantId: string }) {
         }}
       >
         {(items) => (
-          <ul class="resource-list">
-            {items.map((env) => (
-              <li key={env.id} class="resource-row">
-                <a class="resource-link" href={`/environments/${env.id}`}>
-                  {env.display_name}
-                </a>
-                <code class="resource-id">{env.id}</code>
-                <span class="resource-kind">{env.kind}</span>
-              </li>
-            ))}
-          </ul>
+          <ResourceCollection
+            items={items}
+            noun="environments"
+            searchText={(env) =>
+              [
+                env.display_name,
+                env.id,
+                env.kind,
+                resourceLabel(env.kind),
+              ].join(" ")
+            }
+          >
+            {(visible) => (
+              <ul class="resource-list">
+                {visible.map((env) => (
+                  <li key={env.id} class="resource-row">
+                    <a
+                      class="resource-link"
+                      href={consoleHref(`/environments/${env.id}`)}
+                    >
+                      {env.display_name}
+                    </a>
+                    <code class="resource-id">{env.id}</code>
+                    <span class="resource-kind">{resourceLabel(env.kind)}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </ResourceCollection>
         )}
       </AsyncBoundary>
     </section>
@@ -140,10 +175,15 @@ function EnvironmentCreateForm({
       onSubmit={onSubmit}
       aria-label="Create an environment"
     >
+      <ResourceFormIntro
+        title="Create environment"
+        description="Choose an environment name and kind. Production environments require a custom domain."
+      />
       <div class="resource-field">
         <label for="env-display-name">Display name</label>
         <input
           id="env-display-name"
+          placeholder={"Staging"}
           type="text"
           required
           value={displayName}
@@ -155,11 +195,13 @@ function EnvironmentCreateForm({
         <select
           id="env-kind"
           value={kind}
-          onChange={(event) => setKind((event.target as HTMLSelectElement).value)}
+          onChange={(event) =>
+            setKind((event.target as HTMLSelectElement).value)
+          }
         >
           {ENV_KINDS.map((value) => (
             <option key={value} value={value}>
-              {value}
+              {resourceLabel(value)}
             </option>
           ))}
         </select>
@@ -169,6 +211,7 @@ function EnvironmentCreateForm({
           <label for="env-custom-domain">Custom domain</label>
           <input
             id="env-custom-domain"
+            placeholder={"auth.example.com"}
             type="text"
             required
             value={customDomain}
@@ -210,7 +253,11 @@ export function EnvironmentDetail({
   if (tenantId === null) {
     return (
       <section class="resource" aria-labelledby="environment-detail-heading">
-        <h2 id="environment-detail-heading">Environment</h2>
+        <ResourceHeading
+          id="environment-detail-heading"
+          title="Environment"
+          description="Review environment settings and production guardrails."
+        />
         <p class="resource-empty">Select a tenant to view this environment.</p>
       </section>
     );
@@ -245,7 +292,7 @@ function EnvironmentDetailFor({
       await deleteEnvironment(tenantId, environmentId);
       void selectTenant(tenantId, null);
       if (typeof location.route === "function") {
-        location.route("/environments");
+        location.route(consoleHref("/environments"));
       }
     }, "Environment deleted.");
   }
@@ -253,14 +300,18 @@ function EnvironmentDetailFor({
   return (
     <section class="resource" aria-labelledby="environment-detail-heading">
       <p>
-        <a class="resource-back" href="/environments">
+        <a class="resource-back" href={consoleHref("/environments")}>
           Back to environments
         </a>
       </p>
       <AsyncBoundary state={state} loadingLabel="Loading environment">
         {(env) => (
           <div>
-            <h2 id="environment-detail-heading">{env.display_name}</h2>
+            <ResourceHeading
+              id="environment-detail-heading"
+              title={env.display_name}
+              description="Review environment settings and production guardrails."
+            />
             <dl class="resource-detail">
               <dt>Identifier</dt>
               <dd>
@@ -282,7 +333,11 @@ function EnvironmentDetailFor({
               <dd>{new Date(env.created_at_unix_ms).toISOString()}</dd>
             </dl>
             <GuardrailList guardrails={env.guardrails} />
-            <div class="resource-actions" role="group" aria-label="Environment actions">
+            <div
+              class="resource-actions"
+              role="group"
+              aria-label="Environment actions"
+            >
               <ConfirmButton
                 label="Delete"
                 prompt="Delete this environment? This cannot be undone."
@@ -317,7 +372,7 @@ function GuardrailList({
   ];
   return (
     <div class="resource-guardrails">
-      <h3>Guardrails</h3>
+      <h2>Guardrails</h2>
       <dl class="resource-detail">
         {entries.map(([label, value]) => (
           <div key={label} class="resource-guardrail">

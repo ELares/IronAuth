@@ -60,12 +60,7 @@ export function OrgRolePermissionsPanel({
 }: OrgScope & { roleId: string }) {
   const { state, reload } = useAsyncResource<KeysetPage<OrgRolePermissionView>>(
     () =>
-      fetchOrgRolePermissions(
-        tenantId,
-        environmentId,
-        organizationId,
-        roleId,
-      ),
+      fetchOrgRolePermissions(tenantId, environmentId, organizationId, roleId),
     [tenantId, environmentId, organizationId, roleId],
   );
   const mutation = useMutation();
@@ -97,15 +92,22 @@ export function OrgRolePermissionsPanel({
   return (
     <div class="resource-subsection">
       <h4>Permissions this role grants</h4>
-      <p class="resource-note">
-        Every member who resolves this role holds these permissions. Holding a
-        permission and receiving it in a token are two different things: an access
-        token carries the permission claim only for a resource server that has
-        opted in, and only when that resource server issues a token format able to
-        carry one, which the permissions section is where to read and set. The
-        permission itself is defined once for the whole environment there; this list
-        is only which of those entries this one role carries.
+      <p class="resource-hint">
+        Attach permissions from the vocabulary defined for this environment.
       </p>
+      <details class="resource-help">
+        <summary>About role permissions</summary>
+        <p class="resource-note">
+          Every member who resolves this role holds these permissions. Holding a
+          permission and receiving it in a token are two different things: an
+          access token carries the permission claim only for a resource server
+          that has opted in, and only when that resource server issues a token
+          format able to carry one, which the permissions section is where to
+          read and set. The permission itself is defined once for the whole
+          environment there; this list is only which of those entries this one
+          role carries.
+        </p>
+      </details>
       <form
         class="resource-form"
         onSubmit={onAttach}
@@ -115,6 +117,7 @@ export function OrgRolePermissionsPanel({
           <label for="org-role-permission-id">Permission id</label>
           <input
             id="org-role-permission-id"
+            placeholder={"Permission ID from Permissions"}
             type="text"
             required
             value={permissionId}
@@ -147,10 +150,7 @@ export function OrgRolePermissionsPanel({
       >
         {(page) => (
           <div>
-            <ul
-              class="resource-list"
-              aria-label="Permissions the role grants"
-            >
+            <ul class="resource-list" aria-label="Permissions the role grants">
               {page.items.map((mapping, index) => (
                 // Keyed by POSITION, which is the convention issue #97 shipped for
                 // every list in this console. It is a CONVENTION and not a defense:

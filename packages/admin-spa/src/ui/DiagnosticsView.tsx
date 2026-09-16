@@ -39,7 +39,12 @@ import {
   fetchPolicyTraces,
 } from "../api/client";
 import { activeScope } from "../scope/store";
-import { AsyncBoundary, MutationFeedback } from "./ResourceView";
+import {
+  AsyncBoundary,
+  MutationFeedback,
+  ResourceHeading,
+  ResourceDetailNav,
+} from "./ResourceView";
 import { useAsyncResource, useMutation } from "./useResource";
 
 // Render an epoch-microseconds instant as an ISO string, defensively (a value the
@@ -57,7 +62,11 @@ export function DiagnosticsView() {
   if (scope === null) {
     return (
       <section class="resource" aria-labelledby="diagnostics-heading">
-        <h2 id="diagnostics-heading">Diagnostics</h2>
+        <ResourceHeading
+          id="diagnostics-heading"
+          title="Diagnostics"
+          description="Investigate authentication failures, policy decisions and identity flows."
+        />
         <p class="resource-empty">
           Select a tenant and environment to view its diagnostics.
         </p>
@@ -66,7 +75,19 @@ export function DiagnosticsView() {
   }
   return (
     <section class="resource" aria-labelledby="diagnostics-heading">
-      <h2 id="diagnostics-heading">Diagnostics</h2>
+      <ResourceHeading
+        id="diagnostics-heading"
+        title="Diagnostics"
+        description="Investigate authentication failures, policy decisions and identity flows."
+      />
+      <ResourceDetailNav
+        items={[
+          { id: "diagnostics-auth", label: "Authentication" },
+          { id: "diagnostics-policy-section", label: "Policy traces" },
+          { id: "diagnostics-warnings", label: "Warnings" },
+          { id: "diagnostics-flow", label: "Flow inspector" },
+        ]}
+      />
       <ClientAuthDiagnosticsPanel
         tenantId={scope.tenantId}
         environmentId={scope.environmentId}
@@ -108,10 +129,11 @@ function ClientAuthDiagnosticsPanel({
   );
   return (
     <div class="resource-subsection">
-      <h3>Client authentication failures</h3>
+      <h2 id="diagnostics-auth">Client authentication failures</h2>
       <p class="resource-hint">
-        The specific reason a client authentication failed, kept off the wire. The
-        token endpoint returns a uniform invalid_client for every one of these.
+        The specific reason a client authentication failed, kept off the wire.
+        The token endpoint returns a uniform invalid_client for every one of
+        these.
       </p>
       <ClientAuthFilterForm onApply={setApplied} />
       <AsyncBoundary
@@ -130,8 +152,8 @@ function ClientAuthDiagnosticsPanel({
           <ul class="resource-list">
             {page.truncated ? (
               <li class="resource-note">
-                Showing the most recent failures only. Older matching failures were
-                left out; narrow the client or time window to see more.
+                Showing the most recent failures only. Older matching failures
+                were left out; narrow the client or time window to see more.
               </li>
             ) : null}
             {page.items.map((record, index) => (
@@ -205,6 +227,7 @@ function ClientAuthFilterForm({
         <label for="diagnostics-client-id">Client id</label>
         <input
           id="diagnostics-client-id"
+          placeholder={"All clients"}
           type="text"
           value={clientId}
           onInput={(event) =>
@@ -237,10 +260,10 @@ function PolicyTracesPanel({
   );
   return (
     <div class="resource-subsection">
-      <h3>Policy decision traces</h3>
+      <h2 id="diagnostics-policy-section">Policy decision traces</h2>
       <p class="resource-hint">
-        Why a step up, risk, or claim mapping decision came out the way it did, recorded off
-        the request path. Only bounded, non secret fields are kept.
+        Why a step up, risk, or claim mapping decision came out the way it did,
+        recorded off the request path. Only bounded, non secret fields are kept.
       </p>
       <PolicyTraceFilterForm onApply={setApplied} />
       <AsyncBoundary
@@ -259,8 +282,8 @@ function PolicyTracesPanel({
           <ul class="resource-list">
             {page.truncated ? (
               <li class="resource-note">
-                Showing the most recent traces only. Older matching traces were left out;
-                narrow the policy or time window to see more.
+                Showing the most recent traces only. Older matching traces were
+                left out; narrow the policy or time window to see more.
               </li>
             ) : null}
             {page.items.map((record, index) => (
@@ -347,12 +370,13 @@ function WarningsPanel({
   );
   return (
     <div class="resource-subsection">
-      <h3>Operational warnings</h3>
+      <h2 id="diagnostics-warnings">Operational warnings</h2>
       <p class="resource-hint">
-        Live warnings computed from the connector health, the recent token sizes, and the
-        recent permission claim budget verdicts. Nothing here is stored to go stale (except
-        the bounded token size events, which also carry the budget verdicts). A budget
-        warning is a convenience view: the token itself carries the withholding status.
+        Live warnings computed from the connector health, the recent token
+        sizes, and the recent permission claim budget verdicts. Nothing here is
+        stored to go stale (except the bounded token size events, which also
+        carry the budget verdicts). A budget warning is a convenience view: the
+        token itself carries the withholding status.
       </p>
       <AsyncBoundary
         state={state}
@@ -360,7 +384,9 @@ function WarningsPanel({
         empty={{
           when: (items) => items.length === 0,
           render: () => (
-            <p class="resource-empty">No operational warnings for this environment.</p>
+            <p class="resource-empty">
+              No operational warnings for this environment.
+            </p>
           ),
         }}
       >
@@ -383,9 +409,9 @@ function WarningGroups({ items }: { items: WarningItemView[] }) {
     <ul class="resource-list">
       {[...byKind.entries()].map(([kind, group]) => (
         <li key={kind} class="resource-row">
-          <h4>
+          <h3>
             <code class="resource-status">{kind}</code>
-          </h4>
+          </h3>
           <ul class="resource-list">
             {group.map((item, index) => (
               <li key={`${item.subject}-${index}`}>
@@ -416,11 +442,12 @@ function FlowInspectorPanel({
 }) {
   return (
     <div class="resource-subsection">
-      <h3>Flow inspector</h3>
+      <h2 id="diagnostics-flow">Flow inspector</h2>
       <p class="resource-hint">
-        Observe an existing flow read only, or dry run a supplied context through a journey
-        plan. Neither mutates a flow: observe never drives the engine, and a dry run writes no
-        row (it evaluates the real step up and risk policies with every write disabled).
+        Observe an existing flow read only, or dry run a supplied context
+        through a journey plan. Neither mutates a flow: observe never drives the
+        engine, and a dry run writes no row (it evaluates the real step up and
+        risk policies with every write disabled).
       </p>
       <FlowObserveForm tenantId={tenantId} environmentId={environmentId} />
       <FlowDryRunForm tenantId={tenantId} environmentId={environmentId} />
@@ -448,15 +475,23 @@ function FlowObserveForm({
       return;
     }
     void mutation.run(async () => {
-      const result = await fetchFlowObservation(tenantId, environmentId, trimmed);
+      const result = await fetchFlowObservation(
+        tenantId,
+        environmentId,
+        trimmed,
+      );
       setObserved(result);
     }, "Loaded the flow.");
   }
 
   return (
     <div class="resource-row">
-      <h4>Observe a flow</h4>
-      <form class="resource-form" onSubmit={onSubmit} aria-label="Observe a flow by id">
+      <h3>Observe a flow</h3>
+      <form
+        class="resource-form"
+        onSubmit={onSubmit}
+        aria-label="Observe a flow by id"
+      >
         <div class="resource-field">
           <label for="inspector-flow-id">Flow id</label>
           <input
@@ -482,7 +517,11 @@ function FlowObserveForm({
 
 // Render a read only flow observation: the current position, the plan, the redacted context,
 // the current node render, and the recorded policy traces.
-function FlowObservation({ observation }: { observation: FlowObserveResponse }) {
+function FlowObservation({
+  observation,
+}: {
+  observation: FlowObserveResponse;
+}) {
   return (
     <dl class="resource-detail">
       <dt>Flow</dt>
@@ -566,11 +605,7 @@ function PlanSteps({ plan, current }: { plan: string[]; current?: string }) {
 
 // Render a redacted flow context (never a secret: only the step, method tokens, the blind
 // subject handle, and two booleans).
-function ContextView({
-  context,
-}: {
-  context: FlowObserveResponse["context"];
-}) {
+function ContextView({ context }: { context: FlowObserveResponse["context"] }) {
   return (
     <dl class="resource-detail">
       <dt>Step</dt>
@@ -578,7 +613,9 @@ function ContextView({
         <code class="resource-status">{context.step}</code>
       </dd>
       <dt>Methods</dt>
-      <dd>{context.methods.length === 0 ? "none" : context.methods.join(", ")}</dd>
+      <dd>
+        {context.methods.length === 0 ? "none" : context.methods.join(", ")}
+      </dd>
       <dt>Subject</dt>
       <dd>
         <code>{context.subject ?? "none"}</code>
@@ -667,7 +704,10 @@ function FlowDryRunForm({
   const [result, setResult] = useState<FlowDryRunResponse | null>(null);
   const mutation = useMutation();
 
-  function set<K extends keyof DryRunDraft>(key: K, value: DryRunDraft[K]): void {
+  function set<K extends keyof DryRunDraft>(
+    key: K,
+    value: DryRunDraft[K],
+  ): void {
     setDraft((current) => ({ ...current, [key]: value }));
   }
 
@@ -685,8 +725,12 @@ function FlowDryRunForm({
 
   return (
     <div class="resource-row">
-      <h4>Dry run a context</h4>
-      <form class="resource-form" onSubmit={onSubmit} aria-label="Dry run a flow context">
+      <h3>Dry run a context</h3>
+      <form
+        class="resource-form"
+        onSubmit={onSubmit}
+        aria-label="Dry run a flow context"
+      >
         <div class="resource-field">
           <label for="dryrun-journey">Journey</label>
           <select
@@ -872,8 +916,9 @@ function DryRunResult({ result }: { result: FlowDryRunResponse }) {
                   <dd>
                     <code class="resource-status">{step.step_up.outcome}</code>
                     {step.step_up.acr_unmet ? " acr_unmet" : ""}
-                    {step.step_up.age_lapsed ? " age_lapsed" : ""} (achieved{" "}
-                    {step.step_up.achieved_acr})
+                    {step.step_up.age_lapsed
+                      ? " age_lapsed"
+                      : ""} (achieved {step.step_up.achieved_acr})
                   </dd>
                 </>
               ) : null}

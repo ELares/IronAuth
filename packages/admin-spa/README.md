@@ -8,22 +8,22 @@ client. It is served two ways from the same build: EMBEDDED in the single
 IronAuth binary (the default operator experience), and STANDALONE as static
 assets pointed at a configured management base.
 
-Progress on issue #90:
+The console includes an overview of the loaded tenant/environment context and
+entry points for tenants, environments, clients, users, connectors, organizations,
+permissions, invitations, and diagnostics. Grouped navigation highlights the
+current section and collapses into an accessible menu on narrow screens.
+Console links and route patterns retain the `/admin` mount in embedded deployments.
 
-- PR1 was the FOUNDATION: a static shell (an app frame with nav placeholders),
-  the one typed client, the route audit covenant, and in process serving.
-- PR2 wired the real login: the Authorization Code + PKCE flow against the admin
-  issuer, the short lived at+jwt held in memory, and the bearer attached to the
-  typed client.
-- PR3 was the app SHELL: the real console frame (header, sidebar nav of the
-  resource sections, routed placeholder views), the persistent tenant/environment
-  CONTEXT SWITCHER that scopes every view, a keyboard COMMAND PALETTE, and the
-  verbatim management ErrorBody rendering boundary.
-- PR4 (this change) is the first CRUD content: the TENANTS and ENVIRONMENTS
-  surfaces (list, detail, create, delete, plus the tenant suspend, resume, and
-  restore lifecycle), built on a reusable resource pattern PR5 and PR6 follow.
+The visible search control and Cmd/Ctrl-K open the same command palette. Resource
+lists also have local filters over the loaded rows; paginated collections make
+that search boundary explicit. Forms provide descriptions and field guidance,
+one-time credentials have copy controls, and destructive actions require an
+explicit confirmation with Escape cancellation. API errors remain verbatim.
 
-The remaining CRUD content (Users, Connectors, Clients) lands in PR5 and PR6.
+Sign in uses Authorization Code + PKCE against the configured admin issuer.
+The short lived at+jwt stays in memory, and the sign-out control clears that
+console session and its selected context. Tenant/environment selection scopes
+every resource view and collapses when the environment is implicit.
 
 ## The reusable resource pattern (PR4)
 

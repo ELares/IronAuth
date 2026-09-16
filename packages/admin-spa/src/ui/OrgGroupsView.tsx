@@ -29,7 +29,7 @@
 // single funnel) and renders every failure through the verbatim ErrorView
 // boundary, including the RFC 9470 sudo path on a max_age challenge.
 
-import { useState } from "preact/hooks";
+import { useRef, useState } from "preact/hooks";
 import {
   type AddOrgGroupMemberRequest,
   type AssignOrgGroupRoleRequest,
@@ -57,6 +57,7 @@ import {
   ConfirmButton,
   MorePageNote,
   MutationFeedback,
+  ResourceFormIntro,
 } from "./ResourceView";
 import {
   type GroupNode,
@@ -86,11 +87,18 @@ export function OrgGroupsPanel({
 
   return (
     <div class="resource-subsection">
-      <h3>Groups</h3>
-      <p class="resource-note">
-        A group nests inside another group, and every role a group grants is
-        resolved by its members and by the members of every group beneath it.
+      <h2 id="organization-groups">Groups</h2>
+      <p class="resource-hint">
+        Organize members into a hierarchy. Members inherit the roles granted to
+        their group and its parents.
       </p>
+      <details class="resource-help">
+        <summary>How group inheritance works</summary>
+        <p class="resource-note">
+          A group nests inside another group, and every role a group grants is
+          resolved by its members and by the members of every group beneath it.
+        </p>
+      </details>
       <OrgGroupCreateForm
         tenantId={tenantId}
         environmentId={environmentId}
@@ -154,27 +162,77 @@ function GroupTree({
   openGroupId: string | null;
   onToggle: (groupId: string) => void;
 }) {
+  const buttons = useRef<Array<HTMLButtonElement | null>>([]);
+  const [focusedGroupId, setFocusedGroupId] = useState<string | null>(null);
+  const focusId =
+    nodes.find((node) => node.group.id === focusedGroupId)?.group.id ??
+    nodes[0]?.group.id;
   const anyDetached = nodes.some((node) => node.detached);
   return (
     <div>
+      <p id="organization-group-navigation-help" class="resource-hint">
+        Use the arrow keys to move between groups. Press Enter to view a group.
+      </p>
       <ul
         class="resource-tree"
         role="tree"
         aria-label="Group hierarchy of the organization"
+        aria-describedby="organization-group-navigation-help"
       >
-        {nodes.map((node) => (
+        {nodes.map((node, index) => (
           <li
             key={node.group.id}
             class="resource-row resource-tree-item"
             role="treeitem"
             aria-level={node.depth + 1}
             aria-selected={openGroupId === node.group.id}
-            style={{ marginLeft: `${node.depth * 1.4}rem` }}
+            aria-expanded={
+              (nodes[index + 1]?.depth ?? -1) > node.depth ? true : undefined
+            }
           >
+            {node.depth === 0 ? null : (
+              <span class="resource-tree-indent" aria-hidden="true">
+                {Array.from({ length: node.depth }, (_, level) => (
+                  <span key={level} class="resource-tree-indent-step" />
+                ))}
+              </span>
+            )}
             <button
+              ref={(button) => {
+                buttons.current[index] = button;
+              }}
               type="button"
               class="resource-linkbtn"
+              tabIndex={focusId === node.group.id ? 0 : -1}
+              onFocus={() => setFocusedGroupId(node.group.id)}
+              onKeyDown={(event) => {
+                let target = index;
+                if (event.key === "ArrowDown")
+                  target = Math.min(index + 1, nodes.length - 1);
+                else if (event.key === "ArrowUp")
+                  target = Math.max(index - 1, 0);
+                else if (event.key === "Home") target = 0;
+                else if (event.key === "End") target = nodes.length - 1;
+                else if (event.key === "ArrowRight") {
+                  if ((nodes[index + 1]?.depth ?? -1) > node.depth)
+                    target = index + 1;
+                } else if (event.key === "ArrowLeft") {
+                  for (let parent = index - 1; parent >= 0; parent -= 1) {
+                    if (nodes[parent].depth < node.depth) {
+                      target = parent;
+                      break;
+                    }
+                  }
+                } else return;
+                event.preventDefault();
+                buttons.current[target]?.focus();
+              }}
               aria-expanded={openGroupId === node.group.id}
+              aria-controls={
+                openGroupId === node.group.id
+                  ? `org-group-detail-${node.group.id}`
+                  : undefined
+              }
               onClick={() => onToggle(node.group.id)}
             >
               {node.group.display_name}
@@ -224,12 +282,7 @@ function OrgGroupCreateForm({
     };
     void mutation
       .run(async () => {
-        await createOrgGroup(
-          tenantId,
-          environmentId,
-          organizationId,
-          request,
-        );
+        await createOrgGroup(tenantId, environmentId, organizationId, request);
       }, "Group defined.")
       .then((ok) => {
         if (ok) {
@@ -243,10 +296,16 @@ function OrgGroupCreateForm({
 
   return (
     <form class="resource-form" onSubmit={onSubmit} aria-label="Define a group">
+      <ResourceFormIntro
+        title="Define group"
+        headingLevel={3}
+        description="Create a group at the top level or under an existing group."
+      />
       <div class="resource-field">
         <label for="org-group-slug">Slug</label>
         <input
           id="org-group-slug"
+          placeholder={"engineering"}
           type="text"
           required
           value={slug}
@@ -257,6 +316,7 @@ function OrgGroupCreateForm({
         <label for="org-group-display-name">Display name</label>
         <input
           id="org-group-display-name"
+          placeholder={"Engineering"}
           type="text"
           required
           value={displayName}
@@ -387,11 +447,11 @@ function OrgGroupDetail({
   }
 
   return (
-    <div class="resource-detail-panel">
+    <div class="resource-detail-panel" id={`org-group-detail-${groupId}`}>
       <AsyncBoundary state={state} loadingLabel="Loading group">
         {(group) => (
           <div>
-            <h4>Group {group.slug}</h4>
+            <h3>Group {group.slug}</h3>
             <dl class="resource-detail">
               <dt>Identifier</dt>
               <dd>
@@ -546,8 +606,8 @@ function OrgGroupMoveForm({
       )}
       <p class="resource-note">
         A move that would loop the hierarchy, or nest it deeper than the
-        configured maximum, is refused by the server and the reason is shown here
-        unchanged.
+        configured maximum, is refused by the server and the reason is shown
+        here unchanged.
       </p>
       <button
         type="submit"
@@ -761,6 +821,7 @@ function OrgGroupRolesPanel({
           <label for="org-group-role-id">Role id</label>
           <input
             id="org-group-role-id"
+            placeholder={"Role ID from this organization"}
             type="text"
             required
             value={roleId}

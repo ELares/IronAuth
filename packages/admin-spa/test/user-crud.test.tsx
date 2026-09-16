@@ -79,7 +79,9 @@ async function flush(): Promise<void> {
   for (let i = 0; i < 6; i += 1) {
     await Promise.resolve();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
   }
 }
 
@@ -127,9 +129,7 @@ describe("the users list", () => {
 
     const get = calls.find((call) => call.method === "GET");
     expect(get).toBeDefined();
-    expect(get?.url).toContain(
-      "/v1/tenants/ten_a/environments/env_a/users",
-    );
+    expect(get?.url).toContain("/v1/tenants/ten_a/environments/env_a/users");
     expect(root.textContent).toContain("ada@example.test");
     const links = Array.from(root.querySelectorAll(".resource-link")).map((a) =>
       a.getAttribute("href"),
@@ -163,14 +163,14 @@ describe("creating a user", () => {
     await flush();
 
     const form = root.querySelector(".resource-form") as HTMLFormElement;
-    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    form.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
     await flush();
 
     const post = calls.find((call) => call.method === "POST");
     expect(post).toBeDefined();
-    expect(post?.url).toContain(
-      "/v1/tenants/ten_a/environments/env_a/users",
-    );
+    expect(post?.url).toContain("/v1/tenants/ten_a/environments/env_a/users");
     expect(post?.idempotencyKey).toBeTruthy();
     const body = JSON.parse(post?.body ?? "{}") as Record<string, unknown>;
     expect(body.identifier).toBe("grace@example.test");
@@ -232,6 +232,42 @@ describe("revoking a user's sessions", () => {
       "/v1/tenants/ten_a/environments/env_a/users/usr_a/sessions/revoke",
     );
     expect(post?.idempotencyKey).toBeTruthy();
+  });
+});
+
+describe("scheduled offboarding", () => {
+  it("converts the selected local date and time to the API's epoch milliseconds", async () => {
+    activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
+    const calls = stubFetch(() => json(user));
+    const root = mount(<UserDetail userId="usr_a" />);
+    await flush();
+
+    const state = root.querySelector("#user-target-state") as HTMLSelectElement;
+    state.value = "scheduled_offboarding";
+    state.dispatchEvent(new Event("change", { bubbles: true }));
+    await flush();
+    expect(button(root, "Change state").disabled).toBe(true);
+
+    const dateTime = root.querySelector(
+      "#user-offboard-at",
+    ) as HTMLInputElement;
+    expect(dateTime.type).toBe("datetime-local");
+    dateTime.value = "2030-06-15T14:30";
+    dateTime.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    button(root, "Change state").click();
+    await flush();
+    button(root, "Confirm state change").click();
+    await flush();
+
+    const post = calls.find(
+      (call) => call.method === "POST" && call.url.endsWith("/state"),
+    );
+    expect(post).toBeDefined();
+    expect(JSON.parse(post?.body ?? "{}")).toEqual({
+      state: "scheduled_offboarding",
+      scheduled_offboarding_at_unix_ms: new Date("2030-06-15T14:30").getTime(),
+    });
   });
 });
 

@@ -67,13 +67,20 @@ export function OrgDefaultRolePanel({
 
   return (
     <div class="resource-subsection">
-      <h3>Default role</h3>
-      <p class="resource-note">
-        The one role every active member of this organization resolves without a
-        grant of their own. Designating a role MOVES the designation off whatever
-        role held it, and clearing it deletes nothing: the role and every grant of
-        it stay exactly as they are.
+      <h2 id="organization-default-role">Default role</h2>
+      <p class="resource-hint">
+        Choose a role automatically granted to every active member of this
+        organization.
       </p>
+      <details class="resource-help">
+        <summary>How the default role works</summary>
+        <p class="resource-note">
+          The one role every active member of this organization resolves without
+          a grant of their own. Designating a role MOVES the designation off
+          whatever role held it, and clearing it deletes nothing: the role and
+          every grant of it stay exactly as they are.
+        </p>
+      </details>
       <AsyncBoundary
         state={state}
         loadingLabel="Loading the roles of the organization"
@@ -152,8 +159,7 @@ function DefaultRoleForm({
   // only thing standing between an operator and a control pinned at a value the
   // store has moved past.
   const [choice, setChoice] = useState<string | null>(null);
-  const initial =
-    reading.kind === "held" ? reading.role.id : page.items[0].id;
+  const initial = reading.kind === "held" ? reading.role.id : page.items[0].id;
   const selected = choice ?? initial;
 
   function onDesignate(event: Event): void {

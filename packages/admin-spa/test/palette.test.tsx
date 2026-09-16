@@ -38,7 +38,12 @@ afterEach(() => {
 describe("filterCommands", () => {
   const commands: Command[] = [
     { id: "1", label: "Go to Tenants", run: () => undefined },
-    { id: "2", label: "Switch to tenant Acme", hint: "ten_acme", run: () => undefined },
+    {
+      id: "2",
+      label: "Switch to tenant Acme",
+      hint: "ten_acme",
+      run: () => undefined,
+    },
     { id: "3", label: "Go to Users", run: () => undefined },
   ];
 
@@ -47,8 +52,13 @@ describe("filterCommands", () => {
   });
 
   it("matches case-insensitively over label and hint", () => {
-    expect(filterCommands(commands, "TENANT").map((c) => c.id)).toEqual(["1", "2"]);
-    expect(filterCommands(commands, "ten_acme").map((c) => c.id)).toEqual(["2"]);
+    expect(filterCommands(commands, "TENANT").map((c) => c.id)).toEqual([
+      "1",
+      "2",
+    ]);
+    expect(filterCommands(commands, "ten_acme").map((c) => c.id)).toEqual([
+      "2",
+    ]);
     expect(filterCommands(commands, "users").map((c) => c.id)).toEqual(["3"]);
   });
 });
@@ -63,7 +73,28 @@ describe("wrapIndex", () => {
 });
 
 describe("command palette keyboard flow", () => {
-  function keydown(target: EventTarget, key: string, mods: KeyboardEventInit = {}) {
+  it("opens from the visible search control and restores focus after Escape", async () => {
+    const root = mount(<CommandPalette commands={[]} />);
+    await tick();
+    const trigger = root.querySelector(".console-search") as HTMLButtonElement;
+    trigger.focus();
+    trigger.click();
+    await tick();
+    const input = root.querySelector(".cmdk-input") as HTMLInputElement;
+    expect(document.activeElement).toBe(input);
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    );
+    await tick();
+    expect(root.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(root.querySelector(".console-search"));
+  });
+
+  function keydown(
+    target: EventTarget,
+    key: string,
+    mods: KeyboardEventInit = {},
+  ) {
     target.dispatchEvent(
       new KeyboardEvent("keydown", { key, bubbles: true, ...mods }),
     );
@@ -107,7 +138,9 @@ describe("command palette keyboard flow", () => {
 
   it("closes on Escape without running a command", async () => {
     const alpha = vi.fn();
-    const commands: Command[] = [{ id: "a", label: "Alpha action", run: alpha }];
+    const commands: Command[] = [
+      { id: "a", label: "Alpha action", run: alpha },
+    ];
     const root = mount(<CommandPalette commands={commands} />);
     await tick();
 

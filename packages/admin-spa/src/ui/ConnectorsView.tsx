@@ -22,6 +22,7 @@
 // re-supplies it.
 
 import { useLocation } from "preact-iso";
+import { consoleHref } from "./routing";
 import { useState } from "preact/hooks";
 import {
   type ConnectorCapabilitiesView,
@@ -38,7 +39,14 @@ import {
 } from "../api/client";
 import { activeScope } from "../scope/store";
 import type { SudoRecovery } from "./ErrorView";
-import { AsyncBoundary, ConfirmButton, MutationFeedback } from "./ResourceView";
+import {
+  AsyncBoundary,
+  ConfirmButton,
+  MutationFeedback,
+  ResourceHeading,
+  ResourceFormIntro,
+  ResourceCollection,
+} from "./ResourceView";
 import { useAsyncResource, useMutation } from "./useResource";
 
 // Parse a textarea as a JSON object (not an array, not a scalar). Returns the
@@ -64,7 +72,11 @@ export function ConnectorsList() {
   if (scope === null) {
     return (
       <section class="resource" aria-labelledby="connectors-heading">
-        <h2 id="connectors-heading">Connectors</h2>
+        <ResourceHeading
+          id="connectors-heading"
+          title="Connectors"
+          description="Connect external identity providers and check their health and capabilities."
+        />
         <p class="resource-empty">
           Select a tenant and environment to view its connectors.
         </p>
@@ -92,7 +104,11 @@ function ConnectorsForScope({
   );
   return (
     <section class="resource" aria-labelledby="connectors-heading">
-      <h2 id="connectors-heading">Connectors</h2>
+      <ResourceHeading
+        id="connectors-heading"
+        title="Connectors"
+        description="Connect external identity providers and check their health and capabilities."
+      />
       <ConnectorCreateForm
         tenantId={tenantId}
         environmentId={environmentId}
@@ -111,22 +127,36 @@ function ConnectorsForScope({
         }}
       >
         {(items) => (
-          <ul class="resource-list">
-            {items.map((connector) => (
-              <li key={connector.id} class="resource-row">
-                <a
-                  class="resource-link"
-                  href={`/connectors/${connector.id}`}
-                >
-                  {connector.connector_slug}
-                </a>
-                <code class="resource-id">{connector.id}</code>
-                <span class="resource-status">
-                  {connector.enabled ? "enabled" : "disabled"}
-                </span>
-              </li>
-            ))}
-          </ul>
+          <ResourceCollection
+            items={items}
+            noun="connectors"
+            searchText={(connector) =>
+              [
+                connector.connector_slug,
+                connector.id,
+                connector.enabled ? "enabled" : "disabled",
+              ].join(" ")
+            }
+          >
+            {(visible) => (
+              <ul class="resource-list">
+                {visible.map((connector) => (
+                  <li key={connector.id} class="resource-row">
+                    <a
+                      class="resource-link"
+                      href={consoleHref(`/connectors/${connector.id}`)}
+                    >
+                      {connector.connector_slug}
+                    </a>
+                    <code class="resource-id">{connector.id}</code>
+                    <span class="resource-status">
+                      {connector.enabled ? "enabled" : "disabled"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </ResourceCollection>
         )}
       </AsyncBoundary>
     </section>
@@ -177,16 +207,27 @@ function ConnectorCreateForm({
       onSubmit={onSubmit}
       aria-label="Create a connector"
     >
+      <ResourceFormIntro
+        title="Create connector"
+        description="Enter the provider configuration as a JSON object. Keep secret values in the configured secret store."
+      />
       <div class="resource-field">
         <label for="connector-definition">Connector definition (JSON)</label>
         <textarea
           id="connector-definition"
+          spellcheck={false}
+          aria-describedby="connector-definition-help"
+          aria-invalid={invalid}
           rows={8}
           value={definition}
           onInput={(event) =>
             setDefinition((event.target as HTMLTextAreaElement).value)
           }
         />
+        <p id="connector-definition-help" class="resource-hint">
+          Include connector_id, display_name, protocol, endpoints, scopes,
+          client_id and client_secret. Secret references can use env or file.
+        </p>
         {invalid ? (
           <p class="resource-field-error" role="alert">
             Enter a valid JSON object for the connector definition.
@@ -216,7 +257,11 @@ export function ConnectorDetail({ connectorId }: { connectorId?: string }) {
   if (scope === null) {
     return (
       <section class="resource" aria-labelledby="connector-detail-heading">
-        <h2 id="connector-detail-heading">Connector</h2>
+        <ResourceHeading
+          id="connector-detail-heading"
+          title="Connector"
+          description="Review this identity connection, check its health and update its definition."
+        />
         <p class="resource-empty">
           Select a tenant and environment to view this connector.
         </p>
@@ -255,7 +300,7 @@ function ConnectorDetailFor({
     void mutation.run(async () => {
       await deleteConnector(tenantId, environmentId, connectorId);
       if (typeof location.route === "function") {
-        location.route("/connectors");
+        location.route(consoleHref("/connectors"));
       }
     }, "Connector deleted.");
   }
@@ -263,14 +308,18 @@ function ConnectorDetailFor({
   return (
     <section class="resource" aria-labelledby="connector-detail-heading">
       <p>
-        <a class="resource-back" href="/connectors">
+        <a class="resource-back" href={consoleHref("/connectors")}>
           Back to connectors
         </a>
       </p>
       <AsyncBoundary state={state} loadingLabel="Loading connector">
         {(connector) => (
           <div>
-            <h2 id="connector-detail-heading">{connector.connector_slug}</h2>
+            <ResourceHeading
+              id="connector-detail-heading"
+              title={connector.connector_slug}
+              description="Review this identity connection, check its health and update its definition."
+            />
             <dl class="resource-detail">
               <dt>Identifier</dt>
               <dd>
@@ -340,7 +389,7 @@ function CapabilityMatrix({
 }) {
   return (
     <div class="resource-subsection">
-      <h3>Capabilities</h3>
+      <h2>Capabilities</h2>
       <dl class="resource-detail">
         <dt>Refresh tokens</dt>
         <dd>{capabilities.refresh ? "yes" : "no"}</dd>
@@ -373,7 +422,7 @@ function ConnectorCapabilitiesPanel({
   );
   return (
     <div class="resource-subsection">
-      <h3>Capabilities (live)</h3>
+      <h2>Capabilities (live)</h2>
       <AsyncBoundary state={state} loadingLabel="Loading capabilities">
         {(capabilities) => (
           <dl class="resource-detail">
@@ -416,7 +465,7 @@ function ConnectorHealthPanel({
   }
   return (
     <div class="resource-subsection">
-      <h3>Health</h3>
+      <h2>Health</h2>
       <AsyncBoundary state={state} loadingLabel="Loading health">
         {(health) => (
           <dl class="resource-detail">
@@ -494,7 +543,7 @@ function ConnectorUpdateForm({
 
   return (
     <div class="resource-subsection">
-      <h3>Replace definition</h3>
+      <h2>Replace definition</h2>
       <form
         class="resource-form"
         onSubmit={onSubmit}
@@ -506,12 +555,19 @@ function ConnectorUpdateForm({
           </label>
           <textarea
             id="connector-update-definition"
+            spellcheck={false}
+            aria-invalid={invalid}
+            aria-describedby="connector-update-definition-help"
             rows={8}
             value={definition}
             onInput={(event) =>
               setDefinition((event.target as HTMLTextAreaElement).value)
             }
           />
+          <p id="connector-update-definition-help" class="resource-hint">
+            Provide the complete replacement definition, including secret
+            references. Existing fields are replaced.
+          </p>
           {invalid ? (
             <p class="resource-field-error" role="alert">
               Enter a valid JSON object for the connector definition.

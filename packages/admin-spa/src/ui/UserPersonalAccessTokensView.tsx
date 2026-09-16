@@ -36,7 +36,7 @@ import {
   rotateUserPersonalAccessToken,
 } from "../api/client";
 import { describe } from "./OrgApiKeysView";
-import { AsyncBoundary, ConfirmButton } from "./ResourceView";
+import { AsyncBoundary, ConfirmButton, SecretCopyButton } from "./ResourceView";
 import { inputValue } from "./orgPanels";
 import { type Mutation, useAsyncResource } from "./useResource";
 
@@ -63,7 +63,9 @@ export function UserPersonalAccessTokensPanel({
   // every reload, so a token held there would either vanish inconsistently or, worse,
   // survive in the DOM long after the operator stopped looking. The server cannot
   // return it again, so the panel must not behave as though it could.
-  const [issued, setIssued] = useState<{ id: string; key: string } | null>(null);
+  const [issued, setIssued] = useState<{ id: string; key: string } | null>(
+    null,
+  );
   const [name, setName] = useState("");
   const reloadClearingToken = () => {
     setIssued(null);
@@ -72,11 +74,10 @@ export function UserPersonalAccessTokensPanel({
 
   return (
     <div class="resource-subsection">
-      <h3>Personal access tokens</h3>
+      <h2 id="user-tokens">Personal access tokens</h2>
       <p class="resource-note">
-        The tokens that authenticate as this user. The token itself is shown once, when
-        it is created, and is never recoverable afterwards: this list carries only the
-        handle. Revoked tokens stay listed so a rotation is legible.
+        Tokens authenticate as this user. Save each token when it is created; it
+        cannot be retrieved later. Revoked tokens stay visible for reference.
       </p>
       <form
         class="resource-form"
@@ -110,26 +111,34 @@ export function UserPersonalAccessTokensPanel({
             });
         }}
       >
-        <label>
+        <label class="resource-field">
           New token name
           <input
             type="text"
+            required
+            placeholder="Production integration"
             value={name}
             disabled={mutation.state.pending}
             onInput={(event) => setName(inputValue(event))}
           />
         </label>
-        <button type="submit" disabled={mutation.state.pending}>
+        <button
+          class="resource-btn resource-btn-primary"
+          type="submit"
+          disabled={mutation.state.pending || name.trim() === ""}
+        >
           Create token
         </button>
       </form>
       {issued === null ? null : (
         <div class="resource-callout">
+          <h3>Save your new token</h3>
           <p>
-            Copy this token now. It is shown once and cannot be recovered, including by
-            reloading this page.
+            Copy this token now. It is shown once and cannot be recovered,
+            including by reloading this page.
           </p>
           <code class="resource-secret">{issued.key}</code>
+          <SecretCopyButton value={issued.key} label="Copy token" />
         </div>
       )}
       <AsyncBoundary
@@ -138,7 +147,9 @@ export function UserPersonalAccessTokensPanel({
         empty={{
           when: (tokens) => tokens.length === 0,
           render: () => (
-            <p class="resource-empty">This user has no personal access tokens.</p>
+            <p class="resource-empty">
+              This user has no personal access tokens.
+            </p>
           ),
         }}
       >
@@ -157,7 +168,7 @@ export function UserPersonalAccessTokensPanel({
                   <>
                     <ConfirmButton
                       label="Rotate"
-                      prompt="Rotate this token? The current token stops authenticating immediately and a replacement is issued in the same transaction, inheriting this token's name and expiry. The new token is shown ONCE and cannot be recovered."
+                      prompt="Rotate this token? The current token stops working immediately. Save the replacement now; it keeps the same name and expiry and is shown only once."
                       confirmLabel="Confirm rotate"
                       disabled={mutation.state.pending}
                       onConfirm={() =>
@@ -187,7 +198,7 @@ export function UserPersonalAccessTokensPanel({
                     />
                     <ConfirmButton
                       label="Revoke"
-                      prompt="Revoke this token? Anything using it stops authenticating on its very next request, and the token cannot be recovered or un-revoked. The row stays listed so the revocation is legible."
+                      prompt="Revoke this token? It stops authenticating on the next request. This cannot be undone."
                       confirmLabel="Confirm revoke"
                       danger
                       disabled={mutation.state.pending}

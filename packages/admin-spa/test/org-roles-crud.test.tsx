@@ -93,14 +93,19 @@ function json(data: unknown, status = 200): Response {
 }
 
 function noContent(): Response {
-  return new Response(null, { status: 204, headers: { "content-length": "0" } });
+  return new Response(null, {
+    status: 204,
+    headers: { "content-length": "0" },
+  });
 }
 
 async function flush(): Promise<void> {
   for (let i = 0; i < 6; i += 1) {
     await Promise.resolve();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
   }
 }
 
@@ -350,6 +355,40 @@ describe("the organization roles panel", () => {
 });
 
 describe("the organization groups panel", () => {
+  it("supports keyboard navigation through groups without inline styles or extra reads", async () => {
+    const calls = stubFetch(() => json({ items: [groupA, groupB] }));
+    const root = mount(<OrgGroupsPanel {...SCOPE} />);
+    await flush();
+    const parent = button(root, "Engineering");
+    const child = button(root, "Platform");
+    parent.focus();
+    parent.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }),
+    );
+    await flush();
+    expect(document.activeElement).toBe(child);
+    child.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }),
+    );
+    await flush();
+    expect(document.activeElement).toBe(parent);
+    parent.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "End", bubbles: true }),
+    );
+    await flush();
+    expect(document.activeElement).toBe(child);
+    expect(child.tabIndex).toBe(0);
+    expect(parent.tabIndex).toBe(-1);
+    child.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Home", bubbles: true }),
+    );
+    await flush();
+    expect(document.activeElement).toBe(parent);
+    expect(root.querySelectorAll(".resource-tree-indent-step")).toHaveLength(1);
+    expect(root.querySelector(".resource-tree [style]")).toBeNull();
+    expect(calls).toHaveLength(1);
+  });
+
   it("renders the hierarchy as a tree, nesting a child under its parent", async () => {
     stubFetch(() => json({ items: [groupA, groupB] }));
     const root = mount(<OrgGroupsPanel {...SCOPE} />);
@@ -412,9 +451,7 @@ describe("the organization groups panel", () => {
 
   it("defines a group under the chosen parent at the documented POST", async () => {
     const calls = stubFetch((call) =>
-      call.method === "POST"
-        ? json(groupB, 201)
-        : json({ items: [groupA] }),
+      call.method === "POST" ? json(groupB, 201) : json({ items: [groupA] }),
     );
     const root = mount(<OrgGroupsPanel {...SCOPE} />);
     await flush();
@@ -457,9 +494,10 @@ describe("the organization groups panel", () => {
 // The group detail: opening a group reads it fresh and mounts its members and
 // granted roles. Every test here opens `Engineering` first.
 describe("one group", () => {
-  function openGroup(
-    respond: (call: Call) => Response | null,
-  ): { root: HTMLDivElement; calls: Call[] } {
+  function openGroup(respond: (call: Call) => Response | null): {
+    root: HTMLDivElement;
+    calls: Call[];
+  } {
     const calls = stubFetch((call) => {
       const custom = respond(call);
       if (custom !== null) {
@@ -661,7 +699,9 @@ describe("one group", () => {
     ) as HTMLSelectElement;
     expect(select.value).toBe("grp_a");
     // The parent IS readable here, so the unresolvable-parent note is absent.
-    expect(root.textContent).not.toContain("not among the groups readable here");
+    expect(root.textContent).not.toContain(
+      "not among the groups readable here",
+    );
 
     button(root, "Move group").click();
     await flush();
@@ -884,7 +924,9 @@ describe("the roles one group grants", () => {
     button(root, "Engineering").click();
     await flush();
 
-    expect(root.textContent).toContain("More roles granted by this group exist");
+    expect(root.textContent).toContain(
+      "More roles granted by this group exist",
+    );
     // The cursor is a pagination token, never surfaced as a value to copy.
     expect(root.textContent).not.toContain("opaque_gr_2");
   });
@@ -1072,7 +1114,9 @@ describe("the roles of one member", () => {
   it("says so plainly when a member resolves no roles at all", async () => {
     const { root } = open({ items: [] }, effective([]));
     await flush();
-    expect(root.textContent).toContain("resolves no roles in this organization");
+    expect(root.textContent).toContain(
+      "resolves no roles in this organization",
+    );
     expect(rowsOf(root, "Effective role grant paths")).toEqual([]);
     // Nothing is gating resolution, so an empty set really does mean no grants.
     expect(root.textContent).not.toContain("still on file");
@@ -1258,7 +1302,9 @@ describe("the roles and groups panels inside the organization detail", () => {
     expect(root.textContent).toContain("Select a tenant and environment");
     expect(calls.length).toBe(0);
     // Specifically: no roles, groups, or effective-roles read escapes.
-    expect(root.querySelector('[aria-label="Roles of the organization"]')).toBeNull();
+    expect(
+      root.querySelector('[aria-label="Roles of the organization"]'),
+    ).toBeNull();
   });
 
   it("mounts the roles and groups panels under the organization", async () => {
@@ -1327,9 +1373,9 @@ describe("the roles and groups panels inside the organization detail", () => {
     await flush();
 
     // Nothing is read for a member until the operator asks.
-    expect(
-      calls.some((call) => call.url.includes("/effective-roles")),
-    ).toBe(false);
+    expect(calls.some((call) => call.url.includes("/effective-roles"))).toBe(
+      false,
+    );
 
     button(root, "Show roles").click();
     await flush();

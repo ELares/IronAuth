@@ -120,9 +120,9 @@ export function MembershipRolesPanel({
   }
 
   return (
-    <div class="resource-member-roles">
+    <div class="resource-member-roles" id={`membership-roles-${membershipId}`}>
       <div class="resource-subsection">
-        <h4>Roles granted directly</h4>
+        <h3>Roles granted directly</h3>
         <form
           class="resource-form"
           onSubmit={onAssign}
@@ -132,6 +132,7 @@ export function MembershipRolesPanel({
             <label for="org-membership-role-id">Role id</label>
             <input
               id="org-membership-role-id"
+              placeholder={"Role ID from this organization"}
               type="text"
               required
               value={roleId}
@@ -354,15 +355,21 @@ function EffectiveRolesPanel({
 }) {
   return (
     <div class="resource-subsection">
-      <h4>Effective roles, with provenance</h4>
-      <p class="resource-note">
-        One row per grant path. A slug listed more than once is held by more than
-        one path, so withdrawing a single grant leaves the role in place. A path
-        marked as the default role of the organization is carried by the
-        designation and no withdrawal here removes it. This is what the next
-        access token would carry; tokens already issued are not revoked by a
-        change here.
+      <h3>Effective roles, with provenance</h3>
+      <p class="resource-hint">
+        See every role available to this member and where each grant comes from.
       </p>
+      <details class="resource-help">
+        <summary>About effective roles</summary>
+        <p class="resource-note">
+          One row per grant path. A slug listed more than once is held by more
+          than one path, so withdrawing a single grant leaves the role in place.
+          A path marked as the default role of the organization is carried by
+          the designation and no withdrawal here removes it. This is what the
+          next access token would carry; tokens already issued are not revoked
+          by a change here.
+        </p>
+      </details>
       <AsyncBoundary state={state} loadingLabel="Loading effective roles">
         {(view) => (
           <div>
@@ -458,7 +465,7 @@ function EffectivePermissionsPanel({
   const withheld = budgetWithholdingReason(budget);
   return (
     <div class="resource-subsection">
-      <h4>Permissions these roles carry</h4>
+      <h3>Permissions these roles carry</h3>
       <p class="resource-note">
         The resolved permission set, deduplicated, in the order the server
         returned it. A permission is carried by a role, so the way to remove one
@@ -495,19 +502,19 @@ function EffectivePermissionsPanel({
         permissions, counted against the element budget, with a warning past{" "}
         {budget.warn_permission_count}. The verdict here is the ELEMENT count
         only: the configured token size bounds of {budget.warn_token_bytes} and{" "}
-        {budget.max_token_bytes} bytes are shown as context, and the byte verdict
-        belongs to the token mint, which measures the real token rather than
-        estimating it here. Holding a permission and receiving it in a token are
-        two different things in one more way as well: an access token carries the
-        permission claim only for a resource server that has opted in, which the
-        permissions section is where to read and set.
+        {budget.max_token_bytes} bytes are shown as context, and the byte
+        verdict belongs to the token mint, which measures the real token rather
+        than estimating it here. Holding a permission and receiving it in a
+        token are two different things in one more way as well: an access token
+        carries the permission claim only for a resource server that has opted
+        in, which the permissions section is where to read and set.
       </p>
       {budget.permission_count === permissions.length ? null : (
         <p class="resource-note" role="status">
           The budget counted {budget.permission_count} permissions while{" "}
-          {permissions.length} are listed, so the verdict above does not describe
-          the set shown. Read the listed set as what is held and treat the verdict
-          as unreliable.
+          {permissions.length} are listed, so the verdict above does not
+          describe the set shown. Read the listed set as what is held and treat
+          the verdict as unreliable.
         </p>
       )}
       {withheld === null ? null : (

@@ -80,7 +80,9 @@ async function flush(): Promise<void> {
   for (let i = 0; i < 6; i += 1) {
     await Promise.resolve();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
   }
 }
 
@@ -162,7 +164,12 @@ describe("creating a DCR policy", () => {
     const calls = stubFetch((call) =>
       call.method === "POST"
         ? json(
-            { id: "pol_a", name: "force-pkce", primitives: [], created_at_unix_ms: 0 },
+            {
+              id: "pol_a",
+              name: "force-pkce",
+              primitives: [],
+              created_at_unix_ms: 0,
+            },
             201,
           )
         : json(noPolicies),
@@ -198,6 +205,69 @@ describe("creating a DCR policy", () => {
 });
 
 describe("minting an initial access token", () => {
+  it.each([
+    { tenantId: "ten_a", environmentId: "env_b" },
+    { tenantId: "ten_b", environmentId: "env_a" },
+  ])(
+    "clears a displayed token and client lookup when scope changes to $tenantId/$environmentId",
+    async (nextScope) => {
+      activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
+      const secret = "iat-scope-specific-token";
+      const calls = stubFetch((call) => {
+        if (call.url.endsWith("/initial-access-tokens")) {
+          return json(
+            {
+              id: "iat_a",
+              token: secret,
+              token_already_issued: false,
+              expires_at_unix_ms: 1000,
+              created_at_unix_ms: 0,
+            },
+            201,
+          );
+        }
+        if (call.url.endsWith("/clients/cli_a")) {
+          return json({ id: "cli_a", quarantined: true, verified: false });
+        }
+        return json(noPolicies);
+      });
+      const root = mount(<ClientsList />);
+      await flush();
+      const input = root.querySelector("#dcr-client-id") as HTMLInputElement;
+      input.value = "cli_a";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await flush();
+      button(root, "Look up client").click();
+      button(root, "Mint token").click();
+      await flush();
+      expect(root.querySelector(".resource-token-value")?.textContent).toBe(
+        secret,
+      );
+      expect(button(root, "Verify client")).toBeDefined();
+
+      activeScope.value = nextScope;
+      await flush();
+
+      expect(root.querySelector(".resource-token-value")).toBeNull();
+      expect(root.textContent).not.toContain(secret);
+      expect(
+        (root.querySelector("#dcr-client-id") as HTMLInputElement).value,
+      ).toBe("");
+      expect(
+        Array.from(root.querySelectorAll("button")).some(
+          (element) => element.textContent === "Verify client",
+        ),
+      ).toBe(false);
+      expect(
+        calls.some((call) =>
+          call.url.includes(
+            `/tenants/${nextScope.tenantId}/environments/${nextScope.environmentId}/dcr/policies`,
+          ),
+        ),
+      ).toBe(true);
+    },
+  );
+
   it("surfaces the returned token once and never writes it to storage", async () => {
     activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
     const secret = "iat-plaintext-bearer-value";

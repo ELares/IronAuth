@@ -30,7 +30,12 @@ import {
   rotateServiceAccountKey,
 } from "../api/client";
 import { describe } from "./OrgApiKeysView";
-import { AsyncBoundary, ConfirmButton, MutationFeedback } from "./ResourceView";
+import {
+  AsyncBoundary,
+  ConfirmButton,
+  MutationFeedback,
+  SecretCopyButton,
+} from "./ResourceView";
 import { inputValue, sudoFor } from "./orgPanels";
 import { useAsyncResource, useMutation } from "./useResource";
 
@@ -46,22 +51,22 @@ export function ClientServiceAccountKeysPanel({
 
   return (
     <div class="resource-subsection">
-      <h3>Machine identity keys</h3>
+      <h2 id="client-keys">Machine identity keys</h2>
       <p class="resource-note">
-        The API keys that authenticate as the service account of a client. A service account
-        is minted the first time a client uses the machine grant, so a client that has never
-        run has none yet. The key itself is shown once, when it is created, and is never
-        recoverable afterwards.
+        Keys authenticate as a client&#39;s service account. The account is created
+        the first time the client uses machine credentials. Save each key when
+        it is created; it cannot be retrieved later.
       </p>
       <form
         class="resource-form"
+        aria-label="Look up a client service account"
         onSubmit={(event) => {
           event.preventDefault();
           const trimmed = clientId.trim();
           setLookupId(trimmed === "" ? null : trimmed);
         }}
       >
-        <label>
+        <label class="resource-field">
           Client id
           <input
             type="text"
@@ -69,7 +74,13 @@ export function ClientServiceAccountKeysPanel({
             onInput={(event) => setClientId(inputValue(event))}
           />
         </label>
-        <button type="submit">Look up</button>
+        <button
+          class="resource-btn resource-btn-primary"
+          type="submit"
+          disabled={clientId.trim() === ""}
+        >
+          Look up
+        </button>
       </form>
       {lookupId === null ? null : (
         <ServiceAccountFor
@@ -93,17 +104,22 @@ function ServiceAccountFor({
   environmentId: string;
   clientId: string;
 }) {
-  const { state } = useAsyncResource<string | null>(
-    () => fetchClientServiceAccount(tenantId, environmentId, clientId),
+  const { state } = useAsyncResource<{ id: string | null }>(
+    async () => ({
+      id: await fetchClientServiceAccount(tenantId, environmentId, clientId),
+    }),
     [tenantId, environmentId, clientId],
   );
   return (
-    <AsyncBoundary state={state} loadingLabel="Looking up the service account of the client">
-      {(serviceAccountId) =>
+    <AsyncBoundary
+      state={state}
+      loadingLabel="Looking up the service account of the client"
+    >
+      {({ id: serviceAccountId }) =>
         serviceAccountId === null ? (
           <p class="resource-empty">
-            This client has no service account yet. One is minted the first time the
-            client uses the machine grant.
+            This client has no service account yet. One is minted the first time
+            the client uses the machine grant.
           </p>
         ) : (
           <ServiceAccountKeys
@@ -135,7 +151,9 @@ function ServiceAccountKeys({
   const mutation = useMutation();
   // DISPLAY ONCE. Its OWN creation reloads the list WITHOUT clearing it, so the operator
   // can still see the key beside the row that now exists; every OTHER reload clears it.
-  const [issued, setIssued] = useState<{ id: string; key: string } | null>(null);
+  const [issued, setIssued] = useState<{ id: string; key: string } | null>(
+    null,
+  );
   const [name, setName] = useState("");
   const reloadClearingKey = () => {
     setIssued(null);
@@ -179,26 +197,34 @@ function ServiceAccountKeys({
             });
         }}
       >
-        <label>
+        <label class="resource-field">
           New key name
           <input
             type="text"
+            required
+            placeholder="Production integration"
             value={name}
             disabled={mutation.state.pending}
             onInput={(event) => setName(inputValue(event))}
           />
         </label>
-        <button type="submit" disabled={mutation.state.pending}>
+        <button
+          class="resource-btn resource-btn-primary"
+          type="submit"
+          disabled={mutation.state.pending || name.trim() === ""}
+        >
           Create key
         </button>
       </form>
       {issued === null ? null : (
         <div class="resource-callout">
+          <h3>Save your new API key</h3>
           <p>
-            Copy this key now. It is shown once and cannot be recovered, including by
-            reloading this page.
+            Copy this key now. It is shown once and cannot be recovered,
+            including by reloading this page.
           </p>
           <code class="resource-secret">{issued.key}</code>
+          <SecretCopyButton value={issued.key} label="Copy key" />
         </div>
       )}
       <AsyncBoundary
@@ -223,7 +249,7 @@ function ServiceAccountKeys({
                   <>
                     <ConfirmButton
                       label="Rotate"
-                      prompt="Rotate this key? The current key stops authenticating immediately and a replacement is issued in the same transaction, inheriting the name and expiry of this key. The new key is shown ONCE and cannot be recovered."
+                      prompt="Rotate this key? The current key stops working immediately. Save the replacement now; it keeps the same name and expiry and is shown only once."
                       confirmLabel="Confirm rotate"
                       disabled={mutation.state.pending}
                       onConfirm={() =>
@@ -252,7 +278,7 @@ function ServiceAccountKeys({
                     />
                     <ConfirmButton
                       label="Revoke"
-                      prompt="Revoke this key? Anything using it stops authenticating on its very next request, and the key cannot be recovered or un-revoked. The row stays listed so the revocation is legible."
+                      prompt="Revoke this key? It stops authenticating on the next request. This cannot be undone."
                       confirmLabel="Confirm revoke"
                       danger
                       disabled={mutation.state.pending}

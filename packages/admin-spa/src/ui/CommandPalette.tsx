@@ -26,6 +26,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { useLocation } from "preact-iso";
+import { Icon } from "./Icon";
+import { consoleHref } from "./routing";
 import { type Command, filterCommands, wrapIndex } from "./commands";
 import {
   type SearchResult,
@@ -54,6 +56,7 @@ function optionId(index: number): string {
 export interface CommandPaletteProps {
   // Tests inject an explicit command set; production builds them from the store.
   commands?: ReadonlyArray<Command>;
+  showTrigger?: boolean;
 }
 
 // Build the default commands from data already in hand: navigate to each section,
@@ -66,7 +69,7 @@ function useDefaultCommands(): Command[] {
   return useMemo<Command[]>(() => {
     const navigate = (path: string): void => {
       if (typeof location.route === "function") {
-        location.route(path);
+        location.route(consoleHref(path));
       }
     };
     const commands: Command[] = SECTIONS.map((section) => ({
@@ -150,12 +153,16 @@ function useSearch(
   return { results, error, searching };
 }
 
-export function CommandPalette({ commands }: CommandPaletteProps) {
+export function CommandPalette({
+  commands,
+  showTrigger = true,
+}: CommandPaletteProps) {
   const location = useLocation();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef<Element | null>(null);
 
   const defaults = useDefaultCommands();
@@ -166,7 +173,7 @@ export function CommandPalette({ commands }: CommandPaletteProps) {
   // both the in-memory navigation commands and the cross-resource search hits.
   const navigate = (path: string): void => {
     if (typeof location.route === "function") {
-      location.route(path);
+      location.route(consoleHref(path));
     }
   };
   const resultCommands = results.map((result) => toCommand(result, navigate));
@@ -195,15 +202,29 @@ export function CommandPalette({ commands }: CommandPaletteProps) {
       inputRef.current?.focus();
     } else {
       const previous = restoreFocusRef.current;
-      if (previous instanceof HTMLElement) {
+      if (previous instanceof HTMLElement && previous.isConnected) {
         previous.focus();
+      } else if (previous !== null) {
+        triggerRef.current?.focus();
       }
     }
   }, [open]);
 
-  if (!open) {
-    return null;
-  }
+  const trigger = showTrigger ? (
+    <button
+      ref={triggerRef}
+      class="console-search"
+      type="button"
+      aria-label="Search resources and commands"
+      aria-haspopup="dialog"
+      title="Search resources and commands (Ctrl or Cmd K)"
+      onClick={() => setOpen(true)}
+    >
+      <Icon name="search" />
+      <span>Search anything…</span>
+      <kbd aria-hidden="true">⌘ K</kbd>
+    </button>
+  ) : null;
 
   function close(): void {
     setOpen(false);
@@ -248,71 +269,93 @@ export function CommandPalette({ commands }: CommandPaletteProps) {
   }
 
   return (
-    <div class="cmdk-overlay" onClick={close}>
-      <div
-        class="cmdk-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Command palette and search"
-        onClick={(event) => event.stopPropagation()}
-        onKeyDown={onKeyDown}
-      >
-        <input
-          ref={inputRef}
-          class="cmdk-input"
-          type="text"
-          role="combobox"
-          aria-expanded="true"
-          aria-controls={LISTBOX_ID}
-          aria-activedescendant={
-            filtered.length === 0 ? undefined : optionId(activeIndex)
-          }
-          aria-label="Search resources and commands"
-          placeholder="Search resources and commands"
-          value={query}
-          onInput={(event) => {
-            setQuery((event.target as HTMLInputElement).value);
-            setActive(0);
-          }}
-        />
-        {error === null ? null : (
-          <div class="cmdk-error">
-            <ErrorView error={error} />
+    <>
+      {trigger}
+      {open ? (
+        <div class="cmdk-overlay" onClick={close}>
+          <div
+            class="cmdk-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Command palette and search"
+            onClick={(event) => event.stopPropagation()}
+            onKeyDown={onKeyDown}
+          >
+            <input
+              ref={inputRef}
+              class="cmdk-input"
+              type="text"
+              role="combobox"
+              aria-expanded="true"
+              aria-controls={LISTBOX_ID}
+              aria-autocomplete="list"
+              aria-activedescendant={
+                filtered.length === 0 ? undefined : optionId(activeIndex)
+              }
+              aria-label="Search resources and commands"
+              placeholder="Search resources and commands"
+              value={query}
+              onInput={(event) => {
+                setQuery((event.target as HTMLInputElement).value);
+                setActive(0);
+              }}
+            />
+            {error === null ? null : (
+              <div class="cmdk-error">
+                <ErrorView error={error} />
+              </div>
+            )}
+            {searching ? (
+              <p class="cmdk-searching" role="status" aria-live="polite">
+                Searching resources
+              </p>
+            ) : null}
+            <ul class="cmdk-list" id={LISTBOX_ID} role="listbox">
+              {filtered.length === 0 ? (
+                <li class="cmdk-empty" role="option" aria-selected="false">
+                  No matching commands or resources
+                </li>
+              ) : (
+                filtered.map((command, index) => (
+                  <li
+                    key={command.id}
+                    id={optionId(index)}
+                    class={
+                      index === activeIndex
+                        ? "cmdk-item cmdk-active"
+                        : "cmdk-item"
+                    }
+                    role="option"
+                    aria-selected={index === activeIndex}
+                    onClick={() => {
+                      close();
+                      command.run();
+                    }}
+                    onMouseEnter={() => setActive(index)}
+                  >
+                    <span class="cmdk-item-label">{command.label}</span>
+                    {command.hint === undefined ? null : (
+                      <span class="cmdk-item-hint">{command.hint}</span>
+                    )}
+                  </li>
+                ))
+              )}
+            </ul>
+            <div class="cmdk-footer" aria-hidden="true">
+              <span>
+                <kbd>↑</kbd>
+                <kbd>↓</kbd> to navigate
+              </span>
+              <span>
+                <kbd>↵</kbd> to open
+              </span>
+              <span>
+                <kbd>esc</kbd> to close
+              </span>
+            </div>
           </div>
-        )}
-        {searching ? (
-          <p class="cmdk-searching" role="status" aria-live="polite">
-            Searching resources
-          </p>
-        ) : null}
-        <ul class="cmdk-list" id={LISTBOX_ID} role="listbox">
-          {filtered.length === 0 ? (
-            <li class="cmdk-empty" role="option" aria-selected="false">
-              No matching commands or resources
-            </li>
-          ) : (
-            filtered.map((command, index) => (
-              <li
-                key={command.id}
-                id={optionId(index)}
-                class={index === activeIndex ? "cmdk-item cmdk-active" : "cmdk-item"}
-                role="option"
-                aria-selected={index === activeIndex}
-                onClick={() => {
-                  close();
-                  command.run();
-                }}
-                onMouseEnter={() => setActive(index)}
-              >
-                <span class="cmdk-item-label">{command.label}</span>
-                {command.hint === undefined ? null : (
-                  <span class="cmdk-item-hint">{command.hint}</span>
-                )}
-              </li>
-            ))
-          )}
-        </ul>
-      </div>
-    </div>
+        </div>
+      ) : null}
+    </>
   );
 }

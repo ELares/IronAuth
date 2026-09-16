@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Refreshed the admin console and hosted authentication screens.** The console
+  now has a working overview, grouped navigation, visible command search,
+  responsive layouts, searchable resource lists, and clearer forms and guidance.
+  One-time credentials have copy controls, destructive confirmations support
+  keyboard cancellation, and scheduled offboarding uses a local date picker.
+  Navigation stays within the embedded `/admin` mount. Hosted sign-in,
+  registration, recovery, consent, MFA, passkey, device, logout, and organization
+  portal pages share a responsive visual system while retaining their existing
+  authentication behavior and restrictive Content Security Policy. Flow submit
+  buttons display their localized captions and field errors are associated with
+  their controls for assistive technology.
+
 - **A configured `server.public_url` with no dot in its host stopped ALL mail (issue #111).**
   `sender_domain` took the host unvalidated, and `message_id` refuses a domain without a dot, so
   `compose` returned `mime_failed` for every message. `deploy/ironauth.toml` ships
