@@ -111,19 +111,23 @@ Of the four that landed inside their published range, three landed at the top of
 derived headline above the tables moved with them: **94 to 96 logins per second per core
 published, 87 to 88 re-measured**.
 
-WHAT THIS DOES AND DOES NOT SHOW. It does not show the published figures are too fast by these
-amounts, and the login-rate row is the one to be careful with: the table says one PERFORMANCE
-core, while the harness reports whichever core the scheduler handed it. Those are not the same
-quantity, and the gap between them is not a measurement of anything.
+WHAT THIS DOES AND DOES NOT SHOW. Every gap above is a few percent: each re-measured figure sits
+between 1.7 and 6.6 percent past the TOP of its published range, all in the same direction. That is NOT the unpinned-core effect the section above measures. An
+efficiency core costs 62 to 66 ms per verify, a 5.7x spread, so a run that landed on one would be
+off by a factor rather than by a percent. Whatever moved these figures, it was not the scheduler
+handing the example a different kind of core.
 
-What it shows is that the documented command does not reproduce the documented numbers, which is
-the property criterion 2 asks for. The mechanism is in the example's own header: `NOT PINNED: a
-per-core figure below is whichever kind the scheduler chose`. On a heterogeneous CPU the same
-command on the same machine measures a performance core sometimes and an efficiency core other
-times. Two consecutive runs here reported 88 and 87 logins per second at 11.3 and 11.5 ms, so the
-harness does not even reproduce itself to the precision these ranges are written to. The table is
-not drifting away from a stable truth; it was never pinned to one, and no amount of re-running
-under the current example will pin it.
+A few percent in one direction is what an ordinarily busy machine looks like, which is the point:
+these ranges are written to a precision that a developer machine does not hold still to, and the
+document says as much two sections up, that a single value "implies a precision these do not
+have". Two consecutive runs of the harness here reported 88 and 87 logins per second, at 11.3 and
+11.5 ms, without changing anything between them.
+
+So what this shows is narrow and worth stating exactly: the documented command does not return
+the documented numbers, which is the property criterion 2 asks for, and the published ranges are
+tighter than the measurement is repeatable. It does not show the code got slower, and the
+login-rate comparison is the one to be most careful with, because the table says one PERFORMANCE
+core while the harness reports whichever core it was given; those are not the same quantity.
 
 What criterion 2 added is the half that can be mechanical: the example now RUNS on every release
 rather than only being compiled, under one command, with its output archived.
