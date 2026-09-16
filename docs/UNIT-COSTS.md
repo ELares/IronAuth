@@ -89,6 +89,42 @@ deployment whose signing policy selects it mints at about 3% of a password verif
 0.1%. That is a visible line item in a capacity model, not a row rounding to zero, and the old
 sentence told an operator not to model it.
 
+## What a hop costs, and what that settles
+
+A sizing guide needs the cost of asking something else, not only the cost of doing the work,
+because that is what decides whether a cache in front of an operation pays for itself.
+
+| operation | measured |
+|---|---|
+| render the published JWKS, EdDSA only | 0.5 us |
+| render the published JWKS, EdDSA and RS256 (a fresh environment) | 1.3 us |
+| one socket round trip, the FLOOR on this machine | 20 to 21 us |
+
+The round trip is `SELECT 1` over loopback TCP to a Postgres on the same machine, through
+pgbench, with no disk in the path and nothing to plan. It is a floor rather than an estimate:
+a real accelerator read queries a real table or crosses a real network, so every actual hop is
+slower. Both figures come from `scripts/bench.sh`.
+
+**That settles an open question in issue #146.** `IssuerRegistry` holds an optional hot-state
+accelerator for the published JWKS document, and it has no production caller. The natural
+reading is that the boot wiring was simply never finished. The measurement says otherwise.
+
+`jwks_json` consults the accelerator only AFTER `resolve_for_publication` has returned the
+entry, and deliberately: everything that decides WHETHER to publish has to run first, so that a
+fenced scope is refused and a stale entry is never served. The safety ordering is right. Its
+consequence is that a cache hit saves the render and nothing else, because the read that
+produced the entry has already happened.
+
+So the accelerator would have to make a 20 us round trip to avoid 1.3 us of work, roughly
+sixteen times the cost of the thing it replaces, at the best figure this machine can produce
+and against a database sitting on it. Wiring it at this call site would make the JWKS endpoint
+slower, and "not wired" is the faster configuration rather than the unfinished one.
+
+This does not say the hot-state seam is not worth having. It says this USE is not, and the
+distinction is where the seam pays: a hop is worth taking when the alternative is a database
+read, not a microsecond of serialization. The uses whose alternative is a query, rather than a
+render off an already-resolved entry, are the ones to wire.
+
 ## What this does not yet cover
 
 Criterion 4 also asks that the sizing guide be GENERATED from CI benchmark output and regenerate

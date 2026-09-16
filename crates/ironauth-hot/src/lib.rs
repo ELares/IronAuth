@@ -18,10 +18,22 @@
 //! off-by-default `ironcache` feature, because a deployment that never attaches one should not
 //! compile a client for it. [`Tiered`] composes them.
 //!
-//! WHAT IS STILL ABSENT IS CALLERS. [`registry`] declares seven uses and no request path reaches
-//! any of them yet, so this crate is a contract with two implementations and no traffic. That is
-//! worth stating here rather than discovering: a use added to the registry does not become live
-//! by being declared.
+//! WHAT IS STILL ABSENT IS TRAFFIC, which is a narrower statement than the one that used to be
+//! here and is the accurate one. This said "no request path reaches any of them yet". One does:
+//! `IssuerRegistry::jwks_json` reads [`registry::JWKS`] while serving the published document and
+//! writes it on the miss, in production source on the public plane. What no shipped binary does
+//! is INSTALL an implementation, so that call site is inert in every deployment and the
+//! remaining six uses have no call site at all.
+//!
+//! For the JWKS use, inert is now a measured decision rather than an unfinished one. The
+//! accelerator is consulted after the entry is already resolved, so a hit saves the render and
+//! cannot save a database read. `docs/UNIT-COSTS.md` measures both sides: the render is 1.3 us
+//! and the cheapest socket round trip on that machine is 20 us, so installing an implementation
+//! there would trade a microsecond of serialization for sixteen times as much waiting. The seam
+//! pays where the alternative to a hop is a QUERY, which is what the other uses are.
+//!
+//! The general rule still holds and is why this paragraph exists: a use added to the registry
+//! does not become live by being declared, and a call site does not become live by being written.
 //!
 //! # The industry keeps relearning why this has to be a seam
 //!

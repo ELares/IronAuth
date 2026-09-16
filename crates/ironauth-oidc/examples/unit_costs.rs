@@ -29,7 +29,9 @@
 //! accident.
 
 use ironauth_env::Env;
-use ironauth_jose::{JwsAlgorithm, SigningKey, generate_rsa_pkcs1_der, sign_detached};
+use ironauth_jose::{
+    JwsAlgorithm, KeySet, SigningKey, SigningPolicy, generate_rsa_pkcs1_der, sign_detached,
+};
 use ironauth_oidc::{Argon2Params, hash_password_with, verify_password};
 
 /// How many samples per measurement. Small because each one is deliberately expensive.
@@ -42,6 +44,10 @@ const SIGN_SAMPLES: u32 = 2_000;
 /// Warm-up signatures discarded before timing, so the first-call cost of a lazily initialised
 /// backend is not charged to the published figure.
 const SIGN_WARMUP: u32 = 50;
+
+/// How many samples per JWKS RENDER measurement. A render is microseconds like a mint, so it
+/// needs the same sample count to measure the operation rather than the clock.
+const RENDER_SAMPLES: u32 = 2_000;
 
 /// The performance and efficiency core counts on a heterogeneous macOS CPU, or [`None`] when
 /// the host does not report them (a homogeneous machine, or not macOS).
@@ -224,6 +230,68 @@ fn main() {
             "  {label:<40} {mint_us:>12.1} {:>18}",
             format!("{ratio:.0}x cheaper")
         );
+    }
+
+    // THE JWKS RENDER, because it is the cost an accelerator in front of this document could
+    // save and therefore the number that decides whether such an accelerator is worth a hop.
+    //
+    // `IssuerRegistry::jwks_json` consults its hot state AFTER `resolve_for_publication` has
+    // already returned the entry, deliberately: everything deciding WHETHER to publish has to
+    // run first, and `issuer.rs` says so at the call site. The consequence is that a hit saves
+    // this render and nothing else. It cannot save a database read, because the read that
+    // produced the entry has already happened.
+    //
+    // So a cache hop is worth taking only if the hop is cheaper than the figure below. Publish
+    // it rather than reasoning about it: a reader can compare it against their own accelerator
+    // round trip and decide, which is what a sizing guide is for.
+    println!("\nunit-costs: JWKS render (the cost a hot-state hit in front of the document saves)");
+    println!("  {:<40} {:>12}", "published keys", "render us");
+    let now = env.clock().now_utc();
+    // BUILT FRESH rather than reused from the mint loop: `SigningKey` is deliberately not
+    // `Clone`, and a keyset takes ownership.
+    let mut rendered_any = false;
+    for (label, with_rsa) in [
+        ("EdDSA only", false),
+        ("EdDSA + RS256 (a fresh environment)", true),
+    ] {
+        let Ok(ed) = SigningKey::ed25519_from_seed(Some("ed".to_owned()), &[7_u8; 32]) else {
+            continue;
+        };
+        let mut algorithms = vec![JwsAlgorithm::EdDsa];
+        let mut keyset = KeySet::bootstrap(ed, now);
+        if with_rsa {
+            let Ok(der) = generate_rsa_pkcs1_der(env.entropy()) else {
+                continue;
+            };
+            let Ok(rsa) =
+                SigningKey::rsa_from_pkcs1_der(Some("rs".to_owned()), JwsAlgorithm::Rs256, &der)
+            else {
+                continue;
+            };
+            keyset.add(rsa, now);
+            algorithms.push(JwsAlgorithm::Rs256);
+        }
+        let Ok(policy) = SigningPolicy::new(algorithms) else {
+            continue;
+        };
+        // WARMED like the signature loop, so a lazily built projection is not charged here.
+        for _ in 0..SIGN_WARMUP {
+            let _ = keyset
+                .published_jwks(now, &policy)
+                .and_then(|jwks| jwks.to_json());
+        }
+        let started = env.clock().monotonic();
+        for _ in 0..RENDER_SAMPLES {
+            let _ = keyset
+                .published_jwks(now, &policy)
+                .and_then(|jwks| jwks.to_json());
+        }
+        let render_us = started.elapsed().as_secs_f64() * 1_000_000.0 / f64::from(RENDER_SAMPLES);
+        println!("  {label:<40} {render_us:>12.1}");
+        rendered_any = true;
+    }
+    if !rendered_any {
+        println!("  (no signing key could be built on this host, so no render was measured)");
     }
 
     // DERIVED FROM THE MEASUREMENT, not written down. A capacity line is the sentence a
