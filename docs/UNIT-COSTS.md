@@ -1,16 +1,21 @@
 # Per-operation unit costs
 
 Issue #152 criterion 4 asks for per-operation unit costs with the Argon2id parameters stated.
-Measured, reproduced by the one command that runs the whole benchmark harness:
+These are measured. RE-MEASURE THEM WITH THE ONE COMMAND THAT RUNS THE WHOLE BENCHMARK HARNESS:
 
 ```
 PG_BIN=<postgresql bin dir> scripts/bench.sh
 ```
 
-That runs every benchmark and writes each one's output under `target/bench/`; the release
-workflow runs it per release and archives the results. To re-measure only this document's
-numbers, `cargo run --release -p ironauth-oidc --example unit_costs` is that benchmark on its
-own, and it needs no database.
+It runs every benchmark and writes each one's output under `target/bench/`; the release workflow
+runs it per release and archives the results. To re-measure only this document's numbers,
+`cargo run --release -p ironauth-oidc --example unit_costs` is that benchmark on its own, and it
+needs no database, so it needs no `PG_BIN`.
+
+Re-measure, not reproduce. The ranges below were transcribed from two runs, and a single
+invocation produces single values rather than a range. More to the point, running that command
+today does not return these figures: see "what this does not yet cover" at the end, which records
+the comparison and why the example cannot yet be pinned to a repeatable number.
 
 ## Password hashing
 
@@ -90,9 +95,8 @@ Criterion 4 also asks that the sizing guide be GENERATED from CI benchmark outpu
 on release. It is not. This table is still hand-transcribed, and it has drifted.
 
 Re-running the harness on the hardware class the table names (Apple M4 Pro, 10 performance and 4
-efficiency cores, release build, 10 samples) put FIVE of the eight figures above outside their
-own published ranges, and all five in the same direction: the published figure is the optimistic
-one, and the machine is slower than the table says.
+efficiency cores, release build) put six of the ten measured figures published above outside
+their own ranges:
 
 | figure | published | re-measured |
 |---|---|---|
@@ -101,15 +105,25 @@ one, and the machine is slower than the table says.
 | config floor at the default iterations, verify | 4.3 ms | 4.4 ms |
 | double iterations, hash | 21.1 to 22.0 ms | 23.3 ms |
 | double iterations, verify | 21.0 to 21.8 ms | 22.9 ms |
+| RS256 mint | 317 to 318 us | 323.5 us |
 
-A sizing guide that is optimistic in one direction is the bad direction to be wrong in: capacity
-planned against it under-provisions.
+Of the four that landed inside their published range, three landed at the top of it. The
+derived headline above the tables moved with them: **94 to 96 logins per second per core
+published, 87 to 88 re-measured**.
 
-The mechanism is in the example's own header: `NOT PINNED: a per-core figure below is whichever
-kind the scheduler chose`. On a heterogeneous CPU the same command on the same machine measures
-a performance core sometimes and an efficiency core other times, so a single-run figure is not
-repeatable to the precision these ranges are written to. The table is not drifting away from a
-stable truth; it was never pinned to one.
+WHAT THIS DOES AND DOES NOT SHOW. It does not show the published figures are too fast by these
+amounts, and the login-rate row is the one to be careful with: the table says one PERFORMANCE
+core, while the harness reports whichever core the scheduler handed it. Those are not the same
+quantity, and the gap between them is not a measurement of anything.
+
+What it shows is that the documented command does not reproduce the documented numbers, which is
+the property criterion 2 asks for. The mechanism is in the example's own header: `NOT PINNED: a
+per-core figure below is whichever kind the scheduler chose`. On a heterogeneous CPU the same
+command on the same machine measures a performance core sometimes and an efficiency core other
+times. Two consecutive runs here reported 88 and 87 logins per second at 11.3 and 11.5 ms, so the
+harness does not even reproduce itself to the precision these ranges are written to. The table is
+not drifting away from a stable truth; it was never pinned to one, and no amount of re-running
+under the current example will pin it.
 
 What criterion 2 added is the half that can be mechanical: the example now RUNS on every release
 rather than only being compiled, under one command, with its output archived.
