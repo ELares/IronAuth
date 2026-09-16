@@ -54,16 +54,21 @@ ironauth-oidc/device_posture
 # it ran.
 #
 # `ironauth-quota/layered` went the same way, and it is the more interesting case because the
-# entry had been removed once BEFORE on a false signal and put back. That time the references
-# the scan counted were a rustdoc line spelling `layered::tests::...`, so a doc comment had
-# quietly discharged a true claim. This time they are nine real ones: `forward_auth_rules.rs`
-# holds a `LayeredLimiter` as a field, returns one from `limiter_from_config`, and
-# `forward_auth_route.rs` builds a `RequestIdentity` and renders a `LayeredOutcome` on the
-# check path. The five-layer limiter has production callers, so the exemption describes
-# nothing and is gone.
+# entry had been removed once BEFORE on a false signal and put back. That time the reference the
+# scan counted was a rustdoc line spelling a `layered::` path, so a doc comment had quietly
+# discharged a true claim.
 #
-# The difference between the two removals is worth keeping: both looked identical from the
-# scan's output, which reports a count. What separates them is reading WHAT was counted.
+# This time the scan counted nine, and SIX OF THEM ARE PRODUCTION: `forward_auth_rules.rs` holds
+# the limiter as a field, exposes it, and returns one from `limiter_from_config`, while
+# `forward_auth_route.rs` builds a request identity and renders the outcome on the check path,
+# which `lib.rs` mounts. The other three are inside `#[cfg(test)]` modules and prove nothing.
+# Six production callers is still six, so the exemption describes nothing and is gone.
+#
+# THE SENTENCE ABOVE ORIGINALLY SAID "nine real ones", which was the very error the paragraph
+# below warns about, one paragraph after warning about it. Both removals look identical in this
+# scan's output, because it reports a COUNT. What separates them is reading what was counted,
+# and that means classifying every hit rather than trusting the total -- including when the
+# total is large enough to feel conclusive.
 
 
 ALLOWLIST

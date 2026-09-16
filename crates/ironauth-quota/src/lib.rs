@@ -411,11 +411,14 @@ impl RateLimitSnapshot {
     /// against one does not parse the other, so the revision is a wire contract and is
     /// recorded here rather than left to be inferred from the format.
     ///
-    /// The dictionary grammar is pinned because it is ALREADY SERVED. `headers` is not
-    /// reached only by the layered limiter (which has no production caller yet): it is also
-    /// the renderer behind `ironauth_oidc::abuse::stamp_rate_limit_headers`, which stamps
-    /// every throttled login, registration, TOTP, email and SMS OTP, magic link, recovery,
-    /// WebAuthn and proof-of-work response. Moving to the later grammar is a BREAKING wire
+    /// The dictionary grammar is pinned because it is ALREADY SERVED, and by TWO production
+    /// paths rather than the one this paragraph used to name. It is the renderer behind
+    /// `ironauth_oidc::abuse::stamp_rate_limit_headers`, which stamps every throttled login,
+    /// registration, TOTP, email and SMS OTP, magic link, recovery, WebAuthn and proof-of-work
+    /// response. It is also reached through the five-layer request limiter, which this said had
+    /// "no production caller yet": that stopped being true when the forward-auth check endpoint
+    /// gained one, and the forward-auth handler renders these headers on a throttled request.
+    /// The second path makes the pin stronger rather than weaker. Moving to the later grammar is a BREAKING wire
     /// change for anything parsing those, and it needs a deprecation window rather than a
     /// silent reformat.
     ///
