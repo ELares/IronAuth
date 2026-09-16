@@ -16,6 +16,12 @@
 # section now records the size of it: re-running the example put six of its ten published
 # figures outside their own ranges.
 #
+# It is also how a measurement nobody had taken settled an open design question. Reading
+# `issuer.rs` is what establishes WHAT a cache hit in front of the published JWKS document can
+# save, which is a render minus a validation parse and never a database read. Only measuring
+# says whether that is worth a hop, and the render and round-trip benchmarks below are the two
+# sides of it. They came out roughly thirty to one against, which docs/UNIT-COSTS.md records.
+#
 # # Every benchmark reports RAN, SKIPPED, or FAILED, and a SKIP IS NOT SILENT
 #
 # The first draft of this script had two silent holes. A missing PG_BIN printed "all
@@ -59,7 +65,7 @@ on_ci=false
 # STALE OUTPUTS ARE THIS RUN'S OUTPUTS UNTIL THEY ARE REMOVED. Named files rather than
 # `rm -rf "$OUT"`, because BENCH_OUT is a caller-supplied path and this script should not
 # recursively delete one.
-for stale in unit-costs startup-rss hook-latency; do
+for stale in unit-costs startup-rss socket-rtt hook-latency; do
     rm -f "$OUT/$stale.log"
 done
 rm -f "$OUT/hook-latency-samples.json" "$OUT/SUMMARY.txt"
@@ -115,6 +121,17 @@ elif [ "$on_ci" = true ]; then
     skip startup-rss "PG_BIN unset" required
 else
     skip startup-rss "PG_BIN unset; set it to the postgresql bin directory" optional
+fi
+
+# The cost of one socket round trip, which is what decides whether a cache in front of an
+# operation pays for itself. Backs the accelerator section of docs/UNIT-COSTS.md. Needs a
+# Postgres bin directory for pgbench, and starts its own throwaway cluster.
+if [ -n "${PG_BIN:-}" ]; then
+    run socket-rtt scripts/socket-rtt-bench.sh
+elif [ "$on_ci" = true ]; then
+    skip socket-rtt "PG_BIN unset" required
+else
+    skip socket-rtt "PG_BIN unset; set it to the postgresql bin directory" optional
 fi
 
 # WASM hook latency.

@@ -29,7 +29,10 @@
 //! accident.
 
 use ironauth_env::Env;
-use ironauth_jose::{JwsAlgorithm, SigningKey, generate_rsa_pkcs1_der, sign_detached};
+use ironauth_jose::{
+    JwsAlgorithm, KeySet, SigningKey, SigningPolicy, generate_ecdsa_p256_pkcs8_der,
+    generate_rsa_pkcs1_der, sign_detached,
+};
 use ironauth_oidc::{Argon2Params, hash_password_with, verify_password};
 
 /// How many samples per measurement. Small because each one is deliberately expensive.
@@ -42,6 +45,10 @@ const SIGN_SAMPLES: u32 = 2_000;
 /// Warm-up signatures discarded before timing, so the first-call cost of a lazily initialised
 /// backend is not charged to the published figure.
 const SIGN_WARMUP: u32 = 50;
+
+/// How many samples per JWKS RENDER measurement. A render is microseconds like a mint, so it
+/// needs the same sample count to measure the operation rather than the clock.
+const RENDER_SAMPLES: u32 = 2_000;
 
 /// The performance and efficiency core counts on a heterogeneous macOS CPU, or [`None`] when
 /// the host does not report them (a homogeneous machine, or not macOS).
@@ -224,6 +231,147 @@ fn main() {
             "  {label:<40} {mint_us:>12.1} {:>18}",
             format!("{ratio:.0}x cheaper")
         );
+    }
+
+    // THE JWKS RENDER, because it is the cost an accelerator in front of this document could
+    // save and therefore the number that decides whether such an accelerator is worth a hop.
+    //
+    // `IssuerRegistry::jwks_json` consults its hot state AFTER `resolve_for_publication` has
+    // already returned the entry, deliberately: everything deciding WHETHER to publish has to
+    // run first, and `issuer.rs` says so at the call site. The consequence is that a hit saves
+    // this render and nothing else. It cannot save a database read, because the read that
+    // produced the entry has already happened.
+    //
+    // So a cache hop is worth taking only if the hop is cheaper than the figure below. Publish
+    // it rather than reasoning about it: a reader can compare it against their own accelerator
+    // round trip and decide, which is what a sizing guide is for.
+    // THE JWKS RENDER AND WHAT A CACHE HIT ACTUALLY COSTS, because the difference between them
+    // is what an accelerator in front of this document would save, and that difference is the
+    // number issue #146's wiring question turns on.
+    //
+    // `IssuerRegistry::jwks_json` consults its hot state AFTER `resolve_for_publication` has
+    // returned the entry, deliberately: everything deciding WHETHER to publish runs first. So a
+    // hit cannot save a database read. What it saves is the render.
+    //
+    // WHAT IT ADDS IS MEASURED HERE TOO, because the first version of this benchmark said a hit
+    // "saves the render and nothing else" and that was wrong in the expensive direction. On a
+    // hit the path runs `String::from_utf8` and then a full `serde_json` validation parse of the
+    // returned document, which `issuer.rs` keeps deliberately: without it the endpoint served
+    // any UTF-8 bytes under that key as the environment's JWK Set. A miss never pays it. So the
+    // saving is the render MINUS that parse, not the render.
+    println!("\nunit-costs: JWKS render against what a cache hit costs to accept");
+    println!(
+        "  {:<52} {:>10} {:>9} {:>12}",
+        "published keys", "render us", "parse us", "net saved us"
+    );
+    let now = env.clock().now_utc();
+    // A FRESH ENVIRONMENT PUBLISHES THREE ALGORITHMS, not two. `DayOneSigningKeys::generate`
+    // mints EdDSA, ES256 and RS256 and marks all three published from the environment's creation
+    // instant, and the derived policy retains every algorithm present. The first version of this
+    // row measured two keys and labelled them "a fresh environment", which no environment is.
+    // The six-key row is one rotation of each, whose predecessors stay published for a window.
+    let mut rendered_any = false;
+    for (label, algorithms, rotations) in [
+        ("EdDSA only", &[JwsAlgorithm::EdDsa][..], 0_u32),
+        (
+            "EdDSA + ES256 + RS256 (a fresh environment)",
+            &[
+                JwsAlgorithm::EdDsa,
+                JwsAlgorithm::Es256,
+                JwsAlgorithm::Rs256,
+            ][..],
+            0,
+        ),
+        (
+            "the same three, one rotation each (six published)",
+            &[
+                JwsAlgorithm::EdDsa,
+                JwsAlgorithm::Es256,
+                JwsAlgorithm::Rs256,
+            ][..],
+            1,
+        ),
+    ] {
+        let mut keyset: Option<KeySet> = None;
+        let mut built = Vec::new();
+        // GENERATED PER SLOT so each key is distinct, as a real environment's are. Reusing one
+        // key would understate the document: kid strings and moduli both land in the bytes.
+        for round in 0..=rotations {
+            for algorithm in algorithms {
+                let kid = format!("k{round}{}", built.len());
+                let key = match algorithm {
+                    JwsAlgorithm::EdDsa => {
+                        let mut seed = [0_u8; 32];
+                        env.entropy().fill_bytes(&mut seed);
+                        SigningKey::ed25519_from_seed(Some(kid.clone()), &seed).ok()
+                    }
+                    JwsAlgorithm::Es256 => generate_ecdsa_p256_pkcs8_der(env.entropy())
+                        .ok()
+                        .and_then(|der| {
+                            SigningKey::ecdsa_p256_from_pkcs8(Some(kid.clone()), &der).ok()
+                        }),
+                    _ => generate_rsa_pkcs1_der(env.entropy()).ok().and_then(|der| {
+                        SigningKey::rsa_from_pkcs1_der(Some(kid.clone()), JwsAlgorithm::Rs256, &der)
+                            .ok()
+                    }),
+                };
+                let Some(key) = key else { continue };
+                built.push(*algorithm);
+                match keyset.as_mut() {
+                    None => keyset = Some(KeySet::bootstrap(key, now)),
+                    Some(set) => set.add(key, now),
+                }
+            }
+        }
+        let (Some(keyset), Ok(policy)) = (keyset, SigningPolicy::new(built)) else {
+            continue;
+        };
+        let render = || {
+            keyset
+                .published_jwks(now, &policy)
+                .and_then(|jwks| jwks.to_json())
+                .ok()
+        };
+        let Some(document) = render() else { continue };
+
+        for _ in 0..SIGN_WARMUP {
+            let _ = render();
+        }
+        let started = env.clock().monotonic();
+        for _ in 0..RENDER_SAMPLES {
+            let _ = render();
+        }
+        let render_us = started.elapsed().as_secs_f64() * 1_000_000.0 / f64::from(RENDER_SAMPLES);
+
+        // EXACTLY WHAT THE HIT PATH RUNS on the bytes it got back, in the same order: the UTF-8
+        // check, the parse, and the `keys` array test that decides whether to serve them.
+        let bytes = document.clone().into_bytes();
+        let accept = || {
+            String::from_utf8(bytes.clone()).ok().and_then(|text| {
+                serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|value| value.get("keys").map(serde_json::Value::is_array))
+            })
+        };
+        for _ in 0..SIGN_WARMUP {
+            let _ = accept();
+        }
+        let started = env.clock().monotonic();
+        for _ in 0..RENDER_SAMPLES {
+            let _ = accept();
+        }
+        let parse_us = started.elapsed().as_secs_f64() * 1_000_000.0 / f64::from(RENDER_SAMPLES);
+
+        // SUBTRACTED, NOT ASSERTED. A negative net means a hit costs more CPU than rendering
+        // from the entry the caller already holds, before any hop is paid for at all.
+        println!(
+            "  {label:<52} {render_us:>10.2} {parse_us:>9.2} {:>12.2}",
+            render_us - parse_us
+        );
+        rendered_any = true;
+    }
+    if !rendered_any {
+        println!("  (no signing key could be built on this host, so no render was measured)");
     }
 
     // DERIVED FROM THE MEASUREMENT, not written down. A capacity line is the sentence a

@@ -18,10 +18,25 @@
 //! off-by-default `ironcache` feature, because a deployment that never attaches one should not
 //! compile a client for it. [`Tiered`] composes them.
 //!
-//! WHAT IS STILL ABSENT IS CALLERS. [`registry`] declares seven uses and no request path reaches
-//! any of them yet, so this crate is a contract with two implementations and no traffic. That is
-//! worth stating here rather than discovering: a use added to the registry does not become live
-//! by being declared.
+//! WHAT IS STILL ABSENT IS TRAFFIC, which is a narrower statement than the one that used to be
+//! here and is the accurate one. This said "no request path reaches any of them yet". One does:
+//! `IssuerRegistry::jwks_json` reads [`registry::JWKS`] while serving the published document and
+//! writes it on the miss, in production source on the public plane. What no shipped binary does
+//! is INSTALL an implementation, so that call site is inert in every deployment and the
+//! remaining six uses have no call site at all.
+//!
+//! For the JWKS use, inert is now a measured decision rather than an unfinished one. The
+//! accelerator is consulted after the entry is already resolved, so a hit cannot save a database
+//! read; it saves the render, and it ADDS the UTF-8 check and JSON validation parse that
+//! accepting the bytes requires. `docs/UNIT-COSTS.md` measures both sides. For a fresh
+//! environment's three published keys the net saving is about 0.6 us, against a 20 us Postgres
+//! round trip on the same machine, so installing an implementation there would trade well under
+//! a microsecond for roughly thirty times as much waiting. At one published key the net saving
+//! is negative before any hop is paid at all. The seam pays where the alternative to a hop is a
+//! QUERY, which is what the other uses are.
+//!
+//! The general rule still holds and is why this paragraph exists: a use added to the registry
+//! does not become live by being declared, and a call site does not become live by being written.
 //!
 //! # The industry keeps relearning why this has to be a seam
 //!

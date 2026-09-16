@@ -1390,9 +1390,14 @@ pub struct HotStateConfig {
     ///
     /// WHAT IS MISSING IS THE BOOT WIRING, which is a narrower gap than "no consumer". Nothing
     /// outside tests calls `with_jwks_hot_state`, so `jwks_hot` is `None` in every shipped
-    /// binary and the accelerator is never consulted however this key is set. Constructing a
-    /// `HotState` from this address and installing it is the remaining #146 work, and this key
-    /// is the half of it a deployment can act on now.
+    /// binary and the accelerator is never consulted however this key is set.
+    ///
+    /// THAT IS NOW A MEASURED DECISION FOR THE JWKS USE rather than the remaining work, which is
+    /// what this paragraph used to call it. `docs/UNIT-COSTS.md` measures both sides: a hit
+    /// there saves a render and adds a validation parse, netting about 0.6 us for a fresh
+    /// environment's three keys, against a 20 us Postgres round trip on the same machine. So
+    /// installing one behind this key would make the JWKS endpoint slower, and leaving it unset
+    /// is the faster configuration. The seam pays where the alternative to a hop is a query.
     ///
     /// That distinction is written down rather than glossed because the alternative is a knob
     /// that reads as "my cache is on" while nothing consults it, which is the defect this
