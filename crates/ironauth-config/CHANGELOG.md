@@ -6,6 +6,9 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Update regex to 1.13.1, which fixes incorrect match offsets, and TOML to 1.1.6,
+  which reduces parser allocations. Both remain compatible with Rust 1.85.
+
 - Add `database.master_key_id` (issue #153), defaulting to `master-1`, which is the value every
   existing deployment has already written into `tenant_keks.master_key_id`.
 
