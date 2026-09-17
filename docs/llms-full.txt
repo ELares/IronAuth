@@ -908,9 +908,9 @@ assuming every resource supports every CRUD verb.
 | Cross-Account Protection | Verify Google's RISC SETs and apply configured session/trusted-device revocation for identities linked to the configured connector. This is a specific receiver integration, not a general RISC policy engine. |
 | Transactional workers | PostgreSQL outbox, independent lease-based claims, bounded retry/dead-letter behavior, per-aggregate ordering, queue health, and optional IronBus wake-ups. |
 | Observability | Structured scrubbed logs, Prometheus metrics, management-plane health/readiness, graceful shutdown, and optional OTLP traces. |
-| Deployment tooling | Docker Compose, Helm, a Debian package with systemd unit, static musl build/release lanes, database migration commands, preflight `doctor`, and storage recovery/rekey tools. |
+| Deployment tooling | Helm, a Debian package with systemd unit, static musl build/release lanes, database migration commands, preflight `doctor`, and storage recovery/rekey tools. The checked-in general Compose stack has build/configuration/healthcheck limitations; see [container setup](OPERATIONS.md#containers-and-the-checked-in-compose-files). |
 | Config as code | Secret-free snapshots, promotion plan/diff/apply, CLI validate/plan/apply/drift, named target-environment secret resolution, and drift inspection. |
-| Integration tooling | TypeScript verification/protocol utilities, Node BFF middleware, framework quickstarts, generated management SDKs, CLI/TUI tools, MCP servers, and a Terraform provider. Consult each artifact's scope and compatibility before adopting it. |
+| Integration tooling | TypeScript verification/protocol utilities, Node BFF middleware, framework quickstarts, generated management SDKs, CLI tools, MCP library implementations, and a Terraform provider. Consult each artifact's scope and compatibility before adopting it. |
 
 For reliable reconciliation, use the [events contract](EVENTS.md), not webhook
 delivery as a change ledger; [EVENTS-VS-WEBHOOKS.md](EVENTS-VS-WEBHOOKS.md) explains
