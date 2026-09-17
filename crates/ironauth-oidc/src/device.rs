@@ -698,7 +698,10 @@ async fn mint_device_tokens(
         },
         &target,
     )
-    .map_err(|()| TokenError::ServerError)
+    .map_err(|refusal| match refusal {
+        tokens::MintRefusal::Policy { .. } => TokenError::AccessDenied,
+        tokens::MintRefusal::Signing => TokenError::ServerError,
+    })
 }
 
 /// Open a refresh-token family for an approved device flow, if the environment issues

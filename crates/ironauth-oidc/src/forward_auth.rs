@@ -212,14 +212,22 @@ pub struct ForwardAuthOutcome {
 /// Holds the rules privately and exposes no accessor for them. An earlier version had one,
 /// and it handed a caller holding the sanitising surface a reference that skips sanitising.
 pub struct ForwardAuth {
-    rules: RuleSet,
+    rules: std::sync::Arc<RuleSet>,
 }
 
 impl ForwardAuth {
     /// Build a surface over `rules`.
+    ///
+    /// Takes an [`std::sync::Arc`] because issue #154 criterion 4 asks that the SAME rule set
+    /// gate more than this surface. Sharing the compiled set is how "the same" stops being a
+    /// claim about two objects that happen to agree: a boot path that clones the pointer
+    /// cannot hand one consumer a stale set, and a test can assert the identity rather than
+    /// the equality.
     #[must_use]
-    pub fn new(rules: RuleSet) -> Self {
-        Self { rules }
+    pub fn new(rules: impl Into<std::sync::Arc<RuleSet>>) -> Self {
+        Self {
+            rules: rules.into(),
+        }
     }
 
     /// Decide `facts`, and say what the upstream should be told.

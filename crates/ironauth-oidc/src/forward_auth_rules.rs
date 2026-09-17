@@ -109,7 +109,25 @@ impl std::fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
+/// Build the deployment's access rules, SHARED, from validated configuration.
+///
+/// Order is preserved exactly: the engine is first-match-wins, so the list IS the policy.
+///
+/// # Errors
+///
+/// [`ConversionError`] on the first rule this build cannot honour.
+pub fn access_rules_from_config(
+    cfg: &ForwardAuthConfig,
+    acr_order: &[String],
+) -> Result<std::sync::Arc<RuleSet>, ConversionError> {
+    rule_set_from_config(cfg, acr_order).map(std::sync::Arc::new)
+}
+
 /// Build a [`RuleSet`] from validated configuration.
+///
+/// Prefer [`access_rules_from_config`] at a boot path: issue #154 criterion 4 asks that the
+/// SAME rule set gate more than one consumer, and sharing one `Arc` is how that stops being a
+/// claim about two objects that happen to agree.
 ///
 /// Order is preserved exactly: the engine is first-match-wins, so the list IS the policy.
 ///
@@ -333,14 +351,31 @@ impl ForwardAuthRuntime {
         acr_order: &[String],
         clock: std::sync::Arc<dyn ironauth_env::Clock>,
     ) -> Result<Option<Self>, ConversionError> {
+        Self::from_rules(cfg, access_rules_from_config(cfg, acr_order)?, clock)
+    }
+
+    /// The same, over rules a boot path already compiled.
+    ///
+    /// This is the constructor criterion 4 needs: the caller holds the `Arc` it passes here and
+    /// installs the SAME one on the state the issuance gate reads, so the two consumers cannot
+    /// drift onto different sets. `from_config` is the convenience for a caller with only one
+    /// consumer.
+    ///
+    /// # Errors
+    ///
+    /// None today; the signature matches `from_config` so a caller can swap between them, and
+    /// a future rule that only a configured surface can honour has somewhere to refuse.
+    pub fn from_rules(
+        cfg: &ForwardAuthConfig,
+        rules: std::sync::Arc<RuleSet>,
+        clock: std::sync::Arc<dyn ironauth_env::Clock>,
+    ) -> Result<Option<Self>, ConversionError> {
         if !cfg.enabled {
             return Ok(None);
         }
         Ok(Some(Self {
             limiter: limiter_from_config(&cfg.rate_limit, clock),
-            forward_auth: crate::forward_auth::ForwardAuth::new(rule_set_from_config(
-                cfg, acr_order,
-            )?),
+            forward_auth: crate::forward_auth::ForwardAuth::new(rules),
             dialect: match cfg.dialect {
                 ironauth_config::ProxyDialectConfig::ForwardAuth => {
                     crate::forward_auth::Dialect::ForwardAuth

@@ -1048,9 +1048,22 @@ async fn assemble_planes(
     // be: an operator sees a healthy server serving no OIDC, rather than a refusal naming
     // the rule. Here the error reaches the `ExitCode::FAILURE` arm, the same one a malformed
     // `server.public_url` takes.
-    let forward_auth = ironauth_oidc::forward_auth_rules::ForwardAuthRuntime::from_config(
+    //
+    // COMPILED ONCE AND SHARED. Criterion 4 asks that the SAME rule set gate a forward-auth
+    // resource and an OIDC token issuance; building it here and handing the same `Arc` to both
+    // consumers is what makes that a fact about one object rather than a claim about two that
+    // happen to agree. The issuance side is installed regardless of `forward_auth.enabled`,
+    // because turning off a proxy surface must not silently turn off a denial policy.
+    let access_rules = ironauth_oidc::forward_auth_rules::access_rules_from_config(
         &config.forward_auth,
         &config.oidc.acr_order,
+    )
+    .map_err(|error| ServerError::InvalidAccessRules {
+        reason: error.to_string(),
+    })?;
+    let forward_auth = ironauth_oidc::forward_auth_rules::ForwardAuthRuntime::from_rules(
+        &config.forward_auth,
+        std::sync::Arc::clone(&access_rules),
         env.clock_arc(),
     )
     .map_err(|error| ServerError::InvalidAccessRules {
@@ -1066,6 +1079,7 @@ async fn assemble_planes(
             DataPlaneSurfaces::resolve(features, config),
             &shared,
             forward_auth,
+            access_rules,
         )
         .await
     } else {
@@ -1676,6 +1690,7 @@ async fn build_oidc_plane(
     surfaces: DataPlaneSurfaces,
     shared: &SharedPlaneInputs,
     forward_auth: Option<std::sync::Arc<ironauth_oidc::forward_auth_rules::ForwardAuthRuntime>>,
+    access_rules: std::sync::Arc<ironauth_oidc::rules::RuleSet>,
 ) -> Option<OidcPlane> {
     let oidc_config = &config.oidc;
     let policy_config = &config.password_policy;
@@ -2091,6 +2106,12 @@ async fn build_oidc_plane(
         Some(runtime) => state.with_forward_auth(runtime),
         None => state,
     };
+    // THE ISSUANCE CONSUMER OF THE SAME RULES (issue #154 criterion 4). Installed
+    // unconditionally, unlike the surface above: a deployment may write access rules without
+    // serving a proxy check, and gating this on `forward_auth.enabled` would mean switching off
+    // a proxy surface silently switched off a denial policy. With no rules configured the set
+    // is empty and refuses nothing.
+    let state = state.with_access_rules(access_rules);
     // The outbound client sync HTTP flow targets are called through (issue #112). Its
     // `total_timeout` is the flow-target ceiling EXACTLY, because a per-request timeout only
     // shortens it: a smaller ceiling here would silently truncate a target registered above

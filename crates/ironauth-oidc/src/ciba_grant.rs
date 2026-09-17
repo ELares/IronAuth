@@ -409,5 +409,8 @@ async fn mint_ciba_tokens(
         },
         &target,
     )
-    .map_err(|()| TokenError::ServerError)
+    .map_err(|refusal| match refusal {
+        tokens::MintRefusal::Policy { .. } => TokenError::AccessDenied,
+        tokens::MintRefusal::Signing => TokenError::ServerError,
+    })
 }

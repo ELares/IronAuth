@@ -1189,6 +1189,93 @@ pub(crate) fn build_client_credentials_access_token_claims(
     }
     claims
 }
+/// Why a mint refused.
+///
+/// The three mint entry points returned `Result<_, ()>`, and every caller mapped that to a
+/// `server_error`. That is the right answer for a signing failure and the wrong one for a
+/// policy denial: an operator's rule refusing an issuance is not the server failing. A caller
+/// that cannot tell them apart reports a deliberate refusal as a fault, which is how a denial
+/// policy looks like an outage.
+///
+/// The code the `Policy` arm becomes is `access_denied`, which is an EXTENSION of the token
+/// endpoint's error list rather than a member of it. See [`crate::error::TokenError`]'s variant
+/// for why that is the right trade and what it costs a strict client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MintRefusal {
+    /// The claims could not be built or the signing backend refused. A `server_error`.
+    Signing,
+    /// An access rule denied this issuance (issue #154 criterion 4), naming the rule so the
+    /// refusal can be traced to a line an operator wrote.
+    Policy {
+        /// The operator-facing rule name.
+        rule: String,
+    },
+}
+
+impl From<()> for MintRefusal {
+    /// The prior error type, so the `?` inside a mint keeps meaning what it meant.
+    fn from((): ()) -> Self {
+        Self::Signing
+    }
+}
+
+/// The access rule that refuses this issuance, if any (issue #154 criterion 4).
+///
+/// # The request fields are EMPTY, and that is the point
+///
+/// A token issuance is not an HTTP resource request. It has no path a rule could sensibly
+/// constrain, and the endpoint's own path is not one either: a rule reading `path_prefix =
+/// "/admin"` is about the protected application, so matching it against `/token` would be
+/// meaningless and matching it against `/admin` would be a lie.
+///
+/// Leaving them empty makes MOST request-shaped criteria fail to match here: an empty path is
+/// under no prefix and an empty method is in no list.
+///
+/// NOT ALL OF THEM, and an earlier version of this comment claimed otherwise -- it said "an
+/// empty host equals no host", which is false: `Criterion::Host` is exact equality, so an empty
+/// configured host equals the empty one these facts carry, and a `path_matches` accepting the
+/// empty string matches the empty path. Both directions were reachable: as a `deny` such a
+/// rule refused every issuance, and as an `allow` above a real `deny` it matched first and kept
+/// issuing while the operator read a refusal in their config.
+///
+/// What makes the emptiness safe is not the emptiness. [`crate::rules::RuleSet::refusal`] walks
+/// only the rules that constrain the PRINCIPAL, so a rule whose criteria are all about the
+/// request neither refuses nor shadows here whatever it happens to match. The empty fields
+/// remain the honest description of a request that has no path, method or host.
+///
+/// # Only an explicit deny refuses
+///
+/// Through [`crate::rules::RuleSet::refusal`], not `decide`. A token request matches no path
+/// rule, so reading the fall-through as a refusal would mean one forward-auth path rule stopped
+/// every token in the deployment from being issued. The reasoning is on that method.
+pub(crate) fn issuance_refusal(
+    state: &OidcState,
+    subject: &str,
+    acr: Option<String>,
+    roles: Option<&std::collections::BTreeSet<String>>,
+) -> Option<String> {
+    let configured = state.access_rules()?;
+    configured.refusal(&crate::rules::RequestFacts {
+        subject: Some(subject.to_owned()),
+        acr,
+        roles: roles
+            .map(|roles| roles.iter().cloned().collect())
+            .unwrap_or_default(),
+        ..crate::rules::RequestFacts::default()
+    })
+}
+
+/// The authentication context a user-subject issuance reached, for [`issuance_refusal`].
+///
+/// Derived from the recorded methods, the same single source the ID token's `acr` claim uses.
+///
+/// Returns the value rather than an `Option` because a user-subject grant ALWAYS reached one:
+/// `parse_methods` falls back to a password when it parses nothing. The machine door passes
+/// `None` explicitly, and the difference between "reached this" and "authenticated nobody" is
+/// exactly what that call site is making.
+pub(crate) fn issued_acr(auth_methods: &str) -> String {
+    crate::authn::achieved_acr(&crate::authn::parse_methods(auth_methods)).to_owned()
+}
 
 /// Mint the client-credentials (M2M) access token (issue #23), in whichever format
 /// the resolved `target` selects, through the SAME policy-enforced signing core and
@@ -1207,7 +1294,22 @@ pub fn mint_client_credentials_access_token(
     policy: &SigningPolicy,
     request: &ClientCredentialsMintRequest<'_>,
     target: &AccessTokenTarget,
-) -> Result<(MintedAccessToken, i64), ()> {
+) -> Result<(MintedAccessToken, i64), MintRefusal> {
+    // THE MACHINE DOOR. Client-credentials, JWT-bearer and token-exchange grants mint here and
+    // never through `mint_access`, so a gate on the user path alone would leave every machine
+    // token unrefusable -- which is the direction that matters, since a service account is the
+    // principal an operator most often wants to be able to switch off.
+    //
+    // NO ACR, and that is not an omission. A machine identity performs no authentication
+    // ceremony, so there is no achieved context. Deriving one from an empty method list would
+    // hand it `pwd` (`parse_methods` falls back to a password when it parses nothing), and a
+    // rule reading `acr_at_least = "pwd"` would then admit a token that authenticated nobody.
+    // `None` satisfies no floor, so such a rule simply does not select a machine token, which
+    // is the honest answer.
+    if let Some(rule) = issuance_refusal(state, request.subject, None, request.roles) {
+        tracing::info!(rule = %rule, "an access rule refused a machine token issuance");
+        return Err(MintRefusal::Policy { rule });
+    }
     let now = state.now();
     let iat = epoch_secs(now);
     let access_exp = iat.saturating_add(secs(target.ttl));
@@ -1296,13 +1398,14 @@ fn generate_opaque_access_token(state: &OidcState, jti: &IssuedTokenId) -> Strin
 /// `server_error`, so issuance fails closed. The opaque path cannot fail (entropy
 /// draw and hashing are infallible), but the ID token is always signed, so a
 /// signing failure still fails the whole exchange closed.
+/// issuance-gate-allow: delegates to `mint_access`, which is the door.
 pub fn mint(
     state: &OidcState,
     signer: &SigningKey,
     policy: &SigningPolicy,
     request: &MintRequest<'_>,
     target: &AccessTokenTarget,
-) -> Result<IssuedTokens, ()> {
+) -> Result<IssuedTokens, MintRefusal> {
     let now = state.now();
     let iat = epoch_secs(now);
     // The ID token uses the environment's OWN id-token lifetime (issue #192); the
@@ -1362,13 +1465,14 @@ pub fn mint(
 /// Returns `Err(())` if `signer`'s algorithm is not permitted by `policy` or the
 /// signing backend fails; the caller maps that to a token-endpoint `server_error`,
 /// so a signing failure fails the refresh closed. The opaque path is infallible.
+/// issuance-gate-allow: delegates to `mint_access`.
 pub fn mint_access_token(
     state: &OidcState,
     signer: &SigningKey,
     policy: &SigningPolicy,
     request: &MintRequest<'_>,
     target: &AccessTokenTarget,
-) -> Result<MintedRefreshAccess, ()> {
+) -> Result<MintedRefreshAccess, MintRefusal> {
     let now = state.now();
     let (access, permission_budget) = mint_access(state, signer, policy, request, target, now)?;
     Ok(MintedRefreshAccess {
@@ -1402,14 +1506,32 @@ fn mint_access(
     request: &MintRequest<'_>,
     target: &AccessTokenTarget,
     now: SystemTime,
-) -> Result<(MintedAccessToken, PermissionBudgetOutcome), ()> {
+) -> Result<(MintedAccessToken, PermissionBudgetOutcome), MintRefusal> {
+    // THE ACCESS-RULE GATE FOR EVERY USER-SUBJECT GRANT (issue #154 criterion 4).
+    //
+    // Here rather than in the grant handlers. There are seven of those, and a review of the
+    // first attempt at this (PR #1309) found six of the seven ungated -- a gate written once
+    // per door is a gate with a door missing. `mint` and `mint_access_token` are the only two
+    // callers of this function, and between them they carry the authorization-code, refresh,
+    // device and CIBA grants, so one check covers all of them and a new grant inherits it by
+    // calling the same mint.
+    if let Some(rule) = issuance_refusal(
+        state,
+        request.subject,
+        Some(issued_acr(request.auth_methods)),
+        request.roles,
+    ) {
+        tracing::info!(rule = %rule, "an access rule refused a token issuance");
+        return Err(MintRefusal::Policy { rule });
+    }
     let iat = epoch_secs(now);
     let access_exp = iat.saturating_add(secs(target.ttl));
     match target.format {
         // RFC 9068 at+jwt: the header typ is `at+jwt` and the claims carry the
         // section 2.2 set, signed through the same policy-enforced core as the ID
         // token, so an algorithm the policy forbids is refused before signing.
-        TokenFormat::AtJwt => mint_at_jwt(state, signer, policy, request, target, iat, access_exp),
+        TokenFormat::AtJwt => mint_at_jwt(state, signer, policy, request, target, iat, access_exp)
+            .map_err(MintRefusal::from),
         // Opaque: a scope-declaring reference token; only its digest and metadata
         // are stored (the caller records them in the redeem transaction). The token
         // embeds its own `jti` as the routing handle, so the digest is over the
@@ -1454,6 +1576,7 @@ fn mint_access(
 /// The budget is read from the state's `[token_claims]` section here rather than
 /// threaded in on [`MintRequest`]. One source, no wiring point for a caller to miss,
 /// and no way for two call sites to hand the mint two different budgets.
+/// issuance-gate-allow: a format arm below `mint_access`, which has already checked.
 fn mint_at_jwt(
     state: &OidcState,
     signer: &SigningKey,
@@ -1550,6 +1673,7 @@ fn at_jwt_payload(
 /// exchange, the refresh grant, and the client-credentials grant (issue #23): every
 /// opaque access token IronAuth issues is byte-shaped identically regardless of the
 /// grant that minted it.
+/// issuance-gate-allow: a format arm below `mint_access`, which has already checked.
 fn mint_opaque_access(
     state: &OidcState,
     scope: &Scope,
@@ -1588,6 +1712,7 @@ pub struct MintedRefreshToken {
 /// so a token cannot be relocated to another scope), and a database dump yields
 /// nothing replayable.
 #[must_use]
+/// issuance-gate-allow: an opaque successor to a grant gated at its own issuance.
 pub fn mint_refresh_token(state: &OidcState, scope: &Scope) -> MintedRefreshToken {
     let jti = RefreshTokenId::generate(state.env(), scope);
     let mut bytes = [0_u8; OPAQUE_ACCESS_TOKEN_BYTES];
@@ -1624,7 +1749,20 @@ pub fn mint_id_token(
     signer: &SigningKey,
     policy: &SigningPolicy,
     request: &MintRequest<'_>,
-) -> Result<(String, IssuedTokenId), ()> {
+) -> Result<(String, IssuedTokenId), MintRefusal> {
+    // THE FRONT-CHANNEL DOOR, gated for the same reason and separately because it does not go
+    // through `mint_access`: an implicit or hybrid authorize response and a FedCM assertion
+    // mint an ID token and no access token, so a gate on the access path alone would leave a
+    // refused subject receiving an identity receipt.
+    if let Some(rule) = issuance_refusal(
+        state,
+        request.subject,
+        Some(issued_acr(request.auth_methods)),
+        request.roles,
+    ) {
+        tracing::info!(rule = %rule, "an access rule refused a front-channel ID token");
+        return Err(MintRefusal::Policy { rule });
+    }
     let now = state.now();
     let iat = epoch_secs(now);
     // The SAME id-token lifetime a token-endpoint ID token gets (issue #192): the

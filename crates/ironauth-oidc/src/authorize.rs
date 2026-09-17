@@ -1209,11 +1209,19 @@ async fn issue_code(
             code.as_deref(),
         )
         .await
-        .map_err(|()| {
-            redirect_error(
+        .map_err(|refusal| match refusal {
+            // AN OPERATOR'S RULE, NOT A FAULT (issue #154 criterion 4). The front channel
+            // answers with a redirect, so the client learns `access_denied` -- the code RFC
+            // 6749 section 4.1.2.1 defines for exactly this -- rather than a server error that
+            // invites it to retry into the same refusal. The rule name stays in the log.
+            tokens::MintRefusal::Policy { .. } => redirect_error(
+                AuthzErrorCode::AccessDenied,
+                "an access rule refused this issuance",
+            ),
+            tokens::MintRefusal::Signing => redirect_error(
                 AuthzErrorCode::ServerError,
                 "the authorization request could not be processed",
-            )
+            ),
         })?;
         Some(minted)
     } else {
@@ -1335,7 +1343,7 @@ async fn mint_front_channel_id_token(
     response_type: ResponseType,
     resolved: &Resolved<'_>,
     code: Option<&str>,
-) -> Result<String, ()> {
+) -> Result<String, tokens::MintRefusal> {
     let entry = state.issuer_entry(&scope).await.ok_or(())?;
     let signer = entry.signer(state.now()).ok_or(())?;
     let alg = signer.algorithm();

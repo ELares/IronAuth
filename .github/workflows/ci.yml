@@ -1486,6 +1486,12 @@ jobs:
       # ships. Both rules fail against a planted violation, which the PR adding this demonstrates.
       - name: no synchronous cross-region call on a request path
         run: scripts/no-cross-region-sync.sh
+      # Issue #154 criterion 4 asks one rule set to gate every OIDC token issuance. The gate
+      # sits at the mints because the seven grant handlers funnel into three of them, and
+      # "three" is a fact about today's tree: a fourth appearing is silent, because every test
+      # of the other three still passes while the new grant mints tokens nothing refuses.
+      - name: issuance gate (every token mint consults the access rules)
+        run: scripts/issuance-gate.sh
       - name: scoped table registration (every forced-RLS table in the migrations is in the query audit list)
         run: scripts/scoped-table-registration.sh
       - name: audit foreign key claims (no comment asserts an audit_log foreign key that does not exist)

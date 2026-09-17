@@ -255,6 +255,20 @@ pub struct OidcState {
     /// `None` is a uniform 404 on the check path, so a deployment that did not ask for a
     /// forward-auth surface does not advertise one.
     forward_auth: Option<Arc<crate::forward_auth_rules::ForwardAuthRuntime>>,
+    /// The deployment's access rules, for the consumers that are not the forward-auth check
+    /// (issue #154 criterion 4).
+    ///
+    /// The SAME `Arc` the forward-auth surface holds when both are installed, so "the same
+    /// rule set gates a forward-auth resource and an OIDC token issuance" is a fact about one
+    /// object rather than a claim about two that happen to agree.
+    ///
+    /// Present INDEPENDENTLY of `forward_auth.enabled`: a deployment can write access rules
+    /// without serving a proxy check, and tying the issuance layer to an unrelated toggle
+    /// would mean turning off a proxy surface silently turned off a denial policy.
+    ///
+    /// `None` means no rules were configured, which is the shipped default and refuses
+    /// nothing.
+    access_rules: Option<Arc<crate::rules::RuleSet>>,
     // Whether the experimental IdP-side FedCM surface (issue #83) is armed. Kept
     // OUTSIDE `Inner` and set through the builder for the SAME anti-bypass reason as
     // global-token-revocation: it is NOT a plain `OidcConfig` toggle an operator can
@@ -1081,6 +1095,7 @@ impl OidcState {
             // kept passing if `SsfConfig::default()` had changed underneath it.
             risc_receiver: ironauth_config::RiscReceiverConfig::default(),
             forward_auth: None,
+            access_rules: None,
             ssf_enabled: ironauth_config::SsfConfig::default().enabled,
             ssf_max_streams_per_client: ironauth_config::SsfConfig::default()
                 .max_streams_per_client,
@@ -1335,6 +1350,17 @@ impl OidcState {
         runtime: Arc<crate::forward_auth_rules::ForwardAuthRuntime>,
     ) -> Self {
         self.forward_auth = Some(runtime);
+        self
+    }
+
+    /// Install the deployment's access rules for the non-forward-auth consumers (issue #154).
+    ///
+    /// Takes the compiled set rather than the config for the reason `with_forward_auth` does,
+    /// and takes an `Arc` so a boot path installs the SAME object it gave the forward-auth
+    /// surface. Independent of `forward_auth.enabled`: see the field.
+    #[must_use]
+    pub fn with_access_rules(mut self, rules: Arc<crate::rules::RuleSet>) -> Self {
+        self.access_rules = Some(rules);
         self
     }
 
@@ -2242,6 +2268,17 @@ impl OidcState {
         &self,
     ) -> Option<&Arc<crate::forward_auth_rules::ForwardAuthRuntime>> {
         self.forward_auth.as_ref()
+    }
+
+    /// The deployment's access rules, or `None` when none are configured.
+    ///
+    /// `pub` rather than `pub(crate)` for one reason: criterion 4's claim is that the same
+    /// object gates two consumers, and an integration test can only assert `Arc::ptr_eq` if it
+    /// can see what was installed. Equality of the rules would pass against two sets built
+    /// from one file, which is exactly the bug the claim is about.
+    #[must_use]
+    pub fn access_rules(&self) -> Option<&Arc<crate::rules::RuleSet>> {
+        self.access_rules.as_ref()
     }
 
     /// The Google Cross-Account Protection receiver settings (issue #144). Off by default,
