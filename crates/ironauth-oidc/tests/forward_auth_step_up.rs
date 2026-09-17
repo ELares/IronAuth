@@ -133,25 +133,45 @@ async fn a_forward_auth_step_up_admits_the_session_that_answered_it() {
 /// > Trusted-header SSO headers reach the upstream app only after an allow decision and are
 /// > stripped from client-supplied input.
 ///
-/// Both halves are pinned in `forward_auth.rs` against the surface directly. What was not
-/// pinned is the ROUTE: `render` decides which headers reach the wire, and a unit test of the
-/// outcome cannot see a route that emits them on the wrong status or drops them on the right
-/// one. This drives the mounted check endpoint with a real session and reads the response.
+/// # What this adds, stated narrowly, because the first version of this block overstated it
 ///
-/// # WHAT IT KILLS, measured, because two of the three mutations I tried SURVIVED
+/// It is NOT that the route was unpinned. `render`'s allow-only copy is already pinned across
+/// all three actions by `upstream_identity_headers_are_emitted_only_on_an_allow` in
+/// `forward_auth_route.rs`, which hands `render` a hand-built Deny outcome CARRYING headers --
+/// an outcome `evaluate` would never produce -- precisely so the route guard is measured on
+/// its own. What no test reached is the WIRING: that the mounted endpoint resolves a session
+/// into an identity, feeds `evaluate` a header the client supplied, and hands `render` the
+/// resulting outcome and must-delete list. That is what this drives.
 ///
-/// The allow-only decision is made TWICE -- once where `evaluate` builds `upstream_headers`
-/// and once where `render` copies them -- and the route's own comment says why: copying
-/// unconditionally "would depend on that invariant holding forever rather than on this
-/// decision being made here". So neither guard can be killed alone: remove the surface one
-/// and the route still refuses to copy; remove the route one and there is nothing to copy.
-/// This test fails when BOTH go, which is the honest statement of what redundancy buys.
+/// # TWO MUTATIONS SURVIVED THIS TEST, and neither survives the suite
 ///
-/// The stripping mutation survived for a different reason and a worse one: I aimed it at
-/// `ForwardAuth::evaluate`'s call to `strip_trusted_headers`, which the ROUTE does not take --
-/// the dialect adapter strips, and `evaluate` re-strips what is already clean. Mutating the
-/// adapter's call fails this test. A mutation aimed at the wrong site reports SURVIVED and
-/// reads exactly like a vacuous test.
+/// Said that way deliberately. The first version of this block said "neither guard can be
+/// killed alone", which is a claim about the CODE, and it is false: I had run the mutations
+/// against this file alone and written the result up as a property of the suite.
+///
+/// The allow-only decision is made TWICE -- where `evaluate` builds `upstream_headers` and
+/// where `render` copies them -- and the route's comment says why: copying unconditionally
+/// "would depend on that invariant holding forever rather than on this decision being made
+/// here". Each mutation alone leaves the WIRE unchanged, which is all this test reads. Each is
+/// killed by a pre-existing unit test living beside the guard it pins: the route guard by
+/// `upstream_identity_headers_are_emitted_only_on_an_allow`, and the surface guard by
+/// `a_denied_request_forwards_no_identity`, `a_step_up_forwards_no_identity` and
+/// `the_decided_principal_is_the_forwarded_principal` in `forward_auth.rs`. Measured, by
+/// running each against `--lib forward_auth` rather than against this file.
+///
+/// The stripping mutation survived for a different reason, and the explanation I first wrote
+/// for it was also wrong. I said the route "does not take" `evaluate`'s call to
+/// `strip_trusted_headers`. It does -- `evaluate`'s first statement, on every check. It is a
+/// NO-OP by then, because the dialect adapter has already stripped, so removing it changes
+/// nothing observable. Mutating the adapter's call is what fails this test.
+///
+/// # WHAT IT STILL DOES NOT PIN
+///
+/// The stripping half only as far as the ADVISORY. The assertions below read `Remote-User` on
+/// the response and the must-delete list; they do not observe what the RULES saw, so a strip
+/// that stopped feeding sanitised facts to the engine while still reporting the advisory would
+/// pass here. `a_client_supplied_reserved_header_never_decides_a_request` is the test that
+/// covers that, against the surface.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_upstream_identity_reaches_the_wire_only_on_an_allow() {
     let harness = Harness::start_store_backed().await;
