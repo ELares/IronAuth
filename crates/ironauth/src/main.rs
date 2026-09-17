@@ -1336,7 +1336,12 @@ async fn connect_data_plane_registry(
     config: &Config,
     shared: &SharedPlaneInputs,
 ) -> Option<(Arc<IssuerRegistry>, Store)> {
-    let store = match Store::connect(config.database.url.expose()).await {
+    let store = match Store::connect_with_acquire_timeout(
+        config.database.url.expose(),
+        config.database.acquire_timeout_secs,
+    )
+    .await
+    {
         Ok(store) => store,
         Err(error) => {
             tracing::error!(
@@ -1571,7 +1576,12 @@ async fn build_scim_plane(
     env: &Env,
     shared: &SharedPlaneInputs,
 ) -> Option<ScimPlane> {
-    let store = match Store::connect(config.database.url.expose()).await {
+    let store = match Store::connect_with_acquire_timeout(
+        config.database.url.expose(),
+        config.database.acquire_timeout_secs,
+    )
+    .await
+    {
         Ok(store) => store,
         Err(error) => {
             tracing::error!(
@@ -1696,7 +1706,12 @@ async fn build_oidc_plane(
     let policy_config = &config.password_policy;
     let hashing_config = &config.password_hashing;
     let env = env.clone();
-    let store = match Store::connect(config.database.url.expose()).await {
+    let store = match Store::connect_with_acquire_timeout(
+        config.database.url.expose(),
+        config.database.acquire_timeout_secs,
+    )
+    .await
+    {
         Ok(store) => store,
         Err(error) => {
             tracing::error!(

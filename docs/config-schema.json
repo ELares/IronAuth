@@ -609,6 +609,13 @@
       "additionalProperties": false,
       "description": "Primary database settings.",
       "properties": {
+        "acquire_timeout_secs": {
+          "default": 3,
+          "description": "How long a request may wait for a pool connection before it fails, in seconds\n(issue #149).\n\nThis decides what \"the database is unreachable\" LOOKS like to a caller. A pool that has\nbeen closed errors at once; a server that is DOWN or PARTITIONED does not, and the\ndriver retries until this bound. The publication path reads the fence on every discovery\nand JWKS request, so with the driver's own 30-second default each request held one of\nsixteen permits for half a minute under a partition, and the seventeenth queued behind\nthem. The endpoints answered and were unusable, which is the opposite of what the\ndegraded tier promises.\n\nThe default is three seconds: an order of magnitude above a normal connect including a\ncross-zone TLS handshake, and well under the timeout a client gives up at. RAISE it only\nfor a genuinely distant database, and know what it buys -- a longer bound does not make\na request succeed, it makes a doomed one hold a permit for longer.\n\nZero is refused. A zero bound fails every acquire that is not already satisfied by an\nidle connection, which turns ordinary pool contention into an outage.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "master_key": {
           "anyOf": [
             {
@@ -3404,6 +3411,7 @@
     "database": {
       "$ref": "#/$defs/DatabaseConfig",
       "default": {
+        "acquire_timeout_secs": 3,
         "master_key": null,
         "master_key_id": null,
         "password": null,

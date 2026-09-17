@@ -50,6 +50,42 @@ pub struct Store {
     wakes: Option<Arc<WakeDispatcher>>,
 }
 
+/// How long a caller may wait for a pool connection before the request fails (issue #149).
+///
+/// # The default this replaces was thirty seconds, and it was never chosen
+///
+/// `sqlx` defaults `acquire_timeout` to 30s and nothing here overrode it. That number decides
+/// what "Postgres is down" LOOKS like to a request, and 30s is the wrong answer for every
+/// caller in this process.
+///
+/// A closed pool errors immediately, which is what the outage tests induce. A server that is
+/// down or partitioned does the opposite: `sqlx` drops the dead connection, retries with
+/// backoff, and blocks the caller until this deadline. The publication path reads the fence on
+/// EVERY discovery and JWKS request, ahead of the cache and inside a transaction, so under a
+/// partition each request held a permit for half a minute. With sixteen permits, the
+/// seventeenth request queued behind them and so did everything after it: the endpoints
+/// technically answered and operationally did not, which is the opposite of what issue #149's
+/// degraded tier promises.
+///
+/// # Why three seconds
+///
+/// It has to sit between two numbers. Above a normal connect, including a TLS handshake to a
+/// database in another zone, which is tens to low hundreds of milliseconds; and well below the
+/// timeout a client gives up at, because a request that outlives its caller holds a permit for
+/// nobody. This repository's own smoke check uses `--max-time 10`.
+///
+/// Three seconds is an order of magnitude above the first and comfortably under the second. A
+/// deployment whose database is genuinely further away sets `database.acquire_timeout_secs`,
+/// whose own default is this number duplicated -- `ironauth-config` sits BELOW the store and
+/// cannot read this constant, so `the_config_default_matches_the_store_default` pins the two.
+///
+/// # This does not make a request succeed
+///
+/// It makes it FAIL FAST, which is the whole of the intent. The surfaces issue #149 says keep
+/// serving do so by falling back to a warm entry when the fence read returns an error -- and
+/// they could not reach that fallback while the read was still waiting.
+pub const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 3;
+
 impl Store {
     /// Run the pre-upgrade data preflight against this store's database (issue #148).
     ///
@@ -83,6 +119,19 @@ impl Store {
     #[cfg(feature = "testing")]
     pub async fn close_pool_for_test(&self) {
         self.pool.close().await;
+    }
+
+    /// The acquire bound this pool was built with, for a test that the bound is actually SET.
+    ///
+    /// Reading it back is the only way to pin it. A mutation deleted the `.acquire_timeout(..)`
+    /// line from the constructor and the workspace still compiled, with one unused-variable
+    /// warning and no failing test -- so the bound could be removed and the only evidence would
+    /// be a warning in a build log. The pin on the two CONSTANTS does not cover this: they can
+    /// agree perfectly while nothing applies either of them.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn acquire_timeout_for_test(&self) -> std::time::Duration {
+        self.pool.options().get_acquire_timeout()
     }
 
     /// Answer a readiness probe on a POOLED connection (issue #149).
@@ -309,7 +358,7 @@ impl Store {
         crate::kek_backup::restore(&self.pool, rows, manifest).await
     }
 
-    /// Connect to Postgres at `url` with a bounded pool.
+    /// Connect to Postgres at `url` with a bounded pool and the default acquire bound.
     ///
     /// In production `url` should authenticate as the low-privilege
     /// application role (never a superuser and never the table owner), so the
@@ -320,8 +369,26 @@ impl Store {
     ///
     /// [`StoreError::Database`] if the pool cannot be established.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
+        Self::connect_with_acquire_timeout(url, DEFAULT_ACQUIRE_TIMEOUT_SECS).await
+    }
+
+    /// The same, with the acquire bound a deployment configured.
+    ///
+    /// The bound lives on the CONSTRUCTOR rather than at each call site, so a connect cannot be
+    /// written without one. There are six `Store::connect` sites in the binary and only four of
+    /// them hold the parsed config; a per-site bound would have left the other two on whatever
+    /// `sqlx` defaults to, which is the state this replaces.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the pool cannot be established.
+    pub async fn connect_with_acquire_timeout(
+        url: &str,
+        acquire_timeout_secs: u64,
+    ) -> Result<Self, StoreError> {
         let pool = PgPoolOptions::new()
             .max_connections(16)
+            .acquire_timeout(std::time::Duration::from_secs(acquire_timeout_secs))
             .connect(url)
             .await?;
         Ok(Self {

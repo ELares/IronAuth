@@ -721,6 +721,63 @@ async fn both_planes_receive_the_same_shared_values() {
 /// The unwired plane is the control, and it is what makes this non-vacuous: it is built
 /// through `OidcState::new` deliberately, so a version of this assertion that could not
 /// tell an installed resolver from an absent one fails here rather than passing quietly.
+/// THE BOUND IS ACTUALLY APPLIED TO THE POOL (issue #149).
+///
+/// The constant pin below proves the two numbers agree. It cannot prove either is USED, and a
+/// mutation showed that gap: deleting `.acquire_timeout(..)` from the constructor left the
+/// workspace compiling with one unused-variable warning and no failing test. So this reads the
+/// bound back off the pool the constructor built.
+///
+/// A value that is neither default answers a second question at no cost: that the argument is
+/// threaded rather than a constant re-applied inside.
+#[tokio::test]
+async fn the_configured_acquire_bound_reaches_the_pool() {
+    let db = ironauth_store::test_support::TestDatabase::start().await;
+    let store = ironauth_store::Store::connect_with_acquire_timeout(db.app_url(), 7)
+        .await
+        .expect("connect");
+    assert_eq!(
+        store.acquire_timeout_for_test(),
+        std::time::Duration::from_secs(7),
+        "the constructor took the bound and did not apply it, so a dead database stalls every \
+         request for whatever sqlx defaults to"
+    );
+
+    let defaulted = ironauth_store::Store::connect(db.app_url())
+        .await
+        .expect("connect");
+    assert_eq!(
+        defaulted.acquire_timeout_for_test(),
+        std::time::Duration::from_secs(ironauth_store::DEFAULT_ACQUIRE_TIMEOUT_SECS),
+        "and the no-argument constructor must carry the default rather than sqlx's"
+    );
+}
+
+/// THE TWO COPIES OF THE ACQUIRE BOUND AGREE (issue #149).
+///
+/// `ironauth-config` cannot read `ironauth_store::DEFAULT_ACQUIRE_TIMEOUT_SECS`, because config
+/// sits BELOW the store and reversing that to share one integer would be the wrong trade. So the
+/// number is written twice, and this is the test that makes the duplication safe -- the binary is
+/// the first crate that can see both.
+///
+/// Without it the config default could drift from the constructor default, and a deployment that
+/// set nothing would get one number while the doc comment beside it described another.
+#[test]
+fn the_config_default_matches_the_store_default() {
+    assert_eq!(
+        ironauth_config::DEFAULT_ACQUIRE_TIMEOUT_SECS,
+        ironauth_store::DEFAULT_ACQUIRE_TIMEOUT_SECS,
+        "the config default and the pool constructor default are the same number written in \
+         two crates; they have drifted"
+    );
+    assert_eq!(
+        ironauth_config::DatabaseConfig::default().acquire_timeout_secs,
+        ironauth_store::DEFAULT_ACQUIRE_TIMEOUT_SECS,
+        "and the shipped default config must carry it, or a deployment that sets nothing gets \
+         a different bound from the one documented"
+    );
+}
+
 #[tokio::test]
 async fn the_boot_path_installs_the_client_key_resolver() {
     // A TTL that is neither the shipped default (300) nor any other duration this harness
