@@ -322,7 +322,10 @@ function Shell() {
       ? `${pageLabel} · IronAuth`
       : "Sign in · IronAuth";
     if (signedIn.value && previousPath.current !== location.path) {
-      document.getElementById("main-content")?.focus();
+      // Routed content remounts to discard drafts, so the shell restores the
+      // new page's position and focus without depending on the router's state.
+      window.scrollTo(0, 0);
+      document.getElementById("main-content")?.focus({ preventScroll: true });
     }
     previousPath.current = location.path;
   }, [pageLabel, location.path, signedIn.value]);

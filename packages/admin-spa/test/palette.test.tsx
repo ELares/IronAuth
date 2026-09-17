@@ -182,4 +182,30 @@ describe("command palette keyboard flow", () => {
     expect(root.querySelector('[role="dialog"]')).toBeNull();
     expect(alpha).not.toHaveBeenCalled();
   });
+
+  it("scrolls the wrapped keyboard selection into view while keeping combobox focus", async () => {
+    const commands: Command[] = Array.from({ length: 20 }, (_, index) => ({
+      id: String(index),
+      label: `Command ${index}`,
+      run: () => undefined,
+    }));
+    const root = mount(<CommandPalette commands={commands} />);
+    await tick();
+    root.querySelector<HTMLButtonElement>(".console-search")!.click();
+    await tick();
+    const input = root.querySelector<HTMLInputElement>(".cmdk-input")!;
+    const last = root.querySelector<HTMLLIElement>(".cmdk-item:last-child")!;
+    const scrollIntoView = vi.fn();
+    last.scrollIntoView = scrollIntoView;
+
+    keydown(input, "ArrowUp");
+    await tick();
+
+    expect(last.getAttribute("aria-selected")).toBe("true");
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      block: "nearest",
+      inline: "nearest",
+    });
+    expect(document.activeElement).toBe(input);
+  });
 });

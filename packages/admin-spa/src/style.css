@@ -1704,16 +1704,22 @@ a.stat-card:hover {
 .cmdk-overlay {
   position: fixed;
   inset: 0;
+  height: 100dvh;
   background: #10203d66;
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding: 14vh 20px 20px;
+  padding: 14dvh 20px 20px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   z-index: 60;
   backdrop-filter: blur(3px);
 }
 .cmdk-dialog {
   width: min(600px, 100%);
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 13px;
@@ -1722,6 +1728,7 @@ a.stat-card:hover {
 }
 .cmdk-input {
   width: 100%;
+  flex-shrink: 0;
   border: 0;
   border-bottom: 1px solid var(--line);
   padding: 19px 22px;
@@ -1738,7 +1745,9 @@ a.stat-card:hover {
   margin: 0;
   padding: 8px;
   max-height: 360px;
+  min-height: 60px;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .cmdk-item {
   display: flex;
@@ -1756,6 +1765,10 @@ a.stat-card:hover {
   overflow-wrap: anywhere;
   max-width: 45%;
 }
+.cmdk-item-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .cmdk-active {
   background: var(--accent-soft);
   color: var(--accent-hover);
@@ -1770,6 +1783,7 @@ a.stat-card:hover {
   text-align: center;
 }
 .cmdk-searching {
+  flex-shrink: 0;
   margin: 0;
   padding: 10px 22px;
   color: var(--muted);
@@ -1777,12 +1791,16 @@ a.stat-card:hover {
 }
 .cmdk-error {
   padding: 16px 16px 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .cmdk-error .errorbody {
   margin: 0;
 }
 .cmdk-footer {
   display: flex;
+  flex-shrink: 0;
   flex-wrap: wrap;
   gap: 15px;
   align-items: center;
@@ -2060,7 +2078,7 @@ a.stat-card:hover {
     margin-left: 0;
   }
   .cmdk-overlay {
-    padding: 10vh 12px 12px;
+    padding: 10dvh 12px 12px;
   }
 }
 @media (prefers-reduced-motion: reduce) {

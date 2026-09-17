@@ -24,7 +24,13 @@
 // selection without moving focus, Enter runs it, and Escape closes and restores
 // focus to the element that was focused when the palette opened.
 
-import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "preact/hooks";
 import { useLocation } from "preact-iso";
 import { Icon } from "./Icon";
 import { consoleHref } from "./routing";
@@ -162,6 +168,7 @@ export function CommandPalette({
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLUListElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef<Element | null>(null);
 
@@ -179,6 +186,13 @@ export function CommandPalette({
   const resultCommands = results.map((result) => toCommand(result, navigate));
   const filtered = [...filterCommands(source, query), ...resultCommands];
   const activeIndex = wrapIndex(active, filtered.length);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    listRef.current
+      ?.querySelector<HTMLElement>('[aria-selected="true"]')
+      ?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, [open, activeIndex, filtered.length, query, error, searching]);
 
   // Cmd/Ctrl-K toggles the palette from anywhere.
   useEffect(() => {
@@ -316,7 +330,7 @@ export function CommandPalette({
                 Searching resources
               </p>
             ) : null}
-            <ul class="cmdk-list" id={LISTBOX_ID} role="listbox">
+            <ul ref={listRef} class="cmdk-list" id={LISTBOX_ID} role="listbox">
               {filtered.length === 0 ? (
                 <li class="cmdk-empty" role="option" aria-selected="false">
                   No matching commands or resources

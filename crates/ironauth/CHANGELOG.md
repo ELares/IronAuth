@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Console navigation starts each page at the top.** Route changes preserve
+  keyboard focus without jumping to a page's lower content. Command search fits
+  short windows and landscape screens, with all results reachable by scrolling.
+
 - **Resource pages now prioritize existing items.** Creation, invitation,
   credential issuance, membership and grant forms open only after an explicit
   action. Compact header controls open accessible dialogs, including on empty
