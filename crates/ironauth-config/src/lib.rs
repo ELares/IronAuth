@@ -1405,10 +1405,15 @@ pub struct HotStateConfig {
     /// unusual in costing almost nothing above it; a scoped read pays six round trips and a
     /// query under row-level security, measured at 166 us, and is worth accelerating.
     ///
-    /// HOW MUCH depends on what is at the other end of the hop. A hit against the Postgres tier
-    /// is itself a scoped read, 145 us, so fronting ONE repository call it saves thirteen per
-    /// cent; fronting a resolved tenant config, which is three scoped transactions, it saves
-    /// about seventy. See `docs/UNIT-COSTS.md`.
+    /// HOW MUCH depends on what is at the other end of the hop, which is what THIS KEY chooses.
+    /// A hit against the Postgres tier is itself a scoped read, 145 us, so fronting ONE
+    /// repository call it saves thirteen per cent. A hit against an IronCache attached through
+    /// this key costs 30 us, an 82 per cent saving on the same read, and about 94 per cent in
+    /// front of a resolved tenant config, which is three scoped transactions.
+    ///
+    /// So this key is the one that decides whether the seam is worth anything, and the figures
+    /// are in `docs/UNIT-COSTS.md`. They are a floor (a protocol round trip, not the client's
+    /// cost) and a HIT, so a deployment's benefit is a function of its hit rate.
     ///
     /// That distinction is written down rather than glossed because the alternative is a knob
     /// that reads as "my cache is on" while nothing consults it, which is the defect this

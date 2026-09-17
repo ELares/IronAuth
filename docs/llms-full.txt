@@ -8964,6 +8964,10 @@ because that is what decides whether a cache in front of an operation pays for i
 | **one SCOPED read: `begin_scoped` plus a join, under RLS** | **166 us** |
 | a scoped read shaped as `HotStateRepo::get` issues it | 145 us |
 
+| a hit against an attached accelerator | measured |
+|---|---|
+| **one IronCache `GET` hit, 512-byte value, loopback TCP** | **30 us** |
+
 All four are from ONE run of `scripts/bench.sh`, measured as a role that is neither superuser nor
 table owner. That matters: connecting as a superuser bypasses row-level security outright, and
 an earlier revision of this table did exactly that, so its "under RLS" rows had no policy to
@@ -9000,6 +9004,7 @@ against the 166 us scoped read: a 13 per cent saving, bought with a write on eve
 invalidation feed to keep correct.
 
 SO WIRED ONE-FOR-ONE IN FRONT OF A SINGLE REPOSITORY CALL, THE POSTGRES TIER BUYS NOTHING. An
+attached IronCache is a different matter, priced at the end of this section. An
 earlier revision of this section stopped there and concluded the tier "cannot accelerate
 anything, by construction". That is too strong, and the correction is the useful part: what a
 hit replaces is however many scoped transactions the cached answer stands in front of, and that
@@ -9030,9 +9035,27 @@ WHERE THE POSTGRES TIER IS STILL THE RIGHT ANSWER is as a SHARED-STATE mechanism
 faster one: flow state that survives the loss of the node that created it is a real job, and it
 is the one the covenant's "complete on PostgreSQL alone" needs done.
 
-A tier that is genuinely a different store is what would change the per-hit figure.
-`IronCacheHotState` is that tier and the figures above do not measure it, so this document
-cannot yet say whether attaching one repays its operational cost.
+A tier that is genuinely a different store changes the per-hit figure, and that figure is now
+measured. An IronCache `GET` hit costs **30 us**: about what a bare Postgres round trip costs,
+because both are a loopback round trip, and the difference is what the server does on top of it.
+IronCache does a few microseconds of work; a scoped read does a hundred and forty.
+
+So the two tiers answer the question differently, and the table is the whole argument:
+
+| standing in front of one scoped read (166 us) | hit costs | saves |
+|---|---|---|
+| the Postgres tier (`PgHotState`) | 145 us | 13 per cent |
+| an attached IronCache | 30 us | **82 per cent** |
+
+That is the number every wiring decision above turns on, and it says the seam is worth attaching
+an accelerator to. Standing in front of a resolved tenant config, which is three scoped
+transactions, the same hit saves about 94 per cent.
+
+TWO THINGS IT DOES NOT SAY. The measurement is a protocol round trip on one connection, so it is
+a FLOOR for the `redis`-crate path `ironauth-hot` actually uses, which adds its own encoding and
+connection handling. And it is a HIT: a miss costs this plus the read it failed to avoid plus the
+write-back, so the value of attaching one is a function of hit rate, which is a property of a
+deployment rather than of this software.
 
 ### What that means, use by use
 

@@ -70,7 +70,7 @@ on_ci=false
 # STALE OUTPUTS ARE THIS RUN'S OUTPUTS UNTIL THEY ARE REMOVED. Named files rather than
 # `rm -rf "$OUT"`, because BENCH_OUT is a caller-supplied path and this script should not
 # recursively delete one.
-for stale in unit-costs startup-rss socket-rtt hook-latency; do
+for stale in unit-costs startup-rss socket-rtt accelerator-hop hook-latency; do
     rm -f "$OUT/$stale.log"
 done
 rm -f "$OUT/hook-latency-samples.json" "$OUT/SUMMARY.txt"
@@ -138,6 +138,19 @@ elif [ "$on_ci" = true ]; then
     skip socket-rtt "PG_BIN unset" required
 else
     skip socket-rtt "PG_BIN unset; set it to the postgresql bin directory" optional
+fi
+
+# What a hit against the IronCache tier costs, which is the figure every wiring decision in
+# docs/UNIT-COSTS.md turns on and the one nothing measured until now.
+#
+# OPTIONAL EVERYWHERE, INCLUDING CI, and that is deliberate rather than an omission. IronAuth is
+# complete on Postgres alone; an accelerator is an attachment, and a harness that failed without
+# one would make the optional thing mandatory to run the benchmarks. The skip is named in the
+# summary like every other, so it is visible rather than silent.
+if [ -n "${IRONCACHE_ADDR:-}" ]; then
+    run accelerator-hop scripts/accelerator-hop-bench.sh
+else
+    skip accelerator-hop "IRONCACHE_ADDR unset; start an IronCache and set it to host:port" optional
 fi
 
 # WASM hook latency.
