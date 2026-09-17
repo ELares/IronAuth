@@ -528,6 +528,44 @@ impl RuleSet {
         }
     }
 
+    /// The ACR the first matching rule DEMANDS of this principal, if any.
+    ///
+    /// The third consumer of one rule set (issue #154 criterion 4). The forward-auth check
+    /// renders a step-up as a 401 challenge, and the issuance gate cannot offer a remedy at
+    /// all; this is the surface that can actually run the ceremony, so what it needs from the
+    /// rules is the REQUIREMENT rather than a verdict.
+    ///
+    /// # UNRESOLVED, unlike `decide`
+    ///
+    /// [`RuleSet::decide`] resolves a step-up the request has already met into an `Allow`,
+    /// which is what makes a forward-auth rule terminate. Here that resolution would be the
+    /// wrong shape twice over. The caller composes this floor with the request's `acr_values`,
+    /// the per-client floor, the per-scope policy and the broker overlay through
+    /// [`crate::step_up::AuthnRequirement::merge_stronger`], and it is THAT merged requirement
+    /// the step-up machinery evaluates -- including the `max_age` half, which this engine
+    /// cannot express. Handing it a verdict computed from the ACR alone would discard the age
+    /// question and pre-empt a composition that knows more than this rule set does.
+    ///
+    /// # The same principal filter as `refusal`, for the same reason
+    ///
+    /// An authorization request names no resource path, so a rule constraining one would
+    /// either never fire or fire on emptiness. What can honestly select here is who is asking
+    /// and what they have already reached.
+    #[must_use]
+    pub fn step_up_floor(&self, facts: &RequestFacts) -> Option<String> {
+        self.rules
+            .iter()
+            .filter(|rule| Self::constrains_the_principal(rule))
+            .find(|rule| self.first_failing_criterion(rule, facts).is_none())
+            .and_then(|rule| match &rule.action {
+                Action::StepUp { acr } => Some(acr.clone()),
+                // FIRST MATCH WINS, exactly as everywhere else: an `allow` or a `deny` above a
+                // step-up rule means the step-up rule was not reached, and inventing a floor
+                // from a later rule would make this the one reading where order does not hold.
+                Action::Allow | Action::Deny => None,
+            })
+    }
+
     /// Whether `rule` says anything about the principal, as opposed to the request.
     ///
     /// The match is exhaustive so a new [`Criterion`] cannot be added without deciding which
@@ -577,6 +615,25 @@ impl RuleSet {
         }
     }
 
+    /// The index of the first criterion of `rule` that does not hold, or `None` when it
+    /// matches.
+    ///
+    /// Factored out because [`RuleSet::step_up_floor`] asks the same question and must not
+    /// answer it differently. Two implementations of "does this rule match" is how a consumer
+    /// ends up acting on a rule the engine did not select, and this file already says exactly
+    /// that about its trace.
+    ///
+    /// Captures are per-rule: a fresh map each call, so one rule can never read what another
+    /// rule's pattern bound. It stops at the FIRST failure, preserving the short-circuit that
+    /// `all()` gave us, which is also the right answer for a trace -- the criteria after it
+    /// never ran, so claiming anything about them would be a guess.
+    fn first_failing_criterion(&self, rule: &Rule, facts: &RequestFacts) -> Option<usize> {
+        let mut captures: HashMap<String, String> = HashMap::new();
+        rule.criteria
+            .iter()
+            .position(|criterion| !matches(criterion, facts, &mut captures, &self.acr_order))
+    }
+
     /// The single implementation. `decide`, `explain` and `dry_run` all come through here.
     fn walk<R: Recorder>(&self, facts: &RequestFacts, recorder: &mut R) -> Decision {
         self.walk_filtered(facts, recorder, |_| true)
@@ -605,21 +662,7 @@ impl RuleSet {
                 recorder.not_reached(rule);
                 continue;
             }
-            // Captures are per-rule: a fresh map each time, so one rule can never read what
-            // another rule's pattern bound.
-            let mut captures: HashMap<String, String> = HashMap::new();
-            let mut failed_at: Option<usize> = None;
-            for (index, criterion) in rule.criteria.iter().enumerate() {
-                if !matches(criterion, facts, &mut captures, &self.acr_order) {
-                    failed_at = Some(index);
-                    // Stop at the FIRST failure, preserving the short-circuit that
-                    // `all()` gave us. It is also the right answer for a trace: the
-                    // criteria after it never ran, so claiming anything about them
-                    // would be a guess.
-                    break;
-                }
-            }
-            if let Some(index) = failed_at {
+            if let Some(index) = self.first_failing_criterion(rule, facts) {
                 recorder.failed(rule, index);
                 continue;
             }
@@ -4423,6 +4466,154 @@ mod tests {
             RuleSet::default().decide(&facts()).action,
             Action::Deny,
             "while the resource reading of the same empty set still denies"
+        );
+    }
+
+    /// THE THIRD CONSUMER'S ENTRY POINT, and the three readings of one rule set kept apart.
+    ///
+    /// The same set answers three different questions, and a row here for each, because the
+    /// interesting property is that they DISAGREE on purpose: a forward-auth check resolves a
+    /// met step-up into an admission, an issuance reads only explicit denials, and this returns
+    /// the demand itself so the caller can merge it with four other floors.
+    #[test]
+    fn a_step_up_rule_yields_a_floor_here_and_a_verdict_at_the_other_two_consumers() {
+        let rules = RuleSet::new(vec![rule(
+            "finance-needs-mfa",
+            vec![Criterion::Subject(SubjectCheck::InGroup(
+                "finance".to_owned(),
+            ))],
+            Action::StepUp { acr: mfa() },
+        )]);
+        let in_finance = |acr: &str| RequestFacts {
+            subject: Some("alice".to_owned()),
+            groups: vec!["finance".to_owned()],
+            acr: Some(acr.to_owned()),
+            ..RequestFacts::default()
+        };
+
+        // THE FLOOR IS THE DEMAND, whether or not it is already met. That is the difference
+        // from `decide`, and it is what lets the caller compose it with a `max_age` this
+        // engine cannot express.
+        assert_eq!(
+            rules.step_up_floor(&in_finance(&pwd())).as_deref(),
+            Some(mfa().as_str())
+        );
+        assert_eq!(
+            rules.step_up_floor(&in_finance(&mfa())).as_deref(),
+            Some(mfa().as_str()),
+            "a session that already reached the rung still yields the floor: whether it is \
+             SATISFIED is the step-up machinery's question, not this one's"
+        );
+
+        // ...while `decide` resolves the met one, which is what makes a forward-auth rule
+        // terminate, and `refusal` reads neither as a denial.
+        assert_eq!(rules.decide(&in_finance(&mfa())).action, Action::Allow);
+        assert_eq!(
+            rules.decide(&in_finance(&pwd())).action,
+            Action::StepUp { acr: mfa() }
+        );
+        assert_eq!(rules.refusal(&in_finance(&pwd())), None);
+
+        // Someone outside the group gets no floor at all.
+        assert_eq!(
+            rules.step_up_floor(&RequestFacts {
+                subject: Some("bob".to_owned()),
+                acr: Some(pwd()),
+                ..RequestFacts::default()
+            }),
+            None
+        );
+    }
+
+    /// FIRST MATCH WINS HERE TOO, and a request-shaped rule contributes nothing.
+    ///
+    /// Two ways this reading could quietly stop honouring the list. An `allow` above a step-up
+    /// rule means the step-up rule was not reached, so scanning past it for a floor would make
+    /// this the one reading where order does not hold. And a rule constraining only the request
+    /// cannot select at an authorization endpoint, which names no resource path -- the same
+    /// filter `refusal` applies, for the same reason.
+    #[test]
+    fn the_floor_respects_order_and_ignores_a_rule_that_names_no_principal() {
+        let exempted = RuleSet::new(vec![
+            allow(
+                "alice-is-exempt",
+                vec![Criterion::Subject(SubjectCheck::Is("alice".to_owned()))],
+            ),
+            rule(
+                "everyone-needs-mfa",
+                vec![Criterion::Subject(SubjectCheck::Authenticated)],
+                Action::StepUp { acr: mfa() },
+            ),
+        ]);
+        let at = |subject: &str| RequestFacts {
+            subject: Some(subject.to_owned()),
+            acr: Some(pwd()),
+            ..RequestFacts::default()
+        };
+        assert_eq!(
+            exempted.step_up_floor(&at("alice")),
+            None,
+            "the allow matched first, so the rule below it was never reached"
+        );
+        assert_eq!(
+            exempted.step_up_floor(&at("bob")).as_deref(),
+            Some(mfa().as_str()),
+            "and it still applies to everyone the exemption did not name"
+        );
+
+        let request_shaped = RuleSet::new(vec![rule(
+            "admin-area-needs-mfa",
+            vec![Criterion::PathPrefix("/admin".to_owned())],
+            Action::StepUp { acr: mfa() },
+        )]);
+        assert_eq!(
+            request_shaped.step_up_floor(&at("alice")),
+            None,
+            "an authorization request has no resource path for this to constrain"
+        );
+
+        // THE TWO SHAPES THAT WOULD MATCH ANYWAY, which is where the filter actually bites.
+        //
+        // A mutation proved the row above vacuous: `PathPrefix` fails against an empty path
+        // whether or not the filter runs, so deleting the filter left it green. These do not
+        // fail on their own -- an empty configured host EQUALS the empty host these facts
+        // carry, and a rule with no criteria matches everything -- so without the filter each
+        // would demand an ACR of every authorization request in the deployment.
+        for (name, criteria) in [
+            (
+                "empty-host-matches-everything",
+                vec![Criterion::Host(String::new())],
+            ),
+            ("catch-all", Vec::new()),
+        ] {
+            let blanket = RuleSet::new(vec![rule(
+                name,
+                criteria.clone(),
+                Action::StepUp { acr: mfa() },
+            )]);
+            // The premise: it really does match, so the line below is the filter and not a
+            // criterion that happened to fail.
+            assert_eq!(
+                blanket.decide(&at("alice")).matched.as_deref(),
+                Some(name),
+                "{name} must match these facts for this row to measure anything"
+            );
+            assert_eq!(
+                blanket.step_up_floor(&at("alice")),
+                None,
+                "{name} says nothing about who is asking, so it names no floor here"
+            );
+        }
+
+        // ...and an operator who DOES mean "everybody" says so, which every issuance satisfies.
+        let everybody = RuleSet::new(vec![rule(
+            "everybody-needs-mfa",
+            vec![Criterion::Subject(SubjectCheck::Authenticated)],
+            Action::StepUp { acr: mfa() },
+        )]);
+        assert_eq!(
+            everybody.step_up_floor(&at("alice")).as_deref(),
+            Some(mfa().as_str())
         );
     }
 }
