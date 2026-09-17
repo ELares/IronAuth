@@ -24,10 +24,10 @@ use ironauth_store::{
 /// A native Argon2id PHC verifier for `password`, exactly what the login path
 /// stores for a normally-registered user.
 fn argon2_hash(password: &str) -> String {
-    use argon2::password_hash::{PasswordHasher, SaltString};
-    let salt = SaltString::encode_b64(b"exit-export-salt").expect("salt");
+    use argon2::password_hash::PasswordHasher;
+    let salt = b"exit-export-salt";
     argon2::Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), salt)
         .expect("argon2 hash")
         .to_string()
 }

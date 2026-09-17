@@ -306,7 +306,13 @@ impl ForeignHash {
             Scheme::Bcrypt => bcrypt::verify(password, &self.stored).unwrap_or(false),
             Scheme::Scrypt => phc_verify(&scrypt::Scrypt, password, &self.stored),
             Scheme::Pbkdf2 => phc_verify(&pbkdf2::Pbkdf2, password, &self.stored),
-            Scheme::Argon2 => phc_verify(&argon2::Argon2::default(), password, &self.stored),
+            Scheme::Argon2 => {
+                // Argon2 uses password-hash 0.6; scrypt and PBKDF2 still use 0.5.
+                use argon2::PasswordVerifier as _;
+                argon2::Argon2::default()
+                    .verify_password(password, self.stored.as_str())
+                    .is_ok()
+            }
             Scheme::FirebaseScrypt => match parse_firebase(&self.stored) {
                 Ok(fb) => fb.verify(password),
                 Err(_) => false,
@@ -701,7 +707,7 @@ fn parse_firebase_params(segment: &str) -> Result<(u32, u32), HashError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argon2::password_hash::{PasswordHasher, SaltString};
+    use password_hash::SaltString;
 
     /// A known-answer vector for a scheme: a password and a hash produced by an
     /// external implementation of that scheme.
@@ -760,9 +766,9 @@ mod tests {
 
     #[test]
     fn argon2_round_trip_kat() {
-        let salt = SaltString::encode_b64(b"argon2salt000").expect("salt");
+        use argon2::PasswordHasher;
         let hash = argon2::Argon2::default()
-            .hash_password(b"passw0rd", &salt)
+            .hash_password_with_salt(b"passw0rd", b"argon2salt000")
             .expect("argon2 hash")
             .to_string();
         assert!(hash.starts_with("$argon2id$"), "{hash}");

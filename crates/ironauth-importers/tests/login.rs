@@ -9,7 +9,7 @@
 //! This is the credential-intactness proof for Keycloak PBKDF2, Auth0 bcrypt, the
 //! Firebase modified scrypt, and the LDAP PBKDF2 scheme.
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use ironauth_env::Env;
 use ironauth_import::{ImportContext, RecordOutcome, import_stream};
 use ironauth_importers::firebase::FirebaseHashParams;
@@ -20,9 +20,9 @@ use ironauth_store::{CorrelationId, Scope, UserRecord};
 /// A fresh native Argon2id verifier for `password`, the rehash target the login
 /// handler writes on a successful foreign verify.
 fn argon2_hash(password: &str) -> String {
-    let salt = SaltString::encode_b64(b"argon2-rehash-salt").expect("salt");
+    let salt = b"argon2-rehash-salt";
     argon2::Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), salt)
         .expect("argon2 hash")
         .to_string()
 }

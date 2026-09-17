@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use argon2::PasswordVerifier;
-use argon2::password_hash::{PasswordHash, PasswordHasher, SaltString};
+use argon2::password_hash::{PasswordHasher, phc::PasswordHash};
 use ironauth_env::Env;
 use ironauth_import::{ForeignHash, ImportContext, LineSource, import_lines_into_run};
 use ironauth_store::test_support::TestDatabase;
@@ -90,9 +90,9 @@ fn native_verify(record: &ironauth_store::UserRecord, password: &str) -> bool {
 
 /// A native Argon2id verifier, the rehash target.
 fn argon2_hash(password: &str) -> String {
-    let salt = SaltString::from_b64("c29tZXNhbHQ").expect("salt");
+    let salt = b"somesalt";
     argon2::Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), salt)
         .expect("argon2 hash")
         .to_string()
 }
