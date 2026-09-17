@@ -129,6 +129,18 @@ pub struct Identity {
     pub email: Option<String>,
     /// The display name, if the deployment has one.
     pub name: Option<String>,
+    /// The authentication context class this identity's session ACHIEVED, absent when the
+    /// surface that built it does not resolve one.
+    ///
+    /// Derived from the session's recorded method tokens, never from the request. It rides on
+    /// the identity rather than arriving beside it so that the engine's view of how strongly
+    /// the caller authenticated comes from the SAME resolution as who they are: those two
+    /// disagreeing is how a rule authorises one principal and the upstream is told about
+    /// another, which the subject, groups and roles were already consolidated here to prevent.
+    ///
+    /// [`None`] never satisfies an ACR floor and never resolves a step-up, so a surface that
+    /// has not wired this challenges rather than admits.
+    pub acr: Option<String>,
 }
 
 impl Identity {
@@ -200,14 +212,22 @@ pub struct ForwardAuthOutcome {
 /// Holds the rules privately and exposes no accessor for them. An earlier version had one,
 /// and it handed a caller holding the sanitising surface a reference that skips sanitising.
 pub struct ForwardAuth {
-    rules: RuleSet,
+    rules: std::sync::Arc<RuleSet>,
 }
 
 impl ForwardAuth {
     /// Build a surface over `rules`.
+    ///
+    /// Takes an [`std::sync::Arc`] because issue #154 criterion 4 asks that the SAME rule set
+    /// gate more than this surface. Sharing the compiled set is how "the same" stops being a
+    /// claim about two objects that happen to agree: a boot path that clones the pointer
+    /// cannot hand one consumer a stale set, and a test can assert the identity rather than
+    /// the equality.
     #[must_use]
-    pub fn new(rules: RuleSet) -> Self {
-        Self { rules }
+    pub fn new(rules: impl Into<std::sync::Arc<RuleSet>>) -> Self {
+        Self {
+            rules: rules.into(),
+        }
     }
 
     /// Decide `facts`, and say what the upstream should be told.
@@ -246,6 +266,10 @@ impl ForwardAuth {
         facts.roles = identity
             .map(|identity| identity.roles.clone())
             .unwrap_or_default();
+        // THE SAME OVERWRITE, for the same reason. A caller-supplied acr would answer the
+        // step-up challenge made of it; taking it from the resolved identity means the only
+        // thing that can satisfy a step-up rule is an authentication that happened.
+        facts.acr = identity.and_then(|identity| identity.acr.clone());
 
         let decision = self.rules.decide(&facts);
 
@@ -646,6 +670,7 @@ mod tests {
             roles: Vec::new(),
             email: Some("alice@example.test".to_owned()),
             name: Some("Alice".to_owned()),
+            acr: None,
         }
     }
 
@@ -746,6 +771,7 @@ mod tests {
             roles: vec!["r".to_owned()],
             email: Some("e@example.test".to_owned()),
             name: Some("n".to_owned()),
+            acr: None,
         };
         let emitted = upstream_headers_for(&full);
         assert_eq!(
@@ -789,6 +815,7 @@ mod tests {
                 "newline in the display name",
                 Identity {
                     name: Some("A\nB".to_owned()),
+                    acr: None,
                     ..identity()
                 },
                 IdentityError::ControlCharacter { field: "name" },
@@ -891,6 +918,7 @@ mod tests {
             roles: Vec::new(),
             email: None,
             name: None,
+            acr: None,
         };
 
         let outcome = gated.evaluate(facts, Some(&mallory));
@@ -908,6 +936,7 @@ mod tests {
             roles: Vec::new(),
             email: None,
             name: None,
+            acr: None,
         };
         let outcome = gated.evaluate(request_with("X-Other", "kept"), Some(&engineer));
         assert_eq!(outcome.decision.action, Action::Allow);
@@ -987,6 +1016,7 @@ mod tests {
             roles: Vec::new(),
             email: None,
             name: None,
+            acr: None,
         };
         let headers = upstream_headers_for(&sparse);
         let names: Vec<&str> = headers.iter().map(|(name, _)| name.as_str()).collect();
@@ -1563,6 +1593,72 @@ mod tests {
             via_dialect.headers.get("x-internal").map(String::as_str),
             Some("no, yes"),
             "neither value may be dropped"
+        );
+    }
+
+    /// THE CALLER CANNOT ANSWER THE STEP-UP MADE OF THEM.
+    ///
+    /// `RequestFacts::acr` is a public field on a struct the dialect adapters build, so the
+    /// guarantee that it describes an authentication that HAPPENED lives here, in the same
+    /// overwrite that consolidated the subject, groups and roles. Without it the requirement
+    /// is handed to the party it constrains: a request stating `acr = mfa` satisfies a rule
+    /// demanding mfa, and the step-up is decorative.
+    ///
+    /// Driven through `evaluate`, which is the surface every forward-auth request takes.
+    #[test]
+    fn the_reached_context_is_taken_from_the_identity_and_not_from_the_request() {
+        let mfa = crate::step_up::canonical_step_up_acr("mfa");
+        let pwd = crate::step_up::canonical_step_up_acr("pwd");
+        let gate = ForwardAuth::new(RuleSet::new(vec![rule(
+            "needs-mfa",
+            vec![],
+            Action::StepUp { acr: mfa.clone() },
+        )]));
+
+        let claiming = RequestFacts {
+            method: "GET".to_owned(),
+            host: "app.example.com".to_owned(),
+            path: "/payments".to_owned(),
+            acr: Some(mfa.clone()),
+            ..RequestFacts::default()
+        };
+
+        let weak = Identity {
+            acr: Some(pwd),
+            ..identity()
+        };
+        assert_eq!(
+            gate.evaluate(claiming.clone(), Some(&weak)).decision.action,
+            Action::StepUp { acr: mfa.clone() },
+            "a request asserting the context it was told to reach must still be challenged"
+        );
+
+        assert_eq!(
+            gate.evaluate(claiming.clone(), None).decision.action,
+            Action::StepUp { acr: mfa.clone() },
+            "and an anonymous request asserting it must be challenged too, because the \
+             overwrite clears the field rather than leaving what arrived"
+        );
+
+        let stepped_up = Identity {
+            acr: Some(mfa.clone()),
+            ..identity()
+        };
+        let admitted = gate.evaluate(
+            RequestFacts {
+                acr: None,
+                ..claiming
+            },
+            Some(&stepped_up),
+        );
+        assert_eq!(
+            admitted.decision.action,
+            Action::Allow,
+            "and the identity's context is what admits, even when the request stated none"
+        );
+        assert!(
+            !admitted.upstream_headers.is_empty(),
+            "an admission still forwards the identity"
         );
     }
 }

@@ -1824,7 +1824,10 @@ async fn mint_tokens(
         },
         target,
     )
-    .map_err(|()| TokenError::ServerError)?;
+    .map_err(|refusal| match refusal {
+        tokens::MintRefusal::Policy { .. } => TokenError::AccessDenied,
+        tokens::MintRefusal::Signing => TokenError::ServerError,
+    })?;
     // Carry the device secret out to the response. `tokens::mint` cannot know it: the secret
     // has to exist BEFORE the ID token is signed, because the token carries its hash.
     let mut minted = minted;
@@ -2975,7 +2978,10 @@ async fn mint_refresh_access(
         },
         target,
     )
-    .map_err(|()| TokenError::ServerError)?;
+    .map_err(|refusal| match refusal {
+        tokens::MintRefusal::Policy { .. } => TokenError::AccessDenied,
+        tokens::MintRefusal::Signing => TokenError::ServerError,
+    })?;
     // The budget verdict from the REFRESH hook (issue #98), recorded through the same
     // one function the code exchange records through, so the two grants can never
     // report the same verdict differently.

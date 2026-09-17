@@ -1120,14 +1120,14 @@ jobs:
           kubectl rollout status deployment/postgres --timeout=300s
       # THE THREE ROLES THE SCHEMA GRANTS TO, and then the migration. The chart runs neither.
       #
-      # THE GAP IS WORSE THAN "PODS FAIL READINESS", which is what an earlier version of this
-      # comment claimed. `/readyz` opens a TCP connection to the database address and speaks
-      # no protocol (`readiness.rs`: "no bytes are exchanged and no database protocol is
-      # spoken"), so a `helm install` against a fresh, unmigrated, role-less database brings
-      # every pod up READY. The missing migration is SILENT, not loud, and an operator gets
-      # three replicas Kubernetes reports as healthy.
+      # THE GAP USED TO BE SILENT AND IS NOW LOUD, which is the third thing this comment has
+      # said and the first that matches the code. It first claimed pods would fail readiness;
+      # that was false while `/readyz` was a TCP connect that spoke no protocol, so a `helm
+      # install` against a fresh, unmigrated, role-less database brought every pod up READY.
       #
-      # So this step is not load-bearing for the install: deleting it leaves the job green.
+      # Issue #149 made readiness query the serving pool, so an unmigrated database now answers
+      # 503 `not ready: schema not migrated` and the pods stay out of the Service. This step is
+      # therefore load-bearing again: without it the rollout below never becomes ready.
       # It is here because it is what an operator has to do, and because it proves `ironauth
       # migrate` runs from the FROM-scratch image against a real Postgres.
       - name: Provision roles and migrate
@@ -1221,11 +1221,15 @@ jobs:
           echo "ready=$ready desired=$desired"
           test "$desired" -ge 2
           test "$ready" = "$desired"
-      # READINESS IS NOT EVIDENCE OF WORK. `/readyz` opens a TCP connection to the database
-      # address and speaks no protocol, so all three replicas report Ready whether the schema
-      # is migrated, the credential is right, or the database even exists. An assertion that
-      # stopped at the replica count would pass against
-      # `postgres://wrong:wrong@postgres:5432/does_not_exist`.
+      # READINESS IS STILL NOT EVIDENCE OF WORK, though it is now evidence of a database.
+      # `/readyz` used to open a TCP connection and speak no protocol, so all three replicas
+      # reported Ready whether the schema was migrated, the credential was right, or the
+      # database even existed, and an assertion stopping at the replica count would have passed
+      # against `postgres://wrong:wrong@postgres:5432/does_not_exist`.
+      #
+      # Issue #149 closed that specific hole: readiness runs a query on the serving pool, so
+      # those three cases now fail the probe. What a green probe still does not prove is that
+      # any PROTOCOL SURFACE works, which is what this job is checking.
       #
       # So the job asks the deployment a question only a served request can answer, through
       # the Service, which also proves the Service selects the pods.
@@ -1476,6 +1480,18 @@ jobs:
         run: scripts/invariant-lints.sh
       - name: query audit (no scoped-table SQL outside the repository module)
         run: scripts/query-audit.sh
+      # Issue #155 criterion 3: the exploratory multi-region work's one HARD architectural rule,
+      # enforced BEFORE the code it constrains exists. A lint written afterwards is fitted to
+      # whatever was already written, and the shape it was meant to forbid becomes the shape that
+      # ships. Both rules fail against a planted violation, which the PR adding this demonstrates.
+      - name: no synchronous cross-region call on a request path
+        run: scripts/no-cross-region-sync.sh
+      # Issue #154 criterion 4 asks one rule set to gate every OIDC token issuance. The gate
+      # sits at the mints because the seven grant handlers funnel into three of them, and
+      # "three" is a fact about today's tree: a fourth appearing is silent, because every test
+      # of the other three still passes while the new grant mints tokens nothing refuses.
+      - name: issuance gate (every token mint consults the access rules)
+        run: scripts/issuance-gate.sh
       - name: scoped table registration (every forced-RLS table in the migrations is in the query audit list)
         run: scripts/scoped-table-registration.sh
       - name: audit foreign key claims (no comment asserts an audit_log foreign key that does not exist)
@@ -1568,6 +1584,17 @@ jobs:
       # quietly halved, so the gate also walks the published set independently.
       - name: llms.txt (fresh, and covers the published documentation set)
         run: scripts/llms-txt.sh
+      # Issue #152 criterion 4: the sizing guide's tables are GENERATED from the benchmark's own
+      # output rather than transcribed. This checks the document still matches the measurement it
+      # was generated from, so a hand-edited figure fails here.
+      #
+      # IT DOES NOT RE-MEASURE, deliberately. A gate comparing the published table to a fresh run
+      # on a CI runner would fail on every machine that is not the one the guide was measured on,
+      # and the repair anyone reaches for is widening the tolerance until the check means nothing.
+      # Regenerating from the committed measurement is deterministic, which is what makes this a
+      # gate rather than a coin toss.
+      - name: sizing guide (generated from its measurement, not transcribed)
+        run: scripts/unit-costs-doc.sh --check
       # The Helm chart is rendered and its properties asserted (issue #151). helm lint alone
       # says a chart is well formed, not that it deploys IronAuth correctly: the pod hardening,
       # the accelerators being ABSENT rather than merely disabled, and the config landing in a
@@ -2195,7 +2222,27 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+      # `packages` IS PINNED BECAUSE HALF THE ACTION'S DEFAULT STOPPED RESOLVING.
+      #
+      # The default is `tools platform-tools`. `tools` is the pre-2021 SDK Tools, superseded by
+      # the cmdline-tools this action installs separately, and Google's SDK repository stopped
+      # serving it ON 2026-09-14: this job was green at 19:43 UTC and has failed on every run
+      # since 20:58, with the SAME runner image (ubuntu-24.04 20260907.300.1), the same action,
+      # and the same `cmdline-tools-version: 14742923` on both sides. Nothing here or on the
+      # runner moved; the remote repository did.
+      #
+      # `sdkmanager` answers "Failed to find package 'tools'" and the action then throws, so the
+      # job fails before reaching the build -- a red that says nothing about the sample or the
+      # documented flow it exists to verify.
+      #
+      # `platform-tools` is kept only because it is the action's other default and still
+      # resolves. NOTHING HERE USES IT: `mobile-verify.sh` never calls `adb`, and its
+      # "emulator" is IronAuth's own `dev` server rather than an Android one. The compile SDK
+      # and build tools come from `clients/mobile/android/app/build.gradle.kts`, which is where
+      # they belong -- naming them here would be a second place to keep in step with it.
       - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
       - name: gradle
         uses: gradle/actions/setup-gradle@v6
       - name: build the sample and run the documented flow

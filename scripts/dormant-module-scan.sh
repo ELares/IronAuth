@@ -52,25 +52,24 @@ ironauth-oidc/device_posture
 # Removed rather than reworded. That is the scan doing its job: it noticed the day the
 # reason stopped being true, and it failed at the FIRST step of the lane, so nothing after
 # it ran.
-
-
-# The five-layer request limiter (issue #150 criterion 1, PR 1258). Still callerless: the
-# module exports eleven public items and not one of them is named anywhere outside
-# `layered.rs`.
 #
-# #1260 is closed, so the DECISION that blocked a first caller is made (a configured per-IP
-# limit refuses a request with no address, PR 1283). What remains is the wiring, and #150
-# criteria 1, 4 and 5 all wait on it.
+# `ironauth-quota/layered` went the same way, and it is the more interesting case because the
+# entry had been removed once BEFORE on a false signal and put back. That time the reference the
+# scan counted was a rustdoc line spelling a `layered::` path, so a doc comment had quietly
+# discharged a true claim.
 #
-# THIS ENTRY WAS REMOVED ONCE AND PUT BACK. The scan reported it INERT, meaning it had found
-# a reference and would not flag the module anyway. That reference was a rustdoc line in
-# `lib.rs` spelling `layered::tests::...`, added by PR 1284 two commits earlier, so a doc
-# comment had quietly discharged the claim. Removing the entry on that basis would have made
-# the module unflaggable forever: `refs_for` returns 1, the loop skips it before `allow` is
-# consulted, and the staleness check then refuses any attempt to re-add it. The doc line is
-# reworded to name the test without spelling a path, which restores the count to zero and
-# puts the claim back under this gate.
-ironauth-quota/layered
+# This time the scan counted nine, and SIX OF THEM ARE PRODUCTION: `forward_auth_rules.rs` holds
+# the limiter as a field, exposes it, and returns one from `limiter_from_config`, while
+# `forward_auth_route.rs` builds a request identity and renders the outcome on the check path,
+# which `lib.rs` mounts. The other three are inside `#[cfg(test)]` modules and prove nothing.
+# Six production callers is still six, so the exemption describes nothing and is gone.
+#
+# THE SENTENCE ABOVE ORIGINALLY SAID "nine real ones", which was the very error the paragraph
+# below warns about, one paragraph after warning about it. Both removals look identical in this
+# scan's output, because it reports a COUNT. What separates them is reading what was counted,
+# and that means classifying every hit rather than trusting the total -- including when the
+# total is large enough to feel conclusive.
+
 
 ALLOWLIST
 }

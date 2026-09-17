@@ -35,6 +35,16 @@ use ironauth_jose::{
 };
 use ironauth_oidc::{Argon2Params, hash_password_with, verify_password};
 
+/// Quote a label as a JSON string.
+///
+/// HAND-ROLLED, because this example depends on no JSON crate and should not start: the only
+/// values it emits are its own labels and formatted floats. It escapes the two characters that
+/// can break a JSON string, which is the whole of what these labels can contain.
+fn json_string(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 /// How many samples per measurement. Small because each one is deliberately expensive.
 const SAMPLES: u32 = 10;
 
@@ -71,6 +81,21 @@ fn core_split() -> Option<(u32, u32)> {
 }
 
 /// The CPU this ran on, so the numbers carry their hardware.
+/// How many cores `available_parallelism` reports, or 0 when it cannot say.
+fn available_cores() -> usize {
+    std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get)
+}
+
+/// The core mix as the banner states it, or an empty string on a homogeneous machine.
+///
+/// SHARED WITH THE BANNER rather than reformatted, so the record and the printed table cannot
+/// describe two different machines.
+fn core_mix_description() -> String {
+    core_split().map_or_else(String::new, |(performance, efficiency)| {
+        format!("{performance} performance + {efficiency} efficiency")
+    })
+}
+
 fn cpu_brand() -> String {
     std::process::Command::new("sysctl")
         .args(["-n", "machdep.cpu.brand_string"])
@@ -97,10 +122,7 @@ fn main() {
     // compare against their own hardware and draw a conclusion from.
     println!("unit-costs: host");
     println!("  cpu      {}", cpu_brand());
-    println!(
-        "  cores    {}",
-        std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get)
-    );
+    println!("  cores    {}", available_cores());
     println!(
         "  build    {}",
         if cfg!(debug_assertions) {
@@ -116,8 +138,8 @@ fn main() {
     // "cores" line above counts them as interchangeable. A review found the published
     // per-core figure quoted without that caveat, which an operator would then multiply by
     // the full pool width.
-    if let Some((performance, efficiency)) = core_split() {
-        println!("  core mix {performance} performance + {efficiency} efficiency");
+    if core_split().is_some() {
+        println!("  core mix {}", core_mix_description());
         println!(
             "           NOT PINNED: a per-core figure below is whichever kind the scheduler \
              chose"
@@ -153,6 +175,12 @@ fn main() {
         "parameters (m KiB, t, p)", "hash ms", "verify ms"
     );
     let mut shipped_verify_ms = 0.0_f64;
+    // THE MACHINE-READABLE RECORD, accumulated as the human table is printed so the two cannot
+    // disagree (issue #152 criterion 4). The sizing guide is generated from this rather than
+    // transcribed from the table above it, which is how six of its ten published figures came to
+    // sit outside their own ranges.
+    let mut hashing_json: Vec<String> = Vec::new();
+    let mut mint_json: Vec<String> = Vec::new();
     for (label, params) in cases {
         let (m, t, p) = (
             params.memory_kib(),
@@ -173,8 +201,13 @@ fn main() {
         // and quoting one for both is how a capacity estimate drifts.
         let started = env.clock().monotonic();
         for _ in 0..SAMPLES {
+            // pool-boundary-allow: this MEASURES the raw hasher, which is the one caller
+            // that must not route through the pool -- going through
+            // `OidcState::verify_password` would time the admission queue and the worker
+            // hop as well, and the number this example publishes is the per-verify CPU
+            // cost the pool is then sized against. An example is not a request path.
             assert!(
-                verify_password("correct horse battery staple", &hashed),
+                verify_password("correct horse battery staple", &hashed), // pool-boundary-allow: measures the raw verify
                 "the verify must actually succeed, or this measures a failure path"
             );
         }
@@ -186,6 +219,11 @@ fn main() {
             hash_ms,
             verify_ms
         );
+        hashing_json.push(format!(
+            "    {{\"label\": {}, \"m_kib\": {m}, \"t\": {t}, \"p\": {p}, \
+             \"hash_ms\": {hash_ms:.2}, \"verify_ms\": {verify_ms:.2}}}",
+            json_string(label)
+        ));
         if m == 19_456 && t == 2 && p == 1 {
             shipped_verify_ms = verify_ms;
         }
@@ -231,6 +269,10 @@ fn main() {
             "  {label:<40} {mint_us:>12.1} {:>18}",
             format!("{ratio:.0}x cheaper")
         );
+        mint_json.push(format!(
+            "    {{\"algorithm\": {}, \"mint_us\": {mint_us:.1}, \"vs_verify\": {ratio:.0}}}",
+            json_string(label)
+        ));
     }
 
     // THE JWKS RENDER, because it is the cost an accelerator in front of this document could
@@ -381,6 +423,34 @@ fn main() {
     // nothing else, on one core, with no contention: a real login also reads a user, mints
     // tokens and writes an audit row, and the hashing pool bounds concurrency separately. So
     // this is the ceiling arithmetic alone allows, and a deployment will do less.
+    // THE RECORD THE SIZING GUIDE IS GENERATED FROM (issue #152 criterion 4).
+    //
+    // WRITTEN ONLY WHEN ASKED, via UNIT_COSTS_JSON. The example's default behaviour is a human
+    // table on stdout, which is what `scripts/bench.sh` archives and what a developer runs; a
+    // file appearing in a working tree because a benchmark was run once would be a surprise.
+    if let Ok(path) = std::env::var("UNIT_COSTS_JSON") {
+        let document = format!(
+            "{{\n  \"host\": {{\n    \"cpu\": {},\n    \"cores\": {},\n    \"core_mix\": {},\n\
+             \"samples\": {SAMPLES},\n    \"sign_samples\": {SIGN_SAMPLES},\n\
+             \"sign_warmup\": {SIGN_WARMUP}\n  }},\n  \"password_hashing\": [\n{}\n  ],\n\
+             \"token_mint\": [\n{}\n  ],\n  \"shipped_verify_ms\": {shipped_verify_ms:.2}\n}}\n",
+            json_string(&cpu_brand()),
+            available_cores(),
+            json_string(&core_mix_description()),
+            hashing_json.join(",\n"),
+            mint_json.join(",\n"),
+        );
+        match std::fs::write(&path, document) {
+            Ok(()) => println!("\nunit-costs: measurement written to {path}"),
+            Err(error) => {
+                // LOUD, AND A FAILING EXIT. A generator reading a stale file because this one
+                // could not be written would publish last run's numbers as this run's.
+                eprintln!("unit-costs: cannot write {path}: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if shipped_verify_ms > 0.0 {
         println!(
             "\nunit-costs: at the shipped parameters ONE CORE OF THIS KIND sustains at most \

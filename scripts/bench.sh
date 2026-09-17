@@ -13,14 +13,20 @@
 # executed.
 #
 # That is how docs/UNIT-COSTS.md came to be wrong. Its own "what this does not yet cover"
-# section now records the size of it: re-running the example put six of its ten published
-# figures outside their own ranges.
+# section records the size of it: re-running the example put six of the ten figures in its
+# hand-written tables outside their own ranges. Those tables are GENERATED now, from the
+# measurement this run writes, so that particular drift cannot recur.
 #
-# It is also how a measurement nobody had taken settled an open design question. Reading
-# `issuer.rs` is what establishes WHAT a cache hit in front of the published JWKS document can
-# save, which is a render minus a validation parse and never a database read. Only measuring
-# says whether that is worth a hop, and the render and round-trip benchmarks below are the two
-# sides of it. They came out roughly thirty to one against, which docs/UNIT-COSTS.md records.
+# It is also how a measurement nobody had taken settled an open design question, and then how a
+# better one reversed half of the answer. Reading `issuer.rs` establishes WHAT a cache hit in
+# front of the published JWKS document can save, which is a render minus a validation parse and
+# never a database read; measured, that is about 0.6 us against a 20 us hop, so the JWKS
+# accelerator stays unwired. The first version of the round-trip benchmark then generalised that
+# to every use by measuring an autocommit lookup, and a review found no read in this codebase is
+# one: a scoped read pays six round trips around a query under row-level security and measures
+# 166 us, which a hit is very much worth replacing. How much a hit saves then depends on what is
+# at the other end of the hop and on how many scoped reads one cached answer fronts, which
+# docs/UNIT-COSTS.md works through. All the figures are below.
 #
 # # Every benchmark reports RAN, SKIPPED, or FAILED, and a SKIP IS NOT SILENT
 #
@@ -31,7 +37,10 @@
 # rows are invisible in the output rather than named in it.
 #
 # So: outputs are cleared before the run, every benchmark lands in the summary with its
-# status, and ON CI THE DOC-BACKED BENCHMARKS MAY NOT SKIP. That last rule is decided here,
+# status, and ON CI THE DOC-BACKED BENCHMARKS MAY NOT SKIP, with one stated exception below:
+# the accelerator hop needs an IronCache, which is optional infrastructure, and requiring it
+# would make an optional attachment mandatory to run the benchmarks. That skip is named in the
+# summary like every other, so it is visible rather than silent. That rule is decided here,
 # from $GITHUB_ACTIONS, rather than passed in by the workflow. A required-benchmark list
 # supplied by the caller is a list the caller can forget, which puts the silent skip back.
 #
@@ -65,9 +74,10 @@ on_ci=false
 # STALE OUTPUTS ARE THIS RUN'S OUTPUTS UNTIL THEY ARE REMOVED. Named files rather than
 # `rm -rf "$OUT"`, because BENCH_OUT is a caller-supplied path and this script should not
 # recursively delete one.
-for stale in unit-costs startup-rss socket-rtt hook-latency; do
+for stale in unit-costs startup-rss socket-rtt accelerator-hop hook-latency; do
     rm -f "$OUT/$stale.log"
 done
+rm -f "$OUT/unit-costs-measurement.json"
 rm -f "$OUT/hook-latency-samples.json" "$OUT/SUMMARY.txt"
 
 summary=""
@@ -111,7 +121,12 @@ skip() {
 
 # Per-operation unit costs: password hashing at each parameter set, and token mint. Backs
 # docs/UNIT-COSTS.md. Needs no database.
-run unit-costs cargo run --release -q -p ironauth-oidc --example unit_costs
+# UNIT_COSTS_JSON so the run leaves a machine-readable record beside its human output. The
+# sizing guide is generated from that record (issue #152 criterion 4), and the release lane
+# regenerates the document from THIS file rather than measuring a second time, so the archived
+# results and the archived guide describe one run.
+run unit-costs env UNIT_COSTS_JSON="$OUT/unit-costs-measurement.json" \
+    cargo run --release -q -p ironauth-oidc --example unit_costs
 
 # Startup time and idle RSS, backing docs/PERFORMANCE.md. The script initdb's and starts its
 # own throwaway cluster from $PG_BIN, so this needs a Postgres bin directory and no service.
@@ -123,15 +138,29 @@ else
     skip startup-rss "PG_BIN unset; set it to the postgresql bin directory" optional
 fi
 
-# The cost of one socket round trip, which is what decides whether a cache in front of an
-# operation pays for itself. Backs the accelerator section of docs/UNIT-COSTS.md. Needs a
-# Postgres bin directory for pgbench, and starts its own throwaway cluster.
+# What asking the database costs: a bare round trip, and a real indexed single-row lookup. The
+# DIFFERENCE between them is the query work, and that is what decides whether a cache in front
+# of such a read can save anything, since a hit pays a round trip of its own. Backs the
+# accelerator section of docs/UNIT-COSTS.md. Starts its own throwaway cluster from $PG_BIN.
 if [ -n "${PG_BIN:-}" ]; then
     run socket-rtt scripts/socket-rtt-bench.sh
 elif [ "$on_ci" = true ]; then
     skip socket-rtt "PG_BIN unset" required
 else
     skip socket-rtt "PG_BIN unset; set it to the postgresql bin directory" optional
+fi
+
+# What a hit against the IronCache tier costs, which is the figure every wiring decision in
+# docs/UNIT-COSTS.md turns on and the one nothing measured until now.
+#
+# OPTIONAL EVERYWHERE, INCLUDING CI, and that is deliberate rather than an omission. IronAuth is
+# complete on Postgres alone; an accelerator is an attachment, and a harness that failed without
+# one would make the optional thing mandatory to run the benchmarks. The skip is named in the
+# summary like every other, so it is visible rather than silent.
+if [ -n "${IRONCACHE_ADDR:-}" ]; then
+    run accelerator-hop scripts/accelerator-hop-bench.sh
+else
+    skip accelerator-hop "IRONCACHE_ADDR unset; start an IronCache and set it to host:port" optional
 fi
 
 # WASM hook latency.

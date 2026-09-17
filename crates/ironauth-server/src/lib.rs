@@ -33,7 +33,7 @@ mod logwriter;
 pub mod metrics;
 mod observe;
 pub mod proxy;
-mod readiness;
+pub mod readiness;
 mod redact;
 mod routes;
 pub mod telemetry;
@@ -56,7 +56,10 @@ pub use error::ServerError;
 pub use proxy::{
     ClientContext, ClientResolution, FailClosedReason, ForwardDecision, ProxyPolicy, SiteContext,
 };
-pub use readiness::{DegradedTier, OptionalComponent, Readiness, ReadinessProbe};
+pub use readiness::{
+    DatabaseHealth, DatabaseProbe, DegradedTier, OptionalComponent, ProbeDepth, Readiness,
+    ReadinessProbe,
+};
 pub use redact::Redacted;
 
 /// Cheaply cloneable state shared by every handler on both planes.
@@ -116,6 +119,21 @@ impl Server {
             management_extension: None,
             public_extension: None,
         })
+    }
+
+    /// Give readiness a real database check (issue #149).
+    ///
+    /// Without one, `/readyz` opens a socket to the configured address and calls that ready,
+    /// which cannot tell a serving database from one that refuses every credential or was never
+    /// migrated. The probe's own docs carry the rest; the binary always calls this.
+    ///
+    /// Rebuilds the readiness handle rather than mutating it, because it is shared by `Arc` with
+    /// the router state and a probe installed after the router was built would not be seen.
+    #[must_use]
+    pub fn with_database_probe(mut self, probe: Arc<dyn readiness::DatabaseProbe>) -> Self {
+        let current = Arc::clone(&self.readiness);
+        self.readiness = Arc::new(current.as_ref().clone().with_database_probe(probe));
+        self
     }
 
     /// Mount an additional router on the PUBLIC data plane.

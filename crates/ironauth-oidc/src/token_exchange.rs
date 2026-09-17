@@ -503,7 +503,10 @@ async fn issue(
         },
         &target,
     )
-    .map_err(|()| TokenError::ServerError)?;
+    .map_err(|refusal| match refusal {
+        crate::tokens::MintRefusal::Policy { .. } => TokenError::AccessDenied,
+        crate::tokens::MintRefusal::Signing => TokenError::ServerError,
+    })?;
 
     let grant_id = GrantId::generate(state.env(), &scope);
     let access = match &minted {

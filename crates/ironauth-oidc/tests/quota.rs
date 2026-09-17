@@ -36,7 +36,7 @@ use common::Harness;
 use ironauth_config::{OidcConfig, QuotaConfig, ScopeQuotaConfig};
 use ironauth_env::Env;
 use ironauth_oidc::ClientAuthMethod;
-use ironauth_quota::{BLOCK_SIGNAL_COOKIE, BLOCK_SIGNAL_HEADER};
+use ironauth_quota::BLOCK_SIGNAL_HEADER;
 use ironauth_store::{ClientId, EnvironmentId, Scope, TenantId};
 
 /// A quota config that enforces ONLY the request-rate dimension, with an
@@ -143,9 +143,20 @@ async fn at_quota_returns_429_with_ratelimit_headers_and_block_signal() {
         "the over-quota request must be short-circuited with a 429"
     );
     // The structured and legacy rate-limit headers.
-    assert_eq!(
-        headers.get("ratelimit-policy").map(|v| v.to_str().unwrap()),
-        Some("3;w=0"),
+    //
+    // NO `RateLimit-Policy`, AND THIS ASSERTION USED TO DEMAND ONE. It asserted `3;w=0`, which
+    // is exactly the value #1267 stopped emitting: this fixture sets `requests_per_second: 0`
+    // for a deterministic burst budget, nothing refills, and `N;w=0` advertises a rate that
+    // does not exist -- a client reading it would wait zero seconds and retry into the same
+    // refusal for ever.
+    //
+    // So the test was pinning the defect that PR removed, and it has failed on `main` ever
+    // since, visible only when it was the first binary to fail. The positive direction is
+    // covered where a window exists, in `ironauth-quota`'s own tests over a refilling limit.
+    assert!(
+        !headers.contains_key("ratelimit-policy"),
+        "a budget that never refills has no policy window, and `3;w=0` would advertise one: \
+         {headers:?}"
     );
     assert!(
         headers.contains_key("ratelimit"),
@@ -163,25 +174,41 @@ async fn at_quota_returns_429_with_ratelimit_headers_and_block_signal() {
             .map(|v| v.to_str().unwrap()),
         Some("0"),
     );
+    // AND NO `Retry-After`, for the same reason and by the same correction. It is present only
+    // on a denial the client can actually WAIT OUT; this bucket never refills, so no amount of
+    // waiting produces a token and publishing a wait invites a client to retry for ever at the
+    // cadence the server itself advertised.
+    //
+    // The block signal below is what this refusal does carry, and it says the right thing: a
+    // permanent block is exactly the one an edge most wants to offload.
     assert!(
-        headers.contains_key(header::RETRY_AFTER),
-        "Retry-After present"
+        !headers.contains_key(header::RETRY_AFTER),
+        "a refusal no wait can clear must not publish one: {headers:?}"
     );
-    // The machine-readable block signal (header) plus the WAF cookie.
+    // THE BLOCK SIGNAL, WHICH IS PRESENT HERE PRECISELY BECAUSE THE BLOCK IS PERMANENT. It
+    // rides every refusal "whether or not it can be waited out", and its own documentation says
+    // a permanent block is the one an edge most wants to offload.
     assert_eq!(
         headers
             .get(BLOCK_SIGNAL_HEADER)
             .map(|v| v.to_str().unwrap()),
         Some("1"),
     );
-    let cookie = headers
-        .get(header::SET_COOKIE)
-        .expect("block cookie")
-        .to_str()
-        .expect("ascii cookie");
+
+    // AND THE COOKIE HALF OF THAT SIGNAL IS ABSENT, which this asserted was present.
+    //
+    // `block_set_cookie` returns `None` without a retry-after, because the cookie's `Max-Age`
+    // is the wait: the marker is meant to clear when the block lifts. A block that never lifts
+    // has no such number, so no cookie is minted.
+    //
+    // WORTH SAYING PLAINLY RATHER THAN BLESSING: that leaves the two halves of one signal
+    // disagreeing about the case the header singles out as most valuable. A cookie-gating WAF
+    // gets nothing for exactly the refusal a header-reading one is told matters most. Making it
+    // a session cookie for a permanent block is a wire-contract change and belongs in a change
+    // that says so, not in a test correction; the test records the behaviour as it is.
     assert!(
-        cookie.contains(BLOCK_SIGNAL_COOKIE),
-        "the block-signal cookie is set for a cookie-gating WAF: {cookie}"
+        !headers.contains_key(header::SET_COOKIE),
+        "the block cookie's Max-Age is the wait, and this refusal has none: {headers:?}"
     );
 }
 

@@ -350,9 +350,32 @@ pub enum TokenError {
     /// issue #24): the server has increased the enforced interval for this device
     /// code, and the device must slow its polling.
     SlowDown,
-    /// The device-authorization request was denied (RFC 8628 section 3.5, issue #24):
-    /// the human explicitly rejected it at the verification page, or the user code was
-    /// invalidated after exhausting its failed-match budget.
+    /// The request was denied.
+    ///
+    /// Two sources, and they are the same answer to the client: the human explicitly rejected
+    /// a device authorization at the verification page (issue #24, or the user code was
+    /// invalidated after exhausting its failed-match budget), or an operator's access rule
+    /// refused the issuance (issue #154 criterion 4).
+    ///
+    /// # This EXTENDS RFC 6749 section 5.2, which is a wire decision and not a citation
+    ///
+    /// An earlier version of this comment cited section 5.2 as the authority. It is not:
+    /// section 5.2 enumerates a CLOSED list for the token endpoint -- `invalid_request`,
+    /// `invalid_client`, `invalid_grant`, `unauthorized_client`, `unsupported_grant_type`,
+    /// `invalid_scope` -- and `access_denied` is not in it. The code is defined in section
+    /// 4.1.2.1 for the AUTHORIZATION endpoint, and reaches the token endpoint only because
+    /// RFC 8628 section 3.5 and CIBA put it there for their own grants.
+    ///
+    /// Emitting it for the other grants is therefore an extension, taken deliberately. The
+    /// alternative is `invalid_grant`, and that would be false: the grant is valid and the
+    /// server understood it, which is the whole difference an operator's refusal has from a
+    /// malformed request. A strict client switching on section 5.2's list will not recognise
+    /// this and will fall to its default branch, which is the cost; the precedent for the same
+    /// code at the same endpoint already exists two grants over.
+    ///
+    /// The rule NAME is deliberately not on the wire. A client learning which rule refused it
+    /// learns the shape of a policy it is not party to; the name goes to the server log, which
+    /// is where the operator who wrote it is looking.
     AccessDenied,
     /// The device code has expired (RFC 8628 section 3.5, issue #24): its TTL passed
     /// before the flow was approved and redeemed. The device must start a new flow.
@@ -462,7 +485,13 @@ impl TokenError {
                 "the authorization request is still pending user approval"
             }
             TokenError::SlowDown => "polling too frequently; increase the polling interval",
-            TokenError::AccessDenied => "the authorization request was denied",
+            // NOT "the authorization request was denied", which this said while the variant
+            // belonged to the device flow alone. Four of the seven grants that can now reach it
+            // -- client-credentials, JWT-bearer, token-exchange and refresh -- make no
+            // authorization request at all, so that description sent an operator looking for
+            // something that never happened. The same file records fixing exactly this for
+            // `InvalidGrant`.
+            TokenError::AccessDenied => "the request was denied",
             // Also the CIBA answer for a request past its TTL, so it does not say
             // "device" and does not tell a backchannel client to start a device flow.
             TokenError::ExpiredToken => "the authorization request has expired; start a new one",

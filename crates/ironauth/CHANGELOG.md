@@ -24,6 +24,46 @@ range per docs/RELEASING.md.
   buttons display their localized captions and field errors are associated with
   their controls for assistive technology.
 
+- `ironauth storage rekey` REFUSES a change of master key MATERIAL unless the operator passes
+  `--i-will-rebuild-lookups` (issue #153).
+
+  It rewraps keys and rebuilds no lookups. Every blind index in the store is derived from the
+  master secret rather than through a KEK, fifteen of them in all: login handles and external
+  ids, trait logins, flexible and routing identifiers, recovery codes, invitations, organisation
+  contact emails, email and SMS factor recipients, message recipients, and the risk-signal, abuse,
+  SSF-stream and migration-record subjects. After a rotation to new material they are all computed
+  under a key nothing derives any more.
+
+  The failure had no loud symptom: `by_identifier` misses and returns `Ok(None)`, which is
+  indistinguishable from an unknown user, so every existing account stops resolving at login. And
+  `users_identifier_bidx_unique` is a UNIQUE constraint over the index, so re-registering the same
+  address computes a different tag, passes the constraint, and creates a SECOND live user while
+  the first, with its grants and enrolments, becomes unreachable.
+
+  Rotating the NAME while keeping the secret is safe and needs no flag: it moves rows to a new
+  generation and leaves every lookup intact. The configuration docs and `docs/KEK-RECOVERY.md`
+  now say so; before this they pointed at a material rotation with no caveat, which is the
+  procedure the command refuses.
+
+- `ironauth storage rekey` now names its master keys as `ID:env:VAR` or `ID:file:PATH` (issue
+  #153), resolving and deriving the secret exactly as the server does from `database.master_key`.
+
+  BREAKING: the previous `ID:HEX` form is removed. It could not name any real key and could
+  destroy every one. No deployment holds a raw-byte master, because the only production
+  construction derives from a passphrase and the config has no raw-bytes field, so
+  `--from-master-key ID:HEX` never matched a live row. And `--to-master-key ID:HEX` would rewrap
+  every live KEK under a key no server can reconstruct, since HMAC is not invertible: every
+  tenant's sealed PII unopenable from the next restart, reported as a completed rotation with
+  exit code 0.
+
+  The secret is named rather than passed, so the platform master key does not appear in `argv`,
+  and it resolves through the same `Secret` the config uses. That last part is load bearing: the
+  `file` form trims one trailing newline, so a reader that kept it would derive a different key
+  from the same file the server reads.
+
+  The master key id comes from `database.master_key_id`, so the two sides of a rotation can be
+  named apart.
+
 - **A configured `server.public_url` with no dot in its host stopped ALL mail (issue #111).**
   `sender_domain` took the host unvalidated, and `message_id` refuses a domain without a dot, so
   `compose` returned `mime_failed` for every message. `deploy/ironauth.toml` ships

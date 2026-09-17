@@ -468,9 +468,53 @@ async fn the_listing_reports_the_health_a_operator_needs_to_act_on() {
     let (status, _, _) = h.post(&path, "k-health", &body).await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let (status, _, listed) = h.get(&path).await;
-    assert_eq!(status, StatusCode::OK);
-    let listed: serde_json::Value = serde_json::from_str(&listed).expect("json");
+    // POLLED, BECAUSE THE FEED HEAD IS NOT A FUNCTION OF WHAT THIS TEST WROTE.
+    //
+    // `newest_sequence` applies the feed's own visibility watermark: a row counts only once its
+    // `xmin` is below `pg_snapshot_xmin(pg_current_snapshot())`, the oldest transaction still
+    // running ANYWHERE in the cluster. So the head this test needs is withheld for as long as
+    // some unrelated transaction that started earlier is still open.
+    //
+    // THE HOLDER IS THIS BINARY, and an earlier version of this comment blamed "an unrelated
+    // crate's test" on a shared CI cluster. That cannot happen: `cargo test --workspace` runs
+    // test binaries one after another, which `ci.yml` itself relies on when it reclaims the
+    // previous binary's databases. The holders are the SIBLING tests here -- eighteen of them
+    // on their own threads, each `Harness::start` applying the migration chain one write
+    // transaction per migration -- so a qualifying open write is almost always present.
+    //
+    // Which also means the single-shot read was a lottery EVERYWHERE, not a CI artifact. The
+    // same stall is already measured in this crate at about one run in three locally
+    // (`scim_push_worker.rs`), and `events_cursor_ordering.rs` records its own suite holding
+    // the watermark down continuously. CI is only where this one lost.
+    //
+    // The premise "the tenant creation above wrote audit events, so the head is a real number"
+    // is true about the WRITE and false about when it becomes visible.
+    //
+    // A bounded wait is the honest shape, and it is the same one `events_cursor_ordering.rs`
+    // uses for the same reason. It does not paper over a defect: absent is a legitimate answer
+    // the caller must handle, and the last read is asserted either way so a permanently stalled
+    // watermark still fails rather than passing quietly.
+    //
+    // REPRODUCED, rather than reasoned about: with a transaction held open in another session
+    // for four seconds -- standing in for the sibling this suite supplies on its own -- a
+    // single-shot read fails with exactly the CI message and this loop passes.
+    //
+    // And the FIRST attempt at that reproduction proved nothing, which is the part worth
+    // writing down. It held open `BEGIN; SELECT 1;` and both versions passed. A read-only
+    // transaction is assigned no transaction id, so it is not among the running transactions
+    // `pg_snapshot_xmin` is computed from and it holds the watermark down not at all. The
+    // blocker has to WRITE. Anyone re-running this probe needs that, or they will conclude the
+    // stall is not real.
+    let mut listed = serde_json::Value::Null;
+    for _ in 0..100 {
+        let (status, _, body) = h.get(&path).await;
+        assert_eq!(status, StatusCode::OK);
+        listed = serde_json::from_str(&body).expect("json");
+        if listed["feed_head_sequence"].is_i64() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let connection = &listed["items"][0];
 
     // A CONNECTION THAT HAS NEVER RUN says so by OMITTING the fields rather than reporting zero.
@@ -500,13 +544,14 @@ async fn the_listing_reports_the_health_a_operator_needs_to_act_on() {
         listed["items"].as_array().expect("items").len() == 1,
         "{listed}"
     );
-    // The tenant creation above wrote audit events, so the feed is not empty and the head is a
-    // real number. Asserting it is PRESENT rather than a particular value: the point is that a
-    // caller has both halves of the subtraction, not what this environment's sequence happens to
-    // be.
+    // The tenant creation above wrote audit events, so the feed is not empty and the head
+    // becomes a real number once the cluster's watermark passes those rows. Asserting it is
+    // PRESENT rather than a particular value: the point is that a caller has both halves of the
+    // subtraction, not what this environment's sequence happens to be.
     assert!(
         listed["feed_head_sequence"].is_i64(),
-        "the listing did not report the feed head, so lag cannot be computed: {listed}"
+        "the listing did not report the feed head within the wait, so lag cannot be \
+         computed: {listed}"
     );
 }
 

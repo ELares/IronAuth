@@ -72,6 +72,157 @@ impl Store {
         crate::preflight::run(&self.pool, chain).await
     }
 
+    /// Close this handle's pool, so a caller can observe what a dead database looks like.
+    ///
+    /// TEST-ONLY, behind the `testing` feature, because nothing in production should close a
+    /// pool out from under the requests using it. It exists so a readiness test can assert the
+    /// UNREACHABLE arm against the real probe rather than against a fixture: without a way to
+    /// reach that arm, a probe hard-wired to report the schema state would pass every other
+    /// test, and the arm that decides whether a fleet leaves rotation would be the one nothing
+    /// covers.
+    #[cfg(feature = "testing")]
+    pub async fn close_pool_for_test(&self) {
+        self.pool.close().await;
+    }
+
+    /// Answer a readiness probe on a POOLED connection (issue #149).
+    ///
+    /// `/readyz` used to open a bare TCP socket to the configured address and call that ready.
+    /// A socket connect cannot tell a serving database from one that refuses every credential,
+    /// has no such database, hands the role none of the grants migration 0001 issues, or was
+    /// never migrated. All of those answered `ready`, so `readyReplicas == desired` could hold
+    /// against a pod that cannot complete a single query.
+    ///
+    /// # Why the pool and not a fresh connection
+    ///
+    /// A probe that dials its own connection answers whether a NEW connection can be made,
+    /// which is not the question. The pool is what requests are served from; it can be
+    /// exhausted, or holding handles to a server that has since restarted, while a fresh dial
+    /// succeeds. Asking through the pool asks what a request would ask.
+    ///
+    /// # Two states that look like errors and are not
+    ///
+    /// A MISSING LEDGER and a LEDGER THIS ROLE CANNOT READ both mean "not migrated to this
+    /// build", not "the database is broken", and both are reported as such. The second is the
+    /// upgrade case: the grant that lets the serving role read the ledger ships as migration
+    /// 0230, so a deployment that has not applied it yet is one whose schema is behind.
+    ///
+    /// # What "schema ready" means here
+    ///
+    /// EVERY UNAPPLIED MIGRATION IS A `Phase::Contract` ONE. That is the rule, and the reason it
+    /// is not the simpler "every version in the chain is present" is that the simpler one
+    /// disagrees with the runner about when a database is finished.
+    ///
+    /// `ContractPolicy::Deferred` is the DEFAULT: the runner stops before the first pending
+    /// contract migration and applies nothing after it, because a removal is a one-way door an
+    /// operator opens on purpose rather than by restarting a pod. In its own words, until they
+    /// do, "a deployment sits in a state where the new binary and the old one can BOTH serve,
+    /// which is what makes a minor release rollback-safe". A readiness check that called that
+    /// state unready would 503 every replica of a correctly upgraded deployment.
+    ///
+    /// THIS IS ALIGNMENT, NOT A BUG FIX, and the distinction is worth keeping. The runner defers
+    /// only when everything pending after the contract migration is ALSO contract
+    /// (`pending_after_contract_is_all_removal`), and today's chain has non-contract versions
+    /// after its last contract one, so no deployment can currently reach the deferred state. The
+    /// two predicates still disagree, nothing guards the disagreement, and appending a trailing
+    /// contract migration would arm it. Matching the runner costs one phase comparison.
+    ///
+    /// An unapplied EXPAND or MIGRATE version is not ready, and deliberately NOT "the highest
+    /// applied version is high enough": a gap in the middle is what a rollout that failed
+    /// midway leaves behind, and the runner itself refuses to proceed from it.
+    ///
+    /// A database RUNNING AHEAD of this build is ready. During a rolling upgrade the new
+    /// version migrates first and old pods keep serving; if this reported not-ready for the
+    /// extra versions, every old replica would leave rotation the moment the migration landed,
+    /// which is an outage caused by the readiness check rather than detected by it.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::StoreError::Database`] if the connection or the query fails, which is the
+    /// caller's signal that the database is unreachable rather than merely unmigrated.
+    pub async fn probe_readiness(&self) -> Result<SchemaReadiness, crate::StoreError> {
+        // ONE ROUND TRIP, and it is also the liveness query: reading the ledger proves a
+        // pooled connection can execute and that this role can see the table.
+        //
+        // TWO ERROR CODES ARE ANSWERS RATHER THAN FAILURES, and both were found by running this
+        // against a real database as the real serving role.
+        //
+        // The first draft guarded the read with `to_regclass('_schema_migrations') IS NOT NULL`
+        // in the same statement and claimed that distinguished an absent ledger "without a
+        // failed query". It does not: Postgres parses the whole statement before evaluating any
+        // of it, so the reference to a missing table raises 42P01 at parse time and the guard
+        // never runs. The guard is gone; the code is checked instead.
+        // A BUSY POOL IS A SERVING POOL, AND MUST NOT READ AS A BROKEN DATABASE.
+        //
+        // This is the failure a readiness probe causes rather than detects. The pool is fixed at
+        // 16 connections and nothing caps in-flight work below it, so a load spike, a slow
+        // query, or a failover can leave every connection busy for longer than the probe's
+        // timeout. Waiting on the queue would then time out, report the database unreachable,
+        // and take EVERY replica out of its Service at once -- while the database was fine and
+        // the pod was merely working. Removing the endpoints does not shed the load, so the
+        // fleet flaps: drain, come back, get re-loaded, drop out again.
+        //
+        // So the probe NEVER QUEUES. `try_acquire` takes a connection if one is free and
+        // returns immediately if none is, and a saturated pool is itself evidence that
+        // connections exist and queries are running on them.
+        //
+        // THE ERROR DIRECTION IS CHOSEN DELIBERATELY. This can report serving for a pool whose
+        // connections are all hung against a black-holed database. That failure is bounded by
+        // the liveness probe and by request timeouts, both of which act on the same symptom.
+        // The opposite error takes down a healthy fleet under load and amplifies the overload
+        // that caused it. Between a check that misses a hang and a check that manufactures an
+        // outage, the second is worse.
+        let mut connection = match self.pool.try_acquire() {
+            Some(connection) => connection,
+            // SATURATED BUT ALIVE. Connections exist and every one is in use, which is itself
+            // evidence that the database is answering. Report serving without queueing.
+            None if !self.pool.is_closed() && self.pool.size() > 0 => {
+                return Ok(SchemaReadiness::Serving);
+            }
+            // NO POOLED CONNECTION AT ALL, or a closed pool. `try_acquire` returns `None` for
+            // both, and a check that stopped at it would report a DEAD pool as serving, which a
+            // test of exactly that case caught. So this arm asks properly and lets the error
+            // surface: a closed pool, a refused connection, wrong credentials and a missing
+            // database all land here. The caller bounds this call, so it cannot hang.
+            None => self.pool.acquire().await?,
+        };
+        let applied: Vec<i64> = match sqlx::query_scalar(
+            "SELECT COALESCE(ARRAY(SELECT version FROM _schema_migrations), '{}'::bigint[])",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        {
+            Ok(applied) => applied,
+            Err(sqlx::Error::Database(error))
+                // NO LEDGER AT ALL: an empty database, the ordinary state before the first
+                // migration runs.
+                if error.code().as_deref() == Some(UNDEFINED_TABLE)
+                    // A LEDGER THIS ROLE CANNOT READ. The ledger is the migration runner's own
+                    // bookkeeping, created outside every GRANT the chain issues, so
+                    // `ironauth_app` could not read it until migration 0230 said so. A
+                    // deployment that has not applied 0230 is exactly one whose schema is not at
+                    // this build's version. Treating it as an error would report "database
+                    // unreachable" on a healthy database mid-upgrade and pull every replica at
+                    // once, which is a worse failure than the socket check this replaced.
+                    || error.code().as_deref() == Some(INSUFFICIENT_PRIVILEGE) =>
+            {
+                return Ok(SchemaReadiness::NotMigrated);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // A PENDING CONTRACT MIGRATION IS NOT A REASON TO LEAVE ROTATION. See this method's
+        // doc: deferring them is the default and the rollback-safe state, so the only unapplied
+        // versions that mean "not ready" are the ones the runner would have applied.
+        let blocking = crate::migrate::chain().into_iter().any(|migration| {
+            !applied.contains(&migration.version) && migration.phase != crate::Phase::Contract
+        });
+        Ok(if blocking {
+            SchemaReadiness::NotMigrated
+        } else {
+            SchemaReadiness::Serving
+        })
+    }
+
     /// Whether the connected role can see every row, or is itself subject to row-level
     /// security (issue #148).
     ///
@@ -106,6 +257,13 @@ impl Store {
     ///
     /// The pool stays private, as everywhere else on this type. See [`crate::rekey`] for what
     /// the operation is, why it resumes without a cursor, and why it is offline.
+    ///
+    /// # It rewraps keys and rebuilds no LOOKUPS
+    ///
+    /// A rotation to a different SECRET leaves all fifteen master-derived blind indexes computed
+    /// under a key nothing derives any more, so identifier lookups silently stop matching. The
+    /// `ironauth storage rekey` command refuses that unless the operator acknowledges it; this
+    /// method does not, so a caller driving the rewrap directly owns that decision.
     ///
     /// # Errors
     ///
@@ -387,4 +545,19 @@ impl Store {
     pub fn management(&self) -> ManagementStore<'_> {
         ManagementStore::new(self)
     }
+}
+
+/// Postgres SQLSTATE for `permission denied`, which readiness reads as an unapplied schema.
+const INSUFFICIENT_PRIVILEGE: &str = "42501";
+
+/// Postgres SQLSTATE for `undefined table`, which readiness reads as a database never migrated.
+const UNDEFINED_TABLE: &str = "42P01";
+
+/// Whether a database's schema is one this build can serve (issue #149).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaReadiness {
+    /// Every migration this build knows about is applied.
+    Serving,
+    /// At least one is not, or the ledger does not exist yet.
+    NotMigrated,
 }

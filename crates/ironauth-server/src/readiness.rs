@@ -2,15 +2,49 @@
 
 //! Readiness probing for `/readyz`.
 //!
-//! Provisional until issue #7 (persistence substrate) lands: with no database
-//! driver in the graph yet, readiness is a TCP reachability check against the
-//! configured Postgres address. It answers "could this instance plausibly
-//! serve" (listeners up, database socket reachable) without importing a driver
-//! or opening a real connection. When #7 lands, this is replaced by a pool
-//! health check; the endpoint contract (200 ready, 503 not) stays.
+//! # A TCP connect is not readiness, and this said so for as long as it was one
 //!
-//! The probe is bounded by a fixed monotonic deadline via `tokio::time`, so a
-//! black-holed database address never hangs the probe.
+//! This module used to open a bare `TcpStream` to the configured Postgres
+//! address and call that ready: "no bytes are exchanged and no database
+//! protocol is spoken". It carried a note saying that was provisional until
+//! issue #7 (the persistence substrate) landed, at which point it would be
+//! "replaced by a pool health check".
+//!
+//! Issue #7 landed and closed. The replacement did not happen, and the note
+//! kept the gap looking scheduled instead of open. What a socket connect
+//! cannot distinguish is a long list, and every entry on it is a deployment an
+//! orchestrator would have called healthy: wrong credentials, a database that
+//! does not exist, a schema nobody migrated, a Postgres still in recovery. In
+//! Kubernetes terms, `readyReplicas == desired` against a pod that cannot
+//! answer a single query.
+//!
+//! WHAT THE REPLACEMENT DETECTS IS NARROWER THAN THAT LIST, and worth stating
+//! so nobody reads more into a green probe than it earned. It runs ONE query
+//! against ONE table, so it catches every cause that stops a pooled connection
+//! executing at all, and it catches an unapplied schema. It does NOT audit the
+//! per-table privileges the migration chain issues: a role that can read the
+//! migration ledger and has lost `SELECT` on an application table answers this
+//! probe successfully. Checking that would mean touching every table on every
+//! probe interval.
+//!
+//! So a caller that can reach the database supplies a [`DatabaseProbe`], and
+//! readiness asks THAT. The check is a real query on a real pooled connection,
+//! and it reports the schema separately from the connection, because "I am
+//! connected but unmigrated" is a different page for a different person than
+//! "I cannot connect".
+//!
+//! # The fallback is still here, and it announces itself
+//!
+//! A caller that supplies no probe keeps the socket check, because this crate
+//! depends on `ironauth-config` and `ironauth-env` and on no persistence layer,
+//! so it cannot open a database connection by itself. That path is NOT silently equivalent: [`Readiness::Ready`] carries
+//! [`ProbeDepth`] saying which question was actually answered, the body prints
+//! it, and the binary always supplies a real probe. A weaker check that reads
+//! identically to a stronger one is the failure this module already shipped
+//! once.
+//!
+//! Every probe is bounded by a fixed monotonic deadline via `tokio::time`, so
+//! a black-holed database address never hangs the endpoint.
 
 use std::time::Duration;
 
@@ -20,6 +54,94 @@ use tokio::net::TcpStream;
 /// Maximum time to wait for the database TCP connect before reporting not
 /// ready. Kept short so orchestrator probes stay responsive.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What a real database check answered (issue #149).
+///
+/// Separate from [`Readiness`] because a probe reports what it FOUND and this module decides
+/// what that means for serving. Collapsing the two would put the serving decision inside every
+/// implementation, where it could differ per caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseHealth {
+    /// A query completed on a pooled connection and the schema is at a version this build runs.
+    Serving,
+    /// A connection or a query failed: unreachable, refused, wrong credentials, no such
+    /// database, or a server still in recovery.
+    ///
+    /// ONE VARIANT FOR ALL OF THOSE on purpose. They are all "this instance cannot answer", the
+    /// probe body is read by an orchestrator that acts on exactly that, and splitting them here
+    /// would invite a caller to treat some as servable. The distinguishing detail belongs in
+    /// the implementation's own logs, where the error text survives.
+    ///
+    /// NOT MISSING GRANTS, which this doc used to claim. A permission error on the one table
+    /// the shipped implementation reads is indistinguishable from that table's grant not having
+    /// been applied yet, so it is reported as [`Self::SchemaNotReady`]. Listing it here made the
+    /// trait doc and its sole implementer disagree.
+    Unreachable,
+    /// Connected and able to query, but this build cannot confirm the schema it needs.
+    ///
+    /// ITS OWN STATE because it is a different page for a different person. "Cannot connect"
+    /// pages whoever owns the database; this one pages whoever owns the rollout, and is the
+    /// expected transient state midway through one. An operator who cannot tell them apart from
+    /// the probe reads the wrong runbook.
+    ///
+    /// "CANNOT CONFIRM" RATHER THAN "IS UNMIGRATED", because the shipped implementation covers
+    /// two causes it genuinely cannot separate: a migration that has not been applied, and a
+    /// grant on the ledger that was never issued or has been revoked. Both mean the instance
+    /// cannot establish that its schema is ready, both are fixed by finishing the rollout, and
+    /// a probe reading one SQLSTATE has no way to tell which it is. Claiming only the first
+    /// would be the more precise-sounding and less true statement.
+    SchemaNotReady,
+}
+
+/// The database check a caller supplies, so readiness can speak the database protocol.
+///
+/// # Why a trait rather than a store handle
+///
+/// `ironauth-server` depends on `ironauth-config` and nothing else. Taking a store here would
+/// pull the persistence layer, its driver and its migration chain into the HTTP crate to answer
+/// one question. The caller already holds a pool; this asks it.
+///
+/// # What an implementation owes
+///
+/// It must USE A POOLED CONNECTION rather than opening a fresh one. A probe that dials its own
+/// connection each time answers a question nobody asked -- whether a NEW connection can be made
+/// -- while the pool it is standing in for could be exhausted, mid-failover, or holding handles
+/// to a server that has since restarted. It must also be cheap enough to run on every probe
+/// interval, which is a trivial query and never a scan.
+///
+/// It does NOT need to enforce a timeout. [`ReadinessProbe`] bounds every call it makes.
+pub trait DatabaseProbe: Send + Sync + std::fmt::Debug {
+    /// Answer the database's state, using a pooled connection.
+    fn check(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DatabaseHealth> + Send + '_>>;
+}
+
+/// Which question a [`Readiness::Ready`] actually answered (issue #149).
+///
+/// A socket connect and a completed query are not the same evidence, and a body that renders
+/// them identically lets the weaker one pass for the stronger. This is printed so it cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeDepth {
+    /// A query completed on a pooled connection.
+    Query,
+    /// Only a TCP connection was established; no database protocol was spoken.
+    ///
+    /// Reached when no [`DatabaseProbe`] was supplied. The shipped binary always supplies one,
+    /// so a deployment seeing this is running something that does not.
+    SocketOnly,
+}
+
+impl ProbeDepth {
+    /// The token printed in the readiness body.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::SocketOnly => "socket-only",
+        }
+    }
+}
 
 /// A readiness probe over the configured database address.
 #[derive(Debug, Clone)]
@@ -34,6 +156,11 @@ pub struct ReadinessProbe {
     /// Postgres alone cannot be degraded and will never page an operator about a component it
     /// chose not to run.
     optional: Vec<OptionalComponent>,
+    /// The real database check, when the caller supplied one (issue #149).
+    ///
+    /// [`None`] keeps the socket check this module shipped with, and says so in the body
+    /// through [`ProbeDepth::SocketOnly`]. The binary always supplies one.
+    database: Option<std::sync::Arc<dyn DatabaseProbe>>,
 }
 
 /// Split `host:port`, returning [`None`] for anything this probe cannot connect to.
@@ -73,9 +200,13 @@ impl std::fmt::Debug for OptionalComponent {
 /// The result of a readiness probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Readiness {
-    /// Listeners are up, the database address is TCP-reachable, and every optional component
-    /// this deployment attached is answering.
-    Ready,
+    /// Listeners are up, the database answered whatever question was asked of it, and every
+    /// optional component this deployment attached is answering.
+    ///
+    /// CARRIES WHICH QUESTION. A completed query and a socket connect are not the same
+    /// evidence, and a `Ready` that renders them identically lets the weaker pass for the
+    /// stronger. See [`ProbeDepth`].
+    Ready(ProbeDepth),
     /// Serving correctly with an optional component absent (issue #149).
     ///
     /// # This is a 200, and that is the whole point
@@ -86,13 +217,20 @@ pub enum Readiness {
     /// OPTIONAL component is down, which is how an accelerator outage becomes an availability
     /// outage. The tier is reported in the BODY so an operator and a dashboard can see it,
     /// while the orchestrator keeps routing.
-    Degraded(DegradedTier),
-    /// The database address could not be reached within the probe timeout.
+    Degraded(DegradedTier, ProbeDepth),
+    /// The database could not be reached, or refused to answer, within the probe timeout.
     ///
-    /// HARD DOWN, and the only `503`: Postgres is the tier everything is complete on, so a
-    /// deployment that cannot reach it cannot serve, and a probe that said otherwise would
-    /// route traffic into errors.
+    /// HARD DOWN, and a `503`: Postgres is the tier everything is complete on, so a deployment
+    /// that cannot reach it cannot serve, and a probe that said otherwise would route traffic
+    /// into errors.
     DatabaseUnreachable,
+    /// The database answered, but the schema is not one this build can serve (issue #149).
+    ///
+    /// ALSO A `503`, because an instance whose schema is not ready cannot serve requests, and
+    /// the mid-rollout case is exactly when an orchestrator must keep it out of rotation.
+    /// Separate from [`Self::DatabaseUnreachable`] so the body names which of the two it is:
+    /// they page different people and have different runbooks.
+    SchemaNotReady,
 }
 
 /// Which optional component is absent (issue #149).
@@ -154,15 +292,15 @@ impl Readiness {
     /// caller asking what to page about wants [`Readiness::degraded_tier`].
     #[must_use]
     pub fn is_ready(self) -> bool {
-        matches!(self, Readiness::Ready | Readiness::Degraded(_))
+        matches!(self, Readiness::Ready(_) | Readiness::Degraded(..))
     }
 
     /// The tier this instance is degraded to, or [`None`] when it is healthy or hard down.
     #[must_use]
     pub const fn degraded_tier(self) -> Option<DegradedTier> {
         match self {
-            Self::Degraded(tier) => Some(tier),
-            Self::Ready | Self::DatabaseUnreachable => None,
+            Self::Degraded(tier, _) => Some(tier),
+            Self::Ready(_) | Self::DatabaseUnreachable | Self::SchemaNotReady => None,
         }
     }
 }
@@ -180,6 +318,7 @@ impl ReadinessProbe {
             port,
             timeout,
             optional: Vec::new(),
+            database: None,
         }
     }
 
@@ -232,28 +371,56 @@ impl ReadinessProbe {
             port: database.url.port().unwrap_or(5432),
             timeout: PROBE_TIMEOUT,
             optional,
+            database: None,
         }
     }
 
-    /// Probe the database address once.
+    /// Probe the database once, then every declared optional component.
     ///
-    /// Returns [`Readiness::Ready`] only if a TCP connection is established
-    /// within the timeout. A refused, timed-out, or unresolvable address is
-    /// [`Readiness::DatabaseUnreachable`]; no bytes are exchanged and no
-    /// database protocol is spoken.
+    /// With a [`DatabaseProbe`] installed this runs a real query and reports
+    /// [`Readiness::SchemaNotReady`] separately from
+    /// [`Readiness::DatabaseUnreachable`]. Without one it falls back to a TCP
+    /// connect, exchanging no bytes and speaking no database protocol, and the
+    /// [`ProbeDepth`] it returns says which of the two ran.
+    ///
+    /// Every call it makes is bounded by the configured timeout, so an
+    /// implementation that never returns cannot hang the endpoint. A timed-out
+    /// database check is [`Readiness::DatabaseUnreachable`]: it learned nothing
+    /// about the schema, and reporting the friendlier of the two states would
+    /// make a hung database read as a rollout in progress.
     pub async fn probe(&self) -> Readiness {
         // THE DATABASE FIRST, AND IT SHORT-CIRCUITS. A deployment that cannot reach Postgres is
         // hard down whatever else is true, and reporting it as merely degraded because an
         // accelerator answered would route traffic into errors. There is no tier below this one.
-        match tokio::time::timeout(
-            self.timeout,
-            TcpStream::connect((self.host.as_str(), self.port)),
-        )
-        .await
-        {
-            Ok(Ok(_stream)) => {}
-            Ok(Err(_)) | Err(_) => return Readiness::DatabaseUnreachable,
-        }
+        //
+        // THE TIMEOUT IS APPLIED HERE, ONCE, for both arms. An implementation of
+        // `DatabaseProbe` must not have to remember it, and one that forgot would hang the
+        // endpoint it is standing in for.
+        let depth = match self.database.as_ref() {
+            Some(probe) => {
+                match tokio::time::timeout(self.timeout, probe.check()).await {
+                    Ok(DatabaseHealth::Serving) => ProbeDepth::Query,
+                    Ok(DatabaseHealth::SchemaNotReady) => return Readiness::SchemaNotReady,
+                    // A TIMED-OUT PROBE IS UNREACHABLE, not schema-not-ready. The check did not
+                    // get far enough to learn anything about the schema, and guessing the
+                    // friendlier of the two states is how a hung database reads as a rollout.
+                    Ok(DatabaseHealth::Unreachable) | Err(_) => {
+                        return Readiness::DatabaseUnreachable;
+                    }
+                }
+            }
+            None => {
+                match tokio::time::timeout(
+                    self.timeout,
+                    TcpStream::connect((self.host.as_str(), self.port)),
+                )
+                .await
+                {
+                    Ok(Ok(_stream)) => ProbeDepth::SocketOnly,
+                    Ok(Err(_)) | Err(_) => return Readiness::DatabaseUnreachable,
+                }
+            }
+        };
 
         // THE FIRST ABSENT COMPONENT NAMES THE TIER, in declaration order. Two absent at once is
         // a real state and this reports only the first, which is a deliberate simplification
@@ -277,11 +444,25 @@ impl ReadinessProbe {
             )
             .await;
             if !matches!(reachable, Ok(Ok(_))) {
-                return Readiness::Degraded(component.tier);
+                // THE DEPTH TRAVELS HERE TOO. It used to be dropped on this path, so a
+                // deployment with no database probe and an absent accelerator rendered
+                // byte-for-byte identically to one whose real query succeeded. That is the
+                // failure the module header names: a weaker check reading as the stronger one.
+                return Readiness::Degraded(component.tier, depth);
             }
         }
 
-        Readiness::Ready
+        Readiness::Ready(depth)
+    }
+
+    /// Supply the database check, so readiness speaks the database protocol (issue #149).
+    ///
+    /// Without this the probe opens a socket and calls that ready, which cannot tell a serving
+    /// database from one that refuses every credential. See this module's header.
+    #[must_use]
+    pub fn with_database_probe(mut self, probe: std::sync::Arc<dyn DatabaseProbe>) -> Self {
+        self.database = Some(probe);
+        self
     }
 
     /// Declare an optional component whose absence is a degraded tier rather than an outage.
@@ -341,6 +522,7 @@ mod tests {
             port: 5432,
             timeout: Duration::from_millis(150),
             optional: Vec::new(),
+            database: None,
         };
         assert_eq!(probe.probe().await, Readiness::DatabaseUnreachable);
     }
@@ -371,7 +553,10 @@ mod degraded_tests {
         let probe = ReadinessProbe::new("127.0.0.1".to_owned(), port, Duration::from_millis(200));
 
         let outcome = probe.probe().await;
-        assert_eq!(outcome, Readiness::Ready);
+        // SOCKET-ONLY, and named rather than wildcarded: these probes are built with no
+        // `DatabaseProbe`, so this is the fallback arm, and a test that matched any `Ready`
+        // would pass whichever check ran.
+        assert_eq!(outcome, Readiness::Ready(ProbeDepth::SocketOnly));
         assert_eq!(
             outcome.degraded_tier(),
             None,
@@ -391,7 +576,7 @@ mod degraded_tests {
         let outcome = probe.probe().await;
         assert_eq!(
             outcome,
-            Readiness::Degraded(DegradedTier::BackboneAbsent),
+            Readiness::Degraded(DegradedTier::BackboneAbsent, ProbeDepth::SocketOnly),
             "an unreachable accelerator is a degraded tier"
         );
         assert!(
@@ -401,7 +586,7 @@ mod degraded_tests {
         );
         assert_ne!(
             outcome,
-            Readiness::Ready,
+            Readiness::Ready(ProbeDepth::SocketOnly),
             "and it must not read as healthy, or nothing tells an operator to look"
         );
     }
@@ -418,7 +603,7 @@ mod degraded_tests {
 
         assert_eq!(
             probe.probe().await,
-            Readiness::Ready,
+            Readiness::Ready(ProbeDepth::SocketOnly),
             "a component that answers is not a degraded tier"
         );
     }

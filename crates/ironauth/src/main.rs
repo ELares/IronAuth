@@ -86,6 +86,15 @@ mod shared_config;
 #[cfg(all(test, feature = "testing"))]
 mod boot_wiring_tests;
 
+/// The readiness probe the binary installs (issue #149), driven against a real database.
+///
+/// `StoreReadinessProbe` is the only implementation of `DatabaseProbe` that ships, and the
+/// server-side tests all use a fixture that answers whatever they ask. So nothing exercised the
+/// mapping from a real store's answer to the health the endpoint renders, which is where a
+/// serving database could have been reported as unreachable and taken a fleet out of rotation.
+#[cfg(all(test, feature = "testing"))]
+mod readiness_wiring_tests;
+
 /// The outbox boot seam (issue #104, PR 2): drives the REAL `spawn_consumer_pools` and
 /// `outbox_worker_settings` against a real database, because a pool loop that covers a
 /// subset of the registry compiles, lints and tests clean. DB-backed, so it rides the
@@ -412,6 +421,40 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // GIVE READINESS A DATABASE IT CAN SPEAK TO (issue #149). Until this, `/readyz` opened a
+        // socket to the configured address and called that ready, which reported a deployment
+        // with wrong credentials, no such database, or an unmigrated schema as healthy. In
+        // Kubernetes terms `readyReplicas == desired` against a pod that could not answer one
+        // query.
+        //
+        // `readiness_store` is `None` when NO plane holds a pool, and the two ways that happens
+        // are worth naming because they are not the same deployment. One is a server configured
+        // to mount nothing, offering health, readiness and metrics alone, which is a legitimate
+        // thing to run. The other is a plane that was CONFIGURED and could not open its store:
+        // `build_oidc_plane` logs and returns `None` on a failed connect, and serving continues
+        // without it.
+        //
+        // The second must not read as healthy, and this is exactly the failure being fixed
+        // arriving through the fix's own path: the socket connect still succeeds, because
+        // Postgres is listening, so a pod that mounted nothing would answer `ready`. A plane
+        // that was asked for and is absent is a pod that cannot do its job.
+        if let Some(store) = planes.readiness_store.clone() {
+            server = server.with_database_probe(std::sync::Arc::new(StoreReadinessProbe { store }));
+            tracing::info!("readiness probes the database with a query on the serving pool");
+        } else if planes.a_plane_was_configured {
+            server = server.with_database_probe(std::sync::Arc::new(UnreachableReadinessProbe));
+            tracing::error!(
+                "readiness reports NOT READY: a plane was configured but could not open its \
+                 store, so this instance serves none of what it was asked to serve. /readyz \
+                 answers 503 rather than reporting the socket as healthy."
+            );
+        } else {
+            tracing::warn!(
+                "readiness has NO database probe: this instance is configured to mount no \
+                 plane, so there is no serving pool to ask. /readyz falls back to a socket \
+                 check and reports probe=socket-only."
+            );
+        }
         // Mount the management API (issue #11) on the management plane. The state was
         // assembled above; mounting is all this adds, which is why the assembly is a
         // separate step the boot-wiring harness can observe.
@@ -858,6 +901,88 @@ impl DataPlaneSurfaces {
 /// what each plane actually holds. Mounting turns both into opaque `Router`s, which is
 /// why deleting an install, or handing one plane a different value than the other, used
 /// to build with zero warnings.
+/// The readiness answer for an instance whose configured plane could not open its store.
+///
+/// NOT the socket fallback, and that is the point. A plane that was asked for and is absent is
+/// an instance that cannot do its job, while its database socket very likely still accepts: the
+/// causes are wrong credentials, a missing database, absent grants, or a Postgres still in
+/// recovery, none of which close the port. Falling back to the socket check there would answer
+/// `ready` for a pod serving nothing, which is precisely the failure issue #149 is about,
+/// arriving through this change's own path.
+#[derive(Debug, Clone, Copy)]
+struct UnreachableReadinessProbe;
+
+impl ironauth_server::readiness::DatabaseProbe for UnreachableReadinessProbe {
+    fn check(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = ironauth_server::readiness::DatabaseHealth>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { ironauth_server::readiness::DatabaseHealth::Unreachable })
+    }
+}
+
+/// The database check `/readyz` asks, backed by the serving store (issue #149).
+///
+/// # Why this holds the SERVING store rather than opening its own
+///
+/// `ironauth_server::readiness::DatabaseProbe` requires a pooled connection, and the reason is
+/// the whole point of the change: a probe that dials a fresh connection reports whether a NEW
+/// connection can be made, while the pool requests are actually served from could be exhausted
+/// or holding handles to a server that has since restarted. This is a clone of the handle the
+/// data plane serves from, so it shares that pool.
+#[derive(Clone)]
+struct StoreReadinessProbe {
+    store: Store,
+}
+
+// HAND-WRITTEN, because `Store` is not `Debug` and should not become so for this: it holds a
+// pool and a master key, and the second must never reach a log line. This prints the type and
+// nothing it wraps.
+impl std::fmt::Debug for StoreReadinessProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StoreReadinessProbe")
+    }
+}
+
+impl ironauth_server::readiness::DatabaseProbe for StoreReadinessProbe {
+    fn check(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = ironauth_server::readiness::DatabaseHealth>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            use ironauth_server::readiness::DatabaseHealth;
+            match self.store.probe_readiness().await {
+                Ok(ironauth_store::SchemaReadiness::Serving) => DatabaseHealth::Serving,
+                Ok(ironauth_store::SchemaReadiness::NotMigrated) => DatabaseHealth::SchemaNotReady,
+                // LOGGED HERE, because `DatabaseHealth::Unreachable` deliberately collapses
+                // every cause into one state for the orchestrator. The error text is the only
+                // thing that tells an operator WHICH cause, so it must not be dropped on the
+                // floor between the store and the probe.
+                // `?error` AND NOT `%error`. This line is the ONLY thing that tells an
+                // operator which of the collapsed causes they have, and `Display` for
+                // `StoreError::Database` renders the literal string "database error": the sqlx
+                // error, with its SQLSTATE and message, hangs off `source()`, which `%` does
+                // not walk. The justification for collapsing every cause into one variant is
+                // that the text survives in the log, so the text has to actually survive.
+                Err(error) => {
+                    tracing::warn!(error = ?error, "readiness: the database did not answer");
+                    DatabaseHealth::Unreachable
+                }
+            }
+        })
+    }
+}
+
 struct AssembledPlanes {
     /// The management plane's state, or `None` when the management API does not mount.
     management: Option<AdminState>,
@@ -865,6 +990,20 @@ struct AssembledPlanes {
     oidc: Option<OidcPlane>,
     /// The SCIM inbound plane, or `None` when it is disabled or cannot mount.
     scim: Option<ScimPlane>,
+    /// A serving store handle for the readiness probe (issue #149), when any plane opened one.
+    ///
+    /// `None` when no plane holds a pool. Read with [`AssembledPlanes::a_plane_was_configured`]
+    /// to tell the two reasons apart: an instance asked to mount nothing, and an instance whose
+    /// plane was asked for and could not connect.
+    readiness_store: Option<Store>,
+    /// Whether this instance was CONFIGURED to mount a plane, whatever the outcome (issue #149).
+    ///
+    /// Separate from `readiness_store` being `Some` because the interesting case is exactly
+    /// where they disagree: configured and absent. A plane's builder logs and returns `None` on
+    /// a failed connect while serving continues, so without this the instance would be
+    /// indistinguishable from one that was never asked to mount anything, and readiness would
+    /// report it healthy.
+    a_plane_was_configured: bool,
 }
 
 /// Assemble BOTH planes from the one loaded config (issue #414).
@@ -909,8 +1048,22 @@ async fn assemble_planes(
     // be: an operator sees a healthy server serving no OIDC, rather than a refusal naming
     // the rule. Here the error reaches the `ExitCode::FAILURE` arm, the same one a malformed
     // `server.public_url` takes.
-    let forward_auth = ironauth_oidc::forward_auth_rules::ForwardAuthRuntime::from_config(
+    //
+    // COMPILED ONCE AND SHARED. Criterion 4 asks that the SAME rule set gate a forward-auth
+    // resource and an OIDC token issuance; building it here and handing the same `Arc` to both
+    // consumers is what makes that a fact about one object rather than a claim about two that
+    // happen to agree. The issuance side is installed regardless of `forward_auth.enabled`,
+    // because turning off a proxy surface must not silently turn off a denial policy.
+    let access_rules = ironauth_oidc::forward_auth_rules::access_rules_from_config(
         &config.forward_auth,
+        &config.oidc.acr_order,
+    )
+    .map_err(|error| ServerError::InvalidAccessRules {
+        reason: error.to_string(),
+    })?;
+    let forward_auth = ironauth_oidc::forward_auth_rules::ForwardAuthRuntime::from_rules(
+        &config.forward_auth,
+        std::sync::Arc::clone(&access_rules),
         env.clock_arc(),
     )
     .map_err(|error| ServerError::InvalidAccessRules {
@@ -926,6 +1079,7 @@ async fn assemble_planes(
             DataPlaneSurfaces::resolve(features, config),
             &shared,
             forward_auth,
+            access_rules,
         )
         .await
     } else {
@@ -960,10 +1114,36 @@ async fn assemble_planes(
         }
         (management, _) => management,
     };
+    // THE STORE READINESS WILL ASK, taken from WHICHEVER plane serves requests (issue #149).
+    //
+    // EVERY PLANE, NOT JUST OIDC. The first version read only `oidc`, and a review found what
+    // that leaves out: the chart's default install sets `oidc.enabled = false`, and a
+    // management-only or SCIM-only deployment holds a perfectly good pool. All of those kept
+    // the socket check this change exists to remove, so the default Helm install got none of
+    // the fix.
+    //
+    // Each of these is a `Store` handle over a pool the plane serves from, so the probe shares
+    // those connections rather than opening its own. That is what the probe's contract asks
+    // for: a fresh connection can succeed while the pool a request would wait on is exhausted
+    // or holding handles to a server that has since restarted.
+    let readiness_store = oidc
+        .as_ref()
+        .map(|plane| plane.state.store().clone())
+        .or_else(|| scim.as_ref().map(|plane| plane.state.store().clone()))
+        .or_else(|| management.as_ref().map(|state| state.store().clone()));
+
+    // ASKED FOR, not mounted. Read off the CONFIG rather than off the built planes, because
+    // the whole point is to catch the case where a plane was requested and is not here.
+    let a_plane_was_configured = config.oidc.enabled
+        || config.scim.enabled
+        || config.admin.bootstrap_operator_token.is_some();
+
     Ok(AssembledPlanes {
         management,
         oidc,
         scim,
+        readiness_store,
+        a_plane_was_configured,
     })
 }
 
@@ -1510,6 +1690,7 @@ async fn build_oidc_plane(
     surfaces: DataPlaneSurfaces,
     shared: &SharedPlaneInputs,
     forward_auth: Option<std::sync::Arc<ironauth_oidc::forward_auth_rules::ForwardAuthRuntime>>,
+    access_rules: std::sync::Arc<ironauth_oidc::rules::RuleSet>,
 ) -> Option<OidcPlane> {
     let oidc_config = &config.oidc;
     let policy_config = &config.password_policy;
@@ -1925,6 +2106,12 @@ async fn build_oidc_plane(
         Some(runtime) => state.with_forward_auth(runtime),
         None => state,
     };
+    // THE ISSUANCE CONSUMER OF THE SAME RULES (issue #154 criterion 4). Installed
+    // unconditionally, unlike the surface above: a deployment may write access rules without
+    // serving a proxy check, and gating this on `forward_auth.enabled` would mean switching off
+    // a proxy surface silently switched off a denial policy. With no rules configured the set
+    // is empty and refuses nothing.
+    let state = state.with_access_rules(access_rules);
     // The outbound client sync HTTP flow targets are called through (issue #112). Its
     // `total_timeout` is the flow-target ceiling EXACTLY, because a per-request timeout only
     // shortens it: a smaller ceiling here would silently truncate a target registered above
@@ -5703,6 +5890,20 @@ fn select_control_dsn(config: &Config) -> Option<String> {
 /// is DERIVED from the secret (a domain-separated HMAC), so any-length
 /// high-entropy secret works and the same secret always yields the same key
 /// (stable across restarts, which every wrapped tenant key depends on).
+/// The master key id every deployment has been writing into `tenant_keks.master_key_id`.
+///
+/// A DEFAULT RATHER THAN A LITERAL now (issue #153). It has to stay exactly this string, but not
+/// for the reason an earlier version of this comment gave: changing it would not make existing
+/// rows unopenable, because the read path rebuilds each AAD from the id stored in the row. What
+/// it would do is silently start labelling new KEKs differently from every row already written,
+/// splitting the population that a later rotation has to find.
+pub(crate) const DEFAULT_MASTER_KEY_ID: &str = "master-1";
+
+/// The platform envelope master key, or [`None`] with the encrypted-PII paths failing closed.
+///
+/// Derives from `database.master_key` under the id `database.master_key_id`. This is the ONLY
+/// production construction of a master key, which is why `ironauth storage rekey` derives the
+/// same way: a key built any other way opens nothing this function wrote.
 fn resolve_master_key(config: &Config) -> Option<Arc<MasterKey>> {
     let Some(secret) = &config.database.master_key else {
         tracing::warn!(
@@ -5713,10 +5914,32 @@ fn resolve_master_key(config: &Config) -> Option<Arc<MasterKey>> {
         return None;
     };
     match secret.resolve() {
-        Ok(material) => Some(Arc::new(MasterKey::derive(
-            "master-1",
-            material.expose().as_bytes(),
-        ))),
+        // THE ID COMES FROM CONFIG, defaulting to what every existing deployment has written
+        // into its rows. See `DatabaseConfig::master_key_id`: it is bound into the AAD of every
+        // wrapped KEK, so two masters must be able to differ by name before a rotation can be
+        // expressed at all.
+        Ok(material) => {
+            let id = config
+                .database
+                .master_key_id
+                .as_deref()
+                .unwrap_or(DEFAULT_MASTER_KEY_ID);
+            // REFUSED RATHER THAN ACCEPTED, because an id this CLI cannot express is one an
+            // operator could configure and then never name in a rekey. Failing closed here costs
+            // a boot; accepting it costs a rotation nobody can run later.
+            if !master_key_id_is_valid(id) {
+                tracing::error!(
+                    "database.master_key_id must be non-empty and free of ':': the encrypted-PII \
+                     paths will fail closed. ':' is the separator `ironauth storage rekey` splits \
+                     its master-key arguments on, so an id containing one could never be named."
+                );
+                return None;
+            }
+            Some(Arc::new(MasterKey::derive(
+                id,
+                material.expose().as_bytes(),
+            )))
+        }
         Err(error) => {
             tracing::error!(
                 %error,
@@ -5841,6 +6064,7 @@ fn manage_bans(verb: &str, args: &mut impl Iterator<Item = String>) -> ExitCode 
         }
     };
     let env = Env::system();
+
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -6973,7 +7197,7 @@ fn prepare_dev_schema(
             .await
             .map_err(|error| error.to_string())?
             .with_master_key(std::sync::Arc::new(MasterKey::derive(
-                "master-1",
+                DEFAULT_MASTER_KEY_ID,
                 dev::DEV_MASTER_KEY.as_bytes(),
             )));
         store
@@ -8116,8 +8340,10 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 "ironauth storage: expected a subcommand: rekey, kek-backup, or kek-restore."
             );
             eprintln!(
-                "usage: ironauth storage rekey --url DSN --from-master-key ID:HEX \
-                 --to-master-key ID:HEX"
+                "usage: ironauth storage rekey --url DSN --from-master-key KEY \
+                 --to-master-key KEY\n\
+                 where KEY is ID:env:VAR or ID:file:PATH, naming the secret the same way \
+                 `database.master_key` does"
             );
             eprintln!("       ironauth storage kek-backup --url DSN --out FILE");
             eprintln!("       ironauth storage kek-restore --url DSN --in FILE");
@@ -8128,6 +8354,10 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
     let mut url: Option<String> = None;
     let mut from: Option<String> = None;
     let mut to: Option<String> = None;
+    // NAMED FOR WHAT IT COMMITS THE OPERATOR TO, not for what it disables. A flag called
+    // `--force` invites being passed to make an error go away; this one only reads as true if
+    // the person typing it has a plan.
+    let mut acknowledged_lookup_rebuild = false;
     while let Some(arg) = args.next() {
         let mut take = |target: &mut Option<String>, flag: &str| -> bool {
             if let Some(value) = args.next() {
@@ -8153,6 +8383,9 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
             true
         } else if arg == "--to-master-key" {
             take(&mut to, "--to-master-key")
+        } else if arg == "--i-will-rebuild-lookups" {
+            acknowledged_lookup_rebuild = true;
+            true
         } else {
             eprintln!("ironauth storage rekey: unrecognized argument '{arg}'");
             false
@@ -8170,12 +8403,64 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
     };
     let (Some(from), Some(to)) = (parse_master_key(&from), parse_master_key(&to)) else {
         eprintln!(
-            "ironauth storage rekey: a master key is ID:HEX, where HEX is 64 hex characters \
+            "ironauth storage rekey: a master key is ID:env:VAR or ID:file:PATH. The secret is \
+             named the same way `database.master_key` names it and derived the same way, so the \
+             key is the one the server actually uses \
              (32 bytes). The id is bound into every wrapped KEK's AAD, so it is part of the \
              key rather than a label."
         );
         return ExitCode::FAILURE;
     };
+
+    // A CHANGE OF SECRET BREAKS EVERY LOOKUP, SILENTLY, so the operator has to say it out
+    // loud before this runs.
+    //
+    // Every blind index in the store is `master.blind_index(context)`, derived from the
+    // master's material rather than through a KEK. FIFTEEN of them, counted rather than
+    // sampled: the user identifier and external id, the trait login, the flexible and routing identifiers, the recovery code, the invitation identifier, the organisation contact email, the email and SMS factor recipients, the message recipient, the risk-signal and abuse and SSF-stream subjects, and the migration record subject.
+    // `storage rekey` rewraps `tenant_keks` and touches none of them.
+    //
+    // The failure has no loud symptom. `by_identifier` misses and returns `Ok(None)`, which
+    // is indistinguishable from an unknown user, so every existing account stops resolving at
+    // login. And `users_identifier_bidx_unique` is a UNIQUE constraint over the index, so a
+    // re-registration with the same address computes a different tag, passes the constraint,
+    // and creates a SECOND live user while the first -- with its grants, enrolments and
+    // history -- becomes unreachable.
+    //
+    // THE GUARD IS HERE AND NOT IN `Rekey`, deliberately. The library keeps the capability:
+    // its suite exercises rotation between two materials, an eventual index rebuild will need
+    // exactly that, and a type refusing its own purpose is the wrong place to put an
+    // operational warning. This is the door a human walks through.
+    //
+    // COMPARED VIA THE INDEXES, not the secrets, which are not recoverable from a
+    // `MasterKey`. `derive` keys off the secret alone, so two masters agreeing on one fixed
+    // context agree on every context.
+    let probe = ironauth_jose::Aad::builder()
+        .text("ironauth.rekey.material-probe")
+        .build();
+    let material_changes = from.blind_index(&probe).as_bytes() != to.blind_index(&probe).as_bytes();
+    if material_changes && !acknowledged_lookup_rebuild {
+        eprintln!(
+            "\nironauth storage rekey: REFUSING. The two master keys have different \n\
+             material, and this command rewraps keys without rebuilding LOOKUPS.\n\n\
+             Every identifier lookup is derived from the master secret: login handles, \n\
+             external ids, recovery codes, invitations, abuse and risk subjects, email and \n\
+             SMS recipients. After this runs they would all be computed under a key nothing \n\
+             derives any more, and the failure is SILENT: existing accounts stop resolving at \n\
+             login as though they never existed, and re-registering the same address creates \n\
+             a second user while the first becomes unreachable.\n\n\
+             Rotating the NAME while keeping the secret is safe and needs no flag: it moves \n\
+             rows to a new generation and leaves every lookup intact.\n\n\
+             If you have a plan to rebuild the indexes, pass --i-will-rebuild-lookups."
+        );
+        return ExitCode::FAILURE;
+    }
+    if material_changes {
+        println!(
+            "storage rekey: proceeding with a CHANGE OF MATERIAL on --i-will-rebuild-lookups. \n\
+             Every identifier lookup will stop matching until you rebuild the blind indexes."
+        );
+    }
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -8203,6 +8488,7 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
              cannot open both shapes while this runs. Stop the fleet, or run it against a \n\
              quiesced deployment."
         );
+
         match store.rekey_master(&from, &to).await {
             Ok(report) => {
                 println!(
@@ -8471,18 +8757,68 @@ fn kek_restore_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
     })
 }
 
-/// Parse `id:hex` into a master key. The id is bound into every wrapped KEK's AAD.
+/// Parse a master key an operator named: `ID:env:VAR` or `ID:file:PATH` (issue #153).
+///
+/// # Why raw bytes are gone
+///
+/// This took `ID:HEX`, 64 characters used verbatim through `MasterKey::from_bytes`. That form
+/// could not name any real key and could destroy every one.
+///
+/// It cannot NAME one because no deployment holds a raw-byte master. `resolve_master_key` is the
+/// only production construction and it only ever DERIVES, and `DatabaseConfig` has no raw-bytes
+/// field to reach `from_bytes` with. So `--from-master-key ID:HEX` never matched a live row.
+///
+/// It can DESTROY every one because `--to-master-key ID:HEX` rewraps every live KEK under a key
+/// no server can reconstruct: the server derives `HMAC-SHA256(passphrase, label)`, which is not
+/// invertible, so no value of `database.master_key` yields chosen bytes. The rewrap writes the
+/// new id into each row, the completion count is keyed on that id alone, and the command exits
+/// SUCCESS. Every tenant's sealed PII would be unopenable from the next restart, reported as a
+/// finished rotation.
+///
+/// An earlier draft of this change added a derived form ALONGSIDE the hex one, which was worse
+/// than either: the two differ only by a prefix an operator can omit, the omitted reading is the
+/// destructive one, and 64 hex characters is exactly the shape a generated secret has. It also
+/// unlocked the hazard, because a `--from` that finally worked let the run reach the write loop
+/// the old unusable `--from` had always aborted before.
+///
+/// # Why the secret is not on the command line
+///
+/// `ID:secret:PASSPHRASE` would put the platform master key in `argv`, visible to `ps` and to
+/// the shell history, which is the exposure `database.master_key` takes a `Secret` to avoid.
+/// These are the same two indirections that key accepts.
+///
+/// RESOLVED THROUGH `Secret` ITSELF rather than by reading the file here, and that is load
+/// bearing: the `file` form trims one trailing newline, the shape `echo secret > file` produces.
+/// A reader that kept the newline would derive a DIFFERENT key from the same file the server
+/// reads, which is the whole class of bug this function exists to close.
 fn parse_master_key(text: &str) -> Option<ironauth_jose::MasterKey> {
-    let (id, hex) = text.split_once(':')?;
-    if id.is_empty() || hex.len() != 64 {
+    let (id, rest) = text.split_once(':')?;
+    if !master_key_id_is_valid(id) {
         return None;
     }
-    let mut bytes = [0_u8; 32];
-    for (index, pair) in hex.as_bytes().chunks(2).enumerate() {
-        let s = std::str::from_utf8(pair).ok()?;
-        bytes[index] = u8::from_str_radix(s, 16).ok()?;
-    }
-    Some(ironauth_jose::MasterKey::from_bytes(id, bytes))
+    let secret = rest
+        .strip_prefix("env:")
+        .map(|var| ironauth_config::Secret::Env(var.to_owned()))
+        .or_else(|| {
+            rest.strip_prefix("file:")
+                .map(|path| ironauth_config::Secret::File(std::path::PathBuf::from(path)))
+        })?;
+    let material = secret.resolve().ok()?;
+    // THE SAME CONSTRUCTION `resolve_master_key` USES, and it must stay the same: a second
+    // derivation here would produce a key that opens nothing the server wrote.
+    Some(ironauth_jose::MasterKey::derive(
+        id,
+        material.expose().as_bytes(),
+    ))
+}
+
+/// Whether a master key id is one both the server and the rekey can express.
+///
+/// Non-empty, and free of `:` because that is the separator this CLI splits on: an id containing
+/// one could be configured on a server and then never named on the command line, which is the
+/// half-expressible state this whole change exists to remove.
+fn master_key_id_is_valid(id: &str) -> bool {
+    !id.is_empty() && !id.contains(':')
 }
 
 fn print_help() {
@@ -8491,11 +8827,17 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("  ironauth serve [--config PATH]   Run the server until SIGTERM/SIGINT");
-    println!("  ironauth storage rekey --url DSN --from-master-key ID:HEX \\");
-    println!("               --to-master-key ID:HEX");
+    println!("  ironauth storage rekey --url DSN --from-master-key KEY \\");
+    println!("               --to-master-key KEY [--i-will-rebuild-lookups]");
+    println!("                                   KEY is ID:env:VAR or ID:file:PATH, naming the");
+    println!("                                   secret as database.master_key does");
     println!("                                   Rewrap every tenant KEK under a new platform");
     println!("                                   master key. OFFLINE: a running server holds");
-    println!("                                   one master and cannot open both shapes");
+    println!("                                   one master and cannot open both shapes.");
+    println!("                                   REFUSES a change of key MATERIAL unless");
+    println!("                                   --i-will-rebuild-lookups: it rewraps keys and");
+    println!("                                   does not rebuild blind indexes, so every");
+    println!("                                   identifier lookup would silently stop matching");
     println!("  ironauth storage kek-backup --url DSN --out FILE");
     println!("                                   Export every wrapped KEK and print the");
     println!("                                   manifest. REFUSES a connection row-level");
@@ -8582,6 +8924,176 @@ mod tests {
         Config::from_toml_str(toml, "<test>")
             .expect("valid config")
             .config
+    }
+
+    /// Write a secret to its own file and return the path, so a config can reference it the way
+    /// an operator's does.
+    ///
+    /// PER PROCESS, not a fixed path in the shared temp directory: two checkouts running their
+    /// suites at once would otherwise write the same file, and one test would derive from the
+    /// other's secret.
+    fn secret_file(name: &str, secret: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ironauth-master-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a per-process directory");
+        let path = dir.join(format!("{name}.secret"));
+        std::fs::write(&path, secret).expect("write the secret file");
+        path
+    }
+
+    fn config_with_secret(path: &std::path::Path, extra: &str) -> Config {
+        config(&format!(
+            "[database]\nurl = \"postgres://localhost/ironauth\"\n\
+             master_key = {{ file = \"{}\" }}\n{extra}",
+            path.display()
+        ))
+    }
+
+    /// THE DEFECT THIS CLOSES, stated as a test: the key the rekey CLI parses and the key the
+    /// server resolves must be the SAME KEY for the same inputs.
+    ///
+    /// They were not, and nothing compared them. The server derives from a passphrase under a
+    /// hardcoded id; the CLI took an arbitrary id and 64 raw hex characters. So no operator
+    /// could name the key their deployment was using, and a rekey TO a raw key would have
+    /// rewrapped every KEK under something the server can never reconstruct, because HMAC is not
+    /// invertible and no `database.master_key` value yields chosen raw bytes.
+    ///
+    /// The rekey suite's tests could not see this: they construct both masters in-process and
+    /// never go near `resolve_master_key`.
+    #[test]
+    fn the_cli_can_name_the_key_the_server_resolves() {
+        let path = secret_file("same", "a-high-entropy-passphrase");
+        let served =
+            resolve_master_key(&config_with_secret(&path, "")).expect("the server resolves");
+
+        // Exactly what an operator would type, pointing at the same file the config points at.
+        let named = parse_master_key(&format!("master-1:file:{}", path.display()))
+            .expect("the CLI parses the file form");
+
+        // THE IDS MUST MATCH, because the id is written into every wrapped KEK's row and the
+        // read path rebuilds that KEK's AAD from it.
+        assert_eq!(served.id(), named.id());
+
+        // AND THE MATERIAL MUST MATCH, which is the half an id comparison would miss. There is
+        // no accessor for the bytes, so this asserts the property that matters: a KEK wrapped by
+        // one opens under the other.
+        let env = ironauth_env::Env::system();
+        let kek = ironauth_jose::Kek::generate(env.entropy());
+        let aad = ironauth_jose::Aad::builder().text("probe").build();
+        let wrapped = served.wrap_kek(env.entropy(), &aad, &kek);
+        named
+            .unwrap_kek(&aad, &wrapped)
+            .expect("the CLI-named key must open what the server-resolved key wrapped");
+    }
+
+    /// THE TRAILING NEWLINE, which is the subtle half. `echo secret > file` leaves one, the
+    /// config layer trims exactly one, and a CLI that read the file itself would derive a
+    /// different key from the same file. This passes only because both sides resolve through
+    /// `Secret`.
+    #[test]
+    fn a_secret_file_with_a_trailing_newline_still_names_the_same_key() {
+        let path = secret_file("newline", "a-high-entropy-passphrase\n");
+        let served =
+            resolve_master_key(&config_with_secret(&path, "")).expect("the server resolves");
+        let named =
+            parse_master_key(&format!("master-1:file:{}", path.display())).expect("the CLI parses");
+
+        let env = ironauth_env::Env::system();
+        let kek = ironauth_jose::Kek::generate(env.entropy());
+        let aad = ironauth_jose::Aad::builder().text("probe").build();
+        let wrapped = served.wrap_kek(env.entropy(), &aad, &kek);
+        named.unwrap_kek(&aad, &wrapped).expect("same key");
+    }
+
+    /// A DIFFERENT PASSPHRASE MUST NOT OPEN IT. Without this the tests above would pass against
+    /// a `derive` that ignored its input.
+    #[test]
+    fn a_different_passphrase_does_not_open_what_the_server_wrapped() {
+        let served_path = secret_file("diff-served", "a-high-entropy-passphrase");
+        let other_path = secret_file("diff-other", "a-different-passphrase");
+        let served =
+            resolve_master_key(&config_with_secret(&served_path, "")).expect("the server resolves");
+        let other =
+            parse_master_key(&format!("master-1:file:{}", other_path.display())).expect("parses");
+
+        let env = ironauth_env::Env::system();
+        let kek = ironauth_jose::Kek::generate(env.entropy());
+        let aad = ironauth_jose::Aad::builder().text("probe").build();
+        let wrapped = served.wrap_kek(env.entropy(), &aad, &kek);
+        assert!(other.unwrap_kek(&aad, &wrapped).is_err());
+    }
+
+    /// THE CLI CARRIES THE OPERATOR'S ID, which is the point of making it configurable. A parser
+    /// that hardcoded the default would pass every test above, since they all use `master-1`.
+    #[test]
+    fn the_cli_carries_whatever_id_it_was_given() {
+        let path = secret_file("carried-id", "s");
+        let named = parse_master_key(&format!("master-2:file:{}", path.display())).expect("parses");
+        assert_eq!(named.id(), "master-2");
+
+        let served =
+            resolve_master_key(&config_with_secret(&path, "master_key_id = \"master-2\"\n"))
+                .expect("the server resolves");
+        assert_eq!(served.id(), "master-2");
+    }
+
+    /// RAW BYTES ARE REFUSED. `--to-master-key ID:HEX` rewrapped every KEK under a key no server
+    /// can hold and exited SUCCESS, so the form is gone rather than documented.
+    #[test]
+    fn a_raw_hex_master_key_is_refused() {
+        let hex = "9f".repeat(32);
+        assert_eq!(hex.len(), 64);
+        assert!(parse_master_key(&format!("master-2:{hex}")).is_none());
+        // And the inline form, which would put the platform master key in argv.
+        assert!(parse_master_key("master-2:secret:a-passphrase").is_none());
+    }
+
+    /// An id this CLI cannot express is refused on BOTH sides, so it cannot be configured on a
+    /// server and then never named in a rotation.
+    #[test]
+    fn an_id_that_cannot_be_named_is_refused_by_the_cli_and_the_server() {
+        let path = secret_file("bad-id", "s");
+        assert!(parse_master_key(&format!(":file:{}", path.display())).is_none());
+        assert!(resolve_master_key(&config_with_secret(&path, "master_key_id = \"\"\n")).is_none());
+        assert!(
+            resolve_master_key(&config_with_secret(&path, "master_key_id = \"a:b\"\n")).is_none()
+        );
+    }
+
+    /// THE MATERIAL PROBE, which is how the rekey tells a rename from a real rotation.
+    ///
+    /// A `MasterKey` does not expose its bytes, so the two keys cannot be compared directly.
+    /// `derive` keys off the secret alone, so two masters agreeing on one fixed context agree on
+    /// every context: comparing a single blind index is a comparison of the material.
+    ///
+    /// That is the check standing between an operator and a silent loss of every login, so it
+    /// gets a test rather than being trusted to be obvious.
+    #[test]
+    fn a_blind_index_probe_separates_a_rename_from_a_change_of_material() {
+        let probe = ironauth_jose::Aad::builder()
+            .text("ironauth.rekey.material-probe")
+            .build();
+        let original = MasterKey::derive("master-1", b"the-secret");
+        let renamed = MasterKey::derive("master-2", b"the-secret");
+        let rotated = MasterKey::derive("master-2", b"a-different-secret");
+
+        assert_eq!(
+            original.blind_index(&probe).as_bytes(),
+            renamed.blind_index(&probe).as_bytes(),
+            "a rename keeps every lookup working, so the rekey must not refuse it"
+        );
+        assert_ne!(
+            original.blind_index(&probe).as_bytes(),
+            rotated.blind_index(&probe).as_bytes(),
+            "a change of material orphans every lookup, so the rekey must refuse it unqualified"
+        );
+    }
+
+    /// The default is the value already written into every existing deployment's rows.
+    #[test]
+    fn the_master_key_id_defaults_to_what_is_already_written() {
+        let path = secret_file("default-id", "s");
+        let resolved = resolve_master_key(&config_with_secret(&path, "")).expect("resolves");
+        assert_eq!(resolved.id(), "master-1");
     }
 
     #[test]

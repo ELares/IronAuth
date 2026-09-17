@@ -734,6 +734,15 @@ async fn mint_assertion(
         // whatever writes into it.
         access_extra_claims: &access_extra_claims,
     };
+    // A REFUSAL AND A FAULT BOTH BECOME `None` HERE, and the caller answers a server error for
+    // either. That is the safe direction -- an access rule that refuses this issuance refuses
+    // it (issue #154 criterion 4) -- but it reports an operator's deliberate denial as a fault.
+    //
+    // Not corrected here because the FedCM id-assertion response has nowhere honest to put the
+    // distinction: its error shape is defined by the FedCM spec, not by RFC 6749, and inventing
+    // an `access_denied` for it is a wire decision rather than a mapping. The token endpoint
+    // and the redirect front channel both DO distinguish them, which is where a client can act
+    // on the difference. Logged at the mint with the rule name either way.
     tokens::mint_id_token(state, signer, entry.policy(), &request)
         .ok()
         .map(|(token, _jti)| token)

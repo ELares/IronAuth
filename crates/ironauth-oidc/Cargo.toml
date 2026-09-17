@@ -1670,3 +1670,13 @@ path = "tests/saml_route.rs"
 name = "saml_acs"
 required-features = ["testing"]
 path = "tests/saml_acs.rs"
+
+[[test]]
+name = "forward_auth_step_up"
+required-features = ["testing"]
+path = "tests/forward_auth_step_up.rs"
+
+[[test]]
+name = "access_rules_two_consumers"
+required-features = ["testing"]
+path = "tests/access_rules_two_consumers.rs"

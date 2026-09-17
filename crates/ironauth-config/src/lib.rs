@@ -1395,9 +1395,30 @@ pub struct HotStateConfig {
     /// THAT IS NOW A MEASURED DECISION FOR THE JWKS USE rather than the remaining work, which is
     /// what this paragraph used to call it. `docs/UNIT-COSTS.md` measures both sides: a hit
     /// there saves a render and adds a validation parse, netting about 0.6 us for a fresh
-    /// environment's three keys, against a 20 us Postgres round trip on the same machine. So
-    /// installing one behind this key would make the JWKS endpoint slower, and leaving it unset
-    /// is the faster configuration. The seam pays where the alternative to a hop is a query.
+    /// environment's three keys, against a 20 us round trip on the same machine. So installing
+    /// one behind this key would make the JWKS endpoint slower, and leaving it unset is the
+    /// faster configuration.
+    ///
+    /// IT DOES NOT GENERALISE TO THE OTHER USES, which an earlier version of this paragraph
+    /// implied by saying the seam pays wherever the alternative is a query. A cache hit costs a
+    /// round trip and so returns only what an operation costs ABOVE one. The JWKS read is
+    /// unusual in costing almost nothing above it; a scoped read pays six round trips and a
+    /// query under row-level security, measured at 166 us, and is worth accelerating.
+    ///
+    /// HOW MUCH would depend on what is at the other end of the hop, which is what this key is
+    /// eventually FOR. A hit against the Postgres tier is itself a scoped read, 145 us, so
+    /// fronting one repository call it saves thirteen per cent. A hit against an IronCache
+    /// measures 32 to 33 us, an eighty per cent saving on the same read, and about ninety-three
+    /// per cent in front of a resolved tenant config, which is three scoped transactions.
+    ///
+    /// "WOULD", BECAUSE SETTING THIS KEY ATTACHES NOTHING TODAY. It declares an address that
+    /// readiness probes and reports a tier for; it installs no `HotState` implementation, so no
+    /// read changes path however it is set. That is the sentence above about the boot wiring,
+    /// restated so the figures here are not read as a description of what this key does.
+    ///
+    /// The figures are in `docs/UNIT-COSTS.md`, measured by a different instrument from the
+    /// database rows they are compared against, and they are HITS, so a deployment's benefit is
+    /// a function of its hit rate.
     ///
     /// That distinction is written down rather than glossed because the alternative is a knob
     /// that reads as "my cache is on" while nothing consults it, which is the defect this
@@ -1520,6 +1541,20 @@ pub struct AccessRuleConfig {
     /// Whether the request must be authenticated or anonymous.
     #[serde(default)]
     pub subject_state: Option<SubjectStateConfig>,
+    /// The authentication the request ARRIVED with must reach this `acr` floor.
+    ///
+    /// A short alias (`pwd`, `mfa`, `phr`, `phrh`) or a canonical server `acr`. Compared
+    /// through the step-up ladder, so naming `pwd` is satisfied by an `mfa` session.
+    ///
+    /// # Not the same field as `acr`
+    ///
+    /// `acr` names what a `step-up` action DEMANDS, and the action offers the caller a way to
+    /// get there. This SELECTS: a rule carrying it simply does not apply to a caller who has
+    /// not reached the floor, which is how an `allow` reserved for strongly authenticated
+    /// sessions is written above a broader `deny`. The two are independent and a rule may
+    /// carry both.
+    #[serde(default)]
+    pub acr_at_least: Option<String>,
 }
 
 /// Per-layer request-plane rate limits (issue #150 criterion 1).
@@ -2649,6 +2684,42 @@ pub struct DatabaseConfig {
     /// `UserInfo`) failing closed rather than storing plaintext; a production
     /// deployment must set it.
     pub master_key: Option<Secret>,
+
+    /// The identifier of the platform envelope master key (issue #153): a LABEL recorded on
+    /// every KEK this deployment wraps, not key material. Changing it does not break existing
+    /// rows, because the read path rebuilds each KEK's AAD from the id stored in that row and
+    /// key material is an HMAC over `master_key` alone; what it does is label new KEKs
+    /// differently from every row already written, splitting the population a later rotation has
+    /// to find. Changing `database.master_key` and running `ironauth storage rekey` rotates the
+    /// key MATERIAL, and that command now REFUSES to unless `--i-will-rebuild-lookups` is passed,
+    /// because it rewraps keys and rebuilds none of the fifteen blind indexes derived from the
+    /// secret: every identifier lookup would stop matching, silently. Must be non-empty and free
+    /// of `:`, the separator that command splits its master-key arguments on, or the server
+    /// refuses to resolve a master key at all.
+    /// Defaults to `master-1`, which every existing deployment has already written into its rows.
+    ///
+    /// # Why this is configurable, having been a literal
+    ///
+    /// The id is bound into the AAD of every wrapped tenant KEK, and the row records which
+    /// master wrapped it. That is what makes a rotation expressible: two masters must be
+    /// distinguishable, or a rewrapped KEK is indistinguishable from an unrewrapped one.
+    ///
+    /// It was the hardcoded literal `master-1` at every production site, so every deployment's
+    /// master had the same name and no second master could be named. `ironauth storage rekey`
+    /// meanwhile took an arbitrary id, which is the other half of a mismatch that made the
+    /// command unusable: an operator could not name the key their server was using.
+    ///
+    /// # The claim this paragraph used to make, and why it was wrong
+    ///
+    /// It said changing this breaks a deployment that has written data, "in the same way
+    /// changing `master_key` does". It does not, and the difference matters to anyone deciding
+    /// whether they can touch it: `fetch_active_kek` reads `master_key_id` out of the ROW and
+    /// rebuilds the AAD from that, so a renamed master opens everything the old name wrapped.
+    ///
+    /// The real hazard is quieter. Nothing warns when this stops matching what is already
+    /// stored, and the rekey's completion check counts rows whose `master_key_id` is not the
+    /// target, so a typo leaves a second group of rows that a later rotation will not look for.
+    pub master_key_id: Option<String>,
 }
 
 impl Default for DatabaseConfig {
@@ -2658,6 +2729,7 @@ impl Default for DatabaseConfig {
                 .expect("default DSN is valid by construction (covered by test)"),
             password: None,
             master_key: None,
+            master_key_id: None,
         }
     }
 }
@@ -6509,6 +6581,22 @@ fn validate_access_rule(at: &str, rule: &AccessRuleConfig) -> Result<(), ConfigE
         _ => {}
     }
 
+    // AN EMPTY FLOOR IS SATISFIED BY NOTHING, so the rule carrying it never fires. Whether
+    // that is dangerous depends on the action, which is the reason to refuse it here rather
+    // than reason about it per rule: a `deny` that never fires is a restriction the operator
+    // believes they have.
+    //
+    // Whether the value NAMES a rung is checked where the rule is built, because the rungs
+    // come from the authentication registry and this crate sits below it.
+    if let Some(floor) = &rule.acr_at_least {
+        if floor.trim().is_empty() {
+            return Err(invalid(format!(
+                "{at}.acr_at_least is empty: no authentication reaches an unnamed floor, so \
+                 the rule it constrains can never fire"
+            )));
+        }
+    }
+
     // A PREFIX THAT MATCHES NOTHING, OR EVERYTHING, IS NOT A CONSTRAINT.
     //
     // `""` matches no path at all under the engine's segment-boundary rule, so the rule it
@@ -6634,6 +6722,15 @@ fn validate_rule_subject(
                 "subject_equals_capture",
                 rule.subject_equals_capture.is_some(),
             ),
+            // AN ACR IS A CLAIM ABOUT THE SUBJECT TOO. The forward-auth surface fills the
+            // reached authentication context from the resolved identity, so an anonymous
+            // request presents none and no floor can hold. It reads as "anonymous callers who
+            // authenticated strongly", which is not a set of requests.
+            //
+            // This list is hand-written and that is its weakness: it was written when the
+            // vocabulary had four subject fields and a fifth was added without it, which is
+            // exactly how a coherence check stops covering the thing it names.
+            ("acr_at_least", rule.acr_at_least.is_some()),
         ] {
             if set {
                 return Err(invalid(format!(
@@ -11090,6 +11187,14 @@ mod tests {
                      acr = \"urn:example:strong\"\n",
                 ),
                 "which ignores it",
+            ),
+            (deny("acr_at_least = \"   \"\n"), "acr_at_least is empty"),
+            (
+                with(
+                    "[[forward_auth.rules]]\nname = \"a\"\naction = \"allow\"\n\
+                     subject_state = \"anonymous\"\nacr_at_least = \"mfa\"\n",
+                ),
+                "AND sets acr_at_least",
             ),
             (
                 deny("path_matches = \"^/u/(?<user\"\n"),

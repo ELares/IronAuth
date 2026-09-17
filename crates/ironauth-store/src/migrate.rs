@@ -1954,6 +1954,26 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0229_tenant_quota_limits.sql"),
         },
+        // EXPAND, and it has to be: this grants a read the NEW binary's readiness probe needs,
+        // and during a rolling upgrade the migration lands before that binary serves. An old
+        // replica is unaffected, because nothing it runs reads the ledger.
+        Migration {
+            version: 230,
+            name: "readiness_can_read_the_ledger",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0230_readiness_can_read_the_ledger.sql"),
+        },
+        // EXPAND. It ADDS constraints to a table no release writes -- `ironauth-quota` cannot
+        // reach the store at all, and the seam that would apply a stored override documents the
+        // management plane as "wired in M15" with no non-test caller -- so the validating scan
+        // costs nothing and no running binary can be holding a row that would fail it. An old
+        // replica is unaffected: it does not write this table either.
+        Migration {
+            version: 231,
+            name: "tenant_quota_limits_scope_fk",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0231_tenant_quota_limits_scope_fk.sql"),
+        },
     ]
 }
 
