@@ -234,6 +234,11 @@ cursor pagination, request idempotency, rate-limit information, and audited
 mutations. Use the current contract to check exact operations rather than
 assuming every resource supports every CRUD verb.
 
+Management `RateLimit` headers currently report fixed placeholder values; they
+do not establish an enforced request budget. Authentication quotas and
+forward-auth rate limits have separate enforcing paths. See the
+[management header implementation](../crates/ironauth-admin/src/ratelimit.rs).
+
 ## Security, events, and operations
 
 | Capability | What it provides and what to configure |

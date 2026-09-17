@@ -138,8 +138,10 @@ curl --fail-with-body \
   "https://id.example.com/t/$TENANT_ID/e/$ENVIRONMENT_ID/.well-known/openid-configuration"
 ```
 
-Every management POST requires an `Idempotency-Key`. Reuse a key only when
-replaying the identical operation and body. Production environments have
+Supply an `Idempotency-Key` for management POSTs whose public contract requires
+one, including tenant creation. Naturally repeatable operations such as sudo
+elevation document it as optional. Reuse a key only when replaying the identical
+operation and body. Production environments have
 additional guardrails, including a configured custom domain; use the typed
 errors to correct those requirements rather than relabeling production as dev.
 
