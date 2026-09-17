@@ -46,6 +46,18 @@
 //!
 //! # What this does NOT do
 //!
+//! IT DOES NOT REBUILD THE BLIND INDEXES, and that is the consequential one. Fifteen indexes in
+//! the store are derived from the master's material rather than through a KEK, so a rotation to
+//! a different SECRET leaves every one of them computed under a key nothing derives any more:
+//! an identifier lookup misses and reports an unknown user, existing accounts stop resolving at
+//! login, and re-registering the same address creates a second user past the unique index.
+//!
+//! THIS TYPE DOES NOT REFUSE THAT, deliberately. `ironauth storage rekey` does, unless the
+//! operator passes `--i-will-rebuild-lookups`, because the guard belongs at the door a human
+//! walks through rather than in a type that would then be refusing its own purpose -- an
+//! eventual index rebuild needs exactly this capability. An embedder driving the rewrap through
+//! `Store::rekey_master` gets no such prompt and has to know.
+//!
 //! It does not rewrap while the old master is still in use by a running server. A server
 //! holds ONE master key, so between the first rewrapped row and the last, a live process
 //! cannot open both shapes. Online rekey (criterion 2) needs a master key RING on the read

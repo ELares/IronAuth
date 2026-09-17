@@ -128,3 +128,17 @@ manifest is for.
 rotation names the OLD master in `master_key_id` and can only be restored with the old master
 key available. Keep both keys until every backup naming the old one has aged out, or the
 backup is a set of rows nothing can open.
+
+**A rotation to a different SECRET is refused by default**, and the refusal is not about
+backups. `storage rekey` rewraps keys and rebuilds none of the fifteen blind indexes derived
+from the master secret: login handles, external ids, trait logins, flexible and routing
+identifiers, recovery codes, invitations, organisation contact emails, email and SMS factor
+recipients, message recipients, and the risk-signal, abuse, SSF-stream and migration-record
+subjects. After such a rotation every one of them is computed under a key nothing derives any
+more, and the failure is silent: an identifier lookup misses and reports an unknown user, so
+existing accounts stop resolving at login while re-registering the same address creates a
+second user past the unique index.
+
+There is no index-rebuild tool in the tree today. `--i-will-rebuild-lookups` exists for an
+operator who has one of their own; without it, the rotation that is supported is a change of
+NAME with the same secret, which moves rows to a new generation and leaves every lookup intact.

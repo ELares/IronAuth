@@ -17,8 +17,9 @@ range per docs/RELEASING.md.
   IT IS A LABEL, NOT A KEY. Changing it does not break existing rows: the read path rebuilds each
   KEK's AAD from the id stored in that row, and key material is an HMAC over the secret alone.
   What it does is split the population, labelling new KEKs differently from every row already
-  written, which a later rotation then has to find. Rotating the actual key means changing
-  `database.master_key` and running the rekey.
+  written, which a later rotation then has to find. Rotating the key MATERIAL means changing
+  `database.master_key` and running the rekey, which refuses unless the operator passes
+  `--i-will-rebuild-lookups`: it rebuilds none of the blind indexes derived from the secret.
 
   Refused at boot if empty or containing `:`, the separator the rekey splits its master-key
   arguments on: an id that cannot be named is one no rotation could ever target.

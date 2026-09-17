@@ -258,6 +258,13 @@ impl Store {
     /// The pool stays private, as everywhere else on this type. See [`crate::rekey`] for what
     /// the operation is, why it resumes without a cursor, and why it is offline.
     ///
+    /// # It rewraps keys and rebuilds no LOOKUPS
+    ///
+    /// A rotation to a different SECRET leaves all fifteen master-derived blind indexes computed
+    /// under a key nothing derives any more, so identifier lookups silently stop matching. The
+    /// `ironauth storage rekey` command refuses that unless the operator acknowledges it; this
+    /// method does not, so a caller driving the rewrap directly owns that decision.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Encryption`] if the connected role is subject to row-level security, if

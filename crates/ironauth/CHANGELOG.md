@@ -22,8 +22,10 @@ range per docs/RELEASING.md.
   address computes a different tag, passes the constraint, and creates a SECOND live user while
   the first, with its grants and enrolments, becomes unreachable.
 
-  Rotating the NAME while keeping the secret is safe, needs no flag, and is the shape the docs
-  recommend: it moves rows to a new generation and leaves every lookup intact.
+  Rotating the NAME while keeping the secret is safe and needs no flag: it moves rows to a new
+  generation and leaves every lookup intact. The configuration docs and `docs/KEK-RECOVERY.md`
+  now say so; before this they pointed at a material rotation with no caveat, which is the
+  procedure the command refuses.
 
 - `ironauth storage rekey` now names its master keys as `ID:env:VAR` or `ID:file:PATH` (issue
   #153), resolving and deriving the secret exactly as the server does from `database.master_key`.
