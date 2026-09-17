@@ -94,6 +94,9 @@ ironbus-client = { workspace = true, optional = true }
 [features]
 # The optional IronBus notification backbone for the transactional outbox (issue #104).
 ironbus = ["dep:ironbus-client"]
+# The IronCache accelerator backend (issue #146), forwarded so a build of the server can reach
+# it. OFF by default: Postgres-only is the supported default and stays so.
+ironcache = ["ironauth-hot/ironcache"]
 # Default build is lean: no test-support surface. Production only ever needs the
 # default feature set.
 default = []

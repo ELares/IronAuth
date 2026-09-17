@@ -90,6 +90,14 @@ keyring = { version = "3", default-features = false, features = ["apple-native",
 wasm-hooks = ["dep:ironauth-hooks", "ironauth-oidc/wasm-hooks"]
 # Passes the optional IronBus wake-up backbone through to ironauth-store (issue #104).
 ironbus = ["ironauth-store/ironbus"]
+# Passes the optional IronCache accelerator backend through (issue #146). OFF by default: the
+# covenant is that a deployment is COMPLETE on Postgres alone, and this only makes the backend
+# BUILDABLE -- nothing is attached until boot constructs one.
+#
+# BOTH dependents are named, because both depend on `ironauth-hot` and cargo unifies features
+# per crate: naming only one would still enable the backend, and the next reader would have to
+# work out that it arrived through a crate the line does not mention.
+ironcache = ["ironauth-oidc/ironcache", "ironauth-store/ironcache"]
 # Forwarded to the server crate: OTLP trace export off by default so the
 # default build and the musl static lane stay lean and protoc-free.
 otlp = ["ironauth-server/otlp"]

@@ -147,6 +147,14 @@ default = []
 # wasmtime and cranelift, whose MSRV is 1.95 against this crate's published 1.85. See the
 # dependency's own comment above.
 wasm-hooks = ["dep:ironauth-hooks"]
+# The IronCache accelerator backend (issue #146). OFF by default, because the covenant is that
+# a deployment is COMPLETE on Postgres alone and the cache is never required.
+#
+# It is forwarded rather than left on `ironauth-hot` because a feature nothing forwards cannot
+# be enabled in a build of the server: `cargo build -p ironauth --features ironcache` had no
+# path to `ironauth-hot/ironcache`, so `IronCacheHotState` was unreachable from any binary and
+# issue #146's "the full test suite passes in both modes" could not be attempted.
+ironcache = ["ironauth-hot/ironcache"]
 # Enables the ironauth-store real-database harness for the DB-backed integration
 # tests (mirrors ironauth-admin's `testing` gate). Adds no runtime surface.
 testing = ["ironauth-store/testing", "ironauth-saml/test-util"]

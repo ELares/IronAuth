@@ -1392,6 +1392,14 @@ pub struct HotStateConfig {
     /// outside tests calls `with_jwks_hot_state`, so `jwks_hot` is `None` in every shipped
     /// binary and the accelerator is never consulted however this key is set.
     ///
+    /// A SECOND GAP WAS NARROWER STILL AND IS NOW CLOSED: until #1322 the IronCache backend
+    /// could not be BUILT into the server at all. `ironauth-hot` declares an `ironcache`
+    /// feature and no crate above it forwarded one, so `cargo build -p ironauth --features
+    /// ironcache` had no path to it and `IronCacheHotState` was unreachable from any binary --
+    /// which made the measured 80% figure below unattainable rather than merely unattached.
+    /// The feature now forwards through `ironauth-oidc` and `ironauth-store`, and the
+    /// `--all-features` workspace check compiles the binary with it.
+    ///
     /// THAT IS NOW A MEASURED DECISION FOR THE JWKS USE rather than the remaining work, which is
     /// what this paragraph used to call it. `docs/UNIT-COSTS.md` measures both sides: a hit
     /// there saves a render and adds a validation parse, netting about 0.6 us for a fresh
