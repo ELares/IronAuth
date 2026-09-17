@@ -8454,11 +8454,18 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
             to.id()
         );
         println!(
-            "storage rekey: rows move one at a time, and a node can serve throughout ONLY if it \n\
-             already carries both generations. Before running this, set database.master_key and \n\
+            "storage rekey: rows move one at a time, and a node serves throughout only if it \n\
+             already carries both generations. Set database.master_key and \n\
              database.master_key_id to the incoming generation, list the outgoing one under \n\
-             database.previous_master_keys, and restart. Drop that entry only after this \n\
-             reports nothing remaining. Without the ring in place, stop the fleet first."
+             database.previous_master_keys, and restart BEFORE running this. Drop that entry \n\
+             only after this reports nothing remaining."
+        );
+        println!(
+            "storage rekey: WARNING, this rewraps keys and does NOT rebuild blind indexes. \n\
+             Every identifier lookup (login handle, external id, recovery code, invitation, \n\
+             abuse and risk subjects) is derived from the master SECRET, so changing the secret \n\
+             leaves those lookups unable to find existing rows. Changing only the id, with the \n\
+             same secret, leaves them intact."
         );
         match store.rekey_master(&from, &to).await {
             Ok(report) => {

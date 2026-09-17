@@ -54,22 +54,45 @@
 //! generations, `database.previous_master_keys` configures them, and both unwrap sites pick the
 //! key for the generation each ROW records.
 //!
-//! So the sequence that keeps a deployment serving is:
+//! So the KEK half of a rotation can now be served:
 //!
 //! 1. Set `master_key` to the incoming secret and `master_key_id` to its new name, and list the
 //!    OUTGOING generation under `previous_master_keys`. Restart. Every node can now open both
 //!    shapes and writes new work under the incoming master.
-//! 2. Run the rekey. Rows move one at a time and either shape is readable throughout.
+//! 2. Run this. Rows move one at a time and either shape is readable throughout.
 //! 3. Once it reports nothing remaining, drop the `previous_master_keys` entry and restart.
 //!
-//! STEP 1 BEFORE STEP 2, AND STEP 3 STRICTLY AFTER. Running the rekey before the nodes carry the
-//! ring strands every row it has already moved; dropping the predecessor before the run
-//! converges strands every row it has not.
+//! STEP 1 BEFORE STEP 2, AND STEP 3 STRICTLY AFTER. Running this before the nodes carry the ring
+//! strands every row it has already moved; dropping the predecessor before the run converges
+//! strands every row it has not.
 //!
-//! What is still NOT covered here is a test that drives that sequence against a live server
-//! under load, which is what criterion 2 asks for. The ring's behaviour is tested (a mixed
-//! database served by one key value, new work never written under a predecessor, a missing
-//! generation failing closed); the operational sequence is documented and unexercised.
+//! # THE BLIND INDEXES DO NOT SURVIVE A CHANGE OF SECRET, and this does not fix them
+//!
+//! That sequence keeps ENVELOPE reads working. It does not keep LOOKUPS working, and an operator
+//! reading only the steps above would find that out from their users.
+//!
+//! Every blind index in the store is `master.blind_index(context)`, derived from the master's
+//! material directly rather than through a KEK: the user identifier, the external id, the
+//! recovery code, the invitation identifier, the risk-signal subject, the abuse subject, the
+//! trait login, the routing identifier. This module rewraps `tenant_keks` and touches none of
+//! them, so after a rotation to a DIFFERENT SECRET every stored index was computed under a key
+//! nothing derives any more, and a login by identifier stops finding the user it should.
+//!
+//! Verified rather than reasoned: two masters derived from different secrets produce different
+//! indexes for the same context, and two derived from the SAME secret produce the same one
+//! whatever ids they carry, because `derive` keys off the secret alone.
+//!
+//! So a rotation is safe today in exactly one shape: CHANGING THE ID while keeping the secret,
+//! which moves rows to a new generation name and leaves every index intact. Changing the secret
+//! needs the indexes rebuilt, which means reading each sealed identifier and recomputing its
+//! index under the new master. That is not a rewrap and this module does not do it.
+//!
+//! The ring is still the right foundation for the eventual fix: a rebuild has to run while both
+//! generations are readable, which is what it provides.
+//!
+//! Also not covered: a test driving the sequence against a live server under load, which is what
+//! criterion 2 asks for. The ring's own behaviour is tested (a mixed database served by one key
+//! value, new work never written under a predecessor, a missing generation failing closed).
 
 use ironauth_env::Entropy;
 use ironauth_jose::{Kek, MasterKey, Sealed};

@@ -917,3 +917,41 @@ async fn a_ring_without_the_wrapping_master_refuses() {
     let ring = master("master-new", 0x0002).with_previous(master("master-other", 0x0003));
     assert!(open_secret_result(&db, scope, &ring).await.is_err());
 }
+
+/// WHAT A ROTATION DOES NOT CARRY: the blind indexes (issue #153).
+///
+/// Every blind index in the store is `master.blind_index(context)`, derived from the master's
+/// material directly rather than through a KEK, and this module rewraps `tenant_keks` and
+/// touches none of them. So a rotation to a different SECRET leaves every stored index computed
+/// under a key nothing derives any more, and a login by identifier stops finding its user.
+///
+/// This pins the property rather than the consequence, because the consequence is spread across
+/// eight derivations in the repository and one of them changing would not be caught by testing
+/// another. If this ever starts failing, either `derive` stopped keying off the secret alone or
+/// something began carrying indexes across a rotation, and the module doc above needs revisiting.
+#[test]
+fn a_change_of_secret_changes_every_blind_index_and_a_change_of_id_does_not() {
+    let context = ironauth_jose::Aad::builder()
+        .text("user-identifier")
+        .text("alice@example.com")
+        .build();
+
+    let before = MasterKey::derive("master-1", b"the-old-secret");
+    let after_rotation = MasterKey::derive("master-2", b"the-new-secret");
+    assert_ne!(
+        before.blind_index(&context).as_bytes(),
+        after_rotation.blind_index(&context).as_bytes(),
+        "a rotation to a new secret orphans every stored blind index; the rekey does not rebuild \
+         them, so identifier lookups stop finding existing rows"
+    );
+
+    // THE SAFE SHAPE, and the control: renaming the generation while keeping the secret leaves
+    // every index intact, because `derive` keys off the secret alone.
+    let renamed_only = MasterKey::derive("master-2", b"the-old-secret");
+    assert_eq!(
+        before.blind_index(&context).as_bytes(),
+        renamed_only.blind_index(&context).as_bytes(),
+        "changing only the id must leave lookups working, or the one rotation shape that is safe \
+         today would not be"
+    );
+}
