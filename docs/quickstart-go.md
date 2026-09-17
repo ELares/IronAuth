@@ -11,6 +11,23 @@ You need Go 1.24+ and a checkout of this repository. **No Go dependencies**: the
 has `crypto/ed25519`, so the signature check is visible in the example rather than hidden behind
 a package.
 
+## Before running the commands
+
+Run these commands from the repository root in the same shell. Install the
+pinned Rust toolchain and PostgreSQL server binaries first; the
+[emulator guide](EMULATOR.md#run-the-local-development-emulator) explains
+`PG_BIN` discovery. Run as an ordinary user because `initdb` refuses root.
+The emulator will manage a throwaway database for this quickstart:
+
+```sh
+unset DATABASE_URL
+export QS_DIR="$(mktemp -d)"
+```
+
+`QS_DIR` holds logs, temporary application files, and process IDs. The automated
+`scripts/quickstart.sh` runner creates it itself; set it as above when following
+the steps manually. Follow the teardown at the end before removing that directory.
+
 ## 1. Start a local IronAuth
 
 ```bash quickstart
