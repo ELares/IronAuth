@@ -1484,7 +1484,11 @@ ironauth dev
 It is the same binary and the same code paths a deployment runs. It is not a mock, and it is
 not a second implementation that can drift from the real one.
 
-## Prerequisites and a first launch
+## Run the local development emulator
+
+Use the local development emulator with a deterministic seed for offline
+application sign-in tests. The recipe below starts a seeded provider without
+connecting to an external service.
 
 Install the repository's pinned Rust toolchain and PostgreSQL binaries, including
 `initdb`, `pg_ctl`, and `psql`. Run as an ordinary user; PostgreSQL initialization
