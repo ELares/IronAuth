@@ -1690,3 +1690,8 @@ path = "tests/forward_auth_step_up.rs"
 name = "access_rules_three_consumers"
 required-features = ["testing"]
 path = "tests/access_rules_three_consumers.rs"
+
+[[test]]
+name = "degraded_postgres_down"
+required-features = ["testing"]
+path = "tests/degraded_postgres_down.rs"
