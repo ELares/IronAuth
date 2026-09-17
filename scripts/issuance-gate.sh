@@ -15,15 +15,19 @@
 #   * calls `issuance_refusal` (it is a door), or
 #   * carries the marker `issuance-gate-allow: <reason>` on its `fn` line (it is not).
 #
-# The marker is read from the FIRST LINE of the body, or from the doc comment immediately above
-# the `fn`. Not from anywhere in the body: a marker buried a hundred lines down exempts a door
-# nobody reading the signature would know was exempt, and a comment mentioning the string in
-# passing would do it by accident.
+# THE MARKER IS READ FROM THE DOC COMMENT IMMEDIATELY ABOVE THE `fn`, and nowhere else.
 #
-# Not from the `fn` line either, which is where this was written first and where it does not
-# survive: `cargo fmt` moves a trailing comment off a multi-line signature and onto the first
-# body line, so every marker silently stopped counting the moment the file was formatted. The
-# accepted positions are the two rustfmt leaves alone.
+# Not from the `fn` line, which is where it was written first and where it does not survive:
+# `cargo fmt` moves a trailing comment off a multi-line signature onto the first body line, so
+# every marker silently stopped counting the moment the file was formatted.
+#
+# And not from the body either, which is what the second attempt did and what a review took
+# apart. That version accepted a marker in the first COMMENT anywhere in the body rather than
+# the first line, so one buried a hundred lines down exempted a door; and when a body carried
+# no comment at all it absorbed the NEXT item's doc comment, so a marker written for the
+# function below exempted the ungated one above it. Both fail OPEN. One position, read from a
+# buffer that is cleared by any line that is not a comment or an attribute, has neither
+# failure, and it is the position the reason belongs in anyway.
 #
 # WHAT IS NOT A DOOR, and why the marker exists rather than a hard rule: `mint_refresh_token`
 # mints an opaque successor to a grant that was already approved and gated at its own issuance,
@@ -57,31 +61,43 @@ fi
 
 # Every `fn mint*` in the module, with its line number. `awk` walks the file once and reports
 # the body of each, so a door is judged by what it CALLS rather than by what sits near it.
-doors=$(awk -v gate="$GATE" -v marker="$MARKER" '
-    # The doc comment or attribute block immediately above an item, kept so the marker can
-    # live where `cargo fmt` will not move it.
+# THE DOOR PATTERN, kept in ONE place because the count below is checked against it.
+#
+# Deliberately wider than the shapes present today: `async`, any `pub(...)` visibility, a
+# generic parameter list, and a digit or capital in the name all count. The first version
+# matched `^(pub )?(pub\(crate\) )?fn mint[a-z_]*\(` and a review pointed out that
+# `pub async fn mint_device_bound_token(` -- the natural next shape in a module that already
+# has `pub(crate) async fn` in it -- was not a door at all: the scan skipped it silently and
+# still printed "clean", because the pre-existing doors kept the count non-zero.
+#
+# NO ESCAPED PARENTHESES, deliberately. The first version wrote the visibility as
+# `pub(\([a-z:]+\))?` and passed it to awk through `-v`, which processes escape sequences in
+# an assignment: awk received `pub(([a-z:]+))?`, where the parens are GROUPS rather than
+# literals, so `pub(super) fn mint_widget` stopped being a door. The count cross-check below
+# caught it, which is what it is for -- but `pub[^[:space:]]*` needs no escaping at all and
+# cannot be mangled in transit.
+DOOR_RE='^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+mint'
+
+doors=$(awk -v gate="$GATE" -v marker="$MARKER" -v door_re="$DOOR_RE" '
+    # The comment or attribute block immediately above an item. Any other line clears it, so a
+    # block can only ever be credited to the item it actually precedes.
     /^[[:space:]]*(\/\/|#\[)/ {
-        if (name == "") { preceding = preceding $0 "\n" }
-        else if (body_lines == 0) { first_body = first_body $0 "\n"; body_lines = 1 }
-        else if (name != "" && index($0, gate "(") > 0) { gated = 1 }
+        preceding = preceding $0 "\n"
         next
     }
-    # A mint definition at top level: `fn mint...(` or `pub fn mint...(`, column zero.
-    /^(pub )?(pub\(crate\) )?fn mint[a-z_]*\(/ {
+    $0 ~ door_re {
         if (name != "") { emit() }
         name = $0
-        sub(/^.*fn /, "", name)
-        sub(/\(.*$/, "", name)
+        sub(/^.*fn[[:space:]]+/, "", name)
+        sub(/[<(].*$/, "", name)
         line = NR
         marked = (index(preceding, marker) > 0)
         preceding = ""
-        first_body = ""
-        body_lines = 0
         gated = 0
         next
     }
     # A new top-level item ends the previous body.
-    /^(pub )?(pub\(crate\) )?(fn|struct|enum|impl|trait|const|static|mod) / {
+    /^(pub[^ ]* )?(async )?(fn|struct|enum|impl|trait|const|static|mod) / {
         if (name != "") { emit(); name = "" }
         preceding = ""
         next
@@ -92,7 +108,6 @@ doors=$(awk -v gate="$GATE" -v marker="$MARKER" '
     }
     END { if (name != "") { emit() } }
     function emit() {
-        if (index(first_body, marker) > 0) { marked = 1 }
         printf "%s\t%d\t%d\t%d\n", name, line, gated, marked
     }
 ' "$TOKENS")
@@ -104,6 +119,23 @@ if [ -z "$doors" ]; then
     exit 1
 fi
 
+# THE COUNT IS CHECKED AGAINST A SECOND, DUMBER READING OF THE SAME FILE.
+#
+# The awk above is the only thing that decides what a door IS, so a pattern that quietly stops
+# matching one shape removes a door and leaves every remaining one passing -- the failure is
+# invisible because the output still says "clean". `grep -c` over the same expression is not an
+# independent implementation, but it is an independent PASS: if the two disagree, the awk's
+# state machine dropped something it matched (a door inside a block it treated as another
+# item's body, say), and that is exactly the case a reader would never notice.
+found=$(printf '%s\n' "$doors" | grep -c . || true)
+lines=$(grep -cE "$DOOR_RE" "$TOKENS" || true)
+if [ "$found" -ne "$lines" ]; then
+    echo "issuance-gate: the scan reports ${found} mint entry points and the file has ${lines}"
+    echo "  lines matching the same pattern. One of them is wrong, and the direction that"
+    echo "  matters is a door the state machine dropped: it would be ungated and unreported."
+    exit 1
+fi
+
 checked=0
 while IFS=$'\t' read -r name line gated marked; do
     [ -n "$name" ] || continue
@@ -112,8 +144,8 @@ while IFS=$'\t' read -r name line gated marked; do
         continue
     fi
     echo "issuance-gate: ${TOKENS}:${line} \`${name}\` mints tokens and does not consult the"
-    echo "  access rules. Call ${GATE} in it, or mark the \`fn\` line"
-    echo "  \`${MARKER} <why this is not an issuance decision>\`."
+    echo "  access rules. Call ${GATE} in it, or put"
+    echo "  \`${MARKER} <why this is not an issuance decision>\` in its DOC COMMENT."
     fail=1
 done <<< "$doors"
 

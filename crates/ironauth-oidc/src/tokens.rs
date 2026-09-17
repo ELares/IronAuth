@@ -1193,9 +1193,13 @@ pub(crate) fn build_client_credentials_access_token_claims(
 ///
 /// The three mint entry points returned `Result<_, ()>`, and every caller mapped that to a
 /// `server_error`. That is the right answer for a signing failure and the wrong one for a
-/// policy denial: an operator's rule refusing an issuance is not the server failing, and RFC
-/// 6749 section 5.2 has a name for it. A caller that cannot tell them apart reports a
-/// deliberate refusal as a fault, which is how a denial policy looks like an outage.
+/// policy denial: an operator's rule refusing an issuance is not the server failing. A caller
+/// that cannot tell them apart reports a deliberate refusal as a fault, which is how a denial
+/// policy looks like an outage.
+///
+/// The code the `Policy` arm becomes is `access_denied`, which is an EXTENSION of the token
+/// endpoint's error list rather than a member of it. See [`crate::error::TokenError`]'s variant
+/// for why that is the right trade and what it costs a strict client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MintRefusal {
     /// The claims could not be built or the signing backend refused. A `server_error`.
@@ -1224,11 +1228,20 @@ impl From<()> for MintRefusal {
 /// "/admin"` is about the protected application, so matching it against `/token` would be
 /// meaningless and matching it against `/admin` would be a lie.
 ///
-/// Leaving them empty makes every request-shaped criterion FAIL to match here -- an empty path
-/// is under no prefix, an empty method is in no list, an empty host equals no host -- so a rule
-/// carrying one is inert at this consumer rather than accidentally binding. What remains
-/// matchable is what issue #154 asks this layer to deny by: the subject, and the authentication
-/// it reached.
+/// Leaving them empty makes MOST request-shaped criteria fail to match here: an empty path is
+/// under no prefix and an empty method is in no list.
+///
+/// NOT ALL OF THEM, and an earlier version of this comment claimed otherwise -- it said "an
+/// empty host equals no host", which is false: `Criterion::Host` is exact equality, so an empty
+/// configured host equals the empty one these facts carry, and a `path_matches` accepting the
+/// empty string matches the empty path. Both directions were reachable: as a `deny` such a
+/// rule refused every issuance, and as an `allow` above a real `deny` it matched first and kept
+/// issuing while the operator read a refusal in their config.
+///
+/// What makes the emptiness safe is not the emptiness. [`crate::rules::RuleSet::refusal`] walks
+/// only the rules that constrain the PRINCIPAL, so a rule whose criteria are all about the
+/// request neither refuses nor shadows here whatever it happens to match. The empty fields
+/// remain the honest description of a request that has no path, method or host.
 ///
 /// # Only an explicit deny refuses
 ///
@@ -1385,8 +1398,8 @@ fn generate_opaque_access_token(state: &OidcState, jti: &IssuedTokenId) -> Strin
 /// `server_error`, so issuance fails closed. The opaque path cannot fail (entropy
 /// draw and hashing are infallible), but the ID token is always signed, so a
 /// signing failure still fails the whole exchange closed.
+/// issuance-gate-allow: delegates to `mint_access`, which is the door.
 pub fn mint(
-    // issuance-gate-allow: delegates to mint_access, which is the door
     state: &OidcState,
     signer: &SigningKey,
     policy: &SigningPolicy,
@@ -1452,8 +1465,8 @@ pub fn mint(
 /// Returns `Err(())` if `signer`'s algorithm is not permitted by `policy` or the
 /// signing backend fails; the caller maps that to a token-endpoint `server_error`,
 /// so a signing failure fails the refresh closed. The opaque path is infallible.
+/// issuance-gate-allow: delegates to `mint_access`.
 pub fn mint_access_token(
-    // issuance-gate-allow: delegates to mint_access
     state: &OidcState,
     signer: &SigningKey,
     policy: &SigningPolicy,
@@ -1563,8 +1576,8 @@ fn mint_access(
 /// The budget is read from the state's `[token_claims]` section here rather than
 /// threaded in on [`MintRequest`]. One source, no wiring point for a caller to miss,
 /// and no way for two call sites to hand the mint two different budgets.
+/// issuance-gate-allow: a format arm below `mint_access`, which has already checked.
 fn mint_at_jwt(
-    // issuance-gate-allow: a format arm below mint_access
     state: &OidcState,
     signer: &SigningKey,
     policy: &SigningPolicy,
@@ -1660,8 +1673,8 @@ fn at_jwt_payload(
 /// exchange, the refresh grant, and the client-credentials grant (issue #23): every
 /// opaque access token IronAuth issues is byte-shaped identically regardless of the
 /// grant that minted it.
+/// issuance-gate-allow: a format arm below `mint_access`, which has already checked.
 fn mint_opaque_access(
-    // issuance-gate-allow: a format arm below mint_access
     state: &OidcState,
     scope: &Scope,
     target: &AccessTokenTarget,
@@ -1699,8 +1712,8 @@ pub struct MintedRefreshToken {
 /// so a token cannot be relocated to another scope), and a database dump yields
 /// nothing replayable.
 #[must_use]
+/// issuance-gate-allow: an opaque successor to a grant gated at its own issuance.
 pub fn mint_refresh_token(state: &OidcState, scope: &Scope) -> MintedRefreshToken {
-    // issuance-gate-allow: successor to an already-gated grant
     let jti = RefreshTokenId::generate(state.env(), scope);
     let mut bytes = [0_u8; OPAQUE_ACCESS_TOKEN_BYTES];
     state.env().entropy().fill_bytes(&mut bytes);

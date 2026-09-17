@@ -202,10 +202,16 @@ async fn one_rule_set_gates_a_forward_auth_resource_and_a_token_issuance() {
 /// refusal passes. A mutation proved exactly that -- `refusal` rewritten to treat
 /// `(Deny, None)` as a refusal left the test above green.
 ///
-/// So this is the ordinary configuration instead: path rules and no catch-all, which is what
-/// an operator protecting an application writes. A token request matches no path rule, and if
-/// that fall-through refused, the first forward-auth rule anyone wrote would silently stop
-/// every issuance in the deployment.
+/// So this is a configuration without one: a path rule and nothing else. A token request
+/// matches no path rule, and if that fall-through refused, the first forward-auth rule anyone
+/// wrote would silently stop every issuance in the deployment.
+///
+/// It is NOT "what an operator protecting an application writes", which is what this comment
+/// claimed and what a review corrected. The ordinary shape ends in an explicit terminal deny --
+/// the config crate's own `a_well_formed_rule_list_is_accepted` does, this crate's forward-auth
+/// fixtures do, and `validate_access_rule` steers operators there by refusing `path_prefix =
+/// "/"`. That shape is the one this test could not see, and it was a total outage:
+/// `a_terminal_catch_all_deny_does_not_stop_every_token` below is the row for it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_path_rule_that_matches_no_token_request_does_not_refuse_one() {
     let harness = Harness::start_store_backed().await;
@@ -278,6 +284,81 @@ async fn a_path_rule_that_matches_no_token_request_does_not_refuse_one() {
         StatusCode::OK,
         "a path rule constrains a resource, not an issuance: reading the fall-through as a \
          refusal would mean one forward-auth rule stopped every token: {body}"
+    );
+    assert!(body.contains("access_token"), "{body}");
+}
+
+/// THE SHAPE EVERY REAL FORWARD-AUTH LIST ENDS WITH, which the two tests above cannot see.
+///
+/// A review found this and it was a total outage on upgrade. The first test's catch-all is an
+/// `allow`; the second has none at all. An operator's list ends in an explicit terminal
+/// `deny` -- a rule with no criteria, which is how a catch-all is written -- and that arrived
+/// at the issuance consumer as a named, matching deny. Every token in the deployment stopped.
+///
+/// Driven end to end rather than in the engine alone, because the engine's unit row cannot see
+/// the boot path installing these rules for every mint in the process.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_catch_all_deny_does_not_stop_every_token() {
+    let harness = Harness::start_store_backed().await;
+    let subject = harness
+        .seed_user("ordinary@example.test", "correct horse battery")
+        .await;
+
+    let cfg = ForwardAuthConfig {
+        enabled: true,
+        rules: vec![
+            AccessRuleConfig {
+                name: "public-area".to_owned(),
+                action: AccessActionConfig::Allow,
+                path_prefix: Some("/public".to_owned()),
+                ..AccessRuleConfig::default()
+            },
+            // NO CRITERIA. The catch-all, written the way this repository's own canonical rule
+            // list writes it.
+            AccessRuleConfig {
+                name: "deny-the-rest".to_owned(),
+                action: AccessActionConfig::Deny,
+                ..AccessRuleConfig::default()
+            },
+        ],
+        ..ForwardAuthConfig::default()
+    };
+    let rules = access_rules_from_config(&cfg, &[]).expect("the rules convert");
+    let state = harness
+        .state()
+        .clone()
+        .with_access_rules(Arc::clone(&rules));
+    let router = oidc_router(state);
+
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+    let code = harness
+        .issue_code_for_subject(&client_id, &subject, "openid")
+        .await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(
+            header::AUTHORIZATION,
+            format!("Basic {}", STANDARD.encode(format!("{client_id}:{secret}"))),
+        )
+        .body(Body::from(form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT_URI),
+        ])))
+        .expect("request builds");
+
+    let (status, _, body) = send_through(router, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a terminal deny is the forward-auth default written down, not a statement about who \
+         may hold a token: {body}"
     );
     assert!(body.contains("access_token"), "{body}");
 }

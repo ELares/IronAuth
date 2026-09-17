@@ -492,19 +492,57 @@ impl RuleSet {
     /// refuse a grant for a reason the response could not express; the surfaces that CAN offer
     /// the remedy are the authorization request and the forward-auth check, which is where a
     /// step-up rule belongs. `decide` still returns it for them.
-    /// # A fall-through is not a refusal, and that reads off the NAME
+    /// # ONLY the rules that say something about WHO IS ASKING take part
     ///
-    /// `decide` answers a request no rule matched with `(Deny, None)`. The `None` is what
-    /// separates it from a rule that denied, so this asks for both: the action AND a rule to
-    /// attribute it to. Reading the action alone would turn every fall-through into a refusal,
-    /// which is the whole failure this entry point exists to avoid.
+    /// A rule carrying no criterion about the principal is not policy at this consumer, and
+    /// skipping it is the difference between this being usable and being an outage.
+    ///
+    /// The first version excused only the IMPLICIT fall-through -- `decide` answers an
+    /// unmatched request `(Deny, None)`, and reading the action alone would refuse it. A review
+    /// showed that is not enough, because an operator writing the same default DOWN gets the
+    /// opposite answer: `[[forward_auth.rules]] name = "deny the rest", action = "deny"` with
+    /// no criteria matches everything (an empty criteria list is how a catch-all is written),
+    /// so it arrives as `(Deny, Some("deny the rest"))` and refused every token in the
+    /// deployment. That is the repository's own canonical shape -- the config crate's
+    /// `a_well_formed_rule_list_is_accepted` ends with exactly it, this crate's forward-auth
+    /// fixtures use `rule("default-deny", vec![], Action::Deny)`, and `validate_access_rule`
+    /// steers operators toward it by refusing `path_prefix = "/"` with "a rule that applies to
+    /// any path is written by omitting `path_prefix`".
+    ///
+    /// The filter also closes the other direction, which is the one that ADMITS. `Criterion::
+    /// Host("")` equals the empty host these facts carry, and a `PathMatches` accepting the
+    /// empty string matches the empty path, so a request-shaped `allow` could match first and
+    /// shadow the `deny` an operator wrote below it. A rule that constrains nothing about the
+    /// principal now shadows nothing either.
+    ///
+    /// A global "issue nothing" is still expressible and now has to be written as what it is:
+    /// a deny naming `subject_state = "authenticated"`, which every issuance satisfies.
     #[must_use]
     pub fn refusal(&self, facts: &RequestFacts) -> Option<String> {
-        let decision = self.decide(facts);
+        let decision = self.walk_filtered(facts, &mut Silent, Self::constrains_the_principal);
         match (decision.action, decision.matched) {
             (Action::Deny, Some(rule)) => Some(rule),
+            // A fall-through is `(Deny, None)`, and asking for the NAME as well as the action
+            // is what separates it from a rule that denied.
             _ => None,
         }
+    }
+
+    /// Whether `rule` says anything about the principal, as opposed to the request.
+    ///
+    /// The match is exhaustive so a new [`Criterion`] cannot be added without deciding which
+    /// side of this line it is on. Getting that wrong in the request direction makes a rule
+    /// inert at a consumer that should honour it; getting it wrong in the principal direction
+    /// is the outage above.
+    fn constrains_the_principal(rule: &Rule) -> bool {
+        rule.criteria.iter().any(|criterion| match criterion {
+            Criterion::Subject(_) | Criterion::AcrAtLeast(_) => true,
+            Criterion::Method(_)
+            | Criterion::Host(_)
+            | Criterion::PathPrefix(_)
+            | Criterion::PathMatches(_)
+            | Criterion::Header { .. } => false,
+        })
     }
 
     /// The decision, plus a trace of how every rule answered.
@@ -541,8 +579,25 @@ impl RuleSet {
 
     /// The single implementation. `decide`, `explain` and `dry_run` all come through here.
     fn walk<R: Recorder>(&self, facts: &RequestFacts, recorder: &mut R) -> Decision {
+        self.walk_filtered(facts, recorder, |_| true)
+    }
+
+    /// The same walk over a SUBSET of the rules.
+    ///
+    /// One implementation with a predicate rather than a second loop in [`RuleSet::refusal`].
+    /// Two implementations of one decision is how a consumer ends up enforcing something the
+    /// engine does not do, and this file already says that about its trace.
+    ///
+    /// A skipped rule is skipped entirely: it cannot decide and it cannot shadow a later rule
+    /// by matching first. That is the point -- see [`RuleSet::refusal`].
+    fn walk_filtered<R: Recorder>(
+        &self,
+        facts: &RequestFacts,
+        recorder: &mut R,
+        eligible: fn(&Rule) -> bool,
+    ) -> Decision {
         let mut decided: Option<Decision> = None;
-        for rule in &self.rules {
+        for rule in self.rules.iter().filter(|rule| eligible(rule)) {
             if decided.is_some() {
                 // Only a recording walk continues past the decision, and only to mark the
                 // rules that were never consulted. A plain `decide` returns below, so it
@@ -4193,9 +4248,16 @@ mod tests {
                     Criterion::Subject(SubjectCheck::Is("alice".to_owned())),
                 ],
             ),
+            deny(
+                "no-tokens-for-mallory",
+                vec![Criterion::Subject(SubjectCheck::Is("mallory".to_owned()))],
+            ),
             rule(
                 "payments-need-mfa",
-                vec![Criterion::PathPrefix("/payments".to_owned())],
+                vec![
+                    Criterion::PathPrefix("/payments".to_owned()),
+                    Criterion::Subject(SubjectCheck::Authenticated),
+                ],
                 Action::StepUp { acr: mfa() },
             ),
         ]);
@@ -4205,10 +4267,26 @@ mod tests {
             ..facts()
         };
 
+        // A PATH DENY DOES NOT REFUSE, even against a request whose path it matches. It says
+        // nothing about who is asking, and this consumer's question is about the principal.
+        // The resource reading of the same rule is asserted below to be unchanged.
+        assert_eq!(rules.refusal(&at("/admin/users")), None);
         assert_eq!(
-            rules.refusal(&at("/admin/users")).as_deref(),
+            rules.decide(&at("/admin/users")).matched.as_deref(),
             Some("no-admin-area"),
-            "an explicit deny refuses, and names the rule so the log can"
+            "the premise: this rule DOES match, so the line above is a different reading \
+             rather than a rule that simply never fires"
+        );
+
+        // A DENY THAT NAMES SOMEONE refuses, and names the rule so the log can.
+        assert_eq!(
+            rules
+                .refusal(&RequestFacts {
+                    subject: Some("mallory".to_owned()),
+                    ..at("/anything")
+                })
+                .as_deref(),
+            Some("no-tokens-for-mallory")
         );
         assert_eq!(rules.refusal(&at("/reports/q3")), None, "an allow does not");
 
@@ -4232,6 +4310,105 @@ mod tests {
             "the premise: this rule does match and does demand a step-up"
         );
         assert_eq!(rules.refusal(&at("/payments/transfer")), None);
+    }
+
+    /// THE CATCH-ALL DENY EVERY FORWARD-AUTH LIST ENDS WITH MUST NOT STOP EVERY TOKEN.
+    ///
+    /// A review found this and it was a total outage on upgrade. `refusal` excused only the
+    /// IMPLICIT fall-through; an operator writing the same default DOWN -- which is what this
+    /// repository's own canonical rule list does, and what `validate_access_rule` steers them
+    /// toward by refusing `path_prefix = "/"` -- produced `(Deny, Some("deny-the-rest"))` and
+    /// refused every issuance in the deployment.
+    ///
+    /// Three rows, because the shape has three readings that must stay apart: the catch-all is
+    /// inert here, a deny that NAMES someone still bites through it, and the resource reading
+    /// of the identical set is unchanged.
+    #[test]
+    fn a_criteria_less_catch_all_deny_refuses_no_issuance() {
+        let rules = RuleSet::new(vec![
+            allow(
+                "public-area",
+                vec![Criterion::PathPrefix("/public".to_owned())],
+            ),
+            deny(
+                "no-tokens-for-mallory",
+                vec![Criterion::Subject(SubjectCheck::Is("mallory".to_owned()))],
+            ),
+            // How a catch-all is written: no criteria at all.
+            deny("deny-the-rest", Vec::new()),
+        ]);
+        let issuance = |subject: &str| RequestFacts {
+            subject: Some(subject.to_owned()),
+            ..RequestFacts::default()
+        };
+
+        assert_eq!(
+            rules.refusal(&issuance("alice")),
+            None,
+            "the terminal deny says nothing about who is asking, so it is not policy here"
+        );
+        assert_eq!(
+            rules.refusal(&issuance("mallory")).as_deref(),
+            Some("no-tokens-for-mallory"),
+            "and a deny that DOES name someone must still bite, or the fix above turned the \
+             whole consumer off"
+        );
+
+        // THE RESOURCE READING IS UNTOUCHED. The filter belongs to `refusal` alone: a
+        // forward-auth request still falls to the catch-all, which is what it is for.
+        let resource = RequestFacts {
+            path: "/private".to_owned(),
+            subject: Some("alice".to_owned()),
+            ..facts()
+        };
+        assert_eq!(
+            rules.decide(&resource).matched.as_deref(),
+            Some("deny-the-rest")
+        );
+    }
+
+    /// A REQUEST-SHAPED RULE CANNOT SHADOW A PRINCIPAL ONE, which is the admitting direction.
+    ///
+    /// `Criterion::Host` is exact equality and these facts carry an empty host, so a rule
+    /// reading `host = ""` matched every issuance; a `path_matches` accepting the empty string
+    /// does the same. First-match-wins then let such an `allow` sit above a `deny` an operator
+    /// wrote and silently keep issuing. The doc claiming "an empty host equals no host" was
+    /// simply wrong: an empty host equals an empty host.
+    #[test]
+    fn a_rule_matching_only_on_request_shape_neither_refuses_nor_shadows() {
+        let rules = RuleSet::new(vec![
+            allow(
+                "empty-host-matches-everything",
+                vec![Criterion::Host(String::new())],
+            ),
+            deny(
+                "no-tokens-for-mallory",
+                vec![Criterion::Subject(SubjectCheck::Is("mallory".to_owned()))],
+            ),
+        ]);
+        let mallory = RequestFacts {
+            subject: Some("mallory".to_owned()),
+            ..RequestFacts::default()
+        };
+
+        // The premise: that allow really does match these facts.
+        assert_eq!(
+            rules.decide(&mallory).matched.as_deref(),
+            Some("empty-host-matches-everything"),
+            "an empty configured host equals the empty host an issuance carries"
+        );
+        assert_eq!(
+            rules.refusal(&mallory).as_deref(),
+            Some("no-tokens-for-mallory"),
+            "and it must not shadow the deny below it"
+        );
+
+        // The same shape as a DENY refuses nothing either.
+        let blanket = RuleSet::new(vec![deny(
+            "empty-host-denies-everything",
+            vec![Criterion::Host(String::new())],
+        )]);
+        assert_eq!(blanket.refusal(&mallory), None);
     }
 
     /// AN EMPTY RULE SET REFUSES NOTHING, which is the shipped default.
