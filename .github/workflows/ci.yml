@@ -2216,7 +2216,27 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+      # `packages` IS PINNED BECAUSE HALF THE ACTION'S DEFAULT STOPPED RESOLVING.
+      #
+      # The default is `tools platform-tools`. `tools` is the pre-2021 SDK Tools, superseded by
+      # the cmdline-tools this action installs separately, and Google's SDK repository stopped
+      # serving it ON 2026-09-14: this job was green at 19:43 UTC and has failed on every run
+      # since 20:58, with the SAME runner image (ubuntu-24.04 20260907.300.1), the same action,
+      # and the same `cmdline-tools-version: 14742923` on both sides. Nothing here or on the
+      # runner moved; the remote repository did.
+      #
+      # `sdkmanager` answers "Failed to find package 'tools'" and the action then throws, so the
+      # job fails before reaching the build -- a red that says nothing about the sample or the
+      # documented flow it exists to verify.
+      #
+      # `platform-tools` is kept only because it is the action's other default and still
+      # resolves. NOTHING HERE USES IT: `mobile-verify.sh` never calls `adb`, and its
+      # "emulator" is IronAuth's own `dev` server rather than an Android one. The compile SDK
+      # and build tools come from `clients/mobile/android/app/build.gradle.kts`, which is where
+      # they belong -- naming them here would be a second place to keep in step with it.
       - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
       - name: gradle
         uses: gradle/actions/setup-gradle@v6
       - name: build the sample and run the documented flow

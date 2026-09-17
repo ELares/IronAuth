@@ -229,17 +229,39 @@ async fn a_real_connection_open_is_metered_once() {
         .await
         .expect("open the connection");
 
-    let events = match db
-        .store()
-        .scoped(scope)
-        .outbox()
-        .events_page_after(ironauth_store::EventCursor::beginning(), 100)
-        .await
-        .expect("read the feed")
-    {
-        ironauth_store::EventPage::Page(events) => events,
-        ironauth_store::EventPage::Gone { .. } => panic!("nothing was pruned"),
-    };
+    // WAITED FOR, BECAUSE THE FEED SERVES SETTLED ROWS ONLY.
+    //
+    // `events_page_after` withholds a row until its `xmin` is below
+    // `pg_snapshot_xmin(pg_current_snapshot())`, the oldest transaction running anywhere on the
+    // cluster -- so the event this test just wrote is invisible while any earlier write is
+    // still open, and the sibling tests in this binary each apply the migration chain one write
+    // transaction at a time. Reading once and asserting the event is there is a lottery, and it
+    // is the same lottery `scim_push_connections.rs` lost on CI.
+    //
+    // The wait is bounded and the assertions below run on the last read either way, so a feed
+    // that never settles still fails rather than passing quietly. Asserting EXACTLY one is what
+    // this test is for, so the wait ends on presence and the count is still checked after it.
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        events = match db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .events_page_after(ironauth_store::EventCursor::beginning(), 100)
+            .await
+            .expect("read the feed")
+        {
+            ironauth_store::EventPage::Page(events) => events,
+            ironauth_store::EventPage::Gone { .. } => panic!("nothing was pruned"),
+        };
+        if events
+            .iter()
+            .any(|m| m.payload["type"] == "connection.opened")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let opened: Vec<_> = events
         .iter()
         .filter(|m| m.payload["type"] == "connection.opened")
