@@ -1480,6 +1480,12 @@ jobs:
         run: scripts/invariant-lints.sh
       - name: query audit (no scoped-table SQL outside the repository module)
         run: scripts/query-audit.sh
+      # Issue #155 criterion 3: the exploratory multi-region work's one HARD architectural rule,
+      # enforced BEFORE the code it constrains exists. A lint written afterwards is fitted to
+      # whatever was already written, and the shape it was meant to forbid becomes the shape that
+      # ships. Both rules fail against a planted violation, which the PR adding this demonstrates.
+      - name: no synchronous cross-region call on a request path
+        run: scripts/no-cross-region-sync.sh
       - name: scoped table registration (every forced-RLS table in the migrations is in the query audit list)
         run: scripts/scoped-table-registration.sh
       - name: audit foreign key claims (no comment asserts an audit_log foreign key that does not exist)
