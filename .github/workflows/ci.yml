@@ -2216,7 +2216,20 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+      # `packages` IS PINNED BECAUSE THE ACTION'S DEFAULT NO LONGER EXISTS.
+      #
+      # The default is `tools platform-tools`, and `tools` was removed from the Android SDK
+      # repository years ago (it is the pre-2021 SDK Tools, replaced by cmdline-tools, which
+      # this action installs separately). `sdkmanager` answers "Failed to find package 'tools'"
+      # and the action then throws, so this job has been failing before it reached the build at
+      # all -- a red that says nothing about the sample or the documented flow.
+      #
+      # `platform-tools` is the half that still exists and the half a build needs. The compile
+      # SDK and build tools are resolved by Gradle from the module's own declaration, so
+      # naming them here would be a second place to keep in step with it.
       - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
       - name: gradle
         uses: gradle/actions/setup-gradle@v6
       - name: build the sample and run the documented flow
