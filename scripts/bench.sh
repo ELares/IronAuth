@@ -23,7 +23,9 @@
 # accelerator stays unwired. The first version of the round-trip benchmark then generalised that
 # to every use by measuring an autocommit lookup, and a review found no read in this codebase is
 # one: a scoped read pays six round trips around a query under row-level security and measures
-# 158 us, which a hit is very much worth replacing. Both figures are below.
+# 166 us, which a hit is very much worth replacing. How much a hit saves then depends on what is
+# at the other end of the hop and on how many scoped reads one cached answer fronts, which
+# docs/UNIT-COSTS.md works through. All the figures are below.
 #
 # # Every benchmark reports RAN, SKIPPED, or FAILED, and a SKIP IS NOT SILENT
 #

@@ -17,10 +17,14 @@
 #
 # # What this measures, stated exactly, because the first version overclaimed it twice
 #
-# THREE STATEMENTS against a cluster on this same machine over loopback TCP: a bare `SELECT 1`,
-# one autocommit indexed lookup, and one SCOPED read shaped exactly as `begin_scoped` plus a
-# join issues it, under row-level security. Each is a strict superset of the one before, which
-# is what lets a reader see where the cost sits instead of taking a ratio on trust.
+# FOUR STATEMENTS against a cluster on this same machine over loopback TCP: a bare `SELECT 1`,
+# one autocommit indexed lookup, one SCOPED read shaped as `begin_scoped` plus a join issues it,
+# and one scoped read shaped as `HotStateRepo::get` issues it. The first three are each a strict
+# superset of the one before, which is what lets a reader see where the cost sits instead of
+# taking a ratio on trust; the fourth is what a hit against the Postgres tier costs.
+#
+# MEASURED AS A NON-SUPERUSER, because connecting as one bypasses row-level security outright and
+# the policies would cost nothing. The script asserts the policies bite before measuring.
 #
 # It was previously labelled "the FLOOR for any accelerator hop", which was wrong in two
 # separate ways that a review caught. It is not a floor: the figure is a MEAN over the run, and
@@ -115,7 +119,7 @@ measure_latency() {
     statement="$1"
     if [ -x "${PG_BIN}/pgbench" ]; then
         printf '%s\n' "$statement" > "$WORK/stmt.sql"
-        output="$("${PG_BIN}/pgbench" -h 127.0.0.1 -p "$PORT" -U ironauth_super \
+        output="$(PGPASSWORD=probe "${PG_BIN}/pgbench" -h 127.0.0.1 -p "$PORT" -U probe_app \
             -n -c 1 -T "$SECONDS_TO_RUN" -f "$WORK/stmt.sql" postgres 2>&1)" || {
             echo "::error::socket-rtt-bench: pgbench failed" >&2
             echo "$output" >&2
@@ -135,7 +139,7 @@ measure_latency() {
     python3 -c "import sys;print((sys.argv[1]+'\n')*int(sys.argv[2]))" \
         "$statement" "$statements" > "$WORK/stmt.sql" || return 1
     python3 -c "import sys;print((sys.argv[1]+'\n')*500)" "$statement" > "$WORK/warm.sql" || return 1
-    "${PG_BIN}/psql" -h 127.0.0.1 -p "$PORT" -U ironauth_super -q -t -A \
+    PGPASSWORD=probe "${PG_BIN}/psql" -h 127.0.0.1 -p "$PORT" -U probe_app -q -t -A \
         -v ON_ERROR_STOP=1 -f "$WORK/warm.sql" postgres >/dev/null 2>&1 || {
         echo "::error::socket-rtt-bench: psql failed during warm-up" >&2
         return 1
@@ -145,7 +149,7 @@ measure_latency() {
     # SQL, or a table the seed did not create, would otherwise have every iteration error out
     # fast and the timing published as a plausible-looking low number. A benchmark that cannot
     # tell "ran quickly" from "failed quickly" reports the failure as a good result.
-    "${PG_BIN}/psql" -h 127.0.0.1 -p "$PORT" -U ironauth_super -q -t -A \
+    PGPASSWORD=probe "${PG_BIN}/psql" -h 127.0.0.1 -p "$PORT" -U probe_app -q -t -A \
         -v ON_ERROR_STOP=1 -f "$WORK/stmt.sql" postgres >/dev/null 2>&1 || {
         echo "::error::socket-rtt-bench: psql failed while measuring" >&2
         return 1
@@ -174,7 +178,7 @@ measure_latency() {
 # three is what lets a reader see where the cost actually sits rather than taking a ratio on
 # trust.
 "${PG_BIN}/psql" -h 127.0.0.1 -p "$PORT" -U ironauth_super -q -v ON_ERROR_STOP=1 \
-    -f - postgres >/dev/null 2>&1 <<'SEED' || {
+    -f - postgres 2>&1 <<'SEED' | tee "$WORK/seed.log" >/dev/null || {
 CREATE TABLE probe_grants (
     tenant_id text NOT NULL,
     environment_id text NOT NULL,
@@ -209,12 +213,43 @@ CREATE POLICY probe_grants_scope ON probe_grants USING (
     tenant_id = current_setting('ironauth.tenant_id', true)
     AND environment_id = current_setting('ironauth.environment_id', true)
 );
-CREATE ROLE probe_app LOGIN;
-GRANT SELECT ON probe_tokens, probe_grants TO probe_app;
+-- SHAPED AS `hot_state` IS, so the fourth row measures the statement `HotStateRepo::get`
+-- actually issues: four equality predicates plus the expiry comparison against an epoch offset,
+-- not a single-key lookup on a different table.
+CREATE TABLE hot_state_probe (
+    tenant_id text NOT NULL,
+    environment_id text NOT NULL,
+    use_name text NOT NULL,
+    key text NOT NULL,
+    value bytea NOT NULL,
+    expires_at timestamptz NOT NULL,
+    PRIMARY KEY (tenant_id, environment_id, use_name, key)
+);
+INSERT INTO hot_state_probe
+SELECT 't1', 'e1', 'introspection', 'k' || g, repeat('v', 512)::bytea,
+       now() + interval '1 hour'
+FROM generate_series(1, 10000) AS g;
+ALTER TABLE hot_state_probe ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hot_state_probe FORCE ROW LEVEL SECURITY;
+CREATE POLICY hot_state_probe_scope ON hot_state_probe USING (
+    tenant_id = current_setting('ironauth.tenant_id', true)
+    AND environment_id = current_setting('ironauth.environment_id', true)
+);
+-- A LOGIN ROLE THAT IS NEITHER SUPERUSER NOR OWNER, because the measurements below connect as
+-- it. Connecting as the superuser BYPASSES row-level security entirely, so the policies above
+-- would cost nothing and "under RLS" would be a label on a read that never evaluated one. A
+-- review caught exactly that.
+--
+-- GRANTED LAST, after every table exists: naming a table before its CREATE is an error the seed
+-- guard now surfaces rather than swallows.
+CREATE ROLE probe_app LOGIN PASSWORD 'probe';
+GRANT SELECT ON probe_tokens, probe_grants, hot_state_probe TO probe_app;
 ANALYZE probe_tokens;
 ANALYZE probe_grants;
+ANALYZE hot_state_probe;
 SEED
     echo "::error::socket-rtt-bench: could not seed the lookup tables" >&2
+    cat "$WORK/seed.log" >&2 || true
     exit 1
 }
 
@@ -225,6 +260,29 @@ PROBE_KEY="$("${PG_BIN}/psql" -h 127.0.0.1 -p "$PORT" -U ironauth_super -q -t -A
     -c "SELECT encode(sha256('t5000'::bytea), 'hex')" postgres 2>/dev/null)"
 if [ -z "$PROBE_KEY" ]; then
     echo "::error::socket-rtt-bench: could not compute the probe key" >&2
+    exit 1
+fi
+
+# PROVE THE POLICIES ACTUALLY BITE, because "under RLS" was a label on a read that never
+# evaluated one: the first version measured as the superuser, which bypasses row-level security
+# outright. A policy that costs nothing would make the scoped figures too cheap and the whole
+# comparison too flattering to the cache.
+#
+# The check is a contrast, not a presence test: the SAME query must return zero rows with the
+# scope settings unset and one row with them set. Asserting only the second would pass against a
+# policy that admits everything.
+rls_rows() {
+    PGPASSWORD=probe "${PG_BIN}/psql" -h 127.0.0.1 -p "$PORT" -U probe_app -q -t -A \
+        -c "$1" postgres 2>/dev/null | tr -d ' '
+}
+UNSCOPED="$(rls_rows "SELECT count(*) FROM probe_tokens WHERE token_hash = '$PROBE_KEY'")"
+SCOPED_ROWS="$(rls_rows "BEGIN; SELECT set_config('ironauth.tenant_id','t1',true); \
+    SELECT set_config('ironauth.environment_id','e1',true); \
+    SELECT count(*) FROM probe_tokens WHERE token_hash = '$PROBE_KEY'; COMMIT;" | tail -1)"
+if [ "$UNSCOPED" != "0" ] || [ "$SCOPED_ROWS" != "1" ]; then
+    echo "::error::socket-rtt-bench: row-level security is not being enforced on the probe" >&2
+    echo "  unscoped rows: '${UNSCOPED}' (expected 0), scoped rows: '${SCOPED_ROWS}' (expected 1)" >&2
+    echo "  Without this the scoped figures below measure a read with no policy to evaluate." >&2
     exit 1
 fi
 
@@ -251,7 +309,10 @@ HOTGET="$(measure_latency "BEGIN;
 SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
 SELECT set_config('ironauth.tenant_id', 't1', true);
 SELECT set_config('ironauth.environment_id', 'e1', true);
-SELECT scope FROM probe_tokens WHERE token_hash = '$PROBE_KEY';
+SELECT value FROM hot_state_probe
+ WHERE tenant_id = 't1' AND environment_id = 'e1' AND use_name = 'introspection'
+   AND key = 'k5000'
+   AND expires_at > TIMESTAMPTZ 'epoch' + (1758000000000000::text || ' microseconds')::interval;
 COMMIT;")" || exit 1
 
 # MICROSECONDS, because the figures these are compared against are quoted in microseconds and a
@@ -304,7 +365,7 @@ printf '  %-52s %8s us\n' "one autocommit indexed lookup" "$LOOKUP_US"
 printf '  %-52s %8s us\n' "one SCOPED read (begin_scoped + a join, under RLS)" "$SCOPED_US"
 printf '  %-52s %8s us\n' "a SCOPED single-key read (what PgHotState::get costs)" "$HOTGET_US"
 echo
-echo "socket-rtt-bench: all three are MEANS over the run, not floors, taken by one client with"
+echo "socket-rtt-bench: all four are MEANS over the run, not floors, taken by one client with"
 echo "socket-rtt-bench: no other load. A contended database is slower and the gaps widen."
 echo "socket-rtt-bench: THE THIRD ROW IS THE ONE TO SIZE AN ACCELERATOR AGAINST. No read in"
 echo "socket-rtt-bench: IronAuth is an autocommit statement: every scoped read pays BEGIN, an"
@@ -313,8 +374,9 @@ echo "socket-rtt-bench: A cache hit replaces that whole sequence with one round 
 echo "socket-rtt-bench: so what it saves is the third row minus a hop, not the second minus the"
 echo "socket-rtt-bench: first."
 echo
-echo "socket-rtt-bench: THE FOURTH ROW IS WHY THE POSTGRES TIER CANNOT ACCELERATE. PgHotState"
-echo "socket-rtt-bench: reads through begin_scoped too, so a hit against it pays the same six"
-echo "socket-rtt-bench: round trips as the read it stands in front of. In Postgres-only mode the"
-echo "socket-rtt-bench: seam is a SHARED-STATE mechanism, not a faster one; acceleration needs a"
-echo "socket-rtt-bench: tier that is genuinely a different store."
+echo "socket-rtt-bench: THE FOURTH ROW IS WHAT A HIT AGAINST THE POSTGRES TIER COSTS."
+echo "socket-rtt-bench: HotStateRepo::get goes through begin_scoped too, so a hit pays the same"
+echo "socket-rtt-bench: six round trips as a scoped read. Fronting ONE scoped read it therefore"
+echo "socket-rtt-bench: saves almost nothing; the saving scales with how many scoped"
+echo "socket-rtt-bench: transactions the cached answer stands in front of, which is a wiring"
+echo "socket-rtt-bench: choice and not a property of the tier."

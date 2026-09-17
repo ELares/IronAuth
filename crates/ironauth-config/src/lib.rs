@@ -1403,7 +1403,12 @@ pub struct HotStateConfig {
     /// implied by saying the seam pays wherever the alternative is a query. A cache hit costs a
     /// round trip and so returns only what an operation costs ABOVE one. The JWKS read is
     /// unusual in costing almost nothing above it; a scoped read pays six round trips and a
-    /// query under row-level security, measured at 158 us, and is worth accelerating.
+    /// query under row-level security, measured at 166 us, and is worth accelerating.
+    ///
+    /// HOW MUCH depends on what is at the other end of the hop. A hit against the Postgres tier
+    /// is itself a scoped read, 145 us, so fronting ONE repository call it saves thirteen per
+    /// cent; fronting a resolved tenant config, which is three scoped transactions, it saves
+    /// about seventy. See `docs/UNIT-COSTS.md`.
     ///
     /// That distinction is written down rather than glossed because the alternative is a knob
     /// that reads as "my cache is on" while nothing consults it, which is the defect this
