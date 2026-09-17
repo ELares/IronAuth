@@ -2676,9 +2676,12 @@ pub struct DatabaseConfig {
     /// rows, because the read path rebuilds each KEK's AAD from the id stored in that row and
     /// key material is an HMAC over `master_key` alone; what it does is label new KEKs
     /// differently from every row already written, splitting the population a later rotation has
-    /// to find. Rotating the actual key means changing `database.master_key` and running
-    /// `ironauth storage rekey`. Must be non-empty and free of `:`, the separator that command
-    /// splits its master-key arguments on, or the server refuses to resolve a master key at all.
+    /// to find. Changing `database.master_key` and running `ironauth storage rekey` rotates the
+    /// key MATERIAL, and that command now REFUSES to unless `--i-will-rebuild-lookups` is passed,
+    /// because it rewraps keys and rebuilds none of the fifteen blind indexes derived from the
+    /// secret: every identifier lookup would stop matching, silently. Must be non-empty and free
+    /// of `:`, the separator that command splits its master-key arguments on, or the server
+    /// refuses to resolve a master key at all.
     /// Defaults to `master-1`, which every existing deployment has already written into its rows.
     ///
     /// # Why this is configurable, having been a literal

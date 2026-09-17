@@ -811,3 +811,48 @@ async fn a_kek_parked_on_a_third_master_is_not_reported_as_converged() {
         "the stranded row is still readable, but only by a key this rotation never named"
     );
 }
+
+/// WHAT A ROTATION DOES NOT CARRY: the blind indexes (issue #153).
+///
+/// Every blind index in the store is `master.blind_index(context)`, derived from the master's
+/// material directly rather than through a KEK. Fifteen of them, counted rather than sampled:
+/// the user identifier and external id, the trait login, the flexible and routing identifiers, the recovery code, the invitation identifier, the organisation contact email, the email and SMS factor recipients, the message recipient, the risk-signal and abuse and SSF-stream subjects, and the migration record subject.
+/// This module rewraps `tenant_keks` and touches none of them.
+///
+/// So a rotation to different key material leaves every stored index computed under a key
+/// nothing derives any more, and the failure is SILENT: `by_identifier` misses and returns
+/// `Ok(None)`, indistinguishable from an unknown user. `ironauth storage rekey` refuses that
+/// rotation unless the operator passes `--i-will-rebuild-lookups`.
+///
+/// This pins the PROPERTY rather than the consequence, because the consequence is spread across
+/// fifteen derivations and testing one would not catch another changing. If it starts failing,
+/// either `derive` stopped keying off the secret alone or something began carrying indexes
+/// across a rotation, and the CLI's refusal needs revisiting.
+#[test]
+fn a_change_of_secret_changes_every_blind_index_and_a_change_of_id_does_not() {
+    let context = ironauth_jose::Aad::builder()
+        .text("user-identifier")
+        .text("alice@example.com")
+        .build();
+
+    let before = MasterKey::derive("master-1", b"the-old-secret");
+    let rotated = MasterKey::derive("master-2", b"the-new-secret");
+    assert_ne!(
+        before.blind_index(&context).as_bytes(),
+        rotated.blind_index(&context).as_bytes(),
+        "a rotation to new material orphans every stored blind index; this module does not \
+         rebuild them, so identifier lookups stop finding existing rows"
+    );
+
+    // THE SAFE SHAPE, and the control: renaming the generation while keeping the secret leaves
+    // every index intact, because `derive` keys off the secret alone. Without this the assertion
+    // above would pass against a `blind_index` that mixed the id in, which would make even a
+    // rename unsafe and is a different defect.
+    let renamed_only = MasterKey::derive("master-2", b"the-old-secret");
+    assert_eq!(
+        before.blind_index(&context).as_bytes(),
+        renamed_only.blind_index(&context).as_bytes(),
+        "changing only the id must leave lookups working, or the one rotation shape that is safe \
+         today would not be"
+    );
+}

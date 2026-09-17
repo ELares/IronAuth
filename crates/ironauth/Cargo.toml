@@ -134,6 +134,14 @@ required-features = ["testing"]
 name = "doctor_cli"
 required-features = ["testing"]
 
+# The rekey's lookup guard (issue #153): drives the COMPILED `ironauth storage rekey` and checks
+# that a change of key MATERIAL is refused, a rename is not, and the acknowledgement gets past.
+# NO feature gate and no database: the guard runs before the DSN is opened, which is itself part
+# of what these assert, so they are cheap and always run. Deleting the whole refusal left every
+# other test in the tree green, which is why this exists.
+[[test]]
+name = "rekey_cli_guard"
+
 # The outbox retention boot suite (issue #104, PR 3) boots the COMPILED `ironauth serve`
 # against a throwaway database and watches the queue. It is the only thing in the tree that
 # observes the `serve` call site itself: replacing that call with a no-op left every other

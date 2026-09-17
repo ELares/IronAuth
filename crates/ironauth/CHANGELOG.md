@@ -6,6 +6,27 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `ironauth storage rekey` REFUSES a change of master key MATERIAL unless the operator passes
+  `--i-will-rebuild-lookups` (issue #153).
+
+  It rewraps keys and rebuilds no lookups. Every blind index in the store is derived from the
+  master secret rather than through a KEK, fifteen of them in all: login handles and external
+  ids, trait logins, flexible and routing identifiers, recovery codes, invitations, organisation
+  contact emails, email and SMS factor recipients, message recipients, and the risk-signal, abuse,
+  SSF-stream and migration-record subjects. After a rotation to new material they are all computed
+  under a key nothing derives any more.
+
+  The failure had no loud symptom: `by_identifier` misses and returns `Ok(None)`, which is
+  indistinguishable from an unknown user, so every existing account stops resolving at login. And
+  `users_identifier_bidx_unique` is a UNIQUE constraint over the index, so re-registering the same
+  address computes a different tag, passes the constraint, and creates a SECOND live user while
+  the first, with its grants and enrolments, becomes unreachable.
+
+  Rotating the NAME while keeping the secret is safe and needs no flag: it moves rows to a new
+  generation and leaves every lookup intact. The configuration docs and `docs/KEK-RECOVERY.md`
+  now say so; before this they pointed at a material rotation with no caveat, which is the
+  procedure the command refuses.
+
 - `ironauth storage rekey` now names its master keys as `ID:env:VAR` or `ID:file:PATH` (issue
   #153), resolving and deriving the secret exactly as the server does from `database.master_key`.
 

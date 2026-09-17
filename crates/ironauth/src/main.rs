@@ -6042,6 +6042,7 @@ fn manage_bans(verb: &str, args: &mut impl Iterator<Item = String>) -> ExitCode 
         }
     };
     let env = Env::system();
+
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -8331,6 +8332,10 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
     let mut url: Option<String> = None;
     let mut from: Option<String> = None;
     let mut to: Option<String> = None;
+    // NAMED FOR WHAT IT COMMITS THE OPERATOR TO, not for what it disables. A flag called
+    // `--force` invites being passed to make an error go away; this one only reads as true if
+    // the person typing it has a plan.
+    let mut acknowledged_lookup_rebuild = false;
     while let Some(arg) = args.next() {
         let mut take = |target: &mut Option<String>, flag: &str| -> bool {
             if let Some(value) = args.next() {
@@ -8356,6 +8361,9 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
             true
         } else if arg == "--to-master-key" {
             take(&mut to, "--to-master-key")
+        } else if arg == "--i-will-rebuild-lookups" {
+            acknowledged_lookup_rebuild = true;
+            true
         } else {
             eprintln!("ironauth storage rekey: unrecognized argument '{arg}'");
             false
@@ -8381,6 +8389,56 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
+
+    // A CHANGE OF SECRET BREAKS EVERY LOOKUP, SILENTLY, so the operator has to say it out
+    // loud before this runs.
+    //
+    // Every blind index in the store is `master.blind_index(context)`, derived from the
+    // master's material rather than through a KEK. FIFTEEN of them, counted rather than
+    // sampled: the user identifier and external id, the trait login, the flexible and routing identifiers, the recovery code, the invitation identifier, the organisation contact email, the email and SMS factor recipients, the message recipient, the risk-signal and abuse and SSF-stream subjects, and the migration record subject.
+    // `storage rekey` rewraps `tenant_keks` and touches none of them.
+    //
+    // The failure has no loud symptom. `by_identifier` misses and returns `Ok(None)`, which
+    // is indistinguishable from an unknown user, so every existing account stops resolving at
+    // login. And `users_identifier_bidx_unique` is a UNIQUE constraint over the index, so a
+    // re-registration with the same address computes a different tag, passes the constraint,
+    // and creates a SECOND live user while the first -- with its grants, enrolments and
+    // history -- becomes unreachable.
+    //
+    // THE GUARD IS HERE AND NOT IN `Rekey`, deliberately. The library keeps the capability:
+    // its suite exercises rotation between two materials, an eventual index rebuild will need
+    // exactly that, and a type refusing its own purpose is the wrong place to put an
+    // operational warning. This is the door a human walks through.
+    //
+    // COMPARED VIA THE INDEXES, not the secrets, which are not recoverable from a
+    // `MasterKey`. `derive` keys off the secret alone, so two masters agreeing on one fixed
+    // context agree on every context.
+    let probe = ironauth_jose::Aad::builder()
+        .text("ironauth.rekey.material-probe")
+        .build();
+    let material_changes = from.blind_index(&probe).as_bytes() != to.blind_index(&probe).as_bytes();
+    if material_changes && !acknowledged_lookup_rebuild {
+        eprintln!(
+            "\nironauth storage rekey: REFUSING. The two master keys have different \n\
+             material, and this command rewraps keys without rebuilding LOOKUPS.\n\n\
+             Every identifier lookup is derived from the master secret: login handles, \n\
+             external ids, recovery codes, invitations, abuse and risk subjects, email and \n\
+             SMS recipients. After this runs they would all be computed under a key nothing \n\
+             derives any more, and the failure is SILENT: existing accounts stop resolving at \n\
+             login as though they never existed, and re-registering the same address creates \n\
+             a second user while the first becomes unreachable.\n\n\
+             Rotating the NAME while keeping the secret is safe and needs no flag: it moves \n\
+             rows to a new generation and leaves every lookup intact.\n\n\
+             If you have a plan to rebuild the indexes, pass --i-will-rebuild-lookups."
+        );
+        return ExitCode::FAILURE;
+    }
+    if material_changes {
+        println!(
+            "storage rekey: proceeding with a CHANGE OF MATERIAL on --i-will-rebuild-lookups. \n\
+             Every identifier lookup will stop matching until you rebuild the blind indexes."
+        );
+    }
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -8408,6 +8466,7 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
              cannot open both shapes while this runs. Stop the fleet, or run it against a \n\
              quiesced deployment."
         );
+
         match store.rekey_master(&from, &to).await {
             Ok(report) => {
                 println!(
@@ -8747,12 +8806,16 @@ fn print_help() {
     println!("USAGE:");
     println!("  ironauth serve [--config PATH]   Run the server until SIGTERM/SIGINT");
     println!("  ironauth storage rekey --url DSN --from-master-key KEY \\");
-    println!("               --to-master-key KEY");
+    println!("               --to-master-key KEY [--i-will-rebuild-lookups]");
     println!("                                   KEY is ID:env:VAR or ID:file:PATH, naming the");
     println!("                                   secret as database.master_key does");
     println!("                                   Rewrap every tenant KEK under a new platform");
     println!("                                   master key. OFFLINE: a running server holds");
-    println!("                                   one master and cannot open both shapes");
+    println!("                                   one master and cannot open both shapes.");
+    println!("                                   REFUSES a change of key MATERIAL unless");
+    println!("                                   --i-will-rebuild-lookups: it rewraps keys and");
+    println!("                                   does not rebuild blind indexes, so every");
+    println!("                                   identifier lookup would silently stop matching");
     println!("  ironauth storage kek-backup --url DSN --out FILE");
     println!("                                   Export every wrapped KEK and print the");
     println!("                                   manifest. REFUSES a connection row-level");
@@ -8971,6 +9034,35 @@ mod tests {
         assert!(resolve_master_key(&config_with_secret(&path, "master_key_id = \"\"\n")).is_none());
         assert!(
             resolve_master_key(&config_with_secret(&path, "master_key_id = \"a:b\"\n")).is_none()
+        );
+    }
+
+    /// THE MATERIAL PROBE, which is how the rekey tells a rename from a real rotation.
+    ///
+    /// A `MasterKey` does not expose its bytes, so the two keys cannot be compared directly.
+    /// `derive` keys off the secret alone, so two masters agreeing on one fixed context agree on
+    /// every context: comparing a single blind index is a comparison of the material.
+    ///
+    /// That is the check standing between an operator and a silent loss of every login, so it
+    /// gets a test rather than being trusted to be obvious.
+    #[test]
+    fn a_blind_index_probe_separates_a_rename_from_a_change_of_material() {
+        let probe = ironauth_jose::Aad::builder()
+            .text("ironauth.rekey.material-probe")
+            .build();
+        let original = MasterKey::derive("master-1", b"the-secret");
+        let renamed = MasterKey::derive("master-2", b"the-secret");
+        let rotated = MasterKey::derive("master-2", b"a-different-secret");
+
+        assert_eq!(
+            original.blind_index(&probe).as_bytes(),
+            renamed.blind_index(&probe).as_bytes(),
+            "a rename keeps every lookup working, so the rekey must not refuse it"
+        );
+        assert_ne!(
+            original.blind_index(&probe).as_bytes(),
+            rotated.blind_index(&probe).as_bytes(),
+            "a change of material orphans every lookup, so the rekey must refuse it unqualified"
         );
     }
 
