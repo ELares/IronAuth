@@ -22,9 +22,10 @@
 //! so nobody reads more into a green probe than it earned. It runs ONE query
 //! against ONE table, so it catches every cause that stops a pooled connection
 //! executing at all, and it catches an unapplied schema. It does NOT audit the
-//! per-table grants the chain issues: a role that can read the migration ledger
-//! and has lost `SELECT` on `clients` answers this probe successfully. Checking
-//! that would mean touching every table on every probe interval.
+//! per-table privileges the migration chain issues: a role that can read the
+//! migration ledger and has lost `SELECT` on an application table answers this
+//! probe successfully. Checking that would mean touching every table on every
+//! probe interval.
 //!
 //! So a caller that can reach the database supplies a [`DatabaseProbe`], and
 //! readiness asks THAT. The check is a real query on a real pooled connection,
