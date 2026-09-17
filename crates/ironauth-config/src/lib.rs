@@ -2670,6 +2670,39 @@ pub struct DatabaseConfig {
     /// `UserInfo`) failing closed rather than storing plaintext; a production
     /// deployment must set it.
     pub master_key: Option<Secret>,
+
+    /// The identifier of the platform envelope master key (issue #153): a LABEL recorded on
+    /// every KEK this deployment wraps, not key material. Changing it does not break existing
+    /// rows, because the read path rebuilds each KEK's AAD from the id stored in that row and
+    /// key material is an HMAC over `master_key` alone; what it does is label new KEKs
+    /// differently from every row already written, splitting the population a later rotation has
+    /// to find. Rotating the actual key means changing `database.master_key` and running
+    /// `ironauth storage rekey`. Must be non-empty and free of `:`, the separator that command
+    /// splits its master-key arguments on, or the server refuses to resolve a master key at all.
+    /// Defaults to `master-1`, which every existing deployment has already written into its rows.
+    ///
+    /// # Why this is configurable, having been a literal
+    ///
+    /// The id is bound into the AAD of every wrapped tenant KEK, and the row records which
+    /// master wrapped it. That is what makes a rotation expressible: two masters must be
+    /// distinguishable, or a rewrapped KEK is indistinguishable from an unrewrapped one.
+    ///
+    /// It was the hardcoded literal `master-1` at every production site, so every deployment's
+    /// master had the same name and no second master could be named. `ironauth storage rekey`
+    /// meanwhile took an arbitrary id, which is the other half of a mismatch that made the
+    /// command unusable: an operator could not name the key their server was using.
+    ///
+    /// # The claim this paragraph used to make, and why it was wrong
+    ///
+    /// It said changing this breaks a deployment that has written data, "in the same way
+    /// changing `master_key` does". It does not, and the difference matters to anyone deciding
+    /// whether they can touch it: `fetch_active_kek` reads `master_key_id` out of the ROW and
+    /// rebuilds the AAD from that, so a renamed master opens everything the old name wrapped.
+    ///
+    /// The real hazard is quieter. Nothing warns when this stops matching what is already
+    /// stored, and the rekey's completion check counts rows whose `master_key_id` is not the
+    /// target, so a typo leaves a second group of rows that a later rotation will not look for.
+    pub master_key_id: Option<String>,
 }
 
 impl Default for DatabaseConfig {
@@ -2679,6 +2712,7 @@ impl Default for DatabaseConfig {
                 .expect("default DSN is valid by construction (covered by test)"),
             password: None,
             master_key: None,
+            master_key_id: None,
         }
     }
 }

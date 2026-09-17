@@ -6,6 +6,25 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `ironauth storage rekey` now names its master keys as `ID:env:VAR` or `ID:file:PATH` (issue
+  #153), resolving and deriving the secret exactly as the server does from `database.master_key`.
+
+  BREAKING: the previous `ID:HEX` form is removed. It could not name any real key and could
+  destroy every one. No deployment holds a raw-byte master, because the only production
+  construction derives from a passphrase and the config has no raw-bytes field, so
+  `--from-master-key ID:HEX` never matched a live row. And `--to-master-key ID:HEX` would rewrap
+  every live KEK under a key no server can reconstruct, since HMAC is not invertible: every
+  tenant's sealed PII unopenable from the next restart, reported as a completed rotation with
+  exit code 0.
+
+  The secret is named rather than passed, so the platform master key does not appear in `argv`,
+  and it resolves through the same `Secret` the config uses. That last part is load bearing: the
+  `file` form trims one trailing newline, so a reader that kept it would derive a different key
+  from the same file the server reads.
+
+  The master key id comes from `database.master_key_id`, so the two sides of a rotation can be
+  named apart.
+
 - **A configured `server.public_url` with no dot in its host stopped ALL mail (issue #111).**
   `sender_domain` took the host unvalidated, and `message_id` refuses a domain without a dot, so
   `compose` returned `mime_failed` for every message. `deploy/ironauth.toml` ships
