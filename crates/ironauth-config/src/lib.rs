@@ -2670,6 +2670,28 @@ pub struct DatabaseConfig {
     /// `UserInfo`) failing closed rather than storing plaintext; a production
     /// deployment must set it.
     pub master_key: Option<Secret>,
+
+    /// The identifier of the platform envelope master key (issue #153).
+    ///
+    /// # Why this is configurable, having been a literal
+    ///
+    /// The id is bound into the AAD of every wrapped tenant KEK, and the row records which
+    /// master wrapped it. That is what makes a rotation expressible: two masters must be
+    /// distinguishable, or a rewrapped KEK is indistinguishable from an unrewrapped one.
+    ///
+    /// It was the hardcoded literal `master-1` at every production site, so every deployment's
+    /// master had the same name and no second master could be named. `ironauth storage rekey`
+    /// meanwhile took an arbitrary id, which is the other half of a mismatch that made the
+    /// command unusable: an operator could not name the key their server was using.
+    ///
+    /// CHANGING THIS ON A DEPLOYMENT THAT HAS WRITTEN DATA BREAKS IT, in the same way changing
+    /// [`DatabaseConfig::master_key`] does, and for the same reason: every wrapped KEK's AAD
+    /// binds the value that was in force when it was written. It is rotated by running the
+    /// rekey, not by editing this key.
+    ///
+    /// Defaults to `master-1`, which is what every existing deployment has written into its
+    /// rows, so leaving it unset keeps them readable.
+    pub master_key_id: Option<String>,
 }
 
 impl Default for DatabaseConfig {
@@ -2679,6 +2701,7 @@ impl Default for DatabaseConfig {
                 .expect("default DSN is valid by construction (covered by test)"),
             password: None,
             master_key: None,
+            master_key_id: None,
         }
     }
 }

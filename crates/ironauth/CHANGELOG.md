@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `ironauth storage rekey` can now name the key the SERVER is using (issue #153). A master key
+  argument accepts `ID:secret:PASSPHRASE`, which derives it exactly as the server derives it from
+  `database.master_key`, alongside the existing `ID:HEX` raw form.
+
+  Without it the command was unusable and, worse, dangerous if it had worked. The server builds
+  its master with an HMAC over a passphrase; the CLI took 64 raw hex characters. An operator had
+  no way to express the first as the second, and a rekey TO a raw key would have rewrapped every
+  KEK under a key the server can never reconstruct, because HMAC is not invertible and no
+  `database.master_key` value yields a chosen raw key. Every encrypted-PII read would have failed
+  from the next restart onwards.
+
+  The master key id now comes from `database.master_key_id`, so the two sides of a rotation can
+  be named apart.
+
 - **A configured `server.public_url` with no dot in its host stopped ALL mail (issue #111).**
   `sender_domain` took the host unvalidated, and `message_id` refuses a domain without a dot, so
   `compose` returned `mime_failed` for every message. `deploy/ironauth.toml` ships

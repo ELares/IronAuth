@@ -6,6 +6,17 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add `database.master_key_id` (issue #153), defaulting to `master-1`, which is the value every
+  existing deployment has already written into `tenant_keks.master_key_id`.
+
+  The id was a hardcoded literal at every production site, and it is bound into the AAD of every
+  wrapped tenant KEK. Two masters could therefore never be distinguished, which is what a
+  rotation requires: `ironauth storage rekey` took an arbitrary id while the server always used
+  `master-1`, so an operator could not name the key their own deployment was using.
+
+  CHANGING IT ON A DEPLOYMENT THAT HAS WRITTEN DATA BREAKS IT, exactly as changing
+  `database.master_key` does, and for the same reason. It is rotated by running the rekey.
+
 - **The `wasm-hooks` experimental feature (issue #114 criterion 7).** Off by default and
   acknowledgment-gated. The reason is the ABI rather than the runtime: the sandbox is
   adversarially tested and the latency is benchmarked and gated, but a hook is a compiled

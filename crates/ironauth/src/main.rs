@@ -5868,6 +5868,13 @@ fn select_control_dsn(config: &Config) -> Option<String> {
 /// is DERIVED from the secret (a domain-separated HMAC), so any-length
 /// high-entropy secret works and the same secret always yields the same key
 /// (stable across restarts, which every wrapped tenant key depends on).
+/// The master key id every deployment has been writing into `tenant_keks.master_key_id`.
+///
+/// A DEFAULT RATHER THAN A LITERAL now (issue #153). It has to stay exactly this string: it is
+/// bound into the AAD of every KEK already wrapped, so changing the default would make existing
+/// rows unopenable on the next restart.
+pub(crate) const DEFAULT_MASTER_KEY_ID: &str = "master-1";
+
 fn resolve_master_key(config: &Config) -> Option<Arc<MasterKey>> {
     let Some(secret) = &config.database.master_key else {
         tracing::warn!(
@@ -5878,8 +5885,16 @@ fn resolve_master_key(config: &Config) -> Option<Arc<MasterKey>> {
         return None;
     };
     match secret.resolve() {
+        // THE ID COMES FROM CONFIG, defaulting to what every existing deployment has written
+        // into its rows. See `DatabaseConfig::master_key_id`: it is bound into the AAD of every
+        // wrapped KEK, so two masters must be able to differ by name before a rotation can be
+        // expressed at all.
         Ok(material) => Some(Arc::new(MasterKey::derive(
-            "master-1",
+            config
+                .database
+                .master_key_id
+                .as_deref()
+                .unwrap_or(DEFAULT_MASTER_KEY_ID),
             material.expose().as_bytes(),
         ))),
         Err(error) => {
@@ -7138,7 +7153,7 @@ fn prepare_dev_schema(
             .await
             .map_err(|error| error.to_string())?
             .with_master_key(std::sync::Arc::new(MasterKey::derive(
-                "master-1",
+                DEFAULT_MASTER_KEY_ID,
                 dev::DEV_MASTER_KEY.as_bytes(),
             )));
         store
@@ -8281,8 +8296,10 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 "ironauth storage: expected a subcommand: rekey, kek-backup, or kek-restore."
             );
             eprintln!(
-                "usage: ironauth storage rekey --url DSN --from-master-key ID:HEX \
-                 --to-master-key ID:HEX"
+                "usage: ironauth storage rekey --url DSN --from-master-key KEY \
+                 --to-master-key KEY\n\
+                 where KEY is ID:secret:PASSPHRASE (what `database.master_key` holds) or \
+                 ID:HEX (64 hex characters)"
             );
             eprintln!("       ironauth storage kek-backup --url DSN --out FILE");
             eprintln!("       ironauth storage kek-restore --url DSN --in FILE");
@@ -8335,7 +8352,9 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
     };
     let (Some(from), Some(to)) = (parse_master_key(&from), parse_master_key(&to)) else {
         eprintln!(
-            "ironauth storage rekey: a master key is ID:HEX, where HEX is 64 hex characters \
+            "ironauth storage rekey: a master key is ID:secret:PASSPHRASE, which derives it \
+             exactly as the server does from `database.master_key`, or ID:HEX where HEX is 64 \
+             hex characters \
              (32 bytes). The id is bound into every wrapped KEK's AAD, so it is part of the \
              key rather than a label."
         );
@@ -8636,10 +8655,43 @@ fn kek_restore_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
     })
 }
 
-/// Parse `id:hex` into a master key. The id is bound into every wrapped KEK's AAD.
+/// Parse a master key an operator named, in either of the two forms (issue #153).
+///
+/// `id:hex` is 64 hex characters used verbatim, and `id:secret:TEXT` DERIVES the key from a
+/// passphrase exactly as the server does.
+///
+/// # Why the second form has to exist
+///
+/// The server builds its master with `MasterKey::derive(id, secret)`, an HMAC over a passphrase
+/// an operator sets in `database.master_key`. This parser only took raw bytes, so there was no
+/// way to name the key a running deployment was using: an operator would have had to supply the
+/// hex of `HMAC-SHA256(their secret, MASTER_DERIVE_LABEL)`, which is not documented and which
+/// they have no way to compute.
+///
+/// AND NO RAW KEY CAN BE ADOPTED AS A NEW MASTER, which is the worse half. HMAC is not
+/// invertible, so there is no value of `database.master_key` that makes the server reproduce a
+/// key given as hex. A rekey TO a raw key would therefore have rewrapped every KEK under
+/// something the server can never reconstruct, failing every encrypted-PII read from the next
+/// restart onwards -- loudly, because the AAD binds the id, but permanently.
+///
+/// So `secret:` is the form an operator can use on both sides of a real rotation, and the hex
+/// form stays for keys that were genuinely provisioned as bytes.
 fn parse_master_key(text: &str) -> Option<ironauth_jose::MasterKey> {
-    let (id, hex) = text.split_once(':')?;
-    if id.is_empty() || hex.len() != 64 {
+    let (id, rest) = text.split_once(':')?;
+    if id.is_empty() {
+        return None;
+    }
+    if let Some(secret) = rest.strip_prefix("secret:") {
+        if secret.is_empty() {
+            return None;
+        }
+        // THE SAME CONSTRUCTION THE SERVER USES, and it must stay the same: `resolve_master_key`
+        // calls `MasterKey::derive(id, secret_bytes)` and nothing else. A second derivation here
+        // would produce a key that opens nothing the server wrote.
+        return Some(ironauth_jose::MasterKey::derive(id, secret.as_bytes()));
+    }
+    let hex = rest;
+    if hex.len() != 64 {
         return None;
     }
     let mut bytes = [0_u8; 32];
@@ -8656,8 +8708,10 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("  ironauth serve [--config PATH]   Run the server until SIGTERM/SIGINT");
-    println!("  ironauth storage rekey --url DSN --from-master-key ID:HEX \\");
-    println!("               --to-master-key ID:HEX");
+    println!("  ironauth storage rekey --url DSN --from-master-key KEY \\");
+    println!("               --to-master-key KEY");
+    println!("                                   KEY is ID:secret:PASSPHRASE (derived as the");
+    println!("                                   server does) or ID:HEX (64 hex characters)");
     println!("                                   Rewrap every tenant KEK under a new platform");
     println!("                                   master key. OFFLINE: a running server holds");
     println!("                                   one master and cannot open both shapes");
@@ -8747,6 +8801,91 @@ mod tests {
         Config::from_toml_str(toml, "<test>")
             .expect("valid config")
             .config
+    }
+
+    /// Write a secret to its own file and return the path, so a config can reference it the way
+    /// an operator's does.
+    fn secret_file(name: &str, secret: &str) -> String {
+        let path = std::env::temp_dir().join(format!("ironauth-master-key-{name}.secret"));
+        std::fs::write(&path, secret).expect("write the secret file");
+        path.display().to_string()
+    }
+
+    /// THE DEFECT THIS CLOSES, stated as a test: the key the rekey CLI parses and the key the
+    /// server resolves must be the SAME KEY for the same inputs.
+    ///
+    /// They were not, and nothing compared them. The server derives from a passphrase with a
+    /// hardcoded id; the CLI took an arbitrary id and 64 raw hex characters. So no operator
+    /// could name the key their deployment was using, and a rekey TO a raw key would have
+    /// rewrapped every KEK under something the server can never reconstruct, because HMAC is
+    /// not invertible and no `database.master_key` value yields a chosen raw key.
+    ///
+    /// The rekey suite has twenty tests and none of them could see this: they construct both
+    /// masters in-process and never go near `resolve_master_key`.
+    #[test]
+    fn the_cli_can_name_the_key_the_server_resolves() {
+        // A SECRET CANNOT BE A LITERAL IN CONFIG, deliberately, so this goes through the same
+        // `file` indirection an operator uses. A file rather than an env var because this crate
+        // forbids `unsafe`, and `set_var` is unsafe; a distinct path per test because these run
+        // in parallel in one process.
+        let path = secret_file("same", "a-high-entropy-passphrase");
+        let toml = format!(
+            "[database]\nurl = \"postgres://localhost/ironauth\"\nmaster_key = {{ file = \"{path}\" }}\n"
+        );
+        let served = resolve_master_key(&config(&toml)).expect("the server resolves a master");
+
+        // Exactly what an operator would type, using the passphrase they configured.
+        let named = parse_master_key("master-1:secret:a-high-entropy-passphrase")
+            .expect("the CLI parses the derived form");
+
+        // THE IDS MUST MATCH, because the id is bound into every wrapped KEK's AAD: a key with
+        // the right bytes and the wrong name opens nothing.
+        assert_eq!(served.id(), named.id());
+
+        // AND THE MATERIAL MUST MATCH, which is the half an id comparison would miss. There is
+        // no accessor for the bytes, so this asserts the property that matters instead: a KEK
+        // wrapped by one opens under the other.
+        let env = ironauth_env::Env::system();
+        let kek = ironauth_jose::Kek::generate(env.entropy());
+        let aad = ironauth_jose::Aad::builder().text("probe").build();
+        let wrapped = served.wrap_kek(env.entropy(), &aad, &kek);
+        named
+            .unwrap_kek(&aad, &wrapped)
+            .expect("the CLI-named key must open what the server-resolved key wrapped");
+    }
+
+    /// A DIFFERENT PASSPHRASE MUST NOT OPEN IT. Without this the test above would pass against
+    /// a `derive` that ignored its input.
+    #[test]
+    fn a_different_passphrase_does_not_open_what_the_server_wrapped() {
+        let path = secret_file("diff", "a-high-entropy-passphrase");
+        let toml = format!(
+            "[database]\nurl = \"postgres://localhost/ironauth\"\nmaster_key = {{ file = \"{path}\" }}\n"
+        );
+        let served = resolve_master_key(&config(&toml)).expect("the server resolves a master");
+        let other = parse_master_key("master-1:secret:a-different-passphrase").expect("parses");
+
+        let env = ironauth_env::Env::system();
+        let kek = ironauth_jose::Kek::generate(env.entropy());
+        let aad = ironauth_jose::Aad::builder().text("probe").build();
+        let wrapped = served.wrap_kek(env.entropy(), &aad, &kek);
+        assert!(other.unwrap_kek(&aad, &wrapped).is_err());
+    }
+
+    /// The configured id reaches the resolved key, and its default is the value already written
+    /// into every existing deployment's rows.
+    #[test]
+    fn the_master_key_id_is_configurable_and_defaults_to_what_is_already_written() {
+        let path = secret_file("id", "s");
+        let base = format!(
+            "[database]\nurl = \"postgres://localhost/ironauth\"\nmaster_key = {{ file = \"{path}\" }}\n"
+        );
+        let default_id = resolve_master_key(&config(&base)).expect("resolves");
+        assert_eq!(default_id.id(), "master-1");
+
+        let named = resolve_master_key(&config(&format!("{base}master_key_id = \"master-2\"\n")))
+            .expect("resolves");
+        assert_eq!(named.id(), "master-2");
     }
 
     #[test]
