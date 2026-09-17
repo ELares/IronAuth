@@ -57,6 +57,23 @@ pub enum Action {
     /// Distinct from `Deny` because the caller can DO something about it: a forward-auth
     /// surface redirects to re-authenticate, and a token endpoint answers the RFC 9470
     /// `insufficient_user_authentication` challenge.
+    ///
+    /// # A rule carrying this action decides `Allow` once the request reaches the ACR
+    ///
+    /// "Admit only with a stronger authentication" is a condition, not a verdict, and the
+    /// engine resolves it: a matching step-up rule whose ACR the request has ALREADY reached
+    /// decides [`Action::Allow`], attributed to that rule.
+    ///
+    /// Without the resolution this action could not terminate. The caller is challenged,
+    /// authenticates, returns with the stronger authentication, matches the SAME rule, and is
+    /// challenged again, forever, because nothing in the rule set can observe that the
+    /// challenge was met. That is not a hypothetical: the engine shipped with this action and
+    /// with no fact describing the authentication a request arrives with, so every step-up
+    /// rule an operator could write was an infinite redirect.
+    ///
+    /// The comparison is the step-up ladder's ([`crate::acr_satisfies`]) under the
+    /// order the rule set carries, so a request that reached a STRONGER rung than the rule
+    /// names satisfies it, and an unranked ACR satisfies only itself.
     StepUp {
         /// The authentication context class the request must reach.
         acr: String,
@@ -110,6 +127,25 @@ pub enum Criterion {
     /// Every variant requires a subject to be present before any claim about it can hold,
     /// including the group and role checks. See [`SubjectCheck`].
     Subject(SubjectCheck),
+    /// The authentication the request ARRIVED with reaches this ACR floor.
+    ///
+    /// Compared through the step-up ladder ([`crate::acr_satisfies`]) under the
+    /// order the rule set carries, so naming `pwd` is satisfied by an `mfa` session and a
+    /// floor absent from the order is satisfied only by itself.
+    ///
+    /// A request carrying NO authentication context never satisfies this, whatever the floor,
+    /// and an EMPTY floor is satisfied by nothing. Both are the refusing direction, and both
+    /// match the rest of this vocabulary: an empty `PathPrefix` matches no path and an empty
+    /// `Method` list matches no method, because a criterion that constrains nothing is
+    /// written by leaving it out.
+    ///
+    /// # This is not the same thing as [`Action::StepUp`]
+    ///
+    /// The action OFFERS the caller a remedy; this criterion merely selects. A rule that
+    /// should challenge a weakly authenticated caller uses the action. A rule that should
+    /// simply not apply to one -- an `allow` that is only for strongly authenticated
+    /// sessions, sitting above a broader `deny` -- uses this.
+    AcrAtLeast(String),
 }
 
 /// A condition on who is asking.
@@ -162,6 +198,23 @@ pub struct RequestFacts {
     pub groups: Vec<String>,
     /// The subject's roles.
     pub roles: Vec<String>,
+    /// The authentication context class the request ALREADY reached, absent when the caller
+    /// is anonymous or the surface resolved none.
+    ///
+    /// # Derived, never asserted
+    ///
+    /// This is the ACHIEVED context: what the recorded authentication actually did, as
+    /// [`crate::achieved_acr`] derives it from the session's method tokens. It is not
+    /// a value the caller sends. A request-supplied ACR would let anyone answer the step-up
+    /// challenge made of them by claiming to have met it, which is the whole of the
+    /// requirement handed to the party it constrains.
+    ///
+    /// The field is public like the rest of [`RequestFacts`], so the guarantee lives at the
+    /// surface that fills it in: [`crate::forward_auth::ForwardAuth::evaluate`] OVERWRITES
+    /// it from the resolved identity exactly as it overwrites the subject, groups and roles,
+    /// for the same reason -- one principal, so what the engine decides about and what the
+    /// authentication established cannot disagree.
+    pub acr: Option<String>,
 }
 
 /// The engine's answer.
@@ -193,6 +246,16 @@ impl RequestFacts {
             .as_deref()
             .filter(|subject| !subject.is_empty())
     }
+
+    /// The reached authentication context, but only when there actually is one.
+    ///
+    /// An EMPTY acr is not an acr, for the reason `authenticated_subject` gives one field up:
+    /// it is what a partially filled `RequestFacts` and a blank proxy header both produce,
+    /// and treating it as a reached context would let it satisfy an equally empty floor.
+    /// Every reader comes through here, so the question is answered once.
+    fn achieved_acr(&self) -> Option<&str> {
+        self.acr.as_deref().filter(|acr| !acr.is_empty())
+    }
 }
 
 impl Decision {
@@ -207,16 +270,50 @@ impl Decision {
 }
 
 /// An ordered rule set.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RuleSet {
     rules: Vec<Rule>,
+    acr_order: Vec<String>,
+}
+
+impl Default for RuleSet {
+    /// No rules, and the DEFAULT ladder rather than an empty one.
+    ///
+    /// Derived `Default` gave an empty order, which is not "no opinion": an empty order ranks
+    /// nothing, so `acr_satisfies` falls back to exact string equality and an `mfa` session
+    /// stops satisfying a `pwd` floor. A rule set built the short way would have enforced a
+    /// different policy from one built through [`RuleSet::new`], silently and in the
+    /// challenging direction.
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 impl RuleSet {
-    /// Build a rule set from rules in evaluation order.
+    /// Build a rule set from rules in evaluation order, ranking ACRs by the default ladder.
     #[must_use]
     pub fn new(rules: Vec<Rule>) -> Self {
-        Self { rules }
+        Self {
+            rules,
+            acr_order: crate::step_up::default_acr_order(),
+        }
+    }
+
+    /// The same rules, ranking ACRs by a deployment's configured order (`oidc.acr_order`).
+    ///
+    /// Takes the order rather than reading it, because this crate's rule engine is consulted
+    /// by surfaces that resolve configuration differently and two of them disagreeing about
+    /// the ladder is a policy difference, not a detail.
+    #[must_use]
+    pub fn with_acr_order(mut self, order: Vec<String>) -> Self {
+        self.acr_order = order;
+        self
+    }
+
+    /// The ACR order these rules rank by, weakest first.
+    #[must_use]
+    pub fn acr_order(&self) -> &[String] {
+        &self.acr_order
     }
 
     /// The rules, in evaluation order.
@@ -273,6 +370,29 @@ impl RuleSet {
                             deps.fields.insert(FactField::Roles);
                         }
                     },
+                    Criterion::AcrAtLeast(_) => {
+                        deps.fields.insert(FactField::Acr);
+                    }
+                }
+            }
+            // THE ACTION READS A FACT TOO, and only this one does.
+            //
+            // Every other action is a constant: a rule that matches decides `Allow` or `Deny`
+            // regardless of the request. A step-up rule does not -- it resolves to `Allow`
+            // for a caller who has reached the ACR and challenges one who has not -- so the
+            // reached ACR is an INPUT to the decision even when no criterion mentions it.
+            //
+            // Deriving dependencies from criteria alone was therefore a cache key missing an
+            // input, which is the failure the comment above this method describes: two
+            // requests differing only in how strongly they authenticated share one entry, and
+            // the first caller through the door hands their `Allow` to every caller behind
+            // them. The step-up requirement would be enforced for exactly one request per TTL.
+            //
+            // Matched exhaustively so a fifth action cannot be added without answering this.
+            match &rule.action {
+                Action::Allow | Action::Deny => {}
+                Action::StepUp { .. } => {
+                    deps.fields.insert(FactField::Acr);
                 }
             }
         }
@@ -303,6 +423,11 @@ impl RuleSet {
         use std::hash::{Hash, Hasher};
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // THE ORDER IS PART OF THE POLICY, so it is part of the generation. Two replicas
+        // holding identical rules under different `oidc.acr_order` values resolve a step-up
+        // differently -- one admits a session the other challenges -- and a shared store
+        // would let the laxer replica's `Allow` answer the stricter one's request.
+        self.acr_order.hash(&mut hasher);
         // Hashed first so that appending a rule cannot be absorbed by the concatenation of
         // the ones before it.
         self.rules.len().hash(&mut hasher);
@@ -386,7 +511,7 @@ impl RuleSet {
             let mut captures: HashMap<String, String> = HashMap::new();
             let mut failed_at: Option<usize> = None;
             for (index, criterion) in rule.criteria.iter().enumerate() {
-                if !matches(criterion, facts, &mut captures) {
+                if !matches(criterion, facts, &mut captures, &self.acr_order) {
                     failed_at = Some(index);
                     // Stop at the FIRST failure, preserving the short-circuit that
                     // `all()` gave us. It is also the right answer for a trace: the
@@ -401,7 +526,7 @@ impl RuleSet {
             }
             recorder.matched(rule);
             let decision = Decision {
-                action: rule.action.clone(),
+                action: self.resolve(&rule.action, facts),
                 matched: Some(rule.name.clone()),
             };
             if !R::RECORDS {
@@ -412,6 +537,29 @@ impl RuleSet {
             decided = Some(decision);
         }
         decided.unwrap_or_else(Decision::no_match)
+    }
+
+    /// The action a matching rule actually decides, given what the request authenticated as.
+    ///
+    /// Only [`Action::StepUp`] is not already a verdict; see its documentation for why
+    /// resolving it here is what lets a step-up rule terminate.
+    ///
+    /// Placed on the walk rather than at each caller deliberately. `decide`, `explain` and
+    /// `dry_run` all come through `walk`, and criterion 4 asks that the same rules gate a
+    /// forward-auth resource, an OIDC issuance and a step-up requirement -- three surfaces.
+    /// A resolution performed by the caller is a resolution five callers can each get wrong,
+    /// and the wrong answers differ: one loops, one admits.
+    fn resolve(&self, action: &Action, facts: &RequestFacts) -> Action {
+        match action {
+            Action::StepUp { acr }
+                if facts.achieved_acr().is_some_and(|achieved| {
+                    crate::step_up::acr_satisfies(achieved, acr, &self.acr_order)
+                }) =>
+            {
+                Action::Allow
+            }
+            other => other.clone(),
+        }
     }
 }
 
@@ -684,6 +832,7 @@ fn describe(criterion: &Criterion) -> String {
             SubjectCheck::Authenticated => "subject is authenticated".to_owned(),
             SubjectCheck::Anonymous => "subject is anonymous".to_owned(),
         },
+        Criterion::AcrAtLeast(floor) => format!("authentication reaches {floor}"),
     }
 }
 
@@ -696,8 +845,16 @@ fn matches(
     criterion: &Criterion,
     facts: &RequestFacts,
     captures: &mut HashMap<String, String>,
+    acr_order: &[String],
 ) -> bool {
     match criterion {
+        // AN ABSENT FLOOR AND AN ABSENT CONTEXT BOTH REFUSE, and the two `is_some_and`s are
+        // what says so: no reached context fails whatever the floor, and `acr_satisfies`
+        // answers false for an empty floor because an empty string is in no order and equals
+        // no reached value (`achieved_acr` has already excluded the empty one).
+        Criterion::AcrAtLeast(floor) => facts
+            .achieved_acr()
+            .is_some_and(|achieved| crate::step_up::acr_satisfies(achieved, floor, acr_order)),
         Criterion::Method(allowed) => allowed
             .iter()
             .any(|method| method.eq_ignore_ascii_case(&facts.method)),
@@ -862,6 +1019,8 @@ pub enum FactField {
     Groups,
     /// The subject's roles.
     Roles,
+    /// The authentication context class the request reached.
+    Acr,
 }
 
 impl FactDependencies {
@@ -1032,6 +1191,8 @@ impl<S: DecisionStore> CachedRuleSet<S> {
                     // subject is one caller with `None` rather than a third class the key
                     // invents. The file documented both readings at once.
                     FactField::Subject => facts.authenticated_subject().map(str::to_owned),
+                    // Through the SAME accessor again: an empty acr is the absent one.
+                    FactField::Acr => facts.achieved_acr().map(str::to_owned),
                     // Carried in their own fields below, because they are lists.
                     FactField::Groups | FactField::Roles => return None,
                 };
@@ -1354,6 +1515,22 @@ mod tests {
                 "payments-catch-all",
                 vec![Criterion::PathPrefix("/payments".to_owned())],
             ),
+            // THE SIXTH CRITERION TYPE. Without it this set covered five of six, while the
+            // doc above and on `corpus_cases` both said every variant appeared -- so the new
+            // criterion never went through composition with another criterion, never appeared
+            // in a trace, and never took part in the first-match ordering the corpus exists
+            // to pin. Placed above its own catch-all for the same reason the step-up row is.
+            allow(
+                "vault-for-strong-sessions",
+                vec![
+                    Criterion::PathPrefix("/vault".to_owned()),
+                    Criterion::AcrAtLeast(crate::step_up::canonical_step_up_acr("mfa")),
+                ],
+            ),
+            deny(
+                "vault-otherwise",
+                vec![Criterion::PathPrefix("/vault".to_owned())],
+            ),
         ])
     }
 
@@ -1370,6 +1547,28 @@ mod tests {
     /// The rows whose selection turns on the SUBJECT: roles, captures, groups.
     fn corpus_cases_subject() -> Vec<Case> {
         vec![
+            Case {
+                name: "a strong session reaches the vault through the floor above the deny",
+                facts: RequestFacts {
+                    path: "/vault/keys".to_owned(),
+                    subject: Some("alice".to_owned()),
+                    acr: Some(crate::step_up::canonical_step_up_acr("mfa")),
+                    ..facts()
+                },
+                expect: Some("vault-for-strong-sessions"),
+                action: Action::Allow,
+            },
+            Case {
+                name: "the same request with a password session falls to the deny below it",
+                facts: RequestFacts {
+                    path: "/vault/keys".to_owned(),
+                    subject: Some("alice".to_owned()),
+                    acr: Some(crate::step_up::canonical_step_up_acr("pwd")),
+                    ..facts()
+                },
+                expect: Some("vault-otherwise"),
+                action: Action::Deny,
+            },
             Case {
                 name: "anonymous at /admin hits the deny above the allow",
                 facts: RequestFacts {
@@ -2704,6 +2903,7 @@ mod tests {
                     SubjectCheck::InGroup(_) => vec![FactField::Subject, FactField::Groups],
                     SubjectCheck::HasRole(_) => vec![FactField::Subject, FactField::Roles],
                 },
+                Criterion::AcrAtLeast(_) => vec![FactField::Acr],
             }
         }
 
@@ -2712,6 +2912,7 @@ mod tests {
             Criterion::Host("h".to_owned()),
             Criterion::PathPrefix("/p".to_owned()),
             Criterion::PathMatches(Regex::new("^/p$").expect("pattern")),
+            Criterion::AcrAtLeast("mfa".to_owned()),
             Criterion::Header {
                 name: "X-Service".to_owned(),
                 value: "v".to_owned(),
@@ -2728,28 +2929,23 @@ mod tests {
             let rendered = describe(&criterion);
             let wanted = expected(&criterion);
             let deps = RuleSet::new(vec![allow("r", vec![criterion])]).dependencies();
-            for field in &wanted {
-                assert!(
-                    deps.reads(*field),
-                    "{rendered}: {field:?} is not in the cache key, so two requests \
-                     differing only in it would share an entry"
-                );
-            }
-            // And nothing MORE, which is the over-splitting direction.
-            for field in [
-                FactField::Method,
-                FactField::Host,
-                FactField::Path,
-                FactField::Subject,
-                FactField::Groups,
-                FactField::Roles,
-            ] {
-                assert_eq!(
-                    deps.reads(field),
-                    wanted.contains(&field),
-                    "{rendered}: disagreement on {field:?}"
-                );
-            }
+            // BOTH DIRECTIONS AT ONCE, by comparing the SETS.
+            //
+            // This was a positive loop over `wanted` followed by a negative loop over a
+            // hand-written list of every `FactField`. That second list is what fell behind:
+            // `FactField::Acr` was added to the enum and not to it, so over-declaration of the
+            // new fact -- a criterion splitting the cache on something it does not read -- was
+            // unguarded, and a list written to catch a list falling behind had fallen behind.
+            //
+            // Comparing the sets needs no list. A variant added to the enum is covered the
+            // moment `expected` names it, which the compiler already forces.
+            assert_eq!(
+                deps.fields,
+                wanted.iter().copied().collect::<BTreeSet<FactField>>(),
+                "{rendered}: the declared facts and the facts it reads disagree. Missing one \
+                 makes two requests differing only in it share a cache entry; declaring one \
+                 it does not read splits the cache for callers the engine cannot tell apart"
+            );
         }
 
         // Headers are keyed by name, lowercased to match the case-insensitive comparison.
@@ -3605,5 +3801,329 @@ mod tests {
             cached.decide(&live, at(5_001)).cached,
             "an entry still inside its TTL must survive a reclamation driven by expired ones"
         );
+    }
+
+    // ----------------------------------------------------------------------------------
+    // The reached authentication context (issue #154 criterion 4).
+    // ----------------------------------------------------------------------------------
+
+    /// The canonical rungs, so a test asserts against what a SESSION actually carries rather
+    /// than against a short alias no achieved context is ever spelled with.
+    fn pwd() -> String {
+        crate::step_up::canonical_step_up_acr("pwd")
+    }
+
+    fn mfa() -> String {
+        crate::step_up::canonical_step_up_acr("mfa")
+    }
+
+    fn payments_need_mfa() -> RuleSet {
+        RuleSet::new(vec![rule(
+            "payments-need-mfa",
+            vec![Criterion::PathPrefix("/payments".to_owned())],
+            Action::StepUp { acr: mfa() },
+        )])
+    }
+
+    fn at_payments(acr: Option<&str>) -> RequestFacts {
+        RequestFacts {
+            path: "/payments/transfer".to_owned(),
+            subject: Some("alice".to_owned()),
+            acr: acr.map(str::to_owned),
+            ..facts()
+        }
+    }
+
+    /// THE DEFECT THIS CRITERION EXISTED AROUND: a step-up rule that never terminates.
+    ///
+    /// The engine shipped with `Action::StepUp` and with no fact describing the
+    /// authentication a request arrived with. A caller was challenged, authenticated,
+    /// returned, matched the same rule, and was challenged again -- forever -- because
+    /// nothing in a rule set could observe that the challenge had been met.
+    ///
+    /// Both halves are asserted in ONE test on purpose. Either alone is satisfiable by a
+    /// broken engine: a rule that always challenges passes the first, and a rule that always
+    /// admits passes the second.
+    #[test]
+    fn a_step_up_challenges_a_weak_session_and_admits_the_same_caller_once_it_steps_up() {
+        let rules = payments_need_mfa();
+
+        assert_eq!(
+            rules.decide(&at_payments(Some(&pwd()))).action,
+            Action::StepUp { acr: mfa() },
+            "a password session has not reached the rung the rule names"
+        );
+
+        let admitted = rules.decide(&at_payments(Some(&mfa())));
+        assert_eq!(
+            admitted.action,
+            Action::Allow,
+            "the same rule must ADMIT the caller who answered its challenge, or the caller \
+             is redirected to authenticate for as long as they keep returning"
+        );
+        assert_eq!(
+            admitted.matched.as_deref(),
+            Some("payments-need-mfa"),
+            "the admission is attributed to the rule that required it, so an operator \
+             reading a trace can see which requirement was met"
+        );
+    }
+
+    /// AN ANONYMOUS CALLER IS CHALLENGED, NOT ADMITTED.
+    ///
+    /// `None` is the value a surface that has not wired the achieved context produces, and
+    /// the value every `RequestFacts` literal in this repository carried before the field
+    /// existed. It must never satisfy a floor.
+    #[test]
+    fn no_reached_context_satisfies_no_step_up_and_no_floor() {
+        assert_eq!(
+            payments_need_mfa().decide(&at_payments(None)).action,
+            Action::StepUp { acr: mfa() }
+        );
+
+        let floored = RuleSet::new(vec![allow(
+            "strong-only",
+            vec![Criterion::AcrAtLeast(pwd())],
+        )]);
+        assert_eq!(
+            floored.decide(&at_payments(None)).action,
+            Action::Deny,
+            "a rule whose floor is unmet does not match, and nothing below it admits"
+        );
+        assert_eq!(
+            floored.decide(&at_payments(Some(""))).action,
+            Action::Deny,
+            "an EMPTY acr is not a reached context, for the reason an empty subject is not a \
+             subject: it is what a partially filled fact set produces"
+        );
+    }
+
+    /// THE DEGENERATE PAIR: an empty floor met by an empty reached context.
+    ///
+    /// The assertion above passes with or without `achieved_acr`'s emptiness filter, because a
+    /// blank context fails a REAL floor either way -- a mutation proved it vacuous. The filter
+    /// only bites when BOTH sides are blank, and then it decides the whole question: an empty
+    /// string equals an empty string, so `acr_satisfies` returns true on its first line and a
+    /// rule requiring an authentication level nobody named is satisfied by a request that
+    /// named none either.
+    ///
+    /// Configuration cannot reach this: an empty `acr_at_least` is refused as invalid and an
+    /// empty step-up `acr` names no rung. The engine is a public API with public fields, so
+    /// this is pinned where the decision is made rather than where one caller happens to
+    /// validate.
+    #[test]
+    fn an_empty_floor_is_not_satisfied_by_an_empty_reached_context() {
+        let blank_floor = RuleSet::new(vec![allow(
+            "floor-nobody-wrote",
+            vec![Criterion::AcrAtLeast(String::new())],
+        )]);
+        assert_eq!(
+            blank_floor.decide(&at_payments(Some(""))).action,
+            Action::Deny,
+            "two blanks matching is a rule that enforces nothing while reading as a \
+             restriction"
+        );
+        assert_eq!(
+            blank_floor.decide(&at_payments(Some(&mfa()))).action,
+            Action::Deny,
+            "and no real authentication reaches an unnamed floor either"
+        );
+
+        let blank_step_up = RuleSet::new(vec![rule(
+            "step-up-to-nowhere",
+            vec![Criterion::PathPrefix("/payments".to_owned())],
+            Action::StepUp { acr: String::new() },
+        )]);
+        assert_eq!(
+            blank_step_up.decide(&at_payments(Some(""))).action,
+            Action::StepUp { acr: String::new() },
+            "a step-up naming no rung must not be answered by a caller who reached no rung"
+        );
+    }
+
+    /// THE LADDER, NOT STRING EQUALITY. An `mfa` session satisfies a `pwd` floor.
+    ///
+    /// Equality would be the quiet failure: every rule would still enforce SOMETHING, and a
+    /// deployment would only discover that its strongest sessions were being challenged for
+    /// its weakest requirement when a user complained.
+    #[test]
+    fn a_stronger_rung_satisfies_a_weaker_floor_in_both_the_action_and_the_criterion() {
+        let step_up_to_pwd = RuleSet::new(vec![rule(
+            "any-authentication",
+            vec![Criterion::PathPrefix("/payments".to_owned())],
+            Action::StepUp { acr: pwd() },
+        )]);
+        assert_eq!(
+            step_up_to_pwd.decide(&at_payments(Some(&mfa()))).action,
+            Action::Allow,
+            "an mfa session has reached more than a pwd floor asks for"
+        );
+
+        let floor_pwd = RuleSet::new(vec![allow(
+            "authenticated-at-all",
+            vec![Criterion::AcrAtLeast(pwd())],
+        )]);
+        assert_eq!(
+            floor_pwd.decide(&at_payments(Some(&mfa()))).action,
+            Action::Allow
+        );
+
+        // ...and not the other way round.
+        let floor_mfa = RuleSet::new(vec![allow(
+            "strong-only",
+            vec![Criterion::AcrAtLeast(mfa())],
+        )]);
+        assert_eq!(
+            floor_mfa.decide(&at_payments(Some(&pwd()))).action,
+            Action::Deny
+        );
+    }
+
+    /// AN UNRANKED VALUE SATISFIES ONLY ITSELF, which is `acr_satisfies`'s contract and the
+    /// reason a floor naming a value the deployment cannot issue is refused at conversion.
+    #[test]
+    fn an_unranked_reached_context_satisfies_only_an_exact_floor() {
+        let invented = "urn:example:acr:invented";
+        let exact = RuleSet::new(vec![allow(
+            "exact",
+            vec![Criterion::AcrAtLeast(invented.to_owned())],
+        )]);
+        assert_eq!(
+            exact.decide(&at_payments(Some(invented))).action,
+            Action::Allow
+        );
+        assert_eq!(
+            exact.decide(&at_payments(Some(&mfa()))).action,
+            Action::Deny,
+            "a ranked rung cannot outrank a value that is on no ladder"
+        );
+
+        let ranked = RuleSet::new(vec![allow("ranked", vec![Criterion::AcrAtLeast(pwd())])]);
+        assert_eq!(
+            ranked.decide(&at_payments(Some(invented))).action,
+            Action::Deny,
+            "and an unranked session cannot satisfy a ranked floor"
+        );
+    }
+
+    /// A STEP-UP ACTION MAKES THE REACHED CONTEXT A CACHE KEY INPUT, even though no criterion
+    /// in the rule set mentions it.
+    ///
+    /// Dependencies were derived from CRITERIA alone, which was right while every action was
+    /// a constant. A step-up rule is not a constant: it resolves to `Allow` for a caller who
+    /// reached the ACR and challenges one who has not. Keying without the context means the
+    /// first caller through the door leaves their `Allow` where the next caller finds it, so
+    /// the step-up requirement is enforced for exactly one request per TTL.
+    #[test]
+    fn a_step_up_action_alone_puts_the_reached_context_in_the_cache_key() {
+        let cached = CachedRuleSet::new(
+            payments_need_mfa(),
+            MemoryStore::new(Duration::from_secs(60)),
+        );
+
+        assert!(
+            cached.dependencies().reads(FactField::Acr),
+            "no criterion names the acr, and the ACTION still reads it"
+        );
+
+        let strong = at_payments(Some(&mfa()));
+        let weak = at_payments(Some(&pwd()));
+        assert_ne!(
+            cached.key_for(&strong),
+            cached.key_for(&weak),
+            "two callers differing only in how strongly they authenticated must not share \
+             one entry"
+        );
+
+        // The escalation, driven rather than argued: warm the entry with the caller who HAS
+        // stepped up, then present the one who has not.
+        assert_eq!(cached.decide(&strong, at(0)).decision.action, Action::Allow);
+        let following = cached.decide(&weak, at(1));
+        assert_eq!(
+            following.decision.action,
+            Action::StepUp { acr: mfa() },
+            "the weaker caller must be challenged even though a stronger one was just admitted"
+        );
+        assert!(
+            !following.cached,
+            "and must not have been answered out of the stronger caller's entry"
+        );
+    }
+
+    /// THE ORDER IS PART OF THE POLICY, so it is part of the generation a shared store keys on.
+    ///
+    /// Two replicas holding identical rules under different `oidc.acr_order` values resolve a
+    /// step-up differently. Without the order in the fingerprint they share entries, and the
+    /// laxer replica's admission answers the stricter replica's request.
+    #[test]
+    fn the_acr_order_participates_in_the_fingerprint_and_in_the_decision() {
+        let default_ladder = payments_need_mfa();
+        let inverted: Vec<String> = {
+            let mut order = crate::step_up::default_acr_order();
+            order.reverse();
+            order
+        };
+        let reordered = payments_need_mfa().with_acr_order(inverted);
+
+        assert_ne!(
+            default_ladder.fingerprint(),
+            reordered.fingerprint(),
+            "the same rules under a different ladder are a different policy"
+        );
+
+        let weak = at_payments(Some(&pwd()));
+        assert_eq!(
+            default_ladder.decide(&weak).action,
+            Action::StepUp { acr: mfa() }
+        );
+        assert_eq!(
+            reordered.decide(&weak).action,
+            Action::Allow,
+            "under an inverted ladder pwd outranks mfa, which is what makes the two \
+             fingerprints having to differ a correctness property rather than hygiene"
+        );
+    }
+
+    /// `RuleSet::default()` MUST RANK, and this is why `Default` is written rather than derived.
+    ///
+    /// A derived `Default` gave an empty order. An empty order ranks nothing, so
+    /// `acr_satisfies` falls back to exact equality and an `mfa` session stops satisfying a
+    /// `pwd` floor: a rule set built the short way would have enforced a different policy from
+    /// the identical one built through `new`.
+    #[test]
+    fn the_default_rule_set_carries_the_default_ladder() {
+        assert_eq!(
+            RuleSet::default().acr_order(),
+            crate::step_up::default_acr_order(),
+            "an empty order is not `no opinion`, it is `nothing outranks anything`"
+        );
+
+        let built = RuleSet {
+            rules: vec![allow("floor", vec![Criterion::AcrAtLeast(pwd())])],
+            ..RuleSet::default()
+        };
+        assert_eq!(
+            built.decide(&at_payments(Some(&mfa()))).action,
+            Action::Allow
+        );
+    }
+
+    /// A SATISFIED STEP-UP IS REPORTED AS THE ADMISSION IT IS.
+    ///
+    /// `Explanation::why_denied` and `DryRun::would_allow` both branch on the action, and both
+    /// would be wrong about this request if the resolution happened at the caller instead of
+    /// inside the walk: a rehearsal would show a challenge for a caller enforcement admits.
+    #[test]
+    fn the_explanation_and_the_dry_run_agree_that_a_met_step_up_admitted() {
+        let rules = payments_need_mfa();
+        let met = at_payments(Some(&mfa()));
+
+        let explained = rules.explain(&met);
+        assert_eq!(explained.decision.action, Action::Allow);
+        assert_eq!(explained.why_denied(), None);
+        assert_eq!(explained.reason(), "allowed by rule payments-need-mfa");
+
+        assert!(rules.dry_run(&met).would_allow());
+        assert!(!rules.dry_run(&at_payments(Some(&pwd()))).would_allow());
     }
 }

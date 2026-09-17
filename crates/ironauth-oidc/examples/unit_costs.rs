@@ -201,8 +201,13 @@ fn main() {
         // and quoting one for both is how a capacity estimate drifts.
         let started = env.clock().monotonic();
         for _ in 0..SAMPLES {
+            // pool-boundary-allow: this MEASURES the raw hasher, which is the one caller
+            // that must not route through the pool -- going through
+            // `OidcState::verify_password` would time the admission queue and the worker
+            // hop as well, and the number this example publishes is the per-verify CPU
+            // cost the pool is then sized against. An example is not a request path.
             assert!(
-                verify_password("correct horse battery staple", &hashed),
+                verify_password("correct horse battery staple", &hashed), // pool-boundary-allow: measures the raw verify
                 "the verify must actually succeed, or this measures a failure path"
             );
         }

@@ -1050,6 +1050,7 @@ async fn assemble_planes(
     // `server.public_url` takes.
     let forward_auth = ironauth_oidc::forward_auth_rules::ForwardAuthRuntime::from_config(
         &config.forward_auth,
+        &config.oidc.acr_order,
         env.clock_arc(),
     )
     .map_err(|error| ServerError::InvalidAccessRules {

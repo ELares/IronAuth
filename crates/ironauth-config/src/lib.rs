@@ -1541,6 +1541,20 @@ pub struct AccessRuleConfig {
     /// Whether the request must be authenticated or anonymous.
     #[serde(default)]
     pub subject_state: Option<SubjectStateConfig>,
+    /// The authentication the request ARRIVED with must reach this `acr` floor.
+    ///
+    /// A short alias (`pwd`, `mfa`, `phr`, `phrh`) or a canonical server `acr`. Compared
+    /// through the step-up ladder, so naming `pwd` is satisfied by an `mfa` session.
+    ///
+    /// # Not the same field as `acr`
+    ///
+    /// `acr` names what a `step-up` action DEMANDS, and the action offers the caller a way to
+    /// get there. This SELECTS: a rule carrying it simply does not apply to a caller who has
+    /// not reached the floor, which is how an `allow` reserved for strongly authenticated
+    /// sessions is written above a broader `deny`. The two are independent and a rule may
+    /// carry both.
+    #[serde(default)]
+    pub acr_at_least: Option<String>,
 }
 
 /// Per-layer request-plane rate limits (issue #150 criterion 1).
@@ -6567,6 +6581,22 @@ fn validate_access_rule(at: &str, rule: &AccessRuleConfig) -> Result<(), ConfigE
         _ => {}
     }
 
+    // AN EMPTY FLOOR IS SATISFIED BY NOTHING, so the rule carrying it never fires. Whether
+    // that is dangerous depends on the action, which is the reason to refuse it here rather
+    // than reason about it per rule: a `deny` that never fires is a restriction the operator
+    // believes they have.
+    //
+    // Whether the value NAMES a rung is checked where the rule is built, because the rungs
+    // come from the authentication registry and this crate sits below it.
+    if let Some(floor) = &rule.acr_at_least {
+        if floor.trim().is_empty() {
+            return Err(invalid(format!(
+                "{at}.acr_at_least is empty: no authentication reaches an unnamed floor, so \
+                 the rule it constrains can never fire"
+            )));
+        }
+    }
+
     // A PREFIX THAT MATCHES NOTHING, OR EVERYTHING, IS NOT A CONSTRAINT.
     //
     // `""` matches no path at all under the engine's segment-boundary rule, so the rule it
@@ -6692,6 +6722,15 @@ fn validate_rule_subject(
                 "subject_equals_capture",
                 rule.subject_equals_capture.is_some(),
             ),
+            // AN ACR IS A CLAIM ABOUT THE SUBJECT TOO. The forward-auth surface fills the
+            // reached authentication context from the resolved identity, so an anonymous
+            // request presents none and no floor can hold. It reads as "anonymous callers who
+            // authenticated strongly", which is not a set of requests.
+            //
+            // This list is hand-written and that is its weakness: it was written when the
+            // vocabulary had four subject fields and a fifth was added without it, which is
+            // exactly how a coherence check stops covering the thing it names.
+            ("acr_at_least", rule.acr_at_least.is_some()),
         ] {
             if set {
                 return Err(invalid(format!(
@@ -11148,6 +11187,14 @@ mod tests {
                      acr = \"urn:example:strong\"\n",
                 ),
                 "which ignores it",
+            ),
+            (deny("acr_at_least = \"   \"\n"), "acr_at_least is empty"),
+            (
+                with(
+                    "[[forward_auth.rules]]\nname = \"a\"\naction = \"allow\"\n\
+                     subject_state = \"anonymous\"\nacr_at_least = \"mfa\"\n",
+                ),
+                "AND sets acr_at_least",
             ),
             (
                 deny("path_matches = \"^/u/(?<user\"\n"),

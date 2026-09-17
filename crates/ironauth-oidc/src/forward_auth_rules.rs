@@ -40,6 +40,31 @@ pub enum ConversionError {
         /// What the build cannot do, and what would happen if it pretended otherwise.
         why: &'static str,
     },
+    /// The rule names an `acr` that is not a rung of this deployment's ladder.
+    ///
+    /// Refused rather than passed through, because an unranked `acr` is satisfied only by an
+    /// exact string match against an ACHIEVED context, and no authentication achieves a value
+    /// the registry does not issue. The two ways that lands are both silent:
+    ///
+    /// - on a `step-up` action the rule challenges a caller who then cannot ever satisfy it,
+    ///   returns, and is challenged again -- the redirect loop [`crate::rules::Action::StepUp`]
+    ///   documents, re-entered through a typo;
+    /// - on `acr_at_least` the rule never fires, so an `allow` silently stops applying and a
+    ///   `deny` silently stops biting.
+    ///
+    /// It also covers a rung that EXISTS but that this surface cannot observe. See
+    /// [`unobservable_acr`]: a rule naming it enforces a different level from the one it
+    /// reads as, which is the same defect wearing a valid value.
+    UnknownAcr {
+        /// The rule's operator-facing name.
+        rule: String,
+        /// The configuration field carrying it.
+        field: &'static str,
+        /// What the operator wrote.
+        value: String,
+        /// The rungs this deployment can actually reach.
+        known: Vec<&'static str>,
+    },
     /// A pattern that passed config validation failed to compile here.
     ///
     /// Config validates the same pattern with the same crate, so this should be
@@ -61,6 +86,18 @@ impl std::fmt::Display for ConversionError {
                 "forward-auth rule `{rule}` uses `{field}`, which this build cannot \
                  evaluate: {why}"
             ),
+            Self::UnknownAcr {
+                rule,
+                field,
+                value,
+                known,
+            } => write!(
+                f,
+                "forward-auth rule `{rule}` sets `{field}` to `{value}`, which names no \
+                 authentication level this deployment can reach: no session ever achieves \
+                 it, so the rule would loop or would never fire. Known levels: {}",
+                known.join(", ")
+            ),
             Self::Pattern { rule, message } => write!(
                 f,
                 "forward-auth rule `{rule}` has a path_matches that failed to compile \
@@ -79,12 +116,23 @@ impl std::error::Error for ConversionError {}
 /// # Errors
 ///
 /// [`ConversionError`] on the first rule this build cannot honour.
-pub fn rule_set_from_config(cfg: &ForwardAuthConfig) -> Result<RuleSet, ConversionError> {
+pub fn rule_set_from_config(
+    cfg: &ForwardAuthConfig,
+    acr_order: &[String],
+) -> Result<RuleSet, ConversionError> {
     let mut rules = Vec::with_capacity(cfg.rules.len());
     for rule in &cfg.rules {
         rules.push(rule_from_config(rule)?);
     }
-    Ok(RuleSet::new(rules))
+    let set = RuleSet::new(rules);
+    // EMPTY MEANS "NOT CONFIGURED", which `oidc.acr_order` documents as falling back to the
+    // canonical order at read time. `RuleSet::new` already carries that order, so passing the
+    // empty list through would replace a real ladder with one that ranks nothing -- the
+    // failure `RuleSet::default` exists to prevent, arriving by a different door.
+    if acr_order.is_empty() {
+        return Ok(set);
+    }
+    Ok(set.with_acr_order(acr_order.to_vec()))
 }
 
 /// Build one [`Rule`], refusing what this build cannot evaluate.
@@ -156,15 +204,25 @@ fn rule_from_config(cfg: &AccessRuleConfig) -> Result<Rule, ConversionError> {
             capture.clone(),
         )));
     }
+    if let Some(floor) = &cfg.acr_at_least {
+        criteria.push(Criterion::AcrAtLeast(canonical_acr(
+            &cfg.name,
+            "acr_at_least",
+            floor,
+        )?));
+    }
 
     let action = match cfg.action {
         AccessActionConfig::Allow => Action::Allow,
         AccessActionConfig::Deny => Action::Deny,
         // Config validation guarantees `acr` is present and non-empty for step-up, so this
-        // default is unreachable. It is a default rather than an unwrap because an empty
-        // acr is a weaker requirement than a panic is a failure.
+        // default is unreachable. It stays a default rather than an unwrap because a panic at
+        // boot in a path that parses operator input is the worse failure -- and the empty
+        // string is no longer a weak requirement that would quietly ship: `canonical_acr`
+        // names no rung for it and refuses, so the unreachable arm now ends in an error
+        // rather than in a step-up nobody can satisfy.
         AccessActionConfig::StepUp => Action::StepUp {
-            acr: cfg.acr.clone().unwrap_or_default(),
+            acr: canonical_acr(&cfg.name, "acr", cfg.acr.as_deref().unwrap_or_default())?,
         },
     };
 
@@ -173,6 +231,67 @@ fn rule_from_config(cfg: &AccessRuleConfig) -> Result<Rule, ConversionError> {
         criteria,
         action,
     })
+}
+
+/// The one ACR rung this surface can never observe, whatever an operator writes.
+///
+/// `mfa_remembered` is achieved by [`crate::AuthMethod::TrustedDevice`], and a trusted-device
+/// contribution is frozen onto an AUTHORIZATION CODE for one request (`authorize.rs`) and is
+/// never written back to the session. Every other rung reaches a session row, because every
+/// other method establishes one: password, the OTP and magic-link paths, passkeys, federation,
+/// SAML and recovery all mint a session through `interaction::establish_session` carrying what
+/// they proved.
+///
+/// So a forward-auth request never presents this rung. A rule naming it does not fail loudly:
+/// the value is RANKED, between `pwd` and `mfa`, so an `acr_at_least` floor naming it is an
+/// exact synonym for `mfa` at this surface, and a `step-up` naming it terminates one rung above
+/// what it says. Both read as enforcing the remembered-device level and enforce something else,
+/// and a session whose TOKEN carries exactly this rung is refused by the rule that names it.
+///
+/// Read off the registry rather than written as a string, so renaming the rung moves this with
+/// it.
+fn unobservable_acr() -> &'static str {
+    crate::AuthMethod::TrustedDevice.acr()
+}
+
+/// The `acr` an operator wrote, in the form the engine compares against, or a refusal.
+///
+/// # Canonicalising is not cosmetic
+///
+/// The achieved context a session carries is a canonical value (`urn:ironauth:acr:mfa`), and
+/// an operator writing `mfa` means that rung. Comparing the two verbatim never matches, so a
+/// `step-up` rule written the short way -- the way every operator-facing surface in this
+/// project documents, and the way the CLI accepts -- would challenge a caller who has already
+/// met it, forever. The alias is resolved here, once, against the same registry the achieved
+/// value is derived from.
+///
+/// # Errors
+///
+/// [`ConversionError::UnknownAcr`] when the value names no rung, which is the other way the
+/// same loop is reached.
+fn canonical_acr(rule: &str, field: &'static str, value: &str) -> Result<String, ConversionError> {
+    let trimmed = value.trim();
+    let canonical = crate::step_up::canonical_step_up_acr(trimmed);
+    if !crate::step_up::is_known_step_up_acr(trimmed) || canonical == unobservable_acr() {
+        return Err(ConversionError::UnknownAcr {
+            rule: rule.to_owned(),
+            field,
+            value: value.to_owned(),
+            known: observable_step_up_acrs(),
+        });
+    }
+    Ok(canonical)
+}
+
+/// The rungs a forward-auth request can actually present, for an operator-facing error.
+///
+/// `known_step_up_acrs` minus [`unobservable_acr`]. Listing a level the refusal itself would
+/// reject would send an operator straight back into the same error.
+fn observable_step_up_acrs() -> Vec<&'static str> {
+    crate::step_up::known_step_up_acrs()
+        .into_iter()
+        .filter(|acr| *acr != unobservable_acr())
+        .collect()
 }
 
 /// The forward-auth surface a boot path installs on the OIDC plane (issue #154).
@@ -203,8 +322,15 @@ impl ForwardAuthRuntime {
     /// Surfaced at boot rather than at request time, because a rule that cannot be built is
     /// a rule that does not apply, and a missing rule on an ordered access list hands the
     /// request to whatever follows it.
+    ///
+    /// `acr_order` is the deployment's `oidc.acr_order`, passed in rather than defaulted so
+    /// that a forward-auth step-up and an OIDC step-up rank credential strength the same way.
+    /// A deployment that reordered the ladder and had this surface keep the shipped one would
+    /// have two policies, and the disagreement shows up as one plane admitting a session the
+    /// other challenges.
     pub fn from_config(
         cfg: &ForwardAuthConfig,
+        acr_order: &[String],
         clock: std::sync::Arc<dyn ironauth_env::Clock>,
     ) -> Result<Option<Self>, ConversionError> {
         if !cfg.enabled {
@@ -212,7 +338,9 @@ impl ForwardAuthRuntime {
         }
         Ok(Some(Self {
             limiter: limiter_from_config(&cfg.rate_limit, clock),
-            forward_auth: crate::forward_auth::ForwardAuth::new(rule_set_from_config(cfg)?),
+            forward_auth: crate::forward_auth::ForwardAuth::new(rule_set_from_config(
+                cfg, acr_order,
+            )?),
             dialect: match cfg.dialect {
                 ironauth_config::ProxyDialectConfig::ForwardAuth => {
                     crate::forward_auth::Dialect::ForwardAuth
@@ -280,6 +408,19 @@ fn limiter_from_config(
 
 #[cfg(test)]
 mod tests {
+    /// Convert with no configured order, which reaches the SAME canonical ladder through the
+    /// empty-list fallback, so a row that does not care about ranking is unaffected.
+    ///
+    /// This is NOT the shipped deployment, and an earlier version of this comment said it was
+    /// ("`oidc.acr_order` defaults to empty"). It does not: `OidcConfig::default` fills it with
+    /// the six-rung ladder and the section carries `#[serde(default)]`, so a file that never
+    /// mentions the key still arrives here non-empty and `main.rs` passes it straight through.
+    /// Believing otherwise is what left the pass-through untested --
+    /// `the_from_config_seam_ranks_by_the_deployments_ladder` covers it.
+    fn rule_set_from_config_test(cfg: &ForwardAuthConfig) -> Result<RuleSet, ConversionError> {
+        rule_set_from_config(cfg, &[])
+    }
+
     use ironauth_config::{HeaderMatchConfig, ProxyDialectConfig, SubjectStateConfig};
 
     use super::*;
@@ -328,7 +469,7 @@ mod tests {
             let mut cfg = rule("gate");
             mutate(&mut cfg);
 
-            let error = rule_set_from_config(&enabled(vec![cfg]))
+            let error = rule_set_from_config_test(&enabled(vec![cfg]))
                 .expect_err("a rule this build cannot evaluate is refused");
 
             match &error {
@@ -338,7 +479,7 @@ mod tests {
                     assert_eq!(*named, field);
                     assert_eq!(rule, "gate", "the refusal names the rule an operator wrote");
                 }
-                other @ ConversionError::Pattern { .. } => {
+                other @ (ConversionError::Pattern { .. } | ConversionError::UnknownAcr { .. }) => {
                     panic!("expected an Unsupported refusal, got {other:?}")
                 }
             }
@@ -370,7 +511,8 @@ mod tests {
             ..AccessRuleConfig::default()
         };
 
-        let set = rule_set_from_config(&enabled(vec![cfg])).expect("supported criteria convert");
+        let set =
+            rule_set_from_config_test(&enabled(vec![cfg])).expect("supported criteria convert");
         let rules = set.rules();
 
         assert_eq!(rules.len(), 1);
@@ -390,6 +532,7 @@ mod tests {
                 Criterion::PathMatches(pattern) => format!("pattern:{}", pattern.as_str()),
                 Criterion::Header { name, value } => format!("header:{name}={value}"),
                 Criterion::Subject(check) => format!("subject:{check:?}"),
+                Criterion::AcrAtLeast(floor) => format!("acr_at_least:{floor}"),
             })
             .collect();
 
@@ -427,7 +570,7 @@ mod tests {
                 ..AccessRuleConfig::default()
             };
 
-            let set = rule_set_from_config(&enabled(vec![cfg])).expect("converts");
+            let set = rule_set_from_config_test(&enabled(vec![cfg])).expect("converts");
             let rendered = format!("{:?}", set.rules()[0].criteria);
 
             assert!(
@@ -454,7 +597,7 @@ mod tests {
             ..AccessRuleConfig::default()
         };
 
-        let set = rule_set_from_config(&enabled(vec![cfg])).expect("converts");
+        let set = rule_set_from_config_test(&enabled(vec![cfg])).expect("converts");
         let criteria = &set.rules()[0].criteria;
 
         let pattern = criteria
@@ -477,7 +620,7 @@ mod tests {
     #[test]
     fn rule_order_is_preserved_exactly() {
         let names = ["first", "second", "third"];
-        let set = rule_set_from_config(&enabled(names.iter().map(|n| rule(n)).collect()))
+        let set = rule_set_from_config_test(&enabled(names.iter().map(|n| rule(n)).collect()))
             .expect("converts");
 
         let got: Vec<&str> = set.rules().iter().map(|r| r.name.as_str()).collect();
@@ -495,7 +638,7 @@ mod tests {
         };
 
         assert!(
-            ForwardAuthRuntime::from_config(&cfg, clock())
+            ForwardAuthRuntime::from_config(&cfg, &[], clock())
                 .expect("a disabled section is not an error")
                 .is_none()
         );
@@ -530,6 +673,7 @@ mod tests {
                     rules: vec![rule("any")],
                     ..ForwardAuthConfig::default()
                 },
+                &[],
                 clock(),
             )
             .expect("converts")
@@ -541,6 +685,296 @@ mod tests {
                 "{configured:?} must map to its own dialect"
             );
         }
+    }
+    // ----------------------------------------------------------------------------------
+    // The acr an operator writes, and the one the engine compares (issue #154 criterion 4).
+    // ----------------------------------------------------------------------------------
+
+    fn step_up_to(acr: &str) -> AccessRuleConfig {
+        AccessRuleConfig {
+            name: "gate".to_owned(),
+            action: AccessActionConfig::StepUp,
+            acr: Some(acr.to_owned()),
+            path_prefix: Some("/payments".to_owned()),
+            ..AccessRuleConfig::default()
+        }
+    }
+
+    /// A SHORT ALIAS IS RESOLVED, and this is the difference between a working rule and a
+    /// redirect loop.
+    ///
+    /// `mfa` is what the CLI accepts, what the configuration reference documents, and what an
+    /// operator writes. The context a session ACHIEVES is the canonical `urn:` form. Comparing
+    /// the two verbatim never matches, so the rule would challenge a caller who has already
+    /// answered it, and keep challenging.
+    ///
+    /// Asserted by DECIDING, not by reading the built action: the built action agreeing with
+    /// itself proves nothing about whether a real session satisfies it.
+    #[test]
+    fn a_short_alias_is_resolved_to_the_context_a_session_actually_achieves() {
+        let set = rule_set_from_config_test(&enabled(vec![step_up_to("mfa")])).expect("converts");
+
+        let achieved = crate::authn::achieved_acr(&crate::authn::parse_methods("pwd totp"));
+        assert_ne!(
+            achieved, "mfa",
+            "the premise: what a session achieves is not spelled the way an operator writes it"
+        );
+
+        let decided = set.decide(&crate::rules::RequestFacts {
+            method: "GET".to_owned(),
+            host: "app.example".to_owned(),
+            path: "/payments/transfer".to_owned(),
+            subject: Some("alice".to_owned()),
+            acr: Some(achieved.to_owned()),
+            ..crate::rules::RequestFacts::default()
+        });
+        assert_eq!(
+            decided.action,
+            crate::rules::Action::Allow,
+            "an operator writing `mfa` must be satisfied by a session that did MFA"
+        );
+    }
+
+    /// AN ACR NAMING NO RUNG IS REFUSED AT BOOT, in both fields it can appear in.
+    ///
+    /// No session ever achieves a value the registry does not issue, so an unranked one is
+    /// satisfied by nothing: on a `step-up` it loops, and on `acr_at_least` it silently turns
+    /// an `allow` off and a `deny` into a restriction that never bites. Configuration
+    /// validation cannot catch either, because the rungs come from the authentication
+    /// registry and the config crate sits below it.
+    #[test]
+    fn an_acr_naming_no_rung_is_refused_with_the_field_and_the_known_levels() {
+        let mut floor = rule("gate");
+        floor.acr_at_least = Some("urn:example:acr:invented".to_owned());
+
+        for (field, cfg) in [
+            ("acr", step_up_to("urn:example:acr:invented")),
+            ("acr_at_least", floor),
+        ] {
+            let error = rule_set_from_config_test(&enabled(vec![cfg]))
+                .expect_err("an acr nothing achieves is refused");
+            match &error {
+                ConversionError::UnknownAcr {
+                    rule,
+                    field: named,
+                    known,
+                    ..
+                } => {
+                    assert_eq!(*named, field);
+                    assert_eq!(rule, "gate");
+                    assert!(
+                        known.contains(&crate::step_up::canonical_step_up_acr("mfa").as_str()),
+                        "the refusal lists the rungs an operator can pick from, so the \
+                         message is actionable rather than only a rejection"
+                    );
+                }
+                other => panic!("expected an UnknownAcr refusal for {field}, got {other:?}"),
+            }
+        }
+    }
+
+    /// `acr_at_least` BECOMES A CRITERION, so the vocabulary has a runtime behind it.
+    ///
+    /// A configuration field the conversion drops is worse than an absent one: the operator
+    /// reads their own file as a restriction and the engine never applies it.
+    #[test]
+    fn acr_at_least_selects_rather_than_challenging() {
+        let mut cfg = rule("strong-only");
+        cfg.action = AccessActionConfig::Allow;
+        cfg.acr_at_least = Some("mfa".to_owned());
+        let set = rule_set_from_config_test(&enabled(vec![cfg])).expect("converts");
+
+        let at = |methods: &str| crate::rules::RequestFacts {
+            method: "GET".to_owned(),
+            host: "app.example".to_owned(),
+            path: "/x".to_owned(),
+            subject: Some("alice".to_owned()),
+            acr: Some(crate::authn::achieved_acr(&crate::authn::parse_methods(methods)).to_owned()),
+            ..crate::rules::RequestFacts::default()
+        };
+
+        assert_eq!(
+            set.decide(&at("pwd totp")).action,
+            crate::rules::Action::Allow
+        );
+        let weak = set.decide(&at("pwd"));
+        assert_eq!(
+            weak.action,
+            crate::rules::Action::Deny,
+            "the rule does not apply to a weak session, and no rule below it admits"
+        );
+        assert_eq!(
+            weak.matched, None,
+            "a floor SELECTS: the rule did not match, rather than matching and challenging"
+        );
+    }
+
+    /// THE LADDER SURVIVES `from_config`, which is the seam production actually takes.
+    ///
+    /// `rule_set_from_config` is covered with a reordered order below, but every other test
+    /// reaches it directly. `ForwardAuthRuntime::from_config` is what `main.rs` calls, and
+    /// replacing its `acr_order` argument with an empty slice left the whole suite green: the
+    /// runtime would then rank by the shipped ladder while `OidcState::acr_order` ranks by the
+    /// operator's, which is the two-policy failure the parameter exists to prevent.
+    ///
+    /// Asserted BEHAVIOURALLY, because `ForwardAuth` exposes no rule set: under an order that
+    /// ranks `phr` BELOW `mfa` (the canonical ladder puts it above), a passkey session must be
+    /// challenged by a rule demanding `mfa` rather than admitted.
+    #[test]
+    fn the_from_config_seam_ranks_by_the_deployments_ladder() {
+        let phr_below_mfa: Vec<String> = [
+            "urn:ironauth:acr:pwd",
+            "urn:ironauth:acr:mfa_remembered",
+            "phr",
+            "phrh",
+            "urn:ironauth:acr:mfa",
+            "urn:ironauth:acr:attested_passkey",
+        ]
+        .iter()
+        .map(|acr| (*acr).to_owned())
+        .collect();
+
+        let mut cfg = enabled(vec![step_up_to("mfa")]);
+        cfg.rules[0].path_prefix = None;
+
+        let passkey = crate::forward_auth::Identity {
+            user: "alice".to_owned(),
+            groups: Vec::new(),
+            roles: Vec::new(),
+            email: None,
+            name: None,
+            acr: Some(
+                crate::authn::achieved_acr(&crate::authn::parse_methods("passkey")).to_owned(),
+            ),
+        };
+        assert_eq!(
+            passkey.acr.as_deref(),
+            Some("phr"),
+            "the premise: a passkey session reaches the rung this order demotes"
+        );
+
+        let facts = || crate::rules::RequestFacts {
+            method: "GET".to_owned(),
+            host: "app.example".to_owned(),
+            path: "/anything".to_owned(),
+            ..crate::rules::RequestFacts::default()
+        };
+
+        let under_default = ForwardAuthRuntime::from_config(&cfg, &[], clock())
+            .expect("converts")
+            .expect("enabled");
+        assert_eq!(
+            under_default
+                .forward_auth()
+                .evaluate(facts(), Some(&passkey))
+                .decision
+                .action,
+            crate::rules::Action::Allow,
+            "on the canonical ladder phr outranks mfa, so the step-up is already met"
+        );
+
+        let under_operator = ForwardAuthRuntime::from_config(&cfg, &phr_below_mfa, clock())
+            .expect("converts")
+            .expect("enabled");
+        assert_eq!(
+            under_operator
+                .forward_auth()
+                .evaluate(facts(), Some(&passkey))
+                .decision
+                .action,
+            crate::rules::Action::StepUp {
+                acr: crate::step_up::canonical_step_up_acr("mfa")
+            },
+            "the deployment ranked phr below mfa, so the same session must be challenged"
+        );
+    }
+
+    /// A RUNG NO SESSION ROW RECORDS IS REFUSED, even though it is a real advertised level.
+    ///
+    /// `mfa_remembered` is achieved by a trusted device, and that contribution is frozen onto
+    /// an authorization code rather than written back to the session. A forward-auth check
+    /// reads the session, so it never presents this rung: a floor naming it is an exact synonym
+    /// for `mfa` here, and a step-up naming it terminates one rung above what it says.
+    ///
+    /// Derived from the registry on both sides, so renaming the rung moves the test with it.
+    #[test]
+    fn the_rung_this_surface_cannot_observe_is_refused_and_left_out_of_the_advice() {
+        let unobservable = unobservable_acr();
+        assert!(
+            crate::step_up::known_step_up_acrs().contains(&unobservable),
+            "the premise: this is an advertised level, so nothing else would refuse it"
+        );
+
+        let mut floor = rule("gate");
+        floor.acr_at_least = Some(unobservable.to_owned());
+        for cfg in [step_up_to(unobservable), floor] {
+            match rule_set_from_config_test(&enabled(vec![cfg]))
+                .expect_err("a rung this surface never sees is refused")
+            {
+                ConversionError::UnknownAcr { known, .. } => assert!(
+                    !known.contains(&unobservable),
+                    "the advice must not offer the level it just refused"
+                ),
+                other => panic!("expected UnknownAcr, got {other:?}"),
+            }
+        }
+
+        // ...and every OTHER advertised rung still converts, so this is one exclusion rather
+        // than a narrowing of the vocabulary.
+        for acr in observable_step_up_acrs() {
+            rule_set_from_config_test(&enabled(vec![step_up_to(acr)]))
+                .unwrap_or_else(|error| panic!("{acr} must still convert: {error}"));
+        }
+    }
+
+    /// THE REFUSAL TELLS AN OPERATOR WHAT TO WRITE INSTEAD.
+    ///
+    /// The `Display` arm is the only thing that reaches an operator when boot fails, and it was
+    /// the one refusal in this file with no assertion on its rendering.
+    #[test]
+    fn the_unknown_acr_refusal_names_the_rule_the_field_and_the_levels() {
+        let rendered = rule_set_from_config_test(&enabled(vec![step_up_to("strong")]))
+            .expect_err("no rung is named `strong`")
+            .to_string();
+        for expected in ["gate", "`acr`", "strong", "no authentication level"] {
+            assert!(
+                rendered.contains(expected),
+                "the refusal must contain {expected}; got {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains(&crate::step_up::canonical_step_up_acr("mfa")),
+            "and must list a level that does convert; got {rendered}"
+        );
+    }
+
+    /// THE DEPLOYMENT'S LADDER REACHES THIS SURFACE, and an unset one does not blank it.
+    ///
+    /// Two failures in one test because they are the same field read two ways. A configured
+    /// `oidc.acr_order` that stopped here would leave forward-auth ranking by the shipped
+    /// ladder while the OIDC plane ranks by the operator's, so one plane admits a session the
+    /// other challenges. An EMPTY list means "not configured" and must fall back to the
+    /// canonical order, not install an order that ranks nothing.
+    #[test]
+    fn the_configured_acr_order_reaches_the_rules_and_an_empty_one_falls_back() {
+        let cfg = enabled(vec![step_up_to("mfa")]);
+
+        assert_eq!(
+            rule_set_from_config(&cfg, &[])
+                .expect("converts")
+                .acr_order(),
+            crate::step_up::default_acr_order(),
+            "unset is the shipped ladder, not an empty one"
+        );
+
+        let mut inverted = crate::step_up::default_acr_order();
+        inverted.reverse();
+        assert_eq!(
+            rule_set_from_config(&cfg, &inverted)
+                .expect("converts")
+                .acr_order(),
+            inverted
+        );
     }
 }
 
