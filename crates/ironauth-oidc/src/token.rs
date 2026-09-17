@@ -368,6 +368,18 @@ async fn authorization_code_grant(
         return Err(error);
     }
 
+    // 5f-bis. The ACCESS RULES, if this deployment gates issuance on them (issue #154
+    //     criterion 4). The same engine forward-auth consults, evaluated the same way, with
+    //     each surface interpreting the action in its own terms: a deny refuses the grant, and
+    //     a step-up becomes the RFC 9470 challenge 5f already speaks.
+    //
+    //     AFTER the step-up policy above, so a request that is under-qualified for its SCOPE is
+    //     told that first. Both produce the same challenge shape, and the scope requirement is
+    //     the one the client can act on without an operator changing a rule.
+    if let Some(error) = enforce_access_rules(state, headers, &bindings) {
+        return Err(error);
+    }
+
     // 5g. Resolve any DPoP proof (RFC 9449, issue #368) BEFORE minting or consuming.
     //     A valid proof binds the issued tokens to its key (the at+jwt gets a `cnf`
     //     claim, the opaque token and the refresh family store the jkt); no proof is
@@ -2230,6 +2242,74 @@ pub(crate) fn map_store_error(error: StoreError) -> TokenError {
 /// requirement, is treated as "no requirement" so this check never turns a
 /// transient read fault into a spurious step-up (the authorization-endpoint check
 /// is the primary gate).
+/// Evaluate the issuance access rules, returning the error to answer with (issue #154).
+///
+/// [`None`] when the deployment installed no rule set, which is the shipped default and means
+/// this is not on the path at all.
+///
+/// # What a rule set here must cover
+///
+/// The engine DENIES a request matching no rule. That is right for an access-control list and it
+/// means a set written only for resource paths refuses every token: an operator sharing one set
+/// between forward-auth and issuance needs a rule that matches token requests. The refusal is
+/// immediate and total rather than subtle, which is the failure direction to prefer.
+///
+/// # Why the facts are the TOKEN request's
+///
+/// `RequestFacts` describes the request being decided, and here that is the call to the token
+/// endpoint: its method, host, path and headers, with the subject and its groups and roles taken
+/// from the grant being redeemed rather than from anything the client sent. A rule keyed on a
+/// resource path does not match this, by design -- the resource was gated at the forward-auth
+/// surface, and what this gates is whether that subject may be issued a token at all.
+fn enforce_access_rules(
+    state: &OidcState,
+    headers: &HeaderMap,
+    bindings: &ironauth_store::CodeBindings,
+) -> Option<TokenError> {
+    let rules = state.issuance_rules()?;
+    let facts = crate::rules::RequestFacts {
+        method: "POST".to_owned(),
+        host: headers
+            .get(axum::http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_owned(),
+        path: "/token".to_owned(),
+        headers: headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_ascii_lowercase(), value.to_owned()))
+            })
+            .collect(),
+        // THE SUBJECT COMES FROM THE GRANT, never from the request. A subject the client could
+        // supply would let it choose which rule applies to it.
+        subject: Some(bindings.subject.clone()),
+        // MEMBERSHIPS ARE NOT CARRIED ON A GRANT, so a rule keyed on a group or a role cannot
+        // match here and the engine treats it as unsatisfied. `rule_set_from_config` refuses
+        // those criteria at load for the forward-auth surface for the same reason, so a
+        // deployment cannot express one and quietly get a deny.
+        groups: Vec::new(),
+        roles: Vec::new(),
+    };
+
+    match rules.decide(&facts).action {
+        crate::rules::Action::Allow => None,
+        crate::rules::Action::Deny => Some(TokenError::AccessDenied),
+        // THE SAME CHALLENGE 5f SPEAKS, so a client sees one step-up shape whether the
+        // requirement came from a scope or from a rule.
+        crate::rules::Action::StepUp { acr } => Some(TokenError::InsufficientUserAuthentication {
+            acr_values: Some(acr),
+            max_age: None,
+        }),
+    }
+}
+
 async fn enforce_step_up_policy(
     state: &OidcState,
     scope: Scope,

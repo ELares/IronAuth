@@ -622,6 +622,22 @@ name = "caep_interop_profile"
 path = "tests/caep_interop_profile.rs"
 required-features = ["testing"]
 
+# Issue #154 criterion 4: ONE rule set producing the answer each of the three surfaces acts on.
+# The engine's own suite proves it decides correctly; this proves the same SET reaches more than
+# one caller, which is what the criterion is about. No database and no feature gate: the rules
+# engine is pure, and a criterion this cheap to check should always run.
+[[test]]
+name = "rules_gate_three_surfaces"
+path = "tests/rules_gate_three_surfaces.rs"
+
+# Issue #154 criterion 4, the wiring half: the TOKEN ENDPOINT acts on the rules. The decision
+# suite above cannot see this -- replacing the enforcement call with a discard leaves it green --
+# so this one drives the endpoint against a real Postgres.
+[[test]]
+name = "issuance_rules_endpoint"
+path = "tests/issuance_rules_endpoint.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "caep_receiver_corpus"
 path = "tests/caep_receiver_corpus.rs"

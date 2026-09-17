@@ -6,6 +6,20 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Token issuance can be gated on the ACCESS RULE SET (issue #154 criterion 4) via
+  `OidcState::with_issuance_rules`. The engine forward-auth consults, evaluated the same way,
+  with the token endpoint interpreting the action in its own terms: a deny becomes
+  `access_denied`, and a step-up becomes the RFC 9470 `insufficient_user_authentication`
+  challenge the endpoint already speaks for scope-carried requirements.
+
+  OFF BY DEFAULT, and a set installed here must MATCH token requests. The engine denies a request
+  matching no rule, so a set written only for resource paths refuses every token. That is why
+  this is a separate installation rather than a read of the forward-auth runtime: sharing one set
+  across both surfaces is a deployment decision, and it has to be made rather than inherited.
+
+  The subject comes from the grant being redeemed, never from anything the client sent, and
+  memberships are absent because a grant carries none.
+
 ### Embeddable portal widgets, EXPLORATORY (issue #145 criterion 6)
 
 Shape `0.1.0-exp.1`, registered as the `admin-portal-widgets` experimental

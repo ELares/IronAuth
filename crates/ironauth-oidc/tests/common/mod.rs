@@ -281,7 +281,7 @@ impl Harness {
     /// Like [`Harness::start`] but with explicit OIDC settings (for the expiry
     /// test, which wants a short code lifetime).
     pub async fn start_with(config: OidcConfig) -> Self {
-        Self::start_inner(config, None, None, None, None).await
+        Self::start_inner(config, None, None, None, None, None).await
     }
 
     /// Like [`Harness::start`] but with the WASM hook engine installed (issue #114).
@@ -308,7 +308,7 @@ impl Harness {
     ) -> Self {
         let runtime = Arc::new(ironauth_oidc::token_hook::HookRuntime::new(engine));
         Self::spawn_epoch_driver(&runtime);
-        Self::start_inner(config, None, None, None, Some(runtime)).await
+        Self::start_inner(config, None, None, None, Some(runtime), None).await
     }
 
     /// As [`Harness::start_with_hook_engine`], with the outbound path a granted hook's requests
@@ -328,7 +328,7 @@ impl Harness {
         let runtime =
             Arc::new(ironauth_oidc::token_hook::HookRuntime::new(engine).with_fetcher(fetcher));
         Self::spawn_epoch_driver(&runtime);
-        Self::start_inner(OidcConfig::default(), None, None, None, Some(runtime)).await
+        Self::start_inner(OidcConfig::default(), None, None, None, Some(runtime), None).await
     }
 
     /// Advance the hook engine's epoch, as the boot path does.
@@ -391,6 +391,7 @@ impl Harness {
             None,
             Some(max_group_depth),
             None,
+            None,
         )
         .await
     }
@@ -399,7 +400,7 @@ impl Harness {
     /// resolver (issue #25), so a `jwks_uri` client's keys resolve through the
     /// fetcher. Confidential PKCE is relaxed via the passed config.
     pub async fn start_with_resolver(config: OidcConfig, resolver: Arc<ClientKeyResolver>) -> Self {
-        Self::start_inner(config, Some(resolver), None, None, None).await
+        Self::start_inner(config, Some(resolver), None, None, None, None).await
     }
 
     /// Like [`Harness::start_with`] but with the tenant/environment quota engine
@@ -407,7 +408,23 @@ impl Harness {
     /// harness's deterministic clock. Used to drive the real `/authorize` request
     /// path into a 429 and to prove tenant fairness end to end.
     pub async fn start_with_quota(config: OidcConfig, quota_config: QuotaConfig) -> Self {
-        Self::start_inner(config, None, Some(quota_config), None, None).await
+        Self::start_inner(config, None, Some(quota_config), None, None, None).await
+    }
+
+    /// A harness whose token endpoint is gated on an access rule set (issue #154 criterion 4).
+    ///
+    /// The rules reach the SAME state the router is built from, so driving `token` here drives
+    /// the real enforcement rather than the engine in isolation.
+    pub async fn start_with_issuance_rules(rules: ironauth_oidc::rules::RuleSet) -> Self {
+        Self::start_inner(
+            OidcConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            Some(Arc::new(rules)),
+        )
+        .await
     }
 
     async fn start_inner(
@@ -416,6 +433,7 @@ impl Harness {
         quota_config: Option<QuotaConfig>,
         max_group_depth: Option<u32>,
         hook_runtime: Option<Arc<ironauth_oidc::token_hook::HookRuntime>>,
+        issuance_rules: Option<Arc<ironauth_oidc::rules::RuleSet>>,
     ) -> Self {
         let (db, env, clock, scope, client_id) = Self::seed_common().await;
 
@@ -464,6 +482,13 @@ impl Harness {
         // Left untouched (the shipped default) when the test named none.
         let state = match max_group_depth {
             Some(depth) => state.with_max_group_depth(depth),
+            None => state,
+        };
+        // The access rules consulted at token issuance (issue #154 criterion 4), installed on
+        // the SAME state the router is built from, exactly as the boot path does. Left absent
+        // (the shipped default) when the test named none, so every other suite is unaffected.
+        let state = match issuance_rules {
+            Some(rules) => state.with_issuance_rules(rules),
             None => state,
         };
         // Install the tenant/environment quota engine over the SAME deterministic
@@ -2174,6 +2199,28 @@ impl Harness {
     /// `POST /token` with a pre-built form body (already encoded).
     pub async fn token(&self, form: &str) -> (StatusCode, HeaderMap, String) {
         self.token_with_auth(form, None).await
+    }
+
+    /// `POST /token` carrying one extra header, for the access-rule suite (issue #154).
+    ///
+    /// The rules engine reads the token request's headers, so a rule keyed on one is how a test
+    /// drives both the allow and the deny arm against a SINGLE harness: the subject a seeded user
+    /// receives is generated, and a rule naming it could not be written before the harness that
+    /// seeds it exists.
+    pub async fn token_with_header(
+        &self,
+        form: &str,
+        name: &'static str,
+        value: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(name, value)
+            .body(Body::from(form.to_owned()))
+            .expect("a token request");
+        self.send(request).await
     }
 
     /// `POST /token` with an optional `Authorization` header (for

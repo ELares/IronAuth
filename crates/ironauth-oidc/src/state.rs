@@ -255,6 +255,16 @@ pub struct OidcState {
     /// `None` is a uniform 404 on the check path, so a deployment that did not ask for a
     /// forward-auth surface does not advertise one.
     forward_auth: Option<Arc<crate::forward_auth_rules::ForwardAuthRuntime>>,
+    /// The access rules consulted at TOKEN ISSUANCE (issue #154 criterion 4).
+    ///
+    /// `None` is the shipped default and means issuance is not rule-gated at all, which is the
+    /// behaviour before this existed. Installing a set makes every token request evaluate it.
+    ///
+    /// SEPARATE FROM THE FORWARD-AUTH SET even when an operator points both at the same rules,
+    /// and that separation is load bearing: the engine DENIES a request that matches no rule, so
+    /// a set written for forward-auth paths would refuse every token the moment it were shared
+    /// implicitly. Sharing has to be a deployment saying so, with rules that cover both.
+    issuance_rules: Option<Arc<crate::rules::RuleSet>>,
     // Whether the experimental IdP-side FedCM surface (issue #83) is armed. Kept
     // OUTSIDE `Inner` and set through the builder for the SAME anti-bypass reason as
     // global-token-revocation: it is NOT a plain `OidcConfig` toggle an operator can
@@ -1081,6 +1091,7 @@ impl OidcState {
             // kept passing if `SsfConfig::default()` had changed underneath it.
             risc_receiver: ironauth_config::RiscReceiverConfig::default(),
             forward_auth: None,
+            issuance_rules: None,
             ssf_enabled: ironauth_config::SsfConfig::default().enabled,
             ssf_max_streams_per_client: ironauth_config::SsfConfig::default()
                 .max_streams_per_client,
@@ -1336,6 +1347,34 @@ impl OidcState {
     ) -> Self {
         self.forward_auth = Some(runtime);
         self
+    }
+
+    /// Gate TOKEN ISSUANCE on an access rule set (issue #154 criterion 4).
+    ///
+    /// The criterion asks that the same rules gate a forward-auth resource, an OIDC token
+    /// issuance and a step-up requirement. This is the second of the three; the engine is the
+    /// same one, evaluated the same way, and each surface interprets the [`crate::rules::Action`]
+    /// in its own terms.
+    ///
+    /// # A set installed here must MATCH token requests
+    ///
+    /// The engine denies a request that matches no rule, deliberately: a fall-through that
+    /// admitted would be one forgotten rule away from an open door. So a set written only for
+    /// resource paths refuses every token, loudly and immediately. An operator sharing one set
+    /// across both surfaces needs a rule that matches the token endpoint.
+    ///
+    /// That is why this is a separate installation rather than a read of the forward-auth
+    /// runtime: sharing is a deployment decision, and it has to be made rather than inherited.
+    #[must_use]
+    pub fn with_issuance_rules(mut self, rules: Arc<crate::rules::RuleSet>) -> Self {
+        self.issuance_rules = Some(rules);
+        self
+    }
+
+    /// The access rules consulted at token issuance, if any.
+    #[must_use]
+    pub fn issuance_rules(&self) -> Option<&Arc<crate::rules::RuleSet>> {
+        self.issuance_rules.as_ref()
     }
 
     /// Install the Google Cross-Account Protection receiver settings (issue #144).
