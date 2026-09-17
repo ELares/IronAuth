@@ -1070,6 +1070,27 @@ pub struct ClientCredentialsMintRequest<'a> {
     pub act: Option<&'a serde_json::Value>,
 }
 
+/// The agent principal identity a token carries (issue #130).
+///
+/// All three together or none: an agent id with no linked user is exactly the
+/// unattributable principal this issue exists to prevent, and a consumer that had to handle
+/// a partial set would have to decide what a missing half meant.
+#[derive(Debug, Clone, Copy)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "every field IS an identifier, and the suffix is what says so. \
+    Dropping it would leave `agent`, `linked_user` and `organization` naming ids \
+    that read as the objects themselves"
+)]
+pub struct AgentTokenIdentity<'a> {
+    /// The `agp_` principal this token was issued to.
+    pub agent_id: &'a str,
+    /// The user the agent acts FOR.
+    pub linked_user_id: &'a str,
+    /// The organization the agent acts INSIDE.
+    pub organization_id: &'a str,
+}
+
 /// Build the RFC 9068 access-token claim set for a CLIENT-CREDENTIALS (M2M) token
 /// (issue #23). Pure, so it is exercised without a store or a signer.
 ///
@@ -1102,27 +1123,6 @@ pub struct ClientCredentialsMintRequest<'a> {
 /// name never shadows one). `roles` is in that set, so a stored
 /// `custom_token_claims` of `{"roles":["admin"]}` is DROPPED, not emitted. Claims
 /// hygiene otherwise mirrors the code flow: no PII.
-/// The agent principal identity a token carries (issue #130).
-///
-/// All three together or none: an agent id with no linked user is exactly the
-/// unattributable principal this issue exists to prevent, and a consumer that had to handle
-/// a partial set would have to decide what a missing half meant.
-#[derive(Debug, Clone, Copy)]
-#[allow(
-    clippy::struct_field_names,
-    reason = "every field IS an identifier, and the suffix is what says so. \
-    Dropping it would leave `agent`, `linked_user` and `organization` naming ids \
-    that read as the objects themselves"
-)]
-pub struct AgentTokenIdentity<'a> {
-    /// The `agp_` principal this token was issued to.
-    pub agent_id: &'a str,
-    /// The user the agent acts FOR.
-    pub linked_user_id: &'a str,
-    /// The organization the agent acts INSIDE.
-    pub organization_id: &'a str,
-}
-
 pub(crate) fn build_client_credentials_access_token_claims(
     request: &ClientCredentialsMintRequest<'_>,
     iat: i64,
