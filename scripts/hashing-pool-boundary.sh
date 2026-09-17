@@ -14,8 +14,7 @@
 # (`OidcState::hash_password` / `verify_password` / `verify_absent`, which enqueue
 # onto the dedicated worker pool behind per-tenant fair-share admission).
 #
-# THE ONLY functions this lint governs are the raw hashers in the `password`
-# module:
+# The raw wrapper functions this lint governs live in the `password` module:
 #
 #     crate::password::hash_password
 #     crate::password::verify_password
@@ -31,6 +30,14 @@
 # so the pool and its admission apply. The parameterized minter
 # `password::hash_password_with` (used by the pool worker and the tuning probe) is
 # deliberately NOT governed; it is the minting primitive, not a request-path call.
+#
+# Argon2 0.6's raw `hash_password_with_salt` API is ALSO confined to those boundary
+# modules within ironauth-oidc source. Its distinct name lets this lint catch dot
+# calls, UFCS calls, and function references without matching OidcState's admitted
+# `hash_password` method. A handler calling this raw API would bypass the same
+# worker pool and tenant admission that the wrapper rules protect.
+# Raw UFCS calls to this API are also caught across production crates by the
+# bare-call rule, preserving the scope of the earlier `::hash_password` API.
 #
 # The raw hashers are ALSO re-exported from the crate root
 # (`ironauth_oidc::{hash_password,verify_password,verify_absent}`, see
@@ -96,12 +103,13 @@ fi
 
 # Rule bare-call: no BARE call to one of the raw hashers (e.g. after
 # `use crate::password::verify_password;` or `use ironauth_oidc::verify_absent;`)
-# anywhere in production source outside the boundary modules. A method call
+# anywhere in production source outside the boundary modules. Argon2 0.6's raw
+# UFCS `::hash_password_with_salt(...)` call is included too. A method call
 # (`state.verify_password(...)`, `argon2.hash_password(...)`) is preceded by `.` and
 # is NOT matched, and `hash_password_with(` is excluded because `(` never immediately
 # follows the name.
 bare=$(grep -rn --include='*.rs' -E \
-  '(^|[^._[:alnum:]])(hash_password|verify_password|verify_absent)[[:space:]]*\(' \
+  '(^|[^._[:alnum:]])(hash_password|verify_password|verify_absent|hash_password_with_salt)[[:space:]]*\(' \
   crates \
   | grep -Ev "^${ALLOW_RE}:" \
   | grep -Ev "$TESTS_RE" \
@@ -111,6 +119,24 @@ if [ -n "$bare" ]; then
   echo "  called (bare) outside the pool-boundary modules. Route it through"
   echo "  OidcState::{hash_password,verify_password,verify_absent} instead:"
   echo "$bare"
+  fail=1
+fi
+
+# Rule raw-argon2: Argon2's explicit-salt API must not bypass the worker pool in
+# OIDC handlers, whether called as a method, via UFCS, or held as a function value.
+# Match the whole identifier, independently of its punctuation or call syntax.
+# Restrict this rule to OIDC source; other crates legitimately mint test fixtures.
+raw_argon2=$(grep -rn --include='*.rs' -E \
+  '(^|[^[:alnum:]_])hash_password_with_salt([^[:alnum:]_]|$)' \
+  crates/ironauth-oidc/src \
+  | grep -Ev "^${ALLOW_RE}:" \
+  | grep -Ev "$TESTS_RE" \
+  | grep -v 'pool-boundary-allow:' || true)
+if [ -n "$raw_argon2" ]; then
+  echo "hashing-pool-boundary: rule 'raw-argon2' violated: Argon2's raw explicit-salt"
+  echo "  hasher is referenced outside the pool-boundary modules. Route request-path"
+  echo "  hashing through OidcState::hash_password (the admission-controlled pool):"
+  echo "$raw_argon2"
   fail=1
 fi
 
