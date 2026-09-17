@@ -169,6 +169,8 @@ pub struct TransactionTokenRequest<'a> {
 ///
 /// [`TransactionTokenRefusal::NoTrustDomain`] when no audience is configured;
 /// [`TransactionTokenRefusal::Mint`] on a serialisation or signing failure.
+/// issuance-gate-allow: a signing helper with no `OidcState`; the gate is in
+/// `issue_transaction_token`, which is this module's only caller.
 pub fn mint(
     key: &SigningKey,
     request: &TransactionTokenRequest<'_>,
@@ -287,6 +289,21 @@ pub async fn issue_transaction_token(
     let Some(key) = entry.signer(state.now()) else {
         return Err(crate::TokenError::ServerError);
     };
+
+    // THE ACCESS RULES APPLY HERE TOO (issue #154 criterion 4). This is a second path out of the
+    // token-exchange grant: the ordinary one mints through
+    // `tokens::mint_client_credentials_access_token` and is gated there, and this one signs its
+    // own credential and was not. A review found it, and it mattered because the gate's claim
+    // was that seven grant handlers funnel into three mints -- the exchange funnels into two.
+    //
+    // NO ACR. The subject came from a REVALIDATED subject token rather than from an
+    // authentication this server performed, so there is no achieved context to state, and
+    // inventing one would let an `acr_at_least` rule admit a credential on an assertion nobody
+    // here made.
+    if let Some(rule) = crate::tokens::issuance_refusal(state, inputs.subject, None, None) {
+        tracing::info!(rule = %rule, "an access rule refused a transaction token");
+        return Err(crate::TokenError::AccessDenied);
+    }
 
     let now = crate::util::epoch_micros(state.now()) / 1_000_000;
     // The transaction id, which the audit row records. `CorrelationId` already carries its own

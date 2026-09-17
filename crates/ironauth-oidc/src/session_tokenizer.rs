@@ -359,6 +359,8 @@ pub fn load_template_key(record: &SessionTokenKeyRecord) -> Result<SigningKey, M
 /// # Errors
 ///
 /// [`MintError`], naming which stage refused.
+/// issuance-gate-allow: a signing helper with no `OidcState`; the gate is in `tokenize`,
+/// which is this module's only caller and the only route that reaches it.
 pub fn mint(
     template: &ValidatedTemplate,
     key: &SigningKey,
@@ -441,6 +443,37 @@ pub async fn tokenize(
         // expired, revoked, ended and superseded identically. Criterion 3 lives here.
         return unauthenticated();
     };
+    // THE ACCESS RULES APPLY HERE TOO (issue #154 criterion 4). This mints a bearer JWT a
+    // service mesh accepts for its full lifetime with no database call, for the subject that
+    // session belongs to. A review of the gate at the OAuth mints pointed out that it did not
+    // reach this door: an operator who wrote "no tokens for this person" would have seen them
+    // keep minting service-mesh credentials from an ordinary session cookie.
+    //
+    // Placed after the session resolves and before anything is read or signed, so a refused
+    // subject costs a template lookup and a signature neither.
+    // THE ACCESS RULES APPLY HERE TOO (issue #154 criterion 4). This mints a bearer JWT a
+    // service mesh accepts for its full lifetime with no database call, for the subject that
+    // session belongs to. A review of the gate at the OAuth mints pointed out that it did not
+    // reach this door: an operator who wrote "no tokens for this person" would have seen them
+    // keep minting service-mesh credentials from an ordinary session cookie.
+    //
+    // Placed after the session resolves and before anything is read or signed, so a refused
+    // subject costs a template lookup and a signature neither.
+    if let Some(rule) = crate::tokens::issuance_refusal(
+        &state,
+        &session.subject,
+        Some(crate::tokens::issued_acr(&session.auth_methods)),
+        None,
+    ) {
+        tracing::info!(rule = %rule, "an access rule refused a session tokenization");
+        return json_response(
+            StatusCode::FORBIDDEN,
+            json!({
+                "error": "access_denied",
+                "error_description": "An access rule refused this issuance.",
+            }),
+        );
+    }
     if session.impersonation.is_some() {
         return json_response(
             StatusCode::FORBIDDEN,

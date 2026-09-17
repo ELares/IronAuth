@@ -9,11 +9,39 @@
 # today's tree, and the failure mode of a fourth appearing is silent: a new grant mints tokens
 # nothing refuses, and every test of the other three still passes.
 #
-# So this counts the doors. `crates/ironauth-oidc/src/tokens.rs` is the only module that signs
-# a token, and every `fn mint*` in it either
+# So this counts the doors. Every `fn mint*` in a CREDENTIAL-MINTING module either
 #
 #   * calls `issuance_refusal` (it is a door), or
-#   * carries the marker `issuance-gate-allow: <reason>` on its `fn` line (it is not).
+#   * carries the marker `issuance-gate-allow: <reason>` in its doc comment (it is not).
+#
+# `tokens.rs` IS NOT THE ONLY SUCH MODULE, which is what this said and what a review corrected.
+# Nine modules in the crate sign a JWS. Two of the others mint a bearer credential FOR A
+# SUBJECT and were not gated: `session_tokenizer.rs` turns a session cookie into a
+# service-mesh JWT, and `transaction_tokens.rs` is a SECOND path out of the token-exchange
+# grant that signs its own credential instead of going through `mint_client_credentials_
+# access_token`. Both are gated now and both are scanned.
+#
+# The six that are NOT scanned are listed here with the reason, because an unexplained
+# omission is the same defect one level out:
+#
+#   backchannel.rs              a logout token: tells an RP a session ENDED, grants nothing
+#   ssf_set.rs                  a security event token: a notification, grants nothing
+#   federation.rs               outbound: a request WE make to an upstream provider
+#   federation_client_secret.rs outbound: our client assertion to an upstream
+#   fedcm.rs                    already gated -- it calls `tokens::mint_id_token`
+#   fake_idp.rs                 a test double, never mounted by the server
+#
+# A new module that mints a subject credential has to be added to MODULES below. That is a
+# hand-written list and therefore the weak point; it is stated here so the next person adding
+# one sees the question rather than inheriting an answer.
+#
+# WHAT A MARKER PROVES, EXACTLY: nothing about reachability. `session_tokenizer::mint` and
+# `transaction_tokens::mint` are signing helpers with no `OidcState`, so their gate sits in
+# their one caller and each carries a marker naming it. The module-level check below --
+# every listed module must contain a call to the gate somewhere -- is what keeps that pair
+# honest at the file level. Neither check can see a SECOND caller added later that skips the
+# gate. A text scan cannot express reachability, and saying so here is better than a reader
+# inferring a guarantee that is not on offer.
 #
 # THE MARKER IS READ FROM THE DOC COMMENT IMMEDIATELY ABOVE THE `fn`, and nowhere else.
 #
@@ -41,23 +69,39 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-TOKENS="crates/ironauth-oidc/src/tokens.rs"
 GATE="issuance_refusal"
 MARKER="issuance-gate-allow:"
+DEFINED_IN="crates/ironauth-oidc/src/tokens.rs"
+MODULES="crates/ironauth-oidc/src/tokens.rs
+crates/ironauth-oidc/src/session_tokenizer.rs
+crates/ironauth-oidc/src/transaction_tokens.rs"
 fail=0
 
-if [ ! -f "$TOKENS" ]; then
-    echo "issuance-gate: $TOKENS is missing; this scan is pinned to the module that signs tokens"
-    exit 1
-fi
+for module in $MODULES; do
+    if [ ! -f "$module" ]; then
+        echo "issuance-gate: $module is missing. This scan is pinned to the modules that mint a"
+        echo "  subject credential; one that moved is one nothing checks."
+        exit 1
+    fi
+done
 
 # The gate has to EXIST, or every door below would pass by calling nothing.
-if ! grep -q "fn ${GATE}(" "$TOKENS"; then
-    echo "issuance-gate: ${GATE} is not defined in $TOKENS."
+if ! grep -q "fn ${GATE}(" "$DEFINED_IN"; then
+    echo "issuance-gate: ${GATE} is not defined in $DEFINED_IN."
     echo "  Every check below is against a function that no longer exists, so this scan would"
     echo "  pass while nothing is gated."
     exit 1
 fi
+
+# Every module named above has to actually REACH the gate, or it is listed and unprotected.
+for module in $MODULES; do
+    if ! grep -q "${GATE}(" "$module"; then
+        echo "issuance-gate: $module is listed as a credential-minting module and never calls"
+        echo "  ${GATE}. Either it gained a mint that skips the gate, or it stopped minting and"
+        echo "  should leave the list with the reason written down."
+        fail=1
+    fi
+done
 
 # Every `fn mint*` in the module, with its line number. `awk` walks the file once and reports
 # the body of each, so a door is judged by what it CALLS rather than by what sits near it.
@@ -78,7 +122,9 @@ fi
 # cannot be mangled in transit.
 DOOR_RE='^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+mint'
 
-doors=$(awk -v gate="$GATE" -v marker="$MARKER" -v door_re="$DOOR_RE" '
+checked=0
+for module in $MODULES; do
+    doors=$(awk -v gate="$GATE" -v marker="$MARKER" -v door_re="$DOOR_RE" '
     # The comment or attribute block immediately above an item. Any other line clears it, so a
     # block can only ever be credited to the item it actually precedes.
     /^[[:space:]]*(\/\/|#\[)/ {
@@ -110,44 +156,45 @@ doors=$(awk -v gate="$GATE" -v marker="$MARKER" -v door_re="$DOOR_RE" '
     function emit() {
         printf "%s\t%d\t%d\t%d\n", name, line, gated, marked
     }
-' "$TOKENS")
+' "$module")
 
-if [ -z "$doors" ]; then
-    echo "issuance-gate: no mint function found in $TOKENS."
-    echo "  Either the module was renamed or the pattern stopped matching; a scan that finds"
-    echo "  nothing to check is not a passing scan."
-    exit 1
-fi
-
-# THE COUNT IS CHECKED AGAINST A SECOND, DUMBER READING OF THE SAME FILE.
-#
-# The awk above is the only thing that decides what a door IS, so a pattern that quietly stops
-# matching one shape removes a door and leaves every remaining one passing -- the failure is
-# invisible because the output still says "clean". `grep -c` over the same expression is not an
-# independent implementation, but it is an independent PASS: if the two disagree, the awk's
-# state machine dropped something it matched (a door inside a block it treated as another
-# item's body, say), and that is exactly the case a reader would never notice.
-found=$(printf '%s\n' "$doors" | grep -c . || true)
-lines=$(grep -cE "$DOOR_RE" "$TOKENS" || true)
-if [ "$found" -ne "$lines" ]; then
-    echo "issuance-gate: the scan reports ${found} mint entry points and the file has ${lines}"
-    echo "  lines matching the same pattern. One of them is wrong, and the direction that"
-    echo "  matters is a door the state machine dropped: it would be ungated and unreported."
-    exit 1
-fi
-
-checked=0
-while IFS=$'\t' read -r name line gated marked; do
-    [ -n "$name" ] || continue
-    checked=$((checked + 1))
-    if [ "$gated" = "1" ] || [ "$marked" = "1" ]; then
-        continue
+    if [ -z "$doors" ]; then
+        echo "issuance-gate: no mint function found in $module."
+        echo "  Either it was renamed or the pattern stopped matching; a scan that finds nothing"
+        echo "  to check in a module it is pinned to is not a passing scan."
+        exit 1
     fi
-    echo "issuance-gate: ${TOKENS}:${line} \`${name}\` mints tokens and does not consult the"
-    echo "  access rules. Call ${GATE} in it, or put"
-    echo "  \`${MARKER} <why this is not an issuance decision>\` in its DOC COMMENT."
-    fail=1
-done <<< "$doors"
+
+    # THE COUNT IS CHECKED AGAINST A SECOND, DUMBER READING OF THE SAME FILE.
+    #
+    # The awk above is the only thing that decides what a door IS, so a pattern that quietly
+    # stops matching one shape removes a door and leaves every remaining one passing -- the
+    # failure is invisible because the output still says "clean". `grep -c` over the same
+    # expression is not an independent implementation, but it is an independent PASS: if the two
+    # disagree, the state machine dropped something the pattern matched, and that is exactly the
+    # case a reader would never notice.
+    found=$(printf '%s\n' "$doors" | grep -c . || true)
+    lines=$(grep -cE "$DOOR_RE" "$module" || true)
+    if [ "$found" -ne "$lines" ]; then
+        echo "issuance-gate: the scan reports ${found} mint entry points in ${module} and the"
+        echo "  file has ${lines} lines matching the same pattern. One of them is wrong, and the"
+        echo "  direction that matters is a door the state machine dropped: it would be ungated"
+        echo "  and unreported."
+        exit 1
+    fi
+
+    while IFS=$'\t' read -r name line gated marked; do
+        [ -n "$name" ] || continue
+        checked=$((checked + 1))
+        if [ "$gated" = "1" ] || [ "$marked" = "1" ]; then
+            continue
+        fi
+        echo "issuance-gate: ${module}:${line} \`${name}\` mints a credential and does not"
+        echo "  consult the access rules. Call ${GATE} in it, or put"
+        echo "  \`${MARKER} <why this is not an issuance decision>\` in its DOC COMMENT."
+        fail=1
+    done <<< "$doors"
+done
 
 if [ "$fail" -ne 0 ]; then
     echo
@@ -155,4 +202,4 @@ if [ "$fail" -ne 0 ]; then
     echo "that skips the check is a door the policy does not cover, and nothing else notices."
     exit 1
 fi
-echo "issuance-gate: clean (${checked} mint entry points, each gated or marked)"
+echo "issuance-gate: clean (${checked} mint entry points across $(printf '%s\n' $MODULES | grep -c .) modules, each gated or marked)"

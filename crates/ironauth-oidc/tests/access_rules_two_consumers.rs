@@ -362,3 +362,76 @@ async fn a_terminal_catch_all_deny_does_not_stop_every_token() {
     );
     assert!(body.contains("access_token"), "{body}");
 }
+
+/// THE DOORS OUTSIDE THE OAUTH MINTS, which the gate did not reach until a review said so.
+///
+/// `tokens.rs` is not the only module that signs a credential for a subject. The session
+/// tokenizer turns a session cookie into a bearer JWT a service mesh accepts for its full
+/// lifetime with no database call -- so an operator who wrote "no tokens for this person" would
+/// have watched them keep minting service-mesh credentials from an ordinary browser session.
+///
+/// Both halves are asserted, because "it is refused" alone passes against a build that refuses
+/// everyone and would hide a gate that simply broke the endpoint.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_subject_cannot_tokenize_a_session_either() {
+    let harness = Harness::start_store_backed().await;
+    harness
+        .install_session_token_template(
+            "orders",
+            "https://orders.example",
+            60,
+            r#"[{"kind":"static","name":"tier","value":"gold"}]"#,
+        )
+        .await;
+    let blocked = harness
+        .seed_user("blocked@example.test", "correct horse battery")
+        .await;
+    let allowed = harness
+        .seed_user("ordinary@example.test", "correct horse battery")
+        .await;
+
+    let rules = access_rules_from_config(&policy(&blocked), &[]).expect("the rules convert");
+    let state = harness
+        .state()
+        .clone()
+        .with_access_rules(Arc::clone(&rules));
+    let router = oidc_router(state);
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/session/tokenize?tokenize_as=orders",
+        scope.tenant(),
+        scope.environment()
+    );
+
+    let tokenize = |cookie: String| {
+        let (path, router) = (path.clone(), router.clone());
+        async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request builds");
+            send_through(router, request).await
+        }
+    };
+
+    let cookie = harness.session_cookie(&blocked).await;
+    let (status, _, body) = tokenize(cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the same deny rule must refuse a service-mesh credential: {body}"
+    );
+    assert!(body.contains("access_denied"), "{body}");
+
+    let cookie = harness.session_cookie(&allowed).await;
+    let (status, _, body) = tokenize(cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "and everyone else must still be able to tokenize, or the row above passes against a \
+         gate that broke the endpoint: {body}"
+    );
+    assert!(body.contains("token"), "{body}");
+}

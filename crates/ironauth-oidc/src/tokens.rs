@@ -1248,7 +1248,7 @@ impl From<()> for MintRefusal {
 /// Through [`crate::rules::RuleSet::refusal`], not `decide`. A token request matches no path
 /// rule, so reading the fall-through as a refusal would mean one forward-auth path rule stopped
 /// every token in the deployment from being issued. The reasoning is on that method.
-fn issuance_refusal(
+pub(crate) fn issuance_refusal(
     state: &OidcState,
     subject: &str,
     acr: Option<String>,
@@ -1273,7 +1273,7 @@ fn issuance_refusal(
 /// `parse_methods` falls back to a password when it parses nothing. The machine door passes
 /// `None` explicitly, and the difference between "reached this" and "authenticated nobody" is
 /// exactly what that call site is making.
-fn issued_acr(auth_methods: &str) -> String {
+pub(crate) fn issued_acr(auth_methods: &str) -> String {
     crate::authn::achieved_acr(&crate::authn::parse_methods(auth_methods)).to_owned()
 }
 
