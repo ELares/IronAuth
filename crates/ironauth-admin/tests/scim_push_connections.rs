@@ -475,11 +475,20 @@ async fn the_listing_reports_the_health_a_operator_needs_to_act_on() {
     // running ANYWHERE in the cluster. So the head this test needs is withheld for as long as
     // some unrelated transaction that started earlier is still open.
     //
-    // On a throwaway single-suite cluster that is never, which is why this passed locally and
-    // failed on CI, where the whole workspace shares one Postgres: an unrelated crate's test
-    // held the watermark down and the listing omitted the head. The premise "the tenant creation
-    // above wrote audit events, so the head is a real number" is true about the WRITE and false
-    // about when it becomes visible.
+    // THE HOLDER IS THIS BINARY, and an earlier version of this comment blamed "an unrelated
+    // crate's test" on a shared CI cluster. That cannot happen: `cargo test --workspace` runs
+    // test binaries one after another, which `ci.yml` itself relies on when it reclaims the
+    // previous binary's databases. The holders are the SIBLING tests here -- eighteen of them
+    // on their own threads, each `Harness::start` applying the migration chain one write
+    // transaction per migration -- so a qualifying open write is almost always present.
+    //
+    // Which also means the single-shot read was a lottery EVERYWHERE, not a CI artifact. The
+    // same stall is already measured in this crate at about one run in three locally
+    // (`scim_push_worker.rs`), and `events_cursor_ordering.rs` records its own suite holding
+    // the watermark down continuously. CI is only where this one lost.
+    //
+    // The premise "the tenant creation above wrote audit events, so the head is a real number"
+    // is true about the WRITE and false about when it becomes visible.
     //
     // A bounded wait is the honest shape, and it is the same one `events_cursor_ordering.rs`
     // uses for the same reason. It does not paper over a defect: absent is a legitimate answer
@@ -487,8 +496,8 @@ async fn the_listing_reports_the_health_a_operator_needs_to_act_on() {
     // watermark still fails rather than passing quietly.
     //
     // REPRODUCED, rather than reasoned about: with a transaction held open in another session
-    // for four seconds, a single-shot read fails with exactly the CI message and this loop
-    // passes.
+    // for four seconds -- standing in for the sibling this suite supplies on its own -- a
+    // single-shot read fails with exactly the CI message and this loop passes.
     //
     // And the FIRST attempt at that reproduction proved nothing, which is the part worth
     // writing down. It held open `BEGIN; SELECT 1;` and both versions passed. A read-only
