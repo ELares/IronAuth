@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Resource pages now prioritize existing items.** Creation, invitation,
+  credential issuance, membership and grant forms open only after an explicit
+  action. Compact header controls open accessible dialogs, including on empty
+  lists. Cancel and Escape discard the draft and restore focus; successful writes
+  close the dialog and keep confirmations and one-time credentials on the page.
+
 - **Refreshed the admin console and hosted authentication screens.** The console
   now has a working overview, grouped navigation, visible command search,
   responsive layouts, searchable resource lists, and clearer forms and guidance.

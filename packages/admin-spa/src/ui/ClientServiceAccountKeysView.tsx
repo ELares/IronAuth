@@ -20,7 +20,8 @@
 // Everything below the lookup is the same shape as OrgApiKeysPanel and
 // UserPersonalAccessTokensPanel, rendering the same object through the same shared view type.
 
-import { useState } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
+import { CredentialCreateForm } from "./CredentialCreateForm";
 import {
   type ApiKeyView,
   createServiceAccountKey,
@@ -34,6 +35,7 @@ import {
   AsyncBoundary,
   ConfirmButton,
   MutationFeedback,
+  ResourceCreateAction,
   SecretCopyButton,
 } from "./ResourceView";
 import { inputValue, sudoFor } from "./orgPanels";
@@ -48,14 +50,18 @@ export function ClientServiceAccountKeysPanel({
 }) {
   const [clientId, setClientId] = useState("");
   const [lookupId, setLookupId] = useState<string | null>(null);
+  useEffect(() => {
+    setClientId("");
+    setLookupId(null);
+  }, [tenantId, environmentId]);
 
   return (
     <div class="resource-subsection">
       <h2 id="client-keys">Machine identity keys</h2>
       <p class="resource-note">
-        Keys authenticate as a client&#39;s service account. The account is created
-        the first time the client uses machine credentials. Save each key when
-        it is created; it cannot be retrieved later.
+        Keys authenticate as a client&#39;s service account. The account is
+        created the first time the client uses machine credentials. Save each
+        key when it is created; it cannot be retrieved later.
       </p>
       <form
         class="resource-form"
@@ -84,6 +90,7 @@ export function ClientServiceAccountKeysPanel({
       </form>
       {lookupId === null ? null : (
         <ServiceAccountFor
+          key={`${tenantId}:${environmentId}:${lookupId}`}
           tenantId={tenantId}
           environmentId={environmentId}
           clientId={lookupId}
@@ -123,6 +130,7 @@ function ServiceAccountFor({
           </p>
         ) : (
           <ServiceAccountKeys
+            key={`${tenantId}:${environmentId}:${serviceAccountId}`}
             tenantId={tenantId}
             environmentId={environmentId}
             serviceAccountId={serviceAccountId}
@@ -154,7 +162,9 @@ function ServiceAccountKeys({
   const [issued, setIssued] = useState<{ id: string; key: string } | null>(
     null,
   );
-  const [name, setName] = useState("");
+  useEffect(() => {
+    setIssued(null);
+  }, [tenantId, environmentId, serviceAccountId]);
   const reloadClearingKey = () => {
     setIssued(null);
     reload();
@@ -162,60 +172,44 @@ function ServiceAccountKeys({
 
   return (
     <>
+      <div class="resource-subsection-heading">
+        <h3>Service account keys</h3>
+        <ResourceCreateAction
+          key={`${tenantId}:${environmentId}:${serviceAccountId}`}
+          label="Create key"
+          pending={mutation.state.pending}
+        >
+          {(close) => (
+            <CredentialCreateForm
+              title="Create service account key"
+              nameLabel="New key name"
+              submitLabel="Create key"
+              successMessage="Key created."
+              mutation={mutation}
+              onCreate={async (name) => {
+                const created = await createServiceAccountKey(
+                  tenantId,
+                  environmentId,
+                  serviceAccountId,
+                  name,
+                );
+                // Idempotent replays never expose the credential again.
+                setIssued(
+                  created.key === undefined || created.key === null
+                    ? null
+                    : { id: created.id, key: created.key },
+                );
+                reload();
+              }}
+              onCreated={close}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
       <p class="resource-note">
         Principal <code class="resource-row-id">{serviceAccountId}</code>
       </p>
-      <form
-        class="resource-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          const trimmed = name.trim();
-          if (trimmed === "") {
-            return;
-          }
-          void mutation
-            .run(async () => {
-              const created = await createServiceAccountKey(
-                tenantId,
-                environmentId,
-                serviceAccountId,
-                trimmed,
-              );
-              // Absent on an idempotent replay. Showing nothing is correct there: the key
-              // was issued once and this is not that once.
-              setIssued(
-                created.key === undefined || created.key === null
-                  ? null
-                  : { id: created.id, key: created.key },
-              );
-            }, "Key created.")
-            .then((ok: boolean) => {
-              if (ok) {
-                setName("");
-                reload();
-              }
-            });
-        }}
-      >
-        <label class="resource-field">
-          New key name
-          <input
-            type="text"
-            required
-            placeholder="Production integration"
-            value={name}
-            disabled={mutation.state.pending}
-            onInput={(event) => setName(inputValue(event))}
-          />
-        </label>
-        <button
-          class="resource-btn resource-btn-primary"
-          type="submit"
-          disabled={mutation.state.pending || name.trim() === ""}
-        >
-          Create key
-        </button>
-      </form>
+
       {issued === null ? null : (
         <div class="resource-callout">
           <h3>Save your new API key</h3>

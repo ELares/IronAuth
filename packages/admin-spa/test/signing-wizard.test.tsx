@@ -79,7 +79,9 @@ async function flush(): Promise<void> {
   for (let i = 0; i < 6; i += 1) {
     await Promise.resolve();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
   }
 }
 
@@ -118,6 +120,18 @@ const matrix = [
   },
 ];
 
+async function openConfiguration(root: HTMLElement): Promise<void> {
+  expect(root.querySelector("#signing-client-id")).toBeNull();
+  const trigger = Array.from(
+    root.querySelectorAll<HTMLButtonElement>('button[aria-haspopup="dialog"]'),
+  ).find((element) =>
+    element.textContent?.trim().endsWith("Configure token signing"),
+  );
+  expect(trigger).toBeDefined();
+  trigger?.click();
+  await flush();
+}
+
 const noPolicies = { items: [] };
 
 // Route the wizard's read to the interop matrix and everything else (the
@@ -150,9 +164,10 @@ describe("the signing compatibility wizard renders the server's recommendation",
     stubFetch(respondDefault);
     const root = mount(<ClientsList />);
     await flush();
+    await openConfiguration(root);
 
     // AWS API Gateway is the first (default) row, so RS256 and its reason are
-    // shown without any interaction. The value comes from the mocked GET, not a
+    // shown after opening configuration. The value comes from the mocked GET, not a
     // hardcoded TypeScript matrix.
     const recommended = root.querySelector(".signing-recommended");
     expect(recommended?.textContent).toBe("RS256");
@@ -165,6 +180,7 @@ describe("the signing compatibility wizard renders the server's recommendation",
     stubFetch(respondDefault);
     const root = mount(<ClientsList />);
     await flush();
+    await openConfiguration(root);
 
     const select = root.querySelector("#signing-verifier") as HTMLSelectElement;
     select.value = "modern_jose";
@@ -192,6 +208,7 @@ describe("confirming the wizard pins the recommended algorithm", () => {
     });
     const root = mount(<ClientsList />);
     await flush();
+    await openConfiguration(root);
 
     const clientId = root.querySelector(
       "#signing-client-id",
@@ -204,7 +221,8 @@ describe("confirming the wizard pins the recommended algorithm", () => {
     await flush();
 
     const put = calls.find(
-      (call) => call.method === "PUT" && call.url.includes("/signing-algorithm"),
+      (call) =>
+        call.method === "PUT" && call.url.includes("/signing-algorithm"),
     );
     expect(put).toBeDefined();
     expect(put?.url).toContain(
@@ -227,15 +245,13 @@ describe("a failing write renders through the ErrorView boundary", () => {
     const message = "The environment cannot sign RS256 tokens.";
     stubFetch((call) => {
       if (call.method === "PUT" && call.url.includes("/signing-algorithm")) {
-        return json(
-          { error: "env_cannot_sign", message },
-          422,
-        );
+        return json({ error: "env_cannot_sign", message }, 422);
       }
       return respondDefault(call);
     });
     const root = mount(<ClientsList />);
     await flush();
+    await openConfiguration(root);
 
     const clientId = root.querySelector(
       "#signing-client-id",

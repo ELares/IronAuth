@@ -48,13 +48,14 @@ import {
   AsyncBoundary,
   ConfirmButton,
   MutationFeedback,
+  ResourceCreateAction,
   ResourceHeading,
   ResourceFormIntro,
   SecretCopyButton,
   ResourceDetailNav,
 } from "./ResourceView";
 import { ClientServiceAccountKeysPanel } from "./ClientServiceAccountKeysView";
-import { useAsyncResource, useMutation } from "./useResource";
+import { useAsyncResource, useMutation, type Mutation } from "./useResource";
 
 function inputValue(event: Event): string {
   return (event.target as HTMLInputElement).value;
@@ -114,20 +115,20 @@ function ClientsForScope({
         title="Clients"
         description="Look up registered applications, manage token settings and configure client registration."
       />
-      <p class="resource-hint">
-        Applications register using an initial access token. Create a
-        registration policy and issue a token to enable a new application to
-        register.
-      </p>
       <ResourceDetailNav
         items={[
+          { id: "client-policies", label: "Policies" },
+          { id: "client-registration-token", label: "Registration tokens" },
           { id: "client-lookup", label: "Look up client" },
           { id: "client-signing", label: "Token signing" },
           { id: "client-scopes", label: "Scope allowlist" },
           { id: "client-keys", label: "Machine keys" },
-          { id: "client-policies", label: "Policies" },
-          { id: "client-registration-token", label: "Registration token" },
         ]}
+      />
+      <DcrPoliciesPanel tenantId={tenantId} environmentId={environmentId} />
+      <DcrInitialAccessTokenPanel
+        tenantId={tenantId}
+        environmentId={environmentId}
       />
       <DcrClientLookup tenantId={tenantId} environmentId={environmentId} />
       <SigningAlgorithmWizard
@@ -136,11 +137,6 @@ function ClientsForScope({
       />
       <AllowedScopesPanel tenantId={tenantId} environmentId={environmentId} />
       <ClientServiceAccountKeysPanel
-        tenantId={tenantId}
-        environmentId={environmentId}
-      />
-      <DcrPoliciesPanel tenantId={tenantId} environmentId={environmentId} />
-      <DcrInitialAccessTokenPanel
         tenantId={tenantId}
         environmentId={environmentId}
       />
@@ -167,9 +163,40 @@ function SigningAlgorithmWizard({
     () => fetchSigningRecommendations(),
     [],
   );
+  const [confirmation, setConfirmation] = useState<string | null>(null);
   return (
     <div class="resource-subsection">
-      <h2 id="client-signing">Token signing compatibility wizard</h2>
+      <div class="resource-subsection-heading">
+        <h2 id="client-signing">Token signing</h2>
+        <ResourceCreateAction label="Configure token signing">
+          {(close) => (
+            <AsyncBoundary
+              state={state}
+              loadingLabel="Loading recommendations"
+              empty={{
+                when: (rows) => rows.length === 0,
+                render: () => (
+                  <p class="resource-empty">
+                    No verifier recommendations are available.
+                  </p>
+                ),
+              }}
+            >
+              {(rows) => (
+                <SigningAlgorithmWizardForm
+                  tenantId={tenantId}
+                  environmentId={environmentId}
+                  rows={rows}
+                  onConfigured={(message) => {
+                    setConfirmation(message);
+                    close();
+                  }}
+                />
+              )}
+            </AsyncBoundary>
+          )}
+        </ResourceCreateAction>
+      </div>
       <p class="resource-hint">
         Choose the verifier your application uses to find a compatible token
         signing algorithm.
@@ -183,26 +210,11 @@ function SigningAlgorithmWizard({
           server; nothing here is hardcoded.
         </p>
       </details>
-      <AsyncBoundary
-        state={state}
-        loadingLabel="Loading recommendations"
-        empty={{
-          when: (rows) => rows.length === 0,
-          render: () => (
-            <p class="resource-empty">
-              No verifier recommendations are available.
-            </p>
-          ),
-        }}
-      >
-        {(rows) => (
-          <SigningAlgorithmWizardForm
-            tenantId={tenantId}
-            environmentId={environmentId}
-            rows={rows}
-          />
-        )}
-      </AsyncBoundary>
+      {confirmation === null ? null : (
+        <p class="resource-success" role="status">
+          {confirmation}
+        </p>
+      )}
     </div>
   );
 }
@@ -211,10 +223,12 @@ function SigningAlgorithmWizardForm({
   tenantId,
   environmentId,
   rows,
+  onConfigured,
 }: {
   tenantId: string;
   environmentId: string;
   rows: SigningRecommendationView[];
+  onConfigured: (message: string) => void;
 }) {
   const [clientId, setClientId] = useState("");
   const [verifier, setVerifier] = useState(rows[0]?.verifier ?? "");
@@ -240,14 +254,19 @@ function SigningAlgorithmWizardForm({
     if (trimmed === "") {
       return;
     }
-    void mutation.run(async () => {
-      await setClientSigningAlgorithm(
-        tenantId,
-        environmentId,
-        trimmed,
-        selected.recommended,
-      );
-    }, `Signing algorithm set to ${selected.recommended}.`);
+    const message = `Signing algorithm set to ${selected.recommended}.`;
+    void mutation
+      .run(async () => {
+        await setClientSigningAlgorithm(
+          tenantId,
+          environmentId,
+          trimmed,
+          selected.recommended,
+        );
+      }, message)
+      .then((ok) => {
+        if (ok) onConfigured(message);
+      });
   }
 
   return (
@@ -256,6 +275,10 @@ function SigningAlgorithmWizardForm({
       onSubmit={onConfirm}
       aria-label="Set the signing algorithm for a client"
     >
+      <ResourceFormIntro
+        title="Configure token signing"
+        description="Choose the verifier your application uses and apply its recommended signing algorithm."
+      />
       <div class="resource-field">
         <label for="signing-client-id">Client id</label>
         <input
@@ -664,14 +687,30 @@ function DcrPoliciesPanel({
     () => fetchDcrPolicies(tenantId, environmentId),
     [tenantId, environmentId],
   );
+  const [created, setCreated] = useState(false);
   return (
     <div class="resource-subsection">
-      <h2 id="client-policies">Registration policies</h2>
-      <DcrPolicyCreateForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        onCreated={reload}
-      />
+      <div class="resource-subsection-heading">
+        <h2 id="client-policies">Registration policies</h2>
+        <ResourceCreateAction label="Create registration policy">
+          {(close) => (
+            <DcrPolicyCreateForm
+              tenantId={tenantId}
+              environmentId={environmentId}
+              onCreated={() => {
+                setCreated(true);
+                reload();
+                close();
+              }}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
+      {created ? (
+        <p class="resource-success" role="status">
+          Policy created.
+        </p>
+      ) : null}
       <AsyncBoundary
         state={state}
         loadingLabel="Loading policies"
@@ -679,7 +718,7 @@ function DcrPoliciesPanel({
           when: (items) => items.length === 0,
           render: () => (
             <p class="resource-empty">
-              No registration policies yet. Create the first one above.
+              No registration policies are configured in this environment.
             </p>
           ),
         }}
@@ -823,104 +862,147 @@ function DcrInitialAccessTokenPanel({
   environmentId: string;
 }) {
   const mutation = useMutation();
-  const [expiresIn, setExpiresIn] = useState("86400");
-  const [maxUses, setMaxUses] = useState("");
-  const [policyNames, setPolicyNames] = useState("");
   const [created, setCreated] = useState<InitialAccessTokenCreated | null>(
     null,
   );
 
-  function onSubmit(event: Event): void {
-    event.preventDefault();
-    const seconds = Number(expiresIn.trim());
-    if (!Number.isFinite(seconds) || seconds < 0) {
-      return;
-    }
-    const request: CreateInitialAccessTokenRequest = {
-      expires_in_secs: seconds,
-    };
-    if (maxUses.trim() !== "") {
-      request.max_uses = Number(maxUses.trim());
-    }
-    const names = policyNames
-      .split(",")
-      .map((name) => name.trim())
-      .filter((name) => name !== "");
-    if (names.length > 0) {
-      request.policy_names = names;
-    }
+  function onIssue(
+    request: CreateInitialAccessTokenRequest,
+    close: () => void,
+  ): void {
     // Clear any previously displayed token BEFORE the call so a stale credential
     // is never on screen while the next mint is in flight.
     setCreated(null);
-    void mutation.run(async () => {
-      const result = await createDcrInitialAccessToken(
-        tenantId,
-        environmentId,
-        request,
-      );
-      // Hold the result in memory only. This is the ONLY place the token value
-      // lives; it is never persisted or logged.
-      setCreated(result);
-    }, "Initial access token minted.");
+    void mutation
+      .run(async () => {
+        const result = await createDcrInitialAccessToken(
+          tenantId,
+          environmentId,
+          request,
+        );
+        // Hold the result in memory only. This is the ONLY place the token value
+        // lives; it is never persisted or logged.
+        setCreated(result);
+      }, "Initial access token minted.")
+      .then((ok) => {
+        if (ok) close();
+      });
   }
 
   return (
     <div class="resource-subsection">
-      <h2 id="client-registration-token">Initial access token</h2>
-      <p class="resource-hint">
-        Issue a token that lets a new application register. Set an expiry and
-        optional usage limits.
-      </p>
-      <form
-        class="resource-form"
-        onSubmit={onSubmit}
-        aria-label="Mint an initial access token"
-      >
-        <div class="resource-field">
-          <label for="dcr-iat-expires">Lifetime (seconds)</label>
-          <input
-            id="dcr-iat-expires"
-            type="number"
-            required
-            min={0}
-            value={expiresIn}
-            onInput={(event) => setExpiresIn(inputValue(event))}
-          />
-        </div>
-        <div class="resource-field">
-          <label for="dcr-iat-max-uses">
-            Max uses (optional, blank for unlimited)
-          </label>
-          <input
-            id="dcr-iat-max-uses"
-            type="number"
-            min={0}
-            value={maxUses}
-            onInput={(event) => setMaxUses(inputValue(event))}
-          />
-        </div>
-        <div class="resource-field">
-          <label for="dcr-iat-policies">
-            Policy names (optional, comma separated)
-          </label>
-          <input
-            id="dcr-iat-policies"
-            type="text"
-            value={policyNames}
-            onInput={(event) => setPolicyNames(inputValue(event))}
-          />
-        </div>
-        <button
-          type="submit"
-          class="resource-btn resource-btn-primary"
-          disabled={mutation.state.pending || expiresIn.trim() === ""}
+      <div class="resource-subsection-heading">
+        <h2 id="client-registration-token">Initial access token</h2>
+        <ResourceCreateAction
+          label="Issue registration token"
+          pending={mutation.state.pending}
         >
-          Mint token
-        </button>
-      </form>
+          {(close) => (
+            <InitialAccessTokenForm
+              mutation={mutation}
+              onIssue={(request) => onIssue(request, close)}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
+      <p class="resource-hint">
+        Registration tokens allow applications to register using the policies
+        configured for this environment.
+      </p>
       {created === null ? null : <IssuedToken created={created} />}
-      <MutationFeedback state={mutation.state} />
+      {created === null ? null : <MutationFeedback state={mutation.state} />}
     </div>
+  );
+}
+
+function InitialAccessTokenForm({
+  mutation,
+  onIssue,
+}: {
+  mutation: Mutation;
+  onIssue: (request: CreateInitialAccessTokenRequest) => void;
+}) {
+  const [expiresIn, setExpiresIn] = useState("86400");
+  const [maxUses, setMaxUses] = useState("");
+  const [policyNames, setPolicyNames] = useState("");
+  const [submitted, setSubmitted] = useState(false);
+
+  function onSubmit(event: Event): void {
+    event.preventDefault();
+    const seconds = Number(expiresIn.trim());
+    if (!Number.isFinite(seconds) || seconds < 0) return;
+    const request: CreateInitialAccessTokenRequest = {
+      expires_in_secs: seconds,
+    };
+    if (maxUses.trim() !== "") request.max_uses = Number(maxUses.trim());
+    const names = policyNames
+      .split(",")
+      .map((name) => name.trim())
+      .filter(Boolean);
+    if (names.length > 0) request.policy_names = names;
+    setSubmitted(true);
+    onIssue(request);
+  }
+
+  return (
+    <form
+      class="resource-form"
+      onSubmit={onSubmit}
+      aria-label="Mint an initial access token"
+    >
+      <ResourceFormIntro
+        title="Issue registration token"
+        description="Set an expiry and optional usage limits for a token that lets an application register."
+      />
+      <div class="resource-field">
+        <label for="dcr-iat-expires">Lifetime (seconds)</label>
+        <input
+          id="dcr-iat-expires"
+          type="number"
+          required
+          min={0}
+          value={expiresIn}
+          onInput={(event) => setExpiresIn(inputValue(event))}
+        />
+      </div>
+      <div class="resource-field">
+        <label for="dcr-iat-max-uses">
+          Max uses (optional, blank for unlimited)
+        </label>
+        <input
+          id="dcr-iat-max-uses"
+          type="number"
+          min={0}
+          value={maxUses}
+          onInput={(event) => setMaxUses(inputValue(event))}
+        />
+      </div>
+      <div class="resource-field">
+        <label for="dcr-iat-policies">
+          Policy names (optional, comma separated)
+        </label>
+        <input
+          id="dcr-iat-policies"
+          type="text"
+          value={policyNames}
+          onInput={(event) => setPolicyNames(inputValue(event))}
+        />
+      </div>
+      <button
+        type="submit"
+        class="resource-btn resource-btn-primary"
+        disabled={mutation.state.pending || expiresIn.trim() === ""}
+      >
+        Mint token
+      </button>
+      <MutationFeedback
+        state={{
+          ...mutation.state,
+          error: submitted ? mutation.state.error : null,
+          success: null,
+        }}
+      />
+    </form>
   );
 }
 

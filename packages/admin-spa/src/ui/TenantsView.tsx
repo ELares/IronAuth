@@ -29,6 +29,7 @@ import {
   ConfirmButton,
   MutationFeedback,
   ResourceHeading,
+  ResourceCreateAction,
   ResourceFormIntro,
   ResourceCollection,
   resourceLabel,
@@ -47,6 +48,7 @@ function inputValue(event: Event): string {
 // The tenants list plus the create form. Creating or deleting a tenant reloads
 // this list AND refreshes the switcher's tenant list through the store.
 export function TenantsList() {
+  const [notice, setNotice] = useState<string | null>(null);
   const { state, reload } = useAsyncResource<TenantView[]>(
     () => fetchTenants(),
     [],
@@ -61,18 +63,31 @@ export function TenantsList() {
         id="tenants-heading"
         title="Tenants"
         description="Manage your tenants and the environments where your applications run."
+        actions={
+          <ResourceCreateAction label="Create tenant">
+            {(close) => (
+              <TenantCreateForm
+                onCreated={() => {
+                  setNotice("Tenant created.");
+                  onChanged();
+                  close();
+                }}
+              />
+            )}
+          </ResourceCreateAction>
+        }
       />
-      <TenantCreateForm onCreated={onChanged} />
+      {notice === null ? null : (
+        <p class="resource-success" role="status" aria-live="polite">
+          {notice}
+        </p>
+      )}
       <AsyncBoundary
         state={state}
         loadingLabel="Loading tenants"
         empty={{
           when: (items) => items.length === 0,
-          render: () => (
-            <p class="resource-empty">
-              No tenants yet. Create the first one above.
-            </p>
-          ),
+          render: () => <p class="resource-empty">No tenants yet.</p>,
         }}
       >
         {(items) => (

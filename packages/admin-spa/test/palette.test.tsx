@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "preact";
 import { type Command, filterCommands, wrapIndex } from "../src/ui/commands";
 import { CommandPalette } from "../src/ui/CommandPalette";
+import { ResourceCreateAction } from "../src/ui/ResourceView";
 
 let container: HTMLDivElement | null = null;
 
@@ -98,6 +99,34 @@ describe("command palette keyboard flow", () => {
       new KeyboardEvent("keydown", { key, bubbles: true, ...mods }),
     );
   }
+
+  it("keeps global search closed while a resource creation dialog is active", async () => {
+    const root = mount(
+      <>
+        <CommandPalette commands={[]} />
+        <ResourceCreateAction label="Create user">
+          {() => (
+            <form>
+              <input aria-label="Name" />
+            </form>
+          )}
+        </ResourceCreateAction>
+      </>,
+    );
+    await tick();
+    root.querySelector<HTMLButtonElement>(".resource-create-trigger")!.click();
+    await tick();
+    const input = root.querySelector("dialog input")!;
+    for (const modifiers of [{ ctrlKey: true }, { metaKey: true }]) {
+      keydown(input, "k", modifiers);
+      await tick();
+      expect(root.querySelector(".cmdk-input")).toBeNull();
+    }
+    keydown(input, "Escape");
+    await tick();
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(root.querySelector(".cmdk-input")).toBeNull();
+  });
 
   it("opens on Ctrl-K, moves with ArrowDown, runs on Enter, and closes", async () => {
     const alpha = vi.fn();

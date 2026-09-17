@@ -109,6 +109,15 @@ async function flush(): Promise<void> {
   }
 }
 
+async function openAction(root: HTMLElement, label: string): Promise<void> {
+  const trigger = Array.from(
+    root.querySelectorAll<HTMLButtonElement>('[aria-haspopup="dialog"]'),
+  ).find((element) => element.textContent?.trim().endsWith(label));
+  if (trigger === undefined) throw new Error(`no action labelled ${label}`);
+  trigger.click();
+  await flush();
+}
+
 function button(root: HTMLElement, label: string): HTMLButtonElement {
   const found = Array.from(root.querySelectorAll("button")).find(
     (element) => element.textContent === label,
@@ -246,6 +255,7 @@ describe("the organization roles panel", () => {
     const root = mount(<OrgRolesPanel {...SCOPE} />);
     await flush();
 
+    await openAction(root, "Create role");
     type(root, "#org-role-slug", "billing.admin");
     type(root, "#org-role-display-name", "Billing Administrator");
     await flush();
@@ -260,7 +270,7 @@ describe("the organization roles panel", () => {
     });
     // A retried submit must define the role once, so the create is key guarded.
     expect(post?.idempotencyKey).toMatch(/^[0-9a-f]{32}$/);
-    expect(root.textContent).toContain("Role defined.");
+    expect(root.querySelector("dialog")).toBeNull();
   });
 
   it("reads one role fresh and renames only its label", async () => {
@@ -456,6 +466,7 @@ describe("the organization groups panel", () => {
     const root = mount(<OrgGroupsPanel {...SCOPE} />);
     await flush();
 
+    await openAction(root, "Create group");
     type(root, "#org-group-slug", "platform");
     type(root, "#org-group-display-name", "Platform");
     choose(root, "#org-group-parent", "grp_a");
@@ -480,6 +491,7 @@ describe("the organization groups panel", () => {
     const root = mount(<OrgGroupsPanel {...SCOPE} />);
     await flush();
 
+    await openAction(root, "Create group");
     type(root, "#org-group-slug", "engineering");
     type(root, "#org-group-display-name", "Engineering");
     await flush();
@@ -808,6 +820,7 @@ describe("the members of one group", () => {
     expect(rows[0].textContent).toContain("omb_a");
     expect(rows[0].textContent).toContain("gmb_a");
 
+    await openAction(root, "Add group member");
     type(root, "#org-group-member-id", "omb_b");
     await flush();
     button(root, "Add to group").click();
@@ -882,6 +895,7 @@ describe("the roles one group grants", () => {
     expect(rows.length).toBe(1);
     expect(rows[0].textContent).toContain("rol_a");
 
+    await openAction(root, "Grant group role");
     type(root, "#org-group-role-id", "rol_b");
     await flush();
     button(root, "Grant to group").click();
@@ -976,6 +990,7 @@ describe("the roles of one member", () => {
     expect(rows.length).toBe(1);
     expect(rows[0].textContent).toContain("rol_a");
 
+    await openAction(root, "Grant member role");
     type(root, "#org-membership-role-id", "rol_b");
     await flush();
     button(root, "Grant to member").click();
@@ -1012,6 +1027,7 @@ describe("the roles of one member", () => {
       call.url.endsWith("/effective-roles"),
     ).length;
 
+    await openAction(root, "Grant member role");
     type(root, "#org-membership-role-id", "rol_b");
     await flush();
     button(root, "Grant to member").click();
@@ -1388,4 +1404,47 @@ describe("the roles and groups panels inside the organization detail", () => {
     const rows = rowsOf(root, "Effective role grant paths");
     expect(rows.length).toBe(2);
   });
+});
+
+it("starts each explicit member-role grant with a fresh draft and no earlier failure", async () => {
+  const calls = stubFetch((call) => {
+    if (call.method === "POST")
+      return json(
+        { error: "invalid_request", message: "Grant refused", max_age: 0 },
+        403,
+      );
+    if (call.url.endsWith("effective-roles")) return json(effective([]));
+    return json({ items: [] });
+  });
+  const root = mount(
+    <MembershipRolesPanel
+      {...SCOPE}
+      membershipId="omb_a"
+      organizationActive
+      membershipState="active"
+    />,
+  );
+  await flush();
+  await openAction(root, "Grant member role");
+  type(root, "#org-membership-role-id", "unsaved-role");
+  await flush();
+  button(root, "Cancel").click();
+  await flush();
+  await openAction(root, "Grant member role");
+  expect(
+    (root.querySelector("#org-membership-role-id") as HTMLInputElement).value,
+  ).toBe("");
+  type(root, "#org-membership-role-id", "rol_b");
+  await flush();
+  button(root, "Grant to member").click();
+  await flush();
+  expect(root.querySelector("dialog")?.textContent).toContain("Grant refused");
+  button(root, "Cancel").click();
+  await flush();
+  await openAction(root, "Grant member role");
+  expect(
+    (root.querySelector("#org-membership-role-id") as HTMLInputElement).value,
+  ).toBe("");
+  expect(root.querySelector("dialog .errorbody")).toBeNull();
+  expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
 });

@@ -72,8 +72,24 @@ async function flush(): Promise<void> {
   for (let i = 0; i < 6; i += 1) {
     await Promise.resolve();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
   }
+}
+
+function button(root: HTMLElement, label: string): HTMLButtonElement {
+  const searchRoot = root.querySelector("dialog[open]") ?? root;
+  const found = Array.from(
+    searchRoot.querySelectorAll<HTMLButtonElement>("button"),
+  ).find(
+    (element) =>
+      element.textContent === label ||
+      (element.classList.contains("resource-create-trigger") &&
+        element.textContent?.trim() === `+ ${label}`),
+  ) as HTMLButtonElement | undefined;
+  if (found === undefined) throw new Error(`no button labelled ${label}`);
+  return found;
 }
 
 const environment = {
@@ -132,6 +148,32 @@ describe("the environments list", () => {
 });
 
 describe("creating an environment", () => {
+  it("discards a draft when the selected tenant changes", async () => {
+    activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
+    const calls = stubFetch(() => json({ items: [] }));
+    const root = mount(<EnvironmentsList />);
+    await flush();
+    button(root, "Create environment").click();
+    await flush();
+    const input = root.querySelector("#env-display-name") as HTMLInputElement;
+    input.value = "Unfinished production";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    activeScope.value = { tenantId: "ten_b", environmentId: "env_b" };
+    await flush();
+
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(calls.some((call) => call.method === "POST")).toBe(false);
+    expect(
+      calls.some((call) => call.url.includes("/tenants/ten_b/environments")),
+    ).toBe(true);
+    button(root, "Create environment").click();
+    await flush();
+    expect(
+      (root.querySelector("#env-display-name") as HTMLInputElement).value,
+    ).toBe("");
+  });
+
   it("submits createEnvironment to the tenant scoped POST with the body", async () => {
     activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
     const calls = stubFetch((call) =>
@@ -142,13 +184,19 @@ describe("creating an environment", () => {
     const root = mount(<EnvironmentsList />);
     await flush();
 
+    expect(root.querySelector(".resource-form")).toBeNull();
+    button(root, "Create environment").click();
+    await flush();
+
     const input = root.querySelector("#env-display-name") as HTMLInputElement;
     input.value = "staging";
     input.dispatchEvent(new Event("input", { bubbles: true }));
     await flush();
 
     const form = root.querySelector(".resource-form") as HTMLFormElement;
-    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    form.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
     await flush();
 
     const post = calls.find((call) => call.method === "POST");
@@ -157,5 +205,7 @@ describe("creating an environment", () => {
     const body = JSON.parse(post?.body ?? "{}") as Record<string, unknown>;
     expect(body.display_name).toBe("staging");
     expect(body.kind).toBe("dev");
+    expect(root.textContent).toContain("Environment created.");
+    expect(root.querySelector("dialog")).toBeNull();
   });
 });

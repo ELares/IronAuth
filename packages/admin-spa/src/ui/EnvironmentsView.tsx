@@ -28,6 +28,7 @@ import {
   ConfirmButton,
   MutationFeedback,
   ResourceHeading,
+  ResourceCreateAction,
   ResourceFormIntro,
   ResourceCollection,
   resourceLabel,
@@ -58,10 +59,11 @@ export function EnvironmentsList() {
       </section>
     );
   }
-  return <EnvironmentsForTenant tenantId={tenantId} />;
+  return <EnvironmentsForTenant key={tenantId} tenantId={tenantId} />;
 }
 
 function EnvironmentsForTenant({ tenantId }: { tenantId: string }) {
+  const [notice, setNotice] = useState<string | null>(null);
   const { state, reload } = useAsyncResource<EnvironmentView[]>(
     () => fetchEnvironments(tenantId),
     [tenantId],
@@ -79,18 +81,32 @@ function EnvironmentsForTenant({ tenantId }: { tenantId: string }) {
         id="environments-heading"
         title="Environments"
         description="Keep development, staging and production identities separate."
+        actions={
+          <ResourceCreateAction label="Create environment">
+            {(close) => (
+              <EnvironmentCreateForm
+                tenantId={tenantId}
+                onCreated={() => {
+                  setNotice("Environment created.");
+                  onChanged();
+                  close();
+                }}
+              />
+            )}
+          </ResourceCreateAction>
+        }
       />
-      <EnvironmentCreateForm tenantId={tenantId} onCreated={onChanged} />
+      {notice === null ? null : (
+        <p class="resource-success" role="status" aria-live="polite">
+          {notice}
+        </p>
+      )}
       <AsyncBoundary
         state={state}
         loadingLabel="Loading environments"
         empty={{
           when: (items) => items.length === 0,
-          render: () => (
-            <p class="resource-empty">
-              No environments yet. Create the first one above.
-            </p>
-          ),
+          render: () => <p class="resource-empty">No environments yet.</p>,
         }}
       >
         {(items) => (

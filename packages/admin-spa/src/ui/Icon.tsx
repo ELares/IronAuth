@@ -16,6 +16,7 @@ export type IconName =
   | "arrow"
   | "menu"
   | "close"
+  | "plus"
   | "logout"
   | "check";
 
@@ -38,6 +39,7 @@ const paths: Record<IconName, string> = {
   arrow: "M5 12h14 m-5-5 5 5-5 5",
   menu: "M4 6h16 M4 12h16 M4 18h16",
   close: "m6 6 12 12 M18 6 6 18",
+  plus: "M12 5v14 M5 12h14",
   logout: "M9 4H4v16h5 M9 12h12 m-4-4 4 4-4 4",
   check: "m5 12 4 4L19 6",
 };

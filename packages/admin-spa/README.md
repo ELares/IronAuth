@@ -16,7 +16,12 @@ Console links and route patterns retain the `/admin` mount in embedded deploymen
 
 The visible search control and Cmd/Ctrl-K open the same command palette. Resource
 lists also have local filters over the loaded rows; paginated collections make
-that search boundary explicit. Forms provide descriptions and field guidance,
+that search boundary explicit. Lists are the default content. Creation and add
+forms mount only after an explicit header action opens a native modal dialog;
+empty lists never open a form automatically. Cancel or Escape discards the draft
+and restores focus to its trigger. A successful write closes the dialog and
+keeps confirmation or one-time credential output on the page. Forms provide
+descriptions and field guidance,
 one-time credentials have copy controls, and destructive actions require an
 explicit confirmation with Escape cancellation. API errors remain verbatim.
 

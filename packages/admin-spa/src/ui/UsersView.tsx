@@ -40,6 +40,7 @@ import {
   ConfirmButton,
   MutationFeedback,
   ResourceHeading,
+  ResourceCreateAction,
   ResourceFormIntro,
   ResourceCollection,
   resourceLabel,
@@ -92,6 +93,7 @@ export function UsersList() {
   }
   return (
     <UsersForScope
+      key={`${scope.tenantId}/${scope.environmentId}`}
       tenantId={scope.tenantId}
       environmentId={scope.environmentId}
     />
@@ -105,6 +107,7 @@ function UsersForScope({
   tenantId: string;
   environmentId: string;
 }) {
+  const [notice, setNotice] = useState<string | null>(null);
   const { state, reload } = useAsyncResource<UserView[]>(
     () => fetchUsers(tenantId, environmentId),
     [tenantId, environmentId],
@@ -115,22 +118,33 @@ function UsersForScope({
         id="users-heading"
         title="Users"
         description="Manage identities, account access and user credentials in this environment."
+        actions={
+          <ResourceCreateAction label="Create user">
+            {(close) => (
+              <UserCreateForm
+                tenantId={tenantId}
+                environmentId={environmentId}
+                onCreated={() => {
+                  setNotice("User created.");
+                  reload();
+                  close();
+                }}
+              />
+            )}
+          </ResourceCreateAction>
+        }
       />
-      <UserCreateForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        onCreated={reload}
-      />
+      {notice === null ? null : (
+        <p class="resource-success" role="status" aria-live="polite">
+          {notice}
+        </p>
+      )}
       <AsyncBoundary
         state={state}
         loadingLabel="Loading users"
         empty={{
           when: (items) => items.length === 0,
-          render: () => (
-            <p class="resource-empty">
-              No users yet. Create the first one above.
-            </p>
-          ),
+          render: () => <p class="resource-empty">No users yet.</p>,
         }}
       >
         {(items) => (

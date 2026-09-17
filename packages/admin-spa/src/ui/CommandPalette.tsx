@@ -185,6 +185,7 @@ export function CommandPalette({
     function onKeyDown(event: KeyboardEvent): void {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
+        if (document.querySelector("dialog[open]") !== null) return;
         setOpen((wasOpen) => {
           if (!wasOpen) restoreFocusRef.current = document.activeElement;
           return !wasOpen;
@@ -220,10 +221,10 @@ export function CommandPalette({
       aria-label="Search resources and commands"
       aria-haspopup="dialog"
       title="Search resources and commands (Ctrl or Cmd K)"
-        onClick={(event) => {
-          restoreFocusRef.current = event.currentTarget;
-          setOpen(true);
-        }}
+      onClick={(event) => {
+        restoreFocusRef.current = event.currentTarget;
+        setOpen(true);
+      }}
     >
       <Icon name="search" />
       <span>Search anything…</span>

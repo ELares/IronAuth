@@ -96,6 +96,15 @@ function button(root: HTMLElement, label: string): HTMLButtonElement {
   return found;
 }
 
+async function openCreation(root: HTMLElement, label: string): Promise<void> {
+  const trigger = Array.from(
+    root.querySelectorAll<HTMLButtonElement>('button[aria-haspopup="dialog"]'),
+  ).find((element) => element.textContent?.trim().endsWith(label));
+  expect(trigger).toBeDefined();
+  trigger?.click();
+  await flush();
+}
+
 const noPolicies = { items: [] };
 
 beforeEach(() => {
@@ -159,6 +168,23 @@ describe("looking up and verifying a registered client", () => {
 });
 
 describe("creating a DCR policy", () => {
+  it("keeps policies ahead of client lookup and creation fields closed by default", async () => {
+    activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
+    const calls = stubFetch(() => json(noPolicies));
+    const root = mount(<ClientsList />);
+    await flush();
+    expect(root.querySelector("#dcr-policy-name")).toBeNull();
+    expect(root.querySelector("#dcr-iat-expires")).toBeNull();
+    expect(root.querySelector("#signing-client-id")).toBeNull();
+    expect(calls.every((call) => call.method === "GET")).toBe(true);
+    expect(
+      root
+        .querySelector("#client-policies")!
+        .compareDocumentPosition(root.querySelector("#client-lookup")!) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it("submits createDcrPolicy to the documented path with the name and primitives", async () => {
     activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
     const calls = stubFetch((call) =>
@@ -177,6 +203,7 @@ describe("creating a DCR policy", () => {
     const root = mount(<ClientsList />);
     await flush();
 
+    await openCreation(root, "Create registration policy");
     const name = root.querySelector("#dcr-policy-name") as HTMLInputElement;
     name.value = "force-pkce";
     name.dispatchEvent(new Event("input", { bubbles: true }));
@@ -201,10 +228,36 @@ describe("creating a DCR policy", () => {
     expect(body.primitives).toEqual([
       { kind: "reject", property: "redirect_uris" },
     ]);
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(root.textContent).toContain("Policy created.");
   });
 });
 
 describe("minting an initial access token", () => {
+  it("opens a fresh form after cancelling a failed mint without replaying the request", async () => {
+    activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
+    const message = "The requested token lifetime is not allowed.";
+    const calls = stubFetch((call) =>
+      call.url.endsWith("/initial-access-tokens")
+        ? json({ error: "unprocessable_entity", message }, 422)
+        : json(noPolicies),
+    );
+    const root = mount(<ClientsList />);
+    await flush();
+    await openCreation(root, "Issue registration token");
+    button(root, "Mint token").click();
+    await flush();
+    expect(root.querySelector("dialog .errorbody")?.textContent).toContain(
+      message,
+    );
+    button(root, "Cancel").click();
+    await flush();
+    await openCreation(root, "Issue registration token");
+    expect(root.querySelector("dialog .errorbody")).toBeNull();
+    expect(root.textContent).not.toContain(message);
+    expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
+  });
+
   it.each([
     { tenantId: "ten_a", environmentId: "env_b" },
     { tenantId: "ten_b", environmentId: "env_a" },
@@ -238,6 +291,7 @@ describe("minting an initial access token", () => {
       input.dispatchEvent(new Event("input", { bubbles: true }));
       await flush();
       button(root, "Look up client").click();
+      await openCreation(root, "Issue registration token");
       button(root, "Mint token").click();
       await flush();
       expect(root.querySelector(".resource-token-value")?.textContent).toBe(
@@ -292,6 +346,7 @@ describe("minting an initial access token", () => {
     const root = mount(<ClientsList />);
     await flush();
 
+    await openCreation(root, "Issue registration token");
     button(root, "Mint token").click();
     await flush();
 
@@ -308,6 +363,23 @@ describe("minting an initial access token", () => {
     expect(root.textContent).toContain(secret);
     const tokenCell = root.querySelector(".resource-token-value");
     expect(tokenCell?.textContent).toBe(secret);
+    expect(root.querySelector("dialog")).toBeNull();
+    await openCreation(root, "Issue registration token");
+    const draftLifetime =
+      root.querySelector<HTMLInputElement>("#dcr-iat-expires")!;
+    draftLifetime.value = "1200";
+    draftLifetime.dispatchEvent(new Event("input", { bubbles: true }));
+    button(root, "Cancel").click();
+    await flush();
+    expect(root.querySelector(".resource-token-value")?.textContent).toBe(
+      secret,
+    );
+    await openCreation(root, "Issue registration token");
+    expect(
+      root.querySelector<HTMLInputElement>("#dcr-iat-expires")?.value,
+    ).toBe("86400");
+    button(root, "Cancel").click();
+    await flush();
 
     // ... but is NEVER written to localStorage or sessionStorage.
     const persistedTheToken = setItem.mock.calls.some((args) =>

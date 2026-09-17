@@ -57,6 +57,7 @@ import {
   MorePageNote,
   MutationFeedback,
   ResourceHeading,
+  ResourceCreateAction,
   ResourceFormIntro,
   ResourceCollection,
   ResourceDetailNav,
@@ -92,6 +93,7 @@ export function OrganizationsList() {
   }
   return (
     <OrganizationsForScope
+      key={`${scope.tenantId}/${scope.environmentId}`}
       tenantId={scope.tenantId}
       environmentId={scope.environmentId}
     />
@@ -105,6 +107,7 @@ function OrganizationsForScope({
   tenantId: string;
   environmentId: string;
 }) {
+  const [notice, setNotice] = useState<string | null>(null);
   const { state, reload } = useAsyncResource<KeysetPage<OrganizationView>>(
     () => fetchOrganizations(tenantId, environmentId),
     [tenantId, environmentId],
@@ -115,22 +118,33 @@ function OrganizationsForScope({
         id="organizations-heading"
         title="Organizations"
         description="Manage organizations, their members and shared access policies."
+        actions={
+          <ResourceCreateAction label="Create organization">
+            {(close) => (
+              <OrganizationCreateForm
+                tenantId={tenantId}
+                environmentId={environmentId}
+                onCreated={() => {
+                  setNotice("Organization created.");
+                  reload();
+                  close();
+                }}
+              />
+            )}
+          </ResourceCreateAction>
+        }
       />
-      <OrganizationCreateForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        onCreated={reload}
-      />
+      {notice === null ? null : (
+        <p class="resource-success" role="status" aria-live="polite">
+          {notice}
+        </p>
+      )}
       <AsyncBoundary
         state={state}
         loadingLabel="Loading organizations"
         empty={{
           when: (page) => page.items.length === 0,
-          render: () => (
-            <p class="resource-empty">
-              No organizations yet. Create the first one above.
-            </p>
-          ),
+          render: () => <p class="resource-empty">No organizations yet.</p>,
         }}
       >
         {(page) => (
@@ -267,6 +281,7 @@ export function OrganizationDetail({
   }
   return (
     <OrganizationDetailFor
+      key={`${scope.tenantId}/${scope.environmentId}/${organizationId ?? ""}`}
       tenantId={scope.tenantId}
       environmentId={scope.environmentId}
       organizationId={organizationId ?? ""}
@@ -469,29 +484,43 @@ function MembershipsPanel({
     () => fetchMemberships(tenantId, environmentId, organizationId),
     [tenantId, environmentId, organizationId],
   );
+  const [notice, setNotice] = useState<string | null>(null);
   const [openMembershipId, setOpenMembershipId] = useState<string | null>(null);
   return (
     <div class="resource-subsection">
-      <h2 id="organization-members">Members</h2>
-      <p class="resource-hint">
-        Add users to this organization and manage each member&#39;s roles.
-      </p>
-      <MembershipAddForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        organizationId={organizationId}
-        onAdded={reload}
-      />
+      <div class="resource-toolbar resource-section-heading">
+        <div>
+          <h2 id="organization-members">Members</h2>
+          <p class="resource-hint">
+            Manage membership and each member&#39;s roles.
+          </p>
+        </div>
+        <ResourceCreateAction label="Add member">
+          {(close) => (
+            <MembershipAddForm
+              tenantId={tenantId}
+              environmentId={environmentId}
+              organizationId={organizationId}
+              onAdded={() => {
+                setNotice("Member added.");
+                reload();
+                close();
+              }}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
+      {notice === null ? null : (
+        <p class="resource-success" role="status" aria-live="polite">
+          {notice}
+        </p>
+      )}
       <AsyncBoundary
         state={state}
         loadingLabel="Loading members"
         empty={{
           when: (page) => page.items.length === 0,
-          render: () => (
-            <p class="resource-empty">
-              No members yet. Add the first one above.
-            </p>
-          ),
+          render: () => <p class="resource-empty">No members yet.</p>,
         }}
       >
         {(page) => (

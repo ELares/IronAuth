@@ -86,8 +86,14 @@ async function flush(): Promise<void> {
 }
 
 function button(root: HTMLElement, label: string): HTMLButtonElement {
-  const found = Array.from(root.querySelectorAll("button")).find(
-    (element) => element.textContent === label,
+  const searchRoot = root.querySelector("dialog[open]") ?? root;
+  const found = Array.from(
+    searchRoot.querySelectorAll<HTMLButtonElement>("button"),
+  ).find(
+    (element) =>
+      element.textContent === label ||
+      (element.classList.contains("resource-create-trigger") &&
+        element.textContent?.trim() === `+ ${label}`),
   );
   if (found === undefined) {
     throw new Error(`no button labelled ${label}`);
@@ -149,12 +155,82 @@ describe("the users list", () => {
 });
 
 describe("creating a user", () => {
+  it("keeps the dialog and draft open when creation fails", async () => {
+    activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
+    stubFetch((call) =>
+      call.method === "POST"
+        ? json(
+            {
+              error: "forbidden",
+              message: "You cannot create users in this environment.",
+            },
+            403,
+          )
+        : json({ items: [] }),
+    );
+    const root = mount(<UsersList />);
+    await flush();
+    button(root, "Create user").click();
+    await flush();
+    const input = root.querySelector("#user-identifier") as HTMLInputElement;
+    input.value = "retry@example.test";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    const form = root.querySelector(".resource-form") as HTMLFormElement;
+    form.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
+    await flush();
+
+    const dialog = root.querySelector("dialog[open]");
+    expect(dialog).not.toBeNull();
+    expect(dialog?.textContent).toContain(
+      "You cannot create users in this environment.",
+    );
+    expect(
+      (root.querySelector("#user-identifier") as HTMLInputElement).value,
+    ).toBe("retry@example.test");
+    expect(root.textContent).not.toContain("User created.");
+  });
+
+  it("discards a draft when the selected environment changes", async () => {
+    activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
+    const calls = stubFetch(() => json({ items: [] }));
+    const root = mount(<UsersList />);
+    await flush();
+    button(root, "Create user").click();
+    await flush();
+
+    const input = root.querySelector("#user-identifier") as HTMLInputElement;
+    input.value = "unfinished@example.test";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    activeScope.value = { tenantId: "ten_a", environmentId: "env_b" };
+    await flush();
+
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(root.querySelector("#user-identifier")).toBeNull();
+    expect(calls.some((call) => call.method === "POST")).toBe(false);
+    expect(
+      calls.some((call) => call.url.includes("/environments/env_b/users")),
+    ).toBe(true);
+    button(root, "Create user").click();
+    await flush();
+    expect(
+      (root.querySelector("#user-identifier") as HTMLInputElement).value,
+    ).toBe("");
+  });
+
   it("submits createUser to the env scoped POST with the body and key", async () => {
     activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
     const calls = stubFetch((call) =>
       call.method === "POST" ? json(user, 201) : json({ items: [user] }),
     );
     const root = mount(<UsersList />);
+    await flush();
+
+    expect(root.querySelector(".resource-form")).toBeNull();
+    button(root, "Create user").click();
     await flush();
 
     const input = root.querySelector("#user-identifier") as HTMLInputElement;
@@ -175,6 +251,8 @@ describe("creating a user", () => {
     const body = JSON.parse(post?.body ?? "{}") as Record<string, unknown>;
     expect(body.identifier).toBe("grace@example.test");
     expect(body.state).toBe("active");
+    expect(root.textContent).toContain("User created.");
+    expect(root.querySelector("dialog")).toBeNull();
   });
 });
 

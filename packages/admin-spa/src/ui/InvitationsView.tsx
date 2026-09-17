@@ -39,6 +39,7 @@ import {
   AsyncBoundary,
   ConfirmButton,
   MutationFeedback,
+  ResourceCreateAction,
   ResourceHeading,
   ResourceFormIntro,
   SecretCopyButton,
@@ -110,6 +111,7 @@ function InvitationsForScope({
   // token can be surfaced a single time. Both create and resend feed this; it is
   // never persisted or logged.
   const [issued, setIssued] = useState<InvitationCreatedView | null>(null);
+  const [created, setCreated] = useState(false);
 
   const stateFilter = filter === "all" ? undefined : filter;
   const { state, reload } = useAsyncResource<KeysetPage<InvitationView>>(
@@ -123,15 +125,28 @@ function InvitationsForScope({
         id="invitations-heading"
         title="Invitations"
         description="Invite people to this environment and manage pending access invitations."
+        actions={
+          <ResourceCreateAction label="Create invitation">
+            {(close) => (
+              <InvitationCreateForm
+                tenantId={tenantId}
+                environmentId={environmentId}
+                onCreated={(result) => {
+                  setIssued(result);
+                  setCreated(true);
+                  reload();
+                  close();
+                }}
+              />
+            )}
+          </ResourceCreateAction>
+        }
       />
-      <InvitationCreateForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        onCreated={(result) => {
-          setIssued(result);
-          reload();
-        }}
-      />
+      {created ? (
+        <p class="resource-success" role="status">
+          Invitation created.
+        </p>
+      ) : null}
       {issued === null ? null : <IssuedInvitation created={issued} />}
       <div class="resource-field">
         <label for="invitation-state-filter">Filter by state</label>
@@ -161,7 +176,7 @@ function InvitationsForScope({
           when: (page) => page.items.length === 0,
           render: () => (
             <p class="resource-empty">
-              No invitations match. Create one above.
+              No invitations match the selected state.
             </p>
           ),
         }}

@@ -28,7 +28,7 @@
 // through the verbatim ErrorView boundary, including the RFC 9470 sudo path on a
 // max_age challenge.
 
-import { useState } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
 import {
   type AssignOrgMembershipRoleRequest,
   type EffectiveRoleSourceView,
@@ -46,6 +46,8 @@ import {
   ConfirmButton,
   MorePageNote,
   MutationFeedback,
+  ResourceCreateAction,
+  ResourceFormIntro,
 } from "./ResourceView";
 import { type OrgScope, inputValue, sudoFor } from "./orgPanels";
 import { type AsyncState, useAsyncResource, useMutation } from "./useResource";
@@ -89,6 +91,10 @@ export function MembershipRolesPanel({
   );
   const mutation = useMutation();
   const [roleId, setRoleId] = useState("");
+  useEffect(
+    () => setRoleId(""),
+    [tenantId, environmentId, organizationId, membershipId],
+  );
 
   // A grant change moves BOTH halves: the direct list gains or loses a row, and
   // the resolved picture must be re-read rather than inferred, because the
@@ -98,59 +104,79 @@ export function MembershipRolesPanel({
     effective.reload();
   }
 
-  function onAssign(event: Event): void {
+  function onAssign(event: Event, close: () => void): void {
     event.preventDefault();
     const request: AssignOrgMembershipRoleRequest = { role_id: roleId.trim() };
-    void mutation
-      .run(async () => {
-        await assignOrgMembershipRole(
-          tenantId,
-          environmentId,
-          organizationId,
-          membershipId,
-          request,
-        );
-      }, "Role granted to the member.")
-      .then((ok) => {
-        if (ok) {
-          setRoleId("");
-          reloadBoth();
-        }
-      });
+    void mutation.run(async () => {
+      await assignOrgMembershipRole(
+        tenantId,
+        environmentId,
+        organizationId,
+        membershipId,
+        request,
+      );
+      setRoleId("");
+      close();
+      reloadBoth();
+    }, "Role granted to the member.");
   }
 
   return (
     <div class="resource-member-roles" id={`membership-roles-${membershipId}`}>
       <div class="resource-subsection">
-        <h3>Roles granted directly</h3>
-        <form
-          class="resource-form"
-          onSubmit={onAssign}
-          aria-label="Grant a role to the member"
-        >
-          <div class="resource-field">
-            <label for="org-membership-role-id">Role id</label>
-            <input
-              id="org-membership-role-id"
-              placeholder={"Role ID from this organization"}
-              type="text"
-              required
-              value={roleId}
-              onInput={(event) => setRoleId(inputValue(event))}
-            />
-          </div>
-          <button
-            type="submit"
-            class="resource-btn resource-btn-primary"
-            disabled={mutation.state.pending || roleId.trim() === ""}
+        <div class="resource-subsection-heading">
+          <h3>Roles granted directly</h3>
+          <ResourceCreateAction
+            key={`${tenantId}:${environmentId}:${organizationId}:${membershipId}`}
+            label="Grant member role"
+            pending={mutation.state.pending}
+            onOpen={() => {
+              setRoleId("");
+              mutation.reset();
+            }}
           >
-            Grant to member
-          </button>
-          <MutationFeedback
-            state={mutation.state}
-            sudo={sudoFor(mutation.retry)}
-          />
-        </form>
+            {(close) => (
+              <form
+                class="resource-form"
+                onSubmit={(event) => onAssign(event, close)}
+                aria-label="Grant a role to the member"
+              >
+                <ResourceFormIntro
+                  title="Grant member role"
+                  headingLevel={3}
+                  description="Grant a role defined for this organization directly to this member."
+                />
+                <div class="resource-field">
+                  <label for="org-membership-role-id">Role id</label>
+                  <input
+                    id="org-membership-role-id"
+                    placeholder={"Role ID from this organization"}
+                    type="text"
+                    required
+                    value={roleId}
+                    onInput={(event) => setRoleId(inputValue(event))}
+                  />
+                </div>
+                <button
+                  type="submit"
+                  class="resource-btn resource-btn-primary"
+                  disabled={mutation.state.pending || roleId.trim() === ""}
+                >
+                  Grant to member
+                </button>
+                <MutationFeedback
+                  state={mutation.state}
+                  sudo={sudoFor(mutation.retry)}
+                />
+              </form>
+            )}
+          </ResourceCreateAction>
+        </div>
+        <MutationFeedback
+          state={mutation.state}
+          sudo={sudoFor(mutation.retry)}
+        />
+
         <AsyncBoundary
           state={direct.state}
           loadingLabel="Loading direct roles"

@@ -44,6 +44,7 @@ import {
   ConfirmButton,
   MutationFeedback,
   ResourceHeading,
+  ResourceCreateAction,
   ResourceFormIntro,
   ResourceCollection,
 } from "./ResourceView";
@@ -85,6 +86,7 @@ export function ConnectorsList() {
   }
   return (
     <ConnectorsForScope
+      key={`${scope.tenantId}/${scope.environmentId}`}
       tenantId={scope.tenantId}
       environmentId={scope.environmentId}
     />
@@ -98,6 +100,7 @@ function ConnectorsForScope({
   tenantId: string;
   environmentId: string;
 }) {
+  const [notice, setNotice] = useState<string | null>(null);
   const { state, reload } = useAsyncResource<ConnectorView[]>(
     () => fetchConnectors(tenantId, environmentId),
     [tenantId, environmentId],
@@ -108,22 +111,33 @@ function ConnectorsForScope({
         id="connectors-heading"
         title="Connectors"
         description="Connect external identity providers and check their health and capabilities."
+        actions={
+          <ResourceCreateAction label="Create connector">
+            {(close) => (
+              <ConnectorCreateForm
+                tenantId={tenantId}
+                environmentId={environmentId}
+                onCreated={() => {
+                  setNotice("Connector created.");
+                  reload();
+                  close();
+                }}
+              />
+            )}
+          </ResourceCreateAction>
+        }
       />
-      <ConnectorCreateForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        onCreated={reload}
-      />
+      {notice === null ? null : (
+        <p class="resource-success" role="status" aria-live="polite">
+          {notice}
+        </p>
+      )}
       <AsyncBoundary
         state={state}
         loadingLabel="Loading connectors"
         empty={{
           when: (items) => items.length === 0,
-          render: () => (
-            <p class="resource-empty">
-              No connectors yet. Create the first one above.
-            </p>
-          ),
+          render: () => <p class="resource-empty">No connectors yet.</p>,
         }}
       >
         {(items) => (

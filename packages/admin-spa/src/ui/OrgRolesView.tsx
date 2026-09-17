@@ -19,7 +19,7 @@
 // VOCABULARY those mappings draw on is environment scoped and lives in its own
 // section (src/ui/PermissionsView.tsx), not here.
 
-import { useState } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
 import {
   type CreateOrgRoleRequest,
   type KeysetPage,
@@ -37,6 +37,7 @@ import {
   MorePageNote,
   MutationFeedback,
   ResourceFormIntro,
+  ResourceCreateAction,
 } from "./ResourceView";
 import { OrgRolePermissionsPanel } from "./OrgRolePermissionsView";
 import { type OrgScope, inputValue, sudoFor } from "./orgPanels";
@@ -54,10 +55,32 @@ export function OrgRolesPanel({
     [tenantId, environmentId, organizationId],
   );
   const [openRoleId, setOpenRoleId] = useState<string | null>(null);
+  useEffect(
+    () => setOpenRoleId(null),
+    [tenantId, environmentId, organizationId],
+  );
 
   return (
     <div class="resource-subsection">
-      <h2 id="organization-roles">Roles</h2>
+      <div class="resource-subsection-heading">
+        <h2 id="organization-roles">Roles</h2>
+        <ResourceCreateAction
+          key={`${tenantId}:${environmentId}:${organizationId}`}
+          label="Create role"
+        >
+          {(close) => (
+            <OrgRoleCreateForm
+              tenantId={tenantId}
+              environmentId={environmentId}
+              organizationId={organizationId}
+              onCreated={() => {
+                close();
+                reload();
+              }}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
       <p class="resource-hint">
         Define the roles this organization can grant to its members and groups.
       </p>
@@ -69,22 +92,13 @@ export function OrgRolesPanel({
           is immutable: a rename changes only the label.
         </p>
       </details>
-      <OrgRoleCreateForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        organizationId={organizationId}
-        onCreated={reload}
-      />
+
       <AsyncBoundary
         state={state}
         loadingLabel="Loading roles"
         empty={{
           when: (page) => page.items.length === 0,
-          render: () => (
-            <p class="resource-empty">
-              No roles yet. Define the first one above.
-            </p>
-          ),
+          render: () => <p class="resource-empty">No roles yet.</p>,
         }}
       >
         {(page) => (
@@ -150,17 +164,12 @@ function OrgRoleCreateForm({
       slug: slug.trim(),
       display_name: displayName.trim(),
     };
-    void mutation
-      .run(async () => {
-        await createOrgRole(tenantId, environmentId, organizationId, request);
-      }, "Role defined.")
-      .then((ok) => {
-        if (ok) {
-          setSlug("");
-          setDisplayName("");
-          onCreated();
-        }
-      });
+    void mutation.run(async () => {
+      await createOrgRole(tenantId, environmentId, organizationId, request);
+      setSlug("");
+      setDisplayName("");
+      onCreated();
+    }, "Role defined.");
   }
 
   return (

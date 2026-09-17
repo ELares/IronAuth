@@ -18,16 +18,17 @@
 //
 // # Two differences from the organization panel, both forced by where this is mounted
 //
-// It takes the detail view's SHARED `mutation` rather than owning one, because that
-// view renders a single MutationFeedback for every panel under it and a second one
-// would report the same outcome twice.
+// It takes the detail view's SHARED `mutation` rather than owning one. The parent
+// renders panel outcomes; the create dialog shows only its own submitted-request
+// feedback while its background is inert.
 //
 // It owns its OWN list resource and never calls the parent's reload. The parent's
 // AsyncBoundary unmounts everything under it while reloading, which would destroy the
 // display-once token this panel is holding. Reloading only its own list is what lets
 // the newly minted token stay on screen beside the row that now exists.
 
-import { useState } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
+import { CredentialCreateForm } from "./CredentialCreateForm";
 import {
   type ApiKeyView,
   createUserPersonalAccessToken,
@@ -36,8 +37,12 @@ import {
   rotateUserPersonalAccessToken,
 } from "../api/client";
 import { describe } from "./OrgApiKeysView";
-import { AsyncBoundary, ConfirmButton, SecretCopyButton } from "./ResourceView";
-import { inputValue } from "./orgPanels";
+import {
+  AsyncBoundary,
+  ConfirmButton,
+  ResourceCreateAction,
+  SecretCopyButton,
+} from "./ResourceView";
 import { type Mutation, useAsyncResource } from "./useResource";
 
 export function UserPersonalAccessTokensPanel({
@@ -66,7 +71,9 @@ export function UserPersonalAccessTokensPanel({
   const [issued, setIssued] = useState<{ id: string; key: string } | null>(
     null,
   );
-  const [name, setName] = useState("");
+  useEffect(() => {
+    setIssued(null);
+  }, [tenantId, environmentId, userId]);
   const reloadClearingToken = () => {
     setIssued(null);
     reload();
@@ -74,62 +81,45 @@ export function UserPersonalAccessTokensPanel({
 
   return (
     <div class="resource-subsection">
-      <h2 id="user-tokens">Personal access tokens</h2>
+      <div class="resource-subsection-heading">
+        <h2 id="user-tokens">Personal access tokens</h2>
+        <ResourceCreateAction
+          key={`${tenantId}:${environmentId}:${userId}`}
+          label="Create token"
+          pending={mutation.state.pending}
+        >
+          {(close) => (
+            <CredentialCreateForm
+              title="Create personal access token"
+              nameLabel="New token name"
+              submitLabel="Create token"
+              successMessage="Token created."
+              mutation={mutation}
+              onCreate={async (name) => {
+                const created = await createUserPersonalAccessToken(
+                  tenantId,
+                  environmentId,
+                  userId,
+                  name,
+                );
+                // Idempotent replays never expose the credential again.
+                setIssued(
+                  created.key === undefined || created.key === null
+                    ? null
+                    : { id: created.id, key: created.key },
+                );
+                reload();
+              }}
+              onCreated={close}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
       <p class="resource-note">
         Tokens authenticate as this user. Save each token when it is created; it
         cannot be retrieved later. Revoked tokens stay visible for reference.
       </p>
-      <form
-        class="resource-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          const trimmed = name.trim();
-          if (trimmed === "") {
-            return;
-          }
-          void mutation
-            .run(async () => {
-              const created = await createUserPersonalAccessToken(
-                tenantId,
-                environmentId,
-                userId,
-                trimmed,
-              );
-              // `key` is absent on an idempotent replay. Showing nothing is correct
-              // there: the token was issued once and this is not that once.
-              setIssued(
-                created.key === undefined || created.key === null
-                  ? null
-                  : { id: created.id, key: created.key },
-              );
-            }, "Token created.")
-            .then((ok: boolean) => {
-              if (ok) {
-                setName("");
-                reload();
-              }
-            });
-        }}
-      >
-        <label class="resource-field">
-          New token name
-          <input
-            type="text"
-            required
-            placeholder="Production integration"
-            value={name}
-            disabled={mutation.state.pending}
-            onInput={(event) => setName(inputValue(event))}
-          />
-        </label>
-        <button
-          class="resource-btn resource-btn-primary"
-          type="submit"
-          disabled={mutation.state.pending || name.trim() === ""}
-        >
-          Create token
-        </button>
-      </form>
+
       {issued === null ? null : (
         <div class="resource-callout">
           <h3>Save your new token</h3>

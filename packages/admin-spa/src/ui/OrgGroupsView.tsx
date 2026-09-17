@@ -29,7 +29,7 @@
 // single funnel) and renders every failure through the verbatim ErrorView
 // boundary, including the RFC 9470 sudo path on a max_age challenge.
 
-import { useRef, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import {
   type AddOrgGroupMemberRequest,
   type AssignOrgGroupRoleRequest,
@@ -58,6 +58,7 @@ import {
   MorePageNote,
   MutationFeedback,
   ResourceFormIntro,
+  ResourceCreateAction,
 } from "./ResourceView";
 import {
   type GroupNode,
@@ -83,11 +84,34 @@ export function OrgGroupsPanel({
     [tenantId, environmentId, organizationId],
   );
   const [openGroupId, setOpenGroupId] = useState<string | null>(null);
+  useEffect(
+    () => setOpenGroupId(null),
+    [tenantId, environmentId, organizationId],
+  );
   const loaded = state.data?.items ?? [];
 
   return (
     <div class="resource-subsection">
-      <h2 id="organization-groups">Groups</h2>
+      <div class="resource-subsection-heading">
+        <h2 id="organization-groups">Groups</h2>
+        <ResourceCreateAction
+          key={`${tenantId}:${environmentId}:${organizationId}`}
+          label="Create group"
+        >
+          {(close) => (
+            <OrgGroupCreateForm
+              tenantId={tenantId}
+              environmentId={environmentId}
+              organizationId={organizationId}
+              groups={loaded}
+              onCreated={() => {
+                close();
+                reload();
+              }}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
       <p class="resource-hint">
         Organize members into a hierarchy. Members inherit the roles granted to
         their group and its parents.
@@ -99,23 +123,13 @@ export function OrgGroupsPanel({
           resolved by its members and by the members of every group beneath it.
         </p>
       </details>
-      <OrgGroupCreateForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        organizationId={organizationId}
-        groups={loaded}
-        onCreated={reload}
-      />
+
       <AsyncBoundary
         state={state}
         loadingLabel="Loading groups"
         empty={{
           when: (page) => page.items.length === 0,
-          render: () => (
-            <p class="resource-empty">
-              No groups yet. Define the first one above.
-            </p>
-          ),
+          render: () => <p class="resource-empty">No groups yet.</p>,
         }}
       >
         {(page) => (
@@ -280,18 +294,13 @@ function OrgGroupCreateForm({
       display_name: displayName.trim(),
       parent_id: parentId === NO_PARENT ? null : parentId,
     };
-    void mutation
-      .run(async () => {
-        await createOrgGroup(tenantId, environmentId, organizationId, request);
-      }, "Group defined.")
-      .then((ok) => {
-        if (ok) {
-          setSlug("");
-          setDisplayName("");
-          setParentId(NO_PARENT);
-          onCreated();
-        }
-      });
+    void mutation.run(async () => {
+      await createOrgGroup(tenantId, environmentId, organizationId, request);
+      setSlug("");
+      setDisplayName("");
+      setParentId(NO_PARENT);
+      onCreated();
+    }, "Group defined.");
   }
 
   return (
@@ -635,69 +644,88 @@ function OrgGroupMembersPanel({
   );
   const mutation = useMutation();
   const [membershipId, setMembershipId] = useState("");
+  useEffect(
+    () => setMembershipId(""),
+    [tenantId, environmentId, organizationId, groupId],
+  );
 
-  function onAdd(event: Event): void {
+  function onAdd(event: Event, close: () => void): void {
     event.preventDefault();
     const request: AddOrgGroupMemberRequest = {
       membership_id: membershipId.trim(),
     };
-    void mutation
-      .run(async () => {
-        await addOrgGroupMember(
-          tenantId,
-          environmentId,
-          organizationId,
-          groupId,
-          request,
-        );
-      }, "Member added to the group.")
-      .then((ok) => {
-        if (ok) {
-          setMembershipId("");
-          reload();
-        }
-      });
+    void mutation.run(async () => {
+      await addOrgGroupMember(
+        tenantId,
+        environmentId,
+        organizationId,
+        groupId,
+        request,
+      );
+      setMembershipId("");
+      close();
+      reload();
+    }, "Member added to the group.");
   }
 
   return (
     <div class="resource-subsection">
-      <h4>Members of this group</h4>
-      <form
-        class="resource-form"
-        onSubmit={onAdd}
-        aria-label="Add a member to the group"
-      >
-        <div class="resource-field">
-          <label for="org-group-member-id">Membership id</label>
-          <input
-            id="org-group-member-id"
-            type="text"
-            required
-            value={membershipId}
-            onInput={(event) => setMembershipId(inputValue(event))}
-          />
-        </div>
-        <button
-          type="submit"
-          class="resource-btn resource-btn-primary"
-          disabled={mutation.state.pending || membershipId.trim() === ""}
+      <div class="resource-subsection-heading">
+        <h4>Members of this group</h4>
+        <ResourceCreateAction
+          key={`${tenantId}:${environmentId}:${organizationId}:${groupId}`}
+          label="Add group member"
+          pending={mutation.state.pending}
+          onOpen={() => {
+            setMembershipId("");
+            mutation.reset();
+          }}
         >
-          Add to group
-        </button>
-        <MutationFeedback
-          state={mutation.state}
-          sudo={sudoFor(mutation.retry)}
-        />
-      </form>
+          {(close) => (
+            <form
+              class="resource-form"
+              onSubmit={(event) => onAdd(event, close)}
+              aria-label="Add a member to the group"
+            >
+              <ResourceFormIntro
+                title="Add group member"
+                headingLevel={3}
+                description="Enter the organization membership ID to add a member to this group."
+              />
+              <div class="resource-field">
+                <label for="org-group-member-id">Membership id</label>
+                <input
+                  id="org-group-member-id"
+                  type="text"
+                  required
+                  value={membershipId}
+                  onInput={(event) => setMembershipId(inputValue(event))}
+                />
+              </div>
+              <button
+                type="submit"
+                class="resource-btn resource-btn-primary"
+                disabled={mutation.state.pending || membershipId.trim() === ""}
+              >
+                Add to group
+              </button>
+              <MutationFeedback
+                state={mutation.state}
+                sudo={sudoFor(mutation.retry)}
+              />
+            </form>
+          )}
+        </ResourceCreateAction>
+      </div>
+      <MutationFeedback state={mutation.state} sudo={sudoFor(mutation.retry)} />
+
       <AsyncBoundary
         state={state}
         loadingLabel="Loading group members"
         empty={{
           when: (page) => page.items.length === 0,
           render: () => (
-            <p class="resource-empty">
-              No members in this group yet. Add the first one above.
-            </p>
+            <p class="resource-empty">No members in this group yet.</p>
           ),
         }}
       >
@@ -787,68 +815,87 @@ function OrgGroupRolesPanel({
   );
   const mutation = useMutation();
   const [roleId, setRoleId] = useState("");
+  useEffect(
+    () => setRoleId(""),
+    [tenantId, environmentId, organizationId, groupId],
+  );
 
-  function onAssign(event: Event): void {
+  function onAssign(event: Event, close: () => void): void {
     event.preventDefault();
     const request: AssignOrgGroupRoleRequest = { role_id: roleId.trim() };
-    void mutation
-      .run(async () => {
-        await assignOrgGroupRole(
-          tenantId,
-          environmentId,
-          organizationId,
-          groupId,
-          request,
-        );
-      }, "Role granted to the group.")
-      .then((ok) => {
-        if (ok) {
-          setRoleId("");
-          reload();
-        }
-      });
+    void mutation.run(async () => {
+      await assignOrgGroupRole(
+        tenantId,
+        environmentId,
+        organizationId,
+        groupId,
+        request,
+      );
+      setRoleId("");
+      close();
+      reload();
+    }, "Role granted to the group.");
   }
 
   return (
     <div class="resource-subsection">
-      <h4>Roles granted by this group</h4>
-      <form
-        class="resource-form"
-        onSubmit={onAssign}
-        aria-label="Grant a role to the group"
-      >
-        <div class="resource-field">
-          <label for="org-group-role-id">Role id</label>
-          <input
-            id="org-group-role-id"
-            placeholder={"Role ID from this organization"}
-            type="text"
-            required
-            value={roleId}
-            onInput={(event) => setRoleId(inputValue(event))}
-          />
-        </div>
-        <button
-          type="submit"
-          class="resource-btn resource-btn-primary"
-          disabled={mutation.state.pending || roleId.trim() === ""}
+      <div class="resource-subsection-heading">
+        <h4>Roles granted by this group</h4>
+        <ResourceCreateAction
+          key={`${tenantId}:${environmentId}:${organizationId}:${groupId}`}
+          label="Grant group role"
+          pending={mutation.state.pending}
+          onOpen={() => {
+            setRoleId("");
+            mutation.reset();
+          }}
         >
-          Grant to group
-        </button>
-        <MutationFeedback
-          state={mutation.state}
-          sudo={sudoFor(mutation.retry)}
-        />
-      </form>
+          {(close) => (
+            <form
+              class="resource-form"
+              onSubmit={(event) => onAssign(event, close)}
+              aria-label="Grant a role to the group"
+            >
+              <ResourceFormIntro
+                title="Grant group role"
+                headingLevel={3}
+                description="Grant a role defined for this organization to the members of this group."
+              />
+              <div class="resource-field">
+                <label for="org-group-role-id">Role id</label>
+                <input
+                  id="org-group-role-id"
+                  placeholder={"Role ID from this organization"}
+                  type="text"
+                  required
+                  value={roleId}
+                  onInput={(event) => setRoleId(inputValue(event))}
+                />
+              </div>
+              <button
+                type="submit"
+                class="resource-btn resource-btn-primary"
+                disabled={mutation.state.pending || roleId.trim() === ""}
+              >
+                Grant to group
+              </button>
+              <MutationFeedback
+                state={mutation.state}
+                sudo={sudoFor(mutation.retry)}
+              />
+            </form>
+          )}
+        </ResourceCreateAction>
+      </div>
+      <MutationFeedback state={mutation.state} sudo={sudoFor(mutation.retry)} />
+
       <AsyncBoundary
         state={state}
         loadingLabel="Loading group roles"
         empty={{
           when: (page) => page.items.length === 0,
           render: () => (
-            <p class="resource-empty">
-              This group grants no roles yet. Grant the first one above.
-            </p>
+            <p class="resource-empty">This group grants no roles yet.</p>
           ),
         }}
       >

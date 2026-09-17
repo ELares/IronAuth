@@ -52,6 +52,7 @@ import {
   ConfirmButton,
   MorePageNote,
   MutationFeedback,
+  ResourceCreateAction,
   ResourceHeading,
   ResourceFormIntro,
 } from "./ResourceView";
@@ -95,6 +96,7 @@ export function PermissionsList() {
   }
   return (
     <PermissionsForScope
+      key={`${scope.tenantId}/${scope.environmentId}`}
       tenantId={scope.tenantId}
       environmentId={scope.environmentId}
     />
@@ -135,10 +137,26 @@ function PermissionVocabularyPanel({ tenantId, environmentId }: EnvScope) {
     [tenantId, environmentId],
   );
   const [openPermissionId, setOpenPermissionId] = useState<string | null>(null);
+  const [created, setCreated] = useState(false);
 
   return (
     <div class="resource-subsection">
-      <h2>Vocabulary</h2>
+      <div class="resource-subsection-heading">
+        <h2>Vocabulary</h2>
+        <ResourceCreateAction label="Define permission">
+          {(close) => (
+            <PermissionCreateForm
+              tenantId={tenantId}
+              environmentId={environmentId}
+              onCreated={() => {
+                setCreated(true);
+                reload();
+                close();
+              }}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
       <p class="resource-hint">
         Permissions use permanent slugs. Change the display name when the
         wording needs updating.
@@ -156,11 +174,11 @@ function PermissionVocabularyPanel({ tenantId, environmentId }: EnvScope) {
           cannot turn a refusal into a different stored value.
         </p>
       </details>
-      <PermissionCreateForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        onCreated={reload}
-      />
+      {created ? (
+        <p class="resource-success" role="status">
+          Permission defined.
+        </p>
+      ) : null}
       <AsyncBoundary
         state={state}
         loadingLabel="Loading the permission vocabulary"
@@ -168,7 +186,7 @@ function PermissionVocabularyPanel({ tenantId, environmentId }: EnvScope) {
           when: (page) => page.items.length === 0,
           render: () => (
             <p class="resource-empty">
-              No permissions yet. Define the first one above.
+              No permissions are defined in this environment.
             </p>
           ),
         }}

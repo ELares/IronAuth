@@ -20,25 +20,167 @@
 //   MorePageNote states that a keyset read has a tail beyond the page shown, so
 //   a list surface never truncates silently.
 
-import type { ComponentChildren } from "preact";
-import { useEffect, useId, useRef, useState } from "preact/hooks";
+import { createContext, type ComponentChildren } from "preact";
+import {
+  useContext,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "preact/hooks";
 import { ErrorView, type SudoRecovery } from "./ErrorView";
 import type { AsyncState, MutationState } from "./useResource";
+import { Icon } from "./Icon";
 
 export function ResourceHeading({
   id,
   title,
   description,
+  actions,
 }: {
   id: string;
   title: ComponentChildren;
   description: string;
+  actions?: ComponentChildren;
 }) {
   return (
     <header class="resource-heading">
-      <h1 id={id}>{title}</h1>
-      <p class="resource-description">{description}</p>
+      <div class="resource-heading-copy">
+        <h1 id={id}>{title}</h1>
+        <p class="resource-description">{description}</p>
+      </div>
+      {actions === undefined ? null : (
+        <div class="resource-heading-actions">{actions}</div>
+      )}
     </header>
+  );
+}
+
+// Creation is always an explicit action. The native modal keeps the existing
+// list in place, makes its background inert, and handles the keyboard focus trap.
+// Children mount only while open, so cancelling discards the unsaved draft.
+const CreationPending = createContext<((pending: boolean) => void) | null>(
+  null,
+);
+
+export function ResourceCreateAction({
+  label,
+  children,
+  pending = false,
+  onOpen,
+}: {
+  label: string;
+  children: (close: () => void) => ComponentChildren;
+  pending?: boolean;
+  onOpen?: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [closeRequested, setCloseRequested] = useState(false);
+  const [childPending, setChildPending] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const dialog = useRef<HTMLDialogElement>(null);
+  const dialogId = useId();
+  const busy = pending || childPending;
+  const close = () => setCloseRequested(true);
+
+  useLayoutEffect(() => {
+    if (open && closeRequested && !busy) setOpen(false);
+  }, [open, closeRequested, busy]);
+
+  useLayoutEffect(() => {
+    if (!open || dialog.current === null) return;
+    const element = dialog.current;
+    const alreadyLocked = document.body.classList.contains(
+      "resource-dialog-open",
+    );
+    document.body.classList.add("resource-dialog-open");
+    if (typeof element.showModal === "function") {
+      element.showModal();
+    } else {
+      // DOM test environments lack the native dialog methods.
+      element.setAttribute("open", "");
+    }
+    element
+      .querySelector<HTMLElement>(
+        'input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled])',
+      )
+      ?.focus();
+    return () => {
+      if (typeof element.close === "function") element.close();
+      if (!alreadyLocked)
+        document.body.classList.remove("resource-dialog-open");
+      if (trigger.current?.isConnected) trigger.current.focus();
+    };
+  }, [open]);
+
+  return (
+    <div class="resource-create-action">
+      <button
+        ref={trigger}
+        type="button"
+        class="resource-btn resource-btn-primary resource-create-trigger"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-controls={open ? dialogId : undefined}
+        disabled={pending}
+        onClick={() => {
+          onOpen?.();
+          setCloseRequested(false);
+          setChildPending(false);
+          setOpen(true);
+        }}
+      >
+        <Icon name="plus" />
+        {label}
+      </button>
+      {open ? (
+        <dialog
+          ref={dialog}
+          id={dialogId}
+          class="resource-create-dialog"
+          aria-label={label}
+          aria-modal="true"
+          aria-busy={busy}
+          onCancel={(event) => {
+            event.preventDefault();
+            if (!busy) close();
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              event.stopPropagation();
+              if (!busy) close();
+            }
+          }}
+        >
+          <div class="resource-create-dialog-top">
+            <button
+              type="button"
+              class="resource-dialog-close"
+              aria-label={`Close ${label.toLocaleLowerCase()}`}
+              disabled={busy}
+              onClick={close}
+            >
+              <Icon name="close" />
+            </button>
+          </div>
+          <CreationPending.Provider value={setChildPending}>
+            {children(close)}
+          </CreationPending.Provider>
+          <div class="resource-create-dialog-footer">
+            <button
+              type="button"
+              class="resource-btn"
+              disabled={busy}
+              onClick={close}
+            >
+              Cancel
+            </button>
+          </div>
+        </dialog>
+      ) : null}
+    </div>
   );
 }
 
@@ -51,7 +193,8 @@ export function ResourceFormIntro({
   description: string;
   headingLevel?: 2 | 3;
 }) {
-  const Heading = headingLevel === 3 ? "h3" : "h2";
+  const inCreationDialog = useContext(CreationPending) !== null;
+  const Heading = !inCreationDialog && headingLevel === 3 ? "h3" : "h2";
   return (
     <div class="resource-form-heading">
       <Heading class="resource-form-title">{title}</Heading>
@@ -288,6 +431,10 @@ export interface MutationFeedbackProps {
 // Render a write's success confirmation or its verbatim failure. A pending or
 // idle write shows nothing.
 export function MutationFeedback({ state, sudo }: MutationFeedbackProps) {
+  const setCreationPending = useContext(CreationPending);
+  useLayoutEffect(() => {
+    setCreationPending?.(state.pending);
+  }, [setCreationPending, state.pending]);
   if (state.success !== null) {
     return (
       <p class="resource-success" role="status" aria-live="polite">

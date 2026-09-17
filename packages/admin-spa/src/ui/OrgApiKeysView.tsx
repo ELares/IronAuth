@@ -22,7 +22,8 @@
 // to be able to tell "revoked at 14:02" from "no such key", and hiding the row makes
 // a rotation look like a replacement.
 
-import { useState } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
+import { CredentialCreateForm } from "./CredentialCreateForm";
 import {
   type ApiKeyView,
   createOrgApiKey,
@@ -34,9 +35,10 @@ import {
   AsyncBoundary,
   ConfirmButton,
   MutationFeedback,
+  ResourceCreateAction,
   SecretCopyButton,
 } from "./ResourceView";
-import { type OrgScope, inputValue, sudoFor } from "./orgPanels";
+import { type OrgScope, sudoFor } from "./orgPanels";
 import { useAsyncResource, useMutation } from "./useResource";
 
 export function OrgApiKeysPanel({
@@ -67,7 +69,9 @@ export function OrgApiKeysPanel({
   const [issued, setIssued] = useState<{ id: string; key: string } | null>(
     null,
   );
-  const [name, setName] = useState("");
+  useEffect(() => {
+    setIssued(null);
+  }, [tenantId, environmentId, organizationId]);
   const reloadClearingKey = () => {
     setIssued(null);
     reload();
@@ -75,63 +79,46 @@ export function OrgApiKeysPanel({
 
   return (
     <div class="resource-subsection">
-      <h2 id="organization-keys">API keys</h2>
+      <div class="resource-subsection-heading">
+        <h2 id="organization-keys">API keys</h2>
+        <ResourceCreateAction
+          key={`${tenantId}:${environmentId}:${organizationId}`}
+          label="Create key"
+          pending={mutation.state.pending}
+        >
+          {(close) => (
+            <CredentialCreateForm
+              title="Create API key"
+              nameLabel="New key name"
+              submitLabel="Create key"
+              successMessage="Key created."
+              mutation={mutation}
+              onCreate={async (name) => {
+                const created = await createOrgApiKey(
+                  tenantId,
+                  environmentId,
+                  organizationId,
+                  name,
+                );
+                // Idempotent replays never expose the credential again.
+                setIssued(
+                  created.key === undefined || created.key === null
+                    ? null
+                    : { id: created.id, key: created.key },
+                );
+                reload();
+              }}
+              onCreated={close}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
       <p class="resource-note">
         Keys authenticate as this organization. Save each key when it is
         created; it cannot be retrieved later. Revoked keys stay visible for
         reference.
       </p>
-      <form
-        class="resource-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          const trimmed = name.trim();
-          if (trimmed === "") {
-            return;
-          }
-          void mutation
-            .run(async () => {
-              const created = await createOrgApiKey(
-                tenantId,
-                environmentId,
-                organizationId,
-                trimmed,
-              );
-              // `key` is absent on an idempotent replay. Showing nothing is correct
-              // there: the key was issued once and this is not that once.
-              setIssued(
-                created.key === undefined || created.key === null
-                  ? null
-                  : { id: created.id, key: created.key },
-              );
-            }, "Key created.")
-            .then((ok) => {
-              if (ok) {
-                setName("");
-                reload();
-              }
-            });
-        }}
-      >
-        <label class="resource-field">
-          New key name
-          <input
-            type="text"
-            required
-            placeholder="Production integration"
-            value={name}
-            disabled={mutation.state.pending}
-            onInput={(event) => setName(inputValue(event))}
-          />
-        </label>
-        <button
-          class="resource-btn resource-btn-primary"
-          type="submit"
-          disabled={mutation.state.pending || name.trim() === ""}
-        >
-          Create key
-        </button>
-      </form>
+
       {issued === null ? null : (
         <div class="resource-callout">
           <h3>Save your new API key</h3>

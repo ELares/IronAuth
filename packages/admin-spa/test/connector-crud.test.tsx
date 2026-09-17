@@ -79,13 +79,21 @@ async function flush(): Promise<void> {
   for (let i = 0; i < 6; i += 1) {
     await Promise.resolve();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
   }
 }
 
 function button(root: HTMLElement, label: string): HTMLButtonElement {
-  const found = Array.from(root.querySelectorAll("button")).find(
-    (element) => element.textContent === label,
+  const searchRoot = root.querySelector("dialog[open]") ?? root;
+  const found = Array.from(
+    searchRoot.querySelectorAll<HTMLButtonElement>("button"),
+  ).find(
+    (element) =>
+      element.textContent === label ||
+      (element.classList.contains("resource-create-trigger") &&
+        element.textContent?.trim() === `+ ${label}`),
   );
   if (found === undefined) {
     throw new Error(`no button labelled ${label}`);
@@ -183,6 +191,35 @@ describe("the connectors list", () => {
 });
 
 describe("creating a connector", () => {
+  it("cancels without a write and clears the unsaved definition", async () => {
+    activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
+    const calls = stubFetch(() => json({ items: [] }));
+    const root = mount(<ConnectorsList />);
+    await flush();
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(root.querySelector("#connector-definition")).toBeNull();
+    button(root, "Create connector").click();
+    await flush();
+    const textarea = root.querySelector(
+      "#connector-definition",
+    ) as HTMLTextAreaElement;
+    const initialDefinition = textarea.value;
+    textarea.value = definitionJson;
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    button(root, "Cancel").click();
+    await flush();
+
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(calls.some((call) => call.method === "POST")).toBe(false);
+    button(root, "Create connector").click();
+    await flush();
+    expect(
+      (root.querySelector("#connector-definition") as HTMLTextAreaElement)
+        .value,
+    ).toBe(initialDefinition);
+  });
+
   it("submits createConnector to the env scoped POST with the body and key", async () => {
     activeScope.value = { tenantId: "ten_a", environmentId: "env_a" };
     const calls = stubFetch((call) =>
@@ -193,6 +230,10 @@ describe("creating a connector", () => {
     const root = mount(<ConnectorsList />);
     await flush();
 
+    expect(root.querySelector(".resource-form")).toBeNull();
+    button(root, "Create connector").click();
+    await flush();
+
     const textarea = root.querySelector(
       "#connector-definition",
     ) as HTMLTextAreaElement;
@@ -201,7 +242,9 @@ describe("creating a connector", () => {
     await flush();
 
     const form = root.querySelector(".resource-form") as HTMLFormElement;
-    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    form.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
     await flush();
 
     const post = calls.find((call) => call.method === "POST");
@@ -213,6 +256,8 @@ describe("creating a connector", () => {
     const body = JSON.parse(post?.body ?? "{}") as Record<string, unknown>;
     expect(body.connector_id).toBe("acme-oidc");
     expect(body.client_secret).toBe("shh");
+    expect(root.textContent).toContain("Connector created.");
+    expect(root.querySelector("dialog")).toBeNull();
   });
 });
 
