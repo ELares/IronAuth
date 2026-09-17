@@ -2120,10 +2120,16 @@ async fn evaluate_step_up(
     // it takes from the rules is a floor rather than a verdict.
     //
     // It composes through the SAME strongest-wins merge as every other source, which is what
-    // makes it safe to add: a stronger client, scope, essential-claims or overlay floor still
-    // wins, a session that already reached the rung is Satisfied, and a deployment with no
-    // rules contributes nothing. The risk engine above is the precedent -- a non-declarative
-    // source raising the floor through this same seam.
+    // makes it safe to add: a stronger floor from the request, the client, the scope, the
+    // essential claims or the risk engine still wins, the `max_age` those sources set SURVIVES
+    // (this contributes none), a session that already reached the rung is Satisfied, and a
+    // deployment with no rules contributes nothing. The risk engine above is the precedent --
+    // a non-declarative source raising the floor through this same seam.
+    //
+    // NOT the broker overlay, which an earlier version of this list named. That merges BELOW,
+    // so it composes with whatever this produces regardless of how this composed -- it would
+    // survive even a clobber here, and listing it as something the merge protects overstates
+    // what the merge does.
     //
     // `step_up_floor` returns the ACR a matching rule DEMANDS, unresolved. `RuleSet::decide`
     // would have resolved a met step-up into an `Allow`, which is right for forward-auth and

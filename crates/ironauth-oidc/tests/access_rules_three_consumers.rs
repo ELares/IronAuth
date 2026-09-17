@@ -447,6 +447,7 @@ async fn a_refused_subject_cannot_tokenize_a_session_either() {
 /// are driven: without both, "it is challenged" passes against a build that challenges everyone
 /// and "it is issued" passes against one that challenges nobody.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn one_rule_set_also_raises_the_step_up_floor_for_an_authorization_request() {
     let harness = Harness::start_store_backed().await;
     let challenged = harness
@@ -455,16 +456,34 @@ async fn one_rule_set_also_raises_the_step_up_floor_for_an_authorization_request
     let ordinary = harness
         .seed_user("ordinary@example.test", "correct horse battery")
         .await;
+    let passkey_only = harness
+        .seed_user("passkey@example.test", "correct horse battery")
+        .await;
 
     let cfg = ForwardAuthConfig {
         enabled: true,
-        rules: vec![AccessRuleConfig {
-            name: "this-person-uses-mfa".to_owned(),
-            action: AccessActionConfig::StepUp,
-            acr: Some("mfa".to_owned()),
-            subject_is: Some(challenged.clone()),
-            ..AccessRuleConfig::default()
-        }],
+        rules: vec![
+            AccessRuleConfig {
+                name: "this-person-uses-mfa".to_owned(),
+                action: AccessActionConfig::StepUp,
+                acr: Some("mfa".to_owned()),
+                subject_is: Some(challenged.clone()),
+                ..AccessRuleConfig::default()
+            },
+            // A SECOND RULE AT A DIFFERENT RUNG, so the test pins WHICH acr is enforced rather
+            // than only that some floor was raised. A review measured the gap: replacing
+            // `min_acr: Some(floor)` with the mfa constant left every test green, because the
+            // only rule in this test named mfa. An operator writing `phr` would have been
+            // enforced at the weaker rung, and the deployment would look right -- the user is
+            // still challenged, just with the wrong ceremony.
+            AccessRuleConfig {
+                name: "this-person-uses-a-passkey".to_owned(),
+                action: AccessActionConfig::StepUp,
+                acr: Some("phr".to_owned()),
+                subject_is: Some(passkey_only.clone()),
+                ..AccessRuleConfig::default()
+            },
+        ],
         ..ForwardAuthConfig::default()
     };
     let rules = access_rules_from_config(&cfg, &[]).expect("the rules convert");
@@ -517,6 +536,27 @@ async fn one_rule_set_also_raises_the_step_up_floor_for_an_authorization_request
          to the ceremony rather than issue: {location}"
     );
 
+    // THE OTHER RUNG, which is what makes the line above about the rule's acr rather than about
+    // some floor having been raised. `phr` is reachable only by a passkey ceremony, and this
+    // subject has no passkey, so the request fails closed instead of routing to the
+    // second-factor prompt the mfa rule produces. A build that enforced a constant mfa floor
+    // would send this subject to `/login/mfa` too.
+    let (status, headers, body) = authorize(passkey_only).await;
+    let location = headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        !location.starts_with("/login/mfa"),
+        "a phr floor is not reachable by a second factor, so routing there would loop \
+         forever: {status} {location} {body}"
+    );
+    assert!(
+        !location.contains("code="),
+        "and it must certainly not issue: {location}"
+    );
+
     // EVERYONE ELSE is unaffected: the same request on the same rules gets a code.
     let (status, headers, body) = authorize(ordinary).await;
     assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
@@ -529,5 +569,117 @@ async fn one_rule_set_also_raises_the_step_up_floor_for_an_authorization_request
         location.contains("code="),
         "a rule naming one person must not raise the floor for everybody, or the assertion \
          above passes against a deployment that challenges every login: {location}"
+    );
+}
+
+/// THE FLOOR COMPOSES, it does not REPLACE -- which is the claim that makes this safe to add.
+///
+/// A review measured that claim and found it untested: swapping `merge_stronger` for a plain
+/// assignment left every test green, because the one authorize test sent no `acr_values`, no
+/// `max_age`, no `claims`, and used a client with no registered floor -- there was nothing for
+/// a clobber to destroy.
+///
+/// # Finding a discriminator took three goes, and the two failures are the instructive part
+///
+/// `max_age` ON THE REQUEST proved nothing: `authorize` enforces it in a gate of its own as
+/// well as through the requirement, so the outcome was the same under both builds.
+///
+/// `acr_values=phr` proved nothing either, and worse -- a no-rules BASELINE of the same request
+/// produced the identical redirect, so the rules were contributing nothing observable and the
+/// test was measuring the request parameter alone.
+///
+/// What works is a floor only the requirement carries: a per-client `step_up_max_age_secs`. The
+/// rule's acr is one the session has ALREADY reached, so the acr half decides nothing, and the
+/// window is something the rules engine cannot express at all. Composed, the window survives and
+/// the stale session must re-authenticate. Clobbered, it is gone and a code comes back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_floor_from_the_rules_does_not_discard_the_window_a_client_registered() {
+    let harness = Harness::start_store_backed().await;
+    let subject = harness
+        .seed_user("ordinary@example.test", "correct horse battery")
+        .await;
+
+    let cfg = ForwardAuthConfig {
+        enabled: true,
+        rules: vec![AccessRuleConfig {
+            name: "everyone-authenticates".to_owned(),
+            action: AccessActionConfig::StepUp,
+            // ALREADY MET by the password session below, deliberately: this row is about the
+            // window the merge has to preserve, and an unmet acr would decide the outcome on
+            // its own and hide it.
+            acr: Some("pwd".to_owned()),
+            subject_is: Some(subject.clone()),
+            ..AccessRuleConfig::default()
+        }],
+        ..ForwardAuthConfig::default()
+    };
+    let rules = access_rules_from_config(&cfg, &[]).expect("the rules convert");
+
+    let (client, _secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+    harness
+        .grant_consent_scoped(&subject, &client_id, Some("openid"))
+        .await;
+    // The window reaches the decision through `AuthnRequirement` and nowhere else.
+    harness.set_client_step_up(&client, None, Some(60)).await;
+
+    let cookie = harness.session_cookie_at(&subject, "pwd", 0).await;
+    // The clock has to MOVE, or a session stamped at the epoch is zero seconds old under the
+    // harness's `ManualClock` and no window is lapsed.
+    harness
+        .clock()
+        .advance(std::time::Duration::from_secs(3600));
+    let query = format!(
+        "response_type=code&client_id={client_id}&redirect_uri={}&scope={}",
+        common::enc(REDIRECT_URI),
+        common::enc("openid")
+    );
+    let ask = |router: axum::Router| {
+        let (query, cookie) = (query.clone(), cookie.clone());
+        async move {
+            let request = Request::builder()
+                .method("GET")
+                .uri(format!("/authorize?{query}"))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request builds");
+            let (status, headers, body) = send_through(router, request).await;
+            let location = headers
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            (status, location, body)
+        }
+    };
+
+    // THE BASELINE, so this row cannot pass on the client's window alone: with no rules
+    // installed the same request takes the same path, and the assertion below is therefore
+    // about what the rules did NOT destroy rather than about the window existing.
+    let (baseline_status, baseline_location, body) =
+        ask(oidc_router(harness.state().clone())).await;
+    assert_eq!(baseline_status, StatusCode::SEE_OTHER, "{body}");
+    assert!(
+        !baseline_location.contains("code="),
+        "the premise: the registered window already refuses this stale session: \
+         {baseline_location}"
+    );
+
+    let state = harness
+        .state()
+        .clone()
+        .with_access_rules(Arc::clone(&rules));
+    let (status, location, body) = ask(oidc_router(state)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    assert!(
+        !location.contains("code="),
+        "a floor from the rules must not discard the window the client registered: {location}"
+    );
+    assert_eq!(
+        location, baseline_location,
+        "and the outcome must be the one the window already produced, not a different \
+         remediation the rules floor chose on its own"
     );
 }
