@@ -1,0 +1,21 @@
+{
+  "host": {
+    "cpu": "Apple M4 Pro",
+    "cores": 14,
+    "core_mix": "10 performance + 4 efficiency",
+"samples": 10,
+    "sign_samples": 2000,
+"sign_warmup": 50
+  },
+  "password_hashing": [
+    {"label": "OWASP default (shipped)", "m_kib": 19456, "t": 2, "p": 1, "hash_ms": 11.45, "verify_ms": 11.21},
+    {"label": "config floor (the weakest config load accepts)", "m_kib": 8192, "t": 1, "p": 1, "hash_ms": 2.30, "verify_ms": 2.23},
+    {"label": "config floor at the default iterations", "m_kib": 8192, "t": 2, "p": 1, "hash_ms": 4.51, "verify_ms": 4.39},
+    {"label": "double iterations", "m_kib": 19456, "t": 4, "p": 1, "hash_ms": 23.06, "verify_ms": 22.41}
+  ],
+"token_mint": [
+    {"algorithm": "EdDSA", "mint_us": 7.5, "vs_verify": 1493},
+    {"algorithm": "RS256 (published day one)", "mint_us": 323.2, "vs_verify": 35}
+  ],
+  "shipped_verify_ms": 11.21
+}

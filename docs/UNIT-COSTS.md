@@ -1,44 +1,55 @@
 # Per-operation unit costs
 
 Issue #152 criterion 4 asks for per-operation unit costs with the Argon2id parameters stated.
-These are measured. RE-MEASURE THEM WITH THE ONE COMMAND THAT RUNS THE WHOLE BENCHMARK HARNESS:
+The tables below are GENERATED from `docs/unit-costs-measurement.json`, which is the benchmark's
+own output. RE-MEASURE THEM AND REWRITE THIS PAGE WITH ONE COMMAND:
 
 ```
-PG_BIN=<postgresql bin dir> scripts/bench.sh
+scripts/unit-costs-doc.sh --measure
 ```
 
-It runs every benchmark and writes each one's output under `target/bench/`; the release workflow
-runs it per release and archives the results. To re-measure only this document's numbers,
-`cargo run --release -p ironauth-oidc --example unit_costs` is that benchmark on its own, and it
-needs no database, so it needs no `PG_BIN`.
+That runs the unit-costs benchmark on this machine, writes the measurement, and regenerates the
+region below from it. Commit both. `scripts/unit-costs-doc.sh --check` runs in CI and fails if
+the region stops matching the measurement, so the figures cannot drift from their source the way
+the hand-written ones did.
 
-Re-measure, not reproduce. The ranges below were transcribed from two runs, and a single
-invocation produces single values rather than a range. More to the point, running that command
-today does not return these figures: see "what this does not yet cover" at the end, which records
-the comparison and why the example cannot yet be pinned to a repeatable number.
+TO RUN THE BENCHMARK WITHOUT REWRITING ANYTHING, `PG_BIN=<postgresql bin dir> scripts/bench.sh`
+runs every benchmark and archives each one's output under `target/bench/`; the release workflow
+runs it per release. The unit-costs benchmark alone is
+`cargo run --release -p ironauth-oidc --example unit_costs`, which needs no database.
+
+RE-MEASURE, NOT REPRODUCE, and that distinction survives generation. These are single values from
+one run on one machine, and running the command again will not return them exactly: the example
+does not pin cores, so the figure it takes depends on which kind the scheduler handed it. What
+generation fixes is the table drifting from the measurement, not the measurement being
+repeatable. "What this does not yet cover" at the end records how far the hand-written table had
+drifted, which is why this is generated now.
+
+<!-- BEGIN GENERATED: unit costs -->
 
 ## Password hashing
 
 | parameters | hash | verify |
 |---|---|---|
-| **OWASP default (shipped)**: `m=19456 KiB, t=2, p=1` | 11.4 to 12.8 ms | 10.4 to 10.6 ms |
-| config floor, the weakest config load accepts: `m=8192 KiB, t=1, p=1` | 2.3 ms | 2.2 ms |
-| config floor at the default iterations: `m=8192 KiB, t=2, p=1` | 4.3 to 4.4 ms | 4.3 ms |
-| double iterations: `m=19456 KiB, t=4, p=1` | 21.1 to 22.0 ms | 21.0 to 21.8 ms |
+| OWASP default (shipped): `m=19456 KiB, t=2, p=1` | 11.45 ms | 11.21 ms |
+| config floor (the weakest config load accepts): `m=8192 KiB, t=1, p=1` | 2.30 ms | 2.23 ms |
+| config floor at the default iterations: `m=8192 KiB, t=2, p=1` | 4.51 ms | 4.39 ms |
+| double iterations: `m=19456 KiB, t=4, p=1` | 23.06 ms | 22.41 ms |
 
 ## Token mint
 
 | algorithm | mint | versus one password verify |
 |---|---|---|
-| EdDSA | 7.3 to 7.4 us | about 1400x cheaper |
-| RS256, published day one by every environment | 317 to 318 us | about 33x cheaper |
+| EdDSA | 7.5 us | about 1493x cheaper |
+| RS256 (published day one) | 323.2 us | about 35x cheaper |
 
-Apple M4 Pro, 10 performance + 4 efficiency cores, release build, 10 samples per hashing figure
-and 2000 per signature after 50 warm-up signatures. Two runs, and the RANGE of both is printed
-rather than a single value, because a single value implies a precision these do not have.
+Apple M4 Pro, 14 cores, 10 performance + 4 efficiency cores, release build, 10 samples per hashing figure and 2000 per signature after 50 warm-up signatures.
 
-**At the shipped parameters one PERFORMANCE core sustains at most 94 to 96 password logins per
-second.** Read the next two sections before quoting that.
+These figures are GENERATED from `docs/unit-costs-measurement.json`, which is the benchmark's own output. Re-measure with `scripts/unit-costs-doc.sh --measure` and commit the result; `scripts/unit-costs-doc.sh --check` fails if this section was edited by hand.
+
+**At the shipped parameters one core of this kind sustains at most 89 password logins per second (11.21 ms each).** Read the next two sections before quoting that.
+
+<!-- END GENERATED: unit costs -->
 
 ## Which core, and why it matters more than the number
 
@@ -48,7 +59,8 @@ verify: 15 to 16 logins per second, a 5.7x spread against the figure above.
 
 That matters because the obvious way to use a per-core number is to multiply it by the core
 count, and `default_pool_threads()` is `available_parallelism()`, which on this machine is 14.
-Four of those threads land on efficiency cores. Multiplying 95 by 14 overstates the real
+Four of those threads land on efficiency cores. Multiplying the generated per-core figure
+(currently 89) by 14 overstates the real
 aggregate substantially, and the host line says "14 cores" as though they were interchangeable.
 
 The example now prints the performance and efficiency split and says plainly that it is not
@@ -181,10 +193,10 @@ faster one: flow state that survives the loss of the node that created it is a r
 is the one the covenant's "complete on PostgreSQL alone" needs done.
 
 A tier that is genuinely a different store changes the per-hit figure, and that figure is now
-measured. An IronCache `GET` hit costs **32 to 33 us** across four runs, against a scoped read's
-162 us.
+measured. An IronCache `GET` hit costs **32 to 33 us** across four runs, against the 166 us
+scoped read in the table above.
 
-| standing in front of one scoped read (162 us) | hit costs | saves |
+| standing in front of one scoped read (166 us) | hit costs | saves |
 |---|---|---|
 | the Postgres tier (`PgHotState`) | 145 us | 13 per cent |
 | an attached IronCache | 32 to 33 us | **80 per cent** |
@@ -223,7 +235,9 @@ above. `jwks_json` consults its hot state only AFTER `resolve_for_publication` h
 entry, deliberately, so that a fenced scope is refused and a stale entry never served. The entry
 is already in hand by then, so a hit cannot save a read of any shape: it saves the render, and it
 adds the validation parse a hit must pay. That is the first table, netting about 0.6 us against a
-20 us hop, and it is negative at one published key.
+20 us hop. At a single published key it is negative, which the first table above no longer
+shows, because that table publishes password hashing rather than the JWKS render: the render
+figures live in the accelerator section below and came from the same example run.
 
 **The rate counter is a different question entirely.** Sharing it across nodes buys fleet-wide
 correctness that no local answer provides at any speed, so the hop is not being traded against
@@ -239,13 +253,22 @@ an entry already resolved does almost none.
 ## What this does not yet cover
 
 Criterion 4 also asks that the sizing guide be GENERATED from CI benchmark output and regenerate
-on release. It is not. This table is still hand-transcribed, and it has drifted.
+on release. THE TABLES ABOVE NOW ARE: they are written by `scripts/unit-costs-doc.sh` from
+`docs/unit-costs-measurement.json`, which is the benchmark's own output, and `--check` runs in CI
+so a hand-edited figure fails. The release lane regenerates the document from its own run and
+archives it.
 
-Re-running the harness on the hardware class the table names (Apple M4 Pro, 10 performance and 4
-efficiency cores, release build) put six of the ten figures in the password-hashing and
-token-mint tables outside their own ranges:
+What follows is the record of why that was worth doing, kept because the drift it describes is
+what a hand-transcribed measurement does rather than a one-off.
 
-| figure | published | re-measured |
+READ THE "was published" COLUMN AS HISTORY. It is the hand-written table this change replaced,
+and those figures appear nowhere above any more: the tables are regenerated from the measurement
+now, so a reader hunting for them will not find them. That is the point of the record.
+
+Re-running the harness on the hardware class that table named (Apple M4 Pro, 10 performance and 4
+efficiency cores, release build) put six of its ten figures outside their own ranges:
+
+| figure | was published | re-measured |
 |---|---|---|
 | OWASP default, verify | 10.4 to 10.6 ms | 11.3 ms |
 | config floor, verify | 2.2 ms | 2.3 ms |
@@ -254,9 +277,10 @@ token-mint tables outside their own ranges:
 | double iterations, verify | 21.0 to 21.8 ms | 22.9 ms |
 | RS256 mint | 317 to 318 us | 323.5 us |
 
-Of the four that landed inside their published range, three landed at the top of it. The
-derived headline above the tables moved with them: **94 to 96 logins per second per core
-published, 87 to 88 re-measured**.
+Of the four that landed inside their published range, three landed at the top of it. The derived
+headline moved with them: the hand-written one said **94 to 96 logins per second per core**, and
+re-measuring gave **87 to 88**. The generated headline above now carries whatever the committed
+measurement says, which is the whole of the fix.
 
 WHAT THIS DOES AND DOES NOT SHOW. Every gap above is a few percent: each re-measured figure sits
 between 1.7 and 6.6 percent past the TOP of its published range, all in the same direction. That is NOT the unpinned-core effect the section above measures. An
@@ -273,18 +297,28 @@ have". Two consecutive runs of the harness here reported 88 and 87 logins per se
 So what this shows is narrow and worth stating exactly: the documented command does not return
 the documented numbers, which is the property criterion 2 asks for, and the published ranges are
 tighter than the measurement is repeatable. It does not show the code got slower, and the
-login-rate comparison is the one to be most careful with, because the table says one PERFORMANCE
-core while the harness reports whichever core it was given; those are not the same quantity.
+login-rate comparison is the one to be most careful with, because the hand-written table claimed
+one PERFORMANCE core while the harness reports whichever core it was given; those are not the
+same quantity. The generated headline says "one core of this kind" for exactly that reason, so
+the claim the old table made is one this page no longer makes.
 
 What criterion 2 added is the half that can be mechanical: the example now RUNS on every release
-rather than only being compiled, under one command, with its output archived.
+rather than only being compiled, under one command, with its output archived. Criterion 4's
+generation is built on that. The drift recorded below cannot recur IN THE GENERATED REGION,
+which is the password-hashing and token-mint tables: they are written from the measurement rather
+than beside it, and `--check` fails if they stop matching. The other tables on this page, and
+every figure in the prose, are still written by hand and gated by nothing but review.
 
-Generation needs two things this does not have. The first is core pinning, without which a
-generated table would reproduce the same unrepeatable figure more confidently. The second is
-hardware: a table generated from a shared CI runner would be reproducible and wrong for the
-instance classes this guide recommends. Closing criterion 4 needs a pinned run on the named
-instance classes, and the archived results from that run are what the table should be generated
-from.
+WHAT GENERATION DOES NOT FIX is which machine the numbers describe, and there are two parts to
+that. The first is core pinning: the example does not pin, so a generated table reproduces the
+same unrepeatable figure more confidently than a transcribed one did. The second is the hardware
+itself. The release lane ARCHIVES its regenerated document rather than committing it, because a
+shared CI runner is not an instance class this guide recommends, and publishing its numbers here
+would trade a drifted figure for a confidently generated one measured on the wrong machine.
+
+So what remains for criterion 4 is a PINNED run on a named instance class. The mechanism to turn
+that run into this document exists now: `scripts/unit-costs-doc.sh --measure` on that machine,
+and commit what it writes.
 
 The hardware class above is a development machine. A published sizing guide should be measured on
 the instance classes it recommends.
