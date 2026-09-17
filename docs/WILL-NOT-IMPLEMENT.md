@@ -32,7 +32,9 @@ precondition rather than refused; see issue #138 and the M14 milestone.
   none planned.
 - **CIBA push mode.** Why: weakest security properties of the three CIBA
   modes and forbidden by the FAPI-CIBA profile; effectively uncertifiable.
-  Instead: CIBA poll and ping (M13). Revisit: none planned.
+  Instead: CIBA poll, which is the currently advertised usable mode. Ping has
+  schema and consumer foundations but no production profile writer or server
+  worker wiring; see [current capabilities](CAPABILITIES.md). Revisit: none planned.
 - **Session Management iframe and Front-Channel Logout as real features.**
   Why: dependent on third-party cookies, which are blocked in every major
   browser; unreliable by construction in 2026. Instead: RP-initiated logout

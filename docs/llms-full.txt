@@ -107,72 +107,124 @@ Source: README.md
 
 [![OIDF conformance](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/ELares/IronAuth/main/docs/conformance/status/badge.json)](docs/conformance/README.md)
 
-A modern, standards-first OpenID Connect identity platform. Multi-tenant,
-multi-environment, EdDSA-first. One repository holds everything: the provider
-server (Rust), management APIs, SDKs, the admin SPA, hosted auth pages, and
-background workers.
+IronAuth is a self-hosted identity platform for people, organizations, services,
+and agents. Its Rust server combines an OpenID Connect provider, hosted sign-in
+pages, a management API, an embedded administration console, and background
+workers. PostgreSQL is the required persistence layer.
 
-**Status: pre-1.0, foundations (milestone M1) in progress.** Nothing here is
-ready to run in production yet. The complete plan is public: [16 milestones
-and 164 issues](https://github.com/ELares/IronAuth/milestones), from the
-certifiable OIDC core through multi-environment config promotion, passkeys,
-organizations, SCIM, and agent-native OAuth.
+**Status: pre-1.0 and under active development.** The repository contains the
+capabilities described below, but this is not a production-readiness or
+certification claim. The live OpenID Foundation suite has not been provisioned;
+its status is [not yet run](docs/conformance/README.md). Track ongoing work in
+the [issue tracker](https://github.com/ELares/IronAuth/issues) and
+[milestones](https://github.com/ELares/IronAuth/milestones).
 
-## What IronAuth is building toward
+## Start here
 
-- A certified OpenID Connect provider built against the final 2025-2026 spec
-  wave (OAuth 2.1 posture, FAPI 2.0, Shared Signals) with the conformance
-  suite wired into CI as a merge gate.
-- First-class tenants, isolated environments per tenant (dev, staging, prod),
-  and server-side config promotion with diff, plan, and apply.
-- EdDSA (Ed25519) as the default token signing algorithm, with the full
-  RS256/ES256/PS256 matrix supported and per-client negotiation so legacy
-  relying parties are a config flip, never a migration.
-- Single static binary on PostgreSQL. IronCache (Redis-compatible cache) and
-  IronBus (durable message bus) are optional accelerators, never requirements.
-- Secure by default: PKCE everywhere, exact redirect matching, one hardened
-  and fuzzed JOSE verification path, tenant isolation enforced below the
-  application layer.
+| Goal | Guide |
+| --- | --- |
+| Understand the feature set and its current limits | [Capabilities](docs/CAPABILITIES.md) |
+| Run locally or deploy and operate a server | [Operations](docs/OPERATIONS.md) and [local emulator](docs/EMULATOR.md) |
+| Sign in to the console and administer resources | [Admin console](docs/ADMIN-CONSOLE.md) |
+| Add authentication or authorization to an application | [Integrations](docs/INTEGRATIONS.md) |
+| Find a protocol, security, or configuration reference | [Documentation index](docs/README.md) |
 
-## Principles
+## What is implemented
 
-Three covenants, stated once and never moved: no paywalled security features,
-no mandatory first-party infrastructure, no unexportable data. The full
-covenant text, including the supporting commitments and the falsifiable
-commercial line, is in [COVENANTS.md](COVENANTS.md). The per-surface threat
-model is [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) (updated in the same PR
-as any new surface, by rule), deliberate refusals are documented in
-[docs/WILL-NOT-IMPLEMENT.md](docs/WILL-NOT-IMPLEMENT.md), and the security
-policy with safe harbor is [SECURITY.md](SECURITY.md).
+Features have separate configuration and, in some cases, build requirements.
+The [capability guide](docs/CAPABILITIES.md) identifies those requirements and
+the surfaces that are experimental or incomplete.
+
+| Area | Capabilities |
+| --- | --- |
+| Authentication | OIDC discovery, authorization code with PKCE, refresh rotation and reuse detection, client credentials, device authorization, token exchange, PAR, DPoP, introspection, revocation, and logout/session-management surfaces. Ed25519 is the default signing algorithm; clients can negotiate other supported signing algorithms. |
+| Sign-in experience | Hosted login, registration, recovery, consent, MFA enrollment and challenge, passkeys, passwordless methods, organization selection, branding, localization, and a shared headless flow contract for custom pages. |
+| Federation and provisioning | Upstream OIDC and SAML connections, social provider integration, inbound and outbound SCIM, LDAP directory synchronization, bulk imports, and migration support. |
+| Identity and access | Tenants and environments, users, organizations and memberships, groups, invitations, permissions, grants, service accounts, workload federation, agent principals, and an AuthZEN policy decision point. |
+| Administration | An API-first console with resource lists, explicit creation dialogs, search, diagnostics, API keys, and organization administration. The management API additionally exposes audit and configuration resources, and drives generated Go/Python clients, CLI configuration workflows, and admin MCP tools. |
+| Security and operations | Tenant-scoped storage and row-level security, envelope encryption, key lifecycle tools, password policy and breached-password screening, step-up authentication, quotas, a transactional outbox, webhooks, signed log streams, health/readiness probes, metrics, and optional trace export. |
+| Developer tools | A seeded local emulator, React/Next.js/Go/Python quickstarts, a framework-agnostic BFF helper, WebCrypto token/protocol helpers, Java/.NET verification samples, mobile AppAuth samples, and edge verification snippets. |
+
+PostgreSQL alone is a supported mode. IronBus notifications are an optional
+build/configuration choice. The IronCache backend is present, but the current
+server boot path does not attach it; enabling its Cargo feature alone does not
+activate a cache. WASM hooks require an optional build and a newer Rust compiler.
+See [build options and limits](docs/CAPABILITIES.md).
+
+## Try it locally
+
+Install the toolchain in [rust-toolchain.toml](rust-toolchain.toml), PostgreSQL
+server binaries (`initdb`, `pg_ctl`, and `postgres`), and Git. Build the default
+server, then start its local emulator:
+
+```bash
+git clone https://github.com/ELares/IronAuth.git
+cd IronAuth
+cargo build --locked -p ironauth --bin ironauth
+env -u DATABASE_URL ./target/debug/ironauth dev --seed 1
+```
+
+The emulator creates a disposable PostgreSQL cluster and seeds a tenant,
+environment, public OAuth client, test user, and development operator token.
+It prints the scoped issuer, management address, and test credentials. Use the
+printed issuer's `/.well-known/openid-configuration` endpoint to check discovery.
+These deterministic credentials are for local development.
+
+Set `PG_BIN` to the directory containing the PostgreSQL binaries if they are
+not discovered automatically. Removing `DATABASE_URL` in the example ensures
+the emulator owns its database; using an external database follows a different
+setup path. The emulator does not enable the admin console. See the
+[emulator guide](docs/EMULATOR.md) for ports, reset behavior, and that distinction.
+
+To connect an app, follow a [tested quickstart](docs/INTEGRATIONS.md#quickstarts).
+For the console or a persistent deployment, follow
+[server setup](docs/OPERATIONS.md) and [console setup](docs/ADMIN-CONSOLE.md).
+
+## Build and contribute
+
+```bash
+cargo build --locked -p ironauth --bin ironauth
+scripts/gate.sh > gate.log 2>&1
+```
+
+The default server and most crates support Rust 1.85. The optional WASM hook
+engine requires Rust 1.95. A whole-workspace build includes that engine even
+when the server's `wasm-hooks` feature is disabled. The pinned development
+toolchain satisfies both; see the generated
+[artifact compatibility matrix](docs/COMPATIBILITY.md).
+
+The console's current dependency tree requires Node
+`^22.22.2 || ^24.15.0 || >=26.0.0`. Follow the
+[SPA development guide](packages/admin-spa/README.md) when changing browser code.
+The local gate checks compilation, formatting, Clippy, tests, security
+invariants, generated contracts, and documentation freshness. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) before opening a change.
 
 ## Repository layout
 
-- `crates/`: the Rust workspace (server, workers, libraries). Each crate is a
-  documented design seam; see the workspace `Cargo.toml`.
-- `packages/`: TypeScript artifacts (SDKs, admin SPA, hosted pages); arrive
-  with milestones M9 and M12.
-- `docs/`: operating and contributing documentation, including
-  [RELEASING.md](docs/RELEASING.md) and the generated
-  [COMPATIBILITY.md](docs/COMPATIBILITY.md).
-- `scripts/`: the local merge gate (`scripts/gate.sh`) and the structural
-  checks CI enforces.
-- `fuzz/`: the fuzzing harness (lands with the hardened JOSE core).
+| Path | Contents |
+| --- | --- |
+| [crates/](crates/) | Rust server, management and protocol APIs, workers, storage, and supporting libraries. |
+| [packages/](packages/README.md) | Admin SPA, custom hosted-page reference app, TypeScript SDK/BFF helpers, MCP implementations, and sample resource server. |
+| [sdks/](sdks/) and [clients/](clients/) | Generated Go/Python management clients, Java/.NET token verifiers, a reference client, and mobile samples. |
+| [docs/](docs/README.md) | User guides, generated contracts, security references, and operator runbooks. |
+| [charts/ironauth/](charts/ironauth/README.md) and [deploy/](deploy/) | Helm chart, packaging, configuration examples, and conformance infrastructure. |
+| [scripts/](scripts/) | Local gate, generators, structural audits, quickstart checks, and benchmarks. |
+| [terraform-provider-ironauth/](terraform-provider-ironauth/) | Management API provider; current resource coverage is limited to tenants. |
+| [fuzz/](fuzz/README.md) and crate-local fuzz directories | Parser and protocol fuzzing harnesses. |
 
-## Building
+## Project commitments
 
-```
-cargo build --workspace
-scripts/gate.sh   # fmt, clippy pedantic, tests, invariants, supply-chain
-```
-
-The pinned toolchain is in `rust-toolchain.toml`; the MSRV is 1.85 and is
-enforced in CI.
+No paywalled security features, no mandatory first-party infrastructure, and
+no unexportable data. Read the [covenants](COVENANTS.md),
+[security policy](SECURITY.md), [threat model](docs/THREAT-MODEL.md),
+[deliberate refusals](docs/WILL-NOT-IMPLEMENT.md), and
+[exit guide](docs/exit-guide.md) for the commitments and their boundaries.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
-your option (see [LICENSE](LICENSE)), matching the sibling Iron projects.
-The licensing commitments, including no mid-flight relicensing, are part of
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
+option. See [LICENSE](LICENSE) and the licensing commitments in
 [COVENANTS.md](COVENANTS.md).
 
 ---
@@ -183,7 +235,7 @@ Source: SECURITY.md
 
 # Security Policy
 
-IronAuth is pre-1.0 and under active foundational development; no production
+IronAuth is pre-1.0 and under active development; no production
 deployment should exist yet. Until a stable 1.0, the latest release is the
 only supported version. This policy describes how to report a suspected
 vulnerability privately and what you can expect from us.
@@ -235,6 +287,729 @@ The per-surface threat model lives in
 request that ships any new surface. Deliberately rejected features and
 algorithms are documented with reasons in
 [docs/WILL-NOT-IMPLEMENT.md](docs/WILL-NOT-IMPLEMENT.md).
+
+---
+
+# Admin console
+
+Source: docs/ADMIN-CONSOLE.md
+
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
+# Admin console
+
+The IronAuth console is a browser client of the public management API. It is
+embedded in the Rust binary and opens at `/admin/` on the public listener when
+enabled. You can manage identities, organizations, federation connections, and
+client registration, and investigate authentication and policy decisions.
+
+The console covers a subset of the management API. Use the
+[capability guide](CAPABILITIES.md) for the broader platform, the
+[management OpenAPI document](openapi/management.json) for exact operations and
+request schemas, and the [configuration reference](CONFIG.md) for deployment
+settings. The [SPA README](../packages/admin-spa/README.md) covers development and
+standalone hosting.
+
+## Enable and configure sign-in
+
+`admin_spa.enabled` defaults to `false`. When disabled, `/admin` and its deeper
+paths return 404. Enabling it serves the working console, but does not create an
+administrator, register a console client, or populate the admin issuer.
+
+Set up these prerequisites before signing in:
+
+1. Run a migrated database with the control and data plane connections required
+   by the [deployment guide](OPERATIONS.md). The management plane currently mounts
+   only when `admin.bootstrap_operator_token` is configured. Keep that credential
+   on the operator side; the browser never needs it. User management also needs
+   the platform master key to seal and open PII.
+2. Enable OIDC and provision the admin issuer's tenant and environment. Use their
+   actual IronAuth identifiers, rather than display names, in the configuration.
+3. Register a **public** console OAuth client in that issuer for Authorization
+   Code + PKCE, with the exact callback `https://YOUR_CONSOLE_HOST/admin/`. The
+   console requests `openid ironauth.manage`; it has no client secret. Register
+   the client through the issuer's DCR endpoint using the management API's
+   policy/initial-access-token controls. There is no generic management API
+   create-client operation. Inspect and verify the registered client as needed.
+   The current SPA does not send DPoP proofs. From the operator side, explicitly
+   enable this client's bearer-token exception with `setClientBearerTokens`:
+
+   ```text
+   PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/bearer-tokens
+   ```
+
+   ```json
+   {"allowed":true}
+   ```
+
+   Use the admin issuer's scope and this console client ID. The write requires
+   configuration authority and fresh privilege under the deployment's sudo
+   policy. This exception permits unbound bearer tokens for this client, making
+   a stolen token replayable until expiry; it leaves other public clients'
+   DPoP requirement intact. Do not put the operator credential in the browser.
+4. Register the management resource audience under the admin issuer using the
+   supported [snapshot/promotion workflow](snapshot/README.md), with the
+   resource server's `token_format` set to `at_jwt`. The management OIDC bridge
+   requires a signed RFC 9068 `at+jwt` access token; an `opaque` resource format
+   lets token exchange succeed but leaves console API requests unauthorized. Configure the
+   same exact audience in `admin_spa.management_audience`; the console sends
+   it as the OAuth `resource` parameter. The management plane accepts only tokens
+   with the configured issuer and exact audience, not an ordinary application
+   access token from another client or resource.
+5. Create the intended administrator and configure a usable sign-in credential
+   in the admin issuer. Add that administrator's actual OIDC `sub` to
+   `admin_spa.operator_subjects`. An empty allowlist authorizes nobody, and an
+   authenticated subject outside the allowlist cannot administer the deployment.
+6. Enable the console and apply the configuration. Check readiness and startup
+   logs for the OIDC bridge and management plane before opening `/admin/`.
+
+This fragment shows the console settings to add to an otherwise working
+deployment. Replace every example identifier and audience with your provisioned
+values; it is not a complete server configuration:
+
+```toml
+[admin_spa]
+enabled = true
+admin_issuer_tenant = "YOUR_ADMIN_TENANT_ID"
+admin_issuer_environment = "YOUR_ADMIN_ENVIRONMENT_ID"
+console_client_id = "YOUR_PUBLIC_CONSOLE_CLIENT_ID"
+management_audience = "https://auth.example.com/management"
+operator_subjects = ["YOUR_ADMIN_OIDC_SUBJECT"]
+```
+
+The server injects the nonsecret issuer path, public client ID, and audience into
+the console's entry document. Its `/admin/api` proxy forwards browser requests to
+the in-process management router, using only the browser's own bearer credential.
+The proxy is available only when OIDC and the issuer/audience bridge are
+configured and the management plane is mounted.
+
+## Sign-in, MFA, and session behavior
+
+Select **Sign in** to start an OIDC Authorization Code flow with S256 PKCE and
+CSRF state validation. IronAuth's issuer presents the authentication pages and any
+required MFA, passkey, recovery, or consent steps according to its enabled
+features and policies. The console does not supply a separate administrator
+password or bypass those policies. See [headless flows](FLOWS.md) and
+[step-up authentication](design/step-up-authentication.md) for the authentication
+contract and assurance rules.
+
+The short-lived management access token stays in browser memory. Reloading the
+page requires sign-in again; an existing issuer session may let that sign-in
+complete without another credential prompt. The selected tenant/environment IDs
+persist in `sessionStorage`, and the PKCE verifier and state are stored there
+temporarily across the redirect and consumed on return. Bearer tokens are not
+stored in browser storage.
+
+**Sign out of console** clears the in-memory token and selected context. It does
+not call the issuer's logout endpoint or revoke other sessions. When a privileged
+write returns a `max_age` challenge, the error panel can offer **Re-authenticate
+to continue**, requesting a fresh login with `max_age` and `prompt=login`.
+Re-authentication navigates away; the original mutation and draft are not
+persisted across the callback. Return to the affected page and re-enter the
+action after sign-in. Sudo requirements remain enforced by the management API
+in the active environment. The console is not a full MFA enrollment, password
+reset, or end-user account settings interface.
+
+## Find resources and choose a context
+
+The sidebar groups pages into **Workspace**, **Identity**, and **Operations**.
+The header's tenant/environment selector controls the scope of resource pages;
+changing it reloads scoped content and discards drafts and one-time credential
+output from the previous scope. When the loaded context resolves to one tenant
+and one environment, the selector collapses and the environment is implicit.
+Pages without a required selection show guidance instead of sending an unscoped
+request.
+
+The visible search control and **Cmd/Ctrl+K** open the command palette. Search
+page names and the tenant/environment names already loaded by the console, then
+use Arrow Up/Down and Enter to navigate. Escape closes it and restores focus.
+This is navigation search, not a server-wide user or resource search.
+
+Resource collections show their loaded rows first. Where a list offers a local
+filter, it searches only those rows. The current console does not browse every
+cursor page: paginated organization, invitation, role, group, permission, and
+resource-server panels report when additional results exist. The tenant,
+environment, user, and connector wrappers also load only the initial API page;
+their displayed counts and filters do not establish deployment-wide totals.
+Use the management API with its opaque `next_cursor` for complete inventories.
+
+Creation and grant forms open only after you select the relevant **Create**,
+**Add**, **Grant**, or **Configure** action. Empty lists do not automatically open
+a form. Cancel, the close control, or Escape discards the draft and returns focus
+to the action; dismissal is disabled while a submitted request is pending. On
+success the dialog closes, and confirmation or issued credential output stays on
+the page. Destructive and lifecycle actions have an explicit confirmation step.
+
+## Pages and supported operations
+
+Paths below are browser routes under the embedded `/admin` mount. Tenant detail
+uses the route's tenant ID, environment detail uses the active tenant, and
+identity detail routes combine their resource ID with the active
+tenant/environment selection.
+
+| Page | Browser path | What you can do |
+| --- | --- | --- |
+| Overview | `/admin/` | See loaded tenant and environment counts, the active environment, and navigation shortcuts. These are context summaries, not live identity counts or an analytics dashboard. |
+| Tenants | `/admin/tenants`, `/admin/tenants/:tenantId` | List and inspect tenants; explicitly create a tenant with its first environment; suspend, resume, restore, or delete through the server's lifecycle rules. The console does not edit tenant properties. |
+| Environments | `/admin/environments`, `/admin/environments/:environmentId` | List, inspect, create, and delete environments in the active tenant. Choose development, staging, or production and view the resolved guardrails. Production creation requires a custom domain. Guardrails are read-only here. |
+| Clients | `/admin/clients` | List and create DCR registration policies; issue initial access tokens; look up a registered client by ID and verify its quarantine status; choose server-provided ID-token signing recommendations; set or clear a machine grant scope allowlist; manage a client's service-account keys. |
+| Users | `/admin/users`, `/admin/users/:userId` | List, inspect, and create identities; merge-patch profile claims; change lifecycle state or schedule offboarding; link or unlink an external ID; revoke the user's sessions; delete; create, rotate, revoke, and inspect personal access tokens. |
+| Connectors | `/admin/connectors`, `/admin/connectors/:connectorId` | List, inspect, create, replace, and delete federation connector definitions; inspect derived capabilities and this node's live connector health. |
+| Organizations | `/admin/organizations`, `/admin/organizations/:organizationId` | List, create, inspect, enable, disable, and delete organizations; manage memberships, default role, organization API keys, roles, role permissions, and group hierarchy. |
+| Permissions | `/admin/permissions` | Define the environment's permission vocabulary, inspect entries, relabel display names, delete permissions, and enable or disable permission claims for existing resource servers. |
+| Invitations | `/admin/invitations` | List by pending, accepted, or revoked state; create password or passkey invitations; resend pending invitations with a fresh single-use token; revoke. |
+| Diagnostics | `/admin/diagnostics` | Inspect client authentication failures, policy traces, operational warnings, existing flows, and side-effect-free flow dry runs. |
+
+Unknown browser routes display a page with a link back to Overview. Missing
+static assets return a server 404 rather than the console document.
+
+### Client registration and machine identities
+
+The Clients page focuses on Dynamic Client Registration (DCR). It does not offer
+a generic complete client list or a direct create/update/delete client form.
+Registration policies contain server-validated JSON primitive arrays. An initial
+access token references a policy chain and lets a registrant call the issuer's
+registration endpoint subject to that chain, the configured DCR mode and quota,
+and quarantine rules. Registration must be enabled on the issuer for that flow.
+
+Use the registered-client lookup to inspect verification status and explicitly
+verify a quarantined client. The token signing dialog retrieves recommendations
+from the server for the chosen verifier, then pins the recommended signing
+algorithm to the supplied client ID. The machine grant scope allowlist limits
+what a machine may request; it does not grant application permissions or make
+every listed scope issuable.
+
+A service account is created lazily at a client's first machine
+client-credentials issuance. The machine key lookup distinguishes a missing
+client, a registered client with no service account yet, and an existing service
+account whose keys can be managed. The console does not precreate that principal.
+
+### User profile and lifecycle
+
+The profile editor accepts a JSON object as an RFC 7396 merge patch of the user's
+claims. Supply only the fields you intend to change. For example, updating a
+display name can use:
+
+```json
+{"name":"Alex Morgan"}
+```
+
+The access panel exposes `active`, `blocked`, `disabled`,
+`pending_verification`, `scheduled_offboarding`, and `waitlisted`. Scheduled
+offboarding needs a deadline. The server determines the allowed transitions and
+their effect on authentication and sessions; see [user lifecycle](design/USER-LIFECYCLE.md).
+Creating an identity alone does not configure a password or passkey. Use the
+appropriate invitation, authentication, or management credential operation.
+
+### Connector definitions and health
+
+Connector creation and replacement accept a declarative JSON object validated
+by the server against the [connector schema](connector-schema.json). The
+`client_secret` accepts a literal string, `{"env":"UPSTREAM_CLIENT_SECRET"}`,
+or `{"file":"/secure/upstream-client-secret"}`. Env and file references resolve
+on the server handling the write; they are not named snapshot secret-store
+references. Replacement is a full-definition PUT, not a merge patch: supply
+every setting you intend to retain, including `client_secret`, which reads omit.
+The capability panels report login, refresh, group, logout propagation,
+and email-verification trust support from the server's derived matrix. Health
+reports counters, recent errors, and timestamps for the serving node.
+
+### Organizations, role provenance, and permissions
+
+Open an organization to work with these panels:
+
+- **Members:** add an existing user by ID, remove a membership, and open its
+  roles. The membership's stored state remains visible.
+- **Default role:** designate one organization role for all active members.
+  Designating another role moves the designation. Clearing it deletes neither
+  the role nor its direct/group grants. If it is absent from a partial role
+  page, the console reports the uncertainty instead of claiming no default.
+- **API keys:** inspect, create, rotate, and revoke organization credentials.
+- **Roles:** create roles with stable slugs, rename their display names, delete
+  them, and attach or detach permission IDs from the environment vocabulary.
+- **Groups:** create and rename groups, move a group within the hierarchy,
+  delete it, add or remove organization memberships, and grant or withdraw group
+  roles. The group tree supports keyboard navigation and reports partial data.
+
+Member roles distinguish direct grants from effective role paths. An effective
+role may come from a direct grant, group inheritance, the default role, or a
+time-boxed grant; the console preserves separate provenance rows when several
+paths reach the same role. Withdrawing a direct grant can leave access through
+another path. Time-boxed provenance is displayed here; this console does not
+include the access-request approval workflow that produces those grants.
+
+The effective view also shows the resolved permission union and its element-count
+budget. That is an advisory view, not proof that the next token will contain the
+claim: audience opt-in, token format, and other mint-time size limits also apply.
+Read [organization hierarchy and entitlements](design/ORG-HIERARCHY-AND-ENTITLEMENTS.md)
+for inheritance and claim rules.
+
+Permission slugs and kinds are immutable; only display names can be relabeled.
+The Permissions page can toggle the permission claim on an existing resource
+server, but cannot register one or change its token format. Opaque resource
+tokens cannot opt in. Removing a role mapping, deleting a permission, or
+disabling claim emission changes subsequent token issuance; it does not revoke
+access tokens that have already been issued.
+
+### One-time credentials and invitations
+
+New or rotated organization keys, personal access tokens, service-account keys,
+DCR initial access tokens, and invitation tokens are displayed once. Copy the
+value and deliver or store it through your intended secret handling process
+before leaving the page, switching context, or reloading. The browser holds the
+output in memory; list responses do not recover the raw credential. An idempotent
+replay may return metadata without the original secret. Revoked key rows remain
+visible for investigation.
+
+Invitation creation can select password or passkey enrollment and an expiry.
+Resend replaces the old token with a fresh one and expiry; revoke makes the token
+unredeemable. The console exposes the one-time token for the operator to deliver
+through the intended channel; it does not provide an email composer or automatic
+delivery confirmation.
+
+### Diagnostics and flow inspection
+
+Client authentication records show the specific failure reason, client and
+authentication method, assertion key ID/algorithm, derived clock skew, and time.
+The public token endpoint continues to return an opaque `invalid_client`. Apply
+the diagnostics filters explicitly; when results are truncated, narrow the client
+or time window.
+
+Policy traces show recorded rule evaluations. Operational warnings are grouped
+by kind and computed from connector health, recent token-size events, and
+permission-budget verdicts. Connector health is local to the serving node: a
+connector not exercised there can be `unknown`, which is not an outage verdict
+for the entire deployment.
+
+The flow inspector can observe an existing flow by ID without advancing it, or
+dry-run login, registration, recovery, or federation contexts. Dry runs evaluate
+the real step-up and risk policies with writes disabled. They do not authenticate
+a user, mint a token, send a message, or create a persistent flow. See
+[headless flows](FLOWS.md) for the flow object and [configuration](CONFIG.md) for
+diagnostics recording and retention settings.
+
+## Authority, feature gates, and errors
+
+Today the browser's OIDC subject allowlist resolves a signed-in administrator to
+the **operator** plane. It does not bind console users to the management API's
+delegated `help_desk`, `org_admin`, or `read_only` personas. Those personas apply
+to scoped management keys, with independent permission grants and optional
+organization confinement. Application roles and permission slugs are a separate
+authorization vocabulary; granting an application permission does not grant
+console administration.
+
+The management API's closed permission vocabulary is:
+
+| Grant | Authority within the credential's scope |
+| --- | --- |
+| `management.read` | Read management resources, including identity export. |
+| `management.write_config` | Write configuration, connections, client settings, and policies. |
+| `management.write_users` | Manage identities and their credentials/factors. |
+| `management.write_organizations` | Manage organizations, memberships, roles, groups, and permissions. |
+| `management.write_credentials` | Manage management credentials themselves. |
+| `management.impersonate` | Authorize impersonation; no built-in delegated persona grants it automatically. |
+
+`help_desk` combines read with user management, `org_admin` combines read with
+organization management, and `read_only` grants read alone. Organization
+confinement is a separate property of a management credential, not an automatic
+property of the `org_admin` persona. Operator credentials have broader reach.
+See [management authentication and authorization](../crates/ironauth-admin/src/auth.rs)
+for the enforced vocabulary and scope rules.
+
+The sidebar and action controls are not a per-permission entitlement map. The
+server enforces credential scope, management permissions, organization
+confinement, lifecycle restrictions, feature flags, and guardrails on each
+operation. A visible control does not imply that its operation is enabled or
+authorized. API-only facilities such as config promotion, schema extensions,
+SCIM administration, signing-key rotation, logs/exports, webhooks, and delegated
+management credentials require the documented API or its other clients.
+
+Management errors display the API's `error` and `message` verbatim, with scope,
+guardrail, and authentication freshness details when supplied. Bodyless or
+unreadable failures use a fallback error instead of being treated as empty
+success. Keep those details when investigating a failed integration; do not
+replace a server refusal by changing the browser's local scope.
+
+## Keyboard and narrow-screen behavior
+
+The console has a skip-to-content link, labeled fields and controls, visible
+keyboard focus, current-page navigation, and page titles that follow the active
+section. Narrow screens use a navigation toggle; Escape closes the menu and
+returns focus to that toggle. Route changes scroll to the top and focus the main
+content. Creation dialogs use the browser's native modal dialog behavior to keep
+the background inert and contain focus. These describe implemented behaviors,
+not an accessibility certification.
+
+## Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| `/admin/` returns 404 | `admin_spa.enabled` and whether this request reaches the public listener. |
+| The sign-in control is disabled | Served admin issuer and public client ID metadata. In embedded deployments, OIDC plus the issuer tenant/environment and management audience must be configured for runtime injection. |
+| Discovery or callback fails | Issuer reachability, provisioned public client, exact `/admin/` callback origin, PKCE support, and reverse-proxy public URL configuration. |
+| Code exchange fails after successful issuer sign-in | This console client's explicit bearer-token allowance. Public clients require DPoP by default, but the current SPA does not send proofs. Also check the exact client/callback and resource registration. |
+| Login succeeds but management requests fail | Exact audience, `ironauth.manage` scope, administrator `sub` allowlist, and management-plane startup. The proxy adds no operator credential. |
+| `/admin/api/...` returns 404 | A configured OIDC bridge and a successfully mounted management plane, including the bootstrap token and control database connection. |
+| A resource is missing from a filtered list | Active scope and the initial-page/local-filter boundary. Query subsequent API cursor pages for a complete inventory. |
+| Connector health is `unknown` | Whether that connector has been exercised on the node serving the request. |
+| A one-time token is no longer visible | Raw credentials cannot be recovered from lists. Use the relevant rotation or resend operation if you need a replacement. |
+
+---
+
+# IronAuth capabilities
+
+Source: docs/CAPABILITIES.md
+
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
+# IronAuth capabilities
+
+IronAuth implements an identity provider, management API, administration console,
+hosted authentication pages, and background workers in one Rust server. PostgreSQL
+is the primary store. This guide describes the code in this repository, including
+the switches and limits that determine what a deployment actually exposes.
+
+IronAuth is pre-1.0. Implemented protocol support does not imply OpenID Foundation
+certification: the live OIDF runner is not provisioned in this repository. Read the
+[conformance status and enforcement table](conformance/README.md) and
+[profile matrix](conformance/MATRIX.md) before relying on a certification profile.
+
+For setup, use [Operations](OPERATIONS.md). For console workflows, use
+[Admin console](ADMIN-CONSOLE.md). The [documentation index](README.md) connects
+these overview guides to the detailed contracts.
+
+## Availability and configuration
+
+Most capabilities compile into the normal server but require configuration,
+credentials, or a registered resource before they serve useful traffic.
+In particular, `oidc.enabled` defaults to `false`. Authentication defaults below
+describe an OIDC-enabled deployment, not an empty configuration file.
+
+| Surface | How it becomes available | Default |
+| --- | --- | --- |
+| OIDC provider and account APIs | Set `oidc.enabled`; configure the database, issuer URL, and scoped resources. | Off |
+| Management API | Configure the management credentials and database roles; serve it on the management plane. | Requires credentials |
+| Admin console at `/admin` | Set `admin_spa.enabled` and its management API connection settings. | Off |
+| Headless JSON flows | Set `flows.enabled`. | Off |
+| Hosted flow pages | Set `hosted_pages.enabled`; this is a separate browser cutover from the JSON flow switch. | Off |
+| Inbound SCIM | Set `scim.enabled`; create an organization SCIM connection and credential. | Off |
+| Outbound SCIM | Configure a push connection and set `scim_push.enabled` on a worker process. | Off |
+| LDAP/AD synchronization | Configure an LDAP connector and set `ldap_sync.sweep_enabled`. | Off |
+| Shared Signals transmitter | Set `ssf.enabled`; register authenticated receivers and streams. | Off |
+| Google Cross-Account Protection receiver | Set `risc_receiver.enabled` and configure the trusted issuer, keys, audience, and Google connector. | Off |
+| Reverse-proxy forward auth | Set `forward_auth.enabled` and configure ordered access rules. | Off |
+| Message, webhook, flow-target, and SIEM delivery | Configure destinations and enable each subsystem's delivery worker. | Off |
+| Scheduled user offboarding | Schedule an offboarding through the management API; `users.offboarding_worker_enabled` controls execution. | Worker on |
+| Outbox retention | Configure `[outbox]`; `outbox.reap_enabled` controls terminal-row cleanup. | Worker on |
+
+The authoritative keys, validation rules, defaults, and experimental acknowledgment
+versions are in [CONFIG.md](CONFIG.md) and the generated
+[configuration schema](config-schema.json). Unknown keys fail configuration load.
+Use file or environment references for secrets instead of committing secret values.
+
+### Optional build features
+
+Cargo build features are different from the runtime switches above:
+
+| Build feature on `ironauth` | What it adds | Runtime requirement or limit |
+| --- | --- | --- |
+| `wasm-hooks` | Wasmtime component hooks for token claims. | Requires Rust 1.95, the experimental `wasm-hooks` acknowledgment, and a registered hook. |
+| `ironbus` | Optional IronBus wake-up notifications for the PostgreSQL outbox. | Set `outbox.ironbus_addr`; PostgreSQL remains authoritative and polling remains the fallback. |
+| `otlp` | OpenTelemetry OTLP trace export. | Configure `telemetry.otlp_endpoint`; the default build does not include this exporter. |
+| `ironcache` | The Redis-compatible IronCache hot-state backend. | Backend code exists, but the shipped server does not attach a `HotState` implementation. Setting the address does not activate request acceleration. |
+| `testing` | Database test harness and observation accessors. | Test scaffolding; not a deployment capability. |
+
+The normal binary and most libraries publish Rust 1.85 compatibility. The optional
+hook runtime publishes Rust 1.95. See [COMPATIBILITY.md](COMPATIBILITY.md), the
+[server manifest](../crates/ironauth/Cargo.toml), and the
+[hot-state implementation status](../crates/ironauth-hot/src/lib.rs).
+
+## Authentication and OAuth protocols
+
+Use the environment's discovery document as the client contract. Issuers and JWKS
+are scoped to a tenant and environment; several protocol endpoints, including
+`/token`, are shared at the deployment root and recover the scope from the client
+or credential. Do not construct all endpoint URLs by appending paths to the issuer.
+The [router](../crates/ironauth-oidc/src/lib.rs) and
+[discovery generator](../crates/ironauth-oidc/src/discovery.rs) define the served URLs.
+
+| Capability | Implemented behavior and setup |
+| --- | --- |
+| OIDC authorization code | `/authorize` and `/token`, single-use codes, redirect and client binding, PKCE S256, nonce, authentication context, and UserInfo. Public clients use PKCE; confidential clients require it by default too. |
+| Discovery | OIDC and OAuth authorization-server metadata, environment JWKS, supported grants, algorithms, scopes, and enabled legacy response modes. |
+| Subjects and claims | Public or pairwise subjects, standard OIDC scope claims, requested claim handling, `acr`, `amr`, and authentication-time handling. |
+| Refresh tokens | Rotating refresh families, replay/reuse handling, idle and absolute lifetimes, and consent rules for `offline_access`. Refresh issuance is on by default. |
+| Client credentials | Confidential clients obtain access tokens for their service-account principal. This grant does not issue an ID token or refresh token. |
+| JWT bearer grants | Exchange an assertion from a registered external issuer under configured subject mappings and scope bounds. Workload federation does not require a stored password. |
+| Device authorization | RFC 8628 device codes and user codes, a scoped human verification page, explicit approval, and bounded polling. Allow the device grant on the client. |
+| Token exchange | RFC 8693 subject and optional actor tokens, revalidation against current grant state, scope narrowing, registered audiences, and visible actor chains. |
+| CIBA | Backchannel authentication, a scoped human approval page, and token polling. Poll is the advertised usable mode. Ping has schema profiles, queued notifications, and a consumer implementation, but no production profile writer or server worker wiring; push mode is refused. |
+| PAR | RFC 9126 pushed authorization requests with single-use request references. Require PAR at the environment or client level when needed. |
+| Resource indicators | RFC 8707 resource selection and registered resource-server audiences. |
+| Rich authorization requests | RFC 9396 `authorization_details` validation and grant propagation. Configure the accepted authorization-detail types. |
+| DPoP | RFC 9449 proof-of-possession handling and replay checks; optional server nonce enforcement. A plain bearer client remains supported unless its policy requires otherwise. |
+| Client authentication | `client_secret_basic`, `client_secret_post`, and `private_key_jwt`; public clients use `none` only on eligible flows. Configure the client's allowed method and trusted keys. `client_secret_jwt` is recognized but always fails closed because client secrets are stored as irreversible digests. |
+| Access-token formats | Signed RFC 9068 `at+jwt` by default; digest-backed opaque tokens can be selected by environment or resource server. |
+| Revocation and introspection | RFC 7009 revocation and RFC 7662 active-state lookup for the caller's permitted token scope. |
+| Logout | RP-initiated logout with exact registered return URLs, session termination, and optional asynchronous back-channel logout delivery. Enable the back-channel worker for actual notifications. |
+| Dynamic client registration | RFC 7591 and RFC 7592 registration, read, update, and delete. Off by default; supports initial access tokens, registration policies, verification, and abuse controls. |
+| Protected resource metadata | RFC 9728 metadata for registered hosted resources and MCP authorization discovery. |
+| Legacy certification switches | ID-token-only, `code id_token`, `none`, `form_post`, session-management iframe, and front-channel logout are explicit opt-ins. They are not the recommended application defaults. |
+
+Token signing defaults to Ed25519/EdDSA, with per-client signing selection and
+environment key provisioning for legacy-compatible asymmetric algorithms. The
+JOSE verifier's supported algorithm set is broader than the normal signing
+selection; see [signing design](adr/0005-jose-signing.md) and
+[verification design](adr/0004-jose-verification.md) rather than assuming every
+verified algorithm is a selectable issuance algorithm.
+
+Offline JWT validation checks a signature and claims, not current revocation.
+Introspection observes grant revocation immediately; a resource server that only
+validates a previously issued JWT can keep accepting it until `exp`. The default
+access-token lifetime is 300 seconds. See [token formats](design/TOKEN-FORMATS.md)
+and [agent revocation](agents.md#revocation-stated-plainly).
+
+### Authentication methods and account self-service
+
+| Capability | User experience and controls |
+| --- | --- |
+| Passwords | Native Argon2id hashing in a bounded hashing pool; imported foreign verifiers can be upgraded after successful login. Breached-password screening is on by default, using online HIBP or a configured offline corpus. |
+| Passkeys | WebAuthn registration and authentication, discoverable credentials, conditional UI, user verification, related origins, and credential management. WebAuthn is on by default within the enabled provider. |
+| Passkey-only accounts | Remove a password after fresh passkey authentication; the last-usable-method guard prevents losing the only sign-in method. |
+| TOTP and recovery codes | Authenticator enrollment, verification, single-use recovery codes, and factor management. TOTP is on by default. |
+| Email OTP and magic links | Passwordless verification flows with expiring, single-use credentials. Both methods are on by default; actual message delivery requires custom sender wiring, as described below. |
+| SMS OTP | Explicit opt-in, destination/country controls, send caps, cooldowns, conversion monitoring, and automatic route throttling. Off by default; actual SMS delivery requires custom sender wiring. |
+| MFA and step-up | Factor orchestration and RFC 9470 authentication-context policies, including fresh authentication requirements for sensitive scopes. Global MFA is not required by default. |
+| Remembered devices | Optional trusted-device enrollment, expiry, and immediate server-side revocation. Remembered MFA has a weaker context than a fresh MFA ceremony. |
+| Recovery | Independent recovery policy, expiring recovery links, delay/cancel windows, notification hooks, and guards against replacing a stronger credential through a weaker factor. The sender limitation below applies to recovery notices. |
+| Sessions | User-visible session lists, revoke one or other sessions, idle and absolute timeouts, optional peer/device binding, and management fleet revocation. |
+| Linked identities | List, explicitly link after fresh reauthentication, and unlink upstream identities under the last-usable-method guard. Upstream email is not automatically trusted. |
+| Connected applications | List remembered consents and revoke an application's consent with its refresh-family cascade. |
+| Session tokenizer | Exchange an authenticated opaque session for a short-lived JWT using named templates and separate template JWKS; optional JWT session mode. Revocation and idle-timeout limits are documented in [session-tokenizer.md](session-tokenizer.md). |
+
+The shipped binary installs logging senders for email OTP, magic links,
+new-device and recovery-cancel notices, and SMS. Dev mode captures messages
+locally. Configuring messaging providers or enabling their delivery worker does
+not connect these authentication messages to a real provider: that currently
+requires wiring custom `VerificationSender` and `SmsSender` implementations into
+the server. The messaging outbox producer covers account-linked and
+account-unlinked alerts.
+
+The password policy defaults to a 15-code-point minimum for a sole-factor password,
+an 8-code-point minimum when used as an MFA factor, Unicode acceptance, and no
+composition rule or forced rotation. These are configurable policy defaults,
+not a claim of NIST certification. See `[password_policy]`, `[password_hashing]`,
+and the authentication keys in [CONFIG.md](CONFIG.md).
+
+## Federation and enterprise onboarding
+
+| Capability | Implemented scope |
+| --- | --- |
+| Declarative OIDC federation | Store a validated connector definition, credentials, claim mapping, and trust/capability settings. A generic connector and Google, Microsoft, Apple, and GitHub presets exist; GitHub uses its OAuth user/email API path. Enable the federation runtime and configure provider credentials. |
+| Enterprise routing | Organization connections, verified-domain routing, routing rules, and per-client upstream token-capture permissions. |
+| Upstream token retrieval | Authorized applications can retrieve captured upstream credentials for their own session under client and connection capability checks. Capture is an explicit permission. |
+| Inbound SAML | IronAuth acts as a service provider: SP-initiated sign-in, HTTP POST assertion consumption, signed requests, SP metadata, pinned identity-provider keys, assertion validation, replay checks, and explicitly controlled IdP-initiated mode. |
+| Self-service setup portal | Organization-scoped, expiring portal links and sessions with intent fences for OIDC/SAML setup, SCIM setup/testing, SSO testing, IT contacts, certificate renewal, and SAML response diagnostics. |
+| Certificate operations | Replacement certificate pinning, configurable expiry sweeps, warnings, and IT-contact notification integration. |
+| Inbound SCIM 2.0 | Public-plane, connection-scoped provisioning of users and groups, parsed filters, patch operations, bulk limits, schemas, service-provider metadata, and rotatable digest-backed credentials. |
+| Outbound SCIM | Configured downstream connections, asynchronous push, reconciliation/resource state, credential references, and explicit worker activation. |
+| LDAP/AD inbound synchronization | Read-only directory connectors, TLS/bind configuration, periodic sweeps, lifecycle and membership synchronization, and connector health. There is no LDAP write-back. |
+
+Connector capabilities are deliberately machine readable. The management API
+exposes `GET .../connectors/{connector_id}/capabilities`; the
+[capability-matrix schema](capability-matrix.schema.json) describes **a federation
+connector**, not the whole IronAuth platform. In particular, the default
+`email_verified` trust is untrusted. See the
+[connector schema](connector-schema.json), [presets](../crates/ironauth-connector/src/presets.rs),
+and [federation runtime](../crates/ironauth-oidc/src/federation.rs).
+
+Outbound SAML identity-provider service is deferred. An inbound SAML service
+provider does not give IronAuth an outbound SAML IdP role.
+
+## Identity lifecycle, migration, and portability
+
+| Capability | What administrators can do |
+| --- | --- |
+| Tenants and environments | Create isolated environments within tenants, inspect them, and manage tenant suspend, resume, delete, restore, and purge lifecycle operations. Environment issuers, keys, credentials, and runtime data remain distinct. |
+| Users | Create, inspect, update, transition lifecycle state, offboard immediately or on a schedule, correlate external IDs, and revoke a user's session fleet. Session-ending transitions cascade to the relevant grants. |
+| Flexible identifiers | Register and remove typed login identifiers under environment-wide or organization-scoped uniqueness policies, with normalization and migration preflight. |
+| Identity traits | Versioned JSON Schema traits, active-schema introspection, activation checks, progressive profiling, and worker-driven migrations with per-run violations. |
+| Invitations | Provision pending-verification users, issue expiring single-use invitation links, inspect, resend, and revoke invitations. |
+| Signup policy | Per-client schema-validated signup forms, registration controls, disposable-email checks, proof-of-work, waitlist policy, and optional fraud quarantine. |
+| Bulk import | Stream newline-delimited identities into a resumable job. Stable record keys allow an interrupted run to re-present records without duplicating users; migration-run views expose progress and violations. |
+| Source importers | Offline transforms for Keycloak realm exports, Auth0 user plus password-hash exports, Firebase exports with project hash parameters, SCIM-shaped users, and LDAP entries. Gap reports disclose unmapped source data. |
+| Foreign passwords | Verify supported bcrypt, scrypt, PBKDF2, Argon2, Firebase modified-scrypt, SHA-crypt, and LDAP digest records under cost bounds; successful authentication upgrades to the native verifier. |
+| Lazy inbound migration | Call a configured legacy credential verifier on demand, with request bounds and circuit-breaker state, then create or upgrade the local credential. |
+| Identity export | Stream users, traits, lifecycle state, external IDs, tagged password verifiers, and supported factor material in the import record format. The export is authorized and audited. |
+| Outbound lazy migration | A successor identity system can use the documented credential-verification contract to migrate away without forcing every user to reset a password. |
+
+Start migrations with a validation-only importer pass and its gap report.
+Registered WebAuthn passkey private keys are not exportable from authenticators;
+the credential registry export must not be mistaken for portable passkey sign-in.
+The [exit guide](exit-guide.md) specifies exported TOTP seeds, recovery-code hashes,
+credential metadata, and other exclusions. See also
+[migration tooling](skills/migrate-to-ironauth.md),
+[user lifecycle](design/USER-LIFECYCLE.md), and [tenancy](design/TENANCY.md).
+
+## Organizations, authorization, and machine identities
+
+| Capability | Implemented policy model |
+| --- | --- |
+| Organizations and membership | Organization lifecycle, user and service-account memberships, contacts, project grants, administrative consent, and organization selection in authenticated flows. |
+| Roles and groups | Per-organization named roles, group forests, membership, role assignment, ancestor-group inheritance, effective-role reads, cycle rejection, and configurable maximum group depth. |
+| Permissions | An environment-level permission vocabulary, organization role-to-permission mappings, default roles, and optional access-token permission claims for registered resource servers. |
+| Claim budgets | Bound permission-claim count and total token size without capping stored roles or permissions. Overflow policy can require the PDP instead of emitting a truncated authorization set. |
+| AuthZEN PDP | Single and batch live permission evaluations and discovery over IronAuth's organization, group, role, and permission model. The Search APIs are deferred. |
+| External authorization | Allowlisted, additive claim enrichment at issuance and an identity-fact/event contract for synchronizing an external fine-grained authorization system. There is no built-in Zanzibar/ReBAC engine. |
+| Machine scope bounds | Per-client allowed OAuth scopes are a ceiling on what a machine grant may request. Scope allowlists do not replace RBAC permissions. |
+| API keys and PATs | Service-account or organization API keys and user personal access tokens, with explicit scopes, one-time secret display, expiry, rotation, revocation, and machine issuance controls. |
+| Workload federation | Trusted external issuers and subject mappings for JWT bearer grants. |
+| Agent principals | Organization-scoped agents linked to a human, declared exact tool scopes, optional OAuth-client binding, auditable issuance/denial, suspension, and terminal revocation. |
+| Reverse-proxy access | Forward-auth checks with ordered rules and configured proxy dialects, request matching, authentication requirements, headers, and rate limits. Off by default. |
+
+Organization group inheritance is implemented. **Parent organization inheritance
+and a combined `isEntitled` API are design work**, not runtime behavior; see
+[the hierarchy/entitlement design record](design/ORG-HIERARCHY-AND-ENTITLEMENTS.md).
+Use [coarse claims and a live PDP](design/COARSE-CLAIMS-FINE-PDP.md) to choose the
+correct authorization boundary, and [agents.md](agents.md) for agent registration,
+tool enforcement, suspension, revocation, and attribution limits.
+
+## Flows, presentation, and administration
+
+The administration console is a client of the public management API. Its
+dashboard and scoped resource pages provide lists, detail views, explicit create
+actions, lifecycle controls, diagnostics, and operational views; they do not
+define a separate administration contract. See [Admin console](ADMIN-CONSOLE.md)
+for the available pages, authentication model, and setup.
+
+The flow engine represents a persisted interaction as typed nodes and messages,
+consumed through JSON or hosted HTML. Built-in flows cover login, registration,
+consent, MFA, recovery, profiling, federation, and organization selection.
+Declarative journey artifacts add validated topology, guard predicates, reusable
+subflows, templates, immutable versions, pins, and recorded-path replay. Journey
+documents call built-in executors; they do not contain arbitrary authentication
+code or replace the executor's security checks.
+
+Presentation is configured as data: per-environment brands, typed design tokens,
+light/dark variants, sanitized rich-text slots, raster logo/favicon uploads,
+localized message bundles, and per-client signup forms. Custom challenge
+components and signed HTTP flow targets provide extension seams. Target delivery
+requires its worker and supports dead-letter inspection and replay.
+
+See [FLOWS.md](FLOWS.md), the generated [flow schema](flow-schema.json),
+[journey schema](journey-schema.json), and
+[journey artifact implementation](../crates/ironauth-journey/src/lib.rs).
+The management contract is [OpenAPI 3.1](openapi/management.json), with opaque
+cursor pagination, request idempotency, rate-limit information, and audited
+mutations. Use the current contract to check exact operations rather than
+assuming every resource supports every CRUD verb.
+
+Management `RateLimit` headers currently report fixed placeholder values; they
+do not establish an enforced request budget. Authentication quotas and
+forward-auth rate limits have separate enforcing paths. See the
+[management header implementation](../crates/ironauth-admin/src/ratelimit.rs).
+
+## Security, events, and operations
+
+| Capability | What it provides and what to configure |
+| --- | --- |
+| Tenant isolation | Typed scoped identifiers, scope-only repositories, forced PostgreSQL row-level security, and distinct control/data-plane database roles. |
+| Secret storage | Per-tenant/environment key hierarchy, sealed sensitive values, secret references, storage rekey tooling, and recovery procedures. The master key remains an operator-managed deployment secret. |
+| Outbound fetch hardening | Address validation, DNS pinning, redirect refusal, size/time bounds, and one shared outbound dispatcher for supported integrations. These controls do not make an unreachable private callback reachable. |
+| Authentication abuse controls | Bounded hashing work, tenant/environment quota admission, escalating failure regulation, durable bans, proof-of-work, signup controls, and SMS pumping limits. |
+| Risk decisions | Optional explainable new-device, travel, IP, and velocity inputs; configurable step-up thresholds and notification hooks. The risk engine is off by default, and scoring without an enforcing policy is observation. New-device notices have the authentication sender limitation described above. |
+| Recovery and admin safeguards | Recovery delay/cancel and downgrade guards, fresh-authentication checks, optional sudo freshness, and attributed impersonation. Sudo does not add an independent factor to a stolen management bearer. |
+| Audit and diagnostics | Same-transaction mutation audit, audit verification, scoped event reads, safe client-auth diagnostics, policy traces, flow inspector/dry-run, risk decisions, and warnings. Retention and verbosity are configurable. |
+| Ordered event feed | Cursor-based committed domain events for synchronization, reconciliation, SIEM, and metering. Retention expiry is explicit; truncated membership events require reconciliation. |
+| Webhooks | Event subscriptions, signed outbound deliveries, event-type selection, attempts, pause/resume, secret rotation, failure disabling, dead letters, and replay. Enable the delivery worker. |
+| SIEM streams | Scoped audit shipping to HTTP, S3, Datadog, and Splunk sinks, optional signed batches and attestations, durable cursor progress, dead letters, and replay. Enable `log_streams.shipping_enabled`. |
+| Shared Signals | SSF stream CRUD/status/verification/subject management, signed CAEP/RISC SETs, push delivery and RFC 8936 polling. Management authentication currently supports `client_secret_basic`; the receiver supplies the audience. |
+| Cross-Account Protection | Verify Google's RISC SETs and apply configured session/trusted-device revocation for identities linked to the configured connector. This is a specific receiver integration, not a general RISC policy engine. |
+| Transactional workers | PostgreSQL outbox, independent lease-based claims, bounded retry/dead-letter behavior, per-aggregate ordering, queue health, and optional IronBus wake-ups. |
+| Observability | Structured scrubbed logs, Prometheus metrics, management-plane health/readiness, graceful shutdown, and optional OTLP traces. |
+| Deployment tooling | Helm, a Debian package with systemd unit, static musl build/release lanes, database migration commands, preflight `doctor`, and storage recovery/rekey tools. The checked-in general Compose stack has build/configuration/healthcheck limitations; see [container setup](OPERATIONS.md#containers-and-the-checked-in-compose-files). |
+| Config as code | Secret-free snapshots, promotion plan/diff/apply, CLI validate/plan/apply/drift, named target-environment secret resolution, and drift inspection. |
+| Integration tooling | TypeScript verification/protocol utilities, Node BFF middleware, framework quickstarts, generated management SDKs, CLI tools, MCP library implementations, and a Terraform provider. Consult each artifact's scope and compatibility before adopting it. |
+
+For reliable reconciliation, use the [events contract](EVENTS.md), not webhook
+delivery as a change ledger; [EVENTS-VS-WEBHOOKS.md](EVENTS-VS-WEBHOOKS.md) explains
+the difference. [Signed log-stream verification](log-stream-verification.md)
+documents integrity, replay handling, vendor payload wrapping, and the current
+gap-detection limitation.
+
+Config snapshot coverage and promotion coverage differ. The engine currently
+applies `resource_server`, `dcr_policy`, `variable`, `brand`, `locale_bundle`,
+`flow_version`, and `message_template`. Clients, signup forms, and federation
+resources also export for diff/review but are not applied by promotion. Read the
+[snapshot contract and exclusions](snapshot/README.md#exported-is-not-the-same-as-promoted)
+before planning an environment copy. A snapshot excludes users, sessions,
+private keys, secret values, and other runtime/environment-identity resources.
+
+Customer-managed BYOK has store/KMS foundations but **is not wired into the
+server**. Non-default `[byok]` configuration is refused at startup. Do not
+represent those settings as active customer key protection; see
+[CONFIG.md](CONFIG.md), [key recovery](KEK-RECOVERY.md), and
+[the BYOK design record](design/BYOK-AND-SHREDDING.md).
+
+See [Operations](OPERATIONS.md), [release procedures](RELEASING.md),
+[retention](design/RETENTION.md), [performance methodology](PERFORMANCE.md), and
+[unit-cost measurements](UNIT-COSTS.md). Health checks, runtime metrics, tests,
+and benchmarks are evidence for their measured cases, not a universal throughput
+or availability guarantee.
+
+## Experimental and exploratory capabilities
+
+Every feature below defaults off and requires `enabled = true` plus the **exact
+current acknowledgment version** under `[features.<name>]`. Find that version and
+the owning changelog in the [feature maturity ladder](CONFIG.md#feature-maturity-ladder).
+Acknowledgments intentionally fail after incompatible revisions. Enable only the
+surface whose contract and limitations you have reviewed.
+
+| Feature name | Current scope and material limits |
+| --- | --- |
+| `wasm-hooks` | In-process claim-shaping components with capability, fuel, memory, deadline, and host-resource limits. Requires the Cargo feature and Rust 1.95; the WIT interface may change. |
+| `custom-domains-acme` | Custom-domain/ACME foundations, domain verification and encrypted certificate storage. Live issuance requires provisioned CA/domain infrastructure; the operational model is exploratory. |
+| `fedcm` | IdP config, accounts, assertion, and Login Status surfaces. Browser integration remains exploratory; redirect flows are unaffected. Read [fedcm.md](fedcm.md) for browser-test status. |
+| `client-id-metadata-documents` | Resolve URL client IDs using bounded HTTPS metadata fetches and domain trust/quarantine rules. It changes the registration trust model and tracks a draft. |
+| `first-party-challenge` | Browserless first-party native authentication that issues a code for the normal token endpoint. Draft protocol, distinct from the permanently refused ROPC grant. |
+| `global-token-revocation` | Strongly authenticated subject-scoped revoke-everything receiver. Draft wire contract. |
+| `risk-signals` | Signed third-party SET ingestion feeding weighted risk inputs. A signal is not an authorization verdict. |
+| `signup-quarantine` | Review queue for risky registrations with restricted authorization until release, rejection, or extension. |
+| `advanced-recovery` | Admin review, trusted-contact confirmation, and external IDV-gated recovery through the delay/downgrade guard. IronAuth does not verify identity documents itself. |
+| `org-scoped-clients` | Organization ownership schema/model for OAuth clients. This does not establish complete organization client CRUD or hierarchy inheritance. |
+| `agent-token-vault` | Sealed downstream credentials, declared agent connection bounds, configured provider refresh, and human approval for sensitive exchanges. Makes IronAuth the custodian of third-party credentials. |
+| `native-sso` | Mobile app token/device-secret pair exchanged through RFC 8693. The device secret is a bearer credential, not a hardware/device binding. See [native SSO](experimental/native-sso.md). |
+| `identity-chaining` | Receiving-side ID-JAG checks layered on JWT bearer grants. No requesting side; process-global flag and per-issuer trust limits apply. See [identity chaining](experimental/identity-chaining.md). |
+| `transaction-tokens` | Short-lived internal request tokens under a configured trust domain. No replacement flow; authorization data contains narrowed scopes. See [transaction tokens](experimental/transaction-tokens.md). |
+| `attestation-client-auth` | Attester-configured client attestation and possession proof. Proof `jti` replay recording is not wired. See [attestation auth](experimental/attestation-client-auth.md). |
+| `authzen-agent-profile` | Agent tool decisions intersect declared tools with the linked human's organization permissions. IronAuth-specific composition, not a claim of draft-profile conformance. See [agent profile](experimental/authzen-agent-profile.md). |
+| `access-request-approval` | Time-boxed request/decision records and separation of duties. Management effective-role reads can display the grants, but token issuance and AuthZEN decisions do not consume them. |
+| `device-posture-policy-hooks` | Verify signed MDM/EDR signals and evaluate CEL predicates. No data-plane grant/session/token enforcement calls this evaluator yet. |
+| `admin-portal-widgets` | Read-only organization-scoped SSO/SCIM JSON with bearer-only authentication for a vendor's own frontend. Shape is exploratory. |
+
+`sample-experimental` exists solely to exercise configuration acknowledgment; it
+does not gate a product capability. The
+[feature registry](../crates/ironauth-config/src/features.rs) is the source for
+registered flags. Other exploratory WebAuthn options, such as Signal API and
+conditional-create enrollment, have their own default-off OIDC settings and
+browser support constraints.
+
+## Deliberate exclusions and deferred work
+
+The server does not offer ROPC, implicit **access-token** issuance, plain PKCE,
+wildcard redirects, unsecured `alg: none`, or a public-token HMAC verification
+path. Its authorization model does not include a Zanzibar/ReBAC engine, full IGA,
+PAM, session recording, embedded JavaScript plugins, or a second primary database.
+These are deliberate boundaries, not missing configuration.
+
+JAR request objects and JARM response modes are not implemented by the current
+provider registries. Do not infer them from the implemented PAR endpoint or
+asymmetric JWT support. Similarly, the repository's conformance harness does not
+establish FAPI certification. Outbound SAML IdP, LDAP write-back, a Kubernetes
+operator, and several legacy protocol facades remain deferred. Read
+[WILL-NOT-IMPLEMENT.md](WILL-NOT-IMPLEMENT.md) for the distinction between refusal
+and deferral, and check implementation or an artifact changelog before treating
+a design document or issue-tracker milestone as a shipped feature.
 
 ---
 
@@ -308,7 +1083,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `admin.offboarding_retention_secs` | integer | `2592000` | The tenant-offboarding retention window in seconds (issue #46): the grace period during which a soft-deleted (offboarded) tenant can be RESTORED with no data loss, after which the terminal hard deletion (crypto-shred) is due. Tunable, with a safe default of 30 days (`2_592_000` seconds): long enough that an accidental offboarding is recoverable, so the erasure is never a one-way surprise. A restore is refused once the window elapses; a hard delete is refused until it does. |
 | `admin.sudo_mode_enabled` | boolean | `false` | Whether admin sudo mode (session privilege separation) is active on the management surface (issue #73). OFF by default: it is an exploratory bet, gated behind a per-environment flag and a graduation decision. When ON, admin READS are unaffected but a MUTATION requires a RECENT re-authentication: the acting credential must have a recorded elevation whose freshness window has not lapsed, evaluated the same way step-up (issue #72) evaluates a max-auth-age window. A mutation without a fresh elevation returns a structured RFC 9470 challenge (`insufficient_user_authentication`) and executes nothing. The enforced guarantee is that the elevation is SERVER-RECORDED and never CLIENT-ASSERTED: it derives only from a server-written re-auth event, never from a client-supplied header or flag, so a forged header cannot elevate. CAVEAT: because the admin plane authenticates via a single non-interactive bearer credential with NO second factor, sudo mode does NOT yet defeat a fully-stolen admin bearer, which can call the elevate endpoint itself and then mutate. It bounds a header-forgery or replay path, not a stolen bearer. Binding elevation to a distinct interactive re-auth factor (an operator passkey) is a documented graduation step; the freshness seam is factored so end-user application sessions, which have that factor split, get the full guarantee. When OFF, the admin surface behaves exactly as before (no freshness gate). Independent of every other flag. |
 | `admin.sudo_mode_window_secs` | integer | `600` | The admin sudo re-authentication freshness window, in seconds (issue #73): how long a recorded elevation authorizes admin mutations before a fresh re-authentication is required. Only consulted when `sudo_mode_enabled` is true. The default (600) is ten minutes, the GitHub-sudo-mode convention. A tunable with a safe default; a shorter window trades operator friction for a tighter blast radius on a stolen credential. |
-| `admin_spa` | table | see fields | Admin console SPA settings (issue #90): the in-process serving of the Preact admin console on the public plane under `/admin`. Off by default: PR1 ships the serving skeleton (a static shell over the public management API, no auth yet), so a default deployment mounts nothing and every `/admin` path is a uniform 404. A later change flips the default on once the console is functional. |
+| `admin_spa` | table | see fields | Admin console SPA settings (issue #90): the in-process serving of the Preact admin console on the public plane under `/admin`. The working console is embedded in the binary and uses Authorization Code + PKCE against the configured admin issuer. Opt in with `enabled`; while off, every `/admin` path is a uniform 404. The same-origin `/admin/api` proxy is available only when the OIDC bridge is configured and the management plane is mounted. See `docs/ADMIN-CONSOLE.md` for setup and capabilities. |
 | `admin_spa.admin_issuer_environment` | string or unset | unset | The environment identifier of the ADMIN ISSUER (issue #90, PR 2), paired with `admin_issuer_tenant`. Together they name the system environment the console signs in against. Unset leaves the bridge disarmed (fail closed). |
 | `admin_spa.admin_issuer_tenant` | string or unset | unset | The tenant identifier of the ADMIN ISSUER (issue #90, PR 2): the system `(tenant, environment)` whose OIDC provider the console signs in against. The console obtains a short-lived `at+jwt` from this issuer and the management API verifies it against exactly this issuer's published JWKS (never any issuer). Unset leaves the OIDC credential bridge disarmed (fail closed): no `at+jwt` is ever accepted by the management API and the console can authenticate only if a bootstrap operator token path is used out of band. This is a bounded identifier datum; it carries no secret. |
 | `admin_spa.console_client_id` | string or unset | unset | The PUBLIC OAuth client identifier the console uses for its Authorization Code + PKCE sign-in (issue #90, PR 2). A public client holds no secret, so this is a bounded identifier the browser reads from served config; it is never a credential. Unset leaves the console with no client to log in as. |
@@ -335,8 +1110,8 @@ at the top of the file, or map it in `.taplo.toml`).
 | `database` | table | see fields | Primary database settings. |
 | `database.master_key` | string or table or unset | unset | The platform envelope master key (issue #48): a high-entropy secret from which the per-tenant key hierarchy that seals classified PII columns (login handles, standard claims) at rest is derived. Supply it out of band (`{ env = "IRONAUTH_MASTER_KEY" }` or `{ file = "..." }`); a stable value is required across restarts, because every wrapped tenant key depends on it. Unset leaves the encrypted-PII paths (registration, login, `UserInfo`) failing closed rather than storing plaintext; a production deployment must set it. |
 | `database.master_key_id` | string or unset | unset | The identifier of the platform envelope master key (issue #153): a LABEL recorded on every KEK this deployment wraps, not key material. Changing it does not break existing rows, because the read path rebuilds each KEK's AAD from the id stored in that row and key material is an HMAC over `master_key` alone; what it does is label new KEKs differently from every row already written, splitting the population a later rotation has to find. Changing `database.master_key` and running `ironauth storage rekey` rotates the key MATERIAL, and that command now REFUSES to unless `--i-will-rebuild-lookups` is passed, because it rewraps keys and rebuilds none of the fifteen blind indexes derived from the secret: every identifier lookup would stop matching, silently. Must be non-empty and free of `:`, the separator that command splits its master-key arguments on, or the server refuses to resolve a master key at all. Defaults to `master-1`, which every existing deployment has already written into its rows. |
-| `database.password` | string or table or unset | unset | Database password supplied out of band, overriding any password embedded in `url`. |
-| `database.url` | string | `"postgres://ironauth@localhost:5432/ironauth"` | Postgres connection string. Embedding the password here is discouraged; prefer the `password` secret, which is merged at connection time. |
+| `database.password` | string or table or unset | unset | Reserved out-of-band database password setting. The current serving connection paths do not use it to override or complete `url`. |
+| `database.url` | string | `"postgres://ironauth@localhost:5432/ironauth"` | Postgres connection string used directly by the serving connection paths. Include any required password in this DSN and protect the config file or Kubernetes Secret that holds it; `password` is not merged into this value. |
 | `dev_mode` | boolean | `false` | Development mode. Relaxes operational nagging (currently: the literal-secret warning) but never relaxes parse strictness or the feature acknowledgment gate. Never set this in production. |
 | `diagnostics` | table | see fields | Admin diagnostics settings (issue #91): the verbosity and retention of the out-of-band client-authentication diagnostics sink the M9 admin flow inspector reads. Safe defaults: `standard` verbosity (the rich failure reason plus the assertion header, never a derived skew or hint) and a seven day retention (config load rejects a retention above the ninety day ceiling). `off` makes recording a no-op; verbosity never widens what a diagnostic can REPRESENT, only which safe fields populate. |
 | `diagnostics.retention_secs` | integer | `604800` | How long a client-authentication diagnostic is retained before the on-insert prune reclaims it, in seconds. Default seven days ([`DIAGNOSTICS_DEFAULT_RETENTION_SECS`]); config load rejects a value above the ninety day ceiling ([`DIAGNOSTICS_MAX_RETENTION_SECS`]). This replaces the former hard-coded store constant and is threaded into the prune. |
@@ -715,8 +1490,11 @@ Source: docs/EMULATOR.md
 
 # The local emulator: `ironauth dev`
 
-One command brings up a real IronAuth server for development and CI, with no external
-services, no network egress, and no accounts to create.
+One command brings up a real IronAuth server for development and CI, using local
+PostgreSQL binaries with no separately running services and no accounts to create.
+The seeded development workflow uses no external provider. Some production
+features perform outbound requests when explicitly exercised, such as the online
+breached-password check; do not treat dev mode as a network sandbox.
 
 ```
 ironauth dev
@@ -725,18 +1503,47 @@ ironauth dev
 It is the same binary and the same code paths a deployment runs. It is not a mock, and it is
 not a second implementation that can drift from the real one.
 
+## Run the local development emulator
+
+Use the local development emulator with a deterministic seed for offline
+application sign-in tests. The recipe below starts a seeded provider without
+connecting to an external service.
+
+Install the repository's pinned Rust toolchain and PostgreSQL binaries, including
+`initdb`, `pg_ctl`, and `psql`. Run as an ordinary user; PostgreSQL initialization
+refuses root. The emulator looks at `PG_BIN` first, then installed binary paths.
+For Homebrew PostgreSQL 17, set `PG_BIN="$(brew --prefix postgresql@17)/bin"` if
+automatic discovery fails.
+
+From the repository root:
+
+```sh
+cargo build --locked -p ironauth
+env -u DATABASE_URL ./target/debug/ironauth dev --seed 1
+```
+
+Removing `DATABASE_URL` for this command selects the managed throwaway cluster.
+Use the printed issuer URL and management port; they are not interchangeable.
+The default public bind is `127.0.0.1:8080`, and `--bind 127.0.0.1:8081` can
+select another loopback port. The admin console is not enabled in the generated
+development configuration. See [operations](OPERATIONS.md) and
+[console setup](ADMIN-CONSOLE.md) for a dashboard deployment.
+
 ## What you get
 
 ```
 ironauth dev: fake upstream IdP at http://127.0.0.1:58724
 ironauth dev: issuer http://127.0.0.1:8080/t/ten_.../e/env_...
 ironauth dev: client_id cli_... (public, redirect http://127.0.0.1/callback)
+ironauth dev: machine identity sva_... (owned by client cli_...)
+ironauth dev: operator token ironauth-dev-operator-token-not-for-production
+ironauth dev: management http://127.0.0.1:58729
 ironauth dev: user dev@example.test / dev-password-not-for-production
 ironauth dev: captured messages at http://127.0.0.1:58737/
 ```
 
-- **A throwaway database**, brought up by this process and deleted when it exits. Set
-  `DATABASE_URL` to use one you already have instead.
+- **A throwaway database**, brought up by this process and deleted on normal shutdown.
+  Set `DATABASE_URL` only to use a separately managed local development database.
 - **A seeded identity landscape**: an operator, tenant, environment, organization, a public
   client registered for the loopback redirect, and a user with a known password.
 - **Capture sinks instead of providers.** Email and SMS are not sent anywhere; they are
@@ -744,18 +1551,36 @@ ironauth dev: captured messages at http://127.0.0.1:58737/
   without a mail server.
 - **A fake upstream IdP** on its own loopback listener, for exercising federation offline.
 
+The identifiers and ephemeral ports above are illustrative. Discovery and hosted
+login routes use the printed `/t/<tenant>/e/<environment>` issuer. Management
+calls use the separately printed URL with the development operator bearer; never
+put that bearer into browser configuration. The seeded machine identity belongs
+to a separate workload client.
+
+When `DATABASE_URL` is supplied, the emulator does **not** provision roles, apply
+migrations, seed identities, or print the seeded issuer/client/management values.
+Prepare that database yourself and inspect the generated development
+configuration for its management listener. This mode is for a database whose
+lifecycle you already manage, not a shortcut for seeding persistent installations.
+Ctrl-C or SIGTERM performs normal cluster cleanup. A hard kill cannot run cleanup;
+an interrupted cluster may need manual removal from the temporary directory.
+
 ## Determinism, and what it is for
 
-Everything above derives from `--seed` (default `1`). The same seed produces the same tenant
-id, the same client id, and the same one-time codes, on any machine. That is what lets a CI
-job assert an exact code rather than whatever happened to be generated:
+Seeded identifiers and runtime entropy derive from `--seed` (default `1`).
+The same seed produces the same tenant
+id, the same client id, and the same one-time codes for the same request sequence.
+Listener ports are ephemeral and the clock remains real so expiry works normally.
+That is what lets a CI job assert an exact code rather than whatever happened to
+be generated:
 
 ```
 ironauth dev --seed 1
 ```
 
-Change the seed and every identifier changes with it. Pin the seed in CI and the job fails
-loudly if reproducibility ever breaks, instead of passing against a moving target.
+Change the seed and the seeded tenant, environment, and client identifiers change.
+The published development user password and operator token remain fixed constants.
+Pin the seed in CI so the job fails loudly if reproducibility breaks.
 
 ## Reading a one-time code
 
@@ -799,10 +1624,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql
 
+      - name: Build the server
+        run: cargo build --locked -p ironauth
+
       - name: Start the emulator
         run: |
-          PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
-          ironauth dev --bind 127.0.0.1:8080 --seed 1 > dev.log 2>&1 &
+          env -u DATABASE_URL \
+            PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
+            ./target/debug/ironauth dev --bind 127.0.0.1:8080 --seed 1 > dev.log 2>&1 &
           for _ in $(seq 1 100); do
             issuer=$(grep -o 'issuer http://[^ ]*' dev.log | head -1 | sed 's/issuer //')
             if [ -n "$issuer" ] && curl -sf -o /dev/null \
@@ -832,8 +1661,7 @@ jobs:
           code=$(curl -s "$SINK" | jq -r '[.messages[] | select(.kind=="email")][-1].body')
 
           # 3. Assert the DETERMINISTIC code for this seed. Without this the job passes
-          #    against any code at all, and a regression that broke reproducibility -- the
-          #    property the whole seeded emulator rests on -- goes unnoticed.
+          #    against any code at all, and a reproducibility regression goes unnoticed.
           [ "$code" = "334158" ] || {
             echo "code $code is not the expected 334158 for seed 1"; exit 1; }
 
@@ -7730,6 +8558,154 @@ client logic.
 
 ---
 
+# Integrating applications and automation
+
+Source: docs/INTEGRATIONS.md
+
+# Integrating applications and automation
+
+Use IronAuth's public protocols for application sign-in and its management
+API for administration. Choose the integration path that fits your runtime;
+the repository supplies working examples and helpers rather than requiring
+a particular SDK.
+
+## Quickstarts
+
+| Application | Starting point | What it demonstrates |
+| --- | --- | --- |
+| React SPA | [React quickstart](quickstart-react.md) | A React frontend with a BFF that holds tokens server-side. |
+| Next.js App Router | [Next.js quickstart](quickstart-nextjs.md) | Login/callback routes and an opaque browser session backed by `@ironauth/bff`. |
+| Go backend | [Go quickstart](quickstart-go.md) | User authentication and token verification against a local issuer. |
+| Python backend | [Python quickstart](quickstart-python.md) | User authentication and verification without requiring a bespoke sign-in SDK. |
+| iOS / Android | [AppAuth guide](mobile-appauth.md) and [mobile samples](../clients/mobile/) | System-browser sign-in with PKCE; review the documented per-client DPoP exemption for AppAuth. |
+
+Quickstarts use the [local emulator](EMULATOR.md). Their marked shell blocks
+are executed by `scripts/quickstart.sh`; read the runner's prerequisites
+before running a quickstart as an automated check. The TypeScript helpers
+are currently built and packed from the repository, rather than installed
+from a published npm release.
+
+For a persistent deployment, register a client in the correct tenant and
+environment, use its scoped issuer, and configure exact redirect URIs.
+Public clients use PKCE and are subject to the issuer's DPoP policy. Client
+secrets belong in confidential server components.
+
+## Browser applications
+
+The recommended integration holds access and refresh tokens on your server
+and gives the browser an opaque session cookie. The
+[BFF guide](bff.md) explains the browser architecture choices and the
+[BFF package](../packages/ironauth-bff/README.md) documents the handlers.
+
+`@ironauth/bff` provides login, callback, logout, userinfo, and API proxy
+handlers; adapters for Fetch and Node-style request/response runtimes;
+discovery and DPoP helpers; and RFC 9470 step-up challenges and redirects.
+State-changing requests require `X-IronAuth-BFF`. Its development
+`MemorySessionStore` loses sessions on restart and does not share them
+between replicas; implement `SessionStore` using durable shared storage
+for a persistent multi-instance application.
+
+The React and Next.js guides use these handlers. There is no separate
+published React hook library or Next.js SDK in the current tree.
+
+## Hosted and custom authentication pages
+
+The server renders its own hosted sign-in, registration, recovery, consent,
+MFA, passkey, device, logout, and organization pages. Branding and locale
+configuration are managed per environment.
+
+For custom pages, fork [the reference app](../packages/reference-app/README.md)
+and consume the [headless flow contract](FLOWS.md). The server owns the
+authentication decisions and validates every submission. A custom renderer
+must serve its own restrictive security headers; the built-in pages' headers
+do not automatically protect a separately hosted frontend.
+
+## APIs and token verification
+
+Use discovery at `{issuer}/.well-known/openid-configuration` and the
+advertised JWKS. Validate signatures, exact issuer, audience, allowed
+algorithm, and token lifetime. An access token and an ID token serve
+different purposes; do not treat decoding a JWT as verification.
+
+| Runtime / task | Repository support |
+| --- | --- |
+| TypeScript / WebCrypto | [SDK modules](../packages/ironauth-sdk/README.md) for verification, JWKS caching, OAuth/PKCE, DPoP, protected-resource metadata and challenges, authorization checks, and diagnostics. |
+| Edge platforms | [Runtime support and evidence](edge-verification.md), WebCrypto snippets, and a Rust Fastly Compute snippet. Some runtime claims are explicitly inferred rather than measured on a hosted platform. |
+| Java | [Dependency-free verification implementation and samples](../sdks/java/README.md); verification only. |
+| .NET | [Verification implementation and samples](../sdks/dotnet/README.md); verification only. |
+| Session-derived JWTs | [Session tokenizer](session-tokenizer.md), using a configured audience, TTL, claim rules, and template-specific keys. |
+
+Self-contained signature verification does not learn about revocation
+immediately. Tokens remain verifiable until expiration; use introspection
+when a resource server needs current server-side grant state. Tokenized
+sessions have the same TTL tradeoff. See the [agent revocation contract](agents.md)
+and [session tokenizer](session-tokenizer.md).
+
+## Authorization
+
+The TypeScript SDK's `check()` has three configured resolvers: permissions
+in an already verified access token, IronAuth's AuthZEN endpoint, or a
+customer's compatible PDP. Failure returns deny. See the
+[SDK guide](../packages/ironauth-sdk/README.md).
+
+Permissions, organization membership, and grants are separate from the act
+of signing in. Register resource-server scopes and permission mappings in
+the intended environment. The [capability guide](CAPABILITIES.md) describes
+the current AuthZEN, organization, and experimental agent-policy limits.
+
+## Management and automation
+
+The [committed OpenAPI specification](openapi/management.json) describes
+administrative operations. The server serves it at `GET /openapi.json`
+on the management plane when that API is mounted. Use a credential with
+the minimum required permissions and keep management access restricted.
+
+| Client | Current coverage and use |
+| --- | --- |
+| [Admin console](ADMIN-CONSOLE.md) | Selected administration workflows over the public management API, with browser OIDC login mapped to operator subjects. It is not a UI for every API operation. |
+| Go (`sdks/go`) and Python (`sdks/python`) | Generated management clients, checked against the public specification. They are administration clients, not a replacement for application OAuth/OIDC verification. |
+| `ironauth validate/plan/apply/drift` | Configuration-as-code workflows. Snapshot export is broader than apply support; check the [capability guide](CAPABILITIES.md) before planning a promotion. |
+| [Terraform provider](../terraform-provider-ironauth/) | Tenant resource only at present. Its provider-coverage check is a ratchet, not evidence of complete API coverage. Configure credentials through `IRONAUTH_ENDPOINT` and `IRONAUTH_TOKEN` or provider arguments. |
+| [Admin MCP](../packages/ironauth-mcp/README.md) | Advertises declared tools only when the scoped key has their permissions. Destructive calls require `confirm: true`, and mutations carry the MCP audit entry path. This is a library implementation, not a complete MCP transport deployment. |
+| [Docs MCP](../packages/ironauth-docs-mcp/README.md) | Read-only `search_docs` / `read_doc` over [the generated documentation corpus](llms-full.txt), with no management credential. |
+
+List operations use opaque cursor pagination. Preserve the returned cursor
+and honor the configured page limit. Supply an `Idempotency-Key` when the
+operation requires one and handle typed errors and rate limits. The
+[SDK contract](SDK-CONTRACT.md) defines which wire values clients can rely on.
+
+## Provisioning and migration
+
+IronAuth implements inbound SCIM provisioning and outbound SCIM push,
+LDAP synchronization, bulk import, and migration workflows. Configure the
+connection, scope, credentials, mapping, and worker requirements described
+in [capabilities](CAPABILITIES.md) and [operations](OPERATIONS.md). A stored
+connection alone does not establish that every worker is enabled.
+
+Follow the [exit guide](exit-guide.md) for portable exports and the
+[migration skill](skills/migrate-to-ironauth.md) for migration planning.
+Previously stored password hashes use the bounded supported verification
+schemes in the [hash-scheme guide](../crates/ironauth-hash-scheme/README.md).
+
+## Agents and MCP resources
+
+[Agent principals](agents.md) carry an organization, linked human, and
+declared tool scopes. Issuance enforces the declared scopes, and revocation
+affects the agent's grants. Workload federation and ordinary service
+accounts have different identity contracts; use the
+[capability guide](CAPABILITIES.md) to choose between them.
+
+The [MCP sample resource server](../packages/mcp-sample/) demonstrates
+protected-resource metadata, OAuth challenges, and token verification;
+the [conformance page](conformance/mcp.md) states what its recorded tests
+actually measure. The separate admin MCP package drives management tools.
+
+Draft agent and transaction protocols are opt-in prototypes. Read their
+[individual guides](README.md#experimental-protocols) and versioned
+configuration acknowledgements before adopting them.
+
+---
+
 # Recovering a wrapped KEK hierarchy
 
 Source: docs/KEK-RECOVERY.md
@@ -7881,6 +8857,382 @@ NAME with the same secret, which moves rows to a new generation and leaves every
 
 ---
 
+# Running and operating IronAuth
+
+Source: docs/OPERATIONS.md
+
+# Running and operating IronAuth
+
+IronAuth runs as one server binary with PostgreSQL as its required persistent
+store. Protocol endpoints and user-facing pages use the public data plane;
+administration, probes, and metrics use a separate management plane. Enabling a
+listener does not automatically enable every protocol or the admin console.
+
+Use the [capability guide](CAPABILITIES.md) to choose surfaces, the generated
+[configuration reference](CONFIG.md) for exact settings and defaults, and the
+[management OpenAPI contract](openapi/management.json) for administration.
+IronAuth is pre-1.0; check the owning artifact's changelog before upgrading.
+
+## Start locally
+
+Install Rust using the repository's `rust-toolchain.toml` and install PostgreSQL
+binaries, including `initdb`, `pg_ctl`, and `psql`. No running PostgreSQL service
+is needed for the emulator. From the repository root:
+
+```sh
+cargo build --locked -p ironauth
+env -u DATABASE_URL ./target/debug/ironauth dev --seed 1
+```
+
+Run this as an ordinary user because `initdb` refuses root. Set `PG_BIN` to the
+directory containing your PostgreSQL binaries if they are not found automatically.
+For example, a Homebrew PostgreSQL installation can be selected with
+`PG_BIN="$(brew --prefix postgresql@17)/bin"` before starting the emulator.
+
+The emulator starts on `http://127.0.0.1:8080`. Its output supplies the scoped
+issuer URL, public client ID, loopback management URL, development operator token,
+seeded user's credentials, and capture-sink URL. Copy the printed issuer URL;
+discovery lives at `<issuer>/.well-known/openid-configuration`, not at the
+deployment root. The admin console is not enabled by this command. See the
+[emulator guide](EMULATOR.md) for login tests, deterministic secrets, cleanup,
+and the current offline federation limitation.
+
+To put the binary on your PATH instead of using `target/debug`:
+
+```sh
+cargo install --locked --path crates/ironauth
+ironauth --version
+```
+
+The default server artifact supports Rust 1.85. Building the optional
+`wasm-hooks` feature requires Rust 1.95 or newer, and runtime use also requires
+the `wasm-hooks` experimental feature acknowledgment. The pinned development
+toolchain may be newer than either minimum. Node is needed to develop or rebuild
+the console; Rust builds use its committed embedded assets. See
+[compatibility](COMPATIBILITY.md) and the
+[console package guide](../packages/admin-spa/README.md).
+
+## Configure a persistent deployment
+
+Provision a PostgreSQL database and the three roles named by the migration
+grants: `ironauth_app`, `ironauth_control`, and `ironauth_audit_retention`.
+Migrations deliberately do not create these roles or assign passwords. Configure
+credentials and database access with your database administrator. Runtime
+application and control roles must not be superusers, schema owners, or have
+`BYPASSRLS`; the application and control credentials are distinct.
+
+Run the schema migration with a separately controlled migration credential that
+can create and alter the schema and apply its grants:
+
+```sh
+ironauth migrate --url "$MIGRATION_DSN"
+```
+
+`serve` does not apply migrations. A fresh database receives the full chain.
+On upgrades, the default policy defers only a trailing group of contract
+migrations. A contract migration followed by pending non-contract work applies
+with that chain, so inspect the migration report and rollback compatibility
+before deploying. Do not give the migration credential to serving processes.
+
+Here is a minimal persistent-provider configuration. Replace the example URL
+and application DSN, and provide each referenced secret to the process before
+launch. The data-plane connection currently reads `database.url` directly: put
+the full connection string there rather than relying on `database.password` to
+override it. Keep the configuration file protected because it contains a DSN.
+
+```toml
+[server]
+bind = "0.0.0.0:8443"
+management_bind = "127.0.0.1:9443"
+public_url = "https://id.example.com"
+shutdown_grace_secs = 25
+
+[database]
+url = "postgres://ironauth_app:REPLACE_ME@db:5432/ironauth"
+master_key = { env = "IRONAUTH_MASTER_KEY" }
+
+[admin]
+control_database_url = { env = "IRONAUTH_CONTROL_DSN" }
+bootstrap_operator_token = { env = "IRONAUTH_BOOTSTRAP_OPERATOR_TOKEN" }
+
+[oidc]
+enabled = true
+```
+
+```sh
+ironauth serve --config /etc/ironauth/ironauth.toml
+```
+
+The envelope master key is a stable, high-entropy secret held outside the
+database. Without it, encrypted user and login paths fail closed. Losing it
+cannot be repaired with a database backup. Unknown TOML keys abort startup;
+arbitrary `IRONAUTH_*` environment variables are not a configuration overlay.
+Only explicit `{ env = "..." }` and `{ file = "..." }` secret references are
+resolved where the consuming path supports them.
+
+`server.public_url` is the external origin used to construct issuers and
+endpoints. Ports 8443 and 9443 do not imply TLS: the server's listeners are HTTP,
+so terminate TLS in a reverse proxy or ingress. Configure the actual public URL
+and proxy trust settings explicitly; defaults trust no forwarding headers.
+Bind the management plane privately, or restrict it with network policy when
+it must listen on pod interfaces.
+
+## Bootstrap a tenant and verify the provider
+
+The management API mounts only when a bootstrap operator token is configured
+and the control-plane store can open. In production, an unset
+`admin.control_database_url` prevents it from mounting. Setting only
+`oidc.enabled` provides no tenant or environment to serve.
+
+With a management connection on loopback, create your first tenant explicitly:
+
+```sh
+curl --fail-with-body http://127.0.0.1:9443/v1/tenants \
+  -H "Authorization: Bearer $IRONAUTH_BOOTSTRAP_OPERATOR_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: first-tenant-v1' \
+  --data '{"display_name":"Example","environment_display_name":"development","environment_kind":"dev"}'
+```
+
+The response contains `tenant.id` and `environment.id`. Creation provisions
+the first environment and its signing keys in the same transaction. Save those
+IDs as `TENANT_ID` and `ENVIRONMENT_ID`, then check the public issuer:
+
+```sh
+curl --fail-with-body \
+  "https://id.example.com/t/$TENANT_ID/e/$ENVIRONMENT_ID/.well-known/openid-configuration"
+```
+
+Supply an `Idempotency-Key` for management POSTs whose public contract requires
+one, including tenant creation. Naturally repeatable operations such as sudo
+elevation document it as optional. Reuse a key only when replaying the identical
+operation and body. Production environments have
+additional guardrails, including a configured custom domain; use the typed
+errors to correct those requirements rather than relabeling production as dev.
+
+Provision users and scoped management credentials through the documented
+management API. Register application clients through Dynamic Client Registration,
+independently enabled with `oidc.registration_enabled`; its default exposure mode
+requires an initial access token minted through management. Configure resource
+servers through the supported snapshot/promotion path. The management API does
+not currently offer generic client or resource-server creation endpoints. Neither
+a bootstrap token nor an environment management credential is an end-user login
+credential.
+
+## Enable the dashboard and login screens
+
+`admin_spa.enabled = true` serves the embedded console at `/admin/` on the public
+plane. Console login additionally needs an admin issuer tenant and environment,
+a public Authorization Code + PKCE client authorized for `openid ironauth.manage`,
+a registered management resource audience with `token_format = "at_jwt"`, and
+an allowed operator subject. Opaque access tokens do not authenticate to the
+management OIDC bridge. Configure
+`admin_spa.admin_issuer_tenant`, `admin_spa.admin_issuer_environment`,
+`admin_spa.console_client_id`, `admin_spa.management_audience`, and
+`admin_spa.operator_subjects` with the provisioned values. Register the console's
+redirect URL `<public_url>/admin/` on its client. An empty subject
+allowlist authorizes nobody.
+
+The console currently sends no DPoP proofs, so its public client must also have
+`allow_bearer_tokens = true` set through the operator-only client bearer-token
+posture endpoint. This explicitly exempts that client from the public-client
+DPoP requirement and makes its access token a bearer credential. Follow the
+[console setup guide](ADMIN-CONSOLE.md#enable-and-configure-sign-in) for the
+exact management request, and keep this exception scoped to the console client.
+
+The embedded console receives these non-secret identifiers from the server and
+uses `/admin/api` as its same-origin management proxy. This proxy is armed only
+when the admin OIDC bridge is configured, and verifies the exact issuer,
+audience, and operator mapping. Do not place bootstrap or management bearer
+tokens in browser configuration. See the
+[console guide](ADMIN-CONSOLE.md) for the UI, authorization, and
+embedded or standalone deployment.
+
+End-user application sign-in starts through a registered client's OAuth
+authorization request. The scoped `/login`, `/register`, and `/consent` pages
+belong to that flow. The headless flow API (`flows.enabled`) and the hosted flow
+render app (`hosted_pages.enabled`) are separate opt-ins; see
+[the flow contract](FLOWS.md) and the integration quickstarts.
+
+CLI sign-in stores its credential in the platform keychain and uses browser
+loopback login where available, with device authorization as a fallback:
+
+```sh
+ironauth login --issuer "$ISSUER" --client-id "$CLIENT_ID" --account staging
+ironauth logout --account staging
+```
+
+The client must permit the selected grant and redirect. `--device` and
+`--loopback` choose the flow explicitly; `--redirect` supplies a loopback
+redirect; `--force` requests a fresh login even when a usable credential exists.
+`logout` clears local stored credentials; it does not claim to revoke every
+remote session. The config-as-code CLI separately accepts its API URL and
+bearer credential; it does not automatically consume the keychain entry.
+
+## Deploy on Kubernetes
+
+The [Helm chart guide](../charts/ironauth/README.md) has the install sequence and
+the exact values. The chart creates the server Deployment, public Service,
+ServiceAccount, configuration Secret, and disruption budget. It does not deploy
+PostgreSQL, apply migrations, install an ingress, terminate TLS, or create a
+tenant. Provision those prerequisites explicitly.
+
+For advanced settings, including the dashboard, use a complete operator-owned
+configuration Secret via `database.existingConfigSecret`. This avoids adding
+settings to values that the chart does not read. The Secret must contain
+`ironauth.toml`. You can include an additional `control-dsn` file and use
+`control_database_url = { file = "/etc/ironauth/control-dsn" }` because the whole
+Secret is mounted there. The chart only injects the master-key and bootstrap
+token environment references that its documented values configure.
+
+For a single-node development cluster, `replicaCount: 1` is an explicit choice;
+the default is three replicas with node spreading and a disruption budget. A
+local image must be made available to the cluster nodes, and the chart's
+`image.repository` and `image.tag` must name that image. See
+[release and image verification](RELEASING.md) before selecting a published image.
+
+## Containers and the checked-in Compose files
+
+`deploy/Dockerfile` packages an already-built, static Linux binary. Its build
+context must contain that binary as `ironauth`; it does not compile Rust. Build
+the artifact for the container's target architecture using the musl release
+lane, then build the image with that artifact directory as the context:
+
+```sh
+docker build -f deploy/Dockerfile -t ironauth:local /path/to/artifact-directory
+```
+
+The scratch image runs as UID/GID 65532 and contains no shell, package manager,
+or curl. Supply `serve --config PATH` arguments and a mounted configuration
+when launching it. Its process cannot execute a shell-based healthcheck.
+
+The checked-in `deploy/docker-compose.yml` currently describes a development
+PostgreSQL and collector topology, not a working one-command full-provider
+launch: its build expects a root-level prebuilt binary, its healthcheck calls
+curl absent from the shipped image, and its bundled configuration leaves OIDC
+and the management API disabled. The configuration also relies on the currently
+unused database-password override. Use the emulator or the Helm sequence above
+for a complete launch. The separate
+[conformance Compose stack](../deploy/conformance/README.md) has its own
+configuration and runbook.
+
+## Observe readiness and diagnose a rollout
+
+Probe the management plane, not the public Service:
+
+```sh
+curl --fail-with-body http://127.0.0.1:9443/healthz
+curl --fail-with-body http://127.0.0.1:9443/readyz
+curl --fail-with-body http://127.0.0.1:9443/metrics
+```
+
+| Probe result | Meaning and action |
+| --- | --- |
+| `/healthz` returns 200 | The process is serving; this does not prove a configured protocol is usable. |
+| `/readyz` returns `ready` | The serving pool answered a database query and optional configured components answered. |
+| `/readyz` returns 200 `degraded: <tier>` | An optional component is absent or unavailable. Traffic stays routed; inspect the body and component logs. |
+| `/readyz` returns 503 `not ready: database unreachable` | Restore the serving database connection. |
+| `/readyz` returns 503 `not ready: schema not migrated` | Apply the required schema before continuing the rollout. |
+| Readiness includes `probe=...` | A weaker probe was used, such as a listener-only skeleton; verify which serving planes actually mounted. |
+| Management `/v1/*` returns 404 | Check the bootstrap token, control DSN, and startup logs for a plane that did not mount. |
+| Public discovery returns 404 | Check `oidc.enabled`, the scoped issuer path, tenant/environment state, and the data-plane startup logs. |
+| `/admin/*` returns 404 or sign-in is unavailable | Check the console enable flag and its separate issuer/client/audience/subject configuration. |
+
+JSON or text logs are selected by `telemetry.log_format`. OTLP export additionally
+requires the `otlp` Cargo feature and `telemetry.otlp_endpoint`; setting an
+endpoint on a binary without the exporter feature is insufficient. Prometheus
+metrics stay on the private management plane. Audit APIs, event streams,
+webhooks, and SIEM/log sinks are distinct surfaces; see
+[events](EVENTS.md), [events versus webhooks](EVENTS-VS-WEBHOOKS.md), and
+[log-stream verification](log-stream-verification.md).
+
+## Background work and optional accelerators
+
+Durable async work uses the PostgreSQL transactional outbox, with visibility
+leases, retry bounds, dead-letter states, and per-aggregate ordering. Queue
+concurrency and polling are per process and per consumer; size them with the
+number of replicas and database capacity in mind. A stored configuration or
+queued job does not prove its worker is enabled.
+
+| Worker or service | Runtime setting or prerequisite |
+| --- | --- |
+| Scheduled user offboarding | `users.offboarding_worker_enabled`, on by default, plus control-plane scope enumeration. |
+| Outbox retention | `outbox.reap_enabled`, on by default, plus control-plane scope enumeration. |
+| Webhooks | `webhooks.delivery_enabled`, off by default. |
+| Async flow targets | `flow_targets.delivery_enabled`, off by default. |
+| Identity-trait migration | `traits.migration_worker_enabled`, off by default. |
+| Outbound SCIM | `scim_push.enabled`, off by default; distinct from inbound `scim.enabled`. |
+| SAML certificate expiry sweep | `certificate_expiry.sweep_enabled`, off by default. |
+| Audit retention | `audit_retention.enabled`, off by default, with an `ironauth_audit_retention` DSN and control-plane enumeration. |
+
+The configuration reference lists the remaining consumer switches, retention
+windows, and bounds. The audit retention role is intentionally separate from
+the application and control roles. A zero audit-retention window means keep
+forever; do not assume every retention field interprets zero the same way.
+
+IronBus is optional wake-up delivery for outbox workers; messages and processing
+state remain durable in PostgreSQL. Build with `--features ironbus` to use the
+broker backend, and configure `outbox.ironbus_addr`. Without the backend feature,
+the configured wake path is unavailable and polling remains the fallback.
+
+IronCache is also optional. The library provides hot-state backends and JWKS
+call sites, and `hot_state.ironcache_addr` participates in readiness. The shipped
+binary does not currently attach a `HotState` implementation to those read paths,
+including when built with `--features ironcache`, so configuring reachability
+does not enable request acceleration. PostgreSQL-only deployments are complete.
+
+## Upgrade, back up, and recover
+
+Before an upgrade, take a database backup and preserve the envelope master key
+outside it. Test restoration of both in an isolated environment. Config
+snapshots are secret-free exports of promotable environment settings, not
+database or credential backups; see [snapshot format](snapshot/README.md).
+
+Run the new binary's preflight against a superuser or a separately authorized
+`BYPASSRLS` connection. The command refuses a restricted runtime or schema-owner
+connection because forced row-level security could hide the rows it must inspect:
+
+```sh
+ironauth doctor --url "$DOCTOR_DSN"
+ironauth migrate --url "$MIGRATION_DSN"
+```
+
+Read the migration report. If it stops before a contract migration, deploy and
+observe the compatible schema before choosing either `--contract` or a soak:
+
+```sh
+ironauth migrate --url "$MIGRATION_DSN" --soak 24h
+```
+
+`--soak` needs a unit (`s`, `m`, `h`, or `d`) and at least 60 seconds. It checks
+elapsed time recorded in the database when invoked; it is not a background
+scheduler. `--contract` and `--soak` are mutually exclusive. Contract removal
+can end compatibility with the previous binary. Rolling the image back does
+not recreate removed data. The [release guide](RELEASING.md) covers the DEB and
+systemd lifecycle; graceful shutdown uses SIGTERM/SIGINT and the configured
+drain period.
+
+Wrapped tenant-key backup and restore are available through
+`ironauth storage kek-backup` and `kek-restore`. Store the backup manifest
+separately and follow [KEK recovery](KEK-RECOVERY.md), including checks on every
+recovered scope and the consequences of crypto-shred and older backups.
+
+Signing-key lifecycle operations are documented in the management contract;
+they are separate from the platform envelope master key. Platform
+`storage rekey` is offline and rewraps KEKs without rebuilding blind indexes.
+Changing key material is refused by default because identifier lookups would
+stop matching. There is no shipped lookup-rebuild tool. Do not treat this
+command as an online, complete master-secret rotation procedure.
+
+For configuration changes, export a snapshot, run `ironauth validate`, and use
+the server-computed `plan`, `apply`, and `drift` commands against an explicit
+target. Supply `IRONAUTH_API_URL` and `IRONAUTH_TOKEN` or the documented flags;
+inspect `ironauth plan --help` before applying. For identity migrations and
+exports, see [the migration skill guide](skills/migrate-to-ironauth.md),
+[user lifecycle](design/USER-LIFECYCLE.md), and [the exit guide](exit-guide.md).
+
+---
+
 # Measured startup and idle footprint
 
 Source: docs/PERFORMANCE.md
@@ -7990,6 +9342,103 @@ against.
 The hardware class above is a development machine. A published sizing guide should be measured on
 the instance classes it recommends, and these numbers should be read as a floor rather than as a
 capacity statement.
+
+---
+
+# IronAuth documentation
+
+Source: docs/README.md
+
+# IronAuth documentation
+
+Start with the task you want to complete, then use the references for the
+protocol and operating details. These pages describe the current repository;
+IronAuth is pre-1.0, and optional or experimental features have explicit limits.
+
+## Getting started
+
+| Task | Documentation |
+| --- | --- |
+| Evaluate the platform | [Project overview](../README.md) and [capabilities](CAPABILITIES.md) |
+| Run a seeded local identity provider | [Local emulator](EMULATOR.md) |
+| Configure, deploy, upgrade, and monitor | [Operations](OPERATIONS.md), [configuration reference](CONFIG.md), and [Helm chart](../charts/ironauth/README.md) |
+| Use the dashboard and resource pages | [Admin console](ADMIN-CONSOLE.md) |
+| Integrate an app or API | [Integration guide](INTEGRATIONS.md) |
+| Choose a supported SDK | [SDK policy](SDK-POLICY.md) and [artifact compatibility](COMPATIBILITY.md) |
+
+## Applications and authentication
+
+| Topic | Documentation |
+| --- | --- |
+| React SPA with a BFF | [React quickstart](quickstart-react.md) |
+| Next.js App Router | [Next.js quickstart](quickstart-nextjs.md) |
+| Go and Python backends | [Go quickstart](quickstart-go.md) and [Python quickstart](quickstart-python.md) |
+| Browser session architecture and step-up | [BFF guidance](bff.md) and [BFF package](../packages/ironauth-bff/README.md) |
+| Headless authentication and custom pages | [Flow contract](FLOWS.md) and [standalone reference app](../packages/reference-app/README.md) |
+| Mobile sign-in | [AppAuth guide](mobile-appauth.md) |
+| Resource-server and edge verification | [Edge guide](edge-verification.md), [TypeScript SDK](../packages/ironauth-sdk/README.md), [Java](../sdks/java/README.md), and [.NET](../sdks/dotnet/README.md) |
+| Session-derived JWTs | [Session tokenizer](session-tokenizer.md) |
+| Agent identities | [Agent principals](agents.md) |
+| IdP-side FedCM | [Experimental FedCM](fedcm.md) |
+
+## Management, automation, and events
+
+The [management OpenAPI document](openapi/management.json) is the public
+administrative contract. The console, generated management SDKs, configuration
+CLI, provider, and admin MCP tools use that API. Coverage differs by client;
+the [integration guide](INTEGRATIONS.md#management-and-automation) explains it.
+
+| Topic | Documentation |
+| --- | --- |
+| API/SDK stability, cookies, CSRF, and errors | [SDK contract](SDK-CONTRACT.md) |
+| Audit/event vocabulary | [Event catalog](EVENTS.md) and [machine-readable catalog](events/catalog.json) |
+| Event subscriptions versus outgoing webhooks | [Selection guide](EVENTS-VS-WEBHOOKS.md) |
+| Signed SIEM delivery | [Log-stream verification](log-stream-verification.md) |
+| Agent-driven administration | [Admin MCP package](../packages/ironauth-mcp/README.md) |
+| Read-only documentation retrieval | [Docs MCP package](../packages/ironauth-docs-mcp/README.md) |
+| Configuration snapshots | [Snapshot contract](snapshot/README.md) and [supported apply resources](CAPABILITIES.md) |
+| Export and migration | [Exit guide](exit-guide.md) and [migration skill](skills/migrate-to-ironauth.md) |
+
+## Operations, security, and conformance
+
+| Topic | Documentation |
+| --- | --- |
+| Deployment lifecycle, workers, probes, and backup planning | [Operations](OPERATIONS.md) |
+| Encryption and recovery | [KEK recovery](KEK-RECOVERY.md) |
+| Security boundaries | [Threat model](THREAT-MODEL.md), [security policy](../SECURITY.md), and [refused features](WILL-NOT-IMPLEMENT.md) |
+| Release and versioning process | [Releasing](RELEASING.md) and [changelog index](../CHANGELOG.md) |
+| OIDF harness and actual enforcement status | [Conformance overview](conformance/README.md), [profile matrix](conformance/MATRIX.md), and [runner runbook](conformance/RUNBOOK.md) |
+| MCP authorization evidence | [Measured conformance page](conformance/mcp.md) |
+| Startup/idle performance and per-operation costs | [Performance](PERFORMANCE.md) and [unit costs](UNIT-COSTS.md) |
+| Contributing and local validation | [Contribution rules](../CONTRIBUTING.md) |
+
+The OIDF live suite is not currently provisioned and has no live result.
+Static conformance checks run independently of that setup. Implemented logout
+endpoints do not imply that their deferred certification profiles have run.
+
+## Experimental protocols
+
+These are opt-in prototypes with versioned acknowledgements and narrower
+contracts. Use the individual page and the [configuration maturity registry](CONFIG.md)
+before enabling one.
+
+- [Attestation-based client authentication](experimental/attestation-client-auth.md)
+- [AuthZEN agent tool profile](experimental/authzen-agent-profile.md)
+- [Identity chaining / ID-JAG](experimental/identity-chaining.md)
+- [Native SSO](experimental/native-sso.md)
+- [Transaction tokens](experimental/transaction-tokens.md)
+
+## Documentation for agents
+
+[llms.txt](llms.txt) indexes the published documentation and
+[llms-full.txt](llms-full.txt) contains its full text. Both are generated by
+`scripts/gen-llms-txt.py` and checked for freshness and coverage. The docs MCP
+package reads that corpus. [Integration](skills/integrate-ironauth.md) and
+[migration](skills/migrate-to-ironauth.md) skills provide task guidance.
+
+Files under `docs/design/` and `docs/adr/` are maintainer design records.
+Their proposals are not a promise that a runtime feature exists; use the
+[capability guide](CAPABILITIES.md) for the implemented boundaries.
 
 ---
 
@@ -8326,6 +9775,9 @@ protocol risk from the integrator, first.**
 
 | Surface | State |
 | --- | --- |
+| Browser session handling | **Implemented** by the framework-agnostic `packages/ironauth-bff` helper; React and Next.js quickstarts adapt its handlers. No separate React hook library or Next.js SDK ships today |
+| TypeScript protocol and verification helpers | **Implemented** in `packages/ironauth-sdk`: WebCrypto verification, PKCE/OAuth, DPoP, protected-resource metadata, session-token handling, diagnostics, and uniform authorization checks |
+| Step-up middleware helpers | **Implemented** in `packages/ironauth-bff` for RFC 9470 challenges, freshness/factor checks, and reauthentication redirects |
 | Go management SDK | **Generated** from `docs/openapi/management.json` (`sdks/go`) |
 | Python management SDK | **Generated** from `docs/openapi/management.json` (`sdks/python`) |
 | iOS and Android sign-in samples | **Worked AppAuth integrations** (`clients/mobile`) -- sample apps, not a library. See [mobile-appauth.md](mobile-appauth.md), including why an AppAuth client needs the per-client DPoP exemption |
@@ -8335,6 +9787,11 @@ protocol risk from the integrator, first.**
 
 The generated clients are produced by the pipeline in the [SDK contract](SDK-CONTRACT.md);
 CI fails if the management API changes without regenerating them.
+
+The TypeScript development packages currently have private manifests and are
+built or packed from the repository; these rows do not imply npm publication.
+Use the [integration guide](INTEGRATIONS.md) to choose a path and follow the
+package-specific runtime requirements.
 
 ## Deferred, with triggers
 
@@ -8363,12 +9820,13 @@ Nothing below is refused. Each entry states what would change our mind.
   **Revisit trigger**: AppAuth stops tracking a platform release, or a capability IronAuth
   needs cannot be expressed through it.
 
-- **What**: Ruby and PHP beyond generated management clients.
+- **What**: Ruby and PHP SDKs.
   **Why**: for a server-side integration the protocol work is token verification, and that is
   a JOSE problem those ecosystems already solve well. The generated management client covers
   administration; a bespoke SDK on top would mostly restate a verification library.
-  **Instead**: the generated management client, plus the verification guidance in
-  [edge verification](edge-verification.md).
+  **Instead**: call the documented management API over HTTP and use a maintained
+  JOSE library with the verification requirements in [edge verification](edge-verification.md).
+  There are no generated Ruby or PHP management clients in the current tree.
   **Revisit trigger**: a verification path in one of these ecosystems proves error-prone in
   practice -- a recurring integrator mistake is evidence; an absence of one is not.
   **Java and .NET left this list**, and the reason is worth recording because it is not the
@@ -8407,15 +9865,18 @@ or the tracked issue that will land it.
 
 ## Surfaces shipped today
 
-As of milestone M1, the shipped surfaces are the repository and release
-infrastructure, the HTTP server skeleton (dual-plane listener, observability, log
-scrubbing, and the trusted-proxy policy), the persistence and tenant-isolation
-substrate, the outbound fetcher, and the OpenAPI-first management API skeleton.
-The protocol endpoints arrive in M2. The remaining sections are forward-looking:
-they model the surfaces the later M1 and M2 issues are about to ship, so that
-every implementation PR lands into an existing threat frame rather than inventing
-one after the fact. Each mitigation cell cites the issue that owns it; a cell
-without a citation is shipped.
+The repository implements the dual-plane HTTP server, tenant-isolated storage,
+OIDC and account APIs, federation and provisioning, management API, console,
+hosted and headless authentication, background delivery workers, and opt-in
+experimental protocols. The [capability guide](CAPABILITIES.md) identifies
+activation requirements and current runtime limits for those surfaces.
+
+The sections below model these surfaces and their residual risks. Some controls
+and protocols remain incomplete, infrastructure-dependent, or design-only;
+their presence in this threat model does not establish runtime availability.
+Issue references identify the work a control belongs to, rather than whether
+it has shipped. Use the source-backed capability guide and individual residual
+notes to distinguish implemented controls from planned mitigations.
 
 ## Attacker model
 
@@ -9234,7 +10695,9 @@ precondition rather than refused; see issue #138 and the M14 milestone.
   none planned.
 - **CIBA push mode.** Why: weakest security properties of the three CIBA
   modes and forbidden by the FAPI-CIBA profile; effectively uncertifiable.
-  Instead: CIBA poll and ping (M13). Revisit: none planned.
+  Instead: CIBA poll, which is the currently advertised usable mode. Ping has
+  schema and consumer foundations but no production profile writer or server
+  worker wiring; see [current capabilities](CAPABILITIES.md). Revisit: none planned.
 - **Session Management iframe and Front-Channel Logout as real features.**
   Why: dependent on third-party cookies, which are blocked in every major
   browser; unreliable by construction in 2026. Instead: RP-initiated logout
@@ -9536,8 +10999,11 @@ user closes the tab. If you must, then **both** of these, not one:
 - **refresh token rotation** with reuse detection, so a stolen refresh token is detectable and
   the family is killed on replay.
 
-IronAuth's DPoP support is tracked separately; refresh rotation with reuse detection is already
-how its refresh families work.
+IronAuth implements DPoP at the token endpoint and its DPoP-aware consumers;
+public clients require proof under the configured policy. The BFF helper creates
+and retains its proof key server-side. Refresh families use rotation with reuse
+detection. DPoP constrains use of a stolen token, but does not make arbitrary
+resource-server middleware validate the proof automatically.
 
 ## Token storage in the browser
 
@@ -11381,6 +12847,23 @@ You need Go 1.24+ and a checkout of this repository. **No Go dependencies**: the
 has `crypto/ed25519`, so the signature check is visible in the example rather than hidden behind
 a package.
 
+## Before running the commands
+
+Run these commands from the repository root in the same shell. Install the
+pinned Rust toolchain and PostgreSQL server binaries first; the
+[emulator guide](EMULATOR.md#run-the-local-development-emulator) explains
+`PG_BIN` discovery. Run as an ordinary user because `initdb` refuses root.
+The emulator will manage a throwaway database for this quickstart:
+
+```sh
+unset DATABASE_URL
+export QS_DIR="$(mktemp -d)"
+```
+
+`QS_DIR` holds logs, temporary application files, and process IDs. The automated
+`scripts/quickstart.sh` runner creates it itself; set it as above when following
+the steps manually. Follow the teardown at the end before removing that directory.
+
 ## 1. Start a local IronAuth
 
 ```bash quickstart
@@ -11471,7 +12954,26 @@ and no network.
 below **verbatim** and fails if they stop working or take too long. There is no second copy of
 these steps anywhere; the gate reads this file.
 
-You need Node 20+ and a checkout of this repository.
+Use a supported Node 22 version at least 22.22.2, or Node 24 at least 24.15.0,
+and a checkout of this repository. These versions also satisfy the current
+admin console toolchain when working across the checkout.
+
+## Before running the commands
+
+Run these commands from the repository root in the same shell. Install the
+pinned Rust toolchain and PostgreSQL server binaries first; the
+[emulator guide](EMULATOR.md#run-the-local-development-emulator) explains
+`PG_BIN` discovery. Run as an ordinary user because `initdb` refuses root.
+The emulator will manage a throwaway database for this quickstart:
+
+```sh
+unset DATABASE_URL
+export QS_DIR="$(mktemp -d)"
+```
+
+`QS_DIR` holds logs, temporary application files, and process IDs. The automated
+`scripts/quickstart.sh` runner creates it itself; set it as above when following
+the steps manually. Follow the teardown at the end before removing that directory.
 
 ## 1. Start a local IronAuth
 
@@ -11788,6 +13290,23 @@ these steps anywhere; the gate reads this file.
 
 You need Python 3.11+ and a checkout of this repository.
 
+## Before running the commands
+
+Run these commands from the repository root in the same shell. Install the
+pinned Rust toolchain and PostgreSQL server binaries first; the
+[emulator guide](EMULATOR.md#run-the-local-development-emulator) explains
+`PG_BIN` discovery. Run as an ordinary user because `initdb` refuses root.
+The emulator will manage a throwaway database for this quickstart:
+
+```sh
+unset DATABASE_URL
+export QS_DIR="$(mktemp -d)"
+```
+
+`QS_DIR` holds logs, temporary application files, and process IDs. The automated
+`scripts/quickstart.sh` runner creates it itself; set it as above when following
+the steps manually. Follow the teardown at the end before removing that directory.
+
 ## 1. Install the one dependency
 
 ```bash quickstart
@@ -11897,7 +13416,26 @@ no account and no network.
 below **verbatim** and fails if they stop working or take too long. There is no second copy of
 these steps anywhere; the gate reads this file.
 
-You need Node 20+ and a checkout of this repository.
+Use a supported Node 22 version at least 22.22.2, or Node 24 at least 24.15.0,
+and a checkout of this repository. These versions also satisfy the current
+admin console toolchain when working across the checkout.
+
+## Before running the commands
+
+Run these commands from the repository root in the same shell. Install the
+pinned Rust toolchain and PostgreSQL server binaries first; the
+[emulator guide](EMULATOR.md#run-the-local-development-emulator) explains
+`PG_BIN` discovery. Run as an ordinary user because `initdb` refuses root.
+The emulator will manage a throwaway database for this quickstart:
+
+```sh
+unset DATABASE_URL
+export QS_DIR="$(mktemp -d)"
+```
+
+`QS_DIR` holds logs, temporary application files, and process IDs. The automated
+`scripts/quickstart.sh` runner creates it itself; set it as above when following
+the steps manually. Follow the teardown at the end before removing that directory.
 
 ## Why a SPA needs a server at all
 

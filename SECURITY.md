@@ -1,6 +1,6 @@
 # Security Policy
 
-IronAuth is pre-1.0 and under active foundational development; no production
+IronAuth is pre-1.0 and under active development; no production
 deployment should exist yet. Until a stable 1.0, the latest release is the
 only supported version. This policy describes how to report a suspected
 vulnerability privately and what you can expect from us.

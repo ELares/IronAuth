@@ -9,15 +9,18 @@ or the tracked issue that will land it.
 
 ## Surfaces shipped today
 
-As of milestone M1, the shipped surfaces are the repository and release
-infrastructure, the HTTP server skeleton (dual-plane listener, observability, log
-scrubbing, and the trusted-proxy policy), the persistence and tenant-isolation
-substrate, the outbound fetcher, and the OpenAPI-first management API skeleton.
-The protocol endpoints arrive in M2. The remaining sections are forward-looking:
-they model the surfaces the later M1 and M2 issues are about to ship, so that
-every implementation PR lands into an existing threat frame rather than inventing
-one after the fact. Each mitigation cell cites the issue that owns it; a cell
-without a citation is shipped.
+The repository implements the dual-plane HTTP server, tenant-isolated storage,
+OIDC and account APIs, federation and provisioning, management API, console,
+hosted and headless authentication, background delivery workers, and opt-in
+experimental protocols. The [capability guide](CAPABILITIES.md) identifies
+activation requirements and current runtime limits for those surfaces.
+
+The sections below model these surfaces and their residual risks. Some controls
+and protocols remain incomplete, infrastructure-dependent, or design-only;
+their presence in this threat model does not establish runtime availability.
+Issue references identify the work a control belongs to, rather than whether
+it has shipped. Use the source-backed capability guide and individual residual
+notes to distinguish implemented controls from planned mitigations.
 
 ## Attacker model
 

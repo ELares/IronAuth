@@ -47,8 +47,11 @@ user closes the tab. If you must, then **both** of these, not one:
 - **refresh token rotation** with reuse detection, so a stolen refresh token is detectable and
   the family is killed on replay.
 
-IronAuth's DPoP support is tracked separately; refresh rotation with reuse detection is already
-how its refresh families work.
+IronAuth implements DPoP at the token endpoint and its DPoP-aware consumers;
+public clients require proof under the configured policy. The BFF helper creates
+and retains its proof key server-side. Refresh families use rotation with reuse
+detection. DPoP constrains use of a stolen token, but does not make arbitrary
+resource-server middleware validate the proof automatically.
 
 ## Token storage in the browser
 
