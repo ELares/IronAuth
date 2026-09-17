@@ -1963,6 +1963,16 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0230_readiness_can_read_the_ledger.sql"),
         },
+        // EXPAND. It ADDS a constraint to a table that is empty in every deployment (0229
+        // created it and no release writes to it), so the validating scan costs nothing and no
+        // running binary can be holding a row that would fail it. An old replica is unaffected:
+        // it does not write this table either.
+        Migration {
+            version: 231,
+            name: "tenant_quota_limits_scope_fk",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0231_tenant_quota_limits_scope_fk.sql"),
+        },
     ]
 }
 

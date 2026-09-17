@@ -1,0 +1,47 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- Give `tenant_quota_limits` the scope foreign key every forced-RLS table must have.
+--
+-- Migration 0229 created the table with `ENABLE`/`FORCE ROW LEVEL SECURITY` and a scope
+-- policy, and with no foreign key onto `environments`. `absent_scope.rs` asserts that pairing
+-- for every such table and has failed on `main` ever since, which is the only reason the gap
+-- was found: the table is empty in every deployment, so nothing else noticed.
+--
+-- # What the missing key actually costs
+--
+-- The RLS policy compares `tenant_id` and `environment_id` against the two `current_setting`
+-- values the scoped transaction binds. That makes a row UNREACHABLE from any other scope --
+-- it does not make the scope EXIST. A write naming a tenant and environment that were never
+-- created satisfies the policy (the setting says so) and succeeds, and the row it wrote is
+-- then reachable only by repeating that same absent scope. It is invisible to every scope
+-- that does exist, invisible to a scope listing, and it survives the deletion of the tenant it
+-- claims to belong to, because no key ties it to one.
+--
+-- For a quota override that is worse than a stray row. The limiter reads this table by scope;
+-- an override written under a mistyped environment id is silently inert, and an operator
+-- reading the table back under the same typo sees their change and believes it is in force.
+--
+-- # The write is not a rewrite of 0229
+--
+-- Shipped migrations are frozen -- the ledger checksums each file whole, so editing 0229 would
+-- make every deployed environment's chain mismatch. This adds the constraint separately, which
+-- is also the honest record: the table shipped without it.
+--
+-- `NOT VALID` is deliberately NOT used. The table is empty in every deployment (0229 created
+-- it and no release has written to it), so a validating add costs one scan of nothing, and a
+-- `NOT VALID` constraint would leave exactly the pre-existing rows this exists to forbid
+-- unchecked while reading as though it had checked them.
+-- # The NAME is load-bearing, not decoration
+--
+-- `StoreError` recognizes an absent scope by the constraint name ending in `_tenant_id_fkey`
+-- (`SCOPE_FK_SUFFIX`), and answers the uniform not-found for it. A key onto a scope table
+-- whose name does not end that way trips as an unrecognized violation and answers a SERVER
+-- FAULT instead -- a contract defect on the management plane, and an existence oracle anywhere
+-- the table is reachable from the data plane. `absent_scope.rs` asserts that too, and caught
+-- the first version of this file, which named the constraint `..._scope_fkey`.
+--
+-- Written out rather than left to Postgres's generator, which would produce this same string
+-- from the column order: spelled here, a later column reorder cannot silently rename it.
+ALTER TABLE tenant_quota_limits
+    ADD CONSTRAINT tenant_quota_limits_environment_id_tenant_id_fkey
+    FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id);
