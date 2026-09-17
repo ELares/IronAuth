@@ -1711,8 +1711,9 @@ pub struct MintedRefreshToken {
 /// forged handle resolves to nothing (the digest binds the handle to the secret,
 /// so a token cannot be relocated to another scope), and a database dump yields
 /// nothing replayable.
-#[must_use]
+///
 /// issuance-gate-allow: an opaque successor to a grant gated at its own issuance.
+#[must_use]
 pub fn mint_refresh_token(state: &OidcState, scope: &Scope) -> MintedRefreshToken {
     let jti = RefreshTokenId::generate(state.env(), scope);
     let mut bytes = [0_u8; OPAQUE_ACCESS_TOKEN_BYTES];
