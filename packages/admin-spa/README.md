@@ -164,7 +164,10 @@ off, nothing is served in production regardless.
 
 ## Toolchain
 
-Node 20, npm. `package-lock.json` is committed; CI installs with `npm ci`.
+Node 22.22.2 or later on the 22.x release line, Node 24.15.0 or later on the
+24.x release line, or Node 26 and newer, with npm. The supported release lines
+and minimum versions match Vitest 5 and jsdom. `package-lock.json` is committed;
+CI installs with `npm ci`.
 
 ```sh
 cd packages/admin-spa
