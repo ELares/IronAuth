@@ -91,8 +91,12 @@ wasm-hooks = ["dep:ironauth-hooks", "ironauth-oidc/wasm-hooks"]
 # Passes the optional IronBus wake-up backbone through to ironauth-store (issue #104).
 ironbus = ["ironauth-store/ironbus"]
 # Passes the optional IronCache accelerator backend through (issue #146). OFF by default: the
-# covenant is that a deployment is COMPLETE on Postgres alone, and this only makes the backend
-# BUILDABLE -- nothing is attached until boot constructs one.
+# covenant is that a deployment is COMPLETE on Postgres alone.
+#
+# It makes the backend SELECTABLE HERE, which is a smaller claim than the first version of this
+# comment made. `--features ironauth-hot/ironcache` and `--all-features` both already compiled
+# it in, from the workspace root; what this adds is the name a `-p ironauth` build can use.
+# Nothing is attached either way until boot constructs a `HotState`, and nothing does.
 #
 # BOTH dependents are named, because both depend on `ironauth-hot` and cargo unifies features
 # per crate: naming only one would still enable the backend, and the next reader would have to

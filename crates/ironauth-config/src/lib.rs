@@ -1392,13 +1392,20 @@ pub struct HotStateConfig {
     /// outside tests calls `with_jwks_hot_state`, so `jwks_hot` is `None` in every shipped
     /// binary and the accelerator is never consulted however this key is set.
     ///
-    /// A SECOND GAP WAS NARROWER STILL AND IS NOW CLOSED: until #1322 the IronCache backend
-    /// could not be BUILT into the server at all. `ironauth-hot` declares an `ironcache`
-    /// feature and no crate above it forwarded one, so `cargo build -p ironauth --features
-    /// ironcache` had no path to it and `IronCacheHotState` was unreachable from any binary --
-    /// which made the measured 80% figure below unattainable rather than merely unattached.
-    /// The feature now forwards through `ironauth-oidc` and `ironauth-store`, and the
-    /// `--all-features` workspace check compiles the binary with it.
+    /// #1322 CHANGED ONLY HOW THE BACKEND IS SELECTED, and the first version of this paragraph
+    /// claimed much more than that. It said the IronCache backend "could not be BUILT into the
+    /// server at all" before then. That is false, and measurable: `ironauth-hot` is a workspace
+    /// member and a non-optional dependency of `ironauth-oidc` and `ironauth-store`, so
+    /// `--features ironauth-hot/ironcache` from the workspace root already compiled and linked
+    /// it into the binary, and `--all-features` already did the same in CI.
+    ///
+    /// What #1322 added is a feature NAME on the crates a build selects by: `cargo build
+    /// -p ironauth --features ironcache` used to answer "the package does not contain this
+    /// feature". That is the shape `ironbus` already had, and it is how a release or an
+    /// operator asks for an optional backend -- but it changes what is COMPILED not at all,
+    /// because no `#[cfg(feature = "ironcache")]` exists outside `ironauth-hot`.
+    ///
+    /// The gap that matters is unchanged by it, and is the boot wiring above.
     ///
     /// THAT IS NOW A MEASURED DECISION FOR THE JWKS USE rather than the remaining work, which is
     /// what this paragraph used to call it. `docs/UNIT-COSTS.md` measures both sides: a hit

@@ -150,10 +150,12 @@ wasm-hooks = ["dep:ironauth-hooks"]
 # The IronCache accelerator backend (issue #146). OFF by default, because the covenant is that
 # a deployment is COMPLETE on Postgres alone and the cache is never required.
 #
-# It is forwarded rather than left on `ironauth-hot` because a feature nothing forwards cannot
-# be enabled in a build of the server: `cargo build -p ironauth --features ironcache` had no
-# path to `ironauth-hot/ironcache`, so `IronCacheHotState` was unreachable from any binary and
-# issue #146's "the full test suite passes in both modes" could not be attempted.
+# WHAT THIS ADDS IS A NAME, not a capability, and the first version of this comment said
+# otherwise. `--features ironauth-hot/ironcache` from the workspace root already enabled the
+# backend, because `ironauth-hot` is a workspace member and a non-optional dependency here; so
+# did `--all-features`, which is what the CI check runs. What did NOT work was selecting it on
+# the crate a build names: `-p ironauth --features ironcache` answered "the package does not
+# contain this feature". This is the shape `ironbus` already has.
 ironcache = ["ironauth-hot/ironcache"]
 # Enables the ironauth-store real-database harness for the DB-backed integration
 # tests (mirrors ironauth-admin's `testing` gate). Adds no runtime surface.
