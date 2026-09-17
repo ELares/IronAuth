@@ -16,8 +16,20 @@
 # designed around, which is what the issue asks for and why it lands in the exploratory phase.
 #
 # A GATE OVER ZERO VIOLATIONS IS NOT AUTOMATICALLY VACUOUS, but it is worth proving rather than
-# asserting. Both rules below hold today and both FAIL against a planted violation; the PR that
-# added this demonstrates each.
+# asserting. Both rules below hold today and both FAIL against a planted violation.
+#
+# # What this is, and what it is not
+#
+# It is a TEXT SCAN, and a text scan over Rust is evadable by an author who wants to evade it.
+# Four evasions were found and closed before this landed -- production code after a test module,
+# a bodyless `#[cfg(test)] mod x;`, a `#[cfg(test)]` item nested in an `impl`, and a deref
+# assignment whose leading `*` read as a comment -- and the fourth is the one worth remembering,
+# because `rustfmt` PRESERVES that shape, so `cargo fmt` would not have disturbed it.
+#
+# So the honest claim is narrow: this catches the shapes a cross-region call would ACCIDENTALLY
+# take while the replication work is designed, which is what the exploratory phase needs. It is
+# not a security boundary against a determined author, and a reviewer who finds a fifth evasion
+# should close it here rather than conclude the rule does not hold.
 #
 # # What a cross-region synchronous call would require
 #
@@ -45,15 +57,22 @@ cd "$ROOT" || exit 1
 
 # THE SERVING CRATES: every crate that handles a request. The binary is excluded because it IS
 # the boot path, and `ironauth-store` because it owns the pool type this rule is about.
-SERVING_CRATES=(
-    ironauth-oidc
-    ironauth-server
-    ironauth-admin
-    ironauth-scim
-    ironauth-saml
-    ironauth-quota
-    ironauth-hot
-)
+# EVERY CRATE THAT IS NOT THE BOOT PATH OR THE STORAGE LAYER, enumerated rather than sampled. The
+# first version listed seven by hand and missed most of the workspace, including crates squarely
+# on a request path. Excluded, each for a stated reason:
+#   ironauth         -- IS the boot path; opening the pool is its job
+#   ironauth-store   -- owns the pool type this rule is about
+#   ironauth-config  -- parses the region set an operator configures, by design
+#   ironauth-env     -- the clock and entropy seam, no request surface
+#   ironauth-admin-ui -- static assets
+SERVING_CRATES=()
+for dir in crates/*/; do
+    crate="$(basename "$dir")"
+    case "$crate" in
+        ironauth | ironauth-store | ironauth-config | ironauth-env | ironauth-admin-ui) continue ;;
+    esac
+    [ -d "$dir/src" ] && SERVING_CRATES+=("$crate")
+done
 
 status=0
 
@@ -67,22 +86,75 @@ production_source() {
 import re, sys
 path = sys.argv[1]
 text = open(path, encoding="utf-8").read().split("\n")
-# Drop from a `#[cfg(test)]` module header to the end of file. Test modules are conventionally
-# last in this codebase; a mid-file one would only make the scan STRICTER, never blinder.
-for index, line in enumerate(text):
-    if re.match(r'^\s*#\[cfg\(test\)\]\s*$', line):
-        text = text[:index]
-        break
+# Drop each `#[cfg(test)]` item, and ONLY that item.
+#
+# THREE EVASIONS FOUND THIS LOGIC IN SUCCESSION, which is why it is fussier than it looks and why
+# each shape is named rather than summarised.
+#
+#   1. Truncating from the first attribute to end of file hid production code appended AFTER a
+#      test module. The comment excusing it claimed a mid-file test module "would only make the
+#      scan STRICTER" -- the opposite of true.
+#   2. Skipping to the next `}` at COLUMN ZERO is right for `mod tests { ... }` and wrong for
+#      `#[cfg(test)] mod testpki;`, a file-module declaration ending in a semicolon, which
+#      `ironauth-webauthn` has. With no brace to find, the skip ran to end of file and
+#      reproduced (1).
+#   3. Skipping to a column-zero brace also over-runs a `#[cfg(test)]` item NESTED in an `impl`,
+#      whose own close is indented. That blanked 133 live lines of `claims_request.rs`, and a
+#      violation planted inside them passed.
+#
+# So the close must match the ATTRIBUTE'S OWN INDENTATION, which rustfmt guarantees and which
+# needs no brace counting (and so cannot be fooled by a brace inside a string literal).
+kept = []
+index = 0
+while index < len(text):
+    line = text[index]
+    attribute = re.match(r'^(\s*)#\[cfg\(test\)\]\s*$', line)
+    if not attribute:
+        kept.append(line)
+        index += 1
+        continue
+    # Blank lines replace skipped ones so reported line numbers stay true.
+    indent = attribute.group(1)
+    kept.append("")
+    index += 1
+    if index < len(text) and text[index].rstrip().endswith(";"):
+        kept.append("")
+        index += 1
+        continue
+    closer = indent + "}"
+    while index < len(text):
+        kept.append("")
+        closing = text[index] == closer
+        index += 1
+        if closing:
+            break
+text = kept
+in_block_comment = False
 for number, line in enumerate(text, 1):
-    # FULL-LINE COMMENTS ARE NOT CODE, and this scan has already been bitten by treating prose as
-    # a violation: its first run flagged a comment in `ironauth-scim` reading "The pool
-    # `Store::connect` builds", which is a sentence ABOUT the rule rather than a breach of it.
-    # That is the same defect `query-audit.sh` hit on a doc comment saying "per-table grants".
+    # FULL-LINE COMMENTS ARE NOT CODE, and this scan was bitten by treating prose as a violation:
+    # its first run flagged a comment in `ironauth-scim` reading "The pool `Store::connect`
+    # builds", a sentence ABOUT the rule rather than a breach of it -- the same defect
+    # `query-audit.sh` hit on a doc comment saying "per-table grants".
     #
-    # Only whole-line comments are dropped, not the tail of a code line: blanking from `//` would
-    # also truncate any line containing a `postgres://` URL, and a violation sitting after one on
-    # the same line would then be invisible. A trailing comment cannot hide a call this way.
-    if re.match(r'^\s*(//|/\*|\*)', line):
+    # A LEADING `*` IS A DEREF ASSIGNMENT, NOT A COMMENT, and treating it as one was a hole a
+    # review walked through: `*slot = sqlx::postgres::PgPoolOptions::new()` evaded every rule, and
+    # rustfmt PRESERVES that shape, so `cargo fmt` would not have disturbed it. Block comments are
+    # tracked with a state machine instead, so a continuation line is only skipped when a `/*` is
+    # genuinely open.
+    #
+    # Only whole-line comments are dropped, never the tail of a code line: blanking from `//`
+    # would also truncate any line carrying a `postgres://` URL, and a violation after one on the
+    # same line would become invisible.
+    if in_block_comment:
+        if "*/" in line:
+            in_block_comment = False
+        continue
+    stripped = line.lstrip()
+    if stripped.startswith("/*"):
+        if "*/" not in stripped[2:]:
+            in_block_comment = True
+        continue
+    if stripped.startswith("//"):
         continue
     print(f"{path}:{number}:{line}")
 PY
@@ -104,6 +176,14 @@ done
 
 # RULE 2: no serving crate outside the management plane reads a residency attribute.
 #
+# THE ENVIRONMENT PIN'S COLUMN IS `region`, not `region_pin`. The first version of this scan
+# matched only `home_region`, so it missed the per-environment pin entirely -- and that pin is the
+# WRITE-AUTHORITY UNIT the issue names, the more important of the two attributes.
+#
+# Matched as `.region` (a field access) rather than as a bare word, because routing looks like
+# reading a field off a tenant or environment, while a bare `region` also matches a claim named
+# "region" in a mapping fixture. A string literal is not a routing decision.
+#
 # `ironauth-admin` is exempt BY NAME and not by accident: the tenant API validates `home_region`
 # against the operator's configured region set and returns it, which is the feature #46 landed.
 # The exemption is the management plane, not "anywhere it happens to appear".
@@ -111,7 +191,7 @@ for crate in "${SERVING_CRATES[@]}"; do
     [ "$crate" = "ironauth-admin" ] && continue
     [ -d "crates/$crate/src" ] || continue
     hits="$(production_source "$crate" \
-        | grep -nE 'home_region|region_pin|pinned_region' \
+        | grep -nE 'home_region|\.region\b|region_pin|pinned_region' \
         | grep -v 'no-cross-region-allow' || true)"
     if [ -n "$hits" ]; then
         echo "::error::no-cross-region-sync: a request path reads a residency attribute:" >&2
