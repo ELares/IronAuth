@@ -2112,6 +2112,40 @@ async fn evaluate_step_up(
         }
     }
 
+    // THE ACCESS RULES AS A STEP-UP SOURCE (issue #154 criterion 4, the third consumer).
+    //
+    // The criterion asks that ONE rule set gate a forward-auth resource, an OIDC token issuance
+    // and a step-up requirement. The first two are decisions -- admit, refuse -- and this is
+    // not: it is the only one of the three surfaces that can actually RUN the ceremony, so what
+    // it takes from the rules is a floor rather than a verdict.
+    //
+    // It composes through the SAME strongest-wins merge as every other source, which is what
+    // makes it safe to add: a stronger client, scope, essential-claims or overlay floor still
+    // wins, a session that already reached the rung is Satisfied, and a deployment with no
+    // rules contributes nothing. The risk engine above is the precedent -- a non-declarative
+    // source raising the floor through this same seam.
+    //
+    // `step_up_floor` returns the ACR a matching rule DEMANDS, unresolved. `RuleSet::decide`
+    // would have resolved a met step-up into an `Allow`, which is right for forward-auth and
+    // wrong here twice over: the merge below composes this with four other sources, and it is
+    // that merged requirement `evaluate` judges -- including the `max_age` half, which the
+    // rules engine cannot express at all.
+    if let Some(rules) = state.access_rules() {
+        if let Some(floor) = rules.step_up_floor(&crate::rules::RequestFacts {
+            subject: Some(session.subject.clone()),
+            acr: Some(crate::tokens::issued_acr(&session.auth_methods)),
+            ..crate::rules::RequestFacts::default()
+        }) {
+            requirement.merge_stronger(
+                &step_up::AuthnRequirement {
+                    min_acr: Some(floor),
+                    max_auth_age_secs: None,
+                },
+                &order,
+            );
+        }
+    }
+
     // The subject the overlay lookup, the factor probe, and the trusted-device validation
     // bind to. A session subject that will not parse in scope cannot be probed, so the
     // requirement can never be met here.

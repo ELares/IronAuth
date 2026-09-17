@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! One rule set, two consumers (issue #154, criterion 4).
+//! One rule set, all three consumers (issue #154, criterion 4).
 //!
 //! > The same rule set demonstrably gates a forward-auth resource, an OIDC token issuance,
 //! > and a step-up requirement in integration tests.
@@ -434,4 +434,100 @@ async fn a_refused_subject_cannot_tokenize_a_session_either() {
          gate that broke the endpoint: {body}"
     );
     assert!(body.contains("token"), "{body}");
+}
+
+/// THE THIRD CONSUMER: a step-up requirement, from the same rule set.
+///
+/// Criterion 4 names three, and the other two are DECISIONS -- admit, refuse. This one is not:
+/// the authorization request is the only one of the three surfaces that can actually run the
+/// ceremony, so what it takes from the rules is a floor that composes with the request's
+/// `acr_values`, the per-client floor, the per-scope policy and the broker overlay.
+///
+/// The rule demands MFA of one person and says nothing about anyone else, so both directions
+/// are driven: without both, "it is challenged" passes against a build that challenges everyone
+/// and "it is issued" passes against one that challenges nobody.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_rule_set_also_raises_the_step_up_floor_for_an_authorization_request() {
+    let harness = Harness::start_store_backed().await;
+    let challenged = harness
+        .seed_user("challenged@example.test", "correct horse battery")
+        .await;
+    let ordinary = harness
+        .seed_user("ordinary@example.test", "correct horse battery")
+        .await;
+
+    let cfg = ForwardAuthConfig {
+        enabled: true,
+        rules: vec![AccessRuleConfig {
+            name: "this-person-uses-mfa".to_owned(),
+            action: AccessActionConfig::StepUp,
+            acr: Some("mfa".to_owned()),
+            subject_is: Some(challenged.clone()),
+            ..AccessRuleConfig::default()
+        }],
+        ..ForwardAuthConfig::default()
+    };
+    let rules = access_rules_from_config(&cfg, &[]).expect("the rules convert");
+    let state = harness
+        .state()
+        .clone()
+        .with_access_rules(Arc::clone(&rules));
+    let router = oidc_router(state);
+
+    let (client, _secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+
+    let authorize = |subject: String| {
+        let (router, client_id) = (router.clone(), client_id.clone());
+        let harness = &harness;
+        async move {
+            harness
+                .grant_consent_scoped(&subject, &client_id, Some("openid"))
+                .await;
+            let cookie = harness.session_cookie_at(&subject, "pwd", 0).await;
+            let query = format!(
+                "response_type=code&client_id={client_id}&redirect_uri={}&scope={}",
+                common::enc(REDIRECT_URI),
+                common::enc("openid")
+            );
+            let request = Request::builder()
+                .method("GET")
+                .uri(format!("/authorize?{query}"))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request builds");
+            send_through(router, request).await
+        }
+    };
+
+    // THE PERSON THE RULE NAMES, on a password session, is routed to the second-factor
+    // challenge instead of being handed a code.
+    let (status, headers, body) = authorize(challenged).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    let location = headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        location.starts_with("/login/mfa"),
+        "the rule raised the floor above what this session reached, so the request must route \
+         to the ceremony rather than issue: {location}"
+    );
+
+    // EVERYONE ELSE is unaffected: the same request on the same rules gets a code.
+    let (status, headers, body) = authorize(ordinary).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    let location = headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        location.contains("code="),
+        "a rule naming one person must not raise the floor for everybody, or the assertion \
+         above passes against a deployment that challenges every login: {location}"
+    );
 }
