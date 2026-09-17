@@ -1,0 +1,283 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! One rule set, two consumers (issue #154, criterion 4).
+//!
+//! > The same rule set demonstrably gates a forward-auth resource, an OIDC token issuance,
+//! > and a step-up requirement in integration tests.
+//!
+//! "The same" is the load-bearing word, and it is the part a test can get wrong while looking
+//! right: two rule sets built from one config file agree on everything and are still two
+//! objects, so a bug that reloads one and not the other passes such a test forever. Here the
+//! `Arc` is cloned, both consumers hold the SAME pointer, and the test asserts that identity
+//! before it asserts any behaviour.
+//!
+//! The rules are also built from CONFIGURATION rather than assembled in the test, so what is
+//! exercised is the path an operator takes.
+
+mod common;
+
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use common::{Harness, REDIRECT_URI, form, send_through};
+use ironauth_config::{
+    AccessActionConfig, AccessRuleConfig, FORWARD_DECISION_HEADER, FORWARD_DECISION_HONORED,
+    ForwardAuthConfig,
+};
+use ironauth_oidc::forward_auth_rules::{ForwardAuthRuntime, access_rules_from_config};
+use ironauth_oidc::{ClientAuthMethod, oidc_router};
+
+/// The policy: one person is refused, everyone else is admitted.
+///
+/// The catch-all matters. `RuleSet::decide` denies a request no rule matched, so without it the
+/// forward-auth half would refuse BOTH subjects and the deny rule would prove nothing. The
+/// issuance half reads the same rules through `refusal`, where a fall-through is NOT a
+/// refusal -- which is exactly the difference this test is here to hold still.
+fn policy(blocked: &str) -> ForwardAuthConfig {
+    ForwardAuthConfig {
+        enabled: true,
+        rules: vec![
+            AccessRuleConfig {
+                name: "block-the-blocked-person".to_owned(),
+                action: AccessActionConfig::Deny,
+                subject_is: Some(blocked.to_owned()),
+                ..AccessRuleConfig::default()
+            },
+            AccessRuleConfig {
+                name: "everyone-else".to_owned(),
+                action: AccessActionConfig::Allow,
+                ..AccessRuleConfig::default()
+            },
+        ],
+        ..ForwardAuthConfig::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn one_rule_set_gates_a_forward_auth_resource_and_a_token_issuance() {
+    let harness = Harness::start_store_backed().await;
+
+    // REAL USERS, because both consumers read a subject the server resolved: the forward-auth
+    // check reads the session row and the mint reads the grant, and a subject nobody seeded
+    // reaches neither. The rule is written against the id the seeding returns, so the policy
+    // and the principal cannot disagree about who is blocked.
+    let blocked = harness
+        .seed_user("blocked@example.test", "correct horse battery")
+        .await;
+    let allowed = harness
+        .seed_user("ordinary@example.test", "correct horse battery")
+        .await;
+    let cfg = policy(&blocked);
+
+    // COMPILED ONCE. Both consumers are handed clones of this pointer, which is what "the
+    // same rule set" has to mean for the criterion to say anything.
+    let rules = access_rules_from_config(&cfg, &[]).expect("the rules convert");
+    let runtime =
+        ForwardAuthRuntime::from_rules(&cfg, Arc::clone(&rules), harness.env().clock_arc())
+            .expect("the runtime builds")
+            .expect("forward-auth is enabled");
+    let runtime = Arc::new(runtime);
+
+    let state = harness
+        .state()
+        .clone()
+        .with_forward_auth(Arc::clone(&runtime))
+        .with_access_rules(Arc::clone(&rules));
+
+    assert!(
+        Arc::ptr_eq(&rules, state.access_rules().expect("rules are installed")),
+        "the issuance consumer must hold the object the boot path compiled, not a copy of it"
+    );
+
+    let router = oidc_router(state);
+    let scope = harness.scope();
+    let check_path = format!(
+        "/t/{}/e/{}/forward-auth",
+        scope.tenant(),
+        scope.environment()
+    );
+
+    // ---- CONSUMER ONE: the forward-auth resource.
+    let check = |cookie: String| {
+        let (path, router) = (check_path.clone(), router.clone());
+        async move {
+            let request = Request::builder()
+                .method("GET")
+                .uri(path)
+                .header(FORWARD_DECISION_HEADER, FORWARD_DECISION_HONORED)
+                .header("x-forwarded-method", "GET")
+                .header("x-forwarded-host", "app.example.com")
+                .header("x-forwarded-uri", "/reports")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request builds");
+            send_through(router, request).await.0
+        }
+    };
+
+    let blocked_cookie = harness.session_cookie_at(&blocked, "pwd", 0).await;
+    let allowed_cookie = harness.session_cookie_at(&allowed, "pwd", 0).await;
+    assert_eq!(
+        check(blocked_cookie).await,
+        StatusCode::FORBIDDEN,
+        "the deny rule must refuse the resource"
+    );
+    assert_eq!(
+        check(allowed_cookie).await,
+        StatusCode::OK,
+        "and the catch-all must admit everyone else, or the row above proves only that \
+         everything is denied"
+    );
+
+    // ---- CONSUMER TWO: an OIDC token issuance, through the same rules.
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+    let basic = format!("Basic {}", STANDARD.encode(format!("{client_id}:{secret}")));
+
+    let redeem = |code: String| {
+        let (router, basic) = (router.clone(), basic.clone());
+        async move {
+            let body = form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT_URI),
+            ]);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::AUTHORIZATION, basic)
+                .body(Body::from(body))
+                .expect("request builds");
+            send_through(router, request).await
+        }
+    };
+
+    // The codes are issued through the harness's own router, which carries no rules: the gate
+    // under test is at the MINT, and issuing the code must not be what refuses.
+    let blocked_code = harness
+        .issue_code_for_subject(&client_id, &blocked, "openid")
+        .await;
+    let allowed_code = harness
+        .issue_code_for_subject(&client_id, &allowed, "openid")
+        .await;
+
+    let (status, _, body) = redeem(blocked_code).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the same deny rule must refuse the issuance: {body}"
+    );
+    assert!(
+        body.contains("access_denied"),
+        "a refusal by an operator's rule is not a server fault, and RFC 6749 section 5.2 has \
+         the name for it: {body}"
+    );
+    assert!(
+        !body.contains("block-the-blocked-person"),
+        "the rule name is for the operator's log, not for the client that was refused: {body}"
+    );
+
+    let (status, _, body) = redeem(allowed_code).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "and issuance must still work for everyone else, or the assertion above would pass \
+         against a build that refuses every token: {body}"
+    );
+    assert!(body.contains("access_token"), "{body}");
+}
+
+/// A REALISTIC FORWARD-AUTH POLICY MUST NOT STOP EVERY TOKEN IN THE DEPLOYMENT.
+///
+/// The test above carries a catch-all `allow`, because the forward-auth half needs one to
+/// prove its deny rule refuses something in particular. That catch-all also hides the failure
+/// this test exists for: with it, nothing ever falls through, so reading a fall-through as a
+/// refusal passes. A mutation proved exactly that -- `refusal` rewritten to treat
+/// `(Deny, None)` as a refusal left the test above green.
+///
+/// So this is the ordinary configuration instead: path rules and no catch-all, which is what
+/// an operator protecting an application writes. A token request matches no path rule, and if
+/// that fall-through refused, the first forward-auth rule anyone wrote would silently stop
+/// every issuance in the deployment.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_path_rule_that_matches_no_token_request_does_not_refuse_one() {
+    let harness = Harness::start_store_backed().await;
+    let subject = harness
+        .seed_user("ordinary@example.test", "correct horse battery")
+        .await;
+
+    let cfg = ForwardAuthConfig {
+        enabled: true,
+        rules: vec![AccessRuleConfig {
+            name: "no-admin-area".to_owned(),
+            action: AccessActionConfig::Deny,
+            path_prefix: Some("/admin".to_owned()),
+            ..AccessRuleConfig::default()
+        }],
+        ..ForwardAuthConfig::default()
+    };
+    let rules = access_rules_from_config(&cfg, &[]).expect("the rules convert");
+
+    // THE PREMISE, ASSERTED: this rule set really does deny a request that matches nothing,
+    // which is what makes the issuance answer below a different reading rather than a
+    // coincidence. Without this line the test would pass against an engine that admits
+    // everything.
+    assert_eq!(
+        rules
+            .decide(&ironauth_oidc::rules::RequestFacts {
+                method: "POST".to_owned(),
+                host: "app.example.com".to_owned(),
+                path: "/anything".to_owned(),
+                subject: Some(subject.clone()),
+                ..ironauth_oidc::rules::RequestFacts::default()
+            })
+            .action,
+        ironauth_oidc::rules::Action::Deny,
+        "a resource request matching no rule is denied, which is the engine's contract"
+    );
+
+    let state = harness
+        .state()
+        .clone()
+        .with_access_rules(Arc::clone(&rules));
+    let router = oidc_router(state);
+
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client_id = client.to_string();
+    let code = harness
+        .issue_code_for_subject(&client_id, &subject, "openid")
+        .await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(
+            header::AUTHORIZATION,
+            format!("Basic {}", STANDARD.encode(format!("{client_id}:{secret}"))),
+        )
+        .body(Body::from(form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT_URI),
+        ])))
+        .expect("request builds");
+
+    let (status, _, body) = send_through(router, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a path rule constrains a resource, not an issuance: reading the fall-through as a \
+         refusal would mean one forward-auth rule stopped every token: {body}"
+    );
+    assert!(body.contains("access_token"), "{body}");
+}

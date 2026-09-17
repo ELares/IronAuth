@@ -463,6 +463,50 @@ impl RuleSet {
         self.walk(facts, &mut Silent)
     }
 
+    /// The rule that explicitly REFUSES `facts`, for a consumer where the request is already
+    /// authorized and these rules are an additional denial layer.
+    ///
+    /// # This reads the same rules with the OPPOSITE default, deliberately
+    ///
+    /// [`RuleSet::decide`] denies a request no rule matched, and the module documentation
+    /// explains at length why: a forward-auth resource has no other gate, so a fall-through
+    /// that admits is one forgotten rule away from an open door.
+    ///
+    /// Token issuance is not that. By the time a grant reaches a mint, the client has been
+    /// authenticated, the grant validated and the subject's own authorization checked. These
+    /// rules are what issue #154 calls "deny issuance by user/group/network" -- a DENY LIST
+    /// layered on top. Reading `no_match` as a refusal there would mean that the moment an
+    /// operator wrote a single forward-auth path rule, every token in the deployment stopped
+    /// being issued, because a token request matches no path rule.
+    ///
+    /// So this is a SEPARATE entry point rather than a flag on `decide`. A flag is one
+    /// forgotten argument away from a forward-auth check reading its fall-through as an
+    /// admission, and that failure is silent and admits. A caller has to name which question
+    /// it is asking, and the two names do not look alike.
+    ///
+    /// # A step-up is not a refusal here
+    ///
+    /// Only [`Action::Deny`] refuses. A matching [`Action::StepUp`] the request has not met
+    /// describes a remedy a token endpoint cannot offer in this position -- the authentication
+    /// already happened, and there is no caller to redirect. Treating it as a denial would
+    /// refuse a grant for a reason the response could not express; the surfaces that CAN offer
+    /// the remedy are the authorization request and the forward-auth check, which is where a
+    /// step-up rule belongs. `decide` still returns it for them.
+    /// # A fall-through is not a refusal, and that reads off the NAME
+    ///
+    /// `decide` answers a request no rule matched with `(Deny, None)`. The `None` is what
+    /// separates it from a rule that denied, so this asks for both: the action AND a rule to
+    /// attribute it to. Reading the action alone would turn every fall-through into a refusal,
+    /// which is the whole failure this entry point exists to avoid.
+    #[must_use]
+    pub fn refusal(&self, facts: &RequestFacts) -> Option<String> {
+        let decision = self.decide(facts);
+        match (decision.action, decision.matched) {
+            (Action::Deny, Some(rule)) => Some(rule),
+            _ => None,
+        }
+    }
+
     /// The decision, plus a trace of how every rule answered.
     ///
     /// This is what answers "why was this denied" for a request an operator is staring at:
@@ -4125,5 +4169,83 @@ mod tests {
 
         assert!(rules.dry_run(&met).would_allow());
         assert!(!rules.dry_run(&at_payments(Some(&pwd()))).would_allow());
+    }
+
+    /// `refusal` READS THE SAME RULES WITH THE OPPOSITE DEFAULT, and the fall-through is the
+    /// whole point.
+    ///
+    /// Four rows, because three of them are satisfiable by a wrong implementation on their
+    /// own: "an explicit deny refuses" passes against a function that refuses everything, and
+    /// "an allow does not" passes against one that refuses nothing. The row that pins the
+    /// behaviour is the fall-through, and it is the one an operator hits first -- a token
+    /// request matches no path rule.
+    #[test]
+    fn only_an_explicit_deny_refuses_an_already_authorized_request() {
+        let rules = RuleSet::new(vec![
+            deny(
+                "no-admin-area",
+                vec![Criterion::PathPrefix("/admin".to_owned())],
+            ),
+            allow(
+                "reports-for-alice",
+                vec![
+                    Criterion::PathPrefix("/reports".to_owned()),
+                    Criterion::Subject(SubjectCheck::Is("alice".to_owned())),
+                ],
+            ),
+            rule(
+                "payments-need-mfa",
+                vec![Criterion::PathPrefix("/payments".to_owned())],
+                Action::StepUp { acr: mfa() },
+            ),
+        ]);
+        let at = |path: &str| RequestFacts {
+            path: path.to_owned(),
+            subject: Some("alice".to_owned()),
+            ..facts()
+        };
+
+        assert_eq!(
+            rules.refusal(&at("/admin/users")).as_deref(),
+            Some("no-admin-area"),
+            "an explicit deny refuses, and names the rule so the log can"
+        );
+        assert_eq!(rules.refusal(&at("/reports/q3")), None, "an allow does not");
+
+        // THE FALL-THROUGH. `decide` answers this `(Deny, None)`, and reading the action alone
+        // would refuse it -- which for a token issuance means one path rule stops every token.
+        assert_eq!(
+            rules.decide(&at("/somewhere-else")).action,
+            Action::Deny,
+            "the premise: this request IS denied as a resource request"
+        );
+        assert_eq!(
+            rules.refusal(&at("/somewhere-else")),
+            None,
+            "and is NOT a refusal for a consumer whose request was already authorized"
+        );
+
+        // A STEP-UP IS NOT A REFUSAL HERE either: there is no caller to redirect at a mint.
+        assert_eq!(
+            rules.decide(&at("/payments/transfer")).action,
+            Action::StepUp { acr: mfa() },
+            "the premise: this rule does match and does demand a step-up"
+        );
+        assert_eq!(rules.refusal(&at("/payments/transfer")), None);
+    }
+
+    /// AN EMPTY RULE SET REFUSES NOTHING, which is the shipped default.
+    ///
+    /// Stated separately because it is the configuration every deployment starts from: if this
+    /// were a refusal, installing the issuance consumer would stop every token in every
+    /// deployment that never wrote a rule.
+    #[test]
+    fn a_rule_set_with_no_rules_refuses_nothing() {
+        assert_eq!(RuleSet::default().refusal(&facts()), None);
+        assert_eq!(
+            RuleSet::default().decide(&facts()).action,
+            Action::Deny,
+            "while the resource reading of the same empty set still denies"
+        );
     }
 }

@@ -1039,7 +1039,10 @@ async fn mint_and_persist(
         },
         &target,
     )
-    .map_err(|()| TokenError::ServerError)?;
+    .map_err(|refusal| match refusal {
+        crate::tokens::MintRefusal::Policy { .. } => TokenError::AccessDenied,
+        crate::tokens::MintRefusal::Signing => TokenError::ServerError,
+    })?;
 
     // Persist a fresh grant + record the access token against it, so the token is
     // revocable and introspectable by construction (the SAME grant chain). The

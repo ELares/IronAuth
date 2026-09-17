@@ -350,9 +350,16 @@ pub enum TokenError {
     /// issue #24): the server has increased the enforced interval for this device
     /// code, and the device must slow its polling.
     SlowDown,
-    /// The device-authorization request was denied (RFC 8628 section 3.5, issue #24):
-    /// the human explicitly rejected it at the verification page, or the user code was
-    /// invalidated after exhausting its failed-match budget.
+    /// The request was denied (RFC 6749 section 5.2 / RFC 8628 section 3.5).
+    ///
+    /// Two sources, and they are the same answer to the client: the human explicitly rejected
+    /// a device authorization at the verification page (issue #24, or the user code was
+    /// invalidated after exhausting its failed-match budget), or an operator's access rule
+    /// refused the issuance (issue #154 criterion 4).
+    ///
+    /// The rule NAME is deliberately not on the wire. A client learning which rule refused it
+    /// learns the shape of a policy it is not party to; the name goes to the server log, which
+    /// is where the operator who wrote it is looking.
     AccessDenied,
     /// The device code has expired (RFC 8628 section 3.5, issue #24): its TTL passed
     /// before the flow was approved and redeemed. The device must start a new flow.
