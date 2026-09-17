@@ -146,10 +146,10 @@ const MIGRATION_CLAIM: &str = "sweep-nickname";
 /// a normally registered user. The same helper, with the same defaults, that
 /// `tests/export.rs` seeds its native-credential users with.
 fn argon2_hash(password: &str) -> String {
-    use argon2::password_hash::{PasswordHasher, SaltString};
-    let salt = SaltString::encode_b64(b"live-surface-seed-salt").expect("salt");
+    use argon2::password_hash::PasswordHasher;
+    let salt = b"live-surface-seed-salt";
     argon2::Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), salt)
         .expect("argon2 hash")
         .to_string()
 }

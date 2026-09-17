@@ -10,7 +10,7 @@
 //! a re-import is idempotent (no duplicates); and an import into one tenant cannot
 //! touch another.
 
-use argon2::password_hash::{PasswordHash, PasswordVerifier};
+use argon2::password_hash::{PasswordVerifier, phc::PasswordHash};
 use ironauth_env::Env;
 use ironauth_import::scheme::{ForeignHash, firebase_stored};
 use ironauth_import::{ImportContext, RecordOutcome, import_into_run, import_stream};
@@ -62,10 +62,10 @@ fn pbkdf2_hash(password: &str) -> String {
 /// An Argon2 PHC foreign hash for `password` (verified through the foreign path,
 /// then rehashed to a FRESH native Argon2id verifier at import parameters).
 fn argon2_hash(password: &str) -> String {
-    use argon2::password_hash::{PasswordHasher, SaltString};
-    let salt = SaltString::encode_b64(b"argon2-salt-yy").expect("salt");
+    use argon2::password_hash::PasswordHasher;
+    let salt = b"argon2-salt-yy";
     argon2::Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), salt)
         .expect("argon2 hash")
         .to_string()
 }

@@ -30,7 +30,7 @@
 
 use std::sync::OnceLock;
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use argon2::{Algorithm, Argon2, Params, Version};
 use ironauth_env::Env;
 
@@ -139,7 +139,7 @@ fn argon2_with(params: Argon2Params) -> Result<Argon2<'static>, PasswordError> {
 ///
 /// # Errors
 ///
-/// [`PasswordError::Hash`] if the salt cannot be encoded or the hashing step
+/// [`PasswordError::Hash`] if the salt is invalid or the hashing step
 /// fails (unreachable for the fixed valid parameters; surfaced rather than
 /// panicked so a caller fails closed).
 pub fn hash_password(env: &Env, password: &str) -> Result<String, PasswordError> {
@@ -154,7 +154,7 @@ pub fn hash_password(env: &Env, password: &str) -> Result<String, PasswordError>
 ///
 /// # Errors
 ///
-/// [`PasswordError::Hash`] if the salt cannot be encoded or the hashing step
+/// [`PasswordError::Hash`] if the salt is invalid or the hashing step
 /// fails (for example an invalid parameter triple; a validated configuration
 /// bounds the parameters so this is unreachable in practice).
 pub fn hash_password_with(
@@ -164,9 +164,8 @@ pub fn hash_password_with(
 ) -> Result<String, PasswordError> {
     let mut salt_bytes = [0_u8; SALT_BYTES];
     env.entropy().fill_bytes(&mut salt_bytes);
-    let salt = SaltString::encode_b64(&salt_bytes).map_err(|_| PasswordError::Hash)?;
     let hash = argon2_with(params)?
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), &salt_bytes)
         .map_err(|_| PasswordError::Hash)?;
     Ok(hash.to_string())
 }
@@ -239,19 +238,20 @@ pub fn needs_rehash(hash: &str, target: Argon2Params) -> bool {
 pub fn verify_absent(password: &str) -> bool {
     static DUMMY: OnceLock<String> = OnceLock::new();
     let dummy = DUMMY.get_or_init(|| {
-        // A fixed salt: this hash only exists to spend Argon2id time, so it needs
-        // no randomness. encode_b64 of a fixed byte pattern is valid by
-        // construction; fall back to an empty string only if that ever fails, in
-        // which case verify_password below returns false anyway.
-        let salt = SaltString::encode_b64(&[0x24_u8; SALT_BYTES]).ok();
-        salt.and_then(|salt| {
-            argon2()
-                .ok()?
-                .hash_password(b"ironauth-absent-user-placeholder", &salt)
-                .ok()
-                .map(|hash| hash.to_string())
-        })
-        .unwrap_or_default()
+        // This fixed salt spends Argon2id time without protecting a real secret.
+        // Fall back to an empty hash only if the valid fixed parameters fail.
+        argon2()
+            .ok()
+            .and_then(|hasher| {
+                hasher
+                    .hash_password_with_salt(
+                        b"ironauth-absent-user-placeholder",
+                        &[0x24_u8; SALT_BYTES],
+                    )
+                    .ok()
+            })
+            .map(|hash| hash.to_string())
+            .unwrap_or_default()
     });
     // Run the verification for its timing (Argon2id work), then discard the
     // result and always return false. black_box keeps the compiler from eliding
@@ -294,6 +294,36 @@ mod tests {
         let b = hash_password(&env, "same").expect("hash b");
         assert_ne!(a, b, "the salt seam must vary the hash");
         assert!(verify_password("same", &a) && verify_password("same", &b));
+    }
+
+    #[test]
+    fn stored_argon2_hashes_from_before_the_upgrade_still_verify() {
+        // Frozen Argon2 0.5 PHC strings, including costs unlike today's defaults.
+        for stored in [
+            "$argon2id$v=19$m=64,t=3,p=2$aXJvbmF1dGhrYXYwMQ$Ea/OF4SRkXhUo4ESUkRqV5XgY4PdMegemCLFSxeBa8k",
+            "$argon2id$v=19$m=19456,t=2,p=1$aXJvbmF1dGhrYXYwMQ$Cux2Jl9MsBRRAOhVxZDiwTQAkIDpGUyI1JN7FXnmaew",
+        ] {
+            assert!(verify_password("correct horse", stored));
+            assert!(!verify_password("wrong", stored));
+        }
+    }
+
+    #[test]
+    fn hash_uses_exactly_one_raw_salt_from_the_entropy_seam() {
+        let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 17);
+        let (reference, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 17);
+        let mut expected_salt = [0_u8; SALT_BYTES];
+        reference.entropy().fill_bytes(&mut expected_salt);
+
+        let hash = hash_password(&env, "salt seam").expect("hash");
+        let parsed = PasswordHash::new(&hash).expect("PHC hash");
+        assert_eq!(parsed.salt.expect("salt").as_ref(), expected_salt);
+
+        let mut next_actual = [0_u8; SALT_BYTES];
+        let mut next_expected = [0_u8; SALT_BYTES];
+        env.entropy().fill_bytes(&mut next_actual);
+        reference.entropy().fill_bytes(&mut next_expected);
+        assert_eq!(next_actual, next_expected, "hash consumes only its salt");
     }
 
     #[test]

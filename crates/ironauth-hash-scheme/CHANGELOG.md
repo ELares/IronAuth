@@ -6,6 +6,10 @@ docs/RELEASING.md.
 
 ## Unreleased
 
+- Upgrade the Argon2 verifier to 0.6 while retaining the password-hash 0.5
+  interface for scrypt and PBKDF2. Imported Argon2 PHC strings retain their stored
+  cost parameters and continue to verify against the frozen compatibility vectors.
+
 - **The RustCrypto block ciphers moved to their 2024 line**: `aes` 0.8 -> 0.9 and `ctr` 0.9
   -> 0.10. They move as a family (`aes` 0.9 does not accept a `ctr` 0.9 cipher and vice
   versa), so the TWO dependabot PRs proposing them one at a time could not compile. A third

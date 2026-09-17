@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Upgrade Argon2 to 0.6 with explicit raw salts from the environment entropy
+  seam. Stored Argon2 PHC hashes, configured costs, salt length, and the absent-user
+  verification work remain compatible; the hasher's automatic RNG is disabled.
+
 ### Embeddable portal widgets, EXPLORATORY (issue #145 criterion 6)
 
 Shape `0.1.0-exp.1`, registered as the `admin-portal-widgets` experimental
