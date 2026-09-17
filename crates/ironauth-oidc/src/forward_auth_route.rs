@@ -165,6 +165,15 @@ pub async fn check(
             roles: Vec::new(),
             email: None,
             name: None,
+            // DERIVED FROM THE RECORDED METHODS, which is the single source issue #14 put
+            // `amr` and the achieved `acr` behind. The session row carries the tokens for
+            // what actually ran; this is the same derivation the ID token's `acr` claim uses,
+            // so a forward-auth step-up rule and a minted token cannot disagree about how
+            // strongly the same session authenticated.
+            acr: Some(
+                crate::authn::achieved_acr(&crate::authn::parse_methods(&session.auth_methods))
+                    .to_owned(),
+            ),
         });
 
     let outcome = runtime.forward_auth().evaluate(facts, identity.as_ref());

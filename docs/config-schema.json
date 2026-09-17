@@ -33,6 +33,14 @@
             "null"
           ]
         },
+        "acr_at_least": {
+          "default": null,
+          "description": "The authentication the request ARRIVED with must reach this `acr` floor.\n\nA short alias (`pwd`, `mfa`, `phr`, `phrh`) or a canonical server `acr`. Compared\nthrough the step-up ladder, so naming `pwd` is satisfied by an `mfa` session.\n\n# Not the same field as `acr`\n\n`acr` names what a `step-up` action DEMANDS, and the action offers the caller a way to\nget there. This SELECTS: a rule carrying it simply does not apply to a caller who has\nnot reached the floor, which is how an `allow` reserved for strongly authenticated\nsessions is written above a broader `deny`. The two are independent and a rule may\ncarry both.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "action": {
           "$ref": "#/$defs/AccessActionConfig",
           "description": "What this rule decides when it matches. Required: there is no safe default for an\naccess decision, and guessing one turns an omission into a silent allow."
