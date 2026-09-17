@@ -6722,6 +6722,15 @@ fn validate_rule_subject(
                 "subject_equals_capture",
                 rule.subject_equals_capture.is_some(),
             ),
+            // AN ACR IS A CLAIM ABOUT THE SUBJECT TOO. The forward-auth surface fills the
+            // reached authentication context from the resolved identity, so an anonymous
+            // request presents none and no floor can hold. It reads as "anonymous callers who
+            // authenticated strongly", which is not a set of requests.
+            //
+            // This list is hand-written and that is its weakness: it was written when the
+            // vocabulary had four subject fields and a fifth was added without it, which is
+            // exactly how a coherence check stops covering the thing it names.
+            ("acr_at_least", rule.acr_at_least.is_some()),
         ] {
             if set {
                 return Err(invalid(format!(
@@ -11179,9 +11188,13 @@ mod tests {
                 ),
                 "which ignores it",
             ),
+            (deny("acr_at_least = \"   \"\n"), "acr_at_least is empty"),
             (
-                deny("acr_at_least = \"   \"\n"),
-                "acr_at_least is empty",
+                with(
+                    "[[forward_auth.rules]]\nname = \"a\"\naction = \"allow\"\n\
+                     subject_state = \"anonymous\"\nacr_at_least = \"mfa\"\n",
+                ),
+                "AND sets acr_at_least",
             ),
             (
                 deny("path_matches = \"^/u/(?<user\"\n"),

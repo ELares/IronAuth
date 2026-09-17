@@ -1515,6 +1515,22 @@ mod tests {
                 "payments-catch-all",
                 vec![Criterion::PathPrefix("/payments".to_owned())],
             ),
+            // THE SIXTH CRITERION TYPE. Without it this set covered five of six, while the
+            // doc above and on `corpus_cases` both said every variant appeared -- so the new
+            // criterion never went through composition with another criterion, never appeared
+            // in a trace, and never took part in the first-match ordering the corpus exists
+            // to pin. Placed above its own catch-all for the same reason the step-up row is.
+            allow(
+                "vault-for-strong-sessions",
+                vec![
+                    Criterion::PathPrefix("/vault".to_owned()),
+                    Criterion::AcrAtLeast(crate::step_up::canonical_step_up_acr("mfa")),
+                ],
+            ),
+            deny(
+                "vault-otherwise",
+                vec![Criterion::PathPrefix("/vault".to_owned())],
+            ),
         ])
     }
 
@@ -1531,6 +1547,28 @@ mod tests {
     /// The rows whose selection turns on the SUBJECT: roles, captures, groups.
     fn corpus_cases_subject() -> Vec<Case> {
         vec![
+            Case {
+                name: "a strong session reaches the vault through the floor above the deny",
+                facts: RequestFacts {
+                    path: "/vault/keys".to_owned(),
+                    subject: Some("alice".to_owned()),
+                    acr: Some(crate::step_up::canonical_step_up_acr("mfa")),
+                    ..facts()
+                },
+                expect: Some("vault-for-strong-sessions"),
+                action: Action::Allow,
+            },
+            Case {
+                name: "the same request with a password session falls to the deny below it",
+                facts: RequestFacts {
+                    path: "/vault/keys".to_owned(),
+                    subject: Some("alice".to_owned()),
+                    acr: Some(crate::step_up::canonical_step_up_acr("pwd")),
+                    ..facts()
+                },
+                expect: Some("vault-otherwise"),
+                action: Action::Deny,
+            },
             Case {
                 name: "anonymous at /admin hits the deny above the allow",
                 facts: RequestFacts {
@@ -2891,28 +2929,23 @@ mod tests {
             let rendered = describe(&criterion);
             let wanted = expected(&criterion);
             let deps = RuleSet::new(vec![allow("r", vec![criterion])]).dependencies();
-            for field in &wanted {
-                assert!(
-                    deps.reads(*field),
-                    "{rendered}: {field:?} is not in the cache key, so two requests \
-                     differing only in it would share an entry"
-                );
-            }
-            // And nothing MORE, which is the over-splitting direction.
-            for field in [
-                FactField::Method,
-                FactField::Host,
-                FactField::Path,
-                FactField::Subject,
-                FactField::Groups,
-                FactField::Roles,
-            ] {
-                assert_eq!(
-                    deps.reads(field),
-                    wanted.contains(&field),
-                    "{rendered}: disagreement on {field:?}"
-                );
-            }
+            // BOTH DIRECTIONS AT ONCE, by comparing the SETS.
+            //
+            // This was a positive loop over `wanted` followed by a negative loop over a
+            // hand-written list of every `FactField`. That second list is what fell behind:
+            // `FactField::Acr` was added to the enum and not to it, so over-declaration of the
+            // new fact -- a criterion splitting the cache on something it does not read -- was
+            // unguarded, and a list written to catch a list falling behind had fallen behind.
+            //
+            // Comparing the sets needs no list. A variant added to the enum is covered the
+            // moment `expected` names it, which the compiler already forces.
+            assert_eq!(
+                deps.fields,
+                wanted.iter().copied().collect::<BTreeSet<FactField>>(),
+                "{rendered}: the declared facts and the facts it reads disagree. Missing one \
+                 makes two requests differing only in it share a cache entry; declaring one \
+                 it does not read splits the cache for callers the engine cannot tell apart"
+            );
         }
 
         // Headers are keyed by name, lowercased to match the case-insensitive comparison.

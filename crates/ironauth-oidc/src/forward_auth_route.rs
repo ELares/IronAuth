@@ -165,11 +165,22 @@ pub async fn check(
             roles: Vec::new(),
             email: None,
             name: None,
-            // DERIVED FROM THE RECORDED METHODS, which is the single source issue #14 put
-            // `amr` and the achieved `acr` behind. The session row carries the tokens for
-            // what actually ran; this is the same derivation the ID token's `acr` claim uses,
-            // so a forward-auth step-up rule and a minted token cannot disagree about how
-            // strongly the same session authenticated.
+            // DERIVED FROM THE SESSION ROW'S RECORDED METHODS, through the same function the
+            // ID token's `acr` claim uses (issue #14's single source).
+            //
+            // THE FUNCTION IS SHARED; THE INPUT IS NOT, and an earlier version of this comment
+            // said the two "cannot disagree", which is false. The ID token derives from the
+            // methods FROZEN ONTO THE AUTHORIZATION CODE, and a remembered-device
+            // authorization upgrades those to `[<primary>, trusted_device]` for that request
+            // only (`authorize.rs`); nothing writes the upgrade back to the session. So a
+            // session row reading `pwd` mints a token carrying `mfa_remembered` while this
+            // surface reads `pwd`.
+            //
+            // That divergence is deliberate and it fails CLOSED: the trusted-device skip is a
+            // fact about one authorization request, not about the session, and a forward-auth
+            // check is a different request. What it must not be is documented as impossible --
+            // `forward_auth_rules::canonical_acr` refuses the one rung it makes unreachable,
+            // rather than letting a rule name a level this surface can never observe.
             acr: Some(
                 crate::authn::achieved_acr(&crate::authn::parse_methods(&session.auth_methods))
                     .to_owned(),
