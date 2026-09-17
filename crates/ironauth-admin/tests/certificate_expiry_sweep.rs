@@ -272,16 +272,66 @@ async fn two_passes_racing_over_one_certificate_announce_it_once_between_them() 
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     let org = seed_org(&db, &env, scope, "Globex").await;
-    let connection = connect(&db, &env, scope, &org, "https://idp.example/races").await;
-    pin_expiring(&db, &env, scope, &connection, 81, 2 * DAY).await;
-    drain(&db, &env, scope).await;
+    // RETRIED UNTIL THE CONTENTION IS OBSERVED, exactly as its neighbour is and for the same
+    // reason. The justification for asserting `> 0` on a single attempt was a measurement --
+    // "they contended on six of six rounds" -- and six of six is the same kind of evidence the
+    // neighbouring test's three-millisecond sleep had before CI disproved it. Two passes
+    // serialising is a legitimate scheduling outcome on a loaded runner, not a defect; what
+    // this test is about is what the loser reports WHEN they contend.
+    //
+    // Every attempt's assertions below are unchanged, because they hold whichever way the
+    // interleaving fell -- only the row that requires contention to have HAPPENED is what the
+    // loop is for.
+    let mut contended = None;
+    let mut readings: Vec<String> = Vec::new();
+    for attempt in 0..50u8 {
+        let connection = connect(
+            &db,
+            &env,
+            scope,
+            &org,
+            &format!("https://idp.example/races/{attempt}"),
+        )
+        .await;
+        pin_expiring(&db, &env, scope, &connection, 81, 2 * DAY).await;
+        drain(&db, &env, scope).await;
 
-    let (left, right) = tokio::join!(
-        ironauth_admin::certificate_expiry::run_once(db.control_store(), &env, scope, LEADS, 100),
-        ironauth_admin::certificate_expiry::run_once(db.control_store(), &env, scope, LEADS, 100),
-    );
-    let left = left.expect("a losing pass reports rather than raises");
-    let right = right.expect("a losing pass reports rather than raises");
+        let (left, right) = tokio::join!(
+            ironauth_admin::certificate_expiry::run_once(
+                db.control_store(),
+                &env,
+                scope,
+                LEADS,
+                100
+            ),
+            ironauth_admin::certificate_expiry::run_once(
+                db.control_store(),
+                &env,
+                scope,
+                LEADS,
+                100
+            ),
+        );
+        let left = left.expect("a losing pass reports rather than raises");
+        let right = right.expect("a losing pass reports rather than raises");
+        let reading = format!("{left:?} {right:?}");
+        if !readings.contains(&reading) {
+            readings.push(reading);
+        }
+        if left.already_taken + right.already_taken > 0 {
+            contended = Some((left, right));
+            break;
+        }
+    }
+    let (left, right) = contended.unwrap_or_else(|| {
+        panic!(
+            "fifty attempts and neither pass ever reported losing a pair, so the \
+             `already_taken` counter is enforced by nothing. Either the counter stopped \
+             counting, or the two passes stopped overlapping -- each commits three separate \
+             transactions with a round trip apiece, so a window that narrow would be a real \
+             change. Distinct reports observed: {readings:?}"
+        )
+    });
 
     // EXACTLY THREE NOTICES BETWEEN THEM, however the two passes divided the work. That is the
     // guarantee the ledger's primary key gives, and it holds whichever way the interleaving fell.
@@ -304,9 +354,10 @@ async fn two_passes_racing_over_one_certificate_announce_it_once_between_them() 
     // implied by the line above -- `announced` already sums to 3 -- so it held whatever
     // `already_taken` was, including zero. That is the second vacuous guard I wrote here.
     //
-    // The passes may genuinely not overlap, in which case the second finds nothing due and
-    // reports zero of everything; what must never happen is a pass that RAISED, and both
-    // `expect`s above already forbid that.
+    // (A paragraph here used to say the passes "may genuinely not overlap, in which case the
+    // second finds nothing due and reports zero of everything", and that only a RAISED pass is
+    // forbidden. It was left behind when the assertion below was tightened to `> 0`, and it
+    // told a reader triaging that very assertion that the outcome it fails on is legitimate.)
     // THE LOSER REPORTED WHAT IT LOST, which is the assertion that gives `already_taken` any
     // meaning at all. Exactly three pairs exist and exactly three notices went out, so whatever
     // the second pass attempted and did not win, it must have counted.
@@ -411,31 +462,103 @@ async fn a_renewal_landing_mid_pass_is_counted_not_raised() {
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     let org = seed_org(&db, &env, scope, "Globex").await;
-    let connection = connect(&db, &env, scope, &org, "https://idp.example/midpass").await;
+    // THE INTERLEAVING IS RETRIED UNTIL IT IS OBSERVED, because a sleep cannot schedule it.
+    //
+    // This was one attempt with ten certificates and a three-millisecond sleep, reasoning that
+    // thirty records would keep the pass busy past it. On CI it lost, and it lost in the
+    // direction the comment did not consider: the report came back `announced: 27, vanished: 0`
+    // -- twenty-seven, not thirty -- so the unpin landed BEFORE the pass read its work list and
+    // the victim's three were simply absent. That is the SIBLING case this test exists to be
+    // distinct from, and no amount of adding certificates fixes it, because the failure is the
+    // renewal being too early rather than the pass being too short.
+    //
+    // A wall-clock delay cannot place one task inside another's critical section on a shared
+    // runner. What can be done honestly is to try the construction until the interleaving
+    // actually happens, and to say so when it never does rather than asserting on whichever
+    // order won. Each attempt gets its OWN connection and certificates, because a pass consumes
+    // the work it announces.
+    // THE READINGS ARE KEPT, because the exhaustion path is the one this is most likely to
+    // produce and the numbers ARE the diagnosis. The first version panicked with prose alone,
+    // which is the shape of failure that sends the next person to re-run locally to recover
+    // what the test already knew -- and the comment above could only be written because the
+    // assertion this replaced printed `SweepReport { announced: 27, .. }`.
+    //
+    // DISTINCT readings rather than the last one: `27` says the unpin is landing before the
+    // work list is read, so the construction is the problem and the arm is fine, while `30`
+    // is ambiguous between an unpin that landed after the pass finished and an arm that
+    // stopped counting. A run that saw both is a different story from one that saw only one,
+    // and keeping the last alone hides the mix.
+    let mut report = None;
+    let mut readings: Vec<String> = Vec::new();
+    for attempt in 0..50u8 {
+        let connection = connect(
+            &db,
+            &env,
+            scope,
+            &org,
+            &format!("https://idp.example/midpass/{attempt}"),
+        )
+        .await;
+        let mut pinned = Vec::new();
+        for offset in 0..10u8 {
+            pinned.push(
+                pin_expiring(
+                    &db,
+                    &env,
+                    scope,
+                    &connection,
+                    attempt.wrapping_mul(10).wrapping_add(offset),
+                    2 * DAY,
+                )
+                .await,
+            );
+        }
+        drain(&db, &env, scope).await;
+        let victim = *pinned.last().expect("ten certificates");
 
-    // SEVERAL CERTIFICATES, so the pass has enough work to still be running when the unpin
-    // lands. One would be a race the sweep usually wins.
-    let mut pinned = Vec::new();
-    for seed in 90..100u8 {
-        pinned.push(pin_expiring(&db, &env, scope, &connection, seed, 2 * DAY).await);
+        let (pass, unpinned) = tokio::join!(
+            ironauth_admin::certificate_expiry::run_once(
+                db.control_store(),
+                &env,
+                scope,
+                LEADS,
+                100
+            ),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+                db.control_store()
+                    .scoped(scope)
+                    .acting(db.test_actor(&env), CorrelationId::generate(&env))
+                    .saml_connections()
+                    .unpin_certificate(&env, &victim, None)
+                    .await
+            },
+        );
+        unpinned.expect("the operator's renewal succeeds");
+        let pass = pass.expect("a renewal under a pass is not a fault");
+        let reading = format!("{pass:?}");
+        if !readings.contains(&reading) {
+            readings.push(reading);
+        }
+        if pass.vanished > 0 {
+            report = Some(pass);
+            break;
+        }
     }
-    drain(&db, &env, scope).await;
-    let victim = *pinned.last().expect("ten certificates");
-
-    let (report, unpinned) = tokio::join!(
-        ironauth_admin::certificate_expiry::run_once(db.control_store(), &env, scope, LEADS, 100),
-        async {
-            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
-            db.control_store()
-                .scoped(scope)
-                .acting(db.test_actor(&env), CorrelationId::generate(&env))
-                .saml_connections()
-                .unpin_certificate(&env, &victim, None)
-                .await
-        },
-    );
-    unpinned.expect("the operator's renewal succeeds");
-    let report = report.expect("a renewal under a pass is not a fault");
+    let report = report.unwrap_or_else(|| {
+        panic!(
+            "fifty attempts and `vanished` never moved. Two readings, and BOTH are real \
+             signals rather than a flake to retry harder. Either the arm stopped counting -- \
+             this is the assertion that catches a vanished work item being reported as \
+             announced -- or the interleaving stopped being constructible, because the pass \
+             got fast enough that a three-millisecond delay always misses it or the work-list \
+             read moved. The reports below say which: `announced: 27` means the unpin landed \
+             before the work list was read, so the construction is at fault and the arm is \
+             intact; `announced: 30` is ambiguous between a late unpin and a broken arm, and \
+             is where checking the arm first is worth the time. Distinct reports observed: \
+             {readings:?}"
+        )
+    });
 
     // THE VICTIM'S PAIRS LANDED IN THE `vanished` BUCKET, which is the assertion that gives the
     // counter meaning. An earlier version asserted only `announced + vanished == 30`, and that

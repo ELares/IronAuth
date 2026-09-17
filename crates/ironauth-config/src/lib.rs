@@ -6485,11 +6485,6 @@ fn validate_organizations(organizations: &OrganizationsConfig) -> Result<(), Con
     Ok(())
 }
 
-/// Validate the inbound SCIM settings (issue #135).
-///
-/// Every refusal here is a bound whose violation makes a control UNREACHABLE rather than
-/// merely large, which is the distinction that decides what belongs in this function.
-/// Refuse a `scim_push` section that would run the worker without pausing.
 /// Refuse a certificate-expiry sweep that would run forever and warn nobody (issue #141).
 ///
 /// REFUSED RATHER THAN FLOORED, following `validate_scim_push` immediately below: a value an
@@ -6518,6 +6513,7 @@ fn validate_certificate_expiry(expiry: &CertificateExpiryConfig) -> Result<(), C
     Ok(())
 }
 
+/// Refuse a `scim_push` section that would run the worker without pausing.
 fn validate_scim_push(scim_push: &ScimPushConfig) -> Result<(), ConfigError> {
     if scim_push.enabled && scim_push.interval_secs == 0 {
         return Err(ConfigError::Invalid {
@@ -6963,6 +6959,10 @@ fn validate_ssf(ssf: &SsfConfig) -> Result<(), ConfigError> {
 }
 
 /// Refuse a scim section whose page bounds cannot be satisfied.
+/// Validate the inbound SCIM settings (issue #135).
+///
+/// Every refusal here is a bound whose violation makes a control UNREACHABLE rather than
+/// merely large, which is the distinction that decides what belongs in this function.
 fn validate_scim(scim: &ScimConfig) -> Result<(), ConfigError> {
     if scim.max_scan > MANAGEMENT_LIST_HARD_CAP {
         return Err(ConfigError::Invalid {

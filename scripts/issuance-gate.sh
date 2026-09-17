@@ -45,6 +45,13 @@
 #
 # THE MARKER IS READ FROM THE DOC COMMENT IMMEDIATELY ABOVE THE `fn`, and nowhere else.
 #
+# It belongs INSIDE that block, above any attributes. Writing it between an attribute and the
+# `fn` splits the doc block in two, which this scan accepts (it reads comment and attribute
+# lines alike) and `invariant-lints.sh` does not: its `doc-attachment` rule reports two blocks
+# documenting one item as the shape an insertion above an existing block leaves behind. A
+# scripted edit anchored on the `fn` line lands in exactly that position, which is how the
+# first five markers were written and how `mint_refresh_token` turned main red.
+#
 # Not from the `fn` line, which is where it was written first and where it does not survive:
 # `cargo fmt` moves a trailing comment off a multi-line signature onto the first body line, so
 # every marker silently stopped counting the moment the file was formatted.
