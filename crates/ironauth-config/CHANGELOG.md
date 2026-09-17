@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Corrected the generated console setup descriptions and database credential
+  reference. The console is implemented and opt-in; serving connections use
+  `database.url` directly and do not merge the reserved `database.password`
+  setting. This changes documentation only, not configuration behavior.
+
 - Update regex to 1.13.1, which fixes incorrect match offsets, and TOML to 1.1.6,
   which reduces parser allocations. Both remain compatible with Rust 1.85.
 

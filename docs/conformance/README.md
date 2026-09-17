@@ -1,8 +1,10 @@
 # OIDF conformance harness
 
-The OpenID Foundation conformance suite, wired into CI as a merge gate (issue
-#37). Certification is not a launch event: the payoff is keeping the profile
-matrix green release over release, so the suite runs continuously, not once.
+IronAuth's OpenID Foundation conformance harness separates enforcing static
+checks from a live suite that still needs provisioned infrastructure (issue
+#37). The live lane is advisory today; no live conformance or certification
+result exists. The intended ongoing process is to keep the profile matrix
+passing across releases once that infrastructure is enabled.
 
 This directory is the documentation. The harness itself (the pinned stack, the
 cert config, the profile matrix, the results gate, and the one-command runner)

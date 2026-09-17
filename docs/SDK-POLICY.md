@@ -25,6 +25,9 @@ protocol risk from the integrator, first.**
 
 | Surface | State |
 | --- | --- |
+| Browser session handling | **Implemented** by the framework-agnostic `packages/ironauth-bff` helper; React and Next.js quickstarts adapt its handlers. No separate React hook library or Next.js SDK ships today |
+| TypeScript protocol and verification helpers | **Implemented** in `packages/ironauth-sdk`: WebCrypto verification, PKCE/OAuth, DPoP, protected-resource metadata, session-token handling, diagnostics, and uniform authorization checks |
+| Step-up middleware helpers | **Implemented** in `packages/ironauth-bff` for RFC 9470 challenges, freshness/factor checks, and reauthentication redirects |
 | Go management SDK | **Generated** from `docs/openapi/management.json` (`sdks/go`) |
 | Python management SDK | **Generated** from `docs/openapi/management.json` (`sdks/python`) |
 | iOS and Android sign-in samples | **Worked AppAuth integrations** (`clients/mobile`) -- sample apps, not a library. See [mobile-appauth.md](mobile-appauth.md), including why an AppAuth client needs the per-client DPoP exemption |
@@ -34,6 +37,11 @@ protocol risk from the integrator, first.**
 
 The generated clients are produced by the pipeline in the [SDK contract](SDK-CONTRACT.md);
 CI fails if the management API changes without regenerating them.
+
+The TypeScript development packages currently have private manifests and are
+built or packed from the repository; these rows do not imply npm publication.
+Use the [integration guide](INTEGRATIONS.md) to choose a path and follow the
+package-specific runtime requirements.
 
 ## Deferred, with triggers
 
@@ -62,12 +70,13 @@ Nothing below is refused. Each entry states what would change our mind.
   **Revisit trigger**: AppAuth stops tracking a platform release, or a capability IronAuth
   needs cannot be expressed through it.
 
-- **What**: Ruby and PHP beyond generated management clients.
+- **What**: Ruby and PHP SDKs.
   **Why**: for a server-side integration the protocol work is token verification, and that is
   a JOSE problem those ecosystems already solve well. The generated management client covers
   administration; a bespoke SDK on top would mostly restate a verification library.
-  **Instead**: the generated management client, plus the verification guidance in
-  [edge verification](edge-verification.md).
+  **Instead**: call the documented management API over HTTP and use a maintained
+  JOSE library with the verification requirements in [edge verification](edge-verification.md).
+  There are no generated Ruby or PHP management clients in the current tree.
   **Revisit trigger**: a verification path in one of these ecosystems proves error-prone in
   practice -- a recurring integrator mistake is evidence; an absence of one is not.
   **Java and .NET left this list**, and the reason is worth recording because it is not the

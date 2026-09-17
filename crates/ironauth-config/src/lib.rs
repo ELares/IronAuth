@@ -106,11 +106,12 @@ pub struct Config {
     pub hosted_pages: HostedPagesConfig,
 
     /// Admin console SPA settings (issue #90): the in-process serving of the
-    /// Preact admin console on the public plane under `/admin`. Off by default:
-    /// PR1 ships the serving skeleton (a static shell over the public management
-    /// API, no auth yet), so a default deployment mounts nothing and every
-    /// `/admin` path is a uniform 404. A later change flips the default on once
-    /// the console is functional.
+    /// Preact admin console on the public plane under `/admin`. The working
+    /// console is embedded in the binary and uses Authorization Code + PKCE
+    /// against the configured admin issuer. Opt in with `enabled`; while off,
+    /// every `/admin` path is a uniform 404. The same-origin `/admin/api` proxy
+    /// is available only when the OIDC bridge is configured and the management
+    /// plane is mounted. See `docs/ADMIN-CONSOLE.md` for setup and capabilities.
     pub admin_spa: AdminSpaConfig,
 
     /// Flexible-identifier settings (issue #54): the per-environment uniqueness
@@ -2290,10 +2291,10 @@ pub struct HostedPagesConfig {
 /// management API through one generated typed client. This gate mirrors
 /// `flows.enabled` and `hosted_pages.enabled`: a plain operator toggle, off by
 /// default, that mounts nothing on the wire until it is turned on (every
-/// `/admin` path answers a uniform 404 while off, so a deployment that does not
-/// use the console discloses nothing). Off in PR1 because the console is a
-/// static shell with no auth yet; a later change flips the default on once it is
-/// functional.
+/// `/admin` path answers a uniform 404 while off). The real built console is
+/// committed under `crates/ironauth-admin-ui/embedded`, so a Rust build does not
+/// need Node to serve it. Runtime config injects the admin issuer, public client
+/// identifier, and management audience into the served entry document.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct AdminSpaConfig {
@@ -2681,13 +2682,13 @@ pub enum LogFormat {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct DatabaseConfig {
-    /// Postgres connection string. Embedding the password here is
-    /// discouraged; prefer the `password` secret, which is merged at
-    /// connection time.
+    /// Postgres connection string used directly by the serving connection paths.
+    /// Include any required password in this DSN and protect the config file or
+    /// Kubernetes Secret that holds it; `password` is not merged into this value.
     pub url: Dsn,
 
-    /// Database password supplied out of band, overriding any password
-    /// embedded in `url`.
+    /// Reserved out-of-band database password setting. The current serving
+    /// connection paths do not use it to override or complete `url`.
     pub password: Option<Secret>,
 
     /// The platform envelope master key (issue #48): a high-entropy secret from

@@ -1,208 +1,219 @@
 <!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
 
-# IronAuth admin console (admin SPA)
+# IronAuth admin console
 
-The admin console is a Preact single page app that manages an IronAuth
-deployment by speaking the PUBLIC management API through one generated, typed
-client. It is served two ways from the same build: EMBEDDED in the single
-IronAuth binary (the default operator experience), and STANDALONE as static
-assets pointed at a configured management base.
+The console is a Preact single page application that administers IronAuth through
+one generated, typed client of the public management API. It includes Overview,
+Tenants, Environments, Clients, Users, Connectors, Organizations, Permissions,
+Invitations, and Diagnostics, with detail panels for credentials, memberships,
+roles, group hierarchy, and flow inspection.
 
-The console includes an overview of the loaded tenant/environment context and
-entry points for tenants, environments, clients, users, connectors, organizations,
-permissions, invitations, and diagnostics. Grouped navigation highlights the
-current section and collapses into an accessible menu on narrow screens.
-Console links and route patterns retain the `/admin` mount in embedded deployments.
+Read the [admin console guide](../../docs/ADMIN-CONSOLE.md) for deployment,
+sign-in prerequisites, page operations, and current limitations. This README
+describes the frontend's development and integration contract.
 
-The visible search control and Cmd/Ctrl-K open the same command palette. Resource
-lists also have local filters over the loaded rows; paginated collections make
-that search boundary explicit. Lists are the default content. Creation and add
-forms mount only after an explicit header action opens a native modal dialog;
-empty lists never open a form automatically. Cancel or Escape discards the draft
-and restores focus to its trigger. A successful write closes the dialog and
-keeps confirmation or one-time credential output on the page. Forms provide
-descriptions and field guidance,
-one-time credentials have copy controls, and destructive actions require an
-explicit confirmation with Escape cancellation. API errors remain verbatim.
+## Toolchain and commands
 
-Sign in uses Authorization Code + PKCE against the configured admin issuer.
-The short lived at+jwt stays in memory, and the sign-out control clears that
-console session and its selected context. Tenant/environment selection scopes
-every resource view and collapses when the environment is implicit.
-
-## The reusable resource pattern (PR4)
-
-The CRUD surfaces share one shape so every later section reads the same way:
-
-- `src/ui/useResource.ts` holds the hooks. `useAsyncResource(load, deps)` drives a
-  read (a list or a detail) with an explicit loading, ready, or error state and a
-  `reload()`; `useMutation()` drives a write (create, delete, or a lifecycle
-  transition) with a pending, success, or error state, and remembers the last
-  write so the RFC 9470 sudo path can replay it after a re-authentication.
-- `src/ui/ResourceView.tsx` holds the presentational primitives. `AsyncBoundary`
-  renders a read's loading indicator, empty state, verbatim `ErrorView`, or ready
-  content; `MutationFeedback` renders a write's success or its verbatim
-  `ErrorView` (with the sudo recovery when the write can be replayed);
-  `ConfirmButton` gates a destructive action behind an explicit confirm step.
-- `src/ui/TenantsView.tsx` and `src/ui/EnvironmentsView.tsx` compose those into
-  the tenant and environment surfaces. Environments are scoped to the active
-  tenant from the switcher; creating or deleting one refreshes the switcher's
-  environment list through the store, so the single-environment collapse
-  recomputes.
-
-Every read and write goes through a named wrapper in `src/api/client.ts` (the
-single funnel), each mapped to a documented management operation. There is NO
-tenant or environment UPDATE operation in the management contract, so these
-surfaces have none: a tenant is create, read, list, delete, and the suspend,
-resume, and restore lifecycle; an environment is create, read, list, and delete.
-
-## The context switcher and the single environment collapse
-
-The tenant/environment switcher (`src/ui/Switcher.tsx`) is the SINGLE source of
-the active scope every resource view reads. It populates from `listTenants` and
-`listEnvironments` through the one typed client (`src/scope/store.ts`), and every
-scoped management call injects the selected `{tenant_id, environment_id}` into its
-path parameters inside the one typed client wrapper (`src/api/client.ts`), the
-only place a path is formed. The selection persists
-in `sessionStorage` for reload continuity; the bearer token never does (it stays
-in memory only).
-
-The COLLAPSE is a hard rule: when the resolved tenant has exactly one environment
-and the principal has no cross-tenant reach, the switcher renders NO chrome at
-all. The scope is implicit and the homelab operator sees zero ceremony. The
-decision is the pure, unit tested `shouldCollapseSwitcher`.
-
-## The command palette
-
-`src/ui/CommandPalette.tsx` is a hand built (no new runtime dependency) palette
-opened with Cmd or Ctrl K. It is an ARIA combobox: focus is trapped on the search
-input, the active option is tracked with `aria-activedescendant`, and
-ArrowUp/ArrowDown move the selection, Enter runs it, and Escape closes and
-restores focus. It is driven ONLY by data the one typed client already loaded
-(the nav sections plus the tenants and environments the store holds), so it names
-no new endpoint.
-
-## The verbatim ErrorBody boundary
-
-`src/ui/ErrorView.tsx` renders the management `ErrorBody` the one client
-surfaced, VERBATIM: `error` and `message` always, plus `actual_scope`,
-`expected_scope`, and `failed_guardrails` when present, with no rewording and no
-swallowing (API and SPA users see identical errors). Every value is rendered as
-TEXT, escaped by Preact by construction, so a hostile looking message is inert;
-the component uses no `dangerouslySetInnerHTML`. A `max_age` bearing error is the
-RFC 9470 sudo challenge (issue #73): the boundary offers a re-authentication
-(the PR2 login re-run with `max_age` and `prompt=login`), then a sudo elevation,
-then a retry of the mutation. That sequence is dependency injected and unit
-tested; its live end to end continuity across the redirect login is verified
-under the runtime embed (issue #323).
-
-## The one rule: public management API only
-
-Every network call funnels through `src/api/client.ts`, the single module that
-holds an `openapi-fetch` client typed by the generated management contract. No
-other module may perform a network call, import the network library, or name a
-server API path. `scripts/admin-spa-route-audit.sh` enforces this structurally:
-it fails CI if any other module calls a network sink or imports `openapi-fetch`,
-if any absolute URL is hardcoded (the issuer and management bases are runtime
-config, never a literal), and if any management API path the app names is not
-documented in `docs/openapi/management.json`. A small allowlist of OIDC public
-endpoints (`/authorize`, `/token`, `/.well-known/openid-configuration`,
-`/end_session`) is declared for the PR2 login module to draw on.
-
-## How it binds the contract
-
-The app does not hand maintain the request and response shapes.
-`src/api/management.gen.ts` is GENERATED from `docs/openapi/management.json` by
-`openapi-typescript` (`npm run codegen`) and is committed. A CI freshness gate
-(`scripts/admin-spa-bindings.sh`) regenerates it and fails if the committed
-client drifts, so the console and the served management contract can never
-diverge. The generated `paths` type is what makes the one `openapi-fetch` client
-reject an undocumented path or method at compile time.
-
-## Embedded and standalone
-
-The build is served two ways:
-
-- EMBEDDED. The Rust crate `crates/ironauth-admin-ui` embeds the built `dist/`
-  with `rust-embed` and mounts it on the PUBLIC plane under `/admin`, behind the
-  `admin_spa.enabled` config flag (DEFAULT OFF while this is a skeleton; a later
-  change flips it on once the console is functional). While off, every `/admin`
-  path is a uniform 404. The Vite `base` is `/admin/` so every built asset URL is
-  prefixed to match the mount.
-- STANDALONE. The same app builds to static assets you host yourself, pointed at
-  a management base through the `<meta>` tags in `index.html` (like the
-  reference app in `../reference-app`). Rebuild with Vite `base: "/"` if you
-  serve it at a site root.
-
-Config is read from `<meta>` tags by `src/config.ts`: `ironauth-issuer` (the
-public plane base) and `ironauth-management-base` (where the management API is
-reached). Both empty means same origin, which is the embedded deploy.
-
-## Content Security Policy
-
-The embedded console is served with its OWN CSP (see
-`crates/ironauth-admin-ui`), separate from the strict auth-page CSP of issue #89:
-
-```
-default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; object-src 'none'; frame-ancestors 'none'
-```
-
-There is no `unsafe-inline`. The Vite build is configured to emit only content
-hashed, EXTERNAL script and stylesheet assets (no inline `<script>` or `<style>`,
-the module preload polyfill disabled, assets never inlined), so the policy holds
-with `script-src 'self'` and `style-src 'self'`. A standalone deploy MUST serve
-an equivalent CSP from its own static host.
-
-## The embedded dist in PR1
-
-`crates/ironauth-admin-ui` embeds a committed placeholder shell
-(`crates/ironauth-admin-ui/embedded/index.html`) so `cargo build` is green
-WITHOUT a Node toolchain and never needs the (gitignored) `dist/`. The real Vite
-`dist/` is produced by the CI `admin-spa` job and by `npm run build` locally; a
-later change wires the embed to the real build output. Because the flag defaults
-off, nothing is served in production regardless.
-
-## Toolchain
-
-Node 22.22.2 or later on the 22.x release line, Node 24.15.0 or later on the
-24.x release line, or Node 26 and newer, with npm. The supported release lines
-and minimum versions match Vitest 5 and jsdom. `package-lock.json` is committed;
-CI installs with `npm ci`.
+Use Node **22.22.2 or later on 22.x**, **24.15.0 or later on 24.x**, or **26 and
+newer**, with npm. These release lines and minimums match the locked Vitest 5 and
+jsdom requirements and the `engines.node` value in `package.json`. Node 20, 23,
+and 25 are not supported by the current dependency set. `package-lock.json` is
+committed; reproducible installs use `npm ci`.
 
 ```sh
 cd packages/admin-spa
-npm ci            # or npm install to refresh the lockfile
-npm run codegen   # regenerate src/api/management.gen.ts from the management spec
-npm run typecheck # tsc --noEmit, strict
-npm test          # vitest run (unit and component tests, jsdom)
-npm run build     # vite build -> dist/ (content hashed external assets)
+npm ci
+npm run typecheck
+npm test
+npm run build
 ```
 
-Dependencies are kept to a tight budget. Prod (unchanged through PR4): `preact`,
-`@preact/signals` (UI state), `preact-iso` (routing), `openapi-fetch` (the one
-network client). Everything else is a dev dependency: `typescript`, `vite`,
-`@preact/preset-vite`, `openapi-typescript`, and the test runner `vitest` with
-`jsdom`.
+`npm run codegen` regenerates `src/api/management.gen.ts` from
+`docs/openapi/management.json` when the management contract changes. Tests use
+Vitest and jsdom; a production build uses Vite and writes `dist/` with hashed
+external scripts and stylesheets.
 
-## Layout
+Run frontend contract checks from the repository root:
 
-- `src/api/client.ts`: the one module that performs a network call (audited);
-  holds the typed list and elevate wrappers and the verbatim `ErrorBody` mapping.
-- `src/api/management.gen.ts`: the generated management contract (committed).
-- `src/config.ts`: reads the issuer and management base from `<meta>` tags.
-- `src/app.tsx`: the app shell (header, nav, routed views, error boundary wiring).
-- `src/scope/logic.ts`: the pure scope logic (collapse, scope injection).
-- `src/scope/store.ts`: the signal backed active scope (the single source).
-- `src/ui/useResource.ts`: the reusable read and write hooks (PR4).
-- `src/ui/ResourceView.tsx`: the reusable resource view primitives (PR4).
-- `src/ui/TenantsView.tsx`: the tenants CRUD surface (PR4).
-- `src/ui/EnvironmentsView.tsx`: the environments CRUD surface, tenant scoped (PR4).
-- `src/ui/Switcher.tsx`: the tenant/environment context switcher.
-- `src/ui/CommandPalette.tsx` and `src/ui/commands.ts`: the command palette.
-- `src/ui/ErrorView.tsx`: the verbatim management `ErrorBody` boundary.
-- `src/ui/sections.ts`: the resource sections shared by the nav and the palette.
-- `src/auth/sudo.ts`: the RFC 9470 sudo re-authentication orchestration.
-- `src/main.tsx`: the Preact entry point.
-- `src/style.css`: the one external stylesheet.
-- `vite.config.ts`: the CSP clean, `/admin/` based build config.
-- `vitest.config.ts`: the jsdom test config; tests live under `test/`.
+```sh
+scripts/admin-spa-route-audit.sh
+scripts/admin-spa-bindings.sh
+scripts/admin-spa-embed.sh
+```
+
+The embed check installs/builds the SPA, replaces the committed embedded assets,
+and fails when the resulting tree differs. After an intentional frontend change,
+review and commit those generated assets with the source change. The complete
+repository gate remains `scripts/gate.sh`; see [CONTRIBUTING](../../CONTRIBUTING.md).
+
+## Embedded deployment
+
+`crates/ironauth-admin-ui` embeds the **real built console**, committed under
+`crates/ironauth-admin-ui/embedded/`. A normal `cargo build` includes it without
+requiring Node or a preexisting frontend `dist/`. The embed freshness check
+prevents the committed bundle from drifting from the SPA source.
+
+Set `admin_spa.enabled = true` to mount the console on the public plane at
+`/admin/`; the default remains `false`, and disabled paths return 404. The server
+injects issuer/client/audience metadata at request time, with HTML attribute
+escaping. It serves existing embedded assets, falls back to `index.html` for
+browser routes, and returns a real 404 for missing static assets.
+
+The default management base is `/admin/api`. That same-origin proxy forwards the
+method, headers, query, and body to the in-process management router. It adds no
+privileged credential. The proxy needs a configured OIDC bridge and mounted
+management plane; enabling only the console shell does not expose the proxy.
+
+## Runtime configuration and standalone hosting
+
+`src/config.ts` reads these public, nonsecret metadata values:
+
+| Meta tag | Purpose | Empty value |
+| --- | --- | --- |
+| `ironauth-issuer` | Public-plane base available to the client. | Same origin. |
+| `ironauth-management-base` | Base of the documented management API/proxy. | `/admin/api`. |
+| `ironauth-admin-issuer` | OIDC issuer of the administrator system environment. | Sign-in unavailable. |
+| `ironauth-console-client-id` | Public OAuth client identifier for PKCE sign-in. | Sign-in unavailable. |
+| `ironauth-management-audience` | Exact resource audience required by the management bridge. | Resource omitted by the browser; a configured management bridge still requires its audience. |
+
+In embedded deployments the server supplies the last three values when OIDC and
+the admin issuer/audience bridge are configured; the first two stay empty for
+same-origin operation. The configuration reference is generated from
+[`AdminSpaConfig`](../../crates/ironauth-config/src/lib.rs).
+
+You can also serve the production `dist/` from your own static host. Keep the
+`/admin/` mount and Vite's default `base: "/admin/"`: the current login callback is
+always `${window.location.origin}/admin/`. Configure SPA fallback for that mount,
+populate the metadata with your admin issuer, client ID, audience, and management
+proxy base, and register that exact callback on the issuer. Serving at the site
+root requires changing the login callback and routing/build configuration;
+changing Vite's base alone is insufficient.
+
+Provide an appropriate CSP on the static host. Prefer a same-origin reverse
+proxy for the issuer and management API. Cross-origin targets additionally need
+the server's origin policy and the host's `connect-src` to permit discovery,
+token exchange, and management calls; the default embedded CSP allows only
+`'self'`. The development build does not provision issuer resources or an
+administrator automatically.
+
+## Authentication and scope
+
+The console authenticates with Authorization Code + S256 PKCE against the
+configured admin issuer, requesting `openid ironauth.manage` and the management
+resource audience. PKCE verifier/state are temporary redirect state in
+`sessionStorage`; callback processing consumes them and clears code/state from
+the address bar. The resulting short-lived bearer is held **in memory only** by
+`src/auth/session.ts`. No bootstrap operator token, client secret, or management
+key belongs in the frontend metadata.
+
+The server verifies the issuer, audience, token, management scope, and configured
+operator-subject allowlist. Browser login currently resolves only to an operator;
+the API's delegated management-key personas are not console login roles. The
+console sign-out control clears the local token and context without ending the
+issuer's SSO session. The RFC 9470 recovery orchestration wires re-authentication,
+scope-bound sudo elevation, and mutation retry after a freshness challenge.
+However, the real login performs a full-page redirect: the retry closure and
+draft are not persisted or resumed by callback processing. Users must return to
+the operation and re-enter the action after sign-in; the orchestration's unit
+tests alone do not establish automatic browser redirect continuity.
+
+The current SPA's code exchange does **not** send DPoP proofs, while public
+clients require DPoP by default. Console setup therefore includes the explicit
+per-client exception through the management API, from an authorized operator
+client:
+
+```text
+PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/bearer-tokens
+```
+
+```json
+{"allowed":true}
+```
+
+Use this console client's ID in the admin issuer's scope. The write requires
+configuration authority and the applicable sudo freshness. It permits replayable
+unbound bearer tokens for this client until their expiry, while other public
+clients keep their DPoP requirement. The browser still receives no operator
+credential. If issuer sign-in succeeds but token exchange fails, check this
+allowance as well as the exact client/callback and resource audience. Provision
+the client through DCR and resource servers through the supported
+[snapshot/promotion workflow](../../docs/snapshot/README.md); there is no generic
+management API create-client or create-resource-server operation.
+
+`src/scope/store.ts` is the single source for active tenant/environment selection.
+It loads reachable resources through the typed client and persists only the
+selected IDs in `sessionStorage`. Views inject those IDs into the documented
+operation's path parameters through the client wrappers. A single loaded tenant
+and environment collapse the context selector. Scoped views make no calls when
+their required context is absent.
+
+## Resource and navigation behavior
+
+Resource pages prioritize lists. `ResourceCreateAction` opens a native modal only
+after an explicit action; creation forms are not mounted while closed. Cancel or
+Escape discards the draft and restores trigger focus, except while a submitted
+mutation is pending. Successful writes close the dialog and preserve confirmation
+or one-time credential output in the surrounding page. `ConfirmButton` provides
+an explicit confirmation step for destructive and lifecycle actions.
+
+The command palette opens from the header search control or Cmd/Ctrl+K and uses
+only loaded navigation/context data. It supports keyboard selection, Escape
+cancellation, and focus restoration. Local list filtering searches loaded rows
+only, not the complete server inventory. Cursor-based panels show when more
+results exist but do not implement full cursor navigation. The guide describes
+the initial-page limitation of other list wrappers as well.
+
+The responsive shell includes grouped navigation, current-page state, a
+narrow-screen navigation toggle, a skip link, labeled controls, and route-change
+focus management. Accessibility behaviors are covered by component tests; no
+certification claim is made.
+
+## Public management API contract
+
+All network calls funnel through `src/api/client.ts`, which uses `openapi-fetch`
+with the generated management `paths` type. Every management path/method must
+exist in the committed [OpenAPI document](../../docs/openapi/management.json).
+The route audit forbids network calls and network-client imports outside the
+funnel, hardcoded absolute URLs, and undocumented management paths. OIDC public
+endpoints have a small explicit allowlist for login integration.
+
+`scripts/admin-spa-bindings.sh` checks generated type freshness. Add an
+administrative capability to the public API and its OpenAPI contract before
+exposing it in a view. Do not introduce private browser-only management endpoints
+or reach past the management plane.
+
+The `ErrorView` boundary renders API `ErrorBody` fields verbatim as escaped text:
+`error`, `message`, and any supplied scope, guardrail, or freshness details. It
+never injects those values as HTML. Client wrappers also reject bodyless non-2xx
+responses; a failed list request must not appear as an empty successful list.
+
+## Content Security Policy
+
+The embedded console has its own policy, distinct from the authentication pages:
+
+```text
+default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'
+```
+
+Vite emits external assets without inline scripts/styles, disables the module
+preload polyfill, and does not inline build assets. The policy does not require
+`unsafe-inline`. A standalone host must set its own policy and adjust allowed
+connections to its actual deployment topology.
+
+## Source layout
+
+| Location | Responsibility |
+| --- | --- |
+| `src/api/client.ts` | Audited network funnel, typed operation wrappers, errors. |
+| `src/api/management.gen.ts` | Generated, committed management contract. |
+| `src/config.ts` | Runtime metadata parsing. |
+| `src/app.tsx`, `src/ui/routing.ts` | Authentication shell and `/admin` browser routes. |
+| `src/auth/` | PKCE login, in-memory session, sudo recovery. |
+| `src/scope/` | Selected scope, loaded tenant/environment state, collapse rules. |
+| `src/ui/useResource.ts` | Explicit read/write state and mutation retry. |
+| `src/ui/ResourceView.tsx` | Resource headings, filters, creation dialogs, confirmations. |
+| `src/ui/*View.tsx` | Management pages and resource/detail panels. |
+| `src/ui/CommandPalette.tsx`, `commands.ts`, `sections.ts` | Shared navigation and palette data. |
+| `src/style.css` | External stylesheet for the shell and resource views. |
+| `test/`, `vitest.config.ts` | Unit/component tests in jsdom. |
+| `vite.config.ts` | Production assets, CSP constraints, `/admin/` build base. |

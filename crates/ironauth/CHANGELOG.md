@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Updated the project README and documentation with the implemented capability
+  set, console workflows, application integrations, deployment prerequisites,
+  optional build features, and current limitations. Added a task-based
+  documentation index and regenerated the agent-facing documentation corpus.
+
 - **Console navigation starts each page at the top.** Route changes preserve
   keyboard focus without jumping to a page's lower content. Command search fits
   short windows and landscape screens, with all results reachable by scrolling.

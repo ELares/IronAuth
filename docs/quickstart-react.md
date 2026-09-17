@@ -8,7 +8,9 @@ no account and no network.
 below **verbatim** and fails if they stop working or take too long. There is no second copy of
 these steps anywhere; the gate reads this file.
 
-You need Node 20+ and a checkout of this repository.
+Use a supported Node 22 version at least 22.22.2, or Node 24 at least 24.15.0,
+and a checkout of this repository. These versions also satisfy the current
+admin console toolchain when working across the checkout.
 
 ## Why a SPA needs a server at all
 

@@ -1,0 +1,90 @@
+# IronAuth documentation
+
+Start with the task you want to complete, then use the references for the
+protocol and operating details. These pages describe the current repository;
+IronAuth is pre-1.0, and optional or experimental features have explicit limits.
+
+## Getting started
+
+| Task | Documentation |
+| --- | --- |
+| Evaluate the platform | [Project overview](../README.md) and [capabilities](CAPABILITIES.md) |
+| Run a seeded local identity provider | [Local emulator](EMULATOR.md) |
+| Configure, deploy, upgrade, and monitor | [Operations](OPERATIONS.md), [configuration reference](CONFIG.md), and [Helm chart](../charts/ironauth/README.md) |
+| Use the dashboard and resource pages | [Admin console](ADMIN-CONSOLE.md) |
+| Integrate an app or API | [Integration guide](INTEGRATIONS.md) |
+| Choose a supported SDK | [SDK policy](SDK-POLICY.md) and [artifact compatibility](COMPATIBILITY.md) |
+
+## Applications and authentication
+
+| Topic | Documentation |
+| --- | --- |
+| React SPA with a BFF | [React quickstart](quickstart-react.md) |
+| Next.js App Router | [Next.js quickstart](quickstart-nextjs.md) |
+| Go and Python backends | [Go quickstart](quickstart-go.md) and [Python quickstart](quickstart-python.md) |
+| Browser session architecture and step-up | [BFF guidance](bff.md) and [BFF package](../packages/ironauth-bff/README.md) |
+| Headless authentication and custom pages | [Flow contract](FLOWS.md) and [standalone reference app](../packages/reference-app/README.md) |
+| Mobile sign-in | [AppAuth guide](mobile-appauth.md) |
+| Resource-server and edge verification | [Edge guide](edge-verification.md), [TypeScript SDK](../packages/ironauth-sdk/README.md), [Java](../sdks/java/README.md), and [.NET](../sdks/dotnet/README.md) |
+| Session-derived JWTs | [Session tokenizer](session-tokenizer.md) |
+| Agent identities | [Agent principals](agents.md) |
+| IdP-side FedCM | [Experimental FedCM](fedcm.md) |
+
+## Management, automation, and events
+
+The [management OpenAPI document](openapi/management.json) is the public
+administrative contract. The console, generated management SDKs, configuration
+CLI, provider, and admin MCP tools use that API. Coverage differs by client;
+the [integration guide](INTEGRATIONS.md#management-and-automation) explains it.
+
+| Topic | Documentation |
+| --- | --- |
+| API/SDK stability, cookies, CSRF, and errors | [SDK contract](SDK-CONTRACT.md) |
+| Audit/event vocabulary | [Event catalog](EVENTS.md) and [machine-readable catalog](events/catalog.json) |
+| Event subscriptions versus outgoing webhooks | [Selection guide](EVENTS-VS-WEBHOOKS.md) |
+| Signed SIEM delivery | [Log-stream verification](log-stream-verification.md) |
+| Agent-driven administration | [Admin MCP package](../packages/ironauth-mcp/README.md) |
+| Read-only documentation retrieval | [Docs MCP package](../packages/ironauth-docs-mcp/README.md) |
+| Configuration snapshots | [Snapshot contract](snapshot/README.md) and [supported apply resources](CAPABILITIES.md) |
+| Export and migration | [Exit guide](exit-guide.md) and [migration skill](skills/migrate-to-ironauth.md) |
+
+## Operations, security, and conformance
+
+| Topic | Documentation |
+| --- | --- |
+| Deployment lifecycle, workers, probes, and backup planning | [Operations](OPERATIONS.md) |
+| Encryption and recovery | [KEK recovery](KEK-RECOVERY.md) |
+| Security boundaries | [Threat model](THREAT-MODEL.md), [security policy](../SECURITY.md), and [refused features](WILL-NOT-IMPLEMENT.md) |
+| Release and versioning process | [Releasing](RELEASING.md) and [changelog index](../CHANGELOG.md) |
+| OIDF harness and actual enforcement status | [Conformance overview](conformance/README.md), [profile matrix](conformance/MATRIX.md), and [runner runbook](conformance/RUNBOOK.md) |
+| MCP authorization evidence | [Measured conformance page](conformance/mcp.md) |
+| Startup/idle performance and per-operation costs | [Performance](PERFORMANCE.md) and [unit costs](UNIT-COSTS.md) |
+| Contributing and local validation | [Contribution rules](../CONTRIBUTING.md) |
+
+The OIDF live suite is not currently provisioned and has no live result.
+Static conformance checks run independently of that setup. Implemented logout
+endpoints do not imply that their deferred certification profiles have run.
+
+## Experimental protocols
+
+These are opt-in prototypes with versioned acknowledgements and narrower
+contracts. Use the individual page and the [configuration maturity registry](CONFIG.md)
+before enabling one.
+
+- [Attestation-based client authentication](experimental/attestation-client-auth.md)
+- [AuthZEN agent tool profile](experimental/authzen-agent-profile.md)
+- [Identity chaining / ID-JAG](experimental/identity-chaining.md)
+- [Native SSO](experimental/native-sso.md)
+- [Transaction tokens](experimental/transaction-tokens.md)
+
+## Documentation for agents
+
+[llms.txt](llms.txt) indexes the published documentation and
+[llms-full.txt](llms-full.txt) contains its full text. Both are generated by
+`scripts/gen-llms-txt.py` and checked for freshness and coverage. The docs MCP
+package reads that corpus. [Integration](skills/integrate-ironauth.md) and
+[migration](skills/migrate-to-ironauth.md) skills provide task guidance.
+
+Files under `docs/design/` and `docs/adr/` are maintainer design records.
+Their proposals are not a promise that a runtime feature exists; use the
+[capability guide](CAPABILITIES.md) for the implemented boundaries.

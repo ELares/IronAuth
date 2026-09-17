@@ -241,7 +241,7 @@
     },
     "AdminSpaConfig": {
       "additionalProperties": false,
-      "description": "Admin console SPA settings (issue #90).\n\nThe admin console is a Preact single page app served in process on the public\nplane under `/admin`, embedded in the binary and speaking the public\nmanagement API through one generated typed client. This gate mirrors\n`flows.enabled` and `hosted_pages.enabled`: a plain operator toggle, off by\ndefault, that mounts nothing on the wire until it is turned on (every\n`/admin` path answers a uniform 404 while off, so a deployment that does not\nuse the console discloses nothing). Off in PR1 because the console is a\nstatic shell with no auth yet; a later change flips the default on once it is\nfunctional.",
+      "description": "Admin console SPA settings (issue #90).\n\nThe admin console is a Preact single page app served in process on the public\nplane under `/admin`, embedded in the binary and speaking the public\nmanagement API through one generated typed client. This gate mirrors\n`flows.enabled` and `hosted_pages.enabled`: a plain operator toggle, off by\ndefault, that mounts nothing on the wire until it is turned on (every\n`/admin` path answers a uniform 404 while off). The real built console is\ncommitted under `crates/ironauth-admin-ui/embedded`, so a Rust build does not\nneed Node to serve it. Runtime config injects the admin issuer, public client\nidentifier, and management audience into the served entry document.",
       "properties": {
         "admin_issuer_environment": {
           "default": null,
@@ -639,12 +639,12 @@
             }
           ],
           "default": null,
-          "description": "Database password supplied out of band, overriding any password\nembedded in `url`."
+          "description": "Reserved out-of-band database password setting. The current serving\nconnection paths do not use it to override or complete `url`."
         },
         "url": {
           "$ref": "#/$defs/Dsn",
           "default": "postgres://ironauth@localhost:5432/ironauth",
-          "description": "Postgres connection string. Embedding the password here is\ndiscouraged; prefer the `password` secret, which is merged at\nconnection time."
+          "description": "Postgres connection string used directly by the serving connection paths.\nInclude any required password in this DSN and protect the config file or\nKubernetes Secret that holds it; `password` is not merged into this value."
         }
       },
       "type": "object"
@@ -3363,7 +3363,7 @@
         "management_audience": null,
         "operator_subjects": []
       },
-      "description": "Admin console SPA settings (issue #90): the in-process serving of the\nPreact admin console on the public plane under `/admin`. Off by default:\nPR1 ships the serving skeleton (a static shell over the public management\nAPI, no auth yet), so a default deployment mounts nothing and every\n`/admin` path is a uniform 404. A later change flips the default on once\nthe console is functional."
+      "description": "Admin console SPA settings (issue #90): the in-process serving of the\nPreact admin console on the public plane under `/admin`. The working\nconsole is embedded in the binary and uses Authorization Code + PKCE\nagainst the configured admin issuer. Opt in with `enabled`; while off,\nevery `/admin` path is a uniform 404. The same-origin `/admin/api` proxy\nis available only when the OIDC bridge is configured and the management\nplane is mounted. See `docs/ADMIN-CONSOLE.md` for setup and capabilities."
     },
     "audit_retention": {
       "$ref": "#/$defs/AuditRetentionConfig",
