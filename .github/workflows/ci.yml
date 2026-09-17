@@ -1572,6 +1572,17 @@ jobs:
       # quietly halved, so the gate also walks the published set independently.
       - name: llms.txt (fresh, and covers the published documentation set)
         run: scripts/llms-txt.sh
+      # Issue #152 criterion 4: the sizing guide's tables are GENERATED from the benchmark's own
+      # output rather than transcribed. This checks the document still matches the measurement it
+      # was generated from, so a hand-edited figure fails here.
+      #
+      # IT DOES NOT RE-MEASURE, deliberately. A gate comparing the published table to a fresh run
+      # on a CI runner would fail on every machine that is not the one the guide was measured on,
+      # and the repair anyone reaches for is widening the tolerance until the check means nothing.
+      # Regenerating from the committed measurement is deterministic, which is what makes this a
+      # gate rather than a coin toss.
+      - name: sizing guide (generated from its measurement, not transcribed)
+        run: scripts/unit-costs-doc.sh --check
       # The Helm chart is rendered and its properties asserted (issue #151). helm lint alone
       # says a chart is well formed, not that it deploys IronAuth correctly: the pod hardening,
       # the accelerators being ABSENT rather than merely disabled, and the config landing in a

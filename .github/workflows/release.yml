@@ -369,6 +369,26 @@ jobs:
       # PUBLISHED SEPARATELY FROM THE RELEASE ASSETS. These are measurements of one shared CI
       # runner, not artifacts anyone should install, and the sizing guide criterion 4 asks for
       # has to be measured on the instance classes it recommends.
+      # Issue #152 criterion 4 asks the sizing guide REGENERATE ON RELEASE. This produces the
+      # regenerated document from this run's own measurement and archives it beside the raw
+      # results.
+      #
+      # ARCHIVED, NOT COMMITTED. A shared CI runner is not the hardware class the guide
+      # recommends, so publishing its numbers as the guide's would trade a drifted figure for a
+      # confidently generated one measured on the wrong machine. What this gives a maintainer is
+      # the generated document for the instance class they chose, ready to commit.
+      - name: Regenerate the sizing guide from this run's measurement
+        if: always()
+        run: |
+          set -uo pipefail
+          scripts/unit-costs-doc.sh --measure || {
+            echo "::warning::the sizing guide could not be regenerated from this run"
+            exit 0
+          }
+          mkdir -p target/bench
+          cp docs/UNIT-COSTS.md target/bench/UNIT-COSTS.regenerated.md
+          cp docs/unit-costs-measurement.json target/bench/unit-costs-measurement.json
+          git checkout -- docs/UNIT-COSTS.md docs/unit-costs-measurement.json
       - name: Archive the results
         if: always()
         uses: actions/upload-artifact@v7
