@@ -377,17 +377,28 @@ jobs:
       # recommends, so publishing its numbers as the guide's would trade a drifted figure for a
       # confidently generated one measured on the wrong machine. What this gives a maintainer is
       # the generated document for the instance class they chose, ready to commit.
+      # ONE MEASUREMENT, NOT TWO. `--measure` would run the example again, so the archived raw
+      # results and the archived regenerated document would describe two different runs on the
+      # same machine -- which is exactly the mismatch this criterion exists to remove. The
+      # harness has already run it, so this regenerates from THAT output.
       - name: Regenerate the sizing guide from this run's measurement
         if: always()
         run: |
           set -uo pipefail
-          scripts/unit-costs-doc.sh --measure || {
+          if [ ! -s target/bench/unit-costs-measurement.json ]; then
+            echo "::warning::no measurement from this run; the sizing guide was not regenerated"
+            exit 0
+          fi
+          cp target/bench/unit-costs-measurement.json docs/unit-costs-measurement.json
+          scripts/unit-costs-doc.sh || {
             echo "::warning::the sizing guide could not be regenerated from this run"
+            git checkout -- docs/UNIT-COSTS.md docs/unit-costs-measurement.json
             exit 0
           }
-          mkdir -p target/bench
           cp docs/UNIT-COSTS.md target/bench/UNIT-COSTS.regenerated.md
-          cp docs/unit-costs-measurement.json target/bench/unit-costs-measurement.json
+          # RESTORED, because a release must not leave the checkout dirty: the archived document
+          # is the deliverable, and committing a shared runner's numbers is the thing this step
+          # deliberately does not do.
           git checkout -- docs/UNIT-COSTS.md docs/unit-costs-measurement.json
       - name: Archive the results
         if: always()

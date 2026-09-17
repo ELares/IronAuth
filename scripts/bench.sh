@@ -13,8 +13,9 @@
 # executed.
 #
 # That is how docs/UNIT-COSTS.md came to be wrong. Its own "what this does not yet cover"
-# section now records the size of it: re-running the example put six of its ten published
-# figures outside their own ranges.
+# section records the size of it: re-running the example put six of the ten figures in its
+# hand-written tables outside their own ranges. Those tables are GENERATED now, from the
+# measurement this run writes, so that particular drift cannot recur.
 #
 # It is also how a measurement nobody had taken settled an open design question, and then how a
 # better one reversed half of the answer. Reading `issuer.rs` establishes WHAT a cache hit in
@@ -76,6 +77,7 @@ on_ci=false
 for stale in unit-costs startup-rss socket-rtt accelerator-hop hook-latency; do
     rm -f "$OUT/$stale.log"
 done
+rm -f "$OUT/unit-costs-measurement.json"
 rm -f "$OUT/hook-latency-samples.json" "$OUT/SUMMARY.txt"
 
 summary=""
@@ -119,7 +121,12 @@ skip() {
 
 # Per-operation unit costs: password hashing at each parameter set, and token mint. Backs
 # docs/UNIT-COSTS.md. Needs no database.
-run unit-costs cargo run --release -q -p ironauth-oidc --example unit_costs
+# UNIT_COSTS_JSON so the run leaves a machine-readable record beside its human output. The
+# sizing guide is generated from that record (issue #152 criterion 4), and the release lane
+# regenerates the document from THIS file rather than measuring a second time, so the archived
+# results and the archived guide describe one run.
+run unit-costs env UNIT_COSTS_JSON="$OUT/unit-costs-measurement.json" \
+    cargo run --release -q -p ironauth-oidc --example unit_costs
 
 # Startup time and idle RSS, backing docs/PERFORMANCE.md. The script initdb's and starts its
 # own throwaway cluster from $PG_BIN, so this needs a Postgres bin directory and no service.

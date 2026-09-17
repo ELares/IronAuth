@@ -37,6 +37,18 @@ DOC="docs/UNIT-COSTS.md"
 MEASUREMENT="docs/unit-costs-measurement.json"
 MODE="${1:-write}"
 
+# AN UNRECOGNISED ARGUMENT IS AN ERROR, NOT A WRITE. `--chekc` fell through to write mode and
+# exited 0, so a CI step meaning to gate would have silently REGENERATED the document and
+# reported success -- the one outcome a gate must never produce.
+case "$MODE" in
+    write | --check | --measure) ;;
+    *)
+        echo "::error::unit-costs-doc: unknown argument '$MODE'" >&2
+        echo "usage: scripts/unit-costs-doc.sh [--check | --measure]" >&2
+        exit 1
+        ;;
+esac
+
 if [ "$MODE" = "--measure" ]; then
     echo "unit-costs-doc: measuring on this machine"
     UNIT_COSTS_JSON="$ROOT/$MEASUREMENT" \
@@ -110,8 +122,27 @@ def table() -> str:
 
 
 text = doc_path.read_text(encoding="utf-8")
-if BEGIN not in text or END not in text:
-    print(f"::error::unit-costs-doc: {doc_path} has no generated region markers", file=sys.stderr)
+
+# EXACTLY ONE REGION, CHECKED BEFORE SPLITTING. The split keeps everything after the FIRST end
+# marker verbatim, so a SECOND generated block pasted after it -- tables, headline, and the
+# provenance sentence claiming the figures are generated -- survived both the gate and a
+# regeneration. The document then carried two provenance-stamped tables that disagreed, and the
+# advertised repair did not remove the forged one. Counting is what closes that.
+begins, ends = text.count(BEGIN), text.count(END)
+if begins != 1 or ends != 1:
+    print(
+        f"::error::unit-costs-doc: {doc_path} must contain exactly one generated region: "
+        f"found {begins} begin marker(s) and {ends} end marker(s)",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if text.index(END) < text.index(BEGIN):
+    # CHECKED EXPLICITLY, because the split below would otherwise die on an unpack with a raw
+    # traceback and no annotation, which is fail-closed but unreadable in a CI log.
+    print(
+        f"::error::unit-costs-doc: {doc_path} has its end marker before its begin marker",
+        file=sys.stderr,
+    )
     raise SystemExit(1)
 
 head, rest = text.split(BEGIN, 1)
