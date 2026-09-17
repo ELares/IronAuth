@@ -65,9 +65,11 @@ can create and alter the schema and apply its grants:
 ironauth migrate --url "$MIGRATION_DSN"
 ```
 
-`serve` does not apply migrations. A fresh database receives the full chain;
-upgrades defer contract migrations until an explicit operator decision. Do not
-give the migration credential to serving processes.
+`serve` does not apply migrations. A fresh database receives the full chain.
+On upgrades, the default policy defers only a trailing group of contract
+migrations. A contract migration followed by pending non-contract work applies
+with that chain, so inspect the migration report and rollback compatibility
+before deploying. Do not give the migration credential to serving processes.
 
 Here is a minimal persistent-provider configuration. Replace the example URL
 and application DSN, and provide each referenced secret to the process before
@@ -159,7 +161,9 @@ credential.
 `admin_spa.enabled = true` serves the embedded console at `/admin/` on the public
 plane. Console login additionally needs an admin issuer tenant and environment,
 a public Authorization Code + PKCE client authorized for `openid ironauth.manage`,
-a registered management resource audience, and an allowed operator subject. Configure
+a registered management resource audience with `token_format = "at_jwt"`, and
+an allowed operator subject. Opaque access tokens do not authenticate to the
+management OIDC bridge. Configure
 `admin_spa.admin_issuer_tenant`, `admin_spa.admin_issuer_environment`,
 `admin_spa.console_client_id`, `admin_spa.management_audience`, and
 `admin_spa.operator_subjects` with the provisioned values. Register the console's

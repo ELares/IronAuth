@@ -10,6 +10,9 @@ range per docs/RELEASING.md.
   set, console workflows, application integrations, deployment prerequisites,
   optional build features, and current limitations. Added a task-based
   documentation index and regenerated the agent-facing documentation corpus.
+  Clarified migration deferral, authentication message delivery limits, the
+  console's required JWT format, connector credential references, and SDK
+  refresh behavior after documentation review.
 
 - **Console navigation starts each page at the top.** Route changes preserve
   keyboard focus without jumping to a page's lower content. Command search fits

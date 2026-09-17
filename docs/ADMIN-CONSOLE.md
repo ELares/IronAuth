@@ -52,7 +52,10 @@ Set up these prerequisites before signing in:
    a stolen token replayable until expiry; it leaves other public clients'
    DPoP requirement intact. Do not put the operator credential in the browser.
 4. Register the management resource audience under the admin issuer using the
-   supported [snapshot/promotion workflow](snapshot/README.md). Configure the
+   supported [snapshot/promotion workflow](snapshot/README.md), with the
+   resource server's `token_format` set to `at_jwt`. The management OIDC bridge
+   requires a signed RFC 9068 `at+jwt` access token; an `opaque` resource format
+   lets token exchange succeed but leaves console API requests unauthorized. Configure the
    same exact audience in `admin_spa.management_audience`; the console sends
    it as the OAuth `resource` parameter. The management plane accepts only tokens
    with the configured issuer and exact audience, not an ordinary application
@@ -205,10 +208,13 @@ appropriate invitation, authentication, or management credential operation.
 ### Connector definitions and health
 
 Connector creation and replacement accept a declarative JSON object validated
-by the server against the [connector schema](connector-schema.json). Use the
-configured secret store references for upstream credentials. Replacement is a
-full-definition PUT, not a merge patch: supply every setting you intend to
-retain. The capability panels report login, refresh, group, logout propagation,
+by the server against the [connector schema](connector-schema.json). The
+`client_secret` accepts a literal string, `{"env":"UPSTREAM_CLIENT_SECRET"}`,
+or `{"file":"/secure/upstream-client-secret"}`. Env and file references resolve
+on the server handling the write; they are not named snapshot secret-store
+references. Replacement is a full-definition PUT, not a merge patch: supply
+every setting you intend to retain, including `client_secret`, which reads omit.
+The capability panels report login, refresh, group, logout propagation,
 and email-verification trust support from the server's derived matrix. Health
 reports counters, recent errors, and timestamps for the serving node.
 

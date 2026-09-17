@@ -20,7 +20,7 @@ standalone snippets. For app setup, start with the
 | `dpop.ts` | Proof-key generation, proof creation, URL normalization, nonce handling, and proof-aware fetch. |
 | `dpop-store.ts` | Memory and IndexedDB proof-key stores, per-client/environment key slots, load-or-create helpers, and a nonce cache. Persistent proof keys do not turn the package into a browser token-storage layer. |
 | `protected-resource.ts` | RFC 9728 protected-resource metadata, configuration validation, OAuth challenges, and middleware response helpers; configure the resource and trusted authorization servers explicitly. |
-| `session-token.ts` | `SessionTokenClient`, server-advertised session-token mode detection, scheduled refresh, and explicit active/degraded/signed-out state. See the [session tokenizer](../../docs/session-tokenizer.md). |
+| `session-token.ts` | `SessionTokenClient`, server-advertised session-token mode detection, on-demand refresh when `current()` is called near expiry, and explicit active/degraded/signed-out state. Applications schedule calls when periodic refresh is needed. See the [session tokenizer](../../docs/session-tokenizer.md). |
 | `check.ts` | A uniform authorization check using verified-token permissions, IronAuth AuthZEN, or a compatible customer PDP. All expected failures deny. |
 | `debug.ts` | `diagnose` returns verification observations and suggested fixes. Its decoded claims on a refused token are diagnostic data, not authenticated identity. |
 

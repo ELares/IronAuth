@@ -139,6 +139,10 @@ allowance as well as the exact client/callback and resource audience. Provision
 the client through DCR and resource servers through the supported
 [snapshot/promotion workflow](../../docs/snapshot/README.md); there is no generic
 management API create-client or create-resource-server operation.
+Set the management resource server's `token_format` to `at_jwt`: the OIDC
+bridge requires a signed RFC 9068 `at+jwt` access token and rejects opaque
+tokens. A successful token exchange followed by API 401 responses can indicate
+an incorrect resource format.
 
 `src/scope/store.ts` is the single source for active tenant/environment selection.
 It loads reachable resources through the typed client and persists only the

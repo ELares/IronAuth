@@ -115,15 +115,23 @@ and [agent revocation](agents.md#revocation-stated-plainly).
 | Passkeys | WebAuthn registration and authentication, discoverable credentials, conditional UI, user verification, related origins, and credential management. WebAuthn is on by default within the enabled provider. |
 | Passkey-only accounts | Remove a password after fresh passkey authentication; the last-usable-method guard prevents losing the only sign-in method. |
 | TOTP and recovery codes | Authenticator enrollment, verification, single-use recovery codes, and factor management. TOTP is on by default. |
-| Email OTP and magic links | Passwordless verification flows with expiring, single-use credentials and delivery-provider integration. Both methods are on by default, but useful delivery requires a sender. |
-| SMS OTP | Explicit opt-in, destination/country controls, send caps, cooldowns, conversion monitoring, and automatic route throttling. Off by default. |
+| Email OTP and magic links | Passwordless verification flows with expiring, single-use credentials. Both methods are on by default; actual message delivery requires custom sender wiring, as described below. |
+| SMS OTP | Explicit opt-in, destination/country controls, send caps, cooldowns, conversion monitoring, and automatic route throttling. Off by default; actual SMS delivery requires custom sender wiring. |
 | MFA and step-up | Factor orchestration and RFC 9470 authentication-context policies, including fresh authentication requirements for sensitive scopes. Global MFA is not required by default. |
 | Remembered devices | Optional trusted-device enrollment, expiry, and immediate server-side revocation. Remembered MFA has a weaker context than a fresh MFA ceremony. |
-| Recovery | Independent recovery policy, expiring recovery links, delay/cancel windows, notifications, and guards against replacing a stronger credential through a weaker factor. |
+| Recovery | Independent recovery policy, expiring recovery links, delay/cancel windows, notification hooks, and guards against replacing a stronger credential through a weaker factor. The sender limitation below applies to recovery notices. |
 | Sessions | User-visible session lists, revoke one or other sessions, idle and absolute timeouts, optional peer/device binding, and management fleet revocation. |
 | Linked identities | List, explicitly link after fresh reauthentication, and unlink upstream identities under the last-usable-method guard. Upstream email is not automatically trusted. |
 | Connected applications | List remembered consents and revoke an application's consent with its refresh-family cascade. |
 | Session tokenizer | Exchange an authenticated opaque session for a short-lived JWT using named templates and separate template JWKS; optional JWT session mode. Revocation and idle-timeout limits are documented in [session-tokenizer.md](session-tokenizer.md). |
+
+The shipped binary installs logging senders for email OTP, magic links,
+new-device and recovery-cancel notices, and SMS. Dev mode captures messages
+locally. Configuring messaging providers or enabling their delivery worker does
+not connect these authentication messages to a real provider: that currently
+requires wiring custom `VerificationSender` and `SmsSender` implementations into
+the server. The messaging outbox producer covers account-linked and
+account-unlinked alerts.
 
 The password policy defaults to a 15-code-point minimum for a sole-factor password,
 an 8-code-point minimum when used as an MFA factor, Unicode acceptance, and no
@@ -247,7 +255,7 @@ forward-auth rate limits have separate enforcing paths. See the
 | Secret storage | Per-tenant/environment key hierarchy, sealed sensitive values, secret references, storage rekey tooling, and recovery procedures. The master key remains an operator-managed deployment secret. |
 | Outbound fetch hardening | Address validation, DNS pinning, redirect refusal, size/time bounds, and one shared outbound dispatcher for supported integrations. These controls do not make an unreachable private callback reachable. |
 | Authentication abuse controls | Bounded hashing work, tenant/environment quota admission, escalating failure regulation, durable bans, proof-of-work, signup controls, and SMS pumping limits. |
-| Risk decisions | Optional explainable new-device, travel, IP, and velocity inputs; configurable step-up thresholds and notifications. The risk engine is off by default, and scoring without an enforcing policy is observation. |
+| Risk decisions | Optional explainable new-device, travel, IP, and velocity inputs; configurable step-up thresholds and notification hooks. The risk engine is off by default, and scoring without an enforcing policy is observation. New-device notices have the authentication sender limitation described above. |
 | Recovery and admin safeguards | Recovery delay/cancel and downgrade guards, fresh-authentication checks, optional sudo freshness, and attributed impersonation. Sudo does not add an independent factor to a stolen management bearer. |
 | Audit and diagnostics | Same-transaction mutation audit, audit verification, scoped event reads, safe client-auth diagnostics, policy traces, flow inspector/dry-run, risk decisions, and warnings. Retention and verbosity are configurable. |
 | Ordered event feed | Cursor-based committed domain events for synchronization, reconciliation, SIEM, and metering. Retention expiry is explicit; truncated membership events require reconciliation. |
