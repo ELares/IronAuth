@@ -36,7 +36,10 @@
 # rows are invisible in the output rather than named in it.
 #
 # So: outputs are cleared before the run, every benchmark lands in the summary with its
-# status, and ON CI THE DOC-BACKED BENCHMARKS MAY NOT SKIP. That last rule is decided here,
+# status, and ON CI THE DOC-BACKED BENCHMARKS MAY NOT SKIP, with one stated exception below:
+# the accelerator hop needs an IronCache, which is optional infrastructure, and requiring it
+# would make an optional attachment mandatory to run the benchmarks. That skip is named in the
+# summary like every other, so it is visible rather than silent. That rule is decided here,
 # from $GITHUB_ACTIONS, rather than passed in by the workflow. A required-benchmark list
 # supplied by the caller is a list the caller can forget, which puts the silent skip back.
 #

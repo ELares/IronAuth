@@ -51,10 +51,13 @@
 //! one hit turns into 145. `docs/UNIT-COSTS.md` works the cases through.
 //!
 //! AN ATTACHED IRONCACHE IS THE OTHER ANSWER, and it is now measured rather than assumed: a
-//! `GET` hit costs 30 us, about what a bare Postgres round trip costs, because both are one
-//! loopback round trip and the difference is what the server does on top. In front of a single
-//! scoped read that is an 82 per cent saving against the Postgres tier's 13. The seam is worth
-//! attaching an accelerator to; it is not worth much without one.
+//! `GET` hit costs 32 to 33 us, against 145 us for the Postgres tier and 162 us for the scoped
+//! read either would front. That is an eighty per cent saving where the Postgres tier gives
+//! thirteen. The seam is worth attaching an accelerator to; it is not worth much without one.
+//!
+//! The accelerator figure comes from a different instrument than the database ones, a Python
+//! client against `pgbench`, and a C client doing the same loop measured about 4 us less, so it
+//! overstates the hop. `docs/UNIT-COSTS.md` carries that caveat and two others.
 //!
 //! For the write-shaped uses the Postgres tier is worse than nothing: a marker or a counter
 //! would be a second scoped WRITE in the same request. Where that tier IS the right answer is as

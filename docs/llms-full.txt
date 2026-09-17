@@ -8966,7 +8966,7 @@ because that is what decides whether a cache in front of an operation pays for i
 
 | a hit against an attached accelerator | measured |
 |---|---|
-| **one IronCache `GET` hit, 512-byte value, loopback TCP** | **30 us** |
+| **one IronCache `GET` hit, 512-byte value, loopback TCP** | **32 to 33 us** |
 
 All four are from ONE run of `scripts/bench.sh`, measured as a role that is neither superuser nor
 table owner. That matters: connecting as a superuser bypasses row-level security outright, and
@@ -8974,9 +8974,10 @@ an earlier revision of this table did exactly that, so its "under RLS" rows had 
 evaluate. The script now asserts the policies bite, by checking that the same query returns no
 rows with the scope unset and one row with it set, before it measures anything.
 
-All are MEANS over a run by one client with no other load. A contended database is slower and
-the gaps widen. They are not figures for a Redis-shaped accelerator, which speaks a lighter
-protocol; nothing here measures one.
+The four database rows are MEANS over one run by one client with no other load; a contended
+database is slower and the gaps widen. The accelerator row is measured separately, by a
+different instrument, and the section at the end of this page says what it does and does not
+cover.
 
 ### The third row is the one to size an accelerator against
 
@@ -9036,26 +9037,35 @@ faster one: flow state that survives the loss of the node that created it is a r
 is the one the covenant's "complete on PostgreSQL alone" needs done.
 
 A tier that is genuinely a different store changes the per-hit figure, and that figure is now
-measured. An IronCache `GET` hit costs **30 us**: about what a bare Postgres round trip costs,
-because both are a loopback round trip, and the difference is what the server does on top of it.
-IronCache does a few microseconds of work; a scoped read does a hundred and forty.
+measured. An IronCache `GET` hit costs **32 to 33 us** across four runs, against a scoped read's
+162 us.
 
-So the two tiers answer the question differently, and the table is the whole argument:
-
-| standing in front of one scoped read (166 us) | hit costs | saves |
+| standing in front of one scoped read (162 us) | hit costs | saves |
 |---|---|---|
 | the Postgres tier (`PgHotState`) | 145 us | 13 per cent |
-| an attached IronCache | 30 us | **82 per cent** |
+| an attached IronCache | 32 to 33 us | **80 per cent** |
 
 That is the number every wiring decision above turns on, and it says the seam is worth attaching
-an accelerator to. Standing in front of a resolved tenant config, which is three scoped
-transactions, the same hit saves about 94 per cent.
+an accelerator to and worth very little without one. Standing in front of a resolved tenant
+config, which is three scoped transactions, the same hit saves about 93 per cent.
 
-TWO THINGS IT DOES NOT SAY. The measurement is a protocol round trip on one connection, so it is
-a FLOOR for the `redis`-crate path `ironauth-hot` actually uses, which adds its own encoding and
-connection handling. And it is a HIT: a miss costs this plus the read it failed to avoid plus the
-write-back, so the value of attaching one is a function of hit rate, which is a property of a
-deployment rather than of this software.
+WHAT THE FIGURE DOES NOT SAY, in three parts, because each one was got wrong at some point in
+getting here.
+
+It is measured by a DIFFERENT INSTRUMENT from the database rows: a hand-rolled Python client
+against IronCache, where the Postgres figures come from `pgbench`, a compiled C client. A review
+built a C client doing the identical loop and measured about 4 us less per iteration, so the
+Python number OVERSTATES the hop and the saving above is conservative. The two instruments are
+close enough for a comparison spanning 130 us, and not close enough to compare 32 us against the
+20 us bare round trip, which an earlier revision of this section did.
+
+It is a HIT. A miss costs this plus the read it failed to avoid plus the write-back, so what
+attaching an accelerator is worth is a function of hit rate, which is a property of a deployment
+rather than of this software.
+
+It is a PROTOCOL round trip, not the `redis`-crate path's cost, which adds its own encoding and
+connection handling on top. Nothing in a shipped binary takes that path today: `ironcache_addr`
+declares an address that readiness probes, and installs no implementation.
 
 ### What that means, use by use
 

@@ -36,7 +36,8 @@ cd "$ROOT" || exit 1
 ADDR="${IRONCACHE_ADDR:-}"
 if [ -z "$ADDR" ]; then
     echo "accelerator-hop-bench: set IRONCACHE_ADDR to host:port of a running IronCache" >&2
-    echo "  The CI lane installs one; locally:" >&2
+    echo "  No CI lane runs this benchmark: the `ironcache-matrix` job installs a server for" >&2
+    echo "  the hot-state suite, not for this. To run it locally:" >&2
     echo "    cargo install --locked --git https://github.com/ELares/IronCache ironcache" >&2
     echo "    ironcache server --port 17379 --metrics-addr off &" >&2
     exit 1
@@ -49,7 +50,7 @@ WARMUP="${HOP_WARMUP:-2000}"
 # library would make the benchmark's availability depend on a package the repo does not
 # otherwise need, and the protocol here is four lines.
 python3 - "$ADDR" "$ITERATIONS" "$WARMUP" <<'PY'
-import socket, sys, time
+import socket, sys, threading, time
 
 addr, iterations, warmup = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 host, _, port = addr.rpartition(":")
@@ -72,9 +73,10 @@ def command(*parts):
     return connection.recv(65536)
 
 
-# THE KEY SHAPE `ironcache.rs` BUILDS: {namespace}:{tenant}:{env}:{use}:{key}. A shorter key
-# would measure a smaller request than the code sends.
-key = "ironauth:t1:e1:introspection:k5000"
+# THE KEY SHAPE `ironcache.rs` BUILDS: {NAMESPACE}:{tenant}:{env}:{use}:{key}, where NAMESPACE
+# is the literal "ira". A different prefix would measure a different request size than the code
+# sends, and the first version of this used "ironauth".
+key = "ira:t1:e1:introspection:k5000"
 value = b"v" * 512
 if not command("SET", key, value).startswith(b"+OK"):
     print("::error::accelerator-hop-bench: the server refused the seed SET")
@@ -96,13 +98,57 @@ for _ in range(iterations):
     command("GET", key)
 micros = (time.monotonic() - started) * 1_000_000 / iterations
 
+# THIS CLIENT'S OWN FLOOR, measured against a trivial echo server in-process that does no work
+# and returns a reply of the same size. Without it the published figure silently bundles the
+# Python interpreter's per-iteration cost into IronCache's, and the Postgres side of the
+# comparison is measured by pgbench, a compiled C client. Publishing both means a reader can see
+# which part of the number belongs to the instrument.
+echo_listener = socket.socket()
+echo_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+echo_listener.bind(("127.0.0.1", 0))
+echo_listener.listen(1)
+
+
+def echo_serve():
+    peer, _ = echo_listener.accept()
+    peer.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    reply = b"$%d\r\n" % len(value) + value + b"\r\n"
+    while True:
+        if not peer.recv(65536):
+            break
+        peer.sendall(reply)
+
+
+threading.Thread(target=echo_serve, daemon=True).start()
+echo = socket.create_connection(echo_listener.getsockname(), timeout=10)
+echo.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+real_connection, connection = connection, echo
+for _ in range(warmup):
+    command("GET", key)
+started = time.monotonic()
+for _ in range(iterations):
+    command("GET", key)
+floor_micros = (time.monotonic() - started) * 1_000_000 / iterations
+connection = real_connection
+echo.close()
+
 print("accelerator-hop-bench: host")
 print(f"  address     {addr}")
 print(f"  iterations  {iterations} GETs after {warmup} warm-up")
 print(f"  value       {len(value)} bytes, key {len(key)} chars")
 print()
 print(f"accelerator-hop-bench: one IronCache GET hit costs {micros:.1f} us")
-print("accelerator-hop-bench: a protocol round trip on one connection, so a FLOOR for the")
-print("accelerator-hop-bench: `redis`-crate path ironauth-hot actually uses, and a hit rather")
-print("accelerator-hop-bench: than a miss.")
+print(f"accelerator-hop-bench: the same client against an echo server doing no work: "
+      f"{floor_micros:.1f} us")
+print("accelerator-hop-bench:")
+print("accelerator-hop-bench: THE SECOND LINE IS CONTEXT, NOT A TERM TO SUBTRACT. It shares this")
+print("accelerator-hop-bench: process, so it contends for the interpreter lock with the loop")
+print("accelerator-hop-bench: timing it, and a difference taken from it is not a measurement of")
+print("accelerator-hop-bench: the server. What it does show is that most of the first line is")
+print("accelerator-hop-bench: client and loopback rather than cache work.")
+print("accelerator-hop-bench:")
+print("accelerator-hop-bench: A hand-rolled Python client is SLOWER than the `redis`-crate path")
+print("accelerator-hop-bench: ironauth-hot would use: a review built a C client doing the same")
+print("accelerator-hop-bench: loop and measured about 4 us less per iteration. So this is an")
+print("accelerator-hop-bench: UPPER BOUND on that path's round trip, and it is a HIT, not a miss.")
 PY
