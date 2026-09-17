@@ -82,7 +82,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "with-test-db: initializing throwaway cluster in ${PGDATA} on port ${PORT}"
-"${PG_BIN_DIR}/initdb" -D "${PGDATA}" -U "${SUPERUSER}" -A trust >/dev/null
+# Use UTF-8 under C/POSIX locales so multibyte character bounds stay correct.
+"${PG_BIN_DIR}/initdb" -D "${PGDATA}" -U "${SUPERUSER}" -A trust --encoding=UTF8 >/dev/null
 
 # Listen on loopback TCP only; keep the socket in the temp dir.
 "${PG_BIN_DIR}/pg_ctl" -D "${PGDATA}" -w -o \

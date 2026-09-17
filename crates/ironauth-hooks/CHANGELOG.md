@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Update Wasmtime, WASI and their runtime siblings together to 48.0.2, including the
+  upstream fix for generated bindings on the latest Rust nightly. The optional hook
+  runtime keeps its declared Rust 1.95 requirement.
+
 - **The hook runtime has a caller (issue #114).** `LoadedHook::customize` had zero: the engine,
   the deny-by-default sandbox, the four resource bounds, the WIT interface and a latency
   benchmark all shipped, and no hook had ever customized a token. `ironauth-oidc` now runs a

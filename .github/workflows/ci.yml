@@ -66,22 +66,11 @@ jobs:
   test:
     name: test (ubuntu-latest)
     runs-on: ubuntu-latest
-    # MEASURED, not guessed, and the previous value was neither.
-    #
-    # The first run of this job that did not die on disk exhaustion instead hit the
-    # 45-minute ceiling with the suite still running: compile finished at 4m09s and the
-    # test phase had consumed 37.5 minutes without reaching the end. So no run in the
-    # recorded history has ever COMPLETED this suite, and the true wall-clock cost is
-    # still unknown -- which is exactly why the ceiling has to be generous rather than
-    # tight. 90 leaves room for a complete run to be measured for the first time; the
-    # honest next step is to read the duration off a green run and bring this down to it.
-    #
-    # STILL UNPROVEN, and this branch's own run says by how much: job 96119283012 ran the
-    # tests step for 55m36s and died at `absent_scope`, which is `ironauth-store` target 1 of
-    # 88. So 238 non-store binaries plus one store binary cost 55.6 minutes, and the 87
-    # remaining store targets, the database-dense ones, plus the doctests are unmeasured. 90
-    # is room to find out, not a figure anyone has confirmed fits.
-    timeout-minutes: 90
+    # Run 35262758936 exhausted 90 minutes after 308 passing test groups, before
+    # reaching the store targets and doctests. Cold test compilation took 9m05s.
+    # Allow a complete cold-cache run to be measured, then tune this budget from
+    # its finished duration. Keep every test and its assertions in the suite.
+    timeout-minutes: 180
     # The ironauth-store isolation tests (rls, idor, repository) require a real
     # Postgres. The harness creates a fresh per-run database and provisions the
     # low-privilege application role, so it needs a superuser/owner connection;
