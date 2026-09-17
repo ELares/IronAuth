@@ -6,6 +6,18 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add `database.previous_master_keys` (issue #153): generations this deployment can still open
+  data under, each `{ id, secret }`, with the secret named and derived exactly as
+  `database.master_key` is.
+
+  New data is always wrapped under `master_key`, never under one of these, so listing one widens
+  what can be read and nothing else. It is for the window a rotation is in progress; an entry
+  left configured forever is a key that must stay recoverable forever.
+
+  An entry that cannot be resolved, or that reuses `master_key_id`, refuses to resolve a master
+  key at all rather than being skipped: dropping one silently would leave the server blind to
+  exactly the rows a rotation has not reached.
+
 - Add `database.master_key_id` (issue #153), defaulting to `master-1`, which is the value every
   existing deployment has already written into `tenant_keks.master_key_id`.
 

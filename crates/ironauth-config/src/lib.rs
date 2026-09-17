@@ -2671,6 +2671,29 @@ pub struct DatabaseConfig {
     /// deployment must set it.
     pub master_key: Option<Secret>,
 
+    /// Masters this deployment can still OPEN data under, for a rotation in progress (#153).
+    ///
+    /// Each entry is a previous generation: `{ id = "master-1", secret = { env = "..." } }`. A
+    /// KEK wrapped under one of these opens; NEW data is always wrapped under
+    /// [`DatabaseConfig::master_key`], never under one of these, so listing one widens what can
+    /// be read and nothing else.
+    ///
+    /// # What this is for
+    ///
+    /// `ironauth storage rekey` rewraps every tenant KEK from one master to another. Between the
+    /// first rewrapped row and the last, BOTH shapes are live, and a server holding only one
+    /// master cannot serve that state -- which is why the operation is documented as offline.
+    /// Listing the outgoing master here is what lets a server keep serving through it.
+    ///
+    /// The order to do it in is: add the incoming master as `master_key` and the outgoing one
+    /// here, restart, run the rekey, then remove this entry once it reports nothing remaining.
+    /// Removing it before that strands every row the rekey has not reached yet.
+    ///
+    /// Empty is the default and is what a deployment not mid-rotation should have: a predecessor
+    /// left configured forever is a key that must stay recoverable forever.
+    #[serde(default)]
+    pub previous_master_keys: Vec<PreviousMasterKey>,
+
     /// The identifier of the platform envelope master key (issue #153): a LABEL recorded on
     /// every KEK this deployment wraps, not key material. Changing it does not break existing
     /// rows, because the read path rebuilds each KEK's AAD from the id stored in that row and
@@ -2705,6 +2728,17 @@ pub struct DatabaseConfig {
     pub master_key_id: Option<String>,
 }
 
+/// One superseded platform master key, kept so a rotation can run without an outage (#153).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PreviousMasterKey {
+    /// The id this generation was recorded under in `tenant_keks.master_key_id`.
+    pub id: String,
+    /// Its secret, named the same way [`DatabaseConfig::master_key`] is and derived the same
+    /// way. A key given any other way would open nothing this deployment wrote.
+    pub secret: Secret,
+}
+
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
@@ -2713,6 +2747,7 @@ impl Default for DatabaseConfig {
             password: None,
             master_key: None,
             master_key_id: None,
+            previous_master_keys: Vec::new(),
         }
     }
 }

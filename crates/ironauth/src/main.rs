@@ -5913,10 +5913,60 @@ fn resolve_master_key(config: &Config) -> Option<Arc<MasterKey>> {
                 );
                 return None;
             }
-            Some(Arc::new(MasterKey::derive(
-                id,
-                material.expose().as_bytes(),
-            )))
+            let mut master = MasterKey::derive(id, material.expose().as_bytes());
+
+            // THE SUPERSEDED MASTERS, so a rotation in progress can be served (issue #153).
+            //
+            // A FAILURE HERE IS FATAL TO THE MASTER KEY, not skipped. Silently dropping a
+            // predecessor would leave the server unable to open exactly the rows the rotation
+            // has not reached yet, presenting as scattered decryption failures on some tenants
+            // and not others, which is far harder to diagnose than refusing to resolve at all.
+            for previous in &config.database.previous_master_keys {
+                if !master_key_id_is_valid(&previous.id) {
+                    tracing::error!(
+                        id = previous.id,
+                        "a database.previous_master_keys id must be non-empty and free of ':': \
+                         the encrypted-PII paths will fail closed"
+                    );
+                    return None;
+                }
+                if previous.id == id {
+                    tracing::error!(
+                        id = previous.id,
+                        "a database.previous_master_keys entry has the same id as \
+                         database.master_key_id. A rotation is between two DIFFERENT names, and \
+                         the rows record the name, so with one name there is nothing to tell the \
+                         generations apart. The encrypted-PII paths will fail closed."
+                    );
+                    return None;
+                }
+                match previous.secret.resolve() {
+                    Ok(material) => {
+                        master = master.with_previous(MasterKey::derive(
+                            &previous.id,
+                            material.expose().as_bytes(),
+                        ));
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            id = previous.id,
+                            "cannot resolve a database.previous_master_keys secret: the \
+                             encrypted-PII paths will fail closed rather than serve a rotation \
+                             half-blind"
+                        );
+                        return None;
+                    }
+                }
+            }
+            if !config.database.previous_master_keys.is_empty() {
+                tracing::info!(
+                    openable = ?master.openable_ids(),
+                    "platform master key ring: data wrapped under any of these ids can be read, \
+                     and new data is written under the first"
+                );
+            }
+            Some(Arc::new(master))
         }
         Err(error) => {
             tracing::error!(
@@ -8404,9 +8454,11 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
             to.id()
         );
         println!(
-            "storage rekey: OFFLINE operation. A running server holds one master key and \n\
-             cannot open both shapes while this runs. Stop the fleet, or run it against a \n\
-             quiesced deployment."
+            "storage rekey: rows move one at a time, and a node can serve throughout ONLY if it \n\
+             already carries both generations. Before running this, set database.master_key and \n\
+             database.master_key_id to the incoming generation, list the outgoing one under \n\
+             database.previous_master_keys, and restart. Drop that entry only after this \n\
+             reports nothing remaining. Without the ring in place, stop the fleet first."
         );
         match store.rekey_master(&from, &to).await {
             Ok(report) => {
@@ -8751,8 +8803,8 @@ fn print_help() {
     println!("                                   KEY is ID:env:VAR or ID:file:PATH, naming the");
     println!("                                   secret as database.master_key does");
     println!("                                   Rewrap every tenant KEK under a new platform");
-    println!("                                   master key. OFFLINE: a running server holds");
-    println!("                                   one master and cannot open both shapes");
+    println!("                                   master key. Nodes carrying the outgoing key in");
+    println!("                                   database.previous_master_keys serve throughout");
     println!("  ironauth storage kek-backup --url DSN --out FILE");
     println!("                                   Export every wrapped KEK and print the");
     println!("                                   manifest. REFUSES a connection row-level");
@@ -8971,6 +9023,90 @@ mod tests {
         assert!(resolve_master_key(&config_with_secret(&path, "master_key_id = \"\"\n")).is_none());
         assert!(
             resolve_master_key(&config_with_secret(&path, "master_key_id = \"a:b\"\n")).is_none()
+        );
+    }
+
+    /// THE RING REACHES THE SERVER, which is what makes an online rotation possible (#153 c2).
+    ///
+    /// A predecessor listed in config must end up openable by the resolved key, and the current
+    /// master must stay the one new work is written under. Without this nothing connects the
+    /// config surface to `MasterKey`'s ring, and the store tests would be exercising a ring no
+    /// deployment can build.
+    #[test]
+    fn previous_master_keys_reach_the_resolved_key() {
+        let current = secret_file("ring-current", "the-new-secret");
+        let old = secret_file("ring-old", "the-old-secret");
+        let resolved = resolve_master_key(&config_with_secret(
+            &current,
+            &format!(
+                "master_key_id = \"master-2\"\n\
+                 [[database.previous_master_keys]]\nid = \"master-1\"\n\
+                 secret = {{ file = \"{}\" }}\n",
+                old.display()
+            ),
+        ))
+        .expect("the server resolves a ring");
+
+        assert_eq!(
+            resolved.openable_ids(),
+            vec!["master-2", "master-1"],
+            "both generations readable, the current one first"
+        );
+        assert_eq!(
+            resolved.id(),
+            "master-2",
+            "and new work is written under the current master, not a predecessor"
+        );
+
+        // THE PREDECESSOR IS THE KEY THE OLD SECRET DERIVES, not merely a name. A ring carrying
+        // the right id and the wrong material opens nothing, and the id comparison above cannot
+        // tell the difference.
+        let expected = parse_master_key(&format!("master-1:file:{}", old.display()))
+            .expect("the CLI names the same key");
+        let env = ironauth_env::Env::system();
+        let kek = ironauth_jose::Kek::generate(env.entropy());
+        let aad = ironauth_jose::Aad::builder().text("probe").build();
+        let wrapped = expected.wrap_kek(env.entropy(), &aad, &kek);
+        resolved
+            .opener_for("master-1")
+            .unwrap_kek(&aad, &wrapped)
+            .expect("the ring's predecessor must open what the old secret wrapped");
+    }
+
+    /// A PREDECESSOR THAT CANNOT BE RESOLVED FAILS THE WHOLE MASTER KEY rather than being
+    /// dropped. Dropping one would leave the server blind to exactly the rows a rotation has not
+    /// reached, which presents as decryption failures on some tenants and not others.
+    #[test]
+    fn an_unresolvable_previous_master_key_fails_closed() {
+        let current = secret_file("ring-fail-current", "s");
+        assert!(
+            resolve_master_key(&config_with_secret(
+                &current,
+                "[[database.previous_master_keys]]\nid = \"master-1\"\n\
+                 secret = { file = \"/nonexistent/ironauth-test-secret\" }\n",
+            ))
+            .is_none()
+        );
+    }
+
+    /// A PREDECESSOR SHARING THE CURRENT ID IS REFUSED. A rotation is between two different
+    /// names, and the rows record the name: with one name there is nothing to tell the
+    /// generations apart, so the ring would be silently inert.
+    #[test]
+    fn a_previous_master_key_may_not_reuse_the_current_id() {
+        let current = secret_file("ring-dup-current", "s");
+        let old = secret_file("ring-dup-old", "other");
+        assert!(
+            resolve_master_key(&config_with_secret(
+                &current,
+                &format!(
+                    "[[database.previous_master_keys]]\nid = \"master-1\"\n\
+                     secret = {{ file = \"{}\" }}\n",
+                    old.display()
+                ),
+            ))
+            .is_none(),
+            "master_key_id defaults to master-1, so this entry collides with it"
         );
     }
 

@@ -348,6 +348,26 @@ impl core::fmt::Debug for AeadKey {
 pub struct MasterKey {
     id: String,
     key: AeadKey,
+    /// Masters this one SUCCEEDS, kept so a KEK wrapped before a rotation can still be opened
+    /// (issue #153).
+    ///
+    /// # Why the predecessors live inside the key rather than beside it
+    ///
+    /// A rotation is only online if a running server can open BOTH shapes: between the first
+    /// rewrapped row and the last, the two exist side by side, and a server holding one master
+    /// cannot serve that state. That is the reason `rekey.rs` gives for the operation being
+    /// offline.
+    ///
+    /// The alternative was to thread a separate ring alongside the master. The store passes
+    /// `master: &MasterKey` through sixty-six functions from ninety-three call sites, so a
+    /// second parameter would have touched every one of them, most of which only WRAP and have
+    /// no use for a predecessor. Carrying them here changes the two places that unwrap and
+    /// nothing else.
+    ///
+    /// NEVER CONSULTED WHEN WRAPPING. [`MasterKey::wrap_kek`] uses `self` unconditionally, so a
+    /// predecessor can only ever open what already exists; it can never become the key new data
+    /// is written under. That asymmetry is what makes adding one safe.
+    previous: Vec<MasterKey>,
 }
 
 impl MasterKey {
@@ -358,6 +378,7 @@ impl MasterKey {
         Self {
             id: id.into(),
             key: AeadKey::from_bytes(bytes),
+            previous: Vec::new(),
         }
     }
 
@@ -367,7 +388,64 @@ impl MasterKey {
         Self {
             id: id.into(),
             key: AeadKey::generate(entropy),
+            previous: Vec::new(),
         }
+    }
+
+    /// Add a master this one succeeds, so KEKs wrapped under it can still be opened.
+    ///
+    /// Takes ownership and chains, so a deployment can carry more than one generation:
+    /// `current.with_previous(a).with_previous(b)`.
+    ///
+    /// # It cannot be used to wrap
+    ///
+    /// See [`MasterKey::previous`]. Wrapping always uses `self`, so adding a predecessor widens
+    /// only what can be READ, never what new data is written under. A predecessor is dropped by
+    /// removing it from configuration once a rotation has finished, which the rekey's own
+    /// completion count tells an operator.
+    #[must_use]
+    pub fn with_previous(mut self, previous: MasterKey) -> Self {
+        self.previous.push(previous);
+        self
+    }
+
+    /// The key to try against data wrapped under `id`: a predecessor carrying that id, or `self`.
+    ///
+    /// # It falls back to `self` rather than refusing, and that is not laziness
+    ///
+    /// SELECTION BY ID IS NOT THE SECURITY BOUNDARY. The id is bound into the AAD, so the AEAD
+    /// decides: a key that should not open a blob does not open it, whichever key this returns.
+    /// What this does is pick the one that SHOULD work, so a caller makes one attempt instead of
+    /// several.
+    ///
+    /// Refusing when no id matches would be a different and WORSE contract, because it would
+    /// break a property this codebase documents: `MasterKey::derive` keys off the secret alone,
+    /// so renaming `database.master_key_id` while keeping the secret leaves every existing row
+    /// readable. A deployment that renamed its master would suddenly fail every read, and
+    /// `rekey.rs`'s own test says as much -- it constructs two keys with the same material and
+    /// different ids precisely to pin that the unwrap context comes from the ROW.
+    ///
+    /// So a ring WIDENS what can be opened and narrows nothing.
+    #[must_use]
+    pub fn opener_for(&self, id: &str) -> &MasterKey {
+        if self.id == id {
+            return self;
+        }
+        // The CURRENT key is checked first above, so a predecessor sharing its id (which a
+        // misconfiguration could produce) can never shadow it. `self` last, so a rename with an
+        // unchanged secret behaves exactly as it did before rings existed.
+        self.previous
+            .iter()
+            .find(|key| key.id == id)
+            .unwrap_or(self)
+    }
+
+    /// The ids this key can open data under, current first. For diagnostics and boot logging.
+    #[must_use]
+    pub fn openable_ids(&self) -> Vec<&str> {
+        let mut ids = vec![self.id.as_str()];
+        ids.extend(self.previous.iter().map(|key| key.id.as_str()));
+        ids
     }
 
     /// The master key's stable identifier (bound into every wrapped KEK's AAD).
@@ -419,6 +497,7 @@ impl MasterKey {
         Self {
             id: id.into(),
             key: AeadKey::from_bytes(raw),
+            previous: Vec::new(),
         }
     }
 

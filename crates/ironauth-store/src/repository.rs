@@ -65445,7 +65445,15 @@ async fn fetch_active_kek(
     let version: i32 = row.get("version");
     let master_key_id: String = row.get("master_key_id");
     let wrapped: Vec<u8> = row.get("wrapped_kek");
-    let kek = master.unwrap_kek(
+    // THE KEY THAT WRAPPED THIS ROW, which is not always the current one (issue #153). Between
+    // the first rewrapped row and the last, a rotation leaves both shapes live, and a server
+    // holding only the new master cannot serve that state. `opener_for` returns the current key
+    // or a configured predecessor; a wrong choice would still fail the AEAD, because the id is
+    // bound into the AAD below.
+    // THE KEY FOR THIS ROW'S GENERATION, falling back to the current master when no predecessor
+    // carries that id, which is exactly what happened before rings existed.
+    let opener = master.opener_for(&master_key_id);
+    let kek = opener.unwrap_kek(
         &kek_wrap_aad(scope, version, &master_key_id),
         &Sealed::from_bytes(wrapped)?,
     )?;
@@ -65472,7 +65480,10 @@ async fn fetch_kek_by_version(
     let row = row.ok_or(StoreError::Encryption)?;
     let master_key_id: String = row.get("master_key_id");
     let wrapped: Vec<u8> = row.get("wrapped_kek");
-    let kek = master.unwrap_kek(
+    // See `fetch_active_kek`: the row names the master that wrapped it, which a rotation in
+    // progress makes a predecessor rather than the current key.
+    let opener = master.opener_for(&master_key_id);
+    let kek = opener.unwrap_kek(
         &kek_wrap_aad(scope, version, &master_key_id),
         &Sealed::from_bytes(wrapped)?,
     )?;

@@ -46,10 +46,30 @@
 //!
 //! # What this does NOT do
 //!
-//! It does not rewrap while the old master is still in use by a running server. A server
-//! holds ONE master key, so between the first rewrapped row and the last, a live process
-//! cannot open both shapes. Online rekey (criterion 2) needs a master key RING on the read
-//! path first; until then this is an offline operation and says so.
+//! # Running it online, which needs the server to hold both generations
+//!
+//! This used to say a server "holds ONE master key, so between the first rewrapped row and the
+//! last, a live process cannot open both shapes", and that online rekey needed a master key RING
+//! on the read path first. The ring exists now: `MasterKey::with_previous` carries superseded
+//! generations, `database.previous_master_keys` configures them, and both unwrap sites pick the
+//! key for the generation each ROW records.
+//!
+//! So the sequence that keeps a deployment serving is:
+//!
+//! 1. Set `master_key` to the incoming secret and `master_key_id` to its new name, and list the
+//!    OUTGOING generation under `previous_master_keys`. Restart. Every node can now open both
+//!    shapes and writes new work under the incoming master.
+//! 2. Run the rekey. Rows move one at a time and either shape is readable throughout.
+//! 3. Once it reports nothing remaining, drop the `previous_master_keys` entry and restart.
+//!
+//! STEP 1 BEFORE STEP 2, AND STEP 3 STRICTLY AFTER. Running the rekey before the nodes carry the
+//! ring strands every row it has already moved; dropping the predecessor before the run
+//! converges strands every row it has not.
+//!
+//! What is still NOT covered here is a test that drives that sequence against a live server
+//! under load, which is what criterion 2 asks for. The ring's behaviour is tested (a mixed
+//! database served by one key value, new work never written under a predecessor, a missing
+//! generation failing closed); the operational sequence is documented and unexercised.
 
 use ironauth_env::Entropy;
 use ironauth_jose::{Kek, MasterKey, Sealed};

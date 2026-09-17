@@ -811,3 +811,109 @@ async fn a_kek_parked_on_a_third_master_is_not_reported_as_converged() {
         "the stranded row is still readable, but only by a key this rotation never named"
     );
 }
+
+/// A SERVER HOLDING A RING SERVES A ROTATION IN PROGRESS (issue #153 criterion 2).
+///
+/// This is the property the whole criterion rests on and nothing covered. `rekey.rs` says the
+/// operation is offline because "a server holds ONE master key, so between the first rewrapped
+/// row and the last, a live process cannot open both shapes", and names a master key ring on the
+/// read path as what it needs first.
+///
+/// The mixed state here is real rather than simulated: one scope is rewrapped and one is not,
+/// exactly as a resumed or interrupted rekey leaves the database. One key value opens both.
+#[tokio::test]
+async fn a_ring_opens_both_shapes_while_a_rotation_is_half_done() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let old = master("master-old", 0x0001);
+    let new = master("master-new", 0x0002);
+
+    let rotated = db.seed_scope(&env).await;
+    provision(&db, &env, rotated, &old).await;
+    put_secret(&db, &env, rotated, &old, b"rotated").await;
+
+    // THE PASS RUNS BEFORE THE SECOND SCOPE EXISTS, which is how this suite builds a genuinely
+    // mixed database rather than editing rows: the rekey moves what is there, and the scope that
+    // arrives afterwards is written under the old master, exactly as one arriving mid-rotation
+    // would be.
+    let report = Rekey::new(db.owner_pool(), &old, &new, env.entropy())
+        .run()
+        .await
+        .expect("the pass runs");
+    assert_eq!(report.rewrapped, 1, "precondition: exactly one scope moved");
+
+    let untouched = db.seed_scope(&env).await;
+    provision(&db, &env, untouched, &old).await;
+    put_secret(&db, &env, untouched, &old, b"not-yet").await;
+
+    // NEITHER KEY ALONE CAN SERVE THIS, which is why the ring exists. Established first, so the
+    // ring's success below is a contrast rather than an assertion in isolation.
+    let new_only = master("master-new", 0x0002);
+    let old_only = master("master-old", 0x0001);
+    let new_fails = open_secret_result(&db, untouched, &new_only).await.is_err()
+        || open_secret_result(&db, rotated, &new_only).await.is_err();
+    let old_fails = open_secret_result(&db, untouched, &old_only).await.is_err()
+        || open_secret_result(&db, rotated, &old_only).await.is_err();
+    assert!(
+        new_fails && old_fails,
+        "a single master must fail on one side or the other, or this database is not mixed and \
+         the ring below would be proving nothing"
+    );
+
+    // THE RING: the incoming master, carrying the outgoing one as a predecessor.
+    let ring = master("master-new", 0x0002).with_previous(master("master-old", 0x0001));
+    assert_eq!(
+        open_secret(&db, rotated, &ring).await,
+        b"rotated",
+        "the rewrapped scope opens under the new master"
+    );
+    assert_eq!(
+        open_secret(&db, untouched, &ring).await,
+        b"not-yet",
+        "and the scope the pass has not reached opens under the predecessor"
+    );
+}
+
+/// A PREDECESSOR CANNOT BECOME THE KEY NEW DATA IS WRITTEN UNDER.
+///
+/// The ring widens what can be READ. If it also widened what is written, a rotation would never
+/// converge: rows would keep being produced under the key being retired, and the rekey's
+/// completion count would never reach zero.
+#[tokio::test]
+async fn a_ring_wraps_new_work_under_the_current_master_only() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let ring = master("master-new", 0x0002).with_previous(master("master-old", 0x0001));
+
+    let scope = db.seed_scope(&env).await;
+    provision(&db, &env, scope, &ring).await;
+    put_secret(&db, &env, scope, &ring, b"fresh").await;
+
+    assert_eq!(
+        master_of(&db, scope).await,
+        "master-new",
+        "a KEK provisioned through a ring records the CURRENT master, never a predecessor"
+    );
+    // And the predecessor alone cannot open it, which is the same statement from the other side.
+    assert!(
+        open_secret_result(&db, scope, &master("master-old", 0x0001))
+            .await
+            .is_err()
+    );
+}
+
+/// A MASTER THE RING DOES NOT HOLD FAILS CLOSED rather than opening anything.
+#[tokio::test]
+async fn a_ring_without_the_wrapping_master_refuses() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 0x5EED);
+    let old = master("master-old", 0x0001);
+
+    let scope = db.seed_scope(&env).await;
+    provision(&db, &env, scope, &old).await;
+    put_secret(&db, &env, scope, &old, b"sealed").await;
+
+    // A ring carrying a DIFFERENT predecessor: the right shape, the wrong generation.
+    let ring = master("master-new", 0x0002).with_previous(master("master-other", 0x0003));
+    assert!(open_secret_result(&db, scope, &ring).await.is_err());
+}

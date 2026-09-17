@@ -633,6 +633,14 @@
           "default": null,
           "description": "Database password supplied out of band, overriding any password\nembedded in `url`."
         },
+        "previous_master_keys": {
+          "default": [],
+          "description": "Masters this deployment can still OPEN data under, for a rotation in progress (#153).\n\nEach entry is a previous generation: `{ id = \"master-1\", secret = { env = \"...\" } }`. A\nKEK wrapped under one of these opens; NEW data is always wrapped under\n[`DatabaseConfig::master_key`], never under one of these, so listing one widens what can\nbe read and nothing else.\n\n# What this is for\n\n`ironauth storage rekey` rewraps every tenant KEK from one master to another. Between the\nfirst rewrapped row and the last, BOTH shapes are live, and a server holding only one\nmaster cannot serve that state -- which is why the operation is documented as offline.\nListing the outgoing master here is what lets a server keep serving through it.\n\nThe order to do it in is: add the incoming master as `master_key` and the outgoing one\nhere, restart, run the rekey, then remove this entry once it reports nothing remaining.\nRemoving it before that strands every row the rekey has not reached yet.\n\nEmpty is the default and is what a deployment not mid-rotation should have: a predecessor\nleft configured forever is a key that must stay recoverable forever.",
+          "items": {
+            "$ref": "#/$defs/PreviousMasterKey"
+          },
+          "type": "array"
+        },
         "url": {
           "$ref": "#/$defs/Dsn",
           "default": "postgres://ironauth@localhost:5432/ironauth",
@@ -2377,6 +2385,25 @@
         }
       ]
     },
+    "PreviousMasterKey": {
+      "additionalProperties": false,
+      "description": "One superseded platform master key, kept so a rotation can run without an outage (#153).",
+      "properties": {
+        "id": {
+          "description": "The id this generation was recorded under in `tenant_keks.master_key_id`.",
+          "type": "string"
+        },
+        "secret": {
+          "$ref": "#/$defs/Secret",
+          "description": "Its secret, named the same way [`DatabaseConfig::master_key`] is and derived the same\nway. A key given any other way would open nothing this deployment wrote."
+        }
+      },
+      "required": [
+        "id",
+        "secret"
+      ],
+      "type": "object"
+    },
     "ProxyConfig": {
       "additionalProperties": false,
       "description": "Trusted-proxy policy.\n\nForwarding headers (RFC 7239 `Forwarded`, `X-Forwarded-For`,\n`X-Forwarded-Proto`, `X-Forwarded-Host`) and the `Host` header are an\naccount-takeover class when trusted blindly. The default trusts NOTHING:\n`trusted_hops = 0` and `trust_forwarded = false` mean the effective client\nIP is the transport peer and the scheme, host, and issuer derive entirely\nfrom `server.public_url`. Only when the server genuinely runs behind a\nfixed number of trusted reverse proxies should these be raised, and even\nthen scheme and issuer stay config-derived.",
@@ -3399,6 +3426,7 @@
         "master_key": null,
         "master_key_id": null,
         "password": null,
+        "previous_master_keys": [],
         "url": "postgres://ironauth@localhost:5432/ironauth"
       },
       "description": "Primary database settings."

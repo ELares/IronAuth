@@ -6,6 +6,17 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- `MasterKey` can carry superseded generations (issue #153): `with_previous` adds one and
+  `opener_for` returns the key for the generation a given id names.
+
+  This is what lets a rotation run without an outage. Between the first rewrapped KEK and the
+  last, both shapes are live, and a process holding one master could not open both.
+
+  IT WIDENS READING AND NARROWS NOTHING. Wrapping always uses the current key, so a predecessor
+  can never become what new data is written under, and `opener_for` falls back to the current key
+  rather than refusing when no id matches, so renaming a master with an unchanged secret behaves
+  exactly as before.
+
 - **A fourth token profile: `iaj+jws`, the signed journey interchange archive** (issue #347).
   Added to the `token_profiles!` declaration, so the variant, its media type, and
   `TokenTyp::ALL` all move together and `no_two_profiles_share_a_media_type` compares it to the
