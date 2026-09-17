@@ -50,6 +50,15 @@
 //! and that is a wiring choice. A resolved tenant config is three of them, around 500 us, which
 //! one hit turns into 145. `docs/UNIT-COSTS.md` works the cases through.
 //!
+//! AN ATTACHED IRONCACHE IS THE OTHER ANSWER, and it is now measured rather than assumed: a
+//! `GET` hit costs 32 to 33 us, against 145 us for the Postgres tier and 162 us for the scoped
+//! read either would front. That is an eighty per cent saving where the Postgres tier gives
+//! thirteen. The seam is worth attaching an accelerator to; it is not worth much without one.
+//!
+//! The accelerator figure comes from a different instrument than the database ones, a Python
+//! client against `pgbench`, and a C client doing the same loop measured about 4 us less, so it
+//! overstates the hop. `docs/UNIT-COSTS.md` carries that caveat and two others.
+//!
 //! For the write-shaped uses the Postgres tier is worse than nothing: a marker or a counter
 //! would be a second scoped WRITE in the same request. Where that tier IS the right answer is as
 //! shared state rather than speed, holding flow state that survives the node that created it.

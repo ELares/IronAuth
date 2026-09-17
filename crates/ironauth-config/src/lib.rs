@@ -1405,10 +1405,20 @@ pub struct HotStateConfig {
     /// unusual in costing almost nothing above it; a scoped read pays six round trips and a
     /// query under row-level security, measured at 166 us, and is worth accelerating.
     ///
-    /// HOW MUCH depends on what is at the other end of the hop. A hit against the Postgres tier
-    /// is itself a scoped read, 145 us, so fronting ONE repository call it saves thirteen per
-    /// cent; fronting a resolved tenant config, which is three scoped transactions, it saves
-    /// about seventy. See `docs/UNIT-COSTS.md`.
+    /// HOW MUCH would depend on what is at the other end of the hop, which is what this key is
+    /// eventually FOR. A hit against the Postgres tier is itself a scoped read, 145 us, so
+    /// fronting one repository call it saves thirteen per cent. A hit against an IronCache
+    /// measures 32 to 33 us, an eighty per cent saving on the same read, and about ninety-three
+    /// per cent in front of a resolved tenant config, which is three scoped transactions.
+    ///
+    /// "WOULD", BECAUSE SETTING THIS KEY ATTACHES NOTHING TODAY. It declares an address that
+    /// readiness probes and reports a tier for; it installs no `HotState` implementation, so no
+    /// read changes path however it is set. That is the sentence above about the boot wiring,
+    /// restated so the figures here are not read as a description of what this key does.
+    ///
+    /// The figures are in `docs/UNIT-COSTS.md`, measured by a different instrument from the
+    /// database rows they are compared against, and they are HITS, so a deployment's benefit is
+    /// a function of its hit rate.
     ///
     /// That distinction is written down rather than glossed because the alternative is a knob
     /// that reads as "my cache is on" while nothing consults it, which is the defect this

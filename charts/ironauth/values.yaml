@@ -145,10 +145,17 @@ ironbus:
 # reports the accelerator tier.
 #
 # What is STILL true is the half that matters for a values key: no read goes through the
-# accelerator. `ironauth-hot` is not a dependency of any crate that serves a request, so a
-# chart value would configure something that reports its own reachability and accelerates
-# nothing. That is a smaller version of the same "reads as wired when it is not" defect,
-# and a smaller version is still one.
+# accelerator. Not because `ironauth-hot` is absent from the serving crates -- it is a
+# dependency of `ironauth-oidc` and `ironauth-store`, and `jwks_json` reads its JWKS use in
+# production source -- but because NO SHIPPED BINARY INSTALLS AN IMPLEMENTATION, so every
+# such call site is inert. A chart value would configure something that reports its own
+# reachability and accelerates nothing, which is a smaller version of the same "reads as
+# wired when it is not" defect, and a smaller version is still one.
+#
+# The value would be worth adding the day a binary installs one. `docs/UNIT-COSTS.md` now
+# prices what that would buy: a hit against an attached IronCache is 32 to 33 us against a
+# 162 us scoped read, where a hit against the Postgres tier is 145 us and buys almost
+# nothing.
 #
 # A deployment that wants the readiness tier today can supply its own config through
 # database.existingConfigSecret with a [hot_state] section. A first-class value belongs here
