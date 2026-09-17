@@ -104,8 +104,15 @@ because that is what decides whether a cache in front of an operation pays for i
 | asking the database, loopback TCP, same machine | measured |
 |---|---|
 | bare round trip (`SELECT 1`) | 20 us |
-| one autocommit indexed lookup | 32 us |
-| **one SCOPED read: `begin_scoped` plus a join, under RLS** | **158 us** |
+| one autocommit indexed lookup | 35 us |
+| **one SCOPED read: `begin_scoped` plus a join, under RLS** | **166 us** |
+| a scoped read shaped as `HotStateRepo::get` issues it | 145 us |
+
+All four are from ONE run of `scripts/bench.sh`, measured as a role that is neither superuser nor
+table owner. That matters: connecting as a superuser bypasses row-level security outright, and
+an earlier revision of this table did exactly that, so its "under RLS" rows had no policy to
+evaluate. The script now asserts the policies bite, by checking that the same query returns no
+rows with the scope unset and one row with it set, before it measures anything.
 
 All are MEANS over a run by one client with no other load. A contended database is slower and
 the gaps widen. They are not figures for a Redis-shaped accelerator, which speaks a lighter
@@ -125,15 +132,58 @@ SECURITY with policies that re-read those settings. It is 550 call sites against
 reads, so the autocommit figure describes essentially nothing this codebase does.
 
 A cache hit replaces that whole sequence with one round trip of its own. So the saving is the
-third row minus a hop, about **138 us against a 20 us hop, roughly seven to one in favour of the
+third row minus a hop, about **146 us against a 20 us hop, roughly seven to one in favour of the
 accelerator**, and more on a contended database.
+
+### What the Postgres tier can and cannot buy, which is a wiring question
+
+`HotStateRepo::get` goes through `begin_scoped` like every other scoped read. So a hit against
+the Postgres-backed tier pays the same `BEGIN`, isolation level, two `set_config` calls and
+`COMMIT` as the read it stands in front of; only the query inside differs. Measured, 145 us
+against the 166 us scoped read: a 13 per cent saving, bought with a write on every miss and an
+invalidation feed to keep correct.
+
+SO WIRED ONE-FOR-ONE IN FRONT OF A SINGLE REPOSITORY CALL, THE POSTGRES TIER BUYS NOTHING. An
+earlier revision of this section stopped there and concluded the tier "cannot accelerate
+anything, by construction". That is too strong, and the correction is the useful part: what a
+hit replaces is however many scoped transactions the cached answer stands in front of, and that
+is a wiring choice rather than a property of the tier.
+
+Two of the declared uses front more than one:
+
+- `TENANT_CONFIG` is declared as "a tenant's resolved configuration, as the request path reads
+  it". The nearest such load, `load_issuer_entry`, is THREE scoped transactions: the signing-key
+  list, the environment guardrails, and the installed locales. One 145 us hit against roughly
+  500 us is a saving of about 70 per cent, on the Postgres tier alone.
+- `INTROSPECTION` is declared as "the result of an introspection call", not one repository
+  method. An opaque token's resolution is one scoped read behind the client authentication, so
+  there it is the 13 per cent case. A JWT token is not: `verify_any_audience` re-reads the
+  serving-state fence once PER CANDIDATE AUDIENCE, deliberately and uncached, so a multi-audience
+  token pays several scoped reads that one hit could replace.
+
+Note what a hit CANNOT replace, in either case: the client authentication has to happen before
+any cached answer is served, for the same reason the JWKS fence does, so it is on both sides of
+the comparison and cancels.
+
+For the write-shaped uses -- a single-use marker, a rate counter -- the Postgres tier is not
+merely no faster. It is a second scoped WRITE in the same request, so it costs more than not
+having it, and the shared-state justification below does not apply to them either: the durable
+record they need is the row they were already writing.
+
+WHERE THE POSTGRES TIER IS STILL THE RIGHT ANSWER is as a SHARED-STATE mechanism rather than a
+faster one: flow state that survives the loss of the node that created it is a real job, and it
+is the one the covenant's "complete on PostgreSQL alone" needs done.
+
+A tier that is genuinely a different store is what would change the per-hit figure.
+`IronCacheHotState` is that tier and the figures above do not measure it, so this document
+cannot yet say whether attaching one repays its operational cost.
 
 ### What that means, use by use
 
-**Scoped reads are worth accelerating.** Introspection resolves an opaque access token through
-`resolve_opaque_access_token`, which is one of those six-round-trip sequences. A tenant config
-read would be another. For these the hop is bought back several times over, and the earlier
-conclusion here said the opposite.
+**Scoped reads are worth accelerating**, and by how much depends on how many of them one cached
+answer stands in front of, which the previous section works through. Introspection resolves an
+opaque access token through `resolve_opaque_access_token`, one six-round-trip sequence; a
+resolved tenant config is three of them.
 
 **The JWKS document is still not**, and for a reason that has nothing to do with the figures
 above. `jwks_json` consults its hot state only AFTER `resolve_for_publication` has returned the

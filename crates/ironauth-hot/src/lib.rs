@@ -38,7 +38,21 @@
 //! one round trip. The JWKS read is unusual in costing almost nothing above it, because the
 //! entry is already in hand. A SCOPED read is the opposite: `begin_scoped` pays BEGIN, an
 //! isolation level, two `set_config` calls and a COMMIT around a query under row-level security,
-//! measured at 158 us against a 20 us hop. Those uses are worth accelerating several times over.
+//! measured at 166 us against a 20 us hop. Those uses are worth accelerating.
+//!
+//! HOW MUCH DEPENDS ON THE TIER, AND ON THE WIRING. `HotStateRepo::get` goes through
+//! `begin_scoped` as well, so a hit against `PgHotState` pays the same six round trips as the
+//! read it stands in front of: 145 us against 166 us, thirteen per cent, bought with a write on
+//! every miss and an invalidation feed to keep correct. Wired one-for-one in front of a single
+//! repository call, the Postgres tier buys nothing.
+//!
+//! What a hit replaces is however many scoped transactions the cached answer stands in front of,
+//! and that is a wiring choice. A resolved tenant config is three of them, around 500 us, which
+//! one hit turns into 145. `docs/UNIT-COSTS.md` works the cases through.
+//!
+//! For the write-shaped uses the Postgres tier is worse than nothing: a marker or a counter
+//! would be a second scoped WRITE in the same request. Where that tier IS the right answer is as
+//! shared state rather than speed, holding flow state that survives the node that created it.
 //!
 //! The general rule still holds and is why this paragraph exists: a use added to the registry
 //! does not become live by being declared, and a call site does not become live by being written.
