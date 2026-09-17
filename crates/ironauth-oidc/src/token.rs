@@ -1126,83 +1126,6 @@ struct CodeExchangeSession {
     impersonation: Option<ironauth_store::SessionImpersonation>,
 }
 
-/// The subject's effective organization roles at THIS issuance (issue #97), resolved
-/// FRESH from the store rather than replayed from the code or the grant.
-///
-/// This is deliberately the OPPOSITE of `org_id` (issue #94), which freezes onto the
-/// session and then the grant so it is stable for the life of a refresh family. A role
-/// is an AUTHORIZATION input: a role granted or revoked after the code was issued must
-/// be reflected on the next token, so it is re-resolved on every code exchange AND
-/// every refresh. The cost is one bounded query per issuance; the alternative
-/// (freezing) would make a role revocation invisible for the whole family lifetime,
-/// which is not an acceptable property for an authorization claim.
-///
-/// `subject` must be the LOCAL user id the grant recorded, never the public subject
-/// the token carries: resolution is a store read keyed by the real user, and a
-/// pairwise `sub` names no `users` row. The two are the same string TODAY only
-/// because [`OidcState::resolve_public_subject`] hard-codes the public subject type
-/// while per-client pairwise configuration is unpersisted client-registration state
-/// (issue #19). Both call sites therefore resolve roles BEFORE deriving the public
-/// subject, so there is no `subject` binding in scope to pass here by mistake; the
-/// issue that persists the pairwise configuration must keep it that way, or every
-/// pairwise client with an organization context starts failing closed at the mint.
-///
-/// Returns [`None`] when there is no organization context, symmetric with `org_id`: a
-/// role is org-scoped, so with no org there is no set to resolve and the claim is
-/// ABSENT rather than empty. An empty [`Some`] is distinct and DOES emit an empty
-/// array; it means the resolution ran and found nothing, which covers a member
-/// holding no roles, a subject who is not a member at all, and an organization that
-/// is no longer live and active.
-///
-/// # The organization's own lifecycle is fenced in the STORE, not here
-///
-/// A DISABLED or soft-DELETED organization resolves to the EMPTY set, because
-/// [`ironauth_store::OrgGroupRepo::effective_roles`] fences the membership seed of
-/// its shared closure on the organization being live and active. It has to live
-/// there rather than here, and this call site is exactly why: NEITHER mint hook is
-/// in a position to check it. The refresh path never runs the authorize-time
-/// organization resolution at all (it reads the org context frozen onto the family's
-/// grant), and on a code exchange that resolution returns EARLY for an
-/// already-bound session, so its disabled-organization refusal never runs either. A
-/// check added here would also cover only this claim, leaving the admin
-/// effective-roles view disagreeing with the token about the same organization.
-///
-/// Note that `org_id` itself is still EMITTED for a disabled organization: the grant
-/// really is bound to it, and the honest wire answer is "this token is scoped to that
-/// organization and carries no roles in it" rather than a silently org-less token.
-///
-/// # Fails CLOSED
-///
-/// A store fault is a `server_error`, never a role-less token: silently omitting roles
-/// reads downstream as a successful authorization DOWNGRADE, which is a real security
-/// bug rather than a cosmetic omission. This is also why roles do NOT ride the ID
-/// token's `extra_claims` bag, which is deliberately fail-OPEN (under-claim rather
-/// than fail issuance). A frozen `org_id` that no longer parses in this scope, or a
-/// recorded subject that does not, is a store-integrity problem and fails closed for
-/// the same reason.
-///
-/// # Errors
-///
-/// [`TokenError::ServerError`] on a store fault or an unparsable recorded identifier.
-/// The organization context and effective roles a MACHINE IDENTITY carries (issue #126).
-///
-/// One definition for every door that mints under a service-account principal --
-/// `client_credentials`, `jwt:bearer`, and token exchange -- because that is the shape of the
-/// defect this codebase keeps finding: a claim resolved at one door and not another makes the
-/// unresolved door the one to use. The `claims_mapping_at_issuance` comment says the same
-/// thing about mappings, having been written after three grants were found minting tokens
-/// that ran none.
-///
-/// `(None, None)` for a subject that is not a service account, which is the ordinary case at
-/// token exchange: a user's organization is frozen onto their grant at authorization and is
-/// resolved by [`resolve_effective_roles`] instead. Reading a user's membership here would be
-/// a SECOND definition of a user's org context, which is the thing this exists to avoid.
-///
-/// # Errors
-///
-/// [`TokenError::ServerError`] on a store fault. Never degraded to "no roles": on a mint path
-/// that is a silent authorization downgrade indistinguishable from an identity that
-/// legitimately holds none.
 /// Truncate caller-controlled text before it becomes an audit detail.
 ///
 /// The scope on a token request is whatever the caller sent. Writing it verbatim lets one
@@ -1409,6 +1332,25 @@ pub(crate) async fn gate_agent_issuance(
     }))
 }
 
+/// The organization context and effective roles a MACHINE IDENTITY carries (issue #126).
+///
+/// One definition for every door that mints under a service-account principal --
+/// `client_credentials`, `jwt:bearer`, and token exchange -- because that is the shape of the
+/// defect this codebase keeps finding: a claim resolved at one door and not another makes the
+/// unresolved door the one to use. The `claims_mapping_at_issuance` comment says the same
+/// thing about mappings, having been written after three grants were found minting tokens
+/// that ran none.
+///
+/// `(None, None)` for a subject that is not a service account, which is the ordinary case at
+/// token exchange: a user's organization is frozen onto their grant at authorization and is
+/// resolved by [`resolve_effective_roles`] instead. Reading a user's membership here would be
+/// a SECOND definition of a user's org context, which is the thing this exists to avoid.
+///
+/// # Errors
+///
+/// [`TokenError::ServerError`] on a store fault. Never degraded to "no roles": on a mint path
+/// that is a silent authorization downgrade indistinguishable from an identity that
+/// legitimately holds none.
 pub(crate) async fn resolve_workload_org_and_roles(
     state: &OidcState,
     scope: Scope,
@@ -1442,6 +1384,64 @@ pub(crate) async fn resolve_workload_org_and_roles(
     Ok((Some(organization.to_string()), Some(roles)))
 }
 
+/// The subject's effective organization roles at THIS issuance (issue #97), resolved
+/// FRESH from the store rather than replayed from the code or the grant.
+///
+/// This is deliberately the OPPOSITE of `org_id` (issue #94), which freezes onto the
+/// session and then the grant so it is stable for the life of a refresh family. A role
+/// is an AUTHORIZATION input: a role granted or revoked after the code was issued must
+/// be reflected on the next token, so it is re-resolved on every code exchange AND
+/// every refresh. The cost is one bounded query per issuance; the alternative
+/// (freezing) would make a role revocation invisible for the whole family lifetime,
+/// which is not an acceptable property for an authorization claim.
+///
+/// `subject` must be the LOCAL user id the grant recorded, never the public subject
+/// the token carries: resolution is a store read keyed by the real user, and a
+/// pairwise `sub` names no `users` row. The two are the same string TODAY only
+/// because [`OidcState::resolve_public_subject`] hard-codes the public subject type
+/// while per-client pairwise configuration is unpersisted client-registration state
+/// (issue #19). Both call sites therefore resolve roles BEFORE deriving the public
+/// subject, so there is no `subject` binding in scope to pass here by mistake; the
+/// issue that persists the pairwise configuration must keep it that way, or every
+/// pairwise client with an organization context starts failing closed at the mint.
+///
+/// Returns [`None`] when there is no organization context, symmetric with `org_id`: a
+/// role is org-scoped, so with no org there is no set to resolve and the claim is
+/// ABSENT rather than empty. An empty [`Some`] is distinct and DOES emit an empty
+/// array; it means the resolution ran and found nothing, which covers a member
+/// holding no roles, a subject who is not a member at all, and an organization that
+/// is no longer live and active.
+///
+/// # The organization's own lifecycle is fenced in the STORE, not here
+///
+/// A DISABLED or soft-DELETED organization resolves to the EMPTY set, because
+/// [`ironauth_store::OrgGroupRepo::effective_roles`] fences the membership seed of
+/// its shared closure on the organization being live and active. It has to live
+/// there rather than here, and this call site is exactly why: NEITHER mint hook is
+/// in a position to check it. The refresh path never runs the authorize-time
+/// organization resolution at all (it reads the org context frozen onto the family's
+/// grant), and on a code exchange that resolution returns EARLY for an
+/// already-bound session, so its disabled-organization refusal never runs either. A
+/// check added here would also cover only this claim, leaving the admin
+/// effective-roles view disagreeing with the token about the same organization.
+///
+/// Note that `org_id` itself is still EMITTED for a disabled organization: the grant
+/// really is bound to it, and the honest wire answer is "this token is scoped to that
+/// organization and carries no roles in it" rather than a silently org-less token.
+///
+/// # Fails CLOSED
+///
+/// A store fault is a `server_error`, never a role-less token: silently omitting roles
+/// reads downstream as a successful authorization DOWNGRADE, which is a real security
+/// bug rather than a cosmetic omission. This is also why roles do NOT ride the ID
+/// token's `extra_claims` bag, which is deliberately fail-OPEN (under-claim rather
+/// than fail issuance). A frozen `org_id` that no longer parses in this scope, or a
+/// recorded subject that does not, is a store-integrity problem and fails closed for
+/// the same reason.
+///
+/// # Errors
+///
+/// [`TokenError::ServerError`] on a store fault or an unparsable recorded identifier.
 async fn resolve_effective_roles(
     state: &OidcState,
     scope: Scope,

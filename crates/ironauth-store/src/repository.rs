@@ -23111,24 +23111,6 @@ async fn append_hook_version(
     Ok(())
 }
 
-/// Enqueue ONE message onto the generic outbox inside an OPEN domain transaction
-/// (issue #104). This is the transactional-outbox guarantee itself: the message row and
-/// the domain write commit together or neither does, so a rolled-back domain write emits
-/// nothing and a committed one never loses its message.
-///
-/// It takes the caller's transaction rather than opening its own, deliberately. A
-/// producer that enqueued on a separate connection would have a window where the domain
-/// write committed and the message did not (or the reverse), which is the whole class of
-/// defect an outbox exists to remove.
-///
-/// Crate-internal because `scripts/query-audit.sh` confines SQL against a scoped table to
-/// this module: a producer in another crate reaches the outbox through a repository
-/// method here, not by threading a transaction across a crate boundary.
-///
-/// # Errors
-///
-/// [`StoreError::Database`] on a persistence fault, including the unique violation a
-/// second enqueue under the same `(consumer, idempotency_key)` raises.
 /// Enqueue a producer's [`DomainEvent`] onto the webhook event queue, inside the caller's
 /// transaction. A `None` event enqueues nothing.
 ///
@@ -23256,6 +23238,24 @@ async fn enqueue_ssf_lifecycle_trigger(
     Ok(())
 }
 
+/// Enqueue ONE message onto the generic outbox inside an OPEN domain transaction
+/// (issue #104). This is the transactional-outbox guarantee itself: the message row and
+/// the domain write commit together or neither does, so a rolled-back domain write emits
+/// nothing and a committed one never loses its message.
+///
+/// It takes the caller's transaction rather than opening its own, deliberately. A
+/// producer that enqueued on a separate connection would have a window where the domain
+/// write committed and the message did not (or the reverse), which is the whole class of
+/// defect an outbox exists to remove.
+///
+/// Crate-internal because `scripts/query-audit.sh` confines SQL against a scoped table to
+/// this module: a producer in another crate reaches the outbox through a repository
+/// method here, not by threading a transaction across a crate boundary.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a persistence fault, including the unique violation a
+/// second enqueue under the same `(consumer, idempotency_key)` raises.
 pub(crate) async fn enqueue_outbox_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     env: &Env,
@@ -52240,15 +52240,6 @@ impl OrgMembershipRepo<'_> {
             .collect())
     }
 
-    /// One live service-account membership by id.
-    ///
-    /// The counterpart of [`OrgMembershipRepo::get`] and fenced the mirror way: that one
-    /// refuses a service-account row, this one refuses a user row. Neither surface can be
-    /// tricked into rendering the other's principal by being handed its id.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::NotFound`] if no such live service-account membership is visible here.
     /// The ONE organization a service account belongs to, or [`None`] when that is not a
     /// single answer (issue #126).
     ///

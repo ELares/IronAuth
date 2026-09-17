@@ -384,6 +384,22 @@ done < "$token_inventory"
 # needs a parser and a notion of which prose belongs to which item. This catches the shape that
 # compiles silently AND leaves a visible seam, which is the one that survives review.
 #
+# A SECOND SIGNATURE NARROWS THAT GAP, added after a review found FOUR live instances of the
+# uncatchable form in three files -- one of them an 83-line run carrying three items' docs, with
+# two of those items left undocumented. The signature is a single contiguous doc run containing
+# the SAME `#` section heading twice. One item has one `# Errors`; two `# Errors` in one run is
+# two items fused, and it needs no parser to see.
+#
+# It is narrower than the class and says so: a fusion where neither half has a section heading
+# is still invisible, which is how `AgentTokenIdentity` hid. What it removes is the LONG fusions,
+# which are the ones that bury an `# Errors` contract for a function that now has none.
+#
+# IT FOUND THREE MORE ON ITS FIRST RUN, two in `repository.rs` and one only after the second was
+# split -- they nest. And one of those three was not an insertion at all but a SUPERSEDED doc: an
+# older, thinner description of `get_service_account` left above the fuller one already on the
+# method. So "split it and give each half back" is the usual remedy and not the only one; a half
+# that duplicates a doc the item already carries is deleted rather than rehomed.
+#
 # Walks the same trees as the rules above (`crates` and `fuzz`, working tree) so one gate cannot
 # answer about a different file set than the rest.
 doc_attachment=$(
@@ -451,6 +467,23 @@ for path in sorted(line.strip() for line in sys.stdin if line.strip()):
                 f"inserted above an existing doc block leaves behind, and the first block is "
                 f"describing something else. Reattach it to what it is about."
             )
+        # The second signature: one contiguous run carrying the same section heading twice.
+        headings = {}
+        for offset in range(first_block, index):
+            text = lines[offset].strip()
+            if not text.startswith("/// #"):
+                continue
+            heading = text[4:].strip()
+            if heading in headings:
+                bad.append(
+                    f"{path}:{first_block+1}: this doc run carries `{heading}` twice, at lines "
+                    f"{headings[heading]+1} and {offset+1}. One item has one of each section, so "
+                    f"this is the docs of two items fused into one run -- the shape left behind "
+                    f"when an item is inserted, WITH ITS OWN doc, above the doc of another. "
+                    f"Split it and give each half back to what it documents."
+                )
+                break
+            headings[heading] = offset
 for entry in bad:
     print(entry)
 '
