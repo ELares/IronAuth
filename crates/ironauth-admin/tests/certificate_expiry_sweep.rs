@@ -411,31 +411,82 @@ async fn a_renewal_landing_mid_pass_is_counted_not_raised() {
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     let org = seed_org(&db, &env, scope, "Globex").await;
-    let connection = connect(&db, &env, scope, &org, "https://idp.example/midpass").await;
+    // THE INTERLEAVING IS RETRIED UNTIL IT IS OBSERVED, because a sleep cannot schedule it.
+    //
+    // This was one attempt with ten certificates and a three-millisecond sleep, reasoning that
+    // thirty records would keep the pass busy past it. On CI it lost, and it lost in the
+    // direction the comment did not consider: the report came back `announced: 27, vanished: 0`
+    // -- twenty-seven, not thirty -- so the unpin landed BEFORE the pass read its work list and
+    // the victim's three were simply absent. That is the SIBLING case this test exists to be
+    // distinct from, and no amount of adding certificates fixes it, because the failure is the
+    // renewal being too early rather than the pass being too short.
+    //
+    // A wall-clock delay cannot place one task inside another's critical section on a shared
+    // runner. What can be done honestly is to try the construction until the interleaving
+    // actually happens, and to say so when it never does rather than asserting on whichever
+    // order won. Each attempt gets its OWN connection and certificates, because a pass consumes
+    // the work it announces.
+    let mut report = None;
+    for attempt in 0..50u8 {
+        let connection = connect(
+            &db,
+            &env,
+            scope,
+            &org,
+            &format!("https://idp.example/midpass/{attempt}"),
+        )
+        .await;
+        let mut pinned = Vec::new();
+        for offset in 0..10u8 {
+            pinned.push(
+                pin_expiring(
+                    &db,
+                    &env,
+                    scope,
+                    &connection,
+                    attempt.wrapping_mul(10).wrapping_add(offset),
+                    2 * DAY,
+                )
+                .await,
+            );
+        }
+        drain(&db, &env, scope).await;
+        let victim = *pinned.last().expect("ten certificates");
 
-    // SEVERAL CERTIFICATES, so the pass has enough work to still be running when the unpin
-    // lands. One would be a race the sweep usually wins.
-    let mut pinned = Vec::new();
-    for seed in 90..100u8 {
-        pinned.push(pin_expiring(&db, &env, scope, &connection, seed, 2 * DAY).await);
+        let (pass, unpinned) = tokio::join!(
+            ironauth_admin::certificate_expiry::run_once(
+                db.control_store(),
+                &env,
+                scope,
+                LEADS,
+                100
+            ),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+                db.control_store()
+                    .scoped(scope)
+                    .acting(db.test_actor(&env), CorrelationId::generate(&env))
+                    .saml_connections()
+                    .unpin_certificate(&env, &victim, None)
+                    .await
+            },
+        );
+        unpinned.expect("the operator's renewal succeeds");
+        let pass = pass.expect("a renewal under a pass is not a fault");
+        if pass.vanished > 0 {
+            report = Some(pass);
+            break;
+        }
     }
-    drain(&db, &env, scope).await;
-    let victim = *pinned.last().expect("ten certificates");
-
-    let (report, unpinned) = tokio::join!(
-        ironauth_admin::certificate_expiry::run_once(db.control_store(), &env, scope, LEADS, 100),
-        async {
-            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
-            db.control_store()
-                .scoped(scope)
-                .acting(db.test_actor(&env), CorrelationId::generate(&env))
-                .saml_connections()
-                .unpin_certificate(&env, &victim, None)
-                .await
-        },
+    let report = report.expect(
+        "fifty attempts and `vanished` never moved. Two readings, and BOTH are real signals \
+         rather than a flake to retry harder. Either the arm stopped counting -- this is the \
+         assertion that catches a vanished work item being reported as announced, and it fails \
+         here exactly as it should -- or the interleaving stopped being constructible, because \
+         the pass got fast enough that a three-millisecond delay always misses it or the \
+         work-list read moved. Check the arm first; if it is intact, give the sweep a seam to \
+         synchronise on rather than raising this number.",
     );
-    unpinned.expect("the operator's renewal succeeds");
-    let report = report.expect("a renewal under a pass is not a fault");
 
     // THE VICTIM'S PAIRS LANDED IN THE `vanished` BUCKET, which is the assertion that gives the
     // counter meaning. An earlier version asserted only `announced + vanished == 30`, and that
