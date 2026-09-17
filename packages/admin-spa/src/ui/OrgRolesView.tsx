@@ -19,7 +19,7 @@
 // VOCABULARY those mappings draw on is environment scoped and lives in its own
 // section (src/ui/PermissionsView.tsx), not here.
 
-import { useState } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
 import {
   type CreateOrgRoleRequest,
   type KeysetPage,
@@ -36,6 +36,8 @@ import {
   ConfirmButton,
   MorePageNote,
   MutationFeedback,
+  ResourceFormIntro,
+  ResourceCreateAction,
 } from "./ResourceView";
 import { OrgRolePermissionsPanel } from "./OrgRolePermissionsView";
 import { type OrgScope, inputValue, sudoFor } from "./orgPanels";
@@ -53,31 +55,50 @@ export function OrgRolesPanel({
     [tenantId, environmentId, organizationId],
   );
   const [openRoleId, setOpenRoleId] = useState<string | null>(null);
+  useEffect(
+    () => setOpenRoleId(null),
+    [tenantId, environmentId, organizationId],
+  );
 
   return (
     <div class="resource-subsection">
-      <h3>Roles</h3>
-      <p class="resource-note">
-        A role is a stable slug this organization grants. The slug is what an
-        access token carries and what an authorization decision keys on, so it is
-        immutable: a rename changes only the label.
+      <div class="resource-subsection-heading">
+        <h2 id="organization-roles">Roles</h2>
+        <ResourceCreateAction
+          key={`${tenantId}:${environmentId}:${organizationId}`}
+          label="Create role"
+        >
+          {(close) => (
+            <OrgRoleCreateForm
+              tenantId={tenantId}
+              environmentId={environmentId}
+              organizationId={organizationId}
+              onCreated={() => {
+                close();
+                reload();
+              }}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
+      <p class="resource-hint">
+        Define the roles this organization can grant to its members and groups.
       </p>
-      <OrgRoleCreateForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        organizationId={organizationId}
-        onCreated={reload}
-      />
+      <details class="resource-help">
+        <summary>About role slugs and display names</summary>
+        <p class="resource-note">
+          A role is a stable slug this organization grants. The slug is what an
+          access token carries and what an authorization decision keys on, so it
+          is immutable: a rename changes only the label.
+        </p>
+      </details>
+
       <AsyncBoundary
         state={state}
         loadingLabel="Loading roles"
         empty={{
           when: (page) => page.items.length === 0,
-          render: () => (
-            <p class="resource-empty">
-              No roles yet. Define the first one above.
-            </p>
-          ),
+          render: () => <p class="resource-empty">No roles yet.</p>,
         }}
       >
         {(page) => (
@@ -89,6 +110,11 @@ export function OrgRolesPanel({
                     type="button"
                     class="resource-linkbtn"
                     aria-expanded={openRoleId === role.id}
+                    aria-controls={
+                      openRoleId === role.id
+                        ? `org-role-detail-${role.id}`
+                        : undefined
+                    }
                     onClick={() =>
                       setOpenRoleId(openRoleId === role.id ? null : role.id)
                     }
@@ -138,30 +164,26 @@ function OrgRoleCreateForm({
       slug: slug.trim(),
       display_name: displayName.trim(),
     };
-    void mutation
-      .run(async () => {
-        await createOrgRole(
-          tenantId,
-          environmentId,
-          organizationId,
-          request,
-        );
-      }, "Role defined.")
-      .then((ok) => {
-        if (ok) {
-          setSlug("");
-          setDisplayName("");
-          onCreated();
-        }
-      });
+    void mutation.run(async () => {
+      await createOrgRole(tenantId, environmentId, organizationId, request);
+      setSlug("");
+      setDisplayName("");
+      onCreated();
+    }, "Role defined.");
   }
 
   return (
     <form class="resource-form" onSubmit={onSubmit} aria-label="Define a role">
+      <ResourceFormIntro
+        title="Define role"
+        headingLevel={3}
+        description="Choose a stable slug and display name. Permissions can be attached after the role is created."
+      />
       <div class="resource-field">
         <label for="org-role-slug">Slug</label>
         <input
           id="org-role-slug"
+          placeholder={"billing.admin"}
           type="text"
           required
           value={slug}
@@ -172,6 +194,7 @@ function OrgRoleCreateForm({
         <label for="org-role-display-name">Display name</label>
         <input
           id="org-role-display-name"
+          placeholder={"Billing administrator"}
           type="text"
           required
           value={displayName}
@@ -255,11 +278,11 @@ function OrgRoleDetail({
   }
 
   return (
-    <div class="resource-detail-panel">
+    <div class="resource-detail-panel" id={`org-role-detail-${roleId}`}>
       <AsyncBoundary state={state} loadingLabel="Loading role">
         {(role) => (
           <div>
-            <h4>Role {role.slug}</h4>
+            <h3>Role {role.slug}</h3>
             <dl class="resource-detail">
               <dt>Identifier</dt>
               <dd>
@@ -306,7 +329,11 @@ function OrgRoleDetail({
                 Rename role
               </button>
             </form>
-            <div class="resource-actions" role="group" aria-label="Role actions">
+            <div
+              class="resource-actions"
+              role="group"
+              aria-label="Role actions"
+            >
               <ConfirmButton
                 label="Delete role"
                 prompt="Delete this role? Every grant of it is withdrawn, and members stop resolving it at the next token issuance. Access tokens already issued are not revoked."

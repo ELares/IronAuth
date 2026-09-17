@@ -35,7 +35,16 @@ import {
 } from "../api/client";
 import { activeScope } from "../scope/store";
 import type { SudoRecovery } from "./ErrorView";
-import { AsyncBoundary, ConfirmButton, MutationFeedback } from "./ResourceView";
+import {
+  AsyncBoundary,
+  ConfirmButton,
+  MutationFeedback,
+  ResourceCreateAction,
+  ResourceHeading,
+  ResourceFormIntro,
+  SecretCopyButton,
+  resourceLabel,
+} from "./ResourceView";
 import { useAsyncResource, useMutation } from "./useResource";
 
 // The lifecycle states the filter offers, plus the "all" pseudo value that clears
@@ -65,7 +74,11 @@ export function InvitationsList() {
   if (scope === null) {
     return (
       <section class="resource" aria-labelledby="invitations-heading">
-        <h2 id="invitations-heading">Invitations</h2>
+        <ResourceHeading
+          id="invitations-heading"
+          title="Invitations"
+          description="Invite people to this environment and manage pending access invitations."
+        />
         <p class="resource-empty">
           Select a tenant and environment to view its invitations.
         </p>
@@ -98,6 +111,7 @@ function InvitationsForScope({
   // token can be surfaced a single time. Both create and resend feed this; it is
   // never persisted or logged.
   const [issued, setIssued] = useState<InvitationCreatedView | null>(null);
+  const [created, setCreated] = useState(false);
 
   const stateFilter = filter === "all" ? undefined : filter;
   const { state, reload } = useAsyncResource<KeysetPage<InvitationView>>(
@@ -107,15 +121,32 @@ function InvitationsForScope({
 
   return (
     <section class="resource" aria-labelledby="invitations-heading">
-      <h2 id="invitations-heading">Invitations</h2>
-      <InvitationCreateForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        onCreated={(result) => {
-          setIssued(result);
-          reload();
-        }}
+      <ResourceHeading
+        id="invitations-heading"
+        title="Invitations"
+        description="Invite people to this environment and manage pending access invitations."
+        actions={
+          <ResourceCreateAction label="Create invitation">
+            {(close) => (
+              <InvitationCreateForm
+                tenantId={tenantId}
+                environmentId={environmentId}
+                onCreated={(result) => {
+                  setIssued(result);
+                  setCreated(true);
+                  reload();
+                  close();
+                }}
+              />
+            )}
+          </ResourceCreateAction>
+        }
       />
+      {created ? (
+        <p class="resource-success" role="status">
+          Invitation created.
+        </p>
+      ) : null}
       {issued === null ? null : <IssuedInvitation created={issued} />}
       <div class="resource-field">
         <label for="invitation-state-filter">Filter by state</label>
@@ -130,10 +161,10 @@ function InvitationsForScope({
             )
           }
         >
-          <option value="all">all</option>
+          <option value="all">All states</option>
           {INVITATION_STATES.map((value) => (
             <option key={value} value={value}>
-              {value}
+              {resourceLabel(value)}
             </option>
           ))}
         </select>
@@ -145,7 +176,7 @@ function InvitationsForScope({
           when: (page) => page.items.length === 0,
           render: () => (
             <p class="resource-empty">
-              No invitations match. Create one above.
+              No invitations match the selected state.
             </p>
           ),
         }}
@@ -197,19 +228,14 @@ function InvitationCreateForm({
       identifier: identifier.trim(),
     };
     if (credentialType !== "") {
-      request.credential_type =
-        credentialType as InvitationCredentialTypeView;
+      request.credential_type = credentialType as InvitationCredentialTypeView;
     }
     if (expiresIn.trim() !== "") {
       request.expires_in_secs = Number(expiresIn.trim());
     }
     void mutation
       .run(async () => {
-        const result = await createInvitation(
-          tenantId,
-          environmentId,
-          request,
-        );
+        const result = await createInvitation(tenantId, environmentId, request);
         // Hand the result to the parent, which holds it in memory only and
         // surfaces the copy-once token a single time. Never persisted or logged.
         onCreated(result);
@@ -229,10 +255,15 @@ function InvitationCreateForm({
       onSubmit={onSubmit}
       aria-label="Create an invitation"
     >
+      <ResourceFormIntro
+        title="Create invitation"
+        description="Choose the invited identity and its credential type. Blank optional fields use the configured defaults."
+      />
       <div class="resource-field">
         <label for="invitation-identifier">Invited identifier</label>
         <input
           id="invitation-identifier"
+          placeholder={"alex@example.com"}
           type="text"
           required
           value={identifier}
@@ -250,10 +281,10 @@ function InvitationCreateForm({
             setCredentialType((event.target as HTMLSelectElement).value)
           }
         >
-          <option value="">default</option>
+          <option value="">Use configured default</option>
           {CREDENTIAL_TYPES.map((value) => (
             <option key={value} value={value}>
-              {value}
+              {resourceLabel(value)}
             </option>
           ))}
         </select>
@@ -264,6 +295,7 @@ function InvitationCreateForm({
         </label>
         <input
           id="invitation-expires-in"
+          placeholder={"Use configured default"}
           type="number"
           min={0}
           value={expiresIn}
@@ -334,13 +366,17 @@ function InvitationRow({
       <span class="resource-link">{invitation.target_identifier}</span>
       <code class="resource-id">{invitation.id}</code>
       <span class={`resource-status resource-status-${invitation.state}`}>
-        {invitation.state}
+        {resourceLabel(invitation.state).toLowerCase()}
       </span>
       <span class="resource-meta">
         expires {new Date(invitation.expires_at_unix_ms).toISOString()}
       </span>
       {isPending ? (
-        <span class="resource-actions" role="group" aria-label="Invitation actions">
+        <span
+          class="resource-actions"
+          role="group"
+          aria-label="Invitation actions"
+        >
           <button
             type="button"
             class="resource-btn"
@@ -382,22 +418,25 @@ function IssuedInvitation({ created }: { created: InvitationCreatedView }) {
         <dt>Invited identifier</dt>
         <dd>{created.invitation.target_identifier}</dd>
         <dt>Expires at</dt>
-        <dd>
-          {new Date(created.invitation.expires_at_unix_ms).toISOString()}
-        </dd>
+        <dd>{new Date(created.invitation.expires_at_unix_ms).toISOString()}</dd>
       </dl>
       {hasToken ? (
         <div class="resource-token-secret">
           <p class="resource-token-warning">
             Copy this invitation token now. It is shown only once and cannot be
-            retrieved again. Deliver it to the invitee out of band to compose
-            their accept link.
+            retrieved again. Share it with the invitee through your trusted
+            invitation channel.
           </p>
           <code class="resource-token-value">{created.token}</code>
+          <SecretCopyButton
+            value={created.token ?? ""}
+            label="Copy invitation token"
+          />
         </div>
       ) : (
         <p class="resource-token-warning">
-          No token value was returned; it is shown only at the original creation.
+          No token value was returned; it is shown only at the original
+          creation.
         </p>
       )}
     </div>

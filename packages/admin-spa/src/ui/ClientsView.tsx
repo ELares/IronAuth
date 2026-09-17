@@ -44,9 +44,18 @@ import {
 } from "../api/client";
 import { activeScope } from "../scope/store";
 import type { SudoRecovery } from "./ErrorView";
-import { AsyncBoundary, ConfirmButton, MutationFeedback } from "./ResourceView";
+import {
+  AsyncBoundary,
+  ConfirmButton,
+  MutationFeedback,
+  ResourceCreateAction,
+  ResourceHeading,
+  ResourceFormIntro,
+  SecretCopyButton,
+  ResourceDetailNav,
+} from "./ResourceView";
 import { ClientServiceAccountKeysPanel } from "./ClientServiceAccountKeysView";
-import { useAsyncResource, useMutation } from "./useResource";
+import { useAsyncResource, useMutation, type Mutation } from "./useResource";
 
 function inputValue(event: Event): string {
   return (event.target as HTMLInputElement).value;
@@ -72,7 +81,11 @@ export function ClientsList() {
   if (scope === null) {
     return (
       <section class="resource" aria-labelledby="clients-heading">
-        <h2 id="clients-heading">Clients (dynamic client registration)</h2>
+        <ResourceHeading
+          id="clients-heading"
+          title="Clients"
+          description="Look up registered applications, manage token settings and configure client registration."
+        />
         <p class="resource-empty">
           Select a tenant and environment to manage dynamic client registration.
         </p>
@@ -81,6 +94,7 @@ export function ClientsList() {
   }
   return (
     <ClientsForScope
+      key={`${scope.tenantId}/${scope.environmentId}`}
       tenantId={scope.tenantId}
       environmentId={scope.environmentId}
     />
@@ -96,13 +110,26 @@ function ClientsForScope({
 }) {
   return (
     <section class="resource" aria-labelledby="clients-heading">
-      <h2 id="clients-heading">Clients (dynamic client registration)</h2>
-      <p class="resource-note">
-        Dynamic client registration (RFC 7591). Look up and verify a registered
-        client, manage the reusable registration policies, and mint an initial
-        access token. There is no generic client create or edit here; a client is
-        registered by a registrant presenting an initial access token.
-      </p>
+      <ResourceHeading
+        id="clients-heading"
+        title="Clients"
+        description="Look up registered applications, manage token settings and configure client registration."
+      />
+      <ResourceDetailNav
+        items={[
+          { id: "client-policies", label: "Policies" },
+          { id: "client-registration-token", label: "Registration tokens" },
+          { id: "client-lookup", label: "Look up client" },
+          { id: "client-signing", label: "Token signing" },
+          { id: "client-scopes", label: "Scope allowlist" },
+          { id: "client-keys", label: "Machine keys" },
+        ]}
+      />
+      <DcrPoliciesPanel tenantId={tenantId} environmentId={environmentId} />
+      <DcrInitialAccessTokenPanel
+        tenantId={tenantId}
+        environmentId={environmentId}
+      />
       <DcrClientLookup tenantId={tenantId} environmentId={environmentId} />
       <SigningAlgorithmWizard
         tenantId={tenantId}
@@ -110,11 +137,6 @@ function ClientsForScope({
       />
       <AllowedScopesPanel tenantId={tenantId} environmentId={environmentId} />
       <ClientServiceAccountKeysPanel
-        tenantId={tenantId}
-        environmentId={environmentId}
-      />
-      <DcrPoliciesPanel tenantId={tenantId} environmentId={environmentId} />
-      <DcrInitialAccessTokenPanel
         tenantId={tenantId}
         environmentId={environmentId}
       />
@@ -141,35 +163,58 @@ function SigningAlgorithmWizard({
     () => fetchSigningRecommendations(),
     [],
   );
+  const [confirmation, setConfirmation] = useState<string | null>(null);
   return (
     <div class="resource-subsection">
-      <h3>Token signing compatibility wizard</h3>
-      <p class="resource-note">
-        Pick what will verify the ID tokens of a registered client. The wizard shows
-        the recommended signing algorithm for that verifier and, on confirm, pins
-        it onto the client. The recommendations come from the server; nothing here
-        is hardcoded.
+      <div class="resource-subsection-heading">
+        <h2 id="client-signing">Token signing</h2>
+        <ResourceCreateAction label="Configure token signing">
+          {(close) => (
+            <AsyncBoundary
+              state={state}
+              loadingLabel="Loading recommendations"
+              empty={{
+                when: (rows) => rows.length === 0,
+                render: () => (
+                  <p class="resource-empty">
+                    No verifier recommendations are available.
+                  </p>
+                ),
+              }}
+            >
+              {(rows) => (
+                <SigningAlgorithmWizardForm
+                  tenantId={tenantId}
+                  environmentId={environmentId}
+                  rows={rows}
+                  onConfigured={(message) => {
+                    setConfirmation(message);
+                    close();
+                  }}
+                />
+              )}
+            </AsyncBoundary>
+          )}
+        </ResourceCreateAction>
+      </div>
+      <p class="resource-hint">
+        Choose the verifier your application uses to find a compatible token
+        signing algorithm.
       </p>
-      <AsyncBoundary
-        state={state}
-        loadingLabel="Loading recommendations"
-        empty={{
-          when: (rows) => rows.length === 0,
-          render: () => (
-            <p class="resource-empty">
-              No verifier recommendations are available.
-            </p>
-          ),
-        }}
-      >
-        {(rows) => (
-          <SigningAlgorithmWizardForm
-            tenantId={tenantId}
-            environmentId={environmentId}
-            rows={rows}
-          />
-        )}
-      </AsyncBoundary>
+      <details class="resource-help">
+        <summary>How signing recommendations work</summary>
+        <p class="resource-note">
+          Pick what will verify the ID tokens of a registered client. The wizard
+          shows the recommended signing algorithm for that verifier and, on
+          confirm, pins it onto the client. The recommendations come from the
+          server; nothing here is hardcoded.
+        </p>
+      </details>
+      {confirmation === null ? null : (
+        <p class="resource-success" role="status">
+          {confirmation}
+        </p>
+      )}
     </div>
   );
 }
@@ -178,10 +223,12 @@ function SigningAlgorithmWizardForm({
   tenantId,
   environmentId,
   rows,
+  onConfigured,
 }: {
   tenantId: string;
   environmentId: string;
   rows: SigningRecommendationView[];
+  onConfigured: (message: string) => void;
 }) {
   const [clientId, setClientId] = useState("");
   const [verifier, setVerifier] = useState(rows[0]?.verifier ?? "");
@@ -207,14 +254,19 @@ function SigningAlgorithmWizardForm({
     if (trimmed === "") {
       return;
     }
-    void mutation.run(async () => {
-      await setClientSigningAlgorithm(
-        tenantId,
-        environmentId,
-        trimmed,
-        selected.recommended,
-      );
-    }, `Signing algorithm set to ${selected.recommended}.`);
+    const message = `Signing algorithm set to ${selected.recommended}.`;
+    void mutation
+      .run(async () => {
+        await setClientSigningAlgorithm(
+          tenantId,
+          environmentId,
+          trimmed,
+          selected.recommended,
+        );
+      }, message)
+      .then((ok) => {
+        if (ok) onConfigured(message);
+      });
   }
 
   return (
@@ -223,10 +275,15 @@ function SigningAlgorithmWizardForm({
       onSubmit={onConfirm}
       aria-label="Set the signing algorithm for a client"
     >
+      <ResourceFormIntro
+        title="Configure token signing"
+        description="Choose the verifier your application uses and apply its recommended signing algorithm."
+      />
       <div class="resource-field">
         <label for="signing-client-id">Client id</label>
         <input
           id="signing-client-id"
+          placeholder={"Registered client ID"}
           type="text"
           value={clientId}
           onInput={(event) => setClientId(inputValue(event))}
@@ -270,9 +327,7 @@ function SigningAlgorithmWizardForm({
         type="submit"
         class="resource-btn resource-btn-primary"
         disabled={
-          mutation.state.pending ||
-          selected === null ||
-          clientId.trim() === ""
+          mutation.state.pending || selected === null || clientId.trim() === ""
         }
       >
         Set signing algorithm
@@ -322,14 +377,20 @@ function AllowedScopesPanel({
 
   return (
     <div class="resource-subsection">
-      <h3>Machine grant scope allowlist</h3>
-      <p class="resource-note">
-        Which scope tokens a client may request on a machine grant. Leave it unset
-        and every scope is allowed; set a list and the client is restricted to
-        exactly those tokens; set an EMPTY list and it may request none. `openid`
-        and `offline_access` are refused on a machine grant whatever this list says,
-        and this is not the permission set.
+      <h2 id="client-scopes">Machine grant scope allowlist</h2>
+      <p class="resource-hint">
+        Control which scopes a client can request with its machine credentials.
       </p>
+      <details class="resource-help">
+        <summary>How the scope allowlist works</summary>
+        <p class="resource-note">
+          Which scope tokens a client may request on a machine grant. Leave it
+          unset and every scope is allowed; set a list and the client is
+          restricted to exactly those tokens; set an EMPTY list and it may
+          request none. `openid` and `offline_access` are refused on a machine
+          grant whatever this list says, and this is not the permission set.
+        </p>
+      </details>
       <form
         class="resource-form"
         onSubmit={onSubmit}
@@ -339,6 +400,7 @@ function AllowedScopesPanel({
           <label for="allowed-scopes-client-id">Client id</label>
           <input
             id="allowed-scopes-client-id"
+            placeholder={"Registered client ID"}
             type="text"
             value={clientId}
             onInput={(event) => setClientId(inputValue(event))}
@@ -417,9 +479,12 @@ function AllowedScopesForm({
   function onSet(event: Event): void {
     event.preventDefault();
     const list = entries();
-    void mutation.run(async () => {
-      await setClientAllowedScopes(tenantId, environmentId, clientId, list);
-    }, `Allowlist set to ${list.length} scope${list.length === 1 ? "" : "s"}.`);
+    void mutation.run(
+      async () => {
+        await setClientAllowedScopes(tenantId, environmentId, clientId, list);
+      },
+      `Allowlist set to ${list.length} scope${list.length === 1 ? "" : "s"}.`,
+    );
   }
 
   function onClear(): void {
@@ -449,12 +514,18 @@ function AllowedScopesForm({
         <label for="allowed-scopes-list">Allowed scopes (one per line)</label>
         <textarea
           id="allowed-scopes-list"
+          spellcheck={false}
+          aria-describedby="allowed-scopes-list-help"
+          placeholder={"read:orders\nwrite:orders"}
           rows={5}
           value={text}
           onInput={(event) =>
             setText((event.target as HTMLTextAreaElement).value)
           }
         />
+        <p id="allowed-scopes-list-help" class="resource-hint">
+          Enter one allowed scope per line. An empty list allows no scopes.
+        </p>
       </div>
       <button
         type="submit"
@@ -499,7 +570,7 @@ function DcrClientLookup({
 
   return (
     <div class="resource-subsection">
-      <h3>Registered client</h3>
+      <h2 id="client-lookup">Registered client</h2>
       <form
         class="resource-form"
         onSubmit={onSubmit}
@@ -509,6 +580,7 @@ function DcrClientLookup({
           <label for="dcr-client-id">Client id</label>
           <input
             id="dcr-client-id"
+            placeholder={"Registered client ID"}
             type="text"
             value={clientId}
             onInput={(event) => setClientId(inputValue(event))}
@@ -584,11 +656,7 @@ function DcrClientCard({
                 : new Date(client.verified_at_unix_ms).toISOString()}
             </dd>
           </dl>
-          <div
-            class="resource-actions"
-            role="group"
-            aria-label="Verify client"
-          >
+          <div class="resource-actions" role="group" aria-label="Verify client">
             <ConfirmButton
               label="Verify client"
               prompt="Verify this client and lift its quarantine?"
@@ -619,14 +687,30 @@ function DcrPoliciesPanel({
     () => fetchDcrPolicies(tenantId, environmentId),
     [tenantId, environmentId],
   );
+  const [created, setCreated] = useState(false);
   return (
     <div class="resource-subsection">
-      <h3>Registration policies</h3>
-      <DcrPolicyCreateForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        onCreated={reload}
-      />
+      <div class="resource-subsection-heading">
+        <h2 id="client-policies">Registration policies</h2>
+        <ResourceCreateAction label="Create registration policy">
+          {(close) => (
+            <DcrPolicyCreateForm
+              tenantId={tenantId}
+              environmentId={environmentId}
+              onCreated={() => {
+                setCreated(true);
+                reload();
+                close();
+              }}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
+      {created ? (
+        <p class="resource-success" role="status">
+          Policy created.
+        </p>
+      ) : null}
       <AsyncBoundary
         state={state}
         loadingLabel="Loading policies"
@@ -634,7 +718,7 @@ function DcrPoliciesPanel({
           when: (items) => items.length === 0,
           render: () => (
             <p class="resource-empty">
-              No registration policies yet. Create the first one above.
+              No registration policies are configured in this environment.
             </p>
           ),
         }}
@@ -706,10 +790,16 @@ function DcrPolicyCreateForm({
       onSubmit={onSubmit}
       aria-label="Create a registration policy"
     >
+      <ResourceFormIntro
+        title="Create registration policy"
+        headingLevel={3}
+        description="Name the policy and provide its registration rules as a JSON array."
+      />
       <div class="resource-field">
         <label for="dcr-policy-name">Policy name</label>
         <input
           id="dcr-policy-name"
+          placeholder={"Standard application registration"}
           type="text"
           required
           value={name}
@@ -722,12 +812,20 @@ function DcrPolicyCreateForm({
         </label>
         <textarea
           id="dcr-policy-primitives"
+          spellcheck={false}
+          aria-describedby="dcr-policy-primitives-help"
+          aria-invalid={invalid}
+          placeholder={"[]"}
           rows={5}
           value={primitives}
           onInput={(event) =>
             setPrimitives((event.target as HTMLTextAreaElement).value)
           }
         />
+        <p id="dcr-policy-primitives-help" class="resource-hint">
+          Enter a JSON array containing force, restrict, reject or default
+          rules.
+        </p>
         {invalid ? (
           <p class="resource-field-error" role="alert">
             Enter a valid JSON array of policy primitives.
@@ -764,98 +862,147 @@ function DcrInitialAccessTokenPanel({
   environmentId: string;
 }) {
   const mutation = useMutation();
-  const [expiresIn, setExpiresIn] = useState("86400");
-  const [maxUses, setMaxUses] = useState("");
-  const [policyNames, setPolicyNames] = useState("");
   const [created, setCreated] = useState<InitialAccessTokenCreated | null>(
     null,
   );
 
-  function onSubmit(event: Event): void {
-    event.preventDefault();
-    const seconds = Number(expiresIn.trim());
-    if (!Number.isFinite(seconds) || seconds < 0) {
-      return;
-    }
-    const request: CreateInitialAccessTokenRequest = {
-      expires_in_secs: seconds,
-    };
-    if (maxUses.trim() !== "") {
-      request.max_uses = Number(maxUses.trim());
-    }
-    const names = policyNames
-      .split(",")
-      .map((name) => name.trim())
-      .filter((name) => name !== "");
-    if (names.length > 0) {
-      request.policy_names = names;
-    }
+  function onIssue(
+    request: CreateInitialAccessTokenRequest,
+    close: () => void,
+  ): void {
     // Clear any previously displayed token BEFORE the call so a stale credential
     // is never on screen while the next mint is in flight.
     setCreated(null);
-    void mutation.run(async () => {
-      const result = await createDcrInitialAccessToken(
-        tenantId,
-        environmentId,
-        request,
-      );
-      // Hold the result in memory only. This is the ONLY place the token value
-      // lives; it is never persisted or logged.
-      setCreated(result);
-    }, "Initial access token minted.");
+    void mutation
+      .run(async () => {
+        const result = await createDcrInitialAccessToken(
+          tenantId,
+          environmentId,
+          request,
+        );
+        // Hold the result in memory only. This is the ONLY place the token value
+        // lives; it is never persisted or logged.
+        setCreated(result);
+      }, "Initial access token minted.")
+      .then((ok) => {
+        if (ok) close();
+      });
   }
 
   return (
     <div class="resource-subsection">
-      <h3>Initial access token</h3>
-      <form
-        class="resource-form"
-        onSubmit={onSubmit}
-        aria-label="Mint an initial access token"
-      >
-        <div class="resource-field">
-          <label for="dcr-iat-expires">Lifetime (seconds)</label>
-          <input
-            id="dcr-iat-expires"
-            type="number"
-            required
-            min={0}
-            value={expiresIn}
-            onInput={(event) => setExpiresIn(inputValue(event))}
-          />
-        </div>
-        <div class="resource-field">
-          <label for="dcr-iat-max-uses">Max uses (optional, blank for unlimited)</label>
-          <input
-            id="dcr-iat-max-uses"
-            type="number"
-            min={0}
-            value={maxUses}
-            onInput={(event) => setMaxUses(inputValue(event))}
-          />
-        </div>
-        <div class="resource-field">
-          <label for="dcr-iat-policies">
-            Policy names (optional, comma separated)
-          </label>
-          <input
-            id="dcr-iat-policies"
-            type="text"
-            value={policyNames}
-            onInput={(event) => setPolicyNames(inputValue(event))}
-          />
-        </div>
-        <button
-          type="submit"
-          class="resource-btn resource-btn-primary"
-          disabled={mutation.state.pending || expiresIn.trim() === ""}
+      <div class="resource-subsection-heading">
+        <h2 id="client-registration-token">Initial access token</h2>
+        <ResourceCreateAction
+          label="Issue registration token"
+          pending={mutation.state.pending}
         >
-          Mint token
-        </button>
-      </form>
+          {(close) => (
+            <InitialAccessTokenForm
+              mutation={mutation}
+              onIssue={(request) => onIssue(request, close)}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
+      <p class="resource-hint">
+        Registration tokens allow applications to register using the policies
+        configured for this environment.
+      </p>
       {created === null ? null : <IssuedToken created={created} />}
-      <MutationFeedback state={mutation.state} />
+      {created === null ? null : <MutationFeedback state={mutation.state} />}
     </div>
+  );
+}
+
+function InitialAccessTokenForm({
+  mutation,
+  onIssue,
+}: {
+  mutation: Mutation;
+  onIssue: (request: CreateInitialAccessTokenRequest) => void;
+}) {
+  const [expiresIn, setExpiresIn] = useState("86400");
+  const [maxUses, setMaxUses] = useState("");
+  const [policyNames, setPolicyNames] = useState("");
+  const [submitted, setSubmitted] = useState(false);
+
+  function onSubmit(event: Event): void {
+    event.preventDefault();
+    const seconds = Number(expiresIn.trim());
+    if (!Number.isFinite(seconds) || seconds < 0) return;
+    const request: CreateInitialAccessTokenRequest = {
+      expires_in_secs: seconds,
+    };
+    if (maxUses.trim() !== "") request.max_uses = Number(maxUses.trim());
+    const names = policyNames
+      .split(",")
+      .map((name) => name.trim())
+      .filter(Boolean);
+    if (names.length > 0) request.policy_names = names;
+    setSubmitted(true);
+    onIssue(request);
+  }
+
+  return (
+    <form
+      class="resource-form"
+      onSubmit={onSubmit}
+      aria-label="Mint an initial access token"
+    >
+      <ResourceFormIntro
+        title="Issue registration token"
+        description="Set an expiry and optional usage limits for a token that lets an application register."
+      />
+      <div class="resource-field">
+        <label for="dcr-iat-expires">Lifetime (seconds)</label>
+        <input
+          id="dcr-iat-expires"
+          type="number"
+          required
+          min={0}
+          value={expiresIn}
+          onInput={(event) => setExpiresIn(inputValue(event))}
+        />
+      </div>
+      <div class="resource-field">
+        <label for="dcr-iat-max-uses">
+          Max uses (optional, blank for unlimited)
+        </label>
+        <input
+          id="dcr-iat-max-uses"
+          type="number"
+          min={0}
+          value={maxUses}
+          onInput={(event) => setMaxUses(inputValue(event))}
+        />
+      </div>
+      <div class="resource-field">
+        <label for="dcr-iat-policies">
+          Policy names (optional, comma separated)
+        </label>
+        <input
+          id="dcr-iat-policies"
+          type="text"
+          value={policyNames}
+          onInput={(event) => setPolicyNames(inputValue(event))}
+        />
+      </div>
+      <button
+        type="submit"
+        class="resource-btn resource-btn-primary"
+        disabled={mutation.state.pending || expiresIn.trim() === ""}
+      >
+        Mint token
+      </button>
+      <MutationFeedback
+        state={{
+          ...mutation.state,
+          error: submitted ? mutation.state.error : null,
+          success: null,
+        }}
+      />
+    </form>
   );
 }
 
@@ -890,6 +1037,7 @@ function IssuedToken({ created }: { created: InitialAccessTokenCreated }) {
             again. Present it as an Authorization Bearer header at registration.
           </p>
           <code class="resource-token-value">{created.token}</code>
+          <SecretCopyButton value={created.token ?? ""} label="Copy token" />
         </div>
       ) : (
         <p class="resource-token-warning">

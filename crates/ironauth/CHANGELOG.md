@@ -6,6 +6,28 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **Console navigation starts each page at the top.** Route changes preserve
+  keyboard focus without jumping to a page's lower content. Command search fits
+  short windows and landscape screens, with all results reachable by scrolling.
+
+- **Resource pages now prioritize existing items.** Creation, invitation,
+  credential issuance, membership and grant forms open only after an explicit
+  action. Compact header controls open accessible dialogs, including on empty
+  lists. Cancel and Escape discard the draft and restore focus; successful writes
+  close the dialog and keep confirmations and one-time credentials on the page.
+
+- **Refreshed the admin console and hosted authentication screens.** The console
+  now has a working overview, grouped navigation, visible command search,
+  responsive layouts, searchable resource lists, and clearer forms and guidance.
+  One-time credentials have copy controls, destructive confirmations support
+  keyboard cancellation, and scheduled offboarding uses a local date picker.
+  Navigation stays within the embedded `/admin` mount. Hosted sign-in,
+  registration, recovery, consent, MFA, passkey, device, logout, and organization
+  portal pages share a responsive visual system while retaining their existing
+  authentication behavior and restrictive Content Security Policy. Flow submit
+  buttons display their localized captions and field errors are associated with
+  their controls for assistive technology.
+
 - `ironauth storage rekey` REFUSES a change of master key MATERIAL unless the operator passes
   `--i-will-rebuild-lookups` (issue #153).
 

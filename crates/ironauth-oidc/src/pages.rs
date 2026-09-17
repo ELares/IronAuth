@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The bootstrap page surface: HTML escaping, the hardening headers every page
-//! carries, and the minimal unbranded login, registration, and consent
-//! templates (issue #20).
+//! The hosted page surface: HTML escaping, shared accessible page chrome, and the
+//! hardening headers every authentication and organization portal page carries.
 //!
 //! # Hardening baseline
 //!
@@ -28,7 +27,7 @@
 //!
 //! Every value reflected into a page (a prefilled identifier, a `return_to`, a
 //! client display name, a requested scope, an error message) is passed through
-//! [`escape_html`] first. The pages are deliberately unbranded, minimal, and
+//! [`escape_html`] first. The pages use fixed, server-authored chrome and
 //! carry no customer-supplied HTML anywhere: the only dynamic content is
 //! server-known values and escaped reflections. This closes the reflected-
 //! parameter injection class (the Keycloak error-page and Casdoor stored-XSS
@@ -45,9 +44,9 @@ use sha2::{Digest as _, Sha256};
 use crate::hints::InteractionHints;
 
 /// The strict Content-Security-Policy every bootstrap page carries. `default-src
-/// 'none'` denies everything not explicitly re-permitted; the pages load no
-/// script, style, image, or font, so only `form-action 'self'` (a form may post
-/// back to this origin) is opened. `frame-ancestors 'none'` refuses framing,
+/// 'none'` denies everything not explicitly re-permitted; [`page_csp`] permits
+/// only the exact embedded stylesheet by its content hash. `form-action 'self'`
+/// allows a form to post back to this origin. `frame-ancestors 'none'` refuses framing,
 /// `base-uri 'none'` refuses a `<base>` override, and `object-src 'none'` is stated
 /// explicitly (issue #89) so the plugin surface is denied uniformly across every
 /// page, even where a directive re-permits another source. There is no
@@ -121,19 +120,56 @@ pub fn escape_html(value: &str) -> String {
 /// the authorization error page) carries them identically.
 #[must_use]
 pub fn secure_html(status: StatusCode, body: String) -> Response {
+    let body = style_page(body);
     (
         status,
         [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
-            (header::X_FRAME_OPTIONS, "DENY"),
-            (header::REFERRER_POLICY, PAGE_REFERRER_POLICY),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_owned()),
+            (header::CONTENT_SECURITY_POLICY, page_csp()),
+            (header::X_FRAME_OPTIONS, "DENY".to_owned()),
+            (header::REFERRER_POLICY, PAGE_REFERRER_POLICY.to_owned()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
         ],
         body,
     )
         .into_response()
+}
+
+/// Pin the one server-owned stylesheet by content, allowing no arbitrary inline
+/// style, remote stylesheet, or style attribute. Derived from the asset itself so
+/// a visual edit cannot leave the CSP and the emitted bytes out of sync.
+fn stylesheet_hash() -> String {
+    format!(
+        "'sha256-{}'",
+        BASE64_STANDARD.encode(Sha256::digest(PAGES_STYLESHEET.as_bytes()))
+    )
+}
+
+fn page_csp() -> String {
+    format!("{CONTENT_SECURITY_POLICY}; style-src {}", stylesheet_hash())
+}
+
+/// Older organization portal templates omit explicit html/head/body elements.
+/// Normalize those server-authored documents into the shared responsive shell,
+/// then add the fixed stylesheet to the head. Authentication documents already
+/// carry their own language, display and direction, which are preserved.
+fn style_page(body: String) -> String {
+    let body = if body.contains("<html") {
+        body
+    } else {
+        let (title, content) = body
+            .split_once("<title>")
+            .and_then(|(_, rest)| rest.split_once("</title>"))
+            .unwrap_or(("IronAuth", &body));
+        document_styled(title, content, "en", "page", "ltr", None, None, None)
+            .replace("class=\"auth-card\"", "class=\"auth-card portal-page\"")
+    };
+    body.replacen(
+        "<head>",
+        &format!("<head><style>{PAGES_STYLESHEET}</style>"),
+        1,
+    )
 }
 
 /// Wrap page `body_html` in the minimal, unbranded document shell. `title` and
@@ -231,11 +267,19 @@ pub(crate) fn document_styled(
         ),
         None => String::new(),
     };
+    let content = if body_html.contains("<main") {
+        body_html.to_owned()
+    } else {
+        format!(
+            "<main class=\"auth-card\"><header data-brand><span data-product-name>IronAuth</span></header>\
+             {body_html}</main>"
+        )
+    };
     format!(
         "<!doctype html><html lang=\"{lang}\"{dir_attr}><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{robots}{stylesheet}{favicon}\
          <title>{title}</title></head>\
-         <body data-display=\"{display}\">{banner}{body_html}</body></html>"
+         <body data-display=\"{display}\">{banner}{content}</body></html>"
     )
 }
 
@@ -254,6 +298,16 @@ fn return_to_field(return_to: &str) -> String {
         "<input type=\"hidden\" name=\"return_to\" value=\"{}\">",
         escape_html(return_to)
     )
+}
+
+/// Preserve the validated authorization resume target when moving between the
+/// sign-in, registration and recovery screens. Encode it as one query value and
+/// escape the resulting href before interpolation into an attribute.
+fn interaction_href(path: &str, return_to: &str) -> String {
+    escape_html(&format!(
+        "{path}?return_to={}",
+        crate::util::percent_encode_query(return_to)
+    ))
 }
 
 /// An optional escaped error banner, or the empty string when there is no error.
@@ -290,17 +344,21 @@ pub fn login_page(
         "username"
     };
     let body = format!(
-        "<h1>Sign in</h1>{error}\
+        "<h1>Sign in</h1><p class=\"page-description\">Welcome back. Enter your account details to continue.</p>{error}\
          <form method=\"post\" action=\"/login\">{return_to}\
-         <p><label>Identifier <input type=\"text\" name=\"identifier\" value=\"{identifier}\" \
+         <p><label>Account identifier <input type=\"text\" name=\"identifier\" value=\"{identifier}\" \
          autocomplete=\"{username_autocomplete}\" required></label></p>\
          <p><label>Password <input type=\"password\" name=\"password\" \
          autocomplete=\"current-password\" required></label></p>\
-         <p><button type=\"submit\">Sign in</button></p></form>{passkey}",
+         <p><button type=\"submit\">Sign in</button></p></form>{passkey}\
+         <div class=\"auth-links\"><a href=\"{recover_href}\">Forgot your password?</a>\
+         <a href=\"{register_href}\">Create an account</a></div>",
         error = error_banner(error),
         return_to = return_to_field(return_to),
         identifier = escape_html(identifier),
         passkey = passkey.map(passkey_block).unwrap_or_default(),
+        recover_href = interaction_href("/recover", return_to),
+        register_href = interaction_href("/register", return_to),
     );
     document(
         "Sign in",
@@ -464,7 +522,9 @@ const PASSKEY_SCRIPT: &str = r#"(async () => {
 pub fn login_csp(nonce: &str) -> String {
     format!(
         "default-src 'none'; base-uri 'none'; object-src 'none'; form-action 'self'; \
-         frame-ancestors 'none'; script-src 'nonce-{nonce}' 'strict-dynamic'; connect-src 'self'"
+         frame-ancestors 'none'; style-src {style_hash}; \
+         script-src 'nonce-{nonce}' 'strict-dynamic'; connect-src 'self'",
+        style_hash = stylesheet_hash(),
     )
 }
 
@@ -473,6 +533,7 @@ pub fn login_csp(nonce: &str) -> String {
 /// header matches [`secure_html`].
 #[must_use]
 pub fn login_html(status: StatusCode, body: String, nonce: &str) -> Response {
+    let body = style_page(body);
     (
         status,
         [
@@ -565,31 +626,7 @@ pub fn flow_login_html(status: StatusCode, body: String, nonce: &str) -> Respons
 /// variables block) WITHOUT touching the HTML, which stays free of inline style. Served as a
 /// `const &str` so the single binary answers `.../pages.css` with no CDN and no runtime
 /// fetch.
-pub const PAGES_STYLESHEET: &str = ":root{color-scheme:light dark}\
-*{box-sizing:border-box}\
-body{margin:0;font-family:system-ui,sans-serif;line-height:1.5;color:#1a1a1a;background:#f5f5f5}\
-body{display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1.5rem}\
-form,main,.page{width:100%;max-width:24rem}\
-h1{font-size:1.5rem;margin:0 0 1rem}\
-label{display:block;margin:0 0 .75rem;font-weight:500}\
-input[type=text],input[type=email],input[type=tel],input[type=password]{\
-display:block;width:100%;margin-top:.25rem;padding:.5rem .625rem;font-size:1rem;\
-border:1px solid #bbb;border-radius:.375rem;background:#fff;color:inherit}\
-button,input[type=submit]{\
-display:inline-block;padding:.5rem 1rem;font-size:1rem;font-weight:600;cursor:pointer;\
-border:0;border-radius:.375rem;background:#2f5bde;color:#fff}\
-button:hover,input[type=submit]:hover{background:#2848b0}\
-p[role=alert],span.error{color:#b00020}\
-p[role=status][data-environment-banner]{\
-background:#fff4d6;border:1px solid #e0c060;border-radius:.375rem;padding:.5rem .75rem}\
-[data-brand]{margin:0 0 1rem;font-weight:700}\
-[data-brand-token]{display:inline-block;margin-inline-start:.5rem;padding:.125rem .5rem;\
-font-size:.75rem;border-radius:1rem;background:#e6ecff;color:#2848b0}\
-@media (prefers-color-scheme:dark){\
-body{color:#eee;background:#141414}\
-input[type=text],input[type=email],input[type=tel],input[type=password]{\
-background:#1e1e1e;border-color:#444;color:#eee}\
-p[role=status][data-environment-banner]{background:#3a2f10;border-color:#7a6320}}";
+pub const PAGES_STYLESHEET: &str = include_str!("pages.css");
 
 /// Build the `200 OK` response serving the one embedded flow stylesheet (issue #85, FORK C):
 /// a same origin `text/css` asset with `nosniff` and a cacheable `max-age`, so the browser
@@ -617,31 +654,7 @@ pub fn stylesheet_response() -> Response {
 /// byte identical [`PAGES_STYLESHEET`]. The environment banner and brand-token badge chrome
 /// keep fixed guardrail colors; the dark banner override is a fixed literal. No `url()`, no
 /// external host, no inline style: the strict `style-src 'self'` CSP is untouched.
-const BRAND_STYLESHEET_RULES: &str = ":root{color-scheme:light dark}\
-*{box-sizing:border-box}\
-body{margin:0;font-family:var(--font-family);line-height:1.5;color:var(--color-fg);background:var(--color-bg)}\
-body{display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1.5rem}\
-form,main,.page{width:100%;max-width:24rem}\
-h1{font-size:1.5rem;margin:0 0 1rem}\
-label{display:block;margin:0 0 .75rem;font-weight:500}\
-input[type=text],input[type=email],input[type=tel],input[type=password]{\
-display:block;width:100%;margin-top:.25rem;padding:.5rem .625rem;font-size:1rem;\
-border:1px solid var(--color-border);border-radius:var(--radius);\
-background:var(--color-surface);color:var(--color-fg)}\
-button,input[type=submit]{\
-display:inline-block;padding:.5rem 1rem;font-size:1rem;font-weight:600;cursor:pointer;\
-border:0;border-radius:var(--radius);background:var(--color-accent);color:var(--color-accent-fg)}\
-button:hover,input[type=submit]:hover{filter:brightness(.92)}\
-p[role=alert],span.error{color:var(--color-error)}\
-p[role=status][data-environment-banner]{\
-background:#fff4d6;border:1px solid #e0c060;border-radius:var(--radius);padding:.5rem .75rem}\
-[data-brand]{margin:0 0 1rem;font-weight:700}\
-[data-brand-token]{display:inline-block;margin-inline-start:.5rem;padding:.125rem .5rem;\
-font-size:.75rem;border-radius:1rem;background:var(--color-surface);color:var(--color-accent)}\
-[data-brand-slot]{margin:1rem 0;font-size:.9rem}\
-[data-brand-footer]{margin-top:1.5rem;font-size:.8rem;opacity:.85}\
-@media (prefers-color-scheme:dark){\
-p[role=status][data-environment-banner]{background:#3a2f10;border-color:#7a6320}}";
+const BRAND_STYLESHEET_RULES: &str = PAGES_STYLESHEET;
 
 /// Compose the served BRANDED stylesheet for a scope with a brand (issue #86): the
 /// `:root { ... }` custom-property block generated from the brand's TYPED design tokens
@@ -654,8 +667,12 @@ pub(crate) fn brand_stylesheet(
     tokens: &crate::branding::DesignTokens,
     tokens_dark: Option<&crate::branding::DesignTokens>,
 ) -> String {
-    let mut css = crate::branding::tokens_to_css(tokens, tokens_dark);
-    css.push_str(BRAND_STYLESHEET_RULES);
+    let mut css = BRAND_STYLESHEET_RULES.to_owned();
+    // Brand variables follow the layout defaults so authored tokens win the cascade.
+    css.push_str(&crate::branding::tokens_to_css(tokens, tokens_dark));
+    if tokens_dark.is_some() {
+        css.push_str(":root{color-scheme:light dark}");
+    }
     css
 }
 
@@ -821,16 +838,18 @@ pub fn register_page(
     environment_banner: Option<&str>,
 ) -> String {
     let body = format!(
-        "<h1>Create account</h1>{error}\
+        "<h1>Create account</h1><p class=\"page-description\">Set up your account to get started.</p>{error}\
          <form method=\"post\" action=\"/register\">{return_to}\
-         <p><label>Identifier <input type=\"text\" name=\"identifier\" value=\"{identifier}\" \
+         <p><label>Account identifier <input type=\"text\" name=\"identifier\" value=\"{identifier}\" \
          autocomplete=\"username\" required></label></p>\
          <p><label>Password <input type=\"password\" name=\"password\" \
          autocomplete=\"new-password\" required></label></p>\
-         <p><button type=\"submit\">Create account</button></p></form>",
+         <p><button type=\"submit\">Create account</button></p></form>\
+         <div class=\"auth-links\"><a href=\"{login_href}\">Already have an account? Sign in</a></div>",
         error = error_banner(error),
         return_to = return_to_field(return_to),
         identifier = escape_html(identifier),
+        login_href = interaction_href("/login", return_to),
     );
     document(
         "Create account",
@@ -854,14 +873,16 @@ pub fn recover_page(
     environment_banner: Option<&str>,
 ) -> String {
     let body = format!(
-        "<h1>Recover account</h1>{error}\
+        "<h1>Recover account</h1><p class=\"page-description\">Enter your account identifier and we will send recovery instructions if an account exists.</p>{error}\
          <form method=\"post\" action=\"/recover\">{return_to}\
-         <p><label>Identifier <input type=\"text\" name=\"identifier\" value=\"{identifier}\" \
+         <p><label>Account identifier <input type=\"text\" name=\"identifier\" value=\"{identifier}\" \
          autocomplete=\"username\" required></label></p>\
-         <p><button type=\"submit\">Send recovery instructions</button></p></form>",
+         <p><button type=\"submit\">Send recovery instructions</button></p></form>\
+         <div class=\"auth-links\"><a href=\"{login_href}\">Back to sign in</a></div>",
         error = error_banner(error),
         return_to = return_to_field(return_to),
         identifier = escape_html(identifier),
+        login_href = interaction_href("/login", return_to),
     );
     document(
         "Recover account",
@@ -897,7 +918,7 @@ pub fn consent_page(
          <p>The application <strong>{client}</strong> is requesting access.</p>\
          <p>Requested scopes:</p><ul>{scopes}</ul>\
          <form method=\"post\" action=\"/consent\">{return_to}\
-         <p><button type=\"submit\" name=\"decision\" value=\"allow\">Allow</button> \
+         <p class=\"actions\"><button type=\"submit\" name=\"decision\" value=\"allow\">Allow</button> \
          <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></p></form>",
         client = escape_html(client_name),
         scopes = scope_items,
@@ -1100,15 +1121,19 @@ const DEVICE_VERIFY_CSP: &str = "default-src 'none'; base-uri 'none'; object-src
 /// #24). Every other header matches [`secure_html`].
 #[must_use]
 pub fn device_verify_html(status: StatusCode, body: String) -> Response {
+    let body = style_page(body);
     (
         status,
         [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CONTENT_SECURITY_POLICY, DEVICE_VERIFY_CSP),
-            (header::X_FRAME_OPTIONS, "DENY"),
-            (header::REFERRER_POLICY, PAGE_REFERRER_POLICY),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_owned()),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                format!("{DEVICE_VERIFY_CSP}; style-src {}", stylesheet_hash()),
+            ),
+            (header::X_FRAME_OPTIONS, "DENY".to_owned()),
+            (header::REFERRER_POLICY, PAGE_REFERRER_POLICY.to_owned()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
         ],
         body,
     )
@@ -1205,7 +1230,7 @@ pub fn device_confirm_page(page: &DeviceConfirmPage<'_>) -> String {
          <p>Confirm the code shown on your device is <strong>{code}</strong>.</p>\
          <p>Requested scopes:</p><ul>{scopes}</ul>\
          <form method=\"post\" action=\"{action}\">{handle}{code_field}\
-         <p><button type=\"submit\" name=\"decision\" value=\"allow\">Approve</button> \
+         <p class=\"actions\"><button type=\"submit\" name=\"decision\" value=\"allow\">Approve</button> \
          <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></p></form>",
         client = escape_html(page.client_name),
         code = escape_html(page.user_code),
@@ -1294,7 +1319,7 @@ pub fn backchannel_approve_page(action: &str, pending: &[PendingBackchannelItem<
             "<section><h2>{client}</h2>{binding}{details}\
              <p>Requested scopes:</p><ul>{scopes}</ul>\
              <form method=\"post\" action=\"{action}\">{handle}\
-             <p><button type=\"submit\" name=\"decision\" value=\"allow\">Approve</button> \
+             <p class=\"actions\"><button type=\"submit\" name=\"decision\" value=\"allow\">Approve</button> \
              <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></p>\
              </form></section>",
             client = escape_html(item.client_name),
@@ -1400,12 +1425,15 @@ pub fn form_post_page(action: &str, params: &[(&str, Option<&str>)]) -> String {
         );
     }
     let body = format!(
-        "<form method=\"post\" action=\"{action}\">{inputs}</form>\
+        "<h1>Returning to your application</h1>\
+         <p>You will be redirected automatically.</p>\
+         <form method=\"post\" action=\"{action}\">{inputs}\
+         <noscript><p><button type=\"submit\">Continue to application</button></p></noscript></form>\
          <script>{script}</script>",
         action = escape_html(action),
         script = FORM_POST_AUTO_SUBMIT,
     );
-    notice_document("Submit this form", &body)
+    notice_document("Continue to your application", &body)
 }
 
 /// Build the `200 OK` `form_post` interstitial response for `action` (the
@@ -1418,8 +1446,12 @@ pub fn form_post_page(action: &str, params: &[(&str, Option<&str>)]) -> String {
 /// a URL, a `Location` header, or a query string.
 #[must_use]
 pub fn form_post_response(action: &str, params: &[(&str, Option<&str>)]) -> Response {
-    let body = form_post_page(action, params);
-    let csp = form_post_csp(&form_action_origin(action));
+    let body = style_page(form_post_page(action, params));
+    let csp = format!(
+        "{}; style-src {}",
+        form_post_csp(&form_action_origin(action)),
+        stylesheet_hash()
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=UTF-8")
@@ -1559,7 +1591,7 @@ pub fn frontchannel_logout_page(iframe_urls: &[String]) -> String {
     let iframes: String = iframe_urls.iter().fold(String::new(), |mut acc, url| {
         let _ = write!(
             acc,
-            "<iframe src=\"{}\" style=\"display:none\" sandbox=\"allow-same-origin allow-scripts\">\
+            "<iframe src=\"{}\" hidden title=\"Application sign-out\" sandbox=\"allow-same-origin allow-scripts\">\
              </iframe>",
             escape_html(url)
         );
@@ -1631,13 +1663,17 @@ fn frontchannel_logout_csp(origins: &[String]) -> String {
 /// no-referrer` (the RP URIs never leak through `Referer`), and is never cached.
 #[must_use]
 pub fn frontchannel_logout_response(iframe_urls: &[String], frame_origins: &[String]) -> Response {
-    let body = frontchannel_logout_page(iframe_urls);
+    let body = style_page(frontchannel_logout_page(iframe_urls));
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(
             header::CONTENT_SECURITY_POLICY,
-            frontchannel_logout_csp(frame_origins),
+            format!(
+                "{}; style-src {}",
+                frontchannel_logout_csp(frame_origins),
+                stylesheet_hash()
+            ),
         )
         .header(header::X_FRAME_OPTIONS, "DENY")
         .header(header::REFERRER_POLICY, "no-referrer")
@@ -1650,6 +1686,88 @@ pub fn frontchannel_logout_response(iframe_urls: &[String], frame_origins: &[Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn every_embedded_page_stylesheet_is_pinned_to_its_emitted_bytes() {
+        let page = notice_page("Continue", "A safe server-authored message.");
+        let responses = [
+            secure_html(StatusCode::OK, page.clone()),
+            login_html(StatusCode::OK, page.clone(), "test-nonce"),
+            device_verify_html(StatusCode::OK, page),
+            form_post_response(
+                "https://application.test/callback",
+                &[("code", Some("safe"))],
+            ),
+            frontchannel_logout_response(&[], &[]),
+        ];
+        for response in responses {
+            let policy = response.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            let style = body
+                .split_once("<style>")
+                .and_then(|(_, rest)| rest.split_once("</style>"))
+                .map(|(style, _)| style)
+                .expect("hosted pages carry the fixed embedded stylesheet");
+            let hash = BASE64_STANDARD.encode(Sha256::digest(style.as_bytes()));
+            assert!(policy.contains(&format!("style-src 'sha256-{hash}'")));
+            assert!(!policy.contains("unsafe-inline"));
+            assert!(!policy.contains("unsafe-eval"));
+            assert_eq!(body.matches("<style>").count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn portal_documents_gain_a_responsive_shell_without_changing_the_form() {
+        let response = secure_html(
+            StatusCode::OK,
+            "<!doctype html><meta charset=\"utf-8\"><title>Organization setup</title>\
+             <h1>Organization setup</h1><form method=\"post\" action=\"/portal/setup\">\
+             <input type=\"hidden\" name=\"t\" value=\"escaped&amp;token\">\
+             <button type=\"submit\">Continue</button></form>"
+                .to_owned(),
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("<html lang=\"en\">"));
+        assert!(body.contains("<meta name=\"viewport\""));
+        assert!(body.contains("<main class=\"auth-card portal-page\">"));
+        assert!(body.contains("<title>Organization setup</title>"));
+        assert!(body.contains("<form method=\"post\" action=\"/portal/setup\">"));
+        assert!(body.contains("name=\"t\" value=\"escaped&amp;token\""));
+        assert_eq!(body.matches("<main").count(), 1);
+    }
+
+    #[test]
+    fn account_navigation_preserves_the_authorization_resume_target() {
+        let return_to =
+            "/authorize?state=\"quoted\"&scope=openid&redirect_uri=https%3A%2F%2Fapp.test";
+        for page in [
+            login_page(
+                "",
+                return_to,
+                None,
+                &InteractionHints::default(),
+                None,
+                None,
+            ),
+            register_page("", return_to, None, &InteractionHints::default(), None),
+            recover_page("", return_to, None, &InteractionHints::default(), None),
+        ] {
+            assert!(
+                page.contains("?return_to=%2Fauthorize%3Fstate%3D%22quoted%22%26scope%3Dopenid")
+            );
+            assert!(page.contains(&return_to_field(return_to)));
+            assert!(!page.contains("href=\"/authorize?state=\"quoted\""));
+        }
+    }
 
     // Issue #85 (FORK C): the flow render app CSP variants keep the strict discipline and add
     // exactly the sources the served stylesheet and the passkey ceremony need, with no
@@ -1920,8 +2038,12 @@ mod tests {
         let response = secure_html(StatusCode::OK, "<h1>ok</h1>".to_owned());
         let headers = response.headers();
         assert_eq!(
-            headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
-            CONTENT_SECURITY_POLICY
+            headers
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            page_csp()
         );
         assert!(
             CONTENT_SECURITY_POLICY.contains("frame-ancestors 'none'"),
@@ -2300,7 +2422,10 @@ mod tests {
         // The page embeds one hidden iframe per participant, each src escaped.
         let body = frontchannel_logout_page(&iframe_urls);
         assert_eq!(body.matches("<iframe").count(), 2);
-        assert!(body.contains("display:none"), "iframes are hidden");
+        assert!(
+            body.contains(" hidden "),
+            "iframes are hidden without inline styles"
+        );
         // No participants: frame-src is 'none' (the page frames nothing).
         let empty = frontchannel_logout_csp(&[]);
         assert!(empty.contains("frame-src 'none'"), "{empty}");

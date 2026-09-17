@@ -31,6 +31,7 @@
 // every organization in the environment and a panel here would say otherwise.
 
 import { useLocation } from "preact-iso";
+import { consoleHref } from "./routing";
 import { useState } from "preact/hooks";
 import {
   type CreateMembershipRequest,
@@ -55,6 +56,11 @@ import {
   ConfirmButton,
   MorePageNote,
   MutationFeedback,
+  ResourceHeading,
+  ResourceCreateAction,
+  ResourceFormIntro,
+  ResourceCollection,
+  ResourceDetailNav,
 } from "./ResourceView";
 import { MembershipRolesPanel } from "./MemberRolesView";
 import { OrgApiKeysPanel } from "./OrgApiKeysView";
@@ -74,7 +80,11 @@ export function OrganizationsList() {
   if (scope === null) {
     return (
       <section class="resource" aria-labelledby="organizations-heading">
-        <h2 id="organizations-heading">Organizations</h2>
+        <ResourceHeading
+          id="organizations-heading"
+          title="Organizations"
+          description="Manage organizations, their members and shared access policies."
+        />
         <p class="resource-empty">
           Select a tenant and environment to view its organizations.
         </p>
@@ -83,6 +93,7 @@ export function OrganizationsList() {
   }
   return (
     <OrganizationsForScope
+      key={`${scope.tenantId}/${scope.environmentId}`}
       tenantId={scope.tenantId}
       environmentId={scope.environmentId}
     />
@@ -96,52 +107,83 @@ function OrganizationsForScope({
   tenantId: string;
   environmentId: string;
 }) {
+  const [notice, setNotice] = useState<string | null>(null);
   const { state, reload } = useAsyncResource<KeysetPage<OrganizationView>>(
     () => fetchOrganizations(tenantId, environmentId),
     [tenantId, environmentId],
   );
   return (
     <section class="resource" aria-labelledby="organizations-heading">
-      <h2 id="organizations-heading">Organizations</h2>
-      <OrganizationCreateForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        onCreated={reload}
+      <ResourceHeading
+        id="organizations-heading"
+        title="Organizations"
+        description="Manage organizations, their members and shared access policies."
+        actions={
+          <ResourceCreateAction label="Create organization">
+            {(close) => (
+              <OrganizationCreateForm
+                tenantId={tenantId}
+                environmentId={environmentId}
+                onCreated={() => {
+                  setNotice("Organization created.");
+                  reload();
+                  close();
+                }}
+              />
+            )}
+          </ResourceCreateAction>
+        }
       />
+      {notice === null ? null : (
+        <p class="resource-success" role="status" aria-live="polite">
+          {notice}
+        </p>
+      )}
       <AsyncBoundary
         state={state}
         loadingLabel="Loading organizations"
         empty={{
           when: (page) => page.items.length === 0,
-          render: () => (
-            <p class="resource-empty">
-              No organizations yet. Create the first one above.
-            </p>
-          ),
+          render: () => <p class="resource-empty">No organizations yet.</p>,
         }}
       >
         {(page) => (
           <div>
-            <ul class="resource-list">
-              {page.items.map((org) => (
-                <li key={org.id} class="resource-row">
-                  <a
-                    class="resource-link"
-                    href={`/organizations/${org.id}`}
-                  >
-                    {org.display_name}
-                  </a>
-                  <code class="resource-id">{org.id}</code>
-                  <span
-                    class={`resource-status resource-status-${
-                      org.active ? "active" : "disabled"
-                    }`}
-                  >
-                    {org.active ? "active" : "disabled"}
-                  </span>
-                </li>
-              ))}
-            </ul>
+            <ResourceCollection
+              items={page.items}
+              noun="organizations"
+              searchText={(org) =>
+                [
+                  org.display_name,
+                  org.id,
+                  org.active ? "active" : "disabled",
+                ].join(" ")
+              }
+              paginated
+            >
+              {(visible) => (
+                <ul class="resource-list">
+                  {visible.map((org) => (
+                    <li key={org.id} class="resource-row">
+                      <a
+                        class="resource-link"
+                        href={consoleHref(`/organizations/${org.id}`)}
+                      >
+                        {org.display_name}
+                      </a>
+                      <code class="resource-id">{org.id}</code>
+                      <span
+                        class={`resource-status resource-status-${
+                          org.active ? "active" : "disabled"
+                        }`}
+                      >
+                        {org.active ? "active" : "disabled"}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </ResourceCollection>
             <MorePageNote nextCursor={page.nextCursor} noun="organizations" />
           </div>
         )}
@@ -185,10 +227,15 @@ function OrganizationCreateForm({
       onSubmit={onSubmit}
       aria-label="Create an organization"
     >
+      <ResourceFormIntro
+        title="Create organization"
+        description="Give the organization a recognizable name. Members and roles can be added after creation."
+      />
       <div class="resource-field">
         <label for="organization-display-name">Display name</label>
         <input
           id="organization-display-name"
+          placeholder={"Acme Engineering"}
           type="text"
           required
           value={displayName}
@@ -221,7 +268,11 @@ export function OrganizationDetail({
   if (scope === null) {
     return (
       <section class="resource" aria-labelledby="organization-detail-heading">
-        <h2 id="organization-detail-heading">Organization</h2>
+        <ResourceHeading
+          id="organization-detail-heading"
+          title="Organization"
+          description="Manage members, roles, groups and credentials for this organization."
+        />
         <p class="resource-empty">
           Select a tenant and environment to view this organization.
         </p>
@@ -230,6 +281,7 @@ export function OrganizationDetail({
   }
   return (
     <OrganizationDetailFor
+      key={`${scope.tenantId}/${scope.environmentId}/${organizationId ?? ""}`}
       tenantId={scope.tenantId}
       environmentId={scope.environmentId}
       organizationId={organizationId ?? ""}
@@ -260,7 +312,7 @@ function OrganizationDetailFor({
     void mutation.run(async () => {
       await deleteOrganization(tenantId, environmentId, organizationId);
       if (typeof location.route === "function") {
-        location.route("/organizations");
+        location.route(consoleHref("/organizations"));
       }
     }, "Organization deleted.");
   }
@@ -268,14 +320,27 @@ function OrganizationDetailFor({
   return (
     <section class="resource" aria-labelledby="organization-detail-heading">
       <p>
-        <a class="resource-back" href="/organizations">
+        <a class="resource-back" href={consoleHref("/organizations")}>
           Back to organizations
         </a>
       </p>
       <AsyncBoundary state={state} loadingLabel="Loading organization">
         {(org) => (
           <div>
-            <h2 id="organization-detail-heading">{org.display_name}</h2>
+            <ResourceHeading
+              id="organization-detail-heading"
+              title={org.display_name}
+              description="Manage members, roles, groups and credentials for this organization."
+            />
+            <ResourceDetailNav
+              items={[
+                { id: "organization-members", label: "Members" },
+                { id: "organization-default-role", label: "Default role" },
+                { id: "organization-keys", label: "API keys" },
+                { id: "organization-roles", label: "Roles" },
+                { id: "organization-groups", label: "Groups" },
+              ]}
+            />
             <dl class="resource-detail">
               <dt>Identifier</dt>
               <dd>
@@ -419,49 +484,78 @@ function MembershipsPanel({
     () => fetchMemberships(tenantId, environmentId, organizationId),
     [tenantId, environmentId, organizationId],
   );
+  const [notice, setNotice] = useState<string | null>(null);
   const [openMembershipId, setOpenMembershipId] = useState<string | null>(null);
   return (
     <div class="resource-subsection">
-      <h3>Members</h3>
-      <MembershipAddForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        organizationId={organizationId}
-        onAdded={reload}
-      />
+      <div class="resource-toolbar resource-section-heading">
+        <div>
+          <h2 id="organization-members">Members</h2>
+          <p class="resource-hint">
+            Manage membership and each member&#39;s roles.
+          </p>
+        </div>
+        <ResourceCreateAction label="Add member">
+          {(close) => (
+            <MembershipAddForm
+              tenantId={tenantId}
+              environmentId={environmentId}
+              organizationId={organizationId}
+              onAdded={() => {
+                setNotice("Member added.");
+                reload();
+                close();
+              }}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
+      {notice === null ? null : (
+        <p class="resource-success" role="status" aria-live="polite">
+          {notice}
+        </p>
+      )}
       <AsyncBoundary
         state={state}
         loadingLabel="Loading members"
         empty={{
           when: (page) => page.items.length === 0,
-          render: () => (
-            <p class="resource-empty">
-              No members yet. Add the first one above.
-            </p>
-          ),
+          render: () => <p class="resource-empty">No members yet.</p>,
         }}
       >
         {(page) => (
           <div>
-            <ul class="resource-list">
-              {page.items.map((member) => (
-                <MembershipRow
-                  key={member.id}
-                  tenantId={tenantId}
-                  environmentId={environmentId}
-                  organizationId={organizationId}
-                  member={member}
-                  organizationActive={organizationActive}
-                  rolesOpen={openMembershipId === member.id}
-                  onToggleRoles={() =>
-                    setOpenMembershipId(
-                      openMembershipId === member.id ? null : member.id,
-                    )
-                  }
-                  onRemoved={reload}
-                />
-              ))}
-            </ul>
+            <ResourceCollection
+              items={page.items}
+              noun="members"
+              headingLevel={3}
+              searchText={(member) =>
+                [member.user_id, member.id, member.state].join(" ")
+              }
+              paginated
+            >
+              {(visible) => (
+                <ul class="resource-list">
+                  {visible.map((member) => (
+                    <MembershipRow
+                      key={member.id}
+                      tenantId={tenantId}
+                      environmentId={environmentId}
+                      organizationId={organizationId}
+                      member={member}
+                      organizationActive={organizationActive}
+                      rolesOpen={openMembershipId === member.id}
+                      onToggleRoles={() =>
+                        setOpenMembershipId(
+                          openMembershipId === member.id ? null : member.id,
+                        )
+                      }
+                      onRemoved={reload}
+                    />
+                  ))}
+                </ul>
+              )}
+            </ResourceCollection>
             <MorePageNote nextCursor={page.nextCursor} noun="members" />
           </div>
         )}
@@ -505,10 +599,16 @@ function MembershipAddForm({
       onSubmit={onSubmit}
       aria-label="Add a member to the organization"
     >
+      <ResourceFormIntro
+        title="Add member"
+        headingLevel={3}
+        description="Enter the ID of an existing user in this environment."
+      />
       <div class="resource-field">
         <label for="membership-user-id">User id</label>
         <input
           id="membership-user-id"
+          placeholder={"User ID from the Users screen"}
           type="text"
           required
           value={userId}
@@ -575,6 +675,9 @@ function MembershipRow({
           type="button"
           class="resource-btn"
           aria-expanded={rolesOpen}
+          aria-controls={
+            rolesOpen ? `membership-roles-${member.id}` : undefined
+          }
           onClick={onToggleRoles}
         >
           {rolesOpen ? "Hide roles" : "Show roles"}

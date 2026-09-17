@@ -83,20 +83,31 @@ function json(data: unknown, status = 200): Response {
 }
 
 function noContent(): Response {
-  return new Response(null, { status: 204, headers: { "content-length": "0" } });
+  return new Response(null, {
+    status: 204,
+    headers: { "content-length": "0" },
+  });
 }
 
 async function flush(): Promise<void> {
   for (let i = 0; i < 6; i += 1) {
     await Promise.resolve();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
   }
 }
 
 function button(root: HTMLElement, label: string): HTMLButtonElement {
-  const found = Array.from(root.querySelectorAll("button")).find(
-    (element) => element.textContent === label,
+  const searchRoot = root.querySelector("dialog[open]") ?? root;
+  const found = Array.from(
+    searchRoot.querySelectorAll<HTMLButtonElement>("button"),
+  ).find(
+    (element) =>
+      element.textContent === label ||
+      (element.classList.contains("resource-create-trigger") &&
+        element.textContent?.trim() === `+ ${label}`),
   );
   if (found === undefined) {
     throw new Error(`no button labelled ${label}`);
@@ -163,6 +174,8 @@ describe("the organizations list", () => {
     await flush();
     expect(root.textContent).toContain("No organizations yet");
     expect(root.querySelector(".resource-list")).toBeNull();
+    expect(root.querySelector(".resource-form")).toBeNull();
+    expect(root.querySelector("dialog")).toBeNull();
   });
 
   it("surfaces a more-exist note when the read returns a next cursor", async () => {
@@ -183,6 +196,10 @@ describe("creating an organization", () => {
     const root = mount(<OrganizationsList />);
     await flush();
 
+    expect(root.querySelector(".resource-form")).toBeNull();
+    button(root, "Create organization").click();
+    await flush();
+
     const input = root.querySelector(
       "#organization-display-name",
     ) as HTMLInputElement;
@@ -201,6 +218,7 @@ describe("creating an organization", () => {
     const bodyObj = JSON.parse(post?.body ?? "{}") as Record<string, unknown>;
     expect(bodyObj.display_name).toBe("Globex");
     expect(root.textContent).toContain("Organization created.");
+    expect(root.querySelector("dialog")).toBeNull();
   });
 });
 
@@ -353,9 +371,10 @@ describe("the organization memberships panel", () => {
     expect(root.textContent).toContain("omb_a");
 
     // Add a member: POST the documented memberships path with the user id body.
-    const input = root.querySelector(
-      "#membership-user-id",
-    ) as HTMLInputElement;
+    expect(root.querySelector("#membership-user-id")).toBeNull();
+    button(root, "Add member").click();
+    await flush();
+    const input = root.querySelector("#membership-user-id") as HTMLInputElement;
     input.value = "usr_b";
     input.dispatchEvent(new Event("input", { bubbles: true }));
     await flush();
@@ -367,6 +386,8 @@ describe("the organization memberships panel", () => {
     );
     const addBody = JSON.parse(post?.body ?? "{}") as Record<string, unknown>;
     expect(addBody.user_id).toBe("usr_b");
+    expect(root.textContent).toContain("Member added.");
+    expect(root.querySelector("dialog")).toBeNull();
 
     // Remove a member: DELETE the documented membership path only after confirm.
     button(root, "Remove").click();

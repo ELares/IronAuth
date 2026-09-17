@@ -81,8 +81,19 @@ async function flush(): Promise<void> {
   for (let i = 0; i < 6; i += 1) {
     await Promise.resolve();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
   }
+}
+
+async function openAction(root: HTMLElement, label: string): Promise<void> {
+  const trigger = Array.from(
+    root.querySelectorAll<HTMLButtonElement>('[aria-haspopup="dialog"]'),
+  ).find((element) => element.textContent?.trim().endsWith(label));
+  if (trigger === undefined) throw new Error(`no action labelled ${label}`);
+  trigger.click();
+  await flush();
 }
 
 function button(root: HTMLElement, label: string): HTMLButtonElement {
@@ -94,8 +105,6 @@ function button(root: HTMLElement, label: string): HTMLButtonElement {
   }
   return found;
 }
-
-
 
 async function loadPanel(
   respond: (call: Call) => Response,
@@ -147,6 +156,11 @@ describe("api keys create control, display once", () => {
       });
     });
 
+    expect(root.querySelector("dialog")).toBeNull();
+    const trigger = root.querySelector(
+      '[aria-haspopup="dialog"]',
+    ) as HTMLButtonElement;
+    await openAction(root, "Create key");
     const input = root.querySelector("input") as HTMLInputElement;
     input.value = "ci";
     input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -159,6 +173,9 @@ describe("api keys create control, display once", () => {
     // Non-vacuity: the POST actually happened, so the assertions below are about the
     // panel and not about a form that never submitted.
     expect(created).toBe(true);
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(trigger.disabled).toBe(false);
+    expect(document.activeElement).toBe(trigger);
     expect(root.textContent).toContain(KEY);
   });
 
@@ -174,6 +191,8 @@ describe("api keys create control, display once", () => {
           })
         : json({ items: [] }),
     );
+    expect(root.querySelector("dialog")).toBeNull();
+    await openAction(root, "Create key");
     const input = root.querySelector("input") as HTMLInputElement;
     input.value = "ci";
     input.dispatchEvent(new Event("input", { bubbles: true }));

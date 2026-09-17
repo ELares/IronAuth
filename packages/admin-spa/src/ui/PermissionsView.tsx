@@ -52,6 +52,9 @@ import {
   ConfirmButton,
   MorePageNote,
   MutationFeedback,
+  ResourceCreateAction,
+  ResourceHeading,
+  ResourceFormIntro,
 } from "./ResourceView";
 import { useAsyncResource, useMutation } from "./useResource";
 
@@ -80,7 +83,11 @@ export function PermissionsList() {
   if (scope === null) {
     return (
       <section class="resource" aria-labelledby="permissions-heading">
-        <h2 id="permissions-heading">Permissions</h2>
+        <ResourceHeading
+          id="permissions-heading"
+          title="Permissions"
+          description="Define reusable permissions and choose which applications receive permission claims."
+        />
         <p class="resource-empty">
           Select a tenant and environment to manage its permissions.
         </p>
@@ -89,6 +96,7 @@ export function PermissionsList() {
   }
   return (
     <PermissionsForScope
+      key={`${scope.tenantId}/${scope.environmentId}`}
       tenantId={scope.tenantId}
       environmentId={scope.environmentId}
     />
@@ -98,12 +106,16 @@ export function PermissionsList() {
 function PermissionsForScope({ tenantId, environmentId }: EnvScope) {
   return (
     <section class="resource" aria-labelledby="permissions-heading">
-      <h2 id="permissions-heading">Permissions</h2>
+      <ResourceHeading
+        id="permissions-heading"
+        title="Permissions"
+        description="Define reusable permissions and choose which applications receive permission claims."
+      />
       <p class="resource-note">
-        The permission vocabulary of this environment, and which audiences receive
-        it. A permission is defined once here and every organization in this
-        environment attaches the same entries to its own roles, which is done in the
-        role detail of an organization rather than here.
+        The permission vocabulary of this environment, and which audiences
+        receive it. A permission is defined once here and every organization in
+        this environment attaches the same entries to its own roles, which is
+        done in the role detail of an organization rather than here.
       </p>
       <PermissionVocabularyPanel
         tenantId={tenantId}
@@ -125,25 +137,48 @@ function PermissionVocabularyPanel({ tenantId, environmentId }: EnvScope) {
     [tenantId, environmentId],
   );
   const [openPermissionId, setOpenPermissionId] = useState<string | null>(null);
+  const [created, setCreated] = useState(false);
 
   return (
     <div class="resource-subsection">
-      <h3>Vocabulary</h3>
-      <p class="resource-note">
-        A permission is a namespaced stable slug with two or more dot separated
-        segments. The slug is what an access token claim carries and what an
-        authorization decision keys on, so it is immutable: a relabel changes only
-        the label. Case and inner punctuation are never touched here, so a non
-        canonical value is refused by the server rather than quietly rewritten.
-        Surrounding whitespace is the one exception and is trimmed, because no
-        canonical slug can contain any, so trimming it cannot turn a refusal into a
-        different stored value.
+      <div class="resource-subsection-heading">
+        <h2>Vocabulary</h2>
+        <ResourceCreateAction label="Define permission">
+          {(close) => (
+            <PermissionCreateForm
+              tenantId={tenantId}
+              environmentId={environmentId}
+              onCreated={() => {
+                setCreated(true);
+                reload();
+                close();
+              }}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
+      <p class="resource-hint">
+        Permissions use permanent slugs. Change the display name when the
+        wording needs updating.
       </p>
-      <PermissionCreateForm
-        tenantId={tenantId}
-        environmentId={environmentId}
-        onCreated={reload}
-      />
+      <details class="resource-help">
+        <summary>Permission naming rules</summary>
+        <p class="resource-note">
+          A permission is a namespaced stable slug with two or more dot
+          separated segments. The slug is what an access token claim carries and
+          what an authorization decision keys on, so it is immutable: a relabel
+          changes only the label. Case and inner punctuation are never touched
+          here, so a non canonical value is refused by the server rather than
+          quietly rewritten. Surrounding whitespace is the one exception and is
+          trimmed, because no canonical slug can contain any, so trimming it
+          cannot turn a refusal into a different stored value.
+        </p>
+      </details>
+      {created ? (
+        <p class="resource-success" role="status">
+          Permission defined.
+        </p>
+      ) : null}
       <AsyncBoundary
         state={state}
         loadingLabel="Loading the permission vocabulary"
@@ -151,7 +186,7 @@ function PermissionVocabularyPanel({ tenantId, environmentId }: EnvScope) {
           when: (page) => page.items.length === 0,
           render: () => (
             <p class="resource-empty">
-              No permissions yet. Define the first one above.
+              No permissions are defined in this environment.
             </p>
           ),
         }}
@@ -171,6 +206,11 @@ function PermissionVocabularyPanel({ tenantId, environmentId }: EnvScope) {
                     type="button"
                     class="resource-linkbtn"
                     aria-expanded={openPermissionId === permission.id}
+                    aria-controls={
+                      openPermissionId === permission.id
+                        ? `permission-detail-${permission.id}`
+                        : undefined
+                    }
                     onClick={() =>
                       setOpenPermissionId(
                         openPermissionId === permission.id
@@ -247,10 +287,16 @@ function PermissionCreateForm({
       onSubmit={onSubmit}
       aria-label="Define a permission"
     >
+      <ResourceFormIntro
+        title="Define permission"
+        headingLevel={3}
+        description="Use a stable namespaced slug, such as documents.read, and a clear display name."
+      />
       <div class="resource-field">
         <label for="permission-slug">Slug</label>
         <input
           id="permission-slug"
+          placeholder={"documents.read"}
           type="text"
           required
           value={slug}
@@ -261,6 +307,7 @@ function PermissionCreateForm({
         <label for="permission-display-name">Display name</label>
         <input
           id="permission-display-name"
+          placeholder={"Read documents"}
           type="text"
           required
           value={displayName}
@@ -313,12 +360,7 @@ function PermissionDetail({
       displayName === null ? {} : { display_name: displayName.trim() };
     void mutation
       .run(async () => {
-        await updatePermission(
-          tenantId,
-          environmentId,
-          permissionId,
-          request,
-        );
+        await updatePermission(tenantId, environmentId, permissionId, request);
       }, "Permission relabelled.")
       .then((ok) => {
         if (ok) {
@@ -341,11 +383,11 @@ function PermissionDetail({
   }
 
   return (
-    <div class="resource-detail-panel">
+    <div class="resource-detail-panel" id={`permission-detail-${permissionId}`}>
       <AsyncBoundary state={state} loadingLabel="Loading permission">
         {(permission) => (
           <div>
-            <h4>Permission {permission.slug}</h4>
+            <h3>Permission {permission.slug}</h3>
             <dl class="resource-detail">
               <dt>Identifier</dt>
               <dd>
@@ -358,9 +400,7 @@ function PermissionDetail({
               <dt>Kind</dt>
               <dd>{permission.kind}</dd>
               <dt>Created</dt>
-              <dd>
-                {new Date(permission.created_at_unix_ms).toISOString()}
-              </dd>
+              <dd>{new Date(permission.created_at_unix_ms).toISOString()}</dd>
             </dl>
             <form
               class="resource-form"
@@ -420,14 +460,22 @@ function ResourceServerClaimsPanel({ tenantId, environmentId }: EnvScope) {
 
   return (
     <div class="resource-subsection">
-      <h3>Permission claim per audience</h3>
-      <p class="resource-note">
-        Holding a permission and receiving it in a token are two different things.
-        An access token carries the permission claim only for a resource server
-        that has opted in, and only when that resource server issues a token format
-        able to carry one, so an opaque token cannot be opted in and the refusal
-        says so. Nothing else about a resource server is editable here.
+      <h2>Permission claim per audience</h2>
+      <p class="resource-hint">
+        Choose whether each resource server receives permission claims in its
+        access tokens.
       </p>
+      <details class="resource-help">
+        <summary>How permission claims work</summary>
+        <p class="resource-note">
+          Holding a permission and receiving it in a token are two different
+          things. An access token carries the permission claim only for a
+          resource server that has opted in, and only when that resource server
+          issues a token format able to carry one, so an opaque token cannot be
+          opted in and the refusal says so. Nothing else about a resource server
+          is editable here.
+        </p>
+      </details>
       <AsyncBoundary
         state={state}
         loadingLabel="Loading the resource servers"
@@ -462,7 +510,10 @@ function ResourceServerClaimsPanel({ tenantId, environmentId }: EnvScope) {
                 />
               ))}
             </ul>
-            <MorePageNote nextCursor={page.nextCursor} noun="resource servers" />
+            <MorePageNote
+              nextCursor={page.nextCursor}
+              noun="resource servers"
+            />
           </div>
         )}
       </AsyncBoundary>

@@ -73,7 +73,10 @@ function json(data: unknown, status = 200): Response {
 }
 
 function noContent(): Response {
-  return new Response(null, { status: 204, headers: { "content-length": "0" } });
+  return new Response(null, {
+    status: 204,
+    headers: { "content-length": "0" },
+  });
 }
 
 // Flush Preact's scheduled renders and the chained fetch/json microtasks.
@@ -81,13 +84,21 @@ async function flush(): Promise<void> {
   for (let i = 0; i < 6; i += 1) {
     await Promise.resolve();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
   }
 }
 
 function button(root: HTMLElement, label: string): HTMLButtonElement {
-  const found = Array.from(root.querySelectorAll("button")).find(
-    (element) => element.textContent === label,
+  const searchRoot = root.querySelector("dialog[open]") ?? root;
+  const found = Array.from(
+    searchRoot.querySelectorAll<HTMLButtonElement>("button"),
+  ).find(
+    (element) =>
+      element.textContent === label ||
+      (element.classList.contains("resource-create-trigger") &&
+        element.textContent?.trim() === `+ ${label}`),
   );
   if (found === undefined) {
     throw new Error(`no button labelled ${label}`);
@@ -147,6 +158,8 @@ describe("the tenants list", () => {
     await flush();
     expect(root.textContent).toContain("No tenants yet");
     expect(root.querySelector(".resource-list")).toBeNull();
+    expect(root.querySelector(".resource-form")).toBeNull();
+    expect(root.querySelector("dialog")).toBeNull();
   });
 });
 
@@ -160,13 +173,21 @@ describe("creating a tenant", () => {
     const root = mount(<TenantsList />);
     await flush();
 
-    const input = root.querySelector("#tenant-display-name") as HTMLInputElement;
+    expect(root.querySelector(".resource-form")).toBeNull();
+    button(root, "Create tenant").click();
+    await flush();
+
+    const input = root.querySelector(
+      "#tenant-display-name",
+    ) as HTMLInputElement;
     input.value = "Acme";
     input.dispatchEvent(new Event("input", { bubbles: true }));
     await flush();
 
     const form = root.querySelector(".resource-form") as HTMLFormElement;
-    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    form.dispatchEvent(
+      new Event("submit", { bubbles: true, cancelable: true }),
+    );
     await flush();
 
     const post = calls.find((call) => call.method === "POST");
@@ -176,6 +197,7 @@ describe("creating a tenant", () => {
     expect(body.display_name).toBe("Acme");
     expect(body.environment_kind).toBe("dev");
     expect(root.textContent).toContain("Tenant created.");
+    expect(root.querySelector("dialog")).toBeNull();
   });
 });
 

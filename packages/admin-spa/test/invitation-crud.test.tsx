@@ -78,7 +78,9 @@ async function flush(): Promise<void> {
   for (let i = 0; i < 6; i += 1) {
     await Promise.resolve();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
   }
 }
 
@@ -161,6 +163,15 @@ describe("the invitations list", () => {
 });
 
 describe("creating an invitation", () => {
+  async function openCreation(root: HTMLElement): Promise<void> {
+    const trigger = root.querySelector<HTMLButtonElement>(
+      'button[aria-haspopup="dialog"]',
+    );
+    expect(root.querySelector("#invitation-identifier")).toBeNull();
+    trigger?.click();
+    await flush();
+  }
+
   it("surfaces the copy-once token once and never puts it in a URL", async () => {
     const secret = "ira_inv_super_secret_value";
     const calls = stubFetch((call) =>
@@ -171,6 +182,7 @@ describe("creating an invitation", () => {
     const root = mount(<InvitationsList />);
     await flush();
 
+    await openCreation(root);
     const input = root.querySelector(
       "#invitation-identifier",
     ) as HTMLInputElement;
@@ -178,7 +190,9 @@ describe("creating an invitation", () => {
     input.dispatchEvent(new Event("input", { bubbles: true }));
     await flush();
 
-    button(root, "Create invitation").click();
+    root
+      .querySelector<HTMLButtonElement>('dialog button[type="submit"]')
+      ?.click();
     await flush();
 
     const post = calls.find((call) => call.method === "POST");
@@ -191,6 +205,13 @@ describe("creating an invitation", () => {
     // The raw token is surfaced exactly once as copy-once text ...
     expect(root.textContent).toContain(secret);
     expect(root.textContent).toContain("shown only once");
+    expect(root.querySelector("dialog")).toBeNull();
+    await openCreation(root);
+    button(root, "Cancel").click();
+    await flush();
+    expect(root.querySelector(".resource-token-value")?.textContent).toBe(
+      secret,
+    );
     // ... and never leaks into any request URL (memory-only, never in a URL).
     expect(calls.every((call) => !call.url.includes(secret))).toBe(true);
   });
@@ -205,13 +226,16 @@ describe("creating an invitation", () => {
     const root = mount(<InvitationsList />);
     await flush();
 
+    await openCreation(root);
     const input = root.querySelector(
       "#invitation-identifier",
     ) as HTMLInputElement;
     input.value = "ada@example.test";
     input.dispatchEvent(new Event("input", { bubbles: true }));
     await flush();
-    button(root, "Create invitation").click();
+    root
+      .querySelector<HTMLButtonElement>('dialog button[type="submit"]')
+      ?.click();
     await flush();
     expect(root.textContent).toContain(secret);
 

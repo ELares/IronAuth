@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "preact";
 import { type Command, filterCommands, wrapIndex } from "../src/ui/commands";
 import { CommandPalette } from "../src/ui/CommandPalette";
+import { ResourceCreateAction } from "../src/ui/ResourceView";
 
 let container: HTMLDivElement | null = null;
 
@@ -38,7 +39,12 @@ afterEach(() => {
 describe("filterCommands", () => {
   const commands: Command[] = [
     { id: "1", label: "Go to Tenants", run: () => undefined },
-    { id: "2", label: "Switch to tenant Acme", hint: "ten_acme", run: () => undefined },
+    {
+      id: "2",
+      label: "Switch to tenant Acme",
+      hint: "ten_acme",
+      run: () => undefined,
+    },
     { id: "3", label: "Go to Users", run: () => undefined },
   ];
 
@@ -47,8 +53,13 @@ describe("filterCommands", () => {
   });
 
   it("matches case-insensitively over label and hint", () => {
-    expect(filterCommands(commands, "TENANT").map((c) => c.id)).toEqual(["1", "2"]);
-    expect(filterCommands(commands, "ten_acme").map((c) => c.id)).toEqual(["2"]);
+    expect(filterCommands(commands, "TENANT").map((c) => c.id)).toEqual([
+      "1",
+      "2",
+    ]);
+    expect(filterCommands(commands, "ten_acme").map((c) => c.id)).toEqual([
+      "2",
+    ]);
     expect(filterCommands(commands, "users").map((c) => c.id)).toEqual(["3"]);
   });
 });
@@ -63,11 +74,59 @@ describe("wrapIndex", () => {
 });
 
 describe("command palette keyboard flow", () => {
-  function keydown(target: EventTarget, key: string, mods: KeyboardEventInit = {}) {
+  it("opens from the visible search control and restores focus after Escape", async () => {
+    const root = mount(<CommandPalette commands={[]} />);
+    await tick();
+    const trigger = root.querySelector(".console-search") as HTMLButtonElement;
+    trigger.click();
+    await tick();
+    const input = root.querySelector(".cmdk-input") as HTMLInputElement;
+    expect(document.activeElement).toBe(input);
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    );
+    await tick();
+    expect(root.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(root.querySelector(".console-search"));
+  });
+
+  function keydown(
+    target: EventTarget,
+    key: string,
+    mods: KeyboardEventInit = {},
+  ) {
     target.dispatchEvent(
       new KeyboardEvent("keydown", { key, bubbles: true, ...mods }),
     );
   }
+
+  it("keeps global search closed while a resource creation dialog is active", async () => {
+    const root = mount(
+      <>
+        <CommandPalette commands={[]} />
+        <ResourceCreateAction label="Create user">
+          {() => (
+            <form>
+              <input aria-label="Name" />
+            </form>
+          )}
+        </ResourceCreateAction>
+      </>,
+    );
+    await tick();
+    root.querySelector<HTMLButtonElement>(".resource-create-trigger")!.click();
+    await tick();
+    const input = root.querySelector("dialog input")!;
+    for (const modifiers of [{ ctrlKey: true }, { metaKey: true }]) {
+      keydown(input, "k", modifiers);
+      await tick();
+      expect(root.querySelector(".cmdk-input")).toBeNull();
+    }
+    keydown(input, "Escape");
+    await tick();
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(root.querySelector(".cmdk-input")).toBeNull();
+  });
 
   it("opens on Ctrl-K, moves with ArrowDown, runs on Enter, and closes", async () => {
     const alpha = vi.fn();
@@ -107,7 +166,9 @@ describe("command palette keyboard flow", () => {
 
   it("closes on Escape without running a command", async () => {
     const alpha = vi.fn();
-    const commands: Command[] = [{ id: "a", label: "Alpha action", run: alpha }];
+    const commands: Command[] = [
+      { id: "a", label: "Alpha action", run: alpha },
+    ];
     const root = mount(<CommandPalette commands={commands} />);
     await tick();
 
@@ -120,5 +181,31 @@ describe("command palette keyboard flow", () => {
     await tick();
     expect(root.querySelector('[role="dialog"]')).toBeNull();
     expect(alpha).not.toHaveBeenCalled();
+  });
+
+  it("scrolls the wrapped keyboard selection into view while keeping combobox focus", async () => {
+    const commands: Command[] = Array.from({ length: 20 }, (_, index) => ({
+      id: String(index),
+      label: `Command ${index}`,
+      run: () => undefined,
+    }));
+    const root = mount(<CommandPalette commands={commands} />);
+    await tick();
+    root.querySelector<HTMLButtonElement>(".console-search")!.click();
+    await tick();
+    const input = root.querySelector<HTMLInputElement>(".cmdk-input")!;
+    const last = root.querySelector<HTMLLIElement>(".cmdk-item:last-child")!;
+    const scrollIntoView = vi.fn();
+    last.scrollIntoView = scrollIntoView;
+
+    keydown(input, "ArrowUp");
+    await tick();
+
+    expect(last.getAttribute("aria-selected")).toBe("true");
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      block: "nearest",
+      inline: "nearest",
+    });
+    expect(document.activeElement).toBe(input);
   });
 });

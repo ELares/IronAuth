@@ -34,7 +34,7 @@
 // boundary, including the RFC 9470 sudo path on a max_age challenge and the 422
 // that refuses a permission which is not a live entry of THIS environment.
 
-import { useState } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
 import {
   type AssignOrgRolePermissionRequest,
   type KeysetPage,
@@ -48,6 +48,8 @@ import {
   ConfirmButton,
   MorePageNote,
   MutationFeedback,
+  ResourceCreateAction,
+  ResourceFormIntro,
 } from "./ResourceView";
 import { type OrgScope, inputValue, sudoFor } from "./orgPanels";
 import { useAsyncResource, useMutation } from "./useResource";
@@ -60,97 +62,116 @@ export function OrgRolePermissionsPanel({
 }: OrgScope & { roleId: string }) {
   const { state, reload } = useAsyncResource<KeysetPage<OrgRolePermissionView>>(
     () =>
-      fetchOrgRolePermissions(
-        tenantId,
-        environmentId,
-        organizationId,
-        roleId,
-      ),
+      fetchOrgRolePermissions(tenantId, environmentId, organizationId, roleId),
     [tenantId, environmentId, organizationId, roleId],
   );
   const mutation = useMutation();
   const [permissionId, setPermissionId] = useState("");
+  useEffect(
+    () => setPermissionId(""),
+    [tenantId, environmentId, organizationId, roleId],
+  );
 
-  function onAttach(event: Event): void {
+  function onAttach(event: Event, close: () => void): void {
     event.preventDefault();
     const request: AssignOrgRolePermissionRequest = {
       permission_id: permissionId.trim(),
     };
-    void mutation
-      .run(async () => {
-        await assignOrgRolePermission(
-          tenantId,
-          environmentId,
-          organizationId,
-          roleId,
-          request,
-        );
-      }, "Permission attached to the role.")
-      .then((ok) => {
-        if (ok) {
-          setPermissionId("");
-          reload();
-        }
-      });
+    void mutation.run(async () => {
+      await assignOrgRolePermission(
+        tenantId,
+        environmentId,
+        organizationId,
+        roleId,
+        request,
+      );
+      setPermissionId("");
+      close();
+      reload();
+    }, "Permission attached to the role.");
   }
 
   return (
     <div class="resource-subsection">
-      <h4>Permissions this role grants</h4>
-      <p class="resource-note">
-        Every member who resolves this role holds these permissions. Holding a
-        permission and receiving it in a token are two different things: an access
-        token carries the permission claim only for a resource server that has
-        opted in, and only when that resource server issues a token format able to
-        carry one, which the permissions section is where to read and set. The
-        permission itself is defined once for the whole environment there; this list
-        is only which of those entries this one role carries.
-      </p>
-      <form
-        class="resource-form"
-        onSubmit={onAttach}
-        aria-label="Attach a permission to the role"
-      >
-        <div class="resource-field">
-          <label for="org-role-permission-id">Permission id</label>
-          <input
-            id="org-role-permission-id"
-            type="text"
-            required
-            value={permissionId}
-            onInput={(event) => setPermissionId(inputValue(event))}
-          />
-        </div>
-        <button
-          type="submit"
-          class="resource-btn resource-btn-primary"
-          disabled={mutation.state.pending || permissionId.trim() === ""}
+      <div class="resource-subsection-heading">
+        <h4>Permissions this role grants</h4>
+        <ResourceCreateAction
+          key={`${tenantId}:${environmentId}:${organizationId}:${roleId}`}
+          label="Attach permission"
+          pending={mutation.state.pending}
+          onOpen={() => {
+            setPermissionId("");
+            mutation.reset();
+          }}
         >
-          Attach permission
-        </button>
-        <MutationFeedback
-          state={mutation.state}
-          sudo={sudoFor(mutation.retry)}
-        />
-      </form>
+          {(close) => (
+            <form
+              class="resource-form"
+              onSubmit={(event) => onAttach(event, close)}
+              aria-label="Attach a permission to the role"
+            >
+              <ResourceFormIntro
+                title="Attach permission"
+                headingLevel={3}
+                description="Attach a permission defined in this environment to this role."
+              />
+              <div class="resource-field">
+                <label for="org-role-permission-id">Permission id</label>
+                <input
+                  id="org-role-permission-id"
+                  placeholder={"Permission ID from Permissions"}
+                  type="text"
+                  required
+                  value={permissionId}
+                  onInput={(event) => setPermissionId(inputValue(event))}
+                />
+              </div>
+              <button
+                type="submit"
+                class="resource-btn resource-btn-primary"
+                disabled={mutation.state.pending || permissionId.trim() === ""}
+              >
+                Attach permission
+              </button>
+              <MutationFeedback
+                state={mutation.state}
+                sudo={sudoFor(mutation.retry)}
+              />
+            </form>
+          )}
+        </ResourceCreateAction>
+      </div>
+      <MutationFeedback state={mutation.state} sudo={sudoFor(mutation.retry)} />
+      <p class="resource-hint">
+        Attach permissions from the vocabulary defined for this environment.
+      </p>
+      <details class="resource-help">
+        <summary>About role permissions</summary>
+        <p class="resource-note">
+          Every member who resolves this role holds these permissions. Holding a
+          permission and receiving it in a token are two different things: an
+          access token carries the permission claim only for a resource server
+          that has opted in, and only when that resource server issues a token
+          format able to carry one, which the permissions section is where to
+          read and set. The permission itself is defined once for the whole
+          environment there; this list is only which of those entries this one
+          role carries.
+        </p>
+      </details>
+
       <AsyncBoundary
         state={state}
         loadingLabel="Loading the permissions of the role"
         empty={{
           when: (page) => page.items.length === 0,
           render: () => (
-            <p class="resource-empty">
-              This role carries no permissions. Attach the first one above.
-            </p>
+            <p class="resource-empty">This role carries no permissions.</p>
           ),
         }}
       >
         {(page) => (
           <div>
-            <ul
-              class="resource-list"
-              aria-label="Permissions the role grants"
-            >
+            <ul class="resource-list" aria-label="Permissions the role grants">
               {page.items.map((mapping, index) => (
                 // Keyed by POSITION, which is the convention issue #97 shipped for
                 // every list in this console. It is a CONVENTION and not a defense:

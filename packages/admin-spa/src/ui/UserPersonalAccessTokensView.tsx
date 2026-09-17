@@ -18,16 +18,17 @@
 //
 // # Two differences from the organization panel, both forced by where this is mounted
 //
-// It takes the detail view's SHARED `mutation` rather than owning one, because that
-// view renders a single MutationFeedback for every panel under it and a second one
-// would report the same outcome twice.
+// It takes the detail view's SHARED `mutation` rather than owning one. The parent
+// renders panel outcomes; the create dialog shows only its own submitted-request
+// feedback while its background is inert.
 //
 // It owns its OWN list resource and never calls the parent's reload. The parent's
 // AsyncBoundary unmounts everything under it while reloading, which would destroy the
 // display-once token this panel is holding. Reloading only its own list is what lets
 // the newly minted token stay on screen beside the row that now exists.
 
-import { useState } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
+import { CredentialCreateForm } from "./CredentialCreateForm";
 import {
   type ApiKeyView,
   createUserPersonalAccessToken,
@@ -36,8 +37,12 @@ import {
   rotateUserPersonalAccessToken,
 } from "../api/client";
 import { describe } from "./OrgApiKeysView";
-import { AsyncBoundary, ConfirmButton } from "./ResourceView";
-import { inputValue } from "./orgPanels";
+import {
+  AsyncBoundary,
+  ConfirmButton,
+  ResourceCreateAction,
+  SecretCopyButton,
+} from "./ResourceView";
 import { type Mutation, useAsyncResource } from "./useResource";
 
 export function UserPersonalAccessTokensPanel({
@@ -63,8 +68,12 @@ export function UserPersonalAccessTokensPanel({
   // every reload, so a token held there would either vanish inconsistently or, worse,
   // survive in the DOM long after the operator stopped looking. The server cannot
   // return it again, so the panel must not behave as though it could.
-  const [issued, setIssued] = useState<{ id: string; key: string } | null>(null);
-  const [name, setName] = useState("");
+  const [issued, setIssued] = useState<{ id: string; key: string } | null>(
+    null,
+  );
+  useEffect(() => {
+    setIssued(null);
+  }, [tenantId, environmentId, userId]);
   const reloadClearingToken = () => {
     setIssued(null);
     reload();
@@ -72,64 +81,54 @@ export function UserPersonalAccessTokensPanel({
 
   return (
     <div class="resource-subsection">
-      <h3>Personal access tokens</h3>
-      <p class="resource-note">
-        The tokens that authenticate as this user. The token itself is shown once, when
-        it is created, and is never recoverable afterwards: this list carries only the
-        handle. Revoked tokens stay listed so a rotation is legible.
-      </p>
-      <form
-        class="resource-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          const trimmed = name.trim();
-          if (trimmed === "") {
-            return;
-          }
-          void mutation
-            .run(async () => {
-              const created = await createUserPersonalAccessToken(
-                tenantId,
-                environmentId,
-                userId,
-                trimmed,
-              );
-              // `key` is absent on an idempotent replay. Showing nothing is correct
-              // there: the token was issued once and this is not that once.
-              setIssued(
-                created.key === undefined || created.key === null
-                  ? null
-                  : { id: created.id, key: created.key },
-              );
-            }, "Token created.")
-            .then((ok: boolean) => {
-              if (ok) {
-                setName("");
+      <div class="resource-subsection-heading">
+        <h2 id="user-tokens">Personal access tokens</h2>
+        <ResourceCreateAction
+          key={`${tenantId}:${environmentId}:${userId}`}
+          label="Create token"
+          pending={mutation.state.pending}
+        >
+          {(close) => (
+            <CredentialCreateForm
+              title="Create personal access token"
+              nameLabel="New token name"
+              submitLabel="Create token"
+              successMessage="Token created."
+              mutation={mutation}
+              onCreate={async (name) => {
+                const created = await createUserPersonalAccessToken(
+                  tenantId,
+                  environmentId,
+                  userId,
+                  name,
+                );
+                // Idempotent replays never expose the credential again.
+                setIssued(
+                  created.key === undefined || created.key === null
+                    ? null
+                    : { id: created.id, key: created.key },
+                );
                 reload();
-              }
-            });
-        }}
-      >
-        <label>
-          New token name
-          <input
-            type="text"
-            value={name}
-            disabled={mutation.state.pending}
-            onInput={(event) => setName(inputValue(event))}
-          />
-        </label>
-        <button type="submit" disabled={mutation.state.pending}>
-          Create token
-        </button>
-      </form>
+              }}
+              onCreated={close}
+            />
+          )}
+        </ResourceCreateAction>
+      </div>
+      <p class="resource-note">
+        Tokens authenticate as this user. Save each token when it is created; it
+        cannot be retrieved later. Revoked tokens stay visible for reference.
+      </p>
+
       {issued === null ? null : (
         <div class="resource-callout">
+          <h3>Save your new token</h3>
           <p>
-            Copy this token now. It is shown once and cannot be recovered, including by
-            reloading this page.
+            Copy this token now. It is shown once and cannot be recovered,
+            including by reloading this page.
           </p>
           <code class="resource-secret">{issued.key}</code>
+          <SecretCopyButton value={issued.key} label="Copy token" />
         </div>
       )}
       <AsyncBoundary
@@ -138,7 +137,9 @@ export function UserPersonalAccessTokensPanel({
         empty={{
           when: (tokens) => tokens.length === 0,
           render: () => (
-            <p class="resource-empty">This user has no personal access tokens.</p>
+            <p class="resource-empty">
+              This user has no personal access tokens.
+            </p>
           ),
         }}
       >
@@ -157,7 +158,7 @@ export function UserPersonalAccessTokensPanel({
                   <>
                     <ConfirmButton
                       label="Rotate"
-                      prompt="Rotate this token? The current token stops authenticating immediately and a replacement is issued in the same transaction, inheriting this token's name and expiry. The new token is shown ONCE and cannot be recovered."
+                      prompt="Rotate this token? The current token stops working immediately. Save the replacement now; it keeps the same name and expiry and is shown only once."
                       confirmLabel="Confirm rotate"
                       disabled={mutation.state.pending}
                       onConfirm={() =>
@@ -187,7 +188,7 @@ export function UserPersonalAccessTokensPanel({
                     />
                     <ConfirmButton
                       label="Revoke"
-                      prompt="Revoke this token? Anything using it stops authenticating on its very next request, and the token cannot be recovered or un-revoked. The row stays listed so the revocation is legible."
+                      prompt="Revoke this token? It stops authenticating on the next request. This cannot be undone."
                       confirmLabel="Confirm revoke"
                       danger
                       disabled={mutation.state.pending}

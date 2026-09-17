@@ -38,6 +38,8 @@
 //! the same discipline as `pages.rs`). Issue #85 ships the seam with a neutral default; issue
 //! #86 fills safe branding and localization.
 
+use std::fmt::Write as _;
+
 use super::localize::{ResolvedLocale, localize};
 use super::message::{self, Message, MessageContext};
 use super::model::{
@@ -155,8 +157,8 @@ pub(crate) fn render_flow_page(
         .map(|slug| format!("{scope_path}/brand/{}/favicon", percent_encode_query(slug)));
 
     let mut inner = String::new();
-    inner.push_str(&brand_header(theme, logo_href.as_deref()));
     inner.push_str("<main class=\"page\">");
+    inner.push_str(&brand_header(theme, logo_href.as_deref()));
     inner.push_str("<h1>");
     inner.push_str(&pages::escape_html(&title));
     inner.push_str("</h1>");
@@ -175,13 +177,13 @@ pub(crate) fn render_flow_page(
     inner.push_str("<form method=\"post\" action=\"");
     inner.push_str(&pages::escape_html(&flow.ui.action));
     inner.push_str("\">");
-    for node in &flow.ui.nodes {
+    for (index, node) in flow.ui.nodes.iter().enumerate() {
         // When the ceremony renders the passkey group, skip its raw nodes here; they are the
         // ceremony (below), driven by the nonce guarded script, not plain form inputs.
         if ceremony.is_some() && node.group == NodeGroup::Passkey {
             continue;
         }
-        render_node(&mut inner, node, locale);
+        render_node(&mut inner, node, locale, index);
     }
     inner.push_str("</form>");
 
@@ -333,7 +335,7 @@ fn flow_title(flow: &Flow) -> message::MessageId {
 /// Render one node into the page body (issue #85, the generic node renderer). Dispatches on
 /// the typed [`NodeAttributes`], so a node of ANY group (including a group unknown to this
 /// code) renders via the same input or text path. Every interpolated value is escaped.
-fn render_node(body: &mut String, node: &Node, locale: &ResolvedLocale) {
+fn render_node(body: &mut String, node: &Node, locale: &ResolvedLocale, index: usize) {
     match &node.attributes {
         NodeAttributes::Input {
             name,
@@ -361,7 +363,11 @@ fn render_node(body: &mut String, node: &Node, locale: &ResolvedLocale) {
             // ADJACENT (no attribute between `name` and `value`) so the hidden flow field
             // renders as `name="flow" value="..."`, the shape the cross transport equivalence
             // suites read the flow id back from.
-            body.push_str("<input type=\"");
+            body.push_str(if *input_type == InputType::Submit {
+                "<button type=\""
+            } else {
+                "<input type=\""
+            });
             body.push_str(input_type_attr(*input_type));
             body.push_str("\" name=\"");
             body.push_str(&pages::escape_html(name));
@@ -389,12 +395,29 @@ fn render_node(body: &mut String, node: &Node, locale: &ResolvedLocale) {
             if let Some(constraints) = constraints {
                 render_constraint_attrs(body, constraints);
             }
+            render_message_attributes(body, node, *input_type, index);
             body.push('>');
+            if *input_type == InputType::Submit {
+                let caption = node.label.as_ref().map_or_else(
+                    || value.clone().unwrap_or_default(),
+                    |label| localize(label.id, &label.context, locale),
+                );
+                body.push_str(&pages::escape_html(&caption));
+                body.push_str("</button>");
+            }
             if labelled {
                 body.push_str("</label>");
             }
-            for message in &node.messages {
-                body.push_str("<span class=\"error\">");
+            for (message_index, message) in node.messages.iter().enumerate() {
+                let class = if message.kind == message::MessageKind::Error {
+                    "error"
+                } else {
+                    "field-help"
+                };
+                let _ = write!(
+                    body,
+                    "<span class=\"{class}\" id=\"field-{index}-message-{message_index}\">"
+                );
                 body.push_str(&pages::escape_html(&localize(
                     message.id,
                     &message.context,
@@ -412,6 +435,29 @@ fn render_node(body: &mut String, node: &Node, locale: &ResolvedLocale) {
             )));
             body.push_str("</p>");
         }
+    }
+}
+
+/// Connect inline field messages to the control without changing its submission
+/// attributes. Informational help is described but does not mark the field invalid.
+fn render_message_attributes(body: &mut String, node: &Node, input_type: InputType, index: usize) {
+    if node.messages.is_empty() || input_type == InputType::Hidden {
+        return;
+    }
+    body.push_str(" aria-describedby=\"");
+    for (message_index, _) in node.messages.iter().enumerate() {
+        if message_index > 0 {
+            body.push(' ');
+        }
+        let _ = write!(body, "field-{index}-message-{message_index}");
+    }
+    body.push('"');
+    if node
+        .messages
+        .iter()
+        .any(|message| message.kind == message::MessageKind::Error)
+    {
+        body.push_str(" aria-invalid=\"true\"");
     }
 }
 
@@ -539,6 +585,63 @@ mod tests {
             SCOPE_PATH,
             None,
         )
+    }
+
+    #[test]
+    fn field_errors_are_linked_to_inputs_for_assistive_technology() {
+        let mut node = input(NodeGroup::Default, 0, "identifier", InputType::Text, None);
+        node.label = Some(Message::of(message::LOGIN_IDENTIFIER_LABEL));
+        node.messages.push(error_message("Invalid identifier"));
+        node.messages.push(error_message("Try again"));
+        let flow = flow_with(
+            FlowStateTag::IdentifierPassword,
+            Journey::Login,
+            vec![node],
+            Vec::new(),
+        );
+        let page = render_default(&flow);
+        assert!(page.body.contains("aria-invalid=\"true\""));
+        assert!(
+            page.body
+                .contains("aria-describedby=\"field-0-message-0 field-0-message-1\"")
+        );
+        assert!(page.body.contains("id=\"field-0-message-0\""));
+        assert!(page.body.contains("id=\"field-0-message-1\""));
+        assert_eq!(page.body.matches("<main").count(), 1);
+    }
+
+    #[test]
+    fn submit_buttons_show_localized_labels_and_keep_protocol_values() {
+        let mut sign_in = input(
+            NodeGroup::Submit,
+            0,
+            "method",
+            InputType::Submit,
+            Some("password"),
+        );
+        sign_in.label = Some(Message::of(message::LOGIN_SUBMIT_LABEL));
+        let mut deny = input(
+            NodeGroup::Submit,
+            1,
+            "decision",
+            InputType::Submit,
+            Some("deny"),
+        );
+        deny.label = Some(Message::of(message::CONSENT_DENY_LABEL));
+        let flow = flow_with(
+            FlowStateTag::IdentifierPassword,
+            Journey::Login,
+            vec![sign_in, deny],
+            Vec::new(),
+        );
+        let page = render_default(&flow);
+        assert!(page.body.contains(
+            "<button type=\"submit\" name=\"method\" value=\"password\">Sign in</button>"
+        ));
+        assert!(
+            page.body
+                .contains("<button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button>")
+        );
     }
 
     #[test]

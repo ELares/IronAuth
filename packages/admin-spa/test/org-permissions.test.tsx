@@ -121,21 +121,39 @@ function json(data: unknown, status = 200): Response {
 }
 
 function noContent(): Response {
-  return new Response(null, { status: 204, headers: { "content-length": "0" } });
+  return new Response(null, {
+    status: 204,
+    headers: { "content-length": "0" },
+  });
 }
 
 async function flush(): Promise<void> {
   for (let i = 0; i < 6; i += 1) {
     await Promise.resolve();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
   }
 }
 
+async function openAction(root: HTMLElement, label: string): Promise<void> {
+  const trigger = Array.from(
+    root.querySelectorAll<HTMLButtonElement>('[aria-haspopup="dialog"]'),
+  ).find((element) => element.textContent?.trim().endsWith(label));
+  if (trigger === undefined) throw new Error(`no action labelled ${label}`);
+  trigger.click();
+  await flush();
+}
+
 function button(root: HTMLElement, label: string): HTMLButtonElement {
-  const found = Array.from(root.querySelectorAll("button")).find(
-    (element) => element.textContent === label,
-  );
+  const found =
+    Array.from(root.querySelectorAll("dialog button")).find(
+      (element) => element.textContent === label,
+    ) ??
+    Array.from(root.querySelectorAll("button")).find(
+      (element) => element.textContent === label,
+    );
   if (found === undefined) {
     throw new Error(`no button labelled ${label}`);
   }
@@ -247,9 +265,7 @@ function effective(
     roles,
     permissions,
     permission_budget:
-      budget === undefined
-        ? { ...BUDGET, permission_count: count }
-        : budget,
+      budget === undefined ? { ...BUDGET, permission_count: count } : budget,
   };
 }
 
@@ -313,8 +329,10 @@ describe("the permissions one role grants", () => {
     expect(rows[0].textContent).toContain("rpm_a");
 
     const listsBefore = calls.filter(
-      (call) => call.url === `${ORG}/roles/rol_a/permissions` && call.method === "GET",
+      (call) =>
+        call.url === `${ORG}/roles/rol_a/permissions` && call.method === "GET",
     ).length;
+    await openAction(root, "Attach permission");
     type(root, "#org-role-permission-id", "prm_b");
     await flush();
     button(root, "Attach permission").click();
@@ -329,15 +347,16 @@ describe("the permissions one role grants", () => {
     // The list is RE-READ rather than repainted from the request, so what is shown
     // is the stored mapping set and not what this app hoped it would be.
     const listsAfter = calls.filter(
-      (call) => call.url === `${ORG}/roles/rol_a/permissions` && call.method === "GET",
+      (call) =>
+        call.url === `${ORG}/roles/rol_a/permissions` && call.method === "GET",
     ).length;
     expect(listsAfter).toBeGreaterThan(listsBefore);
-    // And the field is CLEARED, so a second submit cannot silently re-attach the id
-    // that is still sitting in it.
-    const field = root.querySelector(
-      "#org-role-permission-id",
-    ) as HTMLInputElement;
-    expect(field.value).toBe("");
+    // A successful attachment closes and discards the draft.
+    expect(root.querySelector("dialog")).toBeNull();
+    await openAction(root, "Attach permission");
+    expect(
+      (root.querySelector("#org-role-permission-id") as HTMLInputElement).value,
+    ).toBe("");
   });
 
   it("detaches by the (role, permission) PAIR, never by the mapping row id", async () => {
@@ -361,7 +380,8 @@ describe("the permissions one role grants", () => {
     );
 
     const listsBefore = calls.filter(
-      (call) => call.url === `${ORG}/roles/rol_a/permissions` && call.method === "GET",
+      (call) =>
+        call.url === `${ORG}/roles/rol_a/permissions` && call.method === "GET",
     ).length;
     button(root, "Confirm detach from role").click();
     await flush();
@@ -371,7 +391,8 @@ describe("the permissions one role grants", () => {
     expect(del?.url).not.toContain("rpm_a");
     // And the list is re-read, so the detached row leaves the panel.
     const listsAfter = calls.filter(
-      (call) => call.url === `${ORG}/roles/rol_a/permissions` && call.method === "GET",
+      (call) =>
+        call.url === `${ORG}/roles/rol_a/permissions` && call.method === "GET",
     ).length;
     expect(listsAfter).toBeGreaterThan(listsBefore);
   });
@@ -383,9 +404,7 @@ describe("the permissions one role grants", () => {
     // rows by permission_id would leave this green. The property is worth pinning
     // regardless, because a caller that "tidied" the list by unique permission would
     // hide a mapping the detach control addresses.
-    stubFetch(() =>
-      json({ items: [mapping, { ...mapping, id: "rpm_b" }] }),
-    );
+    stubFetch(() => json({ items: [mapping, { ...mapping, id: "rpm_b" }] }));
     const root = mount(<OrgRolePermissionsPanel {...SCOPE} roleId="rol_a" />);
     await flush();
     const rows = rowsOf(root, "Permissions the role grants");
@@ -423,6 +442,7 @@ describe("the permissions one role grants", () => {
     );
     const root = mount(<OrgRolePermissionsPanel {...SCOPE} roleId="rol_a" />);
     await flush();
+    await openAction(root, "Attach permission");
     type(root, "#org-role-permission-id", "prm_elsewhere");
     await flush();
     button(root, "Attach permission").click();
@@ -676,9 +696,9 @@ describe("the default role of one organization", () => {
     // than off the whole panel, so "yes" and "no" cannot be satisfied by some other
     // word on the page.
     function defaultRoleValue(root: HTMLElement): string {
-      const term = Array.from(root.querySelectorAll(".resource-detail dt")).find(
-        (element) => element.textContent === "Default role",
-      );
+      const term = Array.from(
+        root.querySelectorAll(".resource-detail dt"),
+      ).find((element) => element.textContent === "Default role");
       if (term === undefined) {
         throw new Error("the role detail names no Default role row");
       }
@@ -699,14 +719,17 @@ describe("the default role of one organization", () => {
   it("reads the tri-state from one page, and never guesses across the cursor", () => {
     const held = makeRole("rol_a", "billing.admin", true);
     const plain = makeRole("rol_b", "support.agent", false);
-    expect(readDefaultRole({ items: [plain, held], nextCursor: null })).toEqual({
+    expect(readDefaultRole({ items: [plain, held], nextCursor: null })).toEqual(
+      {
+        kind: "held",
+        role: held,
+      },
+    );
+    // A cursor does not turn a FOUND designation into an unknown one.
+    expect(readDefaultRole({ items: [held], nextCursor: "opaque" })).toEqual({
       kind: "held",
       role: held,
     });
-    // A cursor does not turn a FOUND designation into an unknown one.
-    expect(
-      readDefaultRole({ items: [held], nextCursor: "opaque" }),
-    ).toEqual({ kind: "held", role: held });
     expect(readDefaultRole({ items: [plain], nextCursor: null })).toEqual({
       kind: "none",
     });
@@ -717,9 +740,10 @@ describe("the default role of one organization", () => {
 });
 
 describe("the ENVIRONMENT scoped permission vocabulary", () => {
-  function open(
-    respond: (call: Call) => Response | null,
-  ): { root: HTMLDivElement; calls: Call[] } {
+  function open(respond: (call: Call) => Response | null): {
+    root: HTMLDivElement;
+    calls: Call[];
+  } {
     const calls = stubFetch((call) => {
       const custom = respond(call);
       if (custom !== null) {
@@ -776,8 +800,9 @@ describe("the ENVIRONMENT scoped permission vocabulary", () => {
     );
     await flush();
     expect(root.textContent).toContain(
-      "No permissions yet. Define the first one above.",
+      "No permissions are defined in this environment.",
     );
+    expect(root.querySelector("#permission-slug")).toBeNull();
     expect(rowsOf(root, "Permissions of the environment")).toEqual([]);
   });
 
@@ -785,6 +810,11 @@ describe("the ENVIRONMENT scoped permission vocabulary", () => {
     const { root, calls } = open((call) =>
       call.method === "POST" ? json(permission, 201) : null,
     );
+    await flush();
+    expect(root.querySelector("#permission-slug")).toBeNull();
+    root
+      .querySelector<HTMLButtonElement>('button[aria-haspopup="dialog"]')
+      ?.click();
     await flush();
     // A slug the server would refuse is sent with its case and its inner
     // punctuation UNREPAIRED, so the refusal names the rule instead of the console
@@ -795,7 +825,9 @@ describe("the ENVIRONMENT scoped permission vocabulary", () => {
     type(root, "#permission-slug", "  Billing.Invoice.Read  ");
     type(root, "#permission-display-name", "Read invoices");
     await flush();
-    button(root, "Define permission").click();
+    root
+      .querySelector<HTMLButtonElement>('dialog button[type="submit"]')
+      ?.click();
     await flush();
 
     const post = calls.find((call) => call.method === "POST");
@@ -805,6 +837,8 @@ describe("the ENVIRONMENT scoped permission vocabulary", () => {
       display_name: "Read invoices",
     });
     expect(post?.idempotencyKey).toMatch(/^[0-9a-f]{32}$/);
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(root.textContent).toContain("Permission defined.");
     // The note must describe the behavior just measured, both halves of it.
     expect(root.textContent).toContain(
       "Case and inner punctuation are never touched here",
@@ -829,7 +863,9 @@ describe("the ENVIRONMENT scoped permission vocabulary", () => {
     button(root, "Read invoices").click();
     await flush();
 
-    const detail = calls.find((call) => call.url.endsWith("/permissions/prm_a"));
+    const detail = calls.find((call) =>
+      call.url.endsWith("/permissions/prm_a"),
+    );
     expect(detail?.url).toBe(`${ENV}/permissions/prm_a`);
 
     type(root, "#permission-relabel", "Read all invoices");
@@ -924,9 +960,10 @@ describe("the ENVIRONMENT scoped permission vocabulary", () => {
 });
 
 describe("the permission claim opt-in per audience", () => {
-  function open(
-    respond: (call: Call) => Response | null,
-  ): { root: HTMLDivElement; calls: Call[] } {
+  function open(respond: (call: Call) => Response | null): {
+    root: HTMLDivElement;
+    calls: Call[];
+  } {
     const calls = stubFetch((call) => {
       const custom = respond(call);
       if (custom !== null) {
@@ -944,9 +981,9 @@ describe("the permission claim opt-in per audience", () => {
   it("lists EVERY resource server by audience, id, token format, and current opt-in", async () => {
     const { root, calls } = open(() => null);
     await flush();
-    expect(
-      calls.some((call) => call.url === `${ENV}/resource-servers`),
-    ).toBe(true);
+    expect(calls.some((call) => call.url === `${ENV}/resource-servers`)).toBe(
+      true,
+    );
     const rows = rowsOf(root, "Resource servers of the environment");
     // One row per registered audience, in the order the server returned them. A
     // truncated list would hide an audience that IS receiving the claim, which is
@@ -1037,7 +1074,8 @@ describe("the permission claim opt-in per audience", () => {
   it("renders the opaque-token refusal verbatim rather than guessing it locally", async () => {
     // Whether a token format can carry a claim is the servers answer, given as a
     // typed 422. The console does not pre-judge it, so the operator reads the rule.
-    const hostile = '<img src=x onerror="steal()"> opaque tokens carry no claims';
+    const hostile =
+      '<img src=x onerror="steal()"> opaque tokens carry no claims';
     const { root } = open((call) => {
       if (call.method === "PATCH") {
         return json({ error: "unprocessable_entity", message: hostile }, 422);
@@ -1086,7 +1124,9 @@ describe("the permission union and the budget verdict on a member", () => {
     expect(root.textContent).toContain("2 of at most 64");
     // The byte bounds are CONTEXT, and the panel says the verdict is the element
     // count only, so "within budget" is never read as covering the token size.
-    expect(root.textContent).toContain("the byte verdict belongs to the token mint");
+    expect(root.textContent).toContain(
+      "the byte verdict belongs to the token mint",
+    );
   });
 
   it("does not hide a permission set behind an empty role list", async () => {
@@ -1094,7 +1134,9 @@ describe("the permission union and the budget verdict on a member", () => {
     // the branch it replaces, so a set that is somehow non empty is still shown.
     const root = openMember(effective([], ["billing.invoice.read"]));
     await flush();
-    expect(root.textContent).toContain("resolves no roles in this organization");
+    expect(root.textContent).toContain(
+      "resolves no roles in this organization",
+    );
     expect(rowsOf(root, "Effective permissions").length).toBe(1);
   });
 
@@ -1118,7 +1160,9 @@ describe("the permission union and the budget verdict on a member", () => {
     await flush();
     const rows = rowsOf(root, "Effective role grant paths");
     expect(rows.length).toBe(1);
-    expect(rows[0].textContent).toContain("the default role of the organization");
+    expect(rows[0].textContent).toContain(
+      "the default role of the organization",
+    );
     expect(rows[0].textContent).not.toContain("granted directly");
   });
 
@@ -1223,9 +1267,7 @@ describe("the permission union and the budget verdict on a member", () => {
       }),
     );
     await flush();
-    expect(root.textContent).toContain(
-      "does not describe the set shown",
-    );
+    expect(root.textContent).toContain("does not describe the set shown");
   });
 
   it("shows no budget note about withholding when the set is within budget", async () => {
@@ -1392,10 +1434,9 @@ describe("the WIDENED malformed-2xx guard on the effective-roles read", () => {
       delete partial[key];
       const root = openMember(effective([], [], partial));
       await flush();
-      expect(
-        root.textContent,
-        `omitting ${key} must be refused`,
-      ).toContain("did not carry a readable permission budget");
+      expect(root.textContent, `omitting ${key} must be refused`).toContain(
+        "did not carry a readable permission budget",
+      );
       expectLoudFailure(root);
       unmountCurrent();
     }
@@ -1432,7 +1473,11 @@ describe("the WIDENED malformed-2xx guard on the effective-roles read", () => {
     // A distinct shape from both "absent" and "not an object": `typeof null` is
     // "object", so a check written as a bare typeof test would fall through it and
     // then read a field off null. It must reach the same worded refusal as the rest.
-    const root = openMember({ roles: [], permissions: [], permission_budget: null });
+    const root = openMember({
+      roles: [],
+      permissions: [],
+      permission_budget: null,
+    });
     await flush();
     expect(root.textContent).toContain(
       "did not carry a readable permission budget",

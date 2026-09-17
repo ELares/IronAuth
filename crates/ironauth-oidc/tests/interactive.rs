@@ -108,7 +108,9 @@ async fn non_prod_hosted_pages_carry_noindex_and_a_banner_prod_pages_do_not() {
         "a prod hosted page is indexable: {body}"
     );
     assert!(
-        !body.contains("data-environment-banner"),
+        // The shared embedded CSS contains the banner selector on every page. Only an
+        // actual banner attribute denotes a rendered environment warning.
+        !body.contains("data-environment-banner="),
         "a prod hosted page shows no environment banner: {body}"
     );
 }

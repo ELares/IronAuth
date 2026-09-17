@@ -9,6 +9,7 @@
 // created, read, listed, deleted, and moved through its lifecycle.
 
 import { useLocation } from "preact-iso";
+import { consoleHref } from "./routing";
 import { useState } from "preact/hooks";
 import {
   type CreateTenantRequest,
@@ -23,7 +24,16 @@ import {
 } from "../api/client";
 import { activeScope, reloadTenants } from "../scope/store";
 import type { SudoRecovery } from "./ErrorView";
-import { AsyncBoundary, ConfirmButton, MutationFeedback } from "./ResourceView";
+import {
+  AsyncBoundary,
+  ConfirmButton,
+  MutationFeedback,
+  ResourceHeading,
+  ResourceCreateAction,
+  ResourceFormIntro,
+  ResourceCollection,
+  resourceLabel,
+} from "./ResourceView";
 import { useAsyncResource, useMutation } from "./useResource";
 
 // The environment kinds the create form offers, matching the management contract
@@ -38,6 +48,7 @@ function inputValue(event: Event): string {
 // The tenants list plus the create form. Creating or deleting a tenant reloads
 // this list AND refreshes the switcher's tenant list through the store.
 export function TenantsList() {
+  const [notice, setNotice] = useState<string | null>(null);
   const { state, reload } = useAsyncResource<TenantView[]>(
     () => fetchTenants(),
     [],
@@ -48,34 +59,66 @@ export function TenantsList() {
   }
   return (
     <section class="resource" aria-labelledby="tenants-heading">
-      <h2 id="tenants-heading">Tenants</h2>
-      <TenantCreateForm onCreated={onChanged} />
+      <ResourceHeading
+        id="tenants-heading"
+        title="Tenants"
+        description="Manage your tenants and the environments where your applications run."
+        actions={
+          <ResourceCreateAction label="Create tenant">
+            {(close) => (
+              <TenantCreateForm
+                onCreated={() => {
+                  setNotice("Tenant created.");
+                  onChanged();
+                  close();
+                }}
+              />
+            )}
+          </ResourceCreateAction>
+        }
+      />
+      {notice === null ? null : (
+        <p class="resource-success" role="status" aria-live="polite">
+          {notice}
+        </p>
+      )}
       <AsyncBoundary
         state={state}
         loadingLabel="Loading tenants"
         empty={{
           when: (items) => items.length === 0,
-          render: () => (
-            <p class="resource-empty">
-              No tenants yet. Create the first one above.
-            </p>
-          ),
+          render: () => <p class="resource-empty">No tenants yet.</p>,
         }}
       >
         {(items) => (
-          <ul class="resource-list">
-            {items.map((tenant) => (
-              <li key={tenant.id} class="resource-row">
-                <a class="resource-link" href={`/tenants/${tenant.id}`}>
-                  {tenant.display_name}
-                </a>
-                <code class="resource-id">{tenant.id}</code>
-                <span class={`resource-status resource-status-${tenant.status}`}>
-                  {tenant.status}
-                </span>
-              </li>
-            ))}
-          </ul>
+          <ResourceCollection
+            items={items}
+            noun="tenants"
+            searchText={(tenant) =>
+              [tenant.display_name, tenant.id, tenant.status].join(" ")
+            }
+          >
+            {(visible) => (
+              <ul class="resource-list">
+                {visible.map((tenant) => (
+                  <li key={tenant.id} class="resource-row">
+                    <a
+                      class="resource-link"
+                      href={consoleHref(`/tenants/${tenant.id}`)}
+                    >
+                      {tenant.display_name}
+                    </a>
+                    <code class="resource-id">{tenant.id}</code>
+                    <span
+                      class={`resource-status resource-status-${tenant.status}`}
+                    >
+                      {tenant.status}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </ResourceCollection>
         )}
       </AsyncBoundary>
     </section>
@@ -122,11 +165,20 @@ function TenantCreateForm({ onCreated }: { onCreated: () => void }) {
   }
 
   return (
-    <form class="resource-form" onSubmit={onSubmit} aria-label="Create a tenant">
+    <form
+      class="resource-form"
+      onSubmit={onSubmit}
+      aria-label="Create a tenant"
+    >
+      <ResourceFormIntro
+        title="Create tenant"
+        description="Add a tenant and its first environment. You can create additional environments later."
+      />
       <div class="resource-field">
         <label for="tenant-display-name">Display name</label>
         <input
           id="tenant-display-name"
+          placeholder={"Acme"}
           type="text"
           required
           value={displayName}
@@ -154,7 +206,7 @@ function TenantCreateForm({ onCreated }: { onCreated: () => void }) {
         >
           {ENV_KINDS.map((kind) => (
             <option key={kind} value={kind}>
-              {kind}
+              {resourceLabel(kind)}
             </option>
           ))}
         </select>
@@ -164,6 +216,7 @@ function TenantCreateForm({ onCreated }: { onCreated: () => void }) {
           <label for="tenant-custom-domain">Custom domain</label>
           <input
             id="tenant-custom-domain"
+            placeholder={"auth.example.com"}
             type="text"
             required
             value={customDomain}
@@ -175,6 +228,7 @@ function TenantCreateForm({ onCreated }: { onCreated: () => void }) {
         <label for="tenant-home-region">Home region (optional)</label>
         <input
           id="tenant-home-region"
+          placeholder={"us-west-2"}
           type="text"
           value={homeRegion}
           onInput={(event) => setHomeRegion(inputValue(event))}
@@ -217,7 +271,7 @@ export function TenantDetail({ tenantId }: { tenantId?: string }) {
       await deleteTenant(id);
       void reloadTenants();
       if (typeof location.route === "function") {
-        location.route("/tenants");
+        location.route(consoleHref("/tenants"));
       }
     }, "Tenant deleted.");
   }
@@ -225,14 +279,18 @@ export function TenantDetail({ tenantId }: { tenantId?: string }) {
   return (
     <section class="resource" aria-labelledby="tenant-detail-heading">
       <p>
-        <a class="resource-back" href="/tenants">
+        <a class="resource-back" href={consoleHref("/tenants")}>
           Back to tenants
         </a>
       </p>
       <AsyncBoundary state={state} loadingLabel="Loading tenant">
         {(tenant) => (
           <div>
-            <h2 id="tenant-detail-heading">{tenant.display_name}</h2>
+            <ResourceHeading
+              id="tenant-detail-heading"
+              title={tenant.display_name}
+              description="Review tenant details and manage its availability."
+            />
             <dl class="resource-detail">
               <dt>Identifier</dt>
               <dd>
@@ -245,7 +303,11 @@ export function TenantDetail({ tenantId }: { tenantId?: string }) {
               <dt>Created</dt>
               <dd>{new Date(tenant.created_at_unix_ms).toISOString()}</dd>
             </dl>
-            <div class="resource-actions" role="group" aria-label="Tenant lifecycle">
+            <div
+              class="resource-actions"
+              role="group"
+              aria-label="Tenant lifecycle"
+            >
               {tenant.status === "active" ? (
                 <ConfirmButton
                   label="Suspend"

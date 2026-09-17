@@ -20,10 +20,339 @@
 //   MorePageNote states that a keyset read has a tail beyond the page shown, so
 //   a list surface never truncates silently.
 
-import type { ComponentChildren } from "preact";
-import { useState } from "preact/hooks";
+import { createContext, type ComponentChildren } from "preact";
+import {
+  useContext,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "preact/hooks";
 import { ErrorView, type SudoRecovery } from "./ErrorView";
 import type { AsyncState, MutationState } from "./useResource";
+import { Icon } from "./Icon";
+
+export function ResourceHeading({
+  id,
+  title,
+  description,
+  actions,
+}: {
+  id: string;
+  title: ComponentChildren;
+  description: string;
+  actions?: ComponentChildren;
+}) {
+  return (
+    <header class="resource-heading">
+      <div class="resource-heading-copy">
+        <h1 id={id}>{title}</h1>
+        <p class="resource-description">{description}</p>
+      </div>
+      {actions === undefined ? null : (
+        <div class="resource-heading-actions">{actions}</div>
+      )}
+    </header>
+  );
+}
+
+// Creation is always an explicit action. The native modal keeps the existing
+// list in place, makes its background inert, and handles the keyboard focus trap.
+// Children mount only while open, so cancelling discards the unsaved draft.
+const CreationPending = createContext<((pending: boolean) => void) | null>(
+  null,
+);
+
+export function ResourceCreateAction({
+  label,
+  children,
+  pending = false,
+  onOpen,
+}: {
+  label: string;
+  children: (close: () => void) => ComponentChildren;
+  pending?: boolean;
+  onOpen?: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [closeRequested, setCloseRequested] = useState(false);
+  const [childPending, setChildPending] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const dialog = useRef<HTMLDialogElement>(null);
+  const dialogId = useId();
+  const busy = pending || childPending;
+  const close = () => setCloseRequested(true);
+
+  useLayoutEffect(() => {
+    if (open && closeRequested && !busy) setOpen(false);
+  }, [open, closeRequested, busy]);
+
+  useLayoutEffect(() => {
+    if (!open || dialog.current === null) return;
+    const element = dialog.current;
+    const alreadyLocked = document.body.classList.contains(
+      "resource-dialog-open",
+    );
+    document.body.classList.add("resource-dialog-open");
+    if (typeof element.showModal === "function") {
+      element.showModal();
+    } else {
+      // DOM test environments lack the native dialog methods.
+      element.setAttribute("open", "");
+    }
+    element
+      .querySelector<HTMLElement>(
+        'input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled])',
+      )
+      ?.focus();
+    return () => {
+      if (typeof element.close === "function") element.close();
+      if (!alreadyLocked)
+        document.body.classList.remove("resource-dialog-open");
+      if (trigger.current?.isConnected) trigger.current.focus();
+    };
+  }, [open]);
+
+  return (
+    <div class="resource-create-action">
+      <button
+        ref={trigger}
+        type="button"
+        class="resource-btn resource-btn-primary resource-create-trigger"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-controls={open ? dialogId : undefined}
+        disabled={pending}
+        onClick={() => {
+          onOpen?.();
+          setCloseRequested(false);
+          setChildPending(false);
+          setOpen(true);
+        }}
+      >
+        <Icon name="plus" />
+        {label}
+      </button>
+      {open ? (
+        <dialog
+          ref={dialog}
+          id={dialogId}
+          class="resource-create-dialog"
+          aria-label={label}
+          aria-modal="true"
+          aria-busy={busy}
+          onCancel={(event) => {
+            event.preventDefault();
+            if (!busy) close();
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              event.stopPropagation();
+              if (!busy) close();
+            }
+          }}
+        >
+          <div class="resource-create-dialog-top">
+            <button
+              type="button"
+              class="resource-dialog-close"
+              aria-label={`Close ${label.toLocaleLowerCase()}`}
+              disabled={busy}
+              onClick={close}
+            >
+              <Icon name="close" />
+            </button>
+          </div>
+          <CreationPending.Provider value={setChildPending}>
+            {children(close)}
+          </CreationPending.Provider>
+          <div class="resource-create-dialog-footer">
+            <button
+              type="button"
+              class="resource-btn"
+              disabled={busy}
+              onClick={close}
+            >
+              Cancel
+            </button>
+          </div>
+        </dialog>
+      ) : null}
+    </div>
+  );
+}
+
+export function ResourceFormIntro({
+  title,
+  description,
+  headingLevel = 2,
+}: {
+  title: string;
+  description: string;
+  headingLevel?: 2 | 3;
+}) {
+  const inCreationDialog = useContext(CreationPending) !== null;
+  const Heading = !inCreationDialog && headingLevel === 3 ? "h3" : "h2";
+  return (
+    <div class="resource-form-heading">
+      <Heading class="resource-form-title">{title}</Heading>
+      <p class="resource-form-help">{description}</p>
+    </div>
+  );
+}
+
+export function ResourceDetailNav({
+  items,
+}: {
+  items: ReadonlyArray<{ id: string; label: string }>;
+}) {
+  return (
+    <nav class="resource-detail-nav" aria-label="On this page">
+      {items.map((item) => (
+        <a key={item.id} href={`#${item.id}`}>
+          {item.label}
+        </a>
+      ))}
+    </nav>
+  );
+}
+
+export function resourceLabel(value: string): string {
+  const labels: Record<string, string> = {
+    dev: "Development",
+    prod: "Production",
+    staging: "Staging",
+    pending_verification: "Pending verification",
+    scheduled_offboarding: "Scheduled offboarding",
+  };
+  return (
+    labels[value] ??
+    value.replace(/_/g, " ").replace(/^./, (letter) => letter.toUpperCase())
+  );
+}
+
+// Search stays within the rows already returned by the management API. For a
+// paginated resource the description makes that boundary visible to operators.
+export function ResourceCollection<T>({
+  items,
+  noun,
+  searchText,
+  paginated = false,
+  headingLevel = 2,
+  children,
+}: {
+  items: ReadonlyArray<T>;
+  noun: string;
+  searchText: (item: T) => string;
+  paginated?: boolean;
+  headingLevel?: 2 | 3;
+  children: (visible: ReadonlyArray<T>) => ComponentChildren;
+}) {
+  const Heading = headingLevel === 3 ? "h3" : "h2";
+  const [query, setQuery] = useState("");
+  const searchRef = useRef<HTMLInputElement>(null);
+  const normalized = query.trim().toLocaleLowerCase();
+  const countNoun =
+    items.length === 1
+      ? noun.endsWith("ies")
+        ? `${noun.slice(0, -3)}y`
+        : noun.replace(/s$/, "")
+      : noun;
+  const visible =
+    normalized === ""
+      ? items
+      : items.filter((item) =>
+          searchText(item).toLocaleLowerCase().includes(normalized),
+        );
+  return (
+    <div class="resource-collection">
+      <div class="resource-toolbar">
+        <div>
+          <Heading class="resource-section-title">All {noun}</Heading>
+          <p class="resource-count" role="status" aria-live="polite">
+            {normalized === ""
+              ? `${items.length} ${countNoun}`
+              : `${visible.length} of ${items.length} ${countNoun}`}
+            {paginated ? " on this page" : ""}
+          </p>
+        </div>
+        <label class="resource-search">
+          <span>Search {noun}</span>
+          <input
+            ref={searchRef}
+            type="search"
+            aria-label={`Search ${noun}`}
+            placeholder={
+              paginated ? "Search this page" : "Search by name, ID or status"
+            }
+            value={query}
+            onInput={(event) =>
+              setQuery((event.target as HTMLInputElement).value)
+            }
+          />
+        </label>
+      </div>
+      {visible.length === 0 ? (
+        <div class="resource-empty">
+          <p class="resource-empty-title">No matching {noun}</p>
+          <p class="resource-empty-description">
+            Try another search or clear the search to see all {noun}
+            {paginated ? " on this page" : ""}.
+          </p>
+          <button
+            type="button"
+            class="resource-btn"
+            onClick={() => {
+              setQuery("");
+              searchRef.current?.focus();
+            }}
+          >
+            Clear search
+          </button>
+        </div>
+      ) : (
+        children(visible)
+      )}
+    </div>
+  );
+}
+
+// Credentials remain in the caller's memory-only state. This control copies the
+// displayed value directly and reports a clipboard failure without logging it.
+export function SecretCopyButton({
+  value,
+  label = "Copy secret",
+}: {
+  value: string;
+  label?: string;
+}) {
+  const [status, setStatus] = useState<"idle" | "copied" | "error">("idle");
+  useEffect(() => setStatus("idle"), [value]);
+  async function copy(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(value);
+      setStatus("copied");
+    } catch {
+      setStatus("error");
+    }
+  }
+  return (
+    <div class="resource-copy-actions">
+      <button type="button" class="resource-btn" onClick={() => void copy()}>
+        {label}
+      </button>
+      <span class="resource-hint" role="status" aria-live="polite">
+        {status === "copied"
+          ? "Copied to clipboard."
+          : status === "error"
+            ? "Copy unavailable. Select the value and copy it manually."
+            : ""}
+      </span>
+    </div>
+  );
+}
 
 // The optional empty state of a read: when `when(data)` holds (an empty list),
 // `render` supplies the empty message instead of the ready content.
@@ -102,6 +431,10 @@ export interface MutationFeedbackProps {
 // Render a write's success confirmation or its verbatim failure. A pending or
 // idle write shows nothing.
 export function MutationFeedback({ state, sudo }: MutationFeedbackProps) {
+  const setCreationPending = useContext(CreationPending);
+  useLayoutEffect(() => {
+    setCreationPending?.(state.pending);
+  }, [setCreationPending, state.pending]);
   if (state.success !== null) {
     return (
       <p class="resource-success" role="status" aria-live="polite">
@@ -139,10 +472,23 @@ export function ConfirmButton({
   disabled,
 }: ConfirmButtonProps) {
   const [armed, setArmed] = useState(false);
+  const promptId = useId();
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  const previouslyArmed = useRef(false);
+  useEffect(() => {
+    if (armed) {
+      confirmRef.current?.focus();
+    } else if (previouslyArmed.current) {
+      triggerRef.current?.focus();
+    }
+    previouslyArmed.current = armed;
+  }, [armed]);
   const dangerClass = danger === true ? " resource-btn-danger" : "";
   if (!armed) {
     return (
       <button
+        ref={triggerRef}
         type="button"
         class={`resource-btn${dangerClass}`}
         disabled={disabled}
@@ -153,11 +499,25 @@ export function ConfirmButton({
     );
   }
   return (
-    <span class="resource-confirm" role="group" aria-label={prompt}>
-      <span class="resource-confirm-prompt">{prompt}</span>
+    <span
+      class="resource-confirm"
+      role="group"
+      aria-label={prompt}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          setArmed(false);
+        }
+      }}
+    >
+      <span id={promptId} class="resource-confirm-prompt">
+        {prompt}
+      </span>
       <button
+        ref={confirmRef}
         type="button"
-        class="resource-btn resource-btn-danger"
+        aria-describedby={promptId}
+        class={`resource-btn${dangerClass}`}
         disabled={disabled}
         onClick={() => {
           setArmed(false);
@@ -166,7 +526,11 @@ export function ConfirmButton({
       >
         {confirmLabel}
       </button>
-      <button type="button" class="resource-btn" onClick={() => setArmed(false)}>
+      <button
+        type="button"
+        class="resource-btn"
+        onClick={() => setArmed(false)}
+      >
         Cancel
       </button>
     </span>
