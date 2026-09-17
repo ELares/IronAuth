@@ -10,10 +10,11 @@ range per docs/RELEASING.md.
   `--i-will-rebuild-lookups` (issue #153).
 
   It rewraps keys and rebuilds no lookups. Every blind index in the store is derived from the
-  master secret rather than through a KEK -- login handles, external ids, recovery codes,
-  invitations, trait logins, routing identifiers, risk and abuse subjects, email and SMS
-  recipients. After a rotation to new material they are all computed under a key nothing derives
-  any more.
+  master secret rather than through a KEK, fifteen of them in all: login handles and external
+  ids, trait logins, flexible and routing identifiers, recovery codes, invitations, organisation
+  contact emails, email and SMS factor recipients, message recipients, and the risk-signal, abuse,
+  SSF-stream and migration-record subjects. After a rotation to new material they are all computed
+  under a key nothing derives any more.
 
   The failure had no loud symptom: `by_identifier` misses and returns `Ok(None)`, which is
   indistinguishable from an unknown user, so every existing account stops resolving at login. And

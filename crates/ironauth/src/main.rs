@@ -8394,10 +8394,9 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
     // loud before this runs.
     //
     // Every blind index in the store is `master.blind_index(context)`, derived from the
-    // master's material rather than through a KEK: the user identifier, the external id, the
-    // recovery code, the invitation identifier, the trait login, the routing identifier, the
-    // risk-signal and abuse subjects, the email and SMS factor recipients, the message
-    // recipient. `storage rekey` rewraps `tenant_keks` and touches none of them.
+    // master's material rather than through a KEK. FIFTEEN of them, counted rather than
+    // sampled: the user identifier and external id, the trait login, the flexible and routing identifiers, the recovery code, the invitation identifier, the organisation contact email, the email and SMS factor recipients, the message recipient, the risk-signal and abuse and SSF-stream subjects, and the migration record subject.
+    // `storage rekey` rewraps `tenant_keks` and touches none of them.
     //
     // The failure has no loud symptom. `by_identifier` misses and returns `Ok(None)`, which
     // is indistinguishable from an unknown user, so every existing account stops resolving at

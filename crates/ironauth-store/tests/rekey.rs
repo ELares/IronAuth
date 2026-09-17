@@ -815,9 +815,8 @@ async fn a_kek_parked_on_a_third_master_is_not_reported_as_converged() {
 /// WHAT A ROTATION DOES NOT CARRY: the blind indexes (issue #153).
 ///
 /// Every blind index in the store is `master.blind_index(context)`, derived from the master's
-/// material directly rather than through a KEK -- the user identifier, the external id, the
-/// recovery code, the invitation identifier, the trait login, the routing identifier, the
-/// risk-signal and abuse subjects, the email and SMS factor recipients, the message recipient.
+/// material directly rather than through a KEK. Fifteen of them, counted rather than sampled:
+/// the user identifier and external id, the trait login, the flexible and routing identifiers, the recovery code, the invitation identifier, the organisation contact email, the email and SMS factor recipients, the message recipient, the risk-signal and abuse and SSF-stream subjects, and the migration record subject.
 /// This module rewraps `tenant_keks` and touches none of them.
 ///
 /// So a rotation to different key material leaves every stored index computed under a key
