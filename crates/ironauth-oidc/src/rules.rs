@@ -46,7 +46,8 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 
 /// What a matching rule decides.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Action {
     /// Admit the request.
     Allow,
@@ -218,7 +219,7 @@ pub struct RequestFacts {
 }
 
 /// The engine's answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Decision {
     /// What to do.
     pub action: Action,
@@ -763,7 +764,8 @@ impl Recorder for Recording {
 }
 
 /// How one rule answered during a traced walk.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RuleOutcome {
     /// Every criterion held, so this rule decided.
     Matched,
@@ -783,7 +785,7 @@ pub enum RuleOutcome {
 }
 
 /// One rule's line in a trace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RuleTrace {
     /// The rule's name.
     pub rule: String,
@@ -792,7 +794,7 @@ pub struct RuleTrace {
 }
 
 /// Every rule's answer, in evaluation order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Trace {
     /// One entry per rule, in the order the rule set declares them, which is the order
     /// they were evaluated in.
@@ -800,7 +802,7 @@ pub struct Trace {
 }
 
 /// The decision and the trace that produced it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Explanation {
     /// What the engine decided.
     pub decision: Decision,

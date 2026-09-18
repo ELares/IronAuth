@@ -215,6 +215,29 @@ pub struct ForwardAuthOutcome {
     pub cache_available: bool,
 }
 
+impl ForwardAuthOutcome {
+    /// A one-line answer to "why did the check answer the way it did" (issue #154
+    /// criterion 5).
+    ///
+    /// Built from the decision alone, so the line is the same whether the decision was
+    /// served from the cache or computed from the rules. The full per-rule trace is the
+    /// dry-run surface's answer, for a hypothetical request; this is the answer for the
+    /// request that just happened.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match (&self.decision.action, self.decision.matched.as_deref()) {
+            (Action::Deny, Some(rule)) => format!("denied by rule {rule}"),
+            (Action::Deny, None) => "denied: no rule matched".to_owned(),
+            (Action::Allow, Some(rule)) => format!("allowed by rule {rule}"),
+            (Action::Allow, None) => "allowed".to_owned(),
+            (Action::StepUp { acr }, Some(rule)) => {
+                format!("rule {rule} requires step-up to {acr}")
+            }
+            (Action::StepUp { acr }, None) => format!("step-up to {acr} required"),
+        }
+    }
+}
+
 /// A forward-auth surface over a rule set.
 ///
 /// Holds the rules privately and exposes no accessor for them. An earlier version had one,
@@ -271,6 +294,22 @@ impl ForwardAuth {
     #[must_use]
     pub fn decision_cache_enabled(&self) -> bool {
         self.decision_cache.is_some()
+    }
+
+    /// The full trace for `facts`: every rule's answer, and the decision it produced
+    /// (issue #154 criterion 5).
+    ///
+    /// Deliberately NOT served from the decision cache: the cache remembers DECISIONS, and a
+    /// rehearsal asking "why would this be denied" wants the walk, not an entry computed by
+    /// an earlier request. The rules it walks are the cache's own when one is installed, so
+    /// the trace always matches what this surface would enforce.
+    #[must_use]
+    pub fn explain(&self, facts: &RequestFacts) -> crate::rules::Explanation {
+        let rules = match &self.decision_cache {
+            Some(cached) => cached.rules(),
+            None => self.rules.as_ref(),
+        };
+        rules.explain(facts)
     }
 
     /// Decide `facts`, and say what the upstream should be told.

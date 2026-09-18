@@ -514,6 +514,14 @@ pub fn oidc_router(state: OidcState) -> Router {
             "/t/{tenant_id}/e/{environment_id}/forward-auth",
             axum::routing::any(forward_auth_route::check),
         )
+        // THE DRY-RUN TRACE (issue #154 criterion 5): the answer to "why would this be
+        // denied" for a hypothetical check request. A DIFFERENT route from the check, which
+        // is what makes "dry-run never enforces" structural rather than a promise: this
+        // handler returns the trace and never calls `evaluate`.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/forward-auth/dry-run",
+            post(forward_auth_route::dry_run),
+        )
         // THE SAML HTTP POST BINDING (issue #139). Scope-routed and connection-routed, because
         // an assertion consumer service URL is per connection: the response is checked against
         // the trust anchors of the connection the identity provider was TOLD to post to, never
