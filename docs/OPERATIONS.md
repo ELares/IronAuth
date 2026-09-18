@@ -49,6 +49,13 @@ the console; Rust builds use its committed embedded assets. See
 [compatibility](COMPATIBILITY.md) and the
 [console package guide](../packages/admin-spa/README.md).
 
+The full development gate additionally requires Node and npm to build the
+TypeScript hook test component. Direct hook integration, admin upload-cap, and
+store migration tests need `scripts/build-ts-hook-fixture.sh` first. The
+component is generated and ignored; production Rust builds do not need it or
+Node. See the [hook sample](../crates/ironauth-hooks/guests-ts/README.md) and
+[security scanning](SECURITY-SCANNING.md).
+
 ## Configure a persistent deployment
 
 Provision a PostgreSQL database and the three roles named by the migration
@@ -290,6 +297,15 @@ leases, retry bounds, dead-letter states, and per-aggregate ordering. Queue
 concurrency and polling are per process and per consumer; size them with the
 number of replicas and database capacity in mind. A stored configuration or
 queued job does not prove its worker is enabled.
+
+Budget PostgreSQL connections for all serving, control-plane, and dedicated
+consumer pools across every replica, with room for migrations and administration.
+Several pools start in each process; the PostgreSQL default of 100 connections
+can be exhausted by three replicas even before external traffic arrives. The
+three-replica CI smoke fixture uses 300 connections. Size production capacity
+for its enabled workers and workload rather than treating that fixture value as
+a deployment guarantee. If discovery fails during a cold start, inspect
+PostgreSQL connection-limit errors and pool waits as well as tenant state.
 
 | Worker or service | Runtime setting or prerequisite |
 | --- | --- |

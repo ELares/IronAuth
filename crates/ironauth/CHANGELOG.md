@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Patch vulnerable Cargo, console tooling, hook builder, conformance Python,
+  and Terraform-provider dependencies. Pin workflow actions to verified commit
+  hashes, use locked npm installs, and add CodeQL and dependency review workflows.
+  Publish the private reporting link and document the three existing Cargo
+  advisory exceptions against their actual consumers while preserving Rust 1.85.
+
 - Updated the project README and documentation with the implemented capability
   set, console workflows, application integrations, deployment prerequisites,
   optional build features, and current limitations. Added a task-based

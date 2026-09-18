@@ -34,9 +34,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: "stable"
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -45,9 +46,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: "stable"
           components: clippy
       - name: Install the WASM target for the pinned toolchain
         # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script,
@@ -60,7 +62,7 @@ jobs:
         # hooks that spin, allocate, and try to open a socket, and without them the sandbox
         # tests verify nothing while still reporting green.
         run: rustup target add wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
@@ -159,7 +161,7 @@ jobs:
       # and let the clamp be the thing that speaks.
       IRONAUTH_TEST_DB_RECLAIM_MIN_AGE_SECS: "300"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # RECLAIM RUNNER DISK, and the reason this step exists at all.
       #
       # From 2026-08-18 22:55 to 2026-08-19, every run of this job died of `No space left
@@ -289,7 +291,9 @@ jobs:
             echo "::error::only ${free_gb}G free after reclaim; this job needs 24G of target plus a docker layer and the per-test databases above it"
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
       - name: Install the WASM target for the pinned toolchain
         # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script,
         # so every job that compiles the workspace needs the target. Added through rustup
@@ -301,7 +305,14 @@ jobs:
         # hooks that spin, allocate, and try to open a socket, and without them the sandbox
         # tests verify nothing while still reporting green.
         run: rustup target add wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22"
+      - name: Build the TypeScript hook test fixture from source
+        # Hook behavior and upload-bound tests read the source-built TypeScript component.
+        # Build it from the package lock before Cargo starts any workspace test binary.
+        run: ./scripts/build-ts-hook-fixture.sh
       - name: tests (workspace, all features)
         run: cargo test --workspace --all-features
       - name: doctests
@@ -386,9 +397,11 @@ jobs:
       IRONAUTH_TEST_DB_DISPOSABLE: "1"
       IRONBUS_ADDR: 127.0.0.1:17654
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: The WASM guest fixtures the admin test build needs
         # NOT OPTIONAL AND NOT SKIPPABLE, and this job needs it even though it runs no hook
         # test. `ironauth-hooks` is an UNCONDITIONAL dev-dependency of `ironauth-admin`, so
@@ -477,9 +490,11 @@ jobs:
     env:
       IRONCACHE_ADDR: 127.0.0.1:17379
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Built from git rather than crates.io: IronCache publishes NO crate at all, client or
       # server. Pinned to an exact COMMIT and not a branch, for the reason the IronBus lane
       # below gives: a branch lets another repository silently change what this lane tests.
@@ -544,9 +559,9 @@ jobs:
       # the toolchain file, so the check genuinely runs under 1.85.
       RUSTUP_TOOLCHAIN: "1.85"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.85
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@077fee5b0788f1a772d4c6ce2814159cd1d6632b # 1.85
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # ONE crate is excluded, under this rule: a workspace member whose DEPENDENCY declares
       # an MSRV above the workspace promise, and which nothing in the shipped binary's graph
       # depends on, is checked at its own MSRV instead of blocking this lane.
@@ -619,14 +634,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
       - name: Install musl target for the pinned toolchain
         # rust-toolchain.toml pins the toolchain cargo actually uses, so the
         # target must be added through rustup (which honors the pin), not via
         # the action (which only equips its own toolchain).
         run: rustup target add x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --target x86_64-unknown-linux-musl -p ironauth
@@ -655,19 +672,21 @@ jobs:
     # builds wasmtime and cranelift in release plus the wasm guest fixtures.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
       - name: Install the WASM target for the pinned toolchain
         # The benchmark runs a real guest component, so the fixtures have to build. Added
         # through rustup rather than the action's `targets:` input because rust-toolchain.toml
         # pins the toolchain cargo actually uses.
         run: rustup target add wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # The gate parses ci.yml to check this job's `runs-on` against the config, so it needs
       # PyYAML. Provisioned here rather than assumed: the repository treats PyYAML as a third
       # party package scripts must not require (see fuzz-matrix-freshness.sh), and the gate has
       # no degraded path -- the check it needs it for is the one that cannot be skipped.
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
       - name: provision the gate's python deps (hash pinned)
@@ -693,7 +712,7 @@ jobs:
         # CANCELLATION, and this workflow sets cancel-in-progress for pull requests, so every
         # superseded push would leave a failed upload step nobody should read as a signal.
         if: success() || failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: hook-latency-measurement
           path: target/hook-bench-measurement.json
@@ -701,37 +720,27 @@ jobs:
 
   ts-hook-freshness:
     name: "TypeScript hook freshness (issue #114 criterion 1)"
-    # The TypeScript sample's component is COMMITTED, not built by build.rs: building it needs
-    # Node and an npm install, and a build script has no business fetching from the network.
-    # The price of committing a build output is that it can drift from the source beside it,
-    # and this job is what stops that. It rebuilds from `src/` and runs the same integration
-    # tests against the rebuilt component, so a source change that was never rebuilt fails here
-    # rather than shipping a sample whose code and artifact disagree.
-    #
-    # A separate job rather than a step in the main suite because it rebuilds an eleven-megabyte
-    # component and then runs the hook tests TWICE, and that does not belong in the critical
-    # path of a suite it can only ever confirm. It changes on the rare commits touching one
-    # directory.
-    #
-    # NOT because Node is unusual here -- an earlier version of this comment said it was "the
-    # only thing in this repository that needs Node", which is false: this file already has
-    # three other `setup-node` steps and `scripts/gate.sh` has several node lanes. The reason
-    # is the cost of THIS check, not the availability of the toolchain.
+    # Build the sample from source into a temporary component, prove the runtime override
+    # reaches the loader, and run its behavioral assertions against those exact bytes.
+    # Keep this separate from the workspace test job because the rebuild and release-mode
+    # hook execution are expensive. No generated WASM component is committed or skipped.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
       - name: Install the WASM target for the pinned toolchain
         # The tests load real components, so this crate's Rust guest fixtures must build too.
         run: rustup target add wasm32-wasip2
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Rebuild the TypeScript hook and check it still behaves
-        # The script SKIPS with exit 0 when npm is absent, and says what it did not verify.
-        # Here npm is always present, so a skip on this runner would itself be the anomaly.
+        # Builds a temporary fixture from locked source and tests those exact bytes.
+        # Missing tools or a failed build are failures; this suite never silently skips.
         run: ./scripts/ts-hook-freshness.sh
 
   deny:
@@ -739,8 +748,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
       # The WASM guest fixtures are their OWN workspace with their own lock file, deliberately
@@ -749,7 +758,7 @@ jobs:
       # unapproved licence, or a RUSTSEC advisory anywhere in that tree would leave this lane
       # green while `crates/ironauth-hooks/build.rs` compiled and EXECUTED its proc macros on
       # every build of the workspace. Same policy file, second lock file.
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
           manifest-path: crates/ironauth-hooks/guests/Cargo.toml
@@ -764,9 +773,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # The emulator brings up its OWN throwaway cluster, so this job needs the Postgres
       # BINARIES but no Postgres service: `initdb` and `pg_ctl`, which is exactly what
       # `dev` looks for. A service container would measure the wrong thing, because a
@@ -908,9 +919,11 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # Linux has no keychain until something provides the Secret Service over D-Bus. macOS
       # and Windows have one built in, so only this platform needs setting up.
@@ -1011,8 +1024,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
       - name: Add the WebAssembly target
         # A `rustup target add` STEP, not the action's `targets:` input, for the reason this
         # workflow already records above the hooks job and the musl one: `rust-toolchain.toml`
@@ -1021,7 +1036,7 @@ jobs:
         # `core` it does not have -- which is exactly how this job first went red
         # (`error[E0463]: can't find crate for core`).
         run: rustup target add wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Run the shared conformance corpus
         run: cargo test -p ironauth-fastly-verify
       - name: Build for the Compute target
@@ -1031,8 +1046,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
       - name: Install musl target and tools
         run: |
           rustup target add x86_64-unknown-linux-musl
@@ -1053,7 +1070,7 @@ jobs:
           # invisible: the job passed for a reason unrelated to the image it was testing.
           cp deploy/Dockerfile image-build/Dockerfile
           docker build -t ironauth:ci image-build
-      - uses: helm/kind-action@v1
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with:
           cluster_name: ironauth
       - name: Load the image into the cluster
@@ -1090,6 +1107,10 @@ jobs:
                 containers:
                   - name: postgres
                     image: postgres:16
+                    # Three replicas start separate serving, control and worker pools.
+                    # With the default 100 slots, a cold discovery request can fail its
+                    # unchanged 3-second acquire bound before the smoke test starts.
+                    args: ["-c", "max_connections=300"]
                     env:
                       - name: POSTGRES_PASSWORD
                         value: postgres
@@ -1291,7 +1312,18 @@ jobs:
         run: |
           kubectl get pods -o wide || true
           kubectl describe deployment/ironauth || true
-          kubectl logs -l app.kubernetes.io/name=ironauth --tail=100 --all-containers || true
+          kubectl logs -l app.kubernetes.io/name=ironauth --tail=100 --all-containers --prefix || true
+          # Connection counts and waits, without logging SQL text or application data.
+          POD=$(kubectl get pod -l app=postgres -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -n "$POD" ]; then
+            kubectl logs "$POD" --tail=100 || true
+            kubectl exec "$POD" -- env PGPASSWORD=postgres \
+              psql -h 127.0.0.1 -U postgres -d ironauth -v ON_ERROR_STOP=1 \
+              -c "SHOW max_connections; SHOW superuser_reserved_connections; \
+              SELECT usename, state, wait_event_type, wait_event, count(*) \
+              FROM pg_stat_activity GROUP BY usename, state, wait_event_type, wait_event \
+              ORDER BY usename, state, wait_event_type, wait_event" || true
+          fi
           kubectl get events --sort-by=.lastTimestamp | tail -40 || true
 
   deb:
@@ -1317,8 +1349,10 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked --version ^2
       - name: Build the package
@@ -1427,10 +1461,12 @@ jobs:
       # the default shallow checkout has no `origin/main` to resolve -- it failed with
       # "'origin/main' is not a revision here; nothing to compare against", which is the
       # check reporting that it could not run rather than that the spec is unchanged.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
       # `ironauth-hooks` builds its guest fixtures for wasm32-wasip2 from a build script, and
       # that script PANICS rather than skipping when the target is missing, on purpose: the
       # fixtures are the hooks that spin, allocate and try to open a socket, so a suite that
@@ -1444,14 +1480,14 @@ jobs:
       # which names neither the crate at fault nor the cause.
       - name: Install the WASM target the hook fixtures build for
         run: rustup target add wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # The conformance static checks parse the profile matrix and RENDER the
       # runner's plan config, so they need PyYAML. Pin the interpreter (the
       # hash-pinned requirements are resolved for CPython 3.12 on linux) and
       # install with --require-hashes, so this lane installs exactly the reviewed
       # bits or fails. Without this the deep matrix and plan-config checks would
       # silently take their degraded fallback path and enforce less than they say.
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
       - name: provision the conformance static-check python deps (hash pinned)
@@ -1590,7 +1626,7 @@ jobs:
       # Secret rather than a ConfigMap are all invisible to it. helm is a single static binary,
       # so this costs one download rather than a cluster.
       - name: helm chart (renders, hardened, accelerators absent by default)
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
         with:
           version: v3.16.3
       - name: helm chart assertions
@@ -1811,13 +1847,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "22"
       - name: install (pinned toolchain)
         working-directory: packages/reference-app
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
       - name: build and typecheck
         working-directory: packages/reference-app
         # `tsc` typechecks and emits; noEmitOnError is on by default, so a type
@@ -1845,8 +1881,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
       - name: install (locked)
@@ -1904,9 +1940,11 @@ jobs:
       IRONAUTH_LDAP_URL: ldap://127.0.0.1:3389
       IRONAUTH_LDAP_PLAINTEXT_URL: ldap://127.0.0.1:3390
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: The WASM guest fixtures the admin test build needs
         # NOT OPTIONAL AND NOT SKIPPABLE, and this job needs it even though it runs no hook
         # test. `ironauth-hooks` is an UNCONDITIONAL dev-dependency of `ironauth-admin`, so
@@ -2041,7 +2079,7 @@ jobs:
           IRONAUTH_LDAP_LOAD_ENTRIES=20000 bash scripts/ldap-load-test.sh
       - name: Record the load-test figures
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ldap-load-report
           path: target/ldap-load-report.txt
@@ -2083,8 +2121,10 @@ jobs:
       IRONAUTH_TEST_DB_DISPOSABLE: "1"
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
       - name: Install the WASM target for the pinned toolchain
         # This lane was RED from the day it was added, and not on a prototype: `ironauth-hooks`
         # builds its guest fixtures for wasm32-wasip2 from a build script, `ironauth-oidc` pulls
@@ -2094,7 +2134,7 @@ jobs:
         # step for the same reason; the comment at the clippy job records why it goes through
         # rustup rather than the action's `targets:` input.
         run: rustup target add wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: pinned draft revisions
         run: scripts/experimental-prototypes.sh --revisions
       - name: prototypes
@@ -2107,8 +2147,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
       - name: install (locked)
@@ -2130,8 +2170,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
         with:
           # The artifact targets net8.0 so consumers on the current LTS can use it; the 8.0
           # runtime is installed alongside the SDK so the shipped target is what actually runs,
@@ -2158,10 +2198,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.85
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@077fee5b0788f1a772d4c6ce2814159cd1d6632b # 1.85
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
       - name: install (locked)
@@ -2186,10 +2226,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.85
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@077fee5b0788f1a772d4c6ce2814159cd1d6632b # 1.85
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
       - name: the checklist, end to end, and the page it generates
@@ -2210,10 +2250,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.85
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-java@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@077fee5b0788f1a772d4c6ce2814159cd1d6632b # 1.85
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
         with:
           distribution: temurin
           java-version: 17
@@ -2235,11 +2275,11 @@ jobs:
       # "emulator" is IronAuth's own `dev` server rather than an Android one. The compile SDK
       # and build tools come from `clients/mobile/android/app/build.gradle.kts`, which is where
       # they belong -- naming them here would be a second place to keep in step with it.
-      - uses: android-actions/setup-android@v4
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
         with:
           packages: platform-tools
       - name: gradle
-        uses: gradle/actions/setup-gradle@v6
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6
       - name: build the sample and run the documented flow
         env:
           GRADLE_BIN: gradle
@@ -2255,7 +2295,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: compile the iOS sample for a generic iOS device
         working-directory: clients/mobile/ios
         run: |
@@ -2287,9 +2327,9 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.85
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@077fee5b0788f1a772d4c6ce2814159cd1d6632b # 1.85
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: exchange the runner's ambient token for an IronAuth access token
         env:
           # GitHub's real key set, fetched through the SSRF-hardened fetcher like any other
@@ -2312,8 +2352,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-java@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
         with:
           distribution: temurin
           # 17 is the floor the artifact needs (in-box Ed25519 arrived in 15, records in 17) and
@@ -2330,8 +2370,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
       - name: install (locked)
@@ -2348,8 +2388,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "22"
       - name: install (locked, from package-lock.json)
@@ -2426,8 +2466,8 @@ jobs:
     # cannot run on a fork's PR is a lane that quietly never runs.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
       - name: install (locked)
@@ -2451,7 +2491,7 @@ jobs:
           # compares against the EXPECTED_CHECKS it imports from the suite. That is the
           # proof-it-ran guarantee, derived rather than hand-written.
           node workers/run-checks.mjs
-      - uses: denoland/setup-deno@v2
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
         with:
           deno-version: v2.x
       - name: deno
@@ -2468,7 +2508,7 @@ jobs:
           # matrix exists to avoid. `run-checks.mjs` is what proves it, by comparing the
           # count against the EXPECTED_CHECKS it imports and throwing on a mismatch.
           deno run --allow-read --allow-env workers/run-checks.mjs
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: latest
       - name: bun
@@ -2525,7 +2565,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Report whether this lane is enforcing anything
         id: status
         env:
@@ -2562,7 +2602,7 @@ jobs:
       # Without this the runner's own dependencies would be absent and the lane
       # could never drive a plan; run-conformance.sh would then (correctly) go RED
       # rather than pass vacuously, which is why provisioning it here matters.
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         if: ${{ steps.status.outputs.enabled == 'true' }}
         with:
           python-version: "3.12"
@@ -2580,7 +2620,7 @@ jobs:
         run: ./run-conformance.sh --trigger merge-gate --up
       - name: Archive suite logs for certification submission
         if: ${{ always() && steps.status.outputs.enabled == 'true' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: conformance-logs-merge-gate
           path: deploy/conformance/results/

@@ -28,6 +28,7 @@ both files and fails if either drifts.
 - [Releasing](docs/RELEASING.md): IronAuth is a monorepo with independently versioned artifacts. Every release
 - [The IronAuth SDK contract](docs/SDK-CONTRACT.md): The wire formats an SDK may depend on, and what it may depend on them FOR.
 - [SDK priority policy](docs/SDK-POLICY.md): Which SDKs IronAuth ships, which are deferred, and the reasoning behind the order.
+- [Security scanning](docs/SECURITY-SCANNING.md): IronAuth checks source code, dependencies, and repository practices separately.
 - [IronAuth Threat Model](docs/THREAT-MODEL.md): Per-surface STRIDE analysis. This document is a merge-gated artifact: no new
 - [Per-operation unit costs](docs/UNIT-COSTS.md): Issue #152 criterion 4 asks for per-operation unit costs with the Argon2id parameters stated.
 - [Will Not Implement, and Why](docs/WILL-NOT-IMPLEMENT.md): Deliberate refusals, published with reasons. A documented refusal list builds

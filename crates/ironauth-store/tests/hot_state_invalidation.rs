@@ -23,6 +23,15 @@ use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{HOT_STATE_INVALIDATION_CONSUMER, InvalidationBatch};
 
+/// Keep unrelated fixtures from holding down this binary's cluster-wide feed watermark.
+///
+/// A separate database does not isolate `pg_snapshot_xmin`: another test's migrations can
+/// withhold a committed invalidation for longer than the polling budget. Acquire this before
+/// creating the fixture and hold it for the whole test. Cargo runs test binaries sequentially,
+/// so this guard only needs to cover this binary. Explicit concurrent transactions within a
+/// test still exercise the watermark, as the blocked-reader test below demonstrates.
+static CLUSTER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// An hour from the epoch, in microseconds: long enough that nothing in these tests expires.
 const AN_HOUR: i64 = 3_600_000_000;
 
@@ -92,6 +101,7 @@ async fn a_change_on_one_node_is_seen_by_every_other_node() {
     // CRITERION 1. Two nodes read one feed from their own positions, so both see the same
     // invalidation. A queue would have handed it to whichever claimed it first and completed it,
     // leaving the other node's accelerator serving the old value for its whole TTL.
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -130,6 +140,7 @@ async fn a_node_that_has_applied_a_change_does_not_see_it_again() {
     // THE CURSOR ACTUALLY ADVANCES. Without this, "every node sees it" is satisfied by a reader
     // that returns the whole feed every time -- which also means a node re-forgets every key on
     // every pass, and the accelerator is useless under any invalidation traffic at all.
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -179,6 +190,7 @@ async fn a_rolled_back_mutation_announces_nothing() {
     // CRITERION 2, the half that is easy to get wrong by opening a second transaction. Both
     // writes are abandoned together, so there must be neither a cache entry nor an invalidation
     // telling every node to forget a key that never changed.
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -244,6 +256,7 @@ async fn two_changes_to_one_key_announce_twice() {
     // alone, the second change to one key is a unique violation: the first invalidation stands,
     // the second is refused, and every node goes on serving what the first change wrote. That is
     // a permanently stale cache produced by a dedup rule.
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -290,6 +303,7 @@ async fn a_checkpoint_never_moves_backwards() {
     // A CURSOR THAT CAN GO BACKWARDS CAN LIVELOCK. Two overlapping passes for one node -- a slow
     // one holding an old position while a fast one has already advanced -- would have the loser
     // write the lower number, and a periodic overlap re-applies the same rows for ever.
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -315,6 +329,7 @@ async fn a_node_with_no_cursor_starts_at_the_beginning() {
     // up to date with respect to invalidations it never saw -- which is only safe because the
     // accelerator IS empty, and stops being safe the moment it populates from a durable tier
     // whose keys were invalidated before the node joined.
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -332,7 +347,7 @@ async fn a_node_with_no_cursor_starts_at_the_beginning() {
         "a node that has never checkpointed starts before the first row"
     );
     let InvalidationBatch::Apply { forget, .. } =
-        feed.next_batch("brand-new-node", 100).await.expect("read")
+        batch_with_rows(&feed, "brand-new-node", 100).await
     else {
         panic!("cold flush")
     };
@@ -340,6 +355,72 @@ async fn a_node_with_no_cursor_starts_at_the_beginning() {
         forget.len(),
         1,
         "and is told about what happened before it joined"
+    );
+}
+
+#[tokio::test]
+async fn a_polling_node_reads_a_committed_invalidation_after_an_older_transaction_ends() {
+    let _serialized = CLUSTER.lock().await;
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.restart_app_store().await;
+    let feed = store.scoped(scope);
+    let feed = feed.hot_state_invalidations();
+
+    // Take the older xid before committing the invalidation. An unrelated transaction
+    // opened afterwards would not hold this row behind the watermark.
+    let mut bystander = db.owner_pool().begin().await.expect("begin bystander");
+    sqlx::query("SELECT pg_current_xact_id()")
+        .execute(&mut *bystander)
+        .await
+        .expect("bystander takes an xid");
+    feed.write_and_announce(&env, "jwks", "kid", b"v", AN_HOUR, "while-blocked", false)
+        .await
+        .expect("commit the invalidation while the older transaction remains open");
+
+    let InvalidationBatch::Apply { forget, through } =
+        feed.next_batch("waiting-node", 100).await.expect("read")
+    else {
+        panic!("cold flush on a fresh feed")
+    };
+    assert!(
+        forget.is_empty(),
+        "a committed invalidation is withheld while the older transaction remains open"
+    );
+    assert_eq!(through, 0, "an empty page must not advance the position");
+    assert_eq!(
+        feed.cursor_for("waiting-node").await.expect("read"),
+        0,
+        "the blocked node still starts at the beginning"
+    );
+
+    // Let the helper execute and retry while the bystander stays open. Borrowing the
+    // pinned future keeps this same reader alive after the timeout and explicit rollback.
+    // The existing helper keeps its original five-second bound.
+    let waiting = batch_with_rows(&feed, "waiting-node", 100);
+    tokio::pin!(waiting);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), waiting.as_mut())
+            .await
+            .is_err(),
+        "the polling read must wait while the older transaction remains open"
+    );
+
+    bystander.rollback().await.expect("release the watermark");
+    let InvalidationBatch::Apply { forget, through } = waiting.await else {
+        panic!("cold flush after releasing a fresh feed")
+    };
+    assert_eq!(
+        forget,
+        vec![("jwks".to_owned(), "kid".to_owned())],
+        "the same polling read delivers exactly the committed invalidation after release"
+    );
+    assert!(through > 0, "the delivered row has a feed position");
+    assert_eq!(
+        feed.cursor_for("waiting-node").await.expect("read"),
+        0,
+        "reading the row does not checkpoint it before the node applies it"
     );
 }
 
@@ -356,6 +437,7 @@ async fn another_consumers_row_is_not_read_as_an_invalidation() {
     // field lookup rather than by the consumer check, so it would pin nothing: the mutant that
     // replaces the consumer comparison with a tautology survives it. This row is refused for
     // exactly one reason, which is the reason under test.
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -422,6 +504,7 @@ async fn a_node_behind_the_retained_window_is_told_to_cold_flush() {
     // THE PRUNE IS DONE DIRECTLY, through the owner pool, because what matters here is the
     // STATE (a cursor before the oldest surviving row), not which component produced it. Driving
     // the reaper would make this a test of the reaper's schedule.
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -517,6 +600,7 @@ async fn a_node_behind_the_retained_window_is_told_to_cold_flush() {
 async fn one_scope_s_invalidations_are_invisible_to_another() {
     // THE FEED IS SCOPED, like everything else. An invalidation naming `config` in one tenant
     // must not make another tenant's node forget its own `config`.
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let mine = db.seed_scope(&env).await;
@@ -551,6 +635,7 @@ async fn applying_a_batch_forgets_the_key_on_this_node_and_checkpoints() {
     use ironauth_hot::{HotState, Ttl, registry};
     use ironauth_store::hot_state::{Applied, PgHotState, apply_invalidations};
 
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -621,6 +706,7 @@ async fn a_use_this_build_does_not_have_is_counted_and_skipped() {
     use ironauth_hot::{HotState, Ttl, registry};
     use ironauth_store::hot_state::{Applied, PgHotState};
 
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -676,6 +762,7 @@ async fn a_cold_flush_checkpoints_so_it_is_not_repeated_for_ever() {
     use ironauth_hot::{HotState, Ttl, registry};
     use ironauth_store::hot_state::{Applied, PgHotState, apply_invalidations};
 
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -753,6 +840,7 @@ async fn broadcast_rows_are_reaped_by_age_because_nothing_completes_them() {
     // COMPLETED or DEAD-LETTERED; an invalidation is never either, so both predicates are false
     // for ever and the rows accumulate. Age is the only rule available, and it is the same
     // number that bounds how far a node may fall behind.
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -807,6 +895,7 @@ async fn a_reap_does_not_touch_another_consumers_rows() {
     // THE CONSUMER FILTER ON THE REAP. Without it, an age-based delete over the shared feed
     // would remove webhook event rows that no consumer had delivered -- the exact thing the
     // reaper's own doc refuses age-based deletion for.
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -857,6 +946,7 @@ async fn a_checkpoint_moves_a_cursor_forward_from_an_existing_row() {
     // the row or tries to move it BACKWARDS. `ON CONFLICT DO NOTHING` would pass all of them,
     // and a cursor that never advances after its first write re-applies every invalidation for
     // ever.
+    let _serialized = CLUSTER.lock().await;
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;

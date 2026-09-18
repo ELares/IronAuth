@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Build the TypeScript hook test component from checked-in source and locked
+  npm dependencies instead of committing a WASM binary. The full gate and CI
+  prepare it automatically; direct integration runs use
+  `scripts/build-ts-hook-fixture.sh`. Ordinary Rust builds remain independent
+  of Node. Patch the component builder dependencies and retain the runtime,
+  sandbox, and upload-size assertions against the generated component.
+
 - Update Wasmtime, WASI and their runtime siblings together to 48.0.2, including the
   upstream fix for generated bindings on the latest Rust nightly. The optional hook
   runtime keeps its declared Rust 1.95 requirement.

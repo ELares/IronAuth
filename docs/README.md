@@ -55,6 +55,7 @@ the [integration guide](INTEGRATIONS.md#management-and-automation) explains it.
 | Deployment lifecycle, workers, probes, and backup planning | [Operations](OPERATIONS.md) |
 | Encryption and recovery | [KEK recovery](KEK-RECOVERY.md) |
 | Security boundaries | [Threat model](THREAT-MODEL.md), [security policy](../SECURITY.md), and [refused features](WILL-NOT-IMPLEMENT.md) |
+| Automated security checks and reviewed dependency exceptions | [Security scanning](SECURITY-SCANNING.md) |
 | Release and versioning process | [Releasing](RELEASING.md) and [changelog index](../CHANGELOG.md) |
 | OIDF harness and actual enforcement status | [Conformance overview](conformance/README.md), [profile matrix](conformance/MATRIX.md), and [runner runbook](conformance/RUNBOOK.md) |
 | MCP authorization evidence | [Measured conformance page](conformance/mcp.md) |

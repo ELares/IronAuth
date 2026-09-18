@@ -29,6 +29,12 @@ to pick an open issue in the current milestone and say so on the issue.
   `tail -1 gate.log` for the verdict. The summary prints from an EXIT trap, so it
   survives an interrupt, and it reports every failing check rather than the first.
   `gate.log` is gitignored.
+  The full gate requires Node and npm: it builds the TypeScript hook fixture
+  from its checked-in source before running Rust integration tests. Use a Node
+  version supported by the [console package](packages/admin-spa/README.md).
+  For a direct hook, admin upload-cap, or store migration test run, prepare the
+  fixture first with `scripts/build-ts-hook-fixture.sh`. Ordinary Rust builds
+  do not require Node or the generated component.
 - **New fuzz targets run in CI.** Three things must agree, not two. A fuzz target
   is registered by a `[[bin]]` entry in its `*/fuzz/Cargo.toml`, it only ever
   EXECUTES if it also has a row in the `.github/workflows/fuzz.yml` matrix, and
@@ -90,6 +96,9 @@ surface, ask on the issue before opening the PR.
 Never open a public issue for a suspected vulnerability; see
 [SECURITY.md](SECURITY.md) for private reporting and the safe-harbor
 commitment.
+
+See [security scanning](docs/SECURITY-SCANNING.md) for automated checks,
+dependency exceptions, and how to investigate a finding without hiding it.
 
 ## Licensing
 
@@ -199,6 +208,11 @@ The console's current dependency tree requires Node
 The local gate checks compilation, formatting, Clippy, tests, security
 invariants, generated contracts, and documentation freshness. Read
 [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change.
+The full gate also uses Node and npm to build the TypeScript hook test fixture
+from source. For direct integration tests, run
+`scripts/build-ts-hook-fixture.sh` first; ordinary Rust builds use no Node tools.
+See [security scanning](docs/SECURITY-SCANNING.md) for scanner coverage and
+reviewed dependency exceptions.
 
 ## Repository layout
 
@@ -245,9 +259,9 @@ vulnerability privately and what you can expect from us.
 Please report suspected security issues privately. Do not open a public issue
 for a vulnerability.
 
-- Preferred: GitHub private vulnerability reporting on this repository (the
-  "Report a vulnerability" button under the Security tab). This channel is
-  monitored by the maintainer.
+- Preferred: [GitHub private vulnerability reporting](https://github.com/ELares/IronAuth/security/advisories/new)
+  on this repository (the "Report a vulnerability" button under the Security
+  tab). This channel is monitored by the maintainer.
 - A dedicated security inbox will be published here once project
   infrastructure exists; until then the GitHub channel is authoritative.
 
@@ -272,6 +286,9 @@ reporting per this policy. This commitment reflects the published
 ship to everyone simultaneously.
 
 ## Advisories
+
+Published security advisories are available on the repository's
+[GitHub security advisories page](https://github.com/ELares/IronAuth/security/advisories).
 
 Every advisory follows the format defined in
 [docs/RELEASING.md](docs/RELEASING.md): it names the exact artifact, the
@@ -1615,8 +1632,10 @@ jobs:
   login:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
 
       # The emulator starts its own throwaway cluster, so install the binaries,
       # not a service container.
@@ -8880,8 +8899,9 @@ BOTH directions, which is what makes this page worth writing a dashboard against
 - a metric emitted and not listed here fails the build, so a series cannot appear on your
   scrape without having been reviewed.
 
-The labels are checked the same way, and the kind is too: a site that emits a label this page
-does not list, or omits one it does, or emits as a gauge what this page calls a counter, fails.
+The labels and kind are checked too: an emitted label this page does not list, a declared
+label absent from every emit site, or a gauge this page calls a counter fails. An individual
+site may emit a subset of the declared labels; the check compares their union across sites.
 
 THAT SENTENCE WAS PUBLISHED BEFORE IT WAS TRUE, which is worth leaving here rather than quietly
 correcting. The label check ran over emit sites resolved through one crate's constants only, so
@@ -9041,6 +9061,13 @@ toolchain may be newer than either minimum. Node is needed to develop or rebuild
 the console; Rust builds use its committed embedded assets. See
 [compatibility](COMPATIBILITY.md) and the
 [console package guide](../packages/admin-spa/README.md).
+
+The full development gate additionally requires Node and npm to build the
+TypeScript hook test component. Direct hook integration, admin upload-cap, and
+store migration tests need `scripts/build-ts-hook-fixture.sh` first. The
+component is generated and ignored; production Rust builds do not need it or
+Node. See the [hook sample](../crates/ironauth-hooks/guests-ts/README.md) and
+[security scanning](SECURITY-SCANNING.md).
 
 ## Configure a persistent deployment
 
@@ -9283,6 +9310,15 @@ leases, retry bounds, dead-letter states, and per-aggregate ordering. Queue
 concurrency and polling are per process and per consumer; size them with the
 number of replicas and database capacity in mind. A stored configuration or
 queued job does not prove its worker is enabled.
+
+Budget PostgreSQL connections for all serving, control-plane, and dedicated
+consumer pools across every replica, with room for migrations and administration.
+Several pools start in each process; the PostgreSQL default of 100 connections
+can be exhausted by three replicas even before external traffic arrives. The
+three-replica CI smoke fixture uses 300 connections. Size production capacity
+for its enabled workers and workload rather than treating that fixture value as
+a deployment guarantee. If discovery fails during a cold start, inspect
+PostgreSQL connection-limit errors and pool waits as well as tenant state.
 
 | Worker or service | Runtime setting or prerequisite |
 | --- | --- |
@@ -9536,6 +9572,7 @@ the [integration guide](INTEGRATIONS.md#management-and-automation) explains it.
 | Deployment lifecycle, workers, probes, and backup planning | [Operations](OPERATIONS.md) |
 | Encryption and recovery | [KEK recovery](KEK-RECOVERY.md) |
 | Security boundaries | [Threat model](THREAT-MODEL.md), [security policy](../SECURITY.md), and [refused features](WILL-NOT-IMPLEMENT.md) |
+| Automated security checks and reviewed dependency exceptions | [Security scanning](SECURITY-SCANNING.md) |
 | Release and versioning process | [Releasing](RELEASING.md) and [changelog index](../CHANGELOG.md) |
 | OIDF harness and actual enforcement status | [Conformance overview](conformance/README.md), [profile matrix](conformance/MATRIX.md), and [runner runbook](conformance/RUNBOOK.md) |
 | MCP authorization evidence | [Measured conformance page](conformance/mcp.md) |
@@ -9977,6 +10014,129 @@ stack needs to know that Vue support is a scheduling decision with a stated trig
 omission that might be fixed next week -- because those two answers lead to different
 decisions. Publishing the trigger also constrains us: a deferral whose trigger has fired and
 that has not been revisited is a visible contradiction rather than a quiet one.
+
+---
+
+# Security scanning
+
+Source: docs/SECURITY-SCANNING.md
+
+# Security scanning
+
+IronAuth checks source code, dependencies, and repository practices separately.
+A green scan is evidence for its configured checks, not a promise that every
+vulnerability or operating risk has been eliminated. Report suspected new
+vulnerabilities through the [private reporting channel](../SECURITY.md).
+
+## Automated checks
+
+| Check | Coverage and trigger | Limits |
+| --- | --- | --- |
+| CodeQL | JavaScript/TypeScript, Python, Go, Rust, and GitHub Actions; every PR, every main push, a weekly schedule, and manual runs. The workflow uses `security-extended` queries and uploads a separate result category per language. | Only completed extraction and analysis runs provide results. CodeQL does not cover every language or prove application behavior. |
+| Dependency Review | Every PR; fails on newly introduced moderate or higher vulnerabilities in runtime, development, and unknown scopes. | Uses GitHub's dependency graph and advisory coverage. It compares changes rather than auditing every pre-existing dependency. |
+| OpenSSF Scorecard | Main pushes and scheduled runs; uploads repository-practice findings to code scanning. | Some checks measure historical reviews, CI, age, or external enrollment rather than current source defects. |
+| Cargo deny | The local gate and CI check Rust advisories, licenses, bans, and approved sources using `deny.toml`. | Three narrowly documented advisory exceptions remain below. |
+| Fuzzing and behavioral tests | CI compiles registered fuzz targets; the local gate exercises parser, isolation, authentication, and invariant tests. | Each target and suite has a defined input surface. A passing run is not exhaustive. |
+
+The workflow files in [.github/workflows](../.github/workflows/) are authoritative
+for triggers, permissions, and query settings. CodeQL scans documentation-only
+changes too, so its coverage does not depend on a path filter. Main analyses
+retain separate runs rather than cancelling a prior commit's scan.
+
+Repository settings must enable the dependency graph and Dependabot alerts for
+dependency review to use the comparison API. Dependabot security updates propose
+patches; they still need validation against the repository's compatibility and
+license promises. Private vulnerability reporting is a separate setting and
+must remain enabled for the link in `SECURITY.md` to work.
+
+## Reproducible inputs
+
+Workflow actions use full commit hashes with readable version comments. Verify
+the upstream commit and action inputs when updating a pin; changing a comment
+does not update the action. Dependabot tracks action updates. The Rust 1.85
+action pin installs 1.85.1, preserving the published compatibility floor.
+
+Node projects use committed lockfiles and `npm ci`. The TypeScript hook sample
+and integration fixture are built from the same checked-in source; no generated
+WASM component is committed. The full gate and CI build it before testing. For
+a direct integration run:
+
+```sh
+scripts/build-ts-hook-fixture.sh
+cargo test --locked -p ironauth-hooks --test typescript_hook --release
+```
+
+This preparation needs Node and npm. Ordinary Rust builds do not invoke Node,
+fetch npm packages, or require the generated test component. The
+[sample guide](../crates/ironauth-hooks/guests-ts/README.md) describes the locked
+builder, sandbox assertions, and size bounds. `scripts/ts-hook-freshness.sh`
+builds a temporary component and tests the actual loader override and behavior.
+
+Discovery, token, and capture JSON in the development scripts is downloaded to
+temporary files and parsed by fixed local Python code. Remote responses are
+data, not downloaded executable programs. Keep that distinction when modifying
+these scripts.
+
+## Reviewed Rust dependency exceptions
+
+The following entries already existed in `deny.toml`. The security remediation
+updates their explanations rather than adding a broad ignore. They are not
+patched dependencies. Re-check consumer source and the complete dependency
+graph whenever a relevant dependency or feature changes.
+
+| Advisory | Dependency and actual use | Remaining constraint and next action |
+| --- | --- | --- |
+| [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436.html) | `paste` is an unmaintained compile-time macro reached through `cel` 0.11.6; it contributes no runtime code. | CEL versions that remove it require Rust 1.86 in practice or by declaration. Upgrade CEL and remove the exception when the default MSRV is raised to at least 1.86. |
+| [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071.html) | `rsa` generates and exports a key in `ironauth-jose`, and verifies public-key signatures in the Fastly snippet. Neither consumer performs private-key decryption or signs with this crate; the Marvin decryption path is unreachable. | No fixed upstream release is available. Any new private-key decryption or signing use invalidates the justification and requires a fresh review before shipping. |
+| [RUSTSEC-2026-0009](https://rustsec.org/advisories/RUSTSEC-2026-0009.html) | `time` 0.3.41 ships through LDAP X.509 parsing and also reaches test code through `rcgen`. Its parsing feature is compiled, but consumers construct ASN.1 dates or format RFC 2822 output; none calls the vulnerable RFC 2822 input parser. | The fix in 0.3.47 requires Rust 1.88, above the default Rust 1.85 promise. Upgrade and remove the exception when that promise changes; any new RFC 2822 parsing invalidates the current justification. |
+
+Do not describe `time` as test-only, absent from the binary, or fixed. Its
+exception relies on current call paths. Likewise, the `rsa` exception must
+account for the Fastly verifier, not just server key generation.
+
+Useful review commands include:
+
+```sh
+cargo tree -i time --all-features
+cargo tree -i rsa --all-features
+cargo tree -i paste --all-features
+cargo deny check
+```
+
+Follow these with a source review of every consumer. A dependency tree alone
+cannot establish whether an affected function is called. An independent OSV
+scan can still report these entries even when Cargo deny accepts the reviewed
+exceptions; preserve that visibility rather than suppressing future findings.
+
+## Investigating Scorecard findings
+
+Read the rule's evidence and scan commit before editing or dismissing an alert.
+The [Scorecard check definitions](https://github.com/ossf/scorecard/blob/main/docs/checks.md)
+explain the measurements. A fresh main scan is required to verify a remediation
+landed; a PR scan alone does not update main's findings.
+
+- **Pinned dependencies, binary artifacts, security policy:** fix the current
+  source or policy and re-scan. Keep generated test artifacts out of Git.
+- **Vulnerabilities:** independently audit all relevant lockfiles and review
+  every residual advisory. An aggregate finding can contain aliases for the
+  same defect. Do not treat a raw identifier count as a count of distinct bugs.
+- **SAST and CI tests:** verify actual completed analyses and test checks on
+  merged commits. Historical windows can remain below their maximum immediately
+  after enabling a workflow; do not rewrite history to manufacture coverage.
+- **Code review:** human-authored changes require independent review. A self
+  review or an admin override does not constitute independent approval, and
+  existing branch protection cannot repair historical review records.
+- **Maintained:** Scorecard also considers repository age. This repository was
+  created on July 12, 2026 and reaches 90 days on October 10, 2026. Keep actual
+  maintenance evidence and reassess after the age threshold; do not fabricate it.
+- **OpenSSF Best Practices:** a badge requires genuine enrollment and a truthful
+  assessment at [bestpractices.dev](https://www.bestpractices.dev/). Adding a badge
+  image or declaring an invented project ID does not satisfy the check.
+
+Dismiss only a finding that has a defensible recorded disposition. Include the
+actual reason, evidence, scan commit, and follow-up condition. Accepted risk is
+different from a false positive or a patched issue. Do not disable a scanner or
+weaken its query set just to clear the dashboard.
 
 ---
 

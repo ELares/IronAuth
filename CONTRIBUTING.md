@@ -17,6 +17,12 @@ to pick an open issue in the current milestone and say so on the issue.
   `tail -1 gate.log` for the verdict. The summary prints from an EXIT trap, so it
   survives an interrupt, and it reports every failing check rather than the first.
   `gate.log` is gitignored.
+  The full gate requires Node and npm: it builds the TypeScript hook fixture
+  from its checked-in source before running Rust integration tests. Use a Node
+  version supported by the [console package](packages/admin-spa/README.md).
+  For a direct hook, admin upload-cap, or store migration test run, prepare the
+  fixture first with `scripts/build-ts-hook-fixture.sh`. Ordinary Rust builds
+  do not require Node or the generated component.
 - **New fuzz targets run in CI.** Three things must agree, not two. A fuzz target
   is registered by a `[[bin]]` entry in its `*/fuzz/Cargo.toml`, it only ever
   EXECUTES if it also has a row in the `.github/workflows/fuzz.yml` matrix, and
@@ -78,6 +84,9 @@ surface, ask on the issue before opening the PR.
 Never open a public issue for a suspected vulnerability; see
 [SECURITY.md](SECURITY.md) for private reporting and the safe-harbor
 commitment.
+
+See [security scanning](docs/SECURITY-SCANNING.md) for automated checks,
+dependency exceptions, and how to investigate a finding without hiding it.
 
 ## Licensing
 

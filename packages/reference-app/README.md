@@ -106,11 +106,12 @@ is the localization seam: a fork localizes by passing a locale overrides map to
 
    ```sh
    cd packages/reference-app
-   npm install
+   npm ci
    npm run build
    ```
 
-   `npm run build` runs `tsc`, which typechecks and emits plain ES modules to
+   The committed lockfile pins the toolchain dependencies. `npm run build`
+   runs `tsc`, which typechecks and emits plain ES modules to
    `dist/`. There is no bundler and no runtime dependency: `dist/main.js` loads
    directly in the browser.
 

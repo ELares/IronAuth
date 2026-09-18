@@ -37,7 +37,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "mcp-conformance: building the sample server"
-(cd packages/mcp-sample && npm install --silent >/dev/null 2>&1 && npm run build >/dev/null)
+(cd packages/mcp-sample && npm ci --silent >/dev/null 2>&1 && npm run build >/dev/null)
 
 # THE RUST BINARY IS BUILT BEFORE THE CLOCK, and this line is what makes the paragraph below
 # true. It used to say the clock started "AFTER the toolchain build" while nothing had built
@@ -94,7 +94,7 @@ fi
 # not exist and a client following the 401 pointer finds a 404. `apply` is the path that
 # registers one: the management API exposes resource servers read-only.
 TENANT=$(echo "${ISSUER}" | sed 's#.*/t/##; s#/e/.*##')
-ENVIRONMENT=$(echo "${ISSUER}" | sed 's#.*/e/##')
+ENVIRONMENT=${ISSUER##*/e/}
 cat > "${WORK}/resources.json" <<JSON
 {
   "schema_version": "ironauth.config-snapshot/v1",

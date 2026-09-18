@@ -44,31 +44,35 @@ yanked = "deny"
 # Scoped advisory ignore (issue #93). RUSTSEC-2023-0071 ("Marvin Attack") is a
 # TIMING side channel in the `rsa` crate's RSA DECRYPTION path (PKCS#1 v1.5
 # unpadding). IronAuth uses the `rsa` crate ONLY to GENERATE a day-one RS256
-# signing key and export it to PKCS#1 DER (crates/ironauth-jose keygen); it never
-# decrypts and never signs with the `rsa` crate. Signing and verification run
-# exclusively on `ring`. The vulnerable decryption path is therefore UNREACHABLE
+# signing key and export it to PKCS#1 DER (crates/ironauth-jose keygen), and for
+# public-key signature verification in snippets/fastly-compute-verify. It never
+# decrypts or signs with the `rsa` crate. The server signs and verifies with
+# `ring`; the snippet holds no private RSA key. The decryption path is UNREACHABLE
 # in this tree. There is no fixed release of `rsa` for this advisory yet, so the
 # only options are ignore-with-justification or vendoring keygen; the former is
 # correct given the path is unreachable. The dep-review lens MUST re-confirm the
-# `rsa` crate is never used to decrypt or sign before this ignore is trusted.
+# `rsa` crate is never used to decrypt or sign before this ignore is trusted,
+# including the Fastly snippet.
 # Scoped advisory ignore (issue #959). RUSTSEC-2026-0009 is a stack-exhaustion DoS
 # in `time`'s parser, fixed in 0.3.47. This tree holds `time` at 0.3.41 and cannot
 # take the fix: 0.3.47 declares `rust-version = "1.88"` and this workspace promises
 # 1.85, so the two constraints are mutually exclusive until the MSRV moves.
 #
-# The path is UNREACHABLE in anything shipped. `cargo tree -i time --all-features`
-# shows exactly one route into the graph: rcgen -> ironauth-fetch. rcgen is an
-# OPTIONAL dependency enabled only by ironauth-fetch's non-default `test-harness`
-# feature, which exists so a test can mint a throwaway TLS identity. No default
-# build of any crate in this workspace reaches `time` at all, so no released binary
-# links the vulnerable parser, and nothing parses attacker-supplied input with it:
-# rcgen uses it to stamp certificate validity dates on material generated in-process
-# by the test itself.
+# `time` DOES ship: ironauth-admin -> ldap3 -> x509-parser/asn1-rs, in addition
+# to rcgen behind ironauth-fetch's non-default `test-harness` feature. The parsing
+# feature is enabled, so a claim that the dependency or parser is absent is false.
+# The advisory affects RFC 2822 INPUT parsing specifically. ASN.1 certificate
+# dates instead parse UTCTime/GeneralizedTime fields and construct time::Date and
+# time::Time in asn1-rs's datetime.rs. x509-parser's only Rfc2822 use is OUTPUT
+# formatting in ASN1Time::to_rfc2822. rcgen constructs certificate validity dates.
+# Neither these dependencies nor repository code parse RFC 2822 input with time,
+# so the vulnerable call path is currently unreachable, not removed or patched.
+# Source: https://github.com/time-rs/time/security/advisories/GHSA-r6v5-fh4h-64xc
 #
 # Re-confirm before trusting this ignore: `cargo tree -i time --all-features` must
-# still show rcgen as the only path, and rcgen must still be optional and
-# test-harness-gated in crates/ironauth-fetch/Cargo.toml. If either changes, or if
-# the MSRV moves to 1.88, drop this entry and take time >= 0.3.47.
+# identify every consumer, and their source must still avoid RFC 2822 input
+# parsing. Any new parser call invalidates this justification. When the MSRV
+# moves to 1.88, drop this entry and take time >= 0.3.47.
 # Scoped advisory ignore (issue #113). RUSTSEC-2024-0436 is an UNMAINTAINED notice, not a
 # vulnerability, against `paste` -- a COMPILE-TIME proc macro that pastes identifiers
 # together and contributes no runtime code to any binary. It reaches this workspace through
@@ -87,8 +91,8 @@ yanked = "deny"
 # only path. If the MSRV promise moves to 1.86 or above, drop this entry and take cel 0.14.
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is UNMAINTAINED, not vulnerable, and is a compile-time proc macro contributing no runtime code. It reaches the graph only through cel 0.11.6, which is pinned below 0.12/0.13/0.14 because none of those COMPILES at this workspace's 1.85 MSRV promise (0.13/0.14 declare 1.86; 0.12.0 declares 1.82 but needs 1.86). Drop this and take cel 0.14 when the MSRV moves." },
-    { id = "RUSTSEC-2023-0071", reason = "rsa crate used only for RS256 keygen + DER export (crates/ironauth-jose); never decrypts or signs, so the Marvin decryption-timing path is unreachable. Signing/verification is on ring." },
-    { id = "RUSTSEC-2026-0009", reason = "time 0.3.41 reaches the graph ONLY through rcgen, an optional dependency behind ironauth-fetch's non-default test-harness feature; no default build links it, so the parser DoS is unreachable in any released artifact. The fix (0.3.47) requires rustc 1.88 against this workspace's 1.85 MSRV promise." },
+    { id = "RUSTSEC-2023-0071", reason = "rsa performs RS256 keygen + DER export in ironauth-jose and public-key verification in the Fastly snippet; neither consumer decrypts or signs with rsa. The Marvin private-key decryption timing path is unreachable; no fixed release is available." },
+    { id = "RUSTSEC-2026-0009", reason = "time 0.3.41 ships through LDAP X.509 parsing and also reaches the test harness through rcgen. The advisory affects RFC 2822 input parsing, which no current consumer invokes: asn1-rs constructs dates from ASN.1 fields, x509-parser only formats RFC 2822 output, and rcgen constructs validity timestamps. The dependency is unpatched; time >=0.3.47 requires rustc 1.88 above the default MSRV 1.85. Re-audit all consumers if the graph changes." },
 ]
 
 [sources]

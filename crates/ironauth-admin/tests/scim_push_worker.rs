@@ -43,6 +43,12 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use tower::ServiceExt;
 
+// Fixtures use separate databases, but the event feed's oldest-running-transaction
+// watermark is cluster-wide. Finish one fixture's setup and reads before another
+// test starts migrations or seed transactions. Concurrency inside each test stays
+// intact, including the checkpoint race and downstream outage/replay controls.
+static CLUSTER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const TOKEN: &str = "downstream-bearer-token";
 const BASE: &str = "https://downstream.example/scim/v2";
 
@@ -522,6 +528,7 @@ impl Harness {
 
 #[tokio::test]
 async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing() {
+    let _cluster = CLUSTER.lock().await;
     // #137 requires the backfill to be RESUMABLE. The test kills it between pages and asserts
     // that the second run continues rather than restarting: for a large org, restarting means
     // re-pushing tens of thousands of people, and the interesting failure is the other one, where
@@ -647,6 +654,7 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
 
 #[tokio::test]
 async fn a_backfill_never_pushes_a_subject_outside_the_connections_scope() {
+    let _cluster = CLUSTER.lock().await;
     // Criterion 4's first half, on the enumeration path rather than the event path. An
     // out-of-scope person must not be provisioned by the initial sweep either, and this is the
     // sweep that touches everybody.
@@ -691,6 +699,7 @@ async fn a_backfill_never_pushes_a_subject_outside_the_connections_scope() {
 
 #[tokio::test]
 async fn a_connection_that_is_not_enumerating_cannot_run_a_backfill_pass() {
+    let _cluster = CLUSTER.lock().await;
     // The mirror of the tail pass's guard. Running an enumeration against a connection that is
     // already tailing would re-push everybody and, worse, the completing pass would then move a
     // live cursor.
@@ -727,6 +736,7 @@ async fn a_connection_that_is_not_enumerating_cannot_run_a_backfill_pass() {
 
 #[tokio::test]
 async fn a_group_reaches_the_downstream_through_the_tail_and_the_backfill() {
+    let _cluster = CLUSTER.lock().await;
     // WHY THIS EXISTS. Criterion 1 asks that the fixture receive writes for in-scope users AND
     // GROUPS, and three separate layers proved their group half: the client converges `/Groups`,
     // the mapper builds a Group body with no `active`, and the translator maps every `org_group.*`
@@ -841,6 +851,7 @@ async fn a_group_reaches_the_downstream_through_the_tail_and_the_backfill() {
 
 #[tokio::test]
 async fn a_group_departure_is_refused_under_deactivate_and_deletes_under_delete() {
+    let _cluster = CLUSTER.lock().await;
     // WHY THIS EXISTS. Criterion 1's third verb is delete/deactivate, and for GROUPS it was the
     // one composition nothing drove. It is also the one this module's own header calls out as
     // having wedged a page: RFC 7643 section 4.2 gives Group no `active`, so a group departure
@@ -952,6 +963,7 @@ async fn a_group_departure_is_refused_under_deactivate_and_deletes_under_delete(
 
 #[tokio::test]
 async fn losing_the_checkpoint_race_is_not_recorded_as_a_connection_failure() {
+    let _cluster = CLUSTER.lock().await;
     // WHY THIS EXISTS. Losing the compare-and-set answers `StoreError::NotFound`, and the driver
     // recorded EVERY error as a connection failure: the loser wrote a failure count, an error
     // string naming an internal condition, and a doubling pause. Nothing had failed. Two healthy
@@ -1026,6 +1038,7 @@ async fn losing_the_checkpoint_race_is_not_recorded_as_a_connection_failure() {
 
 #[tokio::test]
 async fn the_driver_runs_due_connections_and_writes_the_backoff_a_failure_earns() {
+    let _cluster = CLUSTER.lock().await;
     // WHY THIS TEST EXISTS. `run_tail_pass` and `run_backfill_pass` had no caller outside the
     // suite, so criteria 1, 3 and 4 were satisfied by code nothing ran: the tests called those
     // functions directly, which is exactly why they passed and exactly why they proved less than
@@ -1142,6 +1155,7 @@ async fn the_driver_runs_due_connections_and_writes_the_backoff_a_failure_earns(
 
 #[tokio::test]
 async fn a_pass_pushes_each_event_then_checkpoints_once() {
+    let _cluster = CLUSTER.lock().await;
     let h = Harness::start().await;
     let directory = Directory::with("usr_ada", "ada");
     h.start_tailing_from(0).await;
@@ -1225,6 +1239,7 @@ async fn a_pass_pushes_each_event_then_checkpoints_once() {
 
 #[tokio::test]
 async fn an_outage_leaves_the_cursor_where_it_was_and_the_replay_does_not_duplicate() {
+    let _cluster = CLUSTER.lock().await;
     // CRITERION 3, driven rather than argued. The downstream is killed mid-sync and restored, and
     // the assertion is on the END STATE: one resource, not two.
     let h = Harness::start().await;
@@ -1308,6 +1323,7 @@ async fn an_outage_leaves_the_cursor_where_it_was_and_the_replay_does_not_duplic
 
 #[tokio::test]
 async fn an_out_of_scope_subject_is_never_pushed_and_one_that_leaves_is_withdrawn() {
+    let _cluster = CLUSTER.lock().await;
     // CRITERION 4, both halves, from one rule: whether a link exists says whether this connection
     // ever provisioned the subject.
     let h = Harness::start().await;
@@ -1386,6 +1402,7 @@ async fn an_out_of_scope_subject_is_never_pushed_and_one_that_leaves_is_withdraw
 
 #[tokio::test]
 async fn a_cursor_the_feed_has_pruned_past_is_reported_rather_than_silently_restarted() {
+    let _cluster = CLUSTER.lock().await;
     // WHY THIS ARM MATTERS. When a consumer's own position has been pruned, the feed answers
     // `Gone` rather than a page, and there are three things a worker could do with that. Two are
     // wrong: treating it as an empty poll makes the connection sit healthy for ever while it
@@ -1476,6 +1493,7 @@ async fn a_cursor_the_feed_has_pruned_past_is_reported_rather_than_silently_rest
 
 #[tokio::test]
 async fn a_paused_connection_reads_nothing_and_moves_nothing() {
+    let _cluster = CLUSTER.lock().await;
     let h = Harness::start().await;
     let directory = Directory::with("usr_ada", "ada");
     h.start_tailing_from(0).await;

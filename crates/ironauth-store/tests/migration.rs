@@ -8718,7 +8718,8 @@ async fn the_version_timestamp_advances_within_a_transaction() {
 ///
 /// This substitutes the real artifact's byte count into each constraint's own expression and
 /// asks POSTGRES whether it holds. Spelling cannot matter to that, and the number under test is
-/// the committed component's actual size rather than a copy of it.
+/// the source-built component's actual size rather than a copy of it. Prepare it with
+/// `./scripts/build-ts-hook-fixture.sh` before running this test.
 #[tokio::test]
 async fn every_component_bound_admits_the_shipped_typescript_hook() {
     // `start` runs the production chain on a fresh database, so what is scanned below is the
@@ -8735,7 +8736,10 @@ async fn every_component_bound_admits_the_shipped_typescript_hook() {
     let sample_bytes = i64::try_from(
         std::fs::metadata(sample)
             .unwrap_or_else(|error| {
-                panic!("the committed TypeScript component ({sample}): {error}")
+                panic!(
+                    "the source-built TypeScript component ({sample}): {error}; \
+                     run ./scripts/build-ts-hook-fixture.sh before running this test"
+                )
             })
             .len(),
     )

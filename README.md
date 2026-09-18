@@ -94,6 +94,11 @@ The console's current dependency tree requires Node
 The local gate checks compilation, formatting, Clippy, tests, security
 invariants, generated contracts, and documentation freshness. Read
 [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change.
+The full gate also uses Node and npm to build the TypeScript hook test fixture
+from source. For direct integration tests, run
+`scripts/build-ts-hook-fixture.sh` first; ordinary Rust builds use no Node tools.
+See [security scanning](docs/SECURITY-SCANNING.md) for scanner coverage and
+reviewed dependency exceptions.
 
 ## Repository layout
 
