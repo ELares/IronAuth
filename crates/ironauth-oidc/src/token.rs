@@ -262,6 +262,18 @@ fn grant_label(raw: Option<&str>) -> &'static str {
         .map_or(GRANT_NONE, GrantType::as_str)
 }
 
+/// Seconds elapsed since `started`, read off the clock seam.
+///
+/// SPLIT OUT SO IT CAN BE PINNED. The integration test runs a frozen `ManualClock`, so every
+/// duration it observes is zero whether this reads the seam, reads the wall clock, or returns a
+/// constant -- three implementations that render identically, one of which ships a latency panel
+/// that says zero for ever. Nothing in a handler test can tell them apart, because nothing can
+/// advance the clock in the middle of a request. A function taking the clock CAN be handed one
+/// that moves, which is what `elapsed_is_read_from_the_clock_seam` below does.
+fn elapsed_seconds(clock: &dyn ironauth_env::Clock, started: std::time::Instant) -> f64 {
+    clock.monotonic().duration_since(started).as_secs_f64()
+}
+
 /// Record one token request against both metrics.
 fn observe_exchange(
     state: &OidcState,
@@ -269,7 +281,7 @@ fn observe_exchange(
     outcome: &'static str,
     started: std::time::Instant,
 ) {
-    let elapsed = state.env().clock().monotonic().duration_since(started);
+    let elapsed = elapsed_seconds(state.env().clock(), started);
     metrics::counter!(
         TOKEN_REQUESTS_TOTAL,
         "grant_type" => grant_type,
@@ -280,7 +292,58 @@ fn observe_exchange(
         TOKEN_REQUEST_DURATION_SECONDS,
         "grant_type" => grant_type,
     )
-    .record(elapsed.as_secs_f64());
+    .record(elapsed);
+}
+
+#[cfg(test)]
+mod issuance_metric_tests {
+    use std::time::Duration;
+
+    use ironauth_env::{Clock, Env};
+
+    use super::{GRANT_NONE, elapsed_seconds, grant_label};
+
+    /// The duration is the clock's, and it MOVES. A constant zero, a wall-clock read, and a
+    /// correct seam read are indistinguishable under the frozen clock the handler tests use; a
+    /// clock this test advances tells them apart.
+    #[test]
+    fn elapsed_is_read_from_the_clock_seam() {
+        let (_env, clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 7);
+        let started = clock.monotonic();
+        assert!(
+            elapsed_seconds(clock.as_ref(), started).abs() < f64::EPSILON,
+            "nothing has advanced yet"
+        );
+        clock.advance(Duration::from_millis(250));
+        assert!(
+            (elapsed_seconds(clock.as_ref(), started) - 0.25).abs() < f64::EPSILON,
+            "the recorded value tracks the clock, so a constant cannot pass"
+        );
+        clock.advance(Duration::from_millis(750));
+        assert!(
+            (elapsed_seconds(clock.as_ref(), started) - 1.0).abs() < f64::EPSILON,
+            "and keeps tracking it"
+        );
+    }
+
+    /// The label is the PARSED grant or the sentinel, never the caller's string.
+    #[test]
+    fn the_grant_label_is_never_the_callers_string() {
+        assert_eq!(
+            grant_label(Some("client_credentials")),
+            "client_credentials"
+        );
+        assert_eq!(grant_label(Some("  refresh_token  ")), "refresh_token");
+        assert_eq!(grant_label(None), GRANT_NONE);
+        assert_eq!(grant_label(Some("")), GRANT_NONE);
+        assert_eq!(grant_label(Some("   ")), GRANT_NONE);
+        assert_eq!(grant_label(Some("password")), GRANT_NONE);
+        assert_eq!(grant_label(Some("urn:example:anything")), GRANT_NONE);
+        // A value long enough to be an attack on the label store, and one carrying the
+        // exposition's own delimiters.
+        assert_eq!(grant_label(Some(&"a".repeat(4096))), GRANT_NONE);
+        assert_eq!(grant_label(Some("a\"b{c}d\n")), GRANT_NONE);
+    }
 }
 
 async fn exchange(

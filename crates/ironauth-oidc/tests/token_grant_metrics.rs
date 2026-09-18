@@ -3,10 +3,12 @@
 //! Token issuance rate and latency by grant type (issue #152).
 //!
 //! The issue asks the metric contract to carry "token issuance rate and latency by grant type".
-//! Nothing did: the complete contract held forty-one series and none of them said anything about
-//! the token endpoint, so the one number an operator asks for first -- are tokens still being
-//! issued, and by which grant -- had to be inferred from the HTTP route counter, which cannot
-//! separate an issuance from a refusal.
+//! Nothing did. Three contract entries are emitted from this endpoint's module
+//! (`ironauth_oidc_code_reuse_total`, `ironauth_oidc_redeem_error_total` and
+//! `ironauth_oidc_refresh_reuse_total`), but each counts one specific abuse signal and none of
+//! them is a request rate. `ironauth_http_requests_total{route,status}` does separate a 200 from
+//! a 400 on `/token`, so the gap is narrower than "no visibility": what could not be asked was
+//! which GRANT the traffic is, and which OAuth error the refusals carry.
 //!
 //! # What this asserts beyond "the counter moved"
 //!
@@ -72,9 +74,27 @@ fn series_value(rendered: &str, name: &str, labels: &[(&str, &str)]) -> Option<f
     None
 }
 
-/// The value of one labeled series, or zero when it is absent.
-fn series(rendered: &str, name: &str, labels: &[(&str, &str)]) -> f64 {
-    series_value(rendered, name, labels).unwrap_or(0.0)
+/// The value of one labeled counter series, or zero when it is absent.
+///
+/// A counter and a histogram's `_count` are whole numbers, so they are compared as integers: a
+/// float equality on a metric value is a lint here and a rounding argument nobody wants to have.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "counters are whole"
+)]
+fn series(rendered: &str, name: &str, labels: &[(&str, &str)]) -> u64 {
+    series_value(rendered, name, labels).unwrap_or(0.0).round() as u64
+}
+
+/// The value of one labeled counter series, or [`None`] when it is absent.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "counters are whole"
+)]
+fn count(rendered: &str, name: &str, labels: &[(&str, &str)]) -> Option<u64> {
+    series_value(rendered, name, labels).map(|value| value.round() as u64)
 }
 
 const REQUESTS: &str = "ironauth_token_requests_total";
@@ -117,9 +137,31 @@ async fn token_requests_are_counted_by_grant_type_and_outcome() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    // TWO UNSERVICED GRANTS, and they are the point of this test. `password` is the ROPC grant
-    // this build refuses to express at all; the second is a string with nothing behind it.
-    for unserviced in ["password", "urn:example:made-up-by-the-caller"] {
+    // A BODY THE ENDPOINT CANNOT PARSE, which is the branch the recording site sits before the
+    // parse to reach. Repeating a scalar parameter is a duplicate field to `serde_urlencoded`,
+    // so the whole body is refused and NO field is read, including the two serviced grant names
+    // in it. That is the case worth pinning: the label is `none` because the request could not
+    // be read, not because it named nothing.
+    let (status, _headers, _body) = harness
+        .token_with_auth(
+            "grant_type=client_credentials&grant_type=refresh_token",
+            Some(&auth),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unparsable body is refused"
+    );
+
+    // TWO UNSERVICED GRANTS, and they are the point of this test. Both are strings with nothing
+    // behind them, and both are spelled so they cannot occur anywhere else in the exposition:
+    // the leak assertion below greps the whole rendered document, and "password" would have
+    // matched seven of this build's own metric names had it been used as a probe.
+    for unserviced in [
+        "urn:example:probe-alpha-Nn7Qv",
+        "urn:example:probe-beta-Zk2Rw",
+    ] {
         let (status, _headers, _body) = harness
             .token_with_auth(&form(&[("grant_type", unserviced)]), Some(&auth))
             .await;
@@ -130,92 +172,103 @@ async fn token_requests_are_counted_by_grant_type_and_outcome() {
         );
     }
 
-    let rendered = handle.render();
+    assert_exposition(&handle.render());
+}
 
+/// Every assertion about the rendered exposition, split out because the driving half and the
+/// checking half of this test are both long and read better apart.
+fn assert_exposition(rendered: &str) {
     assert_eq!(
         series(
-            &rendered,
+            rendered,
             REQUESTS,
             &[("grant_type", "client_credentials"), ("outcome", "issued")]
         ),
-        1.0,
+        1,
         "the successful exchange is counted as issued"
     );
     assert_eq!(
         series(
-            &rendered,
+            rendered,
             REQUESTS,
             &[
                 ("grant_type", "client_credentials"),
                 ("outcome", "invalid_client")
             ]
         ),
-        1.0,
+        1,
         "the unauthenticated exchange is counted under the SAME grant with a refusing outcome, \
          which is what makes the ratio readable"
-    );
-    assert_eq!(
-        series(
-            &rendered,
-            REQUESTS,
-            &[("grant_type", "none"), ("outcome", "invalid_request")]
-        ),
-        1.0,
-        "a request naming no grant is counted"
     );
 
     // THE CARDINALITY BOUND, asserted rather than described. Two distinct unserviced values
     // produce ONE series with a count of two, not two series.
     assert_eq!(
         series(
-            &rendered,
+            rendered,
             REQUESTS,
             &[
                 ("grant_type", "none"),
                 ("outcome", "unsupported_grant_type")
             ]
         ),
-        2.0,
+        2,
         "both unserviced grant types collapse into one series"
     );
-    for leaked in ["password", "made-up-by-the-caller"] {
+    for leaked in ["probe-alpha-Nn7Qv", "probe-beta-Zk2Rw"] {
         assert!(
             !rendered.contains(leaked),
             "the caller's grant_type string {leaked:?} reached the exposition, so an \
              unauthenticated request can mint a series"
         );
     }
+    // AND THE UNPARSABLE BODY WAS COUNTED, which is the only assertion behind placing the
+    // recording site before the parse. It lands as `invalid_request` alongside the request that
+    // named no grant, so the series carries both.
+    assert_eq!(
+        series(
+            rendered,
+            REQUESTS,
+            &[("grant_type", "none"), ("outcome", "invalid_request")]
+        ),
+        2,
+        "the request naming no grant AND the body that could not be parsed are both counted"
+    );
 
     // LATENCY, by grant type and NOT by outcome. The histogram's count for the serviced grant
     // covers both of its requests, which is the check that the two metrics are recorded from the
     // same place and cannot drift apart.
     assert_eq!(
-        series_value(
-            &rendered,
+        count(
+            rendered,
             &format!("{DURATION}_count"),
             &[("grant_type", "client_credentials")]
         ),
-        Some(2.0),
+        Some(2),
         "the histogram counts every request for the grant, issued and refused alike"
     );
-    assert!(
-        series_value(
-            &rendered,
+    assert_eq!(
+        count(
+            rendered,
             &format!("{DURATION}_count"),
             &[("grant_type", "none")]
-        )
-        .is_some_and(|count| count >= 3.0),
-        "the three requests that named no serviced grant are timed too"
+        ),
+        Some(4),
+        "all four requests that named no serviced grant are timed: the one with no grant, the \
+         unparsable body, and the two unserviced values"
     );
-    // AND THE ELAPSED COMES OFF THE CLOCK SEAM, which is what this harness can prove and a
-    // "greater than zero" assertion cannot. `Harness` runs on a `ManualClock` that nothing
-    // advances during a request, so a duration read through `env().clock()` is exactly zero
-    // while a raw wall-clock read of the same interval would be some small positive number. A
-    // sum of zero is therefore positive evidence rather than an absent measurement: it fails
-    // the moment the handler starts timing itself around the seam.
+    // THE ELAPSED IS READ THROUGH THE SEAM. `Harness` runs a `ManualClock` that nothing advances
+    // during a request, so a duration read through `env().clock()` is exactly zero while a raw
+    // wall-clock read of the same interval is a small positive number: this fails the moment the
+    // handler times itself around the seam.
+    //
+    // WHAT IT CANNOT SAY, because a frozen clock renders a real measurement and no measurement
+    // identically: that the value is the elapsed time at all. A hardcoded zero passes here.
+    // `elapsed_is_read_from_the_clock_seam` in `src/token.rs` is where that is pinned, against a
+    // clock it can advance.
     assert_eq!(
         series_value(
-            &rendered,
+            rendered,
             &format!("{DURATION}_sum"),
             &[("grant_type", "client_credentials")]
         ),

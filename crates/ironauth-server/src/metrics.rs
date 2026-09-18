@@ -143,16 +143,16 @@ pub struct MetricSpec {
 ///
 /// # Scope: the workspace, not this crate
 ///
-/// This constant LIVES in the server crate and is not limited to it. Measured over the tree, 4
-/// of the 41 entries are emitted from `ironauth-server`; 28 come from `ironauth-oidc`, 7 from
-/// the binary crate and 2 from `ironauth-fetch`.
+/// This constant LIVES in the server crate and is not limited to it. Most of what it lists is
+/// emitted from `ironauth-oidc`, the rest from the binary crate, `ironauth-fetch` and this one.
 ///
-/// The paragraph that used to be here said the opposite -- "the server's own metrics. Other
-/// crates export their own (`ironauth-fetch` has two), and they are NOT here yet" -- while
-/// `ironauth_outbound_fetch_blocked_total` and `ironauth_outbound_fetch_requests_total`, which
-/// are those two, sat in the list below it. It was written when the contract held eleven
-/// entries and was never revisited when `the_contract_covers_every_metric_the_workspace_emits`
-/// pulled the rest in.
+/// NO COUNTS IN THIS PARAGRAPH, deliberately. It first said "the server's own metrics. Other
+/// crates export their own (`ironauth-fetch` has two), and they are NOT here yet" while those
+/// two sat in the list below it. The repair stated a measured split, 4/28/7/2 over 41 entries,
+/// and the very next change to add an entry falsified all five numbers in the same commit that
+/// edited the list twenty lines further down. A hand-written count beside a list that grows is
+/// a retraction waiting for its next author, so the shape is stated and the arithmetic is left
+/// to the reader who can count the entries.
 ///
 /// Two boundaries hold it, and they are different claims:
 /// `the_contract_covers_every_metric_this_module_declares` refuses a constant declared HERE with
@@ -464,51 +464,40 @@ pub fn recorder_handle() -> PrometheusHandle {
         .clone()
 }
 
-/// Register metric descriptions and units once, right after install.
+/// Register every contract entry's description and unit once, right after install.
+///
+/// DRIVEN FROM `CONTRACT`, not hand written beside it. This was a hand-maintained list of
+/// eleven `describe_*` calls whose strings had already drifted from the contract's own `help`
+/// (`PROXY_FORWARDING_REJECTED_TOTAL` was described as "ambiguous" here and "rejected and failed
+/// closed" there), and the thirty-odd metrics emitted from other crates had no description at
+/// all: their `# HELP` line on a scrape was the metric name repeated back. The contract already
+/// carries the one-line semantics, and `tests/metric_contract.rs` already holds it against the
+/// emit sites, so reading it here makes the published page, the scrape's HELP text and the
+/// checked value the same string.
+///
+/// The unit is derived from the name rather than declared: `metrics::Unit::Seconds` for a
+/// histogram whose name ends in `_seconds`, which is the Prometheus naming convention the
+/// contract already follows and the only unit this build exports.
 fn describe() {
-    metrics::describe_counter!(
-        HTTP_REQUESTS_TOTAL,
-        "Total HTTP requests by method, route template, and status"
-    );
-    metrics::describe_histogram!(
-        HTTP_REQUEST_DURATION_SECONDS,
-        metrics::Unit::Seconds,
-        "HTTP request duration by method, route template, and status"
-    );
-    metrics::describe_gauge!(UP, "1 while the process is serving");
-    metrics::describe_counter!(
-        PROXY_FORWARDING_REJECTED_TOTAL,
-        "Requests whose forwarding headers were ambiguous and failed closed"
-    );
-    metrics::describe_counter!(
-        OUTBOX_MESSAGES_CLAIMED_TOTAL,
-        "Outbox messages leased by a worker, by consumer"
-    );
-    metrics::describe_counter!(
-        OUTBOX_MESSAGES_TOTAL,
-        "Outbox messages that reached an outcome, by consumer and outcome"
-    );
-    metrics::describe_counter!(
-        OUTBOX_PASS_FAILURES_TOTAL,
-        "Outbox drain passes that could not run, by consumer and kind"
-    );
-    metrics::describe_gauge!(
-        OUTBOX_DEPTH,
-        "Outbox queue depth summed across scopes, by consumer and state"
-    );
-    metrics::describe_gauge!(
-        OUTBOX_OLDEST_READY_AGE_SECONDS,
-        metrics::Unit::Seconds,
-        "How long the oldest ready outbox message has been overdue, by consumer"
-    );
-    metrics::describe_gauge!(
-        LOG_STREAMS,
-        "Configured SIEM log streams summed across scopes, by sink type and status"
-    );
-    metrics::describe_gauge!(
-        LOG_STREAM_DEAD_LETTERS,
-        "Outstanding dead-lettered log stream batches summed across scopes, by sink type"
-    );
+    for spec in CONTRACT {
+        match spec.kind {
+            MetricKind::Counter => metrics::describe_counter!(spec.name, spec.help),
+            MetricKind::Gauge => {
+                if spec.name.ends_with("_seconds") {
+                    metrics::describe_gauge!(spec.name, metrics::Unit::Seconds, spec.help);
+                } else {
+                    metrics::describe_gauge!(spec.name, spec.help);
+                }
+            }
+            MetricKind::Histogram => {
+                if spec.name.ends_with("_seconds") {
+                    metrics::describe_histogram!(spec.name, metrics::Unit::Seconds, spec.help);
+                } else {
+                    metrics::describe_histogram!(spec.name, spec.help);
+                }
+            }
+        }
+    }
 }
 
 /// Render the current metrics in the Prometheus text exposition format.
