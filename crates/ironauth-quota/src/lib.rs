@@ -195,6 +195,25 @@ impl QuotaDimension {
             QuotaDimension::PasswordHashing => "password_hashing",
         }
     }
+
+    /// The dimension a stored label names, or [`None`] for one this build does not have.
+    ///
+    /// `None` IS NOT AN ERROR at every caller. The overrides table stores the label as text
+    /// precisely so a rolling upgrade works: a newer node writes a dimension an older one has
+    /// never heard of, and the older one must keep serving rather than refuse the whole scope's
+    /// limits. A reader that applies overrides skips what it cannot name; a management surface
+    /// that ACCEPTS one refuses it, because an operator typing `requsts` should be told, not
+    /// silently given a row nothing will ever read.
+    #[must_use]
+    pub fn parse(label: &str) -> Option<Self> {
+        match label {
+            "requests" => Some(QuotaDimension::Requests),
+            "token_issuance" => Some(QuotaDimension::TokenIssuance),
+            "hook_seconds" => Some(QuotaDimension::HookSeconds),
+            "password_hashing" => Some(QuotaDimension::PasswordHashing),
+            _ => None,
+        }
+    }
 }
 
 /// One dimension's token-bucket limit: a sustained refill rate and a burst
@@ -1178,6 +1197,32 @@ mod tests {
 
     use ironauth_env::ManualClock;
 
+    /// Every dimension round-trips through its stored label, and nothing else parses.
+    ///
+    /// The two halves are written apart in this file and the overrides table keys on the
+    /// label, so a dimension whose `as_str` and `parse` disagree is a stored override that is
+    /// written successfully and then never applied: the operator sees their limit in the
+    /// management API and the enforcer never hears of it. Driving `all()` rather than a typed
+    /// list means a dimension added to the enum without a parse arm fails here.
+    #[test]
+    fn every_dimension_round_trips_through_its_label() {
+        for dimension in QuotaDimension::all() {
+            assert_eq!(
+                QuotaDimension::parse(dimension.as_str()),
+                Some(dimension),
+                "{} does not parse back from its own label",
+                dimension.as_str()
+            );
+        }
+        for unknown in ["", "requsts", "REQUESTS", "requests ", "storage_bytes"] {
+            assert_eq!(
+                QuotaDimension::parse(unknown),
+                None,
+                "{unknown:?} is not a dimension this build has"
+            );
+        }
+    }
+
     /// A tenant-only config with a small, exact request budget and no refill, so
     /// bucket math is unambiguous in tests. Burst 10 requests, refill 1/s.
     fn test_config() -> QuotaConfig {
@@ -1206,6 +1251,7 @@ mod tests {
             environment: scope,
             usage_thresholds_percent: vec![80, 100],
             idle_bucket_ttl_secs: 0,
+            override_refresh_interval_secs: 0,
         }
     }
 
@@ -1297,6 +1343,7 @@ mod tests {
             },
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
+            override_refresh_interval_secs: 0,
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = env("acme", "prod");
@@ -1326,6 +1373,7 @@ mod tests {
             },
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
+            override_refresh_interval_secs: 0,
         };
         let (enforcer, clock) = enforcer_with(&config);
         let scope = env("acme", "prod");
@@ -1377,6 +1425,7 @@ mod tests {
             },
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
+            override_refresh_interval_secs: 0,
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = env("acme", "prod");
@@ -1416,6 +1465,7 @@ mod tests {
             environment: ScopeQuotaConfig::default(),
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
+            override_refresh_interval_secs: 0,
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = tenant("acme");
@@ -1448,6 +1498,7 @@ mod tests {
             environment: ScopeQuotaConfig::default(),
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
+            override_refresh_interval_secs: 0,
         };
         let (enforcer, clock) = enforcer_with(&config);
         let scope = tenant("acme");
@@ -1529,6 +1580,7 @@ mod tests {
             environment: ScopeQuotaConfig::default(),
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
+            override_refresh_interval_secs: 0,
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let enforcer = Arc::new(enforcer);
@@ -1569,6 +1621,7 @@ mod tests {
             environment: ScopeQuotaConfig::default(),
             usage_thresholds_percent: vec![80, 100],
             idle_bucket_ttl_secs: 0,
+            override_refresh_interval_secs: 0,
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = tenant("acme");
@@ -1599,6 +1652,7 @@ mod tests {
             environment: ScopeQuotaConfig::default(),
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
+            override_refresh_interval_secs: 0,
         };
         let (enforcer, clock) = enforcer_with(&config);
         let scope = tenant("acme");
@@ -1657,6 +1711,7 @@ mod tests {
             },
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
+            override_refresh_interval_secs: 0,
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = env("acme", "prod");

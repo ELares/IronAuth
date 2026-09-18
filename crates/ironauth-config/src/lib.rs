@@ -5971,6 +5971,21 @@ pub struct QuotaConfig {
     /// bounded by real tenancy, because only a verified, existing scope ever
     /// allocates a bucket.
     pub idle_bucket_ttl_secs: u64,
+
+    /// How often (in seconds) a node re-reads the stored per-scope quota overrides and applies
+    /// them to its running enforcer.
+    ///
+    /// THIS NUMBER IS THE SLO. Issue #150 criterion 4 asks that a limit changed through the
+    /// management API take effect "without restart, taking effect within the invalidation SLO",
+    /// and for a polled refresh the SLO is the interval: a write that commits is enforced on
+    /// every node within this many seconds, including the node that served the write. Shorter
+    /// costs one small scoped SELECT per live scope per interval.
+    ///
+    /// Set it to 0 to disable the refresh entirely. A deployment that does that keeps whatever
+    /// the configured tiers say and stored overrides never apply, which is the shipped
+    /// behaviour of every release before the refresher existed; it is not a way to freeze the
+    /// overrides a node has already picked up, because a node that restarts starts with none.
+    pub override_refresh_interval_secs: u64,
 }
 
 impl Default for QuotaConfig {
@@ -6002,6 +6017,11 @@ impl Default for QuotaConfig {
             },
             usage_thresholds_percent: vec![80, 100],
             idle_bucket_ttl_secs: 3600,
+            // TEN SECONDS. An operator raising a tenant's limit during an incident is the case
+            // this serves, and a minute of waiting while traffic is being refused is the wrong
+            // answer; a second would multiply a small read by sixty for a difference nobody
+            // watching a dashboard can perceive.
+            override_refresh_interval_secs: 10,
         }
     }
 }

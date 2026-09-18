@@ -2475,6 +2475,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "override_refresh_interval_secs": {
+          "default": 10,
+          "description": "How often (in seconds) a node re-reads the stored per-scope quota overrides and applies\nthem to its running enforcer.\n\nTHIS NUMBER IS THE SLO. Issue #150 criterion 4 asks that a limit changed through the\nmanagement API take effect \"without restart, taking effect within the invalidation SLO\",\nand for a polled refresh the SLO is the interval: a write that commits is enforced on\nevery node within this many seconds, including the node that served the write. Shorter\ncosts one small scoped SELECT per live scope per interval.\n\nSet it to 0 to disable the refresh entirely. A deployment that does that keeps whatever\nthe configured tiers say and stored overrides never apply, which is the shipped\nbehaviour of every release before the refresher existed; it is not a way to freeze the\noverrides a node has already picked up, because a node that restarts starts with none.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "tenant": {
           "$ref": "#/$defs/ScopeQuotaConfig",
           "default": {
@@ -3819,6 +3826,7 @@
           "token_issuance_per_second": 50
         },
         "idle_bucket_ttl_secs": 3600,
+        "override_refresh_interval_secs": 10,
         "tenant": {
           "hook_seconds_burst": 120,
           "hook_seconds_per_second": 60,
