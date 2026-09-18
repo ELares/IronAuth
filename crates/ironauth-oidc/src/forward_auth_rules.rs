@@ -326,6 +326,9 @@ pub struct ForwardAuthRuntime {
     forward_auth: crate::forward_auth::ForwardAuth,
     dialect: crate::forward_auth::Dialect,
     limiter: ironauth_quota::layered::LayeredLimiter,
+    /// The seam clock, so `evaluate` can stamp the decision cache's TTL from the same time
+    /// everything else in this process rides.
+    clock: std::sync::Arc<dyn ironauth_env::Clock>,
 }
 
 impl ForwardAuthRuntime {
@@ -374,8 +377,17 @@ impl ForwardAuthRuntime {
             return Ok(None);
         }
         Ok(Some(Self {
-            limiter: limiter_from_config(&cfg.rate_limit, clock),
-            forward_auth: crate::forward_auth::ForwardAuth::new(rules),
+            limiter: limiter_from_config(&cfg.rate_limit, clock.clone()),
+            forward_auth: match cfg.decision_cache_ttl_secs {
+                // THE CACHE IS OFF BY DEFAULT (issue #154 criterion 6): a deployment that
+                // has not asked for it gets the same evaluation it always had, and the
+                // field documents what turning it on buys and what bounds it keeps.
+                None => crate::forward_auth::ForwardAuth::new(rules),
+                Some(seconds) => crate::forward_auth::ForwardAuth::with_decision_cache(
+                    rules,
+                    std::time::Duration::from_secs(seconds),
+                ),
+            },
             dialect: match cfg.dialect {
                 ironauth_config::ProxyDialectConfig::ForwardAuth => {
                     crate::forward_auth::Dialect::ForwardAuth
@@ -387,6 +399,7 @@ impl ForwardAuthRuntime {
                     crate::forward_auth::Dialect::Haproxy
                 }
             },
+            clock,
         }))
     }
 
@@ -394,6 +407,17 @@ impl ForwardAuthRuntime {
     #[must_use]
     pub fn forward_auth(&self) -> &crate::forward_auth::ForwardAuth {
         &self.forward_auth
+    }
+
+    /// Decide a check request, stamping the decision cache's TTL from this runtime's clock.
+    #[must_use]
+    pub fn evaluate(
+        &self,
+        facts: crate::rules::RequestFacts,
+        identity: Option<&crate::forward_auth::Identity>,
+    ) -> crate::forward_auth::ForwardAuthOutcome {
+        self.forward_auth
+            .evaluate(facts, identity, self.clock.monotonic())
     }
 
     /// The dialect check requests arrive in.
@@ -901,7 +925,7 @@ mod tests {
         assert_eq!(
             under_default
                 .forward_auth()
-                .evaluate(facts(), Some(&passkey))
+                .evaluate(facts(), Some(&passkey), clock().monotonic())
                 .decision
                 .action,
             crate::rules::Action::Allow,
@@ -914,7 +938,7 @@ mod tests {
         assert_eq!(
             under_operator
                 .forward_auth()
-                .evaluate(facts(), Some(&passkey))
+                .evaluate(facts(), Some(&passkey), clock().monotonic())
                 .decision
                 .action,
             crate::rules::Action::StepUp {
