@@ -44,8 +44,8 @@
 #         --implementation cp --abi cp312 <pkg>==<version>
 #     pip hash <the downloaded artifact>
 
-PyJWT==2.10.1 \
-    --hash=sha256:dcdd193e30abefd5debf142f9adfcdd2b58004e644f25406ffaebd50bd98dacb
+PyJWT==2.14.0 \
+    --hash=sha256:ad0cef71c756a56e74863c2919cf0985f72decbcfcb550ee2f422e7c62b5eedc
 
 cryptography==50.0.1 \
     --hash=sha256:ff838d62ec1bfce4f9ba7fa16f4a7b554cd8d0c299e6be37502161a660c84eef

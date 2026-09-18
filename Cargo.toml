@@ -216,9 +216,10 @@ ring = "0.17"
 # binds its ECDSA generation to its own RNG, so ES256 and RS256 day-one keys are
 # generated with the RustCrypto p256 and rsa crates and exported to PKCS#8 / PKCS#1
 # DER, then LOADED and signed exclusively through ring (the one signature backend).
-# Both crates are used ONLY for keygen + DER export, NEVER to sign, verify, or
-# decrypt: the rsa crate's Marvin timing advisory (RUSTSEC-2023-0071) is on the
-# RSA-DECRYPTION path, which is unreachable here (scoped-ignored in deny.toml). The
+# In ironauth-jose, both crates are used ONLY for keygen + DER export, never to
+# sign, verify, or decrypt. The Fastly snippet also uses rsa for PUBLIC-KEY
+# verification and holds no private key. Neither consumer reaches the Marvin
+# RSA-decryption timing path (RUSTSEC-2023-0071; scoped-ignored in deny.toml). The
 # keygen RNG is a ChaCha20 stream SEEDED from the ironauth-env entropy seam (never
 # an OS RNG), so day-one keys are reproducible under a fixed test entropy source and
 # the determinism seam holds. Both are pure Rust (RustCrypto), permissive (MIT OR
@@ -368,9 +369,11 @@ rustls-native-certs = "0.8"
 # this comment said the latter, which is wrong and would have misled anyone re-evaluating
 # it later.
 #
-# The lockfile also holds `time` at 0.3.41; rcgen pulls it in and 0.3.47 onward declare
-# 1.88. `scripts/msrv-audit.sh` fails the gate if either drifts forward, so this comment
-# explains a constraint the tooling already enforces rather than being its only guard.
+# The lockfile also holds `time` at 0.3.41; both rcgen and the shipped LDAP X.509
+# stack pull it in, and 0.3.47 onward declare 1.88. Its RFC 2822 input-parser DoS
+# advisory remains unpatched; current consumers construct ASN.1 dates or format
+# RFC 2822 output, never parse RFC 2822 input (the full proof is in deny.toml).
+# `scripts/msrv-audit.sh` fails the gate if either dependency drifts forward.
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
 bytes = "1"
 

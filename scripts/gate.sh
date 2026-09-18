@@ -304,53 +304,12 @@ run() {
   fi
 }
 
-# A PREREQUISITE: if this fails, the cargo-dependent checks below are noise, so stop.
-#
-# Scoped to a real COMPILE, deliberately. An earlier version gated on clippy, which exits
-# non-zero identically for `error[E0308]` and for one pedantic style lint on a tree that
-# compiles perfectly -- so a missing `#[must_use]` skipped every later check and reinstated
-# the fix-one-thing-rerun-everything loop this rewrite exists to remove, for what is by far
-# clippy's most common failure mode.
-#
-# The scope is also narrower than it looks. Counted on this file: 67 checks, 64 of them below
-# this prerequisite. FOURTEEN of those 64 reach cargo -- two on gate.sh's own lines and
-# twelve through leaf scripts that shell out to it -- or sixteen when cargo-deny and the
-# ironbus lane are both available. The remaining 48 to 50 do not need a compiling tree at
-# all: mostly grep and python scans, plus six `git diff --exit-code` freshness assertions,
-# a `go build` and FOUR node-toolchain lanes (two guarded by a `node_modules` probe and
-# two not). An earlier version said "two npm lanes", which is the count of the OPTIONAL
-# ones -- the adjacent quantity again, not the one the sentence claims.
-#
-# THIRTEEN of the fourteen, not all fourteen, would report the same root cause and are the
-# slow ones. `compat-matrix.sh` runs `cargo metadata`, which reads MANIFESTS: on a crate
-# whose `src/lib.rs` does not parse, `cargo check` exits 101 while `cargo metadata` exits 0
-# in well under a second. (The exit codes are the load-bearing part and reproduce anywhere;
-# an earlier version quoted a specific millisecond figure taken from a review on one
-# machine, which is not ours to state.) So the honest claim is "about a fifth of the checks
-# below would re-prove one compile error, and they are the slow ones".
-#
-# The distinction is the same defect one layer in: fourteen is true of the set the method
-# selected (reaches cargo), and the sentence beside it claimed a property the method never
-# tested (needs a compiling tree).
-#
-# COUNTED THREE TIMES, AND WRONG THE FIRST TWO. The original said "18 of the 51", where 51
-# was a leftover banner count from before this rewrite. The correction re-derived the
-# denominator and got 63, then miscounted the numerator as fifteen by grepping leaf scripts
-# for the WORD `cargo`: `scripts/rfc9700-scan.sh` holds a shell VARIABLE named `cargo`
-# (`cargo="crates/ironauth-oidc/Cargo.toml"`) and invokes nothing. Counting only `cargo` in
-# COMMAND position gives twelve leaf scripts, not thirteen.
-#
-# The lesson is narrower than "check your arithmetic": a count keyed on a TOKEN counts
-# every appearance of the token, and the second correction reproduced the first one's
-# method while fixing only its inputs.
-#
-# IT ALSO COSTS SOMETHING, on every green run, which is the common case. `cargo check` and
-# `cargo clippy` do not share fingerprints, so clippy re-checks what this just checked. The
-# cost is bounded to the workspace crates rather than the dependency graph (measured:
-# dependencies are reused, only the workspace crate recompiles), so it is a second pass over
-# our own code and not a second build. That is the trade: a bounded fixed cost on every green
-# run, against not spending the gate's full wall-clock re-proving one compile error on a red
-# one. Worth stating rather than presenting this as free.
+# Prerequisites stop the gate when later checks cannot run meaningfully.
+# The compile prerequisite uses cargo check rather than clippy: a lint failure on a
+# compiling tree must still allow the remaining checks to run. This adds a bounded
+# workspace check on green runs and avoids repeating one compile error across the gate.
+# The source-built TypeScript fixture is a separate test prerequisite. Default Rust
+# builds remain independent of Node; the full validation suite needs Node and npm.
 run_required() {
   local label="$1"
   shift
@@ -358,8 +317,8 @@ run_required() {
   if ! "$@"; then
     GATE_FAILURES+=("$label (prerequisite -- later checks were skipped)")
     echo "    FAILED: $label"
-    echo "    This is a PREREQUISITE: the cargo-dependent checks after it need a compiling"
-    echo "    tree, so the gate stops rather than re-proving one root cause 13 times."
+    echo "    This is a PREREQUISITE for the checks that follow, so the gate stops"
+    echo "    here rather than reporting the same missing prerequisite repeatedly."
     exit 1
   fi
 }
@@ -371,6 +330,10 @@ run "msrv audit (no dependency declares a rust-version above the workspace MSRV)
 
 run_required "workspace compiles" cargo check --workspace --all-targets --all-features
 run "clippy (pedantic, -D warnings)" cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# The TypeScript component is generated from locked source dependencies, not committed.
+# Prepare it before the hook behavior and component upload-bound tests read its bytes.
+run_required "TypeScript hook test fixture built from source" ./scripts/build-ts-hook-fixture.sh
 
 # The ironauth-store isolation tests need a real Postgres via DATABASE_URL.
 # with-test-db.sh runs against DATABASE_URL if set (a CI service), else brings up

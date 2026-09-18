@@ -14,39 +14,51 @@ compiles, and a fixture that is not the sample proves nothing about what a tenan
 | --- | --- |
 | `src/token-customize.ts` | The hook. About four kilobytes of TypeScript. |
 | `build.mjs` | Componentizes the compiled JavaScript against `../wit`. |
-| `dist/token-customize.wasm` | The built component, **committed**. |
-| `package.json` | Pinned `componentize-js` and `typescript`. |
+| `dist/token-customize.wasm` | The source-built component, generated and ignored. |
+| `package.json` and `package-lock.json` | Pinned builder and compiler, with locked npm dependencies. |
 
 ## Building
 
+From the repository root, prepare the fixture before running the Rust integration suite:
+
 ```sh
-npm install
-npm run build      # tsc, then node build.mjs
+./scripts/build-ts-hook-fixture.sh
+cargo test -p ironauth-hooks --test typescript_hook --release
 ```
 
-`npm run build` type-checks first, so a TypeScript error is a build failure rather than a
-silently stale `build/`.
+The helper runs `npm ci` against the committed lockfile, type-checks with the local TypeScript
+compiler, and componentizes the result. It requires Node and npm. A TypeScript error or a
+missing tool is a failure. It accepts an optional output path for temporary builds.
 
-## Why the component is committed
+Inside this directory the equivalent manual build is:
+
+```sh
+npm ci --no-audit --no-fund
+npm run build
+```
+
+The builder is pinned to `componentize-js` 0.19.3 with a `jco` 1.17.8 override. Later `jco`
+versions pull in another `componentize-js` release whose `weval` dependency brings back the
+vulnerable `decompress` archive extractor. Keep the locked builder audit clear when updating
+these pins; the source-built fixture must also pass the sandbox and upload-size assertions.
+
+## Why the component is generated before tests
 
 Every Rust fixture is compiled by this crate's `build.rs`, which needs only `cargo` and one
-rustup target. This one needs Node, an npm install and a JavaScript engine to embed. Running
-`npm install` from a build script would put a network fetch in the path of every build of
-`ironauth-hooks`, which breaks offline and vendored builds.
+rustup target. This one needs Node, locked npm dependencies and a JavaScript engine to embed.
+Its build is an explicit test setup step, so ordinary Rust builds need neither Node nor an
+npm network fetch. The generated component lives in ignored `dist/`, or in a temporary
+directory, and is never committed.
 
-So it is built by hand and committed, and `build.rs` points the tests at the committed file and
-FAILS when it is missing, exactly as it fails for a missing Rust fixture. A TypeScript hook test
-that quietly did not run would leave half of criterion 1 unverified while the suite reported
-green.
+`build.rs` exports the expected fixture path without reading it. Tests load it at runtime and
+fail with the preparation command if it is missing. The hooks suite, admin upload-cap test and
+store migration bound test all require a freshly prepared component; none skips its assertions.
 
-The risk that trades for is drift between the source and the artifact.
-`scripts/ts-hook-freshness.sh` closes it: where Node is available it rebuilds from source and
-runs the same integration tests against the rebuilt component. It compares BEHAVIOUR, not bytes.
-
-That is measured, not assumed: two consecutive builds on one machine from an unchanged source
-produced 11127131 and 11127118 bytes with different digests. A checksum gate would fail on a
-rebuild that changed nothing, which is the fastest way to teach everyone to regenerate the
-artifact without reading the diff.
+`scripts/ts-hook-freshness.sh` builds a temporary fixture, proves the override reaches the
+loader, and runs the existing integration assertions against that source-built component. It
+also checks the generated size against the admin upload cap. It compares BEHAVIOUR, not bytes:
+two consecutive builds from unchanged source previously produced 11127131 and 11127118 bytes
+with different digests, so a byte comparison would reject a successful rebuild.
 
 ## Two things a hook author should know before writing one
 
@@ -65,7 +77,7 @@ std's startup needs them. It is `wasi:http/types`, pulled in because the JavaScr
 `fetch` global, that nothing satisfies. That is criterion 2's deny-by-default sandbox working.
 `build.mjs` disables all five features.
 
-**A JavaScript hook carries a JavaScript engine.** This one is roughly 10.6 MiB, of which about
+**A JavaScript hook carries a JavaScript engine.** The locked builder produces about 11.1 MiB, of which about
 four kilobytes is the code in `src/`. That is not a footnote:
 
 - the admin surface's upload cap had to admit it, and 8 MiB did not. See
@@ -90,8 +102,8 @@ four kilobytes is the code in `src/`. That is not a footnote:
 
 ## The test modes
 
-One component serves the whole suite, because four would be forty-four megabytes of JavaScript
-engine in the repository. The hook reads an ID-token claim named `ironauth_ts_hook_mode` and
+One component serves the whole suite, because four would repeat the same JavaScript engine
+in each generated fixture. The hook reads an ID-token claim named `ironauth_ts_hook_mode` and
 strips it from its output:
 
 | Mode | What the hook does | What it demonstrates |

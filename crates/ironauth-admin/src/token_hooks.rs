@@ -1217,13 +1217,11 @@ mod tests {
     /// anyone would actually deploy. Under 8 MiB every TypeScript hook was refused by this
     /// surface, and no test noticed, because the hook tests read components from disk.
     ///
-    /// This reads the COMMITTED TypeScript sample's real length, so it fails when the artifact
-    /// in the tree no longer fits what an operator may upload.
-    ///
-    /// It does NOT see a componentize-js upgrade by itself: bumping the pin does not change the
-    /// committed bytes, so this keeps measuring the old ones until `dist/` is regenerated.
-    /// `scripts/ts-hook-freshness.sh` is what builds from the current pin and compares the
-    /// rebuilt size against this constant. Two guards, two different things guarded.
+    /// This reads the source-built TypeScript sample's real length, so it fails when the
+    /// current locked builder produces a hook that no longer fits what an operator may
+    /// upload. Run `./scripts/build-ts-hook-fixture.sh` before the tests; the gate and CI
+    /// prepare it automatically. `scripts/ts-hook-freshness.sh` separately builds temporary
+    /// bytes and runs the behavioral assertions against that exact component.
     #[test]
     fn the_shipped_typescript_sample_fits_this_bound() {
         let sample = ironauth_hooks::fixtures::TS_TOKEN_CUSTOMIZE.len();
@@ -1234,7 +1232,7 @@ mod tests {
              it samples"
         );
         // And the margin, so shrinking headroom is visible before it is gone. Not a tight
-        // bound: it exists to make "the committed artifact is close to the bound" a test
+        // bound: it exists to make "the source-built artifact is close to the bound" a test
         // failure instead of a discovery.
         assert!(
             sample * 5 / 4 <= MAX_COMPONENT_BYTES,

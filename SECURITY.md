@@ -10,9 +10,9 @@ vulnerability privately and what you can expect from us.
 Please report suspected security issues privately. Do not open a public issue
 for a vulnerability.
 
-- Preferred: GitHub private vulnerability reporting on this repository (the
-  "Report a vulnerability" button under the Security tab). This channel is
-  monitored by the maintainer.
+- Preferred: [GitHub private vulnerability reporting](https://github.com/ELares/IronAuth/security/advisories/new)
+  on this repository (the "Report a vulnerability" button under the Security
+  tab). This channel is monitored by the maintainer.
 - A dedicated security inbox will be published here once project
   infrastructure exists; until then the GitHub channel is authoritative.
 
@@ -37,6 +37,9 @@ reporting per this policy. This commitment reflects the published
 ship to everyone simultaneously.
 
 ## Advisories
+
+Published security advisories are available on the repository's
+[GitHub security advisories page](https://github.com/ELares/IronAuth/security/advisories).
 
 Every advisory follows the format defined in
 [docs/RELEASING.md](docs/RELEASING.md): it names the exact artifact, the

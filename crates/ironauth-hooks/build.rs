@@ -66,12 +66,11 @@ const GUESTS: &[(&str, &str)] = &[
     ("claim_flood", "IRONAUTH_GUEST_CLAIM_FLOOD"),
 ];
 
-/// The committed TypeScript component, relative to this crate's root.
+/// The source-built TypeScript component, relative to this crate's root.
 ///
-/// Not built here, unlike every fixture above. Building it needs Node, an npm install, and a
-/// JavaScript engine to embed; running `npm install` from a build script would put a network
-/// fetch in the path of every build of this crate. `guests-ts/build.mjs` carries the full
-/// reasoning and is what produces this file.
+/// Tests prepare it with `scripts/build-ts-hook-fixture.sh`. Building it needs Node and npm,
+/// which ordinary Rust builds do not require. Export the path without reading the artifact;
+/// the tests fail with the preparation command if their fixture is missing.
 const TS_GUEST: &str = "guests-ts/dist/token-customize.wasm";
 
 fn main() {
@@ -110,27 +109,9 @@ fn main() {
          are built rather than skipped so that a green suite means the sandbox was tested.\n"
     );
 
-    // The TypeScript component is committed rather than built, and it is checked with the same
-    // severity as a missing Rust fixture: absent means BUILD FAILURE, never a skipped test.
-    // Criterion 1 asks for a Rust hook AND a TypeScript hook customizing claims in the
-    // integration suite, and a TypeScript test that quietly does not run would leave half of
-    // that criterion unverified while the suite reported green.
+    // Only tests read this source-built component. Do not fetch JavaScript dependencies or
+    // require a generated test artifact during an ordinary Rust build.
     let ts_guest = manifest.join(TS_GUEST);
-    println!("cargo:rerun-if-changed={}", ts_guest.display());
-    assert!(
-        ts_guest.exists(),
-        "\n\
-         The committed TypeScript hook component is missing:\n\
-         \n\
-             {}\n\
-         \n\
-         It is built by hand, not by this script. To rebuild it:\n\
-         \n\
-             cd crates/ironauth-hooks/guests-ts && npm install && npm run build\n\
-         \n\
-         See guests-ts/build.mjs for why it is committed rather than built here.\n",
-        ts_guest.display()
-    );
     println!(
         "cargo:rustc-env=IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE={}",
         ts_guest.display()

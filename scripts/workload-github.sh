@@ -85,10 +85,13 @@ if [ -z "${IRONAUTH_ASSERTION:-}" ]; then
     fi
     # ZERO STORED SECRETS: this is the whole point. The runner hands the job a token because
     # of WHO IT IS, and nothing in this repository holds a credential for it.
-    IRONAUTH_ASSERTION=$(curl -sf \
+    curl --fail --silent --show-error \
         -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
         "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "${ISSUER}")" \
-        | python3 -c 'import json,sys;print(json.load(sys.stdin)["value"])')
+        --output "${WORK}/ambient-token.json"
+    IRONAUTH_ASSERTION=$(python3 -c \
+        'import json,sys;print(json.load(open(sys.argv[1],encoding="utf-8"))["value"])' \
+        "${WORK}/ambient-token.json")
     echo "workload-github: obtained the runner's ambient OIDC token"
 fi
 
@@ -153,8 +156,11 @@ echo "workload-github: ${IRONAUTH_EXTERNAL_SUBJECT} mapped to ${IDENTITY}"
 # FROM DISCOVERY, never `${ISSUER}/token`. An IronAuth issuer carries a per-environment path
 # while its endpoints sit at the host root, so concatenation builds a URL that 404s -- which is
 # exactly what this script did on its first run, and the same defect the BFF shipped with.
-TOKEN_ENDPOINT=$(curl -sf "${ISSUER}/.well-known/openid-configuration" \
-    | python3 -c 'import json,sys;print(json.load(sys.stdin)["token_endpoint"])')
+curl --fail --silent --show-error "${ISSUER}/.well-known/openid-configuration" \
+    --output "${WORK}/discovery.json"
+TOKEN_ENDPOINT=$(python3 -c \
+    'import json,sys;print(json.load(open(sys.argv[1],encoding="utf-8"))["token_endpoint"])' \
+    "${WORK}/discovery.json")
 STATUS=$(curl -s -o "${WORK}/token.json" -w '%{http_code}' -X POST "${TOKEN_ENDPOINT}" \
     --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer' \
     --data-urlencode "assertion=${IRONAUTH_ASSERTION}" \

@@ -49,6 +49,13 @@ the console; Rust builds use its committed embedded assets. See
 [compatibility](COMPATIBILITY.md) and the
 [console package guide](../packages/admin-spa/README.md).
 
+The full development gate additionally requires Node and npm to build the
+TypeScript hook test component. Direct hook integration, admin upload-cap, and
+store migration tests need `scripts/build-ts-hook-fixture.sh` first. The
+component is generated and ignored; production Rust builds do not need it or
+Node. See the [hook sample](../crates/ironauth-hooks/guests-ts/README.md) and
+[security scanning](SECURITY-SCANNING.md).
+
 ## Configure a persistent deployment
 
 Provision a PostgreSQL database and the three roles named by the migration

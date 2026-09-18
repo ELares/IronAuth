@@ -1,30 +1,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+// Builds an untracked test component from the TypeScript in `src/`.
 //
-// Builds `dist/token-customize.wasm` from the TypeScript in `src/`.
+// Node and locked npm dependencies are explicit test prerequisites, prepared by
+// `scripts/build-ts-hook-fixture.sh`, rather than part of every Rust build. The binary is
+// generated from source and never committed. `scripts/ts-hook-freshness.sh` rebuilds it in a
+// temporary directory and runs the behavioral assertions against those exact bytes.
 //
-// # Why the artifact is committed
-//
-// Every Rust guest fixture in `../guests/` is compiled by this crate's `build.rs`, because
-// building them needs only `cargo` and one rustup target. Building THIS one needs Node, an
-// npm install, and a JavaScript engine to embed, and running `npm install` from a `build.rs`
-// would mean a network fetch on every build of `ironauth-hooks` -- which breaks offline and
-// vendored builds and makes the build non-reproducible.
-//
-// So the component is built here, by hand, and committed. `build.rs` points the tests at the
-// committed file and FAILS if it is missing, exactly as it fails for a missing Rust fixture:
-// a TypeScript hook test that silently does not run would leave criterion 1's TypeScript half
-// unverified while the suite reported green.
-//
-// The risk this trades for is the committed artifact drifting from the source beside it.
-// `scripts/ts-hook-freshness.sh` closes that: where Node is available it rebuilds from source
-// and runs the same integration test against the REBUILT component. It compares BEHAVIOUR and
-// not bytes, and that is not a preference -- MEASURED, on one machine, from an unchanged
-// source: two consecutive builds produced 11127131 and 11127118 bytes with different SHA-256
-// digests. A checksum gate would therefore fail on a rebuild that changed nothing, which is
-// the fastest way to teach everyone to regenerate the artifact without reading the diff.
+// componentize-js output is not byte-reproducible: two consecutive builds from unchanged
+// source produced different byte counts and digests. Test behavior and upload bounds instead
+// of comparing generated file hashes.
 
 import { componentize } from "@bytecodealliance/componentize-js";
-import { writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 
 const out = process.argv[2] ?? "dist/token-customize.wasm";
 
@@ -54,5 +42,6 @@ const { component } = await componentize({
   disableFeatures: ["http", "random", "stdio", "clocks", "fetch-event"],
 });
 
+await mkdir(dirname(out), { recursive: true });
 await writeFile(out, component);
 console.log(`wrote ${out}, ${component.length} bytes`);

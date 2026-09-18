@@ -19,8 +19,11 @@ CLIENT_ID="$2"
 WORK="$3"
 REDIRECT="http://127.0.0.1:4571/callback"
 BASE=$(printf '%s' "${ISSUER}" | sed -E 's#(https?://[^/]+).*#\1#')
-TOKEN_ENDPOINT=$(curl -s "${ISSUER}/.well-known/openid-configuration" \
-    | python3 -c 'import json,sys;print(json.load(sys.stdin)["token_endpoint"])')
+curl --fail --silent --show-error "${ISSUER}/.well-known/openid-configuration" \
+    --output "${WORK}/discovery.json"
+TOKEN_ENDPOINT=$(python3 -c \
+    'import json,sys;print(json.load(open(sys.argv[1],encoding="utf-8"))["token_endpoint"])' \
+    "${WORK}/discovery.json")
 
 VERIFIER=$(openssl rand -hex 32)
 CHALLENGE=$(printf '%s' "${VERIFIER}" | openssl dgst -binary -sha256 | openssl base64 | tr '+/' '-_' | tr -d '=')

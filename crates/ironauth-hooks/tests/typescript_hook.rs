@@ -59,16 +59,15 @@ const MODE_CLAIM: &str = "ironauth_ts_hook_mode";
 /// The claim the sample adds. Its VALUE is derived from three request fields.
 const SAMPLE_CLAIM: &str = "ts_hook_tier";
 
-/// The committed component, read from disk rather than embedded.
+/// The source-built component, read from disk rather than embedded.
 ///
 /// `tests/sandbox.rs` reads its fixtures the same way, and here it matters more: embedding
 /// eleven megabytes with `include_bytes!` would put a copy of a JavaScript engine in this test
 /// binary for no gain, since it is read once.
 ///
 /// The env var is set by `build.rs`, and honours an override so `scripts/ts-hook-freshness.sh`
-/// can point these same tests at a component it just rebuilt from the TypeScript source. That
-/// is what keeps the committed artifact honest: the freshness check compares BEHAVIOUR against
-/// this file, not bytes.
+/// can point these same tests at a temporary component rebuilt from the TypeScript source.
+/// The default fixture is prepared with `scripts/build-ts-hook-fixture.sh` before tests.
 fn component_path() -> String {
     std::env::var("IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE_OVERRIDE")
         .unwrap_or_else(|_| env!("IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE").to_owned())
@@ -76,7 +75,12 @@ fn component_path() -> String {
 
 fn component() -> Vec<u8> {
     let path = component_path();
-    std::fs::read(&path).unwrap_or_else(|error| panic!("reading {path}: {error}"))
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "reading the source-built TypeScript hook component ({path}): {error}; \
+             run ./scripts/build-ts-hook-fixture.sh before running tests"
+        )
+    })
 }
 
 /// The one compiled TypeScript hook, shared by every test in this file.
@@ -86,7 +90,7 @@ fn typescript_hook() -> &'static (HookEngine, LoadedHook) {
         let engine = HookEngine::new().expect("engine");
         let hook = engine
             .load(&component())
-            .expect("the committed TypeScript component must load");
+            .expect("the source-built TypeScript component must load");
         (engine, hook)
     })
 }
@@ -121,11 +125,11 @@ fn claim<'a>(claims: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 /// PRINTS THE PATH THE OTHER TESTS LOAD, so the freshness check can prove its override took.
 ///
-/// `component()` falls back to the committed artifact when
+/// `component()` falls back to the default source-built artifact when
 /// `IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE_OVERRIDE` is unset, which is right for an ordinary run and
 /// dangerous for `scripts/ts-hook-freshness.sh`: that script's entire job is to run these
 /// assertions against a component it just REBUILT, and a typo in the variable name would make
-/// it test the committed one twice and report success. Silently. That is the outcome the whole
+/// it test the default fixture and report success. Silently. That is the outcome the whole
 /// check exists to rule out.
 ///
 /// So the script greps this test's output for the path it handed over. An assertion cannot do
@@ -138,13 +142,18 @@ fn claim<'a>(claims: &'a [(String, String)], name: &str) -> Option<&'a str> {
 /// variable was SET AND READABLE -- a property of the script -- and nothing about what the
 /// other seven tests loaded, because the two literals were independent with nothing crossing
 /// them. Renaming the variable inside `component`, or dropping its override branch, left this
-/// test printing the right path while every other test read the committed artifact. Review
+/// test printing the right path while every other test read the default artifact. Review
 /// measured exactly that mutant and it survived. One function answers "which component" now.
 #[test]
 fn the_override_is_the_component_under_test() {
     let path = component_path();
     let bytes = std::fs::metadata(&path)
-        .unwrap_or_else(|error| panic!("the component must exist at {path}: {error}"))
+        .unwrap_or_else(|error| {
+            panic!(
+                "the source-built TypeScript component must exist at {path}: {error}; \
+                 run ./scripts/build-ts-hook-fixture.sh before running tests"
+            )
+        })
         .len();
     println!("typescript hook under test: {path} ({bytes} bytes)");
     // NO ASSERTION THAT THE BYTES MATCH THE PATH, because there is nothing to compare.

@@ -13,22 +13,24 @@
 # seed, which is what lets a CI job fail loudly if seeding stops being reproducible instead of
 # passing against whatever code happened to be generated.
 set -uo pipefail
-cd "$(git rev-parse --show-toplevel)"
+cd "$(git rev-parse --show-toplevel)" || exit 1
 
 PORT="${PORT:-18110}"
 SEED="${SEED:-1}"
 BIN="${BIN:-./target/debug/ironauth}"
-LOG="$(mktemp -t ironauth-otp-XXXXXX)"
 
 if [ ! -x "$BIN" ]; then
   echo "dev-otp-login: $BIN is not built. Run: cargo build -p ironauth --bin ironauth" >&2
   exit 1
 fi
 
+LOG="$(mktemp -t ironauth-otp-XXXXXX)"
+CAPTURE="$(mktemp -t ironauth-otp-capture-XXXXXX)"
+
 cleanup() {
   [ -n "${DEV_PID:-}" ] && kill "$DEV_PID" 2>/dev/null
   sleep 2
-  rm -f "$LOG"
+  rm -f "$LOG" "$CAPTURE"
 }
 trap cleanup EXIT INT TERM
 
@@ -72,15 +74,19 @@ fi
 
 # 2. Read the code out of the SINK, offline. This is the step a mail server would otherwise be
 #    required for, and it is the reason the emulator exists.
-code=$(curl -s --max-time 10 "$sink" | python3 -c '
+if ! curl --fail --silent --show-error --max-time 10 "$sink" --output "$CAPTURE"; then
+  echo "dev-otp-login: capture sink did not answer" >&2
+  exit 1
+fi
+code=$(python3 -c '
 import json, sys
-messages = json.load(sys.stdin)["messages"]
+messages = json.load(open(sys.argv[1], encoding="utf-8"))["messages"]
 email = [m for m in messages if m["kind"] == "email"]
 if not email:
     print("NO-EMAIL-CAPTURED", file=sys.stderr)
     raise SystemExit(1)
 print(email[-1]["body"])
-')
+' "$CAPTURE")
 if [ -z "$code" ]; then
   echo "dev-otp-login: no email captured in the sink" >&2
   exit 1

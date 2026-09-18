@@ -75,13 +75,22 @@ pub mod fixtures {
     ///
     /// Issue #114 criterion 1 asks for a Rust hook AND a TypeScript hook customizing claims
     /// through `token.customize`. `guests-ts/src/token-customize.ts` is that hook, and this is
-    /// the component built from it, committed rather than built (see `guests-ts/build.mjs`).
+    /// the component built from it by `scripts/build-ts-hook-fixture.sh` before running tests.
     ///
     /// IT IS ELEVEN MEGABYTES, because a JavaScript hook carries a JavaScript engine. That is
     /// not an aside: it is the number the admin surface's upload cap has to admit, and it is
     /// why `ironauth-admin` pins that cap against `.len()` here rather than against a number
-    /// someone chose. Nothing outside a test should reach for this constant.
-    pub const TS_TOKEN_CUSTOMIZE: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE"));
+    /// someone chose. Load it once at runtime so compiling the crate needs neither Node nor a
+    /// generated test artifact. Nothing outside a test should reach for this fixture.
+    pub static TS_TOKEN_CUSTOMIZE: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+        let path = env!("IRONAUTH_GUEST_TS_TOKEN_CUSTOMIZE");
+        std::fs::read(path).unwrap_or_else(|error| {
+            panic!(
+                "reading the source-built TypeScript hook component ({path}): {error}; \
+                 run ./scripts/build-ts-hook-fixture.sh before running tests"
+            )
+        })
+    });
 
     /// A hook that imports `wasi:sockets`, which the sandbox does not link.
     ///
