@@ -205,14 +205,31 @@ pub struct ForwardAuthOutcome {
     /// while the admission stands is worse than a refusal: the upstream would serve the
     /// request as some OTHER principal, or as none.
     pub identity_rejected: Option<IdentityError>,
+    /// Whether the decision was served from the decision cache (issue #154 criterion 6).
+    ///
+    /// Meaningful only when a cache is installed: with none, this is always `false`.
+    pub cached: bool,
+    /// Whether the decision cache was reachable. `false` means the answer was computed and
+    /// an operator has a cache outage worth alerting on; with no cache installed there is
+    /// nothing that can be unavailable, so this is always `true`.
+    pub cache_available: bool,
 }
 
 /// A forward-auth surface over a rule set.
 ///
 /// Holds the rules privately and exposes no accessor for them. An earlier version had one,
 /// and it handed a caller holding the sanitising surface a reference that skips sanitising.
+///
+/// With a decision cache installed, `evaluate` answers an identical request from the cache
+/// within the configured TTL (issue #154 criterion 6). The cache owns a CLONE of the rule
+/// set rather than the shared `Arc`, which is safe because [`RuleSet`] is immutable: the
+/// three consumers hold one `Arc` built at boot and nothing replaces rules on it at
+/// runtime, so a clone cannot drift. The generation-keyed cache makes a rule CHANGE within
+/// this surface immediate anyway; if a live replacement path ever lands, it must route
+/// through `CachedRuleSet::replace_rules` or reconsider this paragraph.
 pub struct ForwardAuth {
     rules: std::sync::Arc<RuleSet>,
+    decision_cache: Option<crate::rules::CachedRuleSet<crate::rules::MemoryStore>>,
 }
 
 impl ForwardAuth {
@@ -227,7 +244,33 @@ impl ForwardAuth {
     pub fn new(rules: impl Into<std::sync::Arc<RuleSet>>) -> Self {
         Self {
             rules: rules.into(),
+            decision_cache: None,
         }
+    }
+
+    /// The same, with a bounded-TTL decision cache in front of the rules (issue #154
+    /// criterion 6). The rules are evaluated through the cache; the shared `Arc` is kept
+    /// for the no-cache path and for the identity the other consumers hold.
+    #[must_use]
+    pub fn with_decision_cache(
+        rules: impl Into<std::sync::Arc<RuleSet>>,
+        ttl: std::time::Duration,
+    ) -> Self {
+        let rules = rules.into();
+        Self {
+            decision_cache: Some(crate::rules::CachedRuleSet::new(
+                rules.as_ref().clone(),
+                crate::rules::MemoryStore::new(ttl),
+            )),
+            rules,
+        }
+    }
+
+    /// Whether a decision cache is installed, for a boot path that wants to log what it
+    /// built.
+    #[must_use]
+    pub fn decision_cache_enabled(&self) -> bool {
+        self.decision_cache.is_some()
     }
 
     /// Decide `facts`, and say what the upstream should be told.
@@ -238,6 +281,9 @@ impl ForwardAuth {
     /// deployment that calls them directly is not protected by anything here. Route
     /// forward-auth traffic through this function.
     ///
+    /// `now` is the caller's monotonic instant, so the cache's TTL rides the same seam as
+    /// every other time in this process.
+    ///
     /// # The principal is taken from `identity`, not from `facts`
     ///
     /// The subject, groups and roles the engine decides about are OVERWRITTEN from
@@ -245,7 +291,12 @@ impl ForwardAuth {
     /// membership while telling the upstream it was serving `mallory`. There is now one
     /// principal, so the two cannot disagree.
     #[must_use]
-    pub fn evaluate(&self, facts: RequestFacts, identity: Option<&Identity>) -> ForwardAuthOutcome {
+    pub fn evaluate(
+        &self,
+        facts: RequestFacts,
+        identity: Option<&Identity>,
+        now: std::time::Instant,
+    ) -> ForwardAuthOutcome {
         let (mut facts, must_delete) = strip_trusted_headers(facts);
 
         // An identity that cannot be serialised is a refusal, not a silent drop.
@@ -255,6 +306,8 @@ impl ForwardAuth {
                 upstream_headers: Vec::new(),
                 must_delete,
                 identity_rejected: Some(problem),
+                cached: false,
+                cache_available: true,
             };
         }
 
@@ -271,7 +324,17 @@ impl ForwardAuth {
         // thing that can satisfy a step-up rule is an authentication that happened.
         facts.acr = identity.and_then(|identity| identity.acr.clone());
 
-        let decision = self.rules.decide(&facts);
+        let (decision, cached, cache_available) = match &self.decision_cache {
+            // THE CACHE ANSWERS, OR FALLS BACK TO THE RULES. A miss and an outage both
+            // evaluate the full rule set, which is the one answer that is always right:
+            // the cache is an optimisation, and an optimisation that can refuse a request
+            // is a liability (criterion 6's "never to a stale allow beyond TTL").
+            Some(cached) => {
+                let answered = cached.decide(&facts, now);
+                (answered.decision, answered.cached, answered.store_available)
+            }
+            None => (self.rules.decide(&facts), false, true),
+        };
 
         // ONLY an allow forwards anything. A step-up is not an admission: the caller has to
         // come back with stronger authentication, and handing the upstream an identity in the
@@ -286,6 +349,8 @@ impl ForwardAuth {
             upstream_headers,
             must_delete,
             identity_rejected: None,
+            cached,
+            cache_available,
         }
     }
 }
@@ -660,6 +725,7 @@ impl Dialect {
 #[cfg(test)]
 mod tests {
     use crate::rules::{Criterion, Rule, SubjectCheck};
+    use ironauth_env::Clock as _;
 
     use super::*;
 
@@ -682,8 +748,96 @@ mod tests {
         }
     }
 
+    /// A monotonic instant for the cache-stamping signature. TESTS ONLY: production time
+    /// comes from the seam clock, and this is a plain wall-clock instant so a test can
+    /// advance it explicitly when it needs to cross a TTL.
+    fn now() -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
     fn open() -> ForwardAuth {
         ForwardAuth::new(RuleSet::new(vec![rule("open", vec![], Action::Allow)]))
+    }
+
+    /// A surface over the same open rule set with a decision cache installed.
+    fn cached(ttl: std::time::Duration) -> ForwardAuth {
+        ForwardAuth::with_decision_cache(
+            RuleSet::new(vec![rule("open", vec![], Action::Allow)]),
+            ttl,
+        )
+    }
+
+    /// THE CACHE IS OFF BY DEFAULT (issue #154 criterion 6): a deployment that has not asked
+    /// for it evaluates every check from the rules, and `cached` says so rather than being
+    /// a field nobody reads.
+    #[test]
+    fn the_decision_cache_is_off_by_default() {
+        let outcome = open().evaluate(request_with("X-Other", "kept"), Some(&identity()), now());
+        assert!(!outcome.cached);
+        assert!(
+            outcome.cache_available,
+            "with no cache there is nothing to be unavailable"
+        );
+        assert!(!open().decision_cache_enabled());
+    }
+
+    /// A repeated check is served from the cache within the TTL, and recomputed after it.
+    ///
+    /// THE TTL IS CROSSED WITH A FROZEN CLOCK, not by sleeping: the property under test is
+    /// the cache's bound, and a wall-clock sleep would make the test measure the machine.
+    #[test]
+    fn a_repeated_check_is_cached_within_ttl_and_recomputed_after() {
+        let surface = cached(std::time::Duration::from_secs(60));
+        let manual = ironauth_env::ManualClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let facts = request_with("X-Other", "kept");
+
+        let first = surface.evaluate(facts.clone(), Some(&identity()), manual.monotonic());
+        assert!(
+            !first.cached,
+            "the first check has nothing to be served from"
+        );
+
+        let second = surface.evaluate(facts.clone(), Some(&identity()), manual.monotonic());
+        assert!(
+            second.cached,
+            "an identical check inside the TTL is answered from the cache"
+        );
+        assert_eq!(second.decision, first.decision);
+        assert_eq!(second.upstream_headers, first.upstream_headers);
+
+        // Two minutes later the entry is older than the window, so the same check is
+        // computed from the rules again.
+        manual.advance(std::time::Duration::from_secs(120));
+        let after_ttl = surface.evaluate(facts, Some(&identity()), manual.monotonic());
+        assert!(
+            !after_ttl.cached,
+            "past the TTL the cache must not serve the entry"
+        );
+        assert_eq!(
+            after_ttl.decision, first.decision,
+            "and the answer is still the same"
+        );
+    }
+
+    /// The cache answers identically to full evaluation, whatever it serves from.
+    #[test]
+    fn the_cache_never_changes_the_decision() {
+        let manual = ironauth_env::ManualClock::new(std::time::SystemTime::UNIX_EPOCH);
+        let uncached = open().evaluate(
+            request_with("X-Other", "kept"),
+            Some(&identity()),
+            manual.monotonic(),
+        );
+        let cached = cached(std::time::Duration::from_secs(60)).evaluate(
+            request_with("X-Other", "kept"),
+            Some(&identity()),
+            manual.monotonic(),
+        );
+        assert_eq!(cached.decision, uncached.decision);
+        assert_eq!(cached.upstream_headers, uncached.upstream_headers);
+        // An in-process store cannot be unavailable; a store that CAN fail is the engine's
+        // own contract, and its outage falls through to full evaluation in rules.rs.
+        assert!(cached.cache_available);
     }
 
     /// A rule set that admits ONLY when a reserved header carries a chosen value, with a
@@ -738,7 +892,7 @@ mod tests {
             "Remote-Groups ",
         ] {
             let outcome =
-                gated_on("Remote-Groups").evaluate(request_with(spelling, "admins"), None);
+                gated_on("Remote-Groups").evaluate(request_with(spelling, "admins"), None, now());
             assert_eq!(
                 outcome.decision.action,
                 Action::Deny,
@@ -849,7 +1003,7 @@ mod tests {
         ];
 
         for (what, bad, expected) in cases {
-            let outcome = open().evaluate(request_with("X-Other", "kept"), Some(&bad));
+            let outcome = open().evaluate(request_with("X-Other", "kept"), Some(&bad), now());
             assert_eq!(
                 outcome.identity_rejected.as_ref(),
                 Some(&expected),
@@ -921,7 +1075,7 @@ mod tests {
             acr: None,
         };
 
-        let outcome = gated.evaluate(facts, Some(&mallory));
+        let outcome = gated.evaluate(facts, Some(&mallory), now());
         assert_eq!(
             outcome.decision.action,
             Action::Deny,
@@ -938,7 +1092,7 @@ mod tests {
             name: None,
             acr: None,
         };
-        let outcome = gated.evaluate(request_with("X-Other", "kept"), Some(&engineer));
+        let outcome = gated.evaluate(request_with("X-Other", "kept"), Some(&engineer), now());
         assert_eq!(outcome.decision.action, Action::Allow);
         assert_eq!(
             outcome.upstream_headers[0],
@@ -950,7 +1104,7 @@ mod tests {
     #[test]
     fn a_denied_request_forwards_no_identity() {
         let shut = ForwardAuth::new(RuleSet::new(vec![rule("shut", vec![], Action::Deny)]));
-        let outcome = shut.evaluate(request_with("X-Other", "kept"), Some(&identity()));
+        let outcome = shut.evaluate(request_with("X-Other", "kept"), Some(&identity()), now());
         assert_eq!(outcome.decision.action, Action::Deny);
         assert!(
             outcome.upstream_headers.is_empty(),
@@ -968,7 +1122,7 @@ mod tests {
                 acr: "mfa".to_owned(),
             },
         )]));
-        let outcome = stepped.evaluate(request_with("X-Other", "kept"), Some(&identity()));
+        let outcome = stepped.evaluate(request_with("X-Other", "kept"), Some(&identity()), now());
         assert_eq!(
             outcome.decision.action,
             Action::StepUp {
@@ -981,7 +1135,11 @@ mod tests {
     /// AN ADMISSION FORWARDS THE AUTHENTICATOR'S VIEW, and only that.
     #[test]
     fn an_allowed_request_forwards_the_established_identity() {
-        let outcome = open().evaluate(request_with("Remote-User", "root"), Some(&identity()));
+        let outcome = open().evaluate(
+            request_with("Remote-User", "root"),
+            Some(&identity()),
+            now(),
+        );
         assert_eq!(outcome.decision.action, Action::Allow);
         assert_eq!(
             outcome.upstream_headers,
@@ -1002,7 +1160,7 @@ mod tests {
     /// AN ANONYMOUS ADMISSION FORWARDS NOTHING.
     #[test]
     fn an_anonymous_admission_forwards_no_identity() {
-        let outcome = open().evaluate(request_with("X-Other", "kept"), None);
+        let outcome = open().evaluate(request_with("X-Other", "kept"), None, now());
         assert_eq!(outcome.decision.action, Action::Allow);
         assert!(outcome.upstream_headers.is_empty());
     }
@@ -1030,7 +1188,8 @@ mod tests {
     /// A NON-RESERVED HEADER IS LEFT ALONE.
     #[test]
     fn an_ordinary_header_is_not_stripped() {
-        let outcome = gated_on("X-Service").evaluate(request_with("X-Service", "admins"), None);
+        let outcome =
+            gated_on("X-Service").evaluate(request_with("X-Service", "admins"), None, now());
         assert_eq!(
             outcome.decision.matched.as_deref(),
             Some("reserved-header-gate"),
@@ -1628,13 +1787,15 @@ mod tests {
             ..identity()
         };
         assert_eq!(
-            gate.evaluate(claiming.clone(), Some(&weak)).decision.action,
+            gate.evaluate(claiming.clone(), Some(&weak), now())
+                .decision
+                .action,
             Action::StepUp { acr: mfa.clone() },
             "a request asserting the context it was told to reach must still be challenged"
         );
 
         assert_eq!(
-            gate.evaluate(claiming.clone(), None).decision.action,
+            gate.evaluate(claiming.clone(), None, now()).decision.action,
             Action::StepUp { acr: mfa.clone() },
             "and an anonymous request asserting it must be challenged too, because the \
              overwrite clears the field rather than leaving what arrived"
@@ -1650,6 +1811,7 @@ mod tests {
                 ..claiming
             },
             Some(&stepped_up),
+            now(),
         );
         assert_eq!(
             admitted.decision.action,

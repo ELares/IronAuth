@@ -187,7 +187,7 @@ pub async fn check(
             ),
         });
 
-    let outcome = runtime.forward_auth().evaluate(facts, identity.as_ref());
+    let outcome = runtime.evaluate(facts, identity.as_ref());
 
     render(&outcome, &must_delete)
 }
@@ -317,6 +317,8 @@ mod tests {
             upstream_headers: upstream,
             must_delete: Vec::new(),
             identity_rejected: None,
+            cached: false,
+            cache_available: true,
         }
     }
 

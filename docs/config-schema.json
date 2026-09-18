@@ -886,6 +886,16 @@
       "additionalProperties": false,
       "description": "Forward-auth access rules (issue #154).\n\nA reverse proxy asks the forward-auth surface whether to admit a request, and this\nsection is where the answer is written down: an ORDERED list of rules, first match\nwins. `ironauth_oidc::rules` evaluates them; this is the vocabulary an operator uses\nto express them.\n\n# What enabling this serves\n\n`enabled = true` mounts the check endpoint at\n`/t/{tenant}/e/{environment}/forward-auth`, which a reverse proxy calls before serving a\nrequest. Off, that route answers a uniform 404, so a deployment that did not ask for the\nsurface does not advertise one.\n\nA rule this build cannot evaluate REFUSES TO BOOT rather than being skipped: the error\nreaches the same non-zero exit a malformed `server.public_url` takes.\n`subject_in_group` and `subject_has_role` are the current cases: the forward-auth\nidentity carries a subject and no memberships, so those checks would compare against an\nempty list and a `deny` rule keyed on a group would never bite.",
       "properties": {
+        "decision_cache_ttl_secs": {
+          "default": null,
+          "description": "The bounded-TTL decision cache for the check endpoint (issue #154 criterion 6).\n\n`None` (the default) evaluates every check from the rules, which is correct and is\nwhat every release before this field shipped did. `Some(seconds)` caches the\ndecision for an identical request within that window, so a proxy checking the same\nresource in a loop stops paying for a full rule evaluation each time.\n\nTHE BOUNDS ARE THE POINT, and the cache is safe because of three of them:\n\n- a cached answer is never served past this TTL (an entry older than the window is\n  recomputed, so the worst-case age of any served decision is bounded by a number\n  the operator set);\n- the rule set's fingerprint is part of the cache key, so a rule change cannot be\n  answered from an entry computed under the previous rules: the change is immediate,\n  not TTL-bounded (issue #154 criterion 6 asks for \"TTL plus the invalidation SLO\",\n  which for a generation-keyed cache is the TTL for an unchanged set and zero for a\n  changed one); and\n- a cache outage falls back to full evaluation, never to a stale allow: the cache\n  lives in this process, and the `DecisionStore` contract refuses to let a store\n  failure become a request failure.\n\nZero is refused at validation: a TTL of zero would cache nothing while reading as a\nfeature somebody turned on, and the off switch already exists (`None`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "dialect": {
           "$ref": "#/$defs/ProxyDialectConfig",
           "default": "forward-auth",
@@ -3465,6 +3475,7 @@
     "forward_auth": {
       "$ref": "#/$defs/ForwardAuthConfig",
       "default": {
+        "decision_cache_ttl_secs": null,
         "dialect": "forward-auth",
         "enabled": false,
         "rate_limit": {

@@ -1692,6 +1692,11 @@ required-features = ["testing"]
 path = "tests/forward_auth_step_up.rs"
 
 [[test]]
+name = "forward_auth_cache"
+required-features = ["testing"]
+path = "tests/forward_auth_cache.rs"
+
+[[test]]
 name = "access_rules_three_consumers"
 required-features = ["testing"]
 path = "tests/access_rules_three_consumers.rs"

@@ -1489,6 +1489,30 @@ pub struct ForwardAuthConfig {
     /// An empty list with `enabled = true` denies nothing and allows nothing to be
     /// decided; validation refuses it rather than leave the default unstated.
     pub rules: Vec<AccessRuleConfig>,
+    /// The bounded-TTL decision cache for the check endpoint (issue #154 criterion 6).
+    ///
+    /// `None` (the default) evaluates every check from the rules, which is correct and is
+    /// what every release before this field shipped did. `Some(seconds)` caches the
+    /// decision for an identical request within that window, so a proxy checking the same
+    /// resource in a loop stops paying for a full rule evaluation each time.
+    ///
+    /// THE BOUNDS ARE THE POINT, and the cache is safe because of three of them:
+    ///
+    /// - a cached answer is never served past this TTL (an entry older than the window is
+    ///   recomputed, so the worst-case age of any served decision is bounded by a number
+    ///   the operator set);
+    /// - the rule set's fingerprint is part of the cache key, so a rule change cannot be
+    ///   answered from an entry computed under the previous rules: the change is immediate,
+    ///   not TTL-bounded (issue #154 criterion 6 asks for "TTL plus the invalidation SLO",
+    ///   which for a generation-keyed cache is the TTL for an unchanged set and zero for a
+    ///   changed one); and
+    /// - a cache outage falls back to full evaluation, never to a stale allow: the cache
+    ///   lives in this process, and the `DecisionStore` contract refuses to let a store
+    ///   failure become a request failure.
+    ///
+    /// Zero is refused at validation: a TTL of zero would cache nothing while reading as a
+    /// feature somebody turned on, and the off switch already exists (`None`).
+    pub decision_cache_ttl_secs: Option<u64>,
 }
 
 /// One ordered access rule.
@@ -6880,6 +6904,17 @@ fn validate_forward_auth(
         ));
     }
 
+    // A ZERO TTL IS REFUSED, not silently ignored: a cache that never serves an entry reads
+    // as a feature somebody turned on, and `None` is the off switch that already exists.
+    if cfg.decision_cache_ttl_secs == Some(0) {
+        return Err(invalid(
+            "forward_auth.decision_cache_ttl_secs is 0, which caches nothing while reading \
+             as a cache somebody enabled: omit the key (or set it to null) to leave the \
+             cache off, or set a positive window"
+                .to_owned(),
+        ));
+    }
+
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (index, rule) in cfg.rules.iter().enumerate() {
         let at = format!("forward_auth.rules[{index}]");
@@ -11456,6 +11491,49 @@ mod tests {
             "<inline>",
         )
         .expect("both prerequisites present, so the surface is usable");
+    }
+
+    /// A zero decision-cache TTL is refused, and the default stays off (issue #154
+    /// criterion 6).
+    ///
+    /// A TTL of zero caches nothing while reading as a cache somebody enabled; `None` is the
+    /// off switch that already exists. The default has to be `None` so that a deployment
+    /// that has not asked for the cache evaluates every check from the rules exactly as
+    /// every release before this field shipped did.
+    #[test]
+    fn a_zero_decision_cache_ttl_is_refused_and_the_default_is_off() {
+        let prerequisites = "[oidc]\nenabled = true\n\
+                             [proxy]\ntrust_forwarded = true\ntrusted_hops = 1\n\
+                             [forward_auth]\nenabled = true\n\
+                             [[forward_auth.rules]]\nname = \"a\"\naction = \"deny\"\n";
+        let with_ttl = |value: &str| {
+            format!(
+                "[oidc]\nenabled = true\n\
+                 [proxy]\ntrust_forwarded = true\ntrusted_hops = 1\n\
+                 [forward_auth]\nenabled = true\ndecision_cache_ttl_secs = {value}\n\
+                 [[forward_auth.rules]]\nname = \"a\"\naction = \"deny\"\n"
+            )
+        };
+
+        let err = Config::from_toml_str(&with_ttl("0"), "<inline>")
+            .expect_err("a zero TTL is not a cache");
+        assert!(
+            format!("{err}").contains("decision_cache_ttl_secs is 0"),
+            "the refusal names the field: {err}"
+        );
+
+        // The same surface with a positive window is accepted, and the default is off.
+        let config = Config::from_toml_str(prerequisites, "<inline>")
+            .expect("valid")
+            .config;
+        assert_eq!(
+            config.forward_auth.decision_cache_ttl_secs, None,
+            "the cache is OFF by default"
+        );
+        let with_cache = Config::from_toml_str(&with_ttl("60"), "<inline>")
+            .expect("a positive window is valid")
+            .config;
+        assert_eq!(with_cache.forward_auth.decision_cache_ttl_secs, Some(60));
     }
 
     /// An absent section boots and serves nothing.
