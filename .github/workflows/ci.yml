@@ -1710,6 +1710,13 @@ jobs:
         # page a dashboard author reads is generated from the same value, so it cannot go on
         # listing a label the build stopped emitting.
         run: scripts/metrics-doc.sh
+      - name: failure matrix freshness (issue #149 criterion 5)
+        # The matrix is checked against the readiness code by
+        # crates/ironauth-server/tests/failure_matrix.rs (tier tokens and /readyz bodies
+        # against the real handler). This is the PUBLISHING half: the page an operator
+        # opens mid-incident is generated from the same types, so it cannot go on naming
+        # a tier the build stopped reporting.
+        run: scripts/failure-matrix-check.sh
       - name: JWT verification conformance corpus freshness (issue #118)
         # The one corpus every verifier in issue #118 is judged against. It is deterministic,
         # so a diff is always a real change; the failure this exists to catch is a REMOVED or

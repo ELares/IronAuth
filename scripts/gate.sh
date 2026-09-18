@@ -383,6 +383,7 @@ run "reference app bindings freshness (generated from the published contract)" s
 # as a diff a reviewer reads: that diff IS the compatibility check.
 run "event catalog freshness (generated from the audit action registry)" scripts/event-catalog.sh
 run "metric contract page freshness (generated from the metric registry)" scripts/metrics-doc.sh
+run "failure matrix freshness (generated from the readiness contract, issue #149)" scripts/failure-matrix-check.sh
 
 # The ONE corpus every verifier in issue #118 is judged against (the TS core today; the
 # Workers, Fastly, Lambda@Edge, Java and .NET verifiers as they land). Deterministic, so a
