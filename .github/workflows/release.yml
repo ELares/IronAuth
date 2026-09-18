@@ -202,7 +202,7 @@ jobs:
       # attestation to check. The package contains that binary plus a unit file and a config,
       # neither of which is a dependency, so the crate graph IS its component list.
       - name: Attest the DEB SBOM
-        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-path: dist/ironauth_*.deb
           sbom-path: crates/ironauth/ironauth.cdx.json
@@ -318,7 +318,7 @@ jobs:
           # version would have failed.
           python3 -c "import json,sys; d=json.load(open('image.cdx.json')); sys.exit(0 if d.get('components') else 1)"
       - name: Attest the image SBOM
-        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
