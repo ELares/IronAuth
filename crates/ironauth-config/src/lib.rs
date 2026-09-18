@@ -2678,6 +2678,16 @@ pub enum LogFormat {
     Pretty,
 }
 
+/// The default acquire bound, in seconds (issue #149).
+///
+/// DUPLICATED FROM `ironauth_store::DEFAULT_ACQUIRE_TIMEOUT_SECS`, and kept identical to it by a
+/// pinning test in that crate, because this crate does not depend on the store -- config sits
+/// BELOW it, and reversing that to share one integer would be the wrong trade. The same shape
+/// `OIDC_DEFAULT_ACR_ORDER` uses, for the same reason.
+///
+/// The reasoning for the VALUE lives on the store's constant, next to the pool it bounds.
+pub const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 3;
+
 /// Primary database settings.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -2690,6 +2700,26 @@ pub struct DatabaseConfig {
     /// Reserved out-of-band database password setting. The current serving
     /// connection paths do not use it to override or complete `url`.
     pub password: Option<Secret>,
+
+    /// How long a request may wait for a pool connection before it fails, in seconds
+    /// (issue #149).
+    ///
+    /// This decides what "the database is unreachable" LOOKS like to a caller. A pool that has
+    /// been closed errors at once; a server that is DOWN or PARTITIONED does not, and the
+    /// driver retries until this bound. The publication path reads the fence on every discovery
+    /// and JWKS request, so with the driver's own 30-second default each request held one of
+    /// sixteen permits for half a minute under a partition, and the seventeenth queued behind
+    /// them. The endpoints answered and were unusable, which is the opposite of what the
+    /// degraded tier promises.
+    ///
+    /// The default is three seconds: an order of magnitude above a normal connect including a
+    /// cross-zone TLS handshake, and well under the timeout a client gives up at. RAISE it only
+    /// for a genuinely distant database, and know what it buys -- a longer bound does not make
+    /// a request succeed, it makes a doomed one hold a permit for longer.
+    ///
+    /// Zero is refused. A zero bound fails every acquire that is not already satisfied by an
+    /// idle connection, which turns ordinary pool contention into an outage.
+    pub acquire_timeout_secs: u64,
 
     /// The platform envelope master key (issue #48): a high-entropy secret from
     /// which the per-tenant key hierarchy that seals classified PII columns
@@ -2744,6 +2774,7 @@ impl Default for DatabaseConfig {
             url: Dsn::parse("postgres://ironauth@localhost:5432/ironauth")
                 .expect("default DSN is valid by construction (covered by test)"),
             password: None,
+            acquire_timeout_secs: DEFAULT_ACQUIRE_TIMEOUT_SECS,
             master_key: None,
             master_key_id: None,
         }
@@ -6406,6 +6437,7 @@ impl Config {
         validate_recovery(&self.oidc)?;
         validate_fedcm(&self.oidc)?;
         validate_quota(&self.quota)?;
+        validate_database(&self.database)?;
         validate_password_hashing(&self.password_hashing)?;
         validate_password_policy(&self.password_policy)?;
         validate_diagnostics(&self.diagnostics)?;
@@ -8612,6 +8644,24 @@ fn is_well_formed_https_endpoint(endpoint: &str) -> bool {
 /// percentage (1 to 100, since 0 percent would fire immediately and above 100 is
 /// unreachable), and it carries no duplicates (a duplicate threshold would emit
 /// the same saturation webhook twice).
+/// Refuse a database section whose acquire bound cannot do its job (issue #149).
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] naming the field and what the value would do.
+fn validate_database(database: &DatabaseConfig) -> Result<(), ConfigError> {
+    if database.acquire_timeout_secs == 0 {
+        return Err(ConfigError::Invalid {
+            message: "database.acquire_timeout_secs must be at least 1: a zero bound fails \
+                      every acquire that an idle connection does not already satisfy, so \
+                      ordinary pool contention becomes an outage and the bound that exists to \
+                      make a DEAD database fail fast makes a HEALTHY one fail too"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_quota(quota: &QuotaConfig) -> Result<(), ConfigError> {
     let thresholds = &quota.usage_thresholds_percent;
     if thresholds.len() > QUOTA_MAX_USAGE_THRESHOLDS {
@@ -13197,5 +13247,32 @@ enabled = true
             ],
         };
         validate_messaging(&good).expect("two distinct https providers are valid");
+    }
+
+    /// A ZERO ACQUIRE BOUND IS REFUSED (issue #149), because it inverts what the bound is for.
+    ///
+    /// The bound exists so a DEAD database fails fast. At zero it also fails a HEALTHY one:
+    /// every acquire that an idle connection does not already satisfy errors immediately, so
+    /// ordinary pool contention becomes an outage. That is the direction worth refusing, and it
+    /// is refused at BOOT rather than discovered under load.
+    #[test]
+    fn a_zero_acquire_bound_is_refused_and_the_default_is_not() {
+        let mut database = DatabaseConfig::default();
+        assert!(
+            validate_database(&database).is_ok(),
+            "the shipped default must pass its own validator"
+        );
+        assert_eq!(
+            database.acquire_timeout_secs, DEFAULT_ACQUIRE_TIMEOUT_SECS,
+            "the premise: the default IS the constant, so the row above is about that value \
+             rather than about whatever a future default happens to be"
+        );
+
+        database.acquire_timeout_secs = 0;
+        let error = validate_database(&database).expect_err("zero is refused");
+        assert!(
+            format!("{error}").contains("acquire_timeout_secs"),
+            "the refusal names the field an operator wrote: {error}"
+        );
     }
 }

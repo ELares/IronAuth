@@ -430,7 +430,9 @@ pub use snapshot::{
     SnapshotViolation, UpstreamTokenGrantSnapshot, VariableSnapshot, classification_coverage_gaps,
     export as export_snapshot, validate_document,
 };
-pub use store::{SchemaReadiness, Store};
+pub use store::{
+    BOOT_CONNECT_TOLERANCE_SECS, DEFAULT_ACQUIRE_TIMEOUT_SECS, SchemaReadiness, Store,
+};
 pub use trait_schema::{
     MAX_DEPTH as TRAIT_SCHEMA_MAX_DEPTH, NarrowingViolation, SchemaError, TraitAnnotations,
     TraitSchema, TransformOp, ValidationFailure, Visibility, apply_transform, narrows,

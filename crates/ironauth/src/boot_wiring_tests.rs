@@ -721,6 +721,111 @@ async fn both_planes_receive_the_same_shared_values() {
 /// The unwired plane is the control, and it is what makes this non-vacuous: it is built
 /// through `OidcState::new` deliberately, so a version of this assertion that could not
 /// tell an installed resolver from an absent one fails here rather than passing quietly.
+/// THE BOUND IS ACTUALLY APPLIED TO THE POOL (issue #149).
+///
+/// The constant pin below proves the two numbers agree. It cannot prove either is USED, and a
+/// mutation showed that gap: deleting `.acquire_timeout(..)` from the constructor left the
+/// workspace compiling with one unused-variable warning and no failing test. So this reads the
+/// bound back off the pool the constructor built.
+///
+/// A value that is neither default answers a second question at no cost: that the argument is
+/// threaded rather than a constant re-applied inside.
+#[tokio::test]
+async fn the_configured_acquire_bound_reaches_the_pool() {
+    let db = ironauth_store::test_support::TestDatabase::start().await;
+    let store = ironauth_store::Store::connect_with_acquire_timeout(db.app_url(), 7)
+        .await
+        .expect("connect");
+    assert_eq!(
+        store.acquire_timeout_for_test(),
+        std::time::Duration::from_secs(7),
+        "the constructor took the bound and did not apply it, so a dead database stalls every \
+         request for whatever sqlx defaults to"
+    );
+
+    let defaulted = ironauth_store::Store::connect(db.app_url())
+        .await
+        .expect("connect");
+    assert_eq!(
+        defaulted.acquire_timeout_for_test(),
+        std::time::Duration::from_secs(ironauth_store::DEFAULT_ACQUIRE_TIMEOUT_SECS),
+        "and the no-argument constructor must carry the default rather than sqlx's"
+    );
+}
+
+/// THE BOOT CONNECT IS NOT BOUNDED BY THE REQUEST BOUND (issue #149).
+///
+/// `PoolOptions::connect()` applies `acquire_timeout` to its own eager connection, so the first
+/// version of this change cut every boot connect's tolerance from thirty seconds to three. A
+/// boot connect is ONE-SHOT -- the background subsystems log an error and are never retried,
+/// and `/readyz` is fed only by the serving planes -- so a pod whose workers all missed a
+/// three-second window reports READY with them permanently dead.
+///
+/// The bounds are separated now, and this is what says so: an unreachable database must take
+/// longer to give up on than the request bound, because the connect retries within the boot
+/// tolerance rather than failing on the first attempt.
+///
+/// A PORT NOBODY IS LISTENING ON, not a hostname, because a DNS failure is not transient and
+/// `sqlx` does not retry it -- that would measure the resolver rather than the retry loop.
+#[tokio::test]
+async fn an_unreachable_database_is_retried_past_the_request_bound() {
+    let unreachable = "postgres://ironauth@127.0.0.1:1/ironauth";
+    let started = std::time::Instant::now();
+    // A THREE-SECOND TOLERANCE, not the shipped thirty. The property is the SEPARATION of the
+    // two bounds, and three seconds shows it as well as thirty while costing the suite
+    // twenty-seven fewer on every run. The shipped value is pinned below instead.
+    let outcome = ironauth_store::Store::connect_with_bounds(unreachable, 1, 3).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        outcome.is_err(),
+        "a port nobody is listening on cannot connect"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(2),
+        "the connect gave up in {elapsed:?}, which is inside the one-second REQUEST bound it \
+         was given -- so the boot tolerance is not being applied and a database that is merely \
+         starting up would be abandoned"
+    );
+    // THE SHIPPED PAIR, read through bindings so the comparison is not folded to a constant --
+    // clippy warns on an assertion whose value it can compute, and the comparison IS the point.
+    let (tolerance, request_bound) = (
+        ironauth_store::BOOT_CONNECT_TOLERANCE_SECS,
+        ironauth_store::DEFAULT_ACQUIRE_TIMEOUT_SECS,
+    );
+    assert!(
+        tolerance > request_bound,
+        "the SHIPPED tolerance ({tolerance}s) must exceed the shipped request bound \
+         ({request_bound}s), or the separation this test measures is one the default \
+         configuration does not have"
+    );
+}
+
+/// THE TWO COPIES OF THE ACQUIRE BOUND AGREE (issue #149).
+///
+/// `ironauth-config` cannot read `ironauth_store::DEFAULT_ACQUIRE_TIMEOUT_SECS`, because config
+/// sits BELOW the store and reversing that to share one integer would be the wrong trade. So the
+/// number is written twice, and this is the test that makes the duplication safe -- the binary is
+/// the first crate that can see both.
+///
+/// Without it the config default could drift from the constructor default, and a deployment that
+/// set nothing would get one number while the doc comment beside it described another.
+#[test]
+fn the_config_default_matches_the_store_default() {
+    assert_eq!(
+        ironauth_config::DEFAULT_ACQUIRE_TIMEOUT_SECS,
+        ironauth_store::DEFAULT_ACQUIRE_TIMEOUT_SECS,
+        "the config default and the pool constructor default are the same number written in \
+         two crates; they have drifted"
+    );
+    assert_eq!(
+        ironauth_config::DatabaseConfig::default().acquire_timeout_secs,
+        ironauth_store::DEFAULT_ACQUIRE_TIMEOUT_SECS,
+        "and the shipped default config must carry it, or a deployment that sets nothing gets \
+         a different bound from the one documented"
+    );
+}
+
 #[tokio::test]
 async fn the_boot_path_installs_the_client_key_resolver() {
     // A TTL that is neither the shipped default (300) nor any other duration this harness
