@@ -22,7 +22,7 @@ use ironauth_env::Env;
 use ironauth_quota::{EnvironmentId, QuotaDimension, QuotaEnforcer, TenantId};
 use ironauth_store::{ActorRef, CorrelationId, Scope, ServiceId};
 
-/// An enforcer whose configured tiers are generous, so anything that refuses comes from an
+/// An enforcer whose configured tier is generous, so anything that refuses comes from an
 /// override rather than from the default.
 fn generous_enforcer(env: &Env) -> Arc<QuotaEnforcer> {
     let tier = ScopeQuotaConfig {
@@ -34,6 +34,27 @@ fn generous_enforcer(env: &Env) -> Arc<QuotaEnforcer> {
         hook_seconds_burst: 1_000,
         password_hashing_per_second: 1_000,
         password_hashing_burst: 1_000,
+    };
+    let config = QuotaConfig {
+        tenant: tier.clone(),
+        environment: tier,
+        ..QuotaConfig::default()
+    };
+    Arc::new(QuotaEnforcer::from_config(&config, env.clock_arc()))
+}
+
+/// An enforcer whose configured tier admits exactly two requests and refills nothing, so an
+/// unlimited scope is distinguishable from one still on its configured tier.
+fn two_spend_enforcer(env: &Env) -> Arc<QuotaEnforcer> {
+    let tier = ScopeQuotaConfig {
+        requests_per_second: 0,
+        requests_burst: 2,
+        token_issuance_per_second: 0,
+        token_issuance_burst: 0,
+        hook_seconds_per_second: 0,
+        hook_seconds_burst: 0,
+        password_hashing_per_second: 0,
+        password_hashing_burst: 0,
     };
     let config = QuotaConfig {
         tenant: tier.clone(),
@@ -194,5 +215,49 @@ async fn a_dimension_this_build_does_not_have_is_counted_and_skipped() {
     assert!(
         !admits(&enforcer, scope),
         "the dimension this build DOES have still applied"
+    );
+}
+
+#[tokio::test]
+async fn rows_naming_only_unknown_dimensions_leave_the_configured_tier_alone() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-quota-allunknown").await;
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let enforcer = two_spend_enforcer(&env);
+
+    // THE CONTROL: the configured tier admits exactly two requests, so a scope that has
+    // become UNLIMITED is distinguishable from one that stayed on its tier.
+    assert!(
+        admits(&enforcer, scope),
+        "the configured tier admits a first spend"
+    );
+    assert!(
+        admits(&enforcer, scope),
+        "the configured tier admits a second spend"
+    );
+    assert!(
+        !admits(&enforcer, scope),
+        "the configured tier refuses a third spend"
+    );
+
+    // A NEWER NODE'S ROWS, and NOTHING else: every stored row names a dimension this build
+    // does not have.
+    store_override(&h, scope, &env, "storage_bytes", 1.0, 1.0).await;
+    store_override(&h, scope, &env, "entitlement_ops", 1.0, 1.0).await;
+
+    let summary = ironauth_admin::quota_refresh::refresh(h.store(), &[scope], &enforcer)
+        .await
+        .expect("refresh");
+    assert_eq!(summary.unknown_dimensions, 2, "{summary:?}");
+    assert_eq!(summary.applied, 0, "{summary:?}");
+    assert_eq!(summary.cleared, 1, "{summary:?}");
+
+    // THE MUTANT THIS GUARDS. An applied all-None override would answer `None` (unlimited,
+    // not enforced) for every dimension, and this third spend would be admitted: a quota
+    // bypass on exactly the rolling-upgrade node the PR body claims is safe.
+    assert!(
+        !admits(&enforcer, scope),
+        "a scope whose stored rows name nothing this build has stays on its configured tier"
     );
 }

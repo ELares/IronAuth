@@ -64,6 +64,9 @@ fn request_quota(env_burst: u64) -> QuotaConfig {
         // tier/concurrency assertions independent of eviction. The eviction test
         // below installs its own reaping config.
         idle_bucket_ttl_secs: 0,
+        // The override refresher is a boot-path concern (issue #150 criterion 4);
+        // these enforcement tests drive the enforcer directly.
+        override_refresh_interval_secs: 0,
     }
 }
 
@@ -346,6 +349,7 @@ fn tenant_limited_quota(tenant_burst: u64) -> QuotaConfig {
         environment: scope(1_000),
         usage_thresholds_percent: vec![100],
         idle_bucket_ttl_secs: 0,
+        override_refresh_interval_secs: 0,
     }
 }
 

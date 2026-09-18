@@ -48,6 +48,11 @@ pub struct Refreshed {
     /// label as text: during a rolling upgrade a newer node writes a dimension an older one
     /// cannot name, and the older one must keep applying the rest. A count that stays non-zero
     /// outside an upgrade means the two ends have diverged.
+    ///
+    /// A scope whose rows name NOTHING this build has is cleared, not applied: an all-`None`
+    /// override would make every dimension unlimited (a missing dimension is not enforced), so
+    /// applying it would widen the quota as a side effect of an upgrade rather than leave it
+    /// on the configured tier.
     pub unknown_dimensions: usize,
 }
 
@@ -74,11 +79,13 @@ pub async fn refresh(
             continue;
         }
         let mut limits = ScopeLimits::default();
+        let mut known = 0usize;
         for (label, stored) in rows {
             let Some(dimension) = QuotaDimension::parse(&label) else {
                 summary.unknown_dimensions += 1;
                 continue;
             };
+            known += 1;
             let limit = Limit::new(stored.refill_per_sec, stored.burst);
             match dimension {
                 QuotaDimension::Requests => limits.requests = Some(limit),
@@ -86,6 +93,17 @@ pub async fn refresh(
                 QuotaDimension::HookSeconds => limits.hook_seconds = Some(limit),
                 QuotaDimension::PasswordHashing => limits.password_hashing = Some(limit),
             }
+        }
+        if known == 0 {
+            // Rows exist, but nothing this build can name is among them. Applying the empty
+            // set would NOT be a no-op: `ScopeLimits::get` answers `None` (unlimited, not
+            // enforced) for a missing dimension, so an all-None override would widen every
+            // dimension to unlimited on this node. Clear instead: the scope stays on its
+            // configured tier, which is what this build would enforce if the newer rows did
+            // not exist.
+            enforcer.clear_environment_override(&tenant, &environment);
+            summary.cleared += 1;
+            continue;
         }
         enforcer.set_environment_override(&tenant, &environment, limits);
         summary.applied += 1;
