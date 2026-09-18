@@ -8,10 +8,12 @@
     "build": "tsc && node build.mjs"
   },
   "devDependencies": {
-    "@bytecodealliance/componentize-js": "0.19.3",
+    "@bytecodealliance/componentize-js": "0.18.5",
     "typescript": "5.9.3"
   },
   "overrides": {
-    "@bytecodealliance/jco": "1.17.8"
+    "@bytecodealliance/jco": "1.17.8",
+    "@bytecodealliance/componentize-js": "$@bytecodealliance/componentize-js",
+    "@bytecodealliance/weval": "0.5.0"
   }
 }

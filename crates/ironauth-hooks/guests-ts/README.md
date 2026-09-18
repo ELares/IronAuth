@@ -37,10 +37,12 @@ npm ci --no-audit --no-fund
 npm run build
 ```
 
-The builder is pinned to `componentize-js` 0.19.3 with a `jco` 1.17.8 override. Later `jco`
-versions pull in another `componentize-js` release whose `weval` dependency brings back the
-vulnerable `decompress` archive extractor. Keep the locked builder audit clear when updating
-these pins; the source-built fixture must also pass the sandbox and upload-size assertions.
+The builder stays on `componentize-js` 0.18.5, including its nested copies, with `jco` 1.17.8
+and `weval` 0.5.0 overrides. The patched `weval` removes the vulnerable `decompress` archive
+extractor. Version 0.19.3 of the component builder passed most behavior checks but needed all
+16 MiB of the shipped memory limit, violating the existing 2x headroom assertion. The locked
+0.18.5 stack retains that assertion and passes all seven integration tests. Keep both the
+dependency audit and sandbox/upload-size assertions green when updating these pins.
 
 ## Why the component is generated before tests
 
@@ -77,7 +79,7 @@ std's startup needs them. It is `wasi:http/types`, pulled in because the JavaScr
 `fetch` global, that nothing satisfies. That is criterion 2's deny-by-default sandbox working.
 `build.mjs` disables all five features.
 
-**A JavaScript hook carries a JavaScript engine.** The locked builder produces about 11.1 MiB, of which about
+**A JavaScript hook carries a JavaScript engine.** The locked builder produces about 10.6 MiB, of which about
 four kilobytes is the code in `src/`. That is not a footnote:
 
 - the admin surface's upload cap had to admit it, and 8 MiB did not. See
@@ -97,8 +99,8 @@ four kilobytes is the code in `src/`. That is not a footnote:
   and it is true of the warm path and false of the first request for this artifact.
 - it still runs inside the shipped `Limits::claim_shaping`, unmodified.
   `the_typescript_hook_fits_the_shipped_limits_with_margin` searches for the smallest limit it
-  survives and PRINTS the ratio: memory at 8 MiB of the shipped 16 (2x), fuel at 12.5M of the
-  shipped 50M (4x).
+  survives and PRINTS the ratio. The patched builder retains memory at 8 MiB of the shipped
+  16 (2x); the release validation used 1.5625M fuel of the shipped 50M (32x).
 
 ## The test modes
 

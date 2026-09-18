@@ -420,8 +420,8 @@ if [ -x packages/ironauth-sdk/node_modules/.bin/tsc ]; then
         bash -c 'cd packages/ironauth-sdk && npm test --silent'
 else
     echo "sdk check(): SKIPPED, packages/ironauth-sdk dependencies are not installed."
-    echo "             Run: (cd packages/ironauth-sdk && npm install)  [CI runs this check]"
-    skipped "SDK check() middleware" "cd packages/ironauth-sdk && npm install"
+    echo "             Run: (cd packages/ironauth-sdk && npm ci)  [CI runs this check]"
+    skipped "SDK check() middleware" "cd packages/ironauth-sdk && npm ci"
 fi
 
 run "journey transcript replay" scripts/journey-replay.sh
@@ -443,8 +443,8 @@ if [ -x packages/admin-spa/node_modules/.bin/openapi-typescript ]; then
     run "admin SPA bindings freshness (generated from the OpenAPI document)" scripts/admin-spa-bindings.sh
 else
     echo "admin-spa-bindings: SKIPPED, packages/admin-spa dependencies are not installed."
-    echo "                    Run: (cd packages/admin-spa && npm install)  [CI runs this check]"
-    skipped "admin SPA bindings freshness" "cd packages/admin-spa && npm install"
+    echo "                    Run: (cd packages/admin-spa && npm ci)  [CI runs this check]"
+    skipped "admin SPA bindings freshness" "cd packages/admin-spa && npm ci"
 fi
 run "idempotent write audit (no admin handler splits two store writes behind one Idempotency-Key)" scripts/idempotent-write-audit.sh
 run "event feed producer census (joining the feed is a decision, not an accident)" scripts/event-ordering-audit.sh
