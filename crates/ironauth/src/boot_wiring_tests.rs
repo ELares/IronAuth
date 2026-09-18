@@ -753,6 +753,54 @@ async fn the_configured_acquire_bound_reaches_the_pool() {
     );
 }
 
+/// THE BOOT CONNECT IS NOT BOUNDED BY THE REQUEST BOUND (issue #149).
+///
+/// `PoolOptions::connect()` applies `acquire_timeout` to its own eager connection, so the first
+/// version of this change cut every boot connect's tolerance from thirty seconds to three. A
+/// boot connect is ONE-SHOT -- the background subsystems log an error and are never retried,
+/// and `/readyz` is fed only by the serving planes -- so a pod whose workers all missed a
+/// three-second window reports READY with them permanently dead.
+///
+/// The bounds are separated now, and this is what says so: an unreachable database must take
+/// longer to give up on than the request bound, because the connect retries within the boot
+/// tolerance rather than failing on the first attempt.
+///
+/// A PORT NOBODY IS LISTENING ON, not a hostname, because a DNS failure is not transient and
+/// `sqlx` does not retry it -- that would measure the resolver rather than the retry loop.
+#[tokio::test]
+async fn an_unreachable_database_is_retried_past_the_request_bound() {
+    let unreachable = "postgres://ironauth@127.0.0.1:1/ironauth";
+    let started = std::time::Instant::now();
+    // A THREE-SECOND TOLERANCE, not the shipped thirty. The property is the SEPARATION of the
+    // two bounds, and three seconds shows it as well as thirty while costing the suite
+    // twenty-seven fewer on every run. The shipped value is pinned below instead.
+    let outcome = ironauth_store::Store::connect_with_bounds(unreachable, 1, 3).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        outcome.is_err(),
+        "a port nobody is listening on cannot connect"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(2),
+        "the connect gave up in {elapsed:?}, which is inside the one-second REQUEST bound it \
+         was given -- so the boot tolerance is not being applied and a database that is merely \
+         starting up would be abandoned"
+    );
+    // THE SHIPPED PAIR, read through bindings so the comparison is not folded to a constant --
+    // clippy warns on an assertion whose value it can compute, and the comparison IS the point.
+    let (tolerance, request_bound) = (
+        ironauth_store::BOOT_CONNECT_TOLERANCE_SECS,
+        ironauth_store::DEFAULT_ACQUIRE_TIMEOUT_SECS,
+    );
+    assert!(
+        tolerance > request_bound,
+        "the SHIPPED tolerance ({tolerance}s) must exceed the shipped request bound \
+         ({request_bound}s), or the separation this test measures is one the default \
+         configuration does not have"
+    );
+}
+
 /// THE TWO COPIES OF THE ACQUIRE BOUND AGREE (issue #149).
 ///
 /// `ironauth-config` cannot read `ironauth_store::DEFAULT_ACQUIRE_TIMEOUT_SECS`, because config

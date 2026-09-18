@@ -84,7 +84,37 @@ pub struct Store {
 /// It makes it FAIL FAST, which is the whole of the intent. The surfaces issue #149 says keep
 /// serving do so by falling back to a warm entry when the fence read returns an error -- and
 /// they could not reach that fallback while the read was still waiting.
+///
+/// # It does NOT bound the boot connect, and the first version of this change did
+///
+/// `PoolOptions::connect()` applies `acquire_timeout` as the deadline for its own eager
+/// connection -- "Don't take longer than `acquire_timeout` starting from when this is called."
+/// So setting three seconds here silently cut the tolerance for a database that is STARTING UP
+/// from thirty seconds to three, and a review measured what that costs, because a boot connect
+/// is ONE-SHOT. `spawn_webhook_delivery_pools`, `start_scim_push_scheduler`,
+/// `start_audit_retention_sweeper`, `start_log_shipper` and the rest log an error, return
+/// nothing, and are never retried; `/readyz` is fed only by the serving planes, so a pod whose
+/// background subsystems all failed to connect reports READY and runs indefinitely with them
+/// dead.
+///
+/// The two bounds are separated for that reason: this one governs a REQUEST, and
+/// [`BOOT_CONNECT_TOLERANCE_SECS`] governs the one-shot connect, which is why the pool is built
+/// lazily and then probed.
 pub const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 3;
+
+/// How long the ONE-SHOT boot connect may keep retrying a database that is not yet answering.
+///
+/// Thirty seconds, which is what `sqlx` gave this path before a request bound existed --
+/// deliberately unchanged, because none of the request-path reasoning applies here. A deploy
+/// that races Postgres's own start, a failover, or a cold cluster is the ORDINARY case, and the
+/// cost of giving up early is not a slow request: it is a subsystem that never starts and is
+/// never retried.
+///
+/// `sqlx` already retries the right errors inside this window -- a refused connection is
+/// "assumed to be the system starting up", along with `53300 too_many_connections` and
+/// `57P03 cannot_connect_now` -- so this is the budget for that retry loop rather than one
+/// attempt.
+pub const BOOT_CONNECT_TOLERANCE_SECS: u64 = 30;
 
 impl Store {
     /// Run the pre-upgrade data preflight against this store's database (issue #148).
@@ -375,9 +405,11 @@ impl Store {
     /// The same, with the acquire bound a deployment configured.
     ///
     /// The bound lives on the CONSTRUCTOR rather than at each call site, so a connect cannot be
-    /// written without one. There are six `Store::connect` sites in the binary and only four of
-    /// them hold the parsed config; a per-site bound would have left the other two on whatever
-    /// `sqlx` defaults to, which is the state this replaces.
+    /// written without one. An earlier version of this sentence said there were "six
+    /// `Store::connect` sites in the binary and only four hold the parsed config"; `main.rs`
+    /// has FORTY-FOUR, and three pass the configured value. That is exactly why the bound
+    /// belongs here: a per-site bound would have left forty-one of them on whatever `sqlx`
+    /// defaults to, which is the state this replaces.
     ///
     /// # Errors
     ///
@@ -386,11 +418,61 @@ impl Store {
         url: &str,
         acquire_timeout_secs: u64,
     ) -> Result<Self, StoreError> {
+        Self::connect_with_bounds(url, acquire_timeout_secs, BOOT_CONNECT_TOLERANCE_SECS).await
+    }
+
+    /// The same, with BOTH bounds named.
+    ///
+    /// The boot tolerance is a parameter so a test can measure the SEPARATION of the two bounds
+    /// without waiting the real one out. It was not, and the test that pins it took thirty-one
+    /// seconds -- a suite pays that on every run, for ever, to observe a property a
+    /// three-second tolerance demonstrates just as well. The DEFAULT is pinned separately and
+    /// cheaply.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the pool cannot be established within the boot tolerance.
+    pub async fn connect_with_bounds(
+        url: &str,
+        acquire_timeout_secs: u64,
+        boot_tolerance_secs: u64,
+    ) -> Result<Self, StoreError> {
+        // LAZY, THEN PROBED, so the two bounds do not collapse into one.
+        //
+        // `connect()` applies `acquire_timeout` to its own eager connection, which is how the
+        // first version of this change cut every boot connect's tolerance to the request bound.
+        // Building lazily leaves the pool carrying the request bound and leaves the BOOT budget
+        // to the probe below.
         let pool = PgPoolOptions::new()
             .max_connections(16)
             .acquire_timeout(std::time::Duration::from_secs(acquire_timeout_secs))
-            .connect(url)
-            .await?;
+            .connect_lazy(url)?;
+
+        // THE PROBE KEEPS `connect` MEANING WHAT ITS CALLERS RELY ON: an `Err` here is a
+        // database this process could not reach, reported once at boot rather than discovered
+        // by the first request. Forty-odd call sites branch on it.
+        //
+        // One `acquire` is not the budget -- it is bounded by the pool's own short request
+        // bound -- so this retries until the boot tolerance is spent, which is what restores
+        // the behaviour `connect()` had.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(boot_tolerance_secs);
+        loop {
+            match pool.acquire().await {
+                Ok(connection) => {
+                    drop(connection);
+                    break;
+                }
+                // NOT LOGGED. This crate carries no tracing dependency, and adding one so a
+                // retry loop can narrate itself would be the wrong trade: the outcome is
+                // reported either way -- success, or the error the caller already logs.
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
         Ok(Self {
             pool,
             master: None,
