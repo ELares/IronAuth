@@ -332,6 +332,18 @@ pub const CONTRACT: &[MetricSpec] = &[
         help: "Refresh tokens presented after rotation, which is a theft signal",
     },
     MetricSpec {
+        name: "ironauth_token_requests_total",
+        kind: MetricKind::Counter,
+        labels: &["grant_type", "outcome"],
+        help: "Token endpoint requests by grant type and outcome",
+    },
+    MetricSpec {
+        name: "ironauth_token_request_duration_seconds",
+        kind: MetricKind::Histogram,
+        labels: &["grant_type"],
+        help: "Token endpoint request duration in seconds, by grant type",
+    },
+    MetricSpec {
         name: "ironauth_outbound_fetch_blocked_total",
         kind: MetricKind::Counter,
         labels: &["purpose", "reason"],

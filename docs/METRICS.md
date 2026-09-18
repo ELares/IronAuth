@@ -92,10 +92,12 @@ label on the wire with every test green.
 | `ironauth_sms_route_throttled_total` | counter | `route` | SMS sends refused by a per-route throttle |
 | `ironauth_sms_send_hash_rejected_total` | counter | none | SMS sends refused because the recipient hash was rejected |
 | `ironauth_sms_send_refused_total` | counter | `reason` | SMS sends refused, by reason |
+| `ironauth_token_request_duration_seconds` | histogram | `grant_type` | Token endpoint request duration in seconds, by grant type |
+| `ironauth_token_requests_total` | counter | `grant_type`, `outcome` | Token endpoint requests by grant type and outcome |
 | `ironauth_up` | gauge | none | 1 while the process is serving |
 | `ironauth_verification_send_suppressed_total` | counter | `purpose` | Verification sends suppressed, by purpose |
 
-41 metrics, 12 of them carrying no labels at all.
+43 metrics, 12 of them carrying no labels at all.
 
 ## Scope
 
