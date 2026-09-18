@@ -418,7 +418,13 @@ impl Store {
         url: &str,
         acquire_timeout_secs: u64,
     ) -> Result<Self, StoreError> {
-        Self::connect_with_bounds(url, acquire_timeout_secs, BOOT_CONNECT_TOLERANCE_SECS).await
+        Self::connect_with_bounds(
+            url,
+            acquire_timeout_secs,
+            BOOT_CONNECT_TOLERANCE_SECS,
+            &ironauth_env::SystemClock,
+        )
+        .await
     }
 
     /// The same, with BOTH bounds named.
@@ -436,6 +442,7 @@ impl Store {
         url: &str,
         acquire_timeout_secs: u64,
         boot_tolerance_secs: u64,
+        clock: &dyn ironauth_env::Clock,
     ) -> Result<Self, StoreError> {
         // LAZY, THEN PROBED, so the two bounds do not collapse into one.
         //
@@ -455,10 +462,24 @@ impl Store {
         // One `acquire` is not the budget -- it is bounded by the pool's own short request
         // bound -- so this retries until the boot tolerance is spent, which is what restores
         // the behaviour `connect()` had.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(boot_tolerance_secs);
+        // THE BUDGET IS READ OFF THE CLOCK SEAM, which is why this takes one. The first version
+        // of this change read the monotonic clock out of `std` twice and asked
+        // `scripts/invariant-lints.sh` for an exemption, on the reasoning that a constructor has
+        // no Env to read a clock from and that the seam carries no monotonic elapsed anyway.
+        // Both halves were false: `Clock::monotonic` is one of the trait's two methods,
+        // `Env::system()` takes no arguments, and `rekey_master` a hundred lines above already
+        // builds one. The lint script had recorded the same correction once before.
+        //
+        // Threading it costs nothing here: `connect_with_bounds` has two callers, and the
+        // wrapper above passes the real clock, so none of the forty-four `Store::connect` sites
+        // in the binary changes.
+        let budget = std::time::Duration::from_secs(boot_tolerance_secs);
+        let deadline = clock.monotonic() + budget;
         loop {
-            match pool.acquire().await {
+            let outcome = pool.acquire().await;
+            // READ AFTER THE ATTEMPT, so the attempt's own duration counts against the budget.
+            let now = clock.monotonic();
+            match outcome {
                 Ok(connection) => {
                     drop(connection);
                     break;
@@ -466,7 +487,7 @@ impl Store {
                 // NOT LOGGED. This crate carries no tracing dependency, and adding one so a
                 // retry loop can narrate itself would be the wrong trade: the outcome is
                 // reported either way -- success, or the error the caller already logs.
-                Err(_) if std::time::Instant::now() < deadline => {
+                Err(_) if now < deadline => {
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
                 Err(error) => return Err(error.into()),
