@@ -32,6 +32,24 @@ async fn the_shipped_probe_reports_a_migrated_database_as_serving() {
 #[tokio::test]
 async fn the_shipped_probe_separates_an_unmigrated_schema_from_an_unreachable_database() {
     let pool = TestDatabase::fresh_owner_pool_with_roles().await;
+    // SQLx returns the role-provisioning connection through a spawned task. Wait for that
+    // return before testing the schema: the production probe deliberately answers Serving
+    // when a live pool has no idle connection, which is a different readiness scenario.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while pool.num_idle() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "the unmigrated-schema fixture must have an idle connection before probing: \
+             {error}; size={}, idle={}, closed={}",
+            pool.size(),
+            pool.num_idle(),
+            pool.is_closed()
+        )
+    });
     let probe = StoreReadinessProbe {
         store: ironauth_store::Store::from_pool(pool),
     };
