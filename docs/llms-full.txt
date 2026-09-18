@@ -9304,6 +9304,15 @@ concurrency and polling are per process and per consumer; size them with the
 number of replicas and database capacity in mind. A stored configuration or
 queued job does not prove its worker is enabled.
 
+Budget PostgreSQL connections for all serving, control-plane, and dedicated
+consumer pools across every replica, with room for migrations and administration.
+Several pools start in each process; the PostgreSQL default of 100 connections
+can be exhausted by three replicas even before external traffic arrives. The
+three-replica CI smoke fixture uses 300 connections. Size production capacity
+for its enabled workers and workload rather than treating that fixture value as
+a deployment guarantee. If discovery fails during a cold start, inspect
+PostgreSQL connection-limit errors and pool waits as well as tenant state.
+
 | Worker or service | Runtime setting or prerequisite |
 | --- | --- |
 | Scheduled user offboarding | `users.offboarding_worker_enabled`, on by default, plus control-plane scope enumeration. |

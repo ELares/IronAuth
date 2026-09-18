@@ -1107,6 +1107,10 @@ jobs:
                 containers:
                   - name: postgres
                     image: postgres:16
+                    # Three replicas start separate serving, control and worker pools.
+                    # With the default 100 slots, a cold discovery request can fail its
+                    # unchanged 3-second acquire bound before the smoke test starts.
+                    args: ["-c", "max_connections=300"]
                     env:
                       - name: POSTGRES_PASSWORD
                         value: postgres
@@ -1308,7 +1312,16 @@ jobs:
         run: |
           kubectl get pods -o wide || true
           kubectl describe deployment/ironauth || true
-          kubectl logs -l app.kubernetes.io/name=ironauth --tail=100 --all-containers || true
+          kubectl logs -l app.kubernetes.io/name=ironauth --tail=100 --all-containers --prefix || true
+          # Connection counts and waits, without logging SQL text or application data.
+          POD=$(kubectl get pod -l app=postgres -o jsonpath='{.items[0].metadata.name}')
+          kubectl logs "$POD" --tail=100 || true
+          kubectl exec "$POD" -- env PGPASSWORD=postgres \
+            psql -h 127.0.0.1 -U postgres -d ironauth -v ON_ERROR_STOP=1 \
+            -c "SHOW max_connections; SHOW superuser_reserved_connections; \
+            SELECT usename, state, wait_event_type, wait_event, count(*) \
+            FROM pg_stat_activity GROUP BY usename, state, wait_event_type, wait_event \
+            ORDER BY usename, state, wait_event_type, wait_event" || true
           kubectl get events --sort-by=.lastTimestamp | tail -40 || true
 
   deb:
