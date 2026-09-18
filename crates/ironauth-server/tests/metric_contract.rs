@@ -43,6 +43,7 @@ use ironauth_server::metrics::{self, MetricKind};
 /// disagrees; it is proof that no site it can read disagrees, which is the honest claim and is
 /// still the one that catches the change a person actually makes.
 fn emit_sites() -> Vec<(String, String, Vec<String>)> {
+    let consts = workspace_metric_consts();
     let mut sites = Vec::new();
     // READ AT RUNTIME, NOT `include_str!`, because the outbox and log-stream metrics are emitted
     // from the BINARY crate and a macro path cannot reach a sibling crate without a brittle
@@ -50,6 +51,12 @@ fn emit_sites() -> Vec<(String, String, Vec<String>)> {
     // the first version listed three files in this crate and reported that no site sets
     // `consumer`, which was true of the files it read and false of the workspace.
     for source in workspace_sources() {
+        // A TEST EMIT IS NOT AN EXPORT, and this scan used to count one. `cfg_test_spans` was
+        // already written for exactly that, and applied only by `workspace_emitted_metrics`;
+        // widening this scan to every crate is what made the omission reachable, because the
+        // emits inside `#[cfg(test)] mod tests` are overwhelmingly in the crates it could not
+        // see before.
+        let skip = cfg_test_spans(&source);
         for macro_name in ["counter", "gauge", "histogram"] {
             let needle = format!("{macro_name}!(");
             let mut from = 0;
@@ -67,6 +74,10 @@ fn emit_sites() -> Vec<(String, String, Vec<String>)> {
                         .next_back()
                         .is_some_and(|c| c.is_alphanumeric() || c == '_')
                 {
+                    from = open;
+                    continue;
+                }
+                if skip.iter().any(|(lo, hi)| start >= *lo && start <= *hi) {
                     from = open;
                     continue;
                 }
@@ -91,12 +102,33 @@ fn emit_sites() -> Vec<(String, String, Vec<String>)> {
                 let args = &source[open..close];
                 from = close.max(open + 1);
 
-                // The first argument is the metric: a bare constant, or `metrics::CONST`.
+                // THE METRIC'S NAME, BOTH SPELLINGS. The first argument is a bare string
+                // literal, a constant, or `metrics::CONST`, and this scan used to take only the
+                // third-of-a-case it could resolve: an all-uppercase identifier, looked up in
+                // THIS crate's metrics module alone. Thirty of the forty-one contract entries
+                // are named by a literal or by a constant another crate declares, so the label
+                // and kind assertions below reached eleven of them while the file's own doc,
+                // and then a published page, said they reached all.
+                //
+                // `workspace_emitted_metrics` already resolved both spellings the same way; the
+                // two scans disagreeing about what an emit site IS was the whole defect.
                 let Some(first) = args.split(',').next() else {
                     continue;
                 };
-                let ident = first.trim().rsplit("::").next().unwrap_or("").trim();
-                if ident.is_empty() || !ident.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+                let first = first.trim();
+                let name = if let Some(literal) = first
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.split('"').next())
+                {
+                    literal.to_owned()
+                } else {
+                    let ident = first.rsplit("::").next().unwrap_or("").trim();
+                    let Some(value) = consts.get(ident) else {
+                        continue;
+                    };
+                    value.clone()
+                };
+                if !name.starts_with("ironauth_") {
                     continue;
                 }
                 // A label is the token immediately BEFORE each `=>`. Taking the last
@@ -113,7 +145,7 @@ fn emit_sites() -> Vec<(String, String, Vec<String>)> {
                     })
                     .filter(|label| !label.is_empty() && !label.contains('('))
                     .collect();
-                sites.push((ident.to_owned(), macro_name.to_owned(), labels));
+                sites.push((name, macro_name.to_owned(), labels));
             }
         }
     }
@@ -218,9 +250,10 @@ fn cfg_test_spans(source: &str) -> Vec<(usize, usize)> {
 
 /// Every `pub const NAME: &str = "ironauth_..."` ANYWHERE in the workspace.
 ///
-/// The sibling `value_of` reads only this crate's metrics module, which is correct for the
-/// constants declared there and blind to the ones other crates declare. A metric named by a
-/// constant in `ironauth-fetch` was invisible to every check here.
+/// Both scans in this file resolve a constant through here. An earlier version of `emit_sites`
+/// read only this crate's metrics module, which is correct for the constants declared there and
+/// blind to the ones other crates declare, so a metric named by a constant in `ironauth-fetch`
+/// was invisible to the kind and label assertions.
 fn workspace_metric_consts() -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     for source in workspace_sources() {
@@ -360,12 +393,43 @@ fn the_contract_covers_every_metric_the_workspace_emits() {
     );
 }
 
-/// The value of a `pub const NAME: &str = "..."` in the metrics module.
-fn value_of(ident: &str) -> Option<String> {
-    include_str!("../src/metrics.rs")
-        .split_once(&format!("pub const {ident}: &str = \""))
-        .and_then(|(_, rest)| rest.split_once('"'))
-        .map(|(value, _)| value.to_owned())
+/// THE TWO SCANS AGREE ABOUT WHAT AN EMIT SITE IS.
+///
+/// This file has two: `workspace_emitted_metrics`, which resolves a metric name from a literal
+/// or from a constant declared anywhere in the workspace, and `emit_sites`, which also reads the
+/// labels. They disagreed. `emit_sites` took only an all-uppercase identifier and resolved it
+/// only against this crate's metrics module, so the kind and label assertions in
+/// `every_emit_site_matches_the_contract_it_is_declared_under` reached ELEVEN of the forty-one
+/// contract entries while the name-only checks reached all of them.
+///
+/// Nothing said so. The two name-only tests passed, the label test passed, and the count of
+/// metrics it had actually looked at appeared nowhere -- so a page generated from the contract
+/// published "the labels are checked the same way" over thirty rows where nothing checked them.
+///
+/// This is the assertion that would have failed then and fails again if the scans drift: two
+/// independently written walks over the same tree, compared to each other. Neither one's
+/// expectation comes from the other.
+#[test]
+fn both_scans_find_the_same_emit_sites() {
+    let from_sites: std::collections::BTreeSet<String> =
+        emit_sites().into_iter().map(|(name, _, _)| name).collect();
+    let from_names = workspace_emitted_metrics();
+    assert_eq!(
+        from_sites, from_names,
+        "the label-reading scan and the name-only scan disagree about which metrics this \
+         workspace emits, so one of them is checking a subset of the other's metrics while \
+         both report success"
+    );
+    // A FLOOR, because two scans that both went blind agree perfectly. The contract is the
+    // independent quantity here: every entry in it has an emit site by
+    // `every_contract_metric_has_an_emit_site`, so a scan reading fewer distinct names than the
+    // contract has entries has stopped seeing some of them.
+    assert!(
+        from_sites.len() >= metrics::CONTRACT.len(),
+        "the scan reads {} distinct metrics and the contract has {} entries",
+        from_sites.len(),
+        metrics::CONTRACT.len()
+    );
 }
 
 #[test]
@@ -387,12 +451,9 @@ fn every_emit_site_matches_the_contract_it_is_declared_under() {
         sites.len()
     );
 
-    for (ident, macro_name, labels) in &sites {
-        let Some(name) = value_of(ident) else {
-            continue;
-        };
+    for (name, macro_name, labels) in &sites {
         let Some(spec) = metrics::CONTRACT.iter().find(|spec| spec.name == name) else {
-            panic!("{ident} ({name}) is emitted and is in no contract entry");
+            panic!("{name} is emitted and is in no contract entry");
         };
 
         let declared_macro = match spec.kind {
@@ -421,7 +482,7 @@ fn every_emit_site_matches_the_contract_it_is_declared_under() {
         // a defect -- a label missing from EVERY site is.
         let all_labels: std::collections::HashSet<&str> = sites
             .iter()
-            .filter(|(other, _, _)| value_of(other).as_deref() == Some(spec.name))
+            .filter(|(other, _, _)| other == spec.name)
             .flat_map(|(_, _, labels)| labels.iter().map(String::as_str))
             .collect();
         for declared in spec.labels {
@@ -503,4 +564,83 @@ fn the_contract_covers_every_metric_this_module_declares() {
              nothing checks that it is exported or what labels it carries"
         );
     }
+}
+
+/// The cardinality bound `docs/METRICS.md` publishes: no series is keyed by a principal.
+///
+/// # What the bound is
+///
+/// A label whose value is a tenant, a client, a user or an environment multiplies every series
+/// it appears on by the number of distinct values a DEPLOYMENT has. That number is unbounded
+/// from this repository's side, so the bound cannot be a threshold on a count; it has to be a
+/// refusal of the label itself. It is also the label class that puts identifiers on a scrape
+/// surface, which is usually protected less carefully than the database holding the same
+/// identifiers.
+///
+/// # Why it is a test rather than a sentence
+///
+/// The published page states the bound, and a statement about the code held in a different
+/// artifact is the thing this repository keeps having to retract. The expectation lives HERE --
+/// the list below is the test's, not the contract's -- and the observation is read from
+/// `CONTRACT`, so the two cannot be the same edit. Adding `tenant` to a metric turns the page's
+/// paragraph false and fails this test in the same commit.
+///
+/// The `_id` suffix rule is what makes it hold for names nobody has thought of yet. A label
+/// ending in `_id` is per-entity by construction, whatever the entity turns out to be called,
+/// so a future `workspace_id` fails without anyone having to remember to extend the list.
+#[test]
+fn no_metric_carries_a_per_principal_label() {
+    for spec in metrics::CONTRACT {
+        for label in spec.labels {
+            assert_per_principal_free(spec.name, label, "the contract lists");
+        }
+    }
+    // AND THE SAME RULE OVER WHAT THE CODE EMITS, which is the half the first version left out.
+    // It read `CONTRACT` alone, so the bound held over a list of labels rather than over the
+    // series a scrape actually carries: adding `"tenant" => ...` to an emit site left every
+    // test green and put the label on the wire. The contract is a promise; the emit sites are
+    // the behaviour, and a bound stated about one must be checked against the other.
+    for (name, _, labels) in emit_sites() {
+        for label in &labels {
+            assert_per_principal_free(&name, label, "an emit site sets");
+        }
+    }
+}
+
+/// Refuse one label name as per-principal, for [`no_metric_carries_a_per_principal_label`].
+fn assert_per_principal_free(metric: &str, label: &str, whence: &str) {
+    const PER_PRINCIPAL: &[&str] = &[
+        "tenant",
+        "client",
+        "environment",
+        "env",
+        "user",
+        "subject",
+        "sub",
+        "account",
+        "org",
+        "organization",
+        "email",
+        "username",
+        "session",
+        "ip",
+        "remote_addr",
+        // THIS REPOSITORY'S OWN WORD for a tenant and an environment together. A label named
+        // `scope` is two unbounded dimensions at once, and it is the name a person working in
+        // this codebase would reach for first.
+        "scope",
+    ];
+
+    assert!(
+        !PER_PRINCIPAL.contains(&label),
+        "{whence} the label `{label}` on {metric}, which is one value per principal: it \
+         multiplies that metric's series by a count this build does not bound, and \
+         docs/METRICS.md publishes the opposite. The per-tenant view belongs on the events and \
+         usage API, which is authenticated and paginated"
+    );
+    assert!(
+        !label.ends_with("_id"),
+        "{whence} the label `{label}` on {metric}, and a label ending in `_id` is one value per \
+         entity by construction. See the cardinality section of docs/METRICS.md"
+    );
 }

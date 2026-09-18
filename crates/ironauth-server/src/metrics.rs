@@ -141,13 +141,23 @@ pub struct MetricSpec {
 /// this one. A bidirectional check has a loop per direction, and counting them is how that is
 /// seen without running anything.
 ///
-/// # Scope
+/// # Scope: the workspace, not this crate
 ///
-/// The server's own metrics. Other crates export their own (`ironauth-fetch` has two), and they
-/// are NOT here yet: bringing them in means moving their constants behind one registry, which is
-/// a wider change than the contract this issue asks for.
-/// `the_contract_covers_every_metric_this_module_declares` holds the boundary, so a metric added
-/// to THIS module without a contract entry fails the build rather than quietly escaping.
+/// This constant LIVES in the server crate and is not limited to it. Measured over the tree, 4
+/// of the 41 entries are emitted from `ironauth-server`; 28 come from `ironauth-oidc`, 7 from
+/// the binary crate and 2 from `ironauth-fetch`.
+///
+/// The paragraph that used to be here said the opposite -- "the server's own metrics. Other
+/// crates export their own (`ironauth-fetch` has two), and they are NOT here yet" -- while
+/// `ironauth_outbound_fetch_blocked_total` and `ironauth_outbound_fetch_requests_total`, which
+/// are those two, sat in the list below it. It was written when the contract held eleven
+/// entries and was never revisited when `the_contract_covers_every_metric_the_workspace_emits`
+/// pulled the rest in.
+///
+/// Two boundaries hold it, and they are different claims:
+/// `the_contract_covers_every_metric_this_module_declares` refuses a constant declared HERE with
+/// no entry, and `the_contract_covers_every_metric_the_workspace_emits` refuses a metric emitted
+/// ANYWHERE with no entry.
 pub const CONTRACT: &[MetricSpec] = &[
     MetricSpec {
         name: HTTP_REQUESTS_TOTAL,
