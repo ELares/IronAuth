@@ -123,13 +123,7 @@ scan derivable-kind-is-public 'impl[[:space:]]+DerivableKind[[:space:]]+for' 1
 # how loaded the box is. It is not -- loading the box stretches the denominator, so the ratio
 # only ever admitted MORE than the absolute ceiling standing beside it and could not fail. The
 # ratio and its baseline read are gone; see the assertion for the measurements.
-# 12 -> 15: the boot-connect budget (#1324). `Store::connect_with_bounds` retries an unreachable
-# database until a monotonic deadline, and its test asserts the connect took longer than the
-# request bound. Neither can go through the Clock seam: the constructor takes a URL and returns
-# the Store an Env is later built around, so no Clock exists at that point, and the seam carries
-# no monotonic elapsed for the test to read -- a frozen one makes the loop spin for ever and the
-# assertion read zero. Two markers on the loop, one on the harness.
-scan time-via-env 'SystemTime::now|Instant::now' 15
+scan time-via-env 'SystemTime::now|Instant::now' 12
 # The `rand::` guard requires a non-identifier char (or start of line) before `rand`
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
 # (for example a `Brand::` associated call) is not a false positive.

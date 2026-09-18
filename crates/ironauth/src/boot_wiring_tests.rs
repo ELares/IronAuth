@@ -770,12 +770,15 @@ async fn the_configured_acquire_bound_reaches_the_pool() {
 #[tokio::test]
 async fn an_unreachable_database_is_retried_past_the_request_bound() {
     let unreachable = "postgres://ironauth@127.0.0.1:1/ironauth";
-    let started = std::time::Instant::now(); // invariant-allow: time-via-env -- a TIMING harness: the assertion is that the connect took LONGER than the request bound, which is a claim about real elapsed time and reads zero against a frozen seam
+    // THROUGH THE SEAM, like the connect under test. `SystemClock::monotonic` is the raw
+    // monotonic read, so this measures exactly what a direct one would and needs no exemption.
+    let clock: &dyn ironauth_env::Clock = &ironauth_env::SystemClock;
+    let started = clock.monotonic();
     // A THREE-SECOND TOLERANCE, not the shipped thirty. The property is the SEPARATION of the
     // two bounds, and three seconds shows it as well as thirty while costing the suite
     // twenty-seven fewer on every run. The shipped value is pinned below instead.
-    let outcome = ironauth_store::Store::connect_with_bounds(unreachable, 1, 3).await;
-    let elapsed = started.elapsed();
+    let outcome = ironauth_store::Store::connect_with_bounds(unreachable, 1, 3, clock).await;
+    let elapsed = clock.monotonic().duration_since(started);
 
     assert!(
         outcome.is_err(),

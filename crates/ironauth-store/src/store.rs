@@ -418,7 +418,13 @@ impl Store {
         url: &str,
         acquire_timeout_secs: u64,
     ) -> Result<Self, StoreError> {
-        Self::connect_with_bounds(url, acquire_timeout_secs, BOOT_CONNECT_TOLERANCE_SECS).await
+        Self::connect_with_bounds(
+            url,
+            acquire_timeout_secs,
+            BOOT_CONNECT_TOLERANCE_SECS,
+            &ironauth_env::SystemClock,
+        )
+        .await
     }
 
     /// The same, with BOTH bounds named.
@@ -436,6 +442,7 @@ impl Store {
         url: &str,
         acquire_timeout_secs: u64,
         boot_tolerance_secs: u64,
+        clock: &dyn ironauth_env::Clock,
     ) -> Result<Self, StoreError> {
         // LAZY, THEN PROBED, so the two bounds do not collapse into one.
         //
@@ -455,18 +462,23 @@ impl Store {
         // One `acquire` is not the budget -- it is bounded by the pool's own short request
         // bound -- so this retries until the boot tolerance is spent, which is what restores
         // the behaviour `connect()` had.
-        // A MONOTONIC BOOT BUDGET, not protocol time. This is a constructor taking a URL, so no
-        // Env exists yet to read a Clock from -- the Env is built around the Store this returns
-        // -- and the Clock seam carries no monotonic elapsed to inject. A frozen seam here would
-        // make the retry loop below spin for ever.
+        // THE BUDGET IS READ OFF THE CLOCK SEAM, which is why this takes one. The first version
+        // of this change read the monotonic clock out of `std` twice and asked
+        // `scripts/invariant-lints.sh` for an exemption, on the reasoning that a constructor has
+        // no Env to read a clock from and that the seam carries no monotonic elapsed anyway.
+        // Both halves were false: `Clock::monotonic` is one of the trait's two methods,
+        // `Env::system()` takes no arguments, and `rekey_master` a hundred lines above already
+        // builds one. The lint script had recorded the same correction once before.
+        //
+        // Threading it costs nothing here: `connect_with_bounds` has two callers, and the
+        // wrapper above passes the real clock, so none of the forty-four `Store::connect` sites
+        // in the binary changes.
         let budget = std::time::Duration::from_secs(boot_tolerance_secs);
-        let deadline = std::time::Instant::now() + budget; // invariant-allow: time-via-env -- see above
+        let deadline = clock.monotonic() + budget;
         loop {
             let outcome = pool.acquire().await;
             // READ AFTER THE ATTEMPT, so the attempt's own duration counts against the budget.
-            // On its own line because the exemption marker has to sit on the matching line and
-            // rustfmt moves a trailing comment off a match arm.
-            let now = std::time::Instant::now(); // invariant-allow: time-via-env -- the second half of the same monotonic budget
+            let now = clock.monotonic();
             match outcome {
                 Ok(connection) => {
                     drop(connection);
