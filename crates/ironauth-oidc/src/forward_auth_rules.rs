@@ -420,6 +420,19 @@ impl ForwardAuthRuntime {
             .evaluate(facts, identity, self.clock.monotonic())
     }
 
+    /// The full trace for a hypothetical check request (issue #154 criterion 5), the
+    /// dry-run half of "answer why was this denied".
+    ///
+    /// Decodes the request the way the check route does (the configured dialect reads the
+    /// original request from its own headers), sanitises it the way the check route does,
+    /// and returns every rule's answer WITHOUT deciding anything enforceable: the route
+    /// that calls this is not the check route, and the dry-run types return no owned
+    /// decision.
+    #[must_use]
+    pub fn explain(&self, facts: &crate::rules::RequestFacts) -> crate::rules::Explanation {
+        self.forward_auth.explain(facts)
+    }
+
     /// The dialect check requests arrive in.
     #[must_use]
     pub fn dialect(&self) -> crate::forward_auth::Dialect {

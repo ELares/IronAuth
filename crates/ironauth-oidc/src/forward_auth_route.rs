@@ -29,9 +29,11 @@
 //! not ask for this surface does not advertise one, and the 404 is indistinguishable from
 //! the route not existing.
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Method, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
 
 use crate::forward_auth::{DialectError, ForwardAuthOutcome, Identity};
 use crate::forward_auth::{ProxyHop, trusted_header_names};
@@ -47,6 +49,29 @@ use crate::wellknown::parse_scope;
 /// configure. A client sending `Remote-User` is either a misconfigured proxy or an attempt
 /// to forge an identity, and an operator wants to know which without reproducing it.
 pub const MUST_DELETE_HEADER: &str = "x-ironauth-must-delete";
+
+/// A hypothetical check request, for the dry-run surface (issue #154 criterion 5).
+///
+/// The SHAPE OF A CHECK REQUEST: what a proxy sends. The configured dialect reads the
+/// original request from these headers exactly as it does on the live check, so the trace
+/// answers the question the live path would have answered.
+#[derive(Debug, Deserialize)]
+pub struct DryRunRequest {
+    /// The method of the hypothetical request.
+    pub method: String,
+    /// Every header a proxy would forward, name and value.
+    #[serde(default)]
+    pub headers: Vec<DryRunHeader>,
+}
+
+/// One header of a hypothetical request.
+#[derive(Debug, Deserialize)]
+pub struct DryRunHeader {
+    /// The header name.
+    pub name: String,
+    /// The header value.
+    pub value: String,
+}
 
 /// Throttled forward-auth checks, by the layer that refused (issue #150 criterion 1).
 ///
@@ -192,6 +217,80 @@ pub async fn check(
     render(&outcome, &must_delete)
 }
 
+/// Answer "why would this request be denied" for a HYPOTHETICAL check request (issue #154
+/// criterion 5): every rule's answer, the decision they produce, and the one-line reason.
+///
+/// THE DRY-RUN HALF OF THE CRITERION, and the separation is structural, not a promise: this
+/// route never calls `evaluate`. It decodes the request through the SAME dialect the check
+/// route uses, sanitises it through the SAME sanitisation, walks the SAME rules — and
+/// returns the trace. There is no enforcement path from here: the caller gets JSON, not a
+/// verdict a proxy can act on.
+///
+/// Same hop gate as the check: only a request that arrived through the trusted-proxy chain
+/// may ask. The trace names rules and criteria, which is configuration knowledge, and the
+/// check response's own explanation header is the reason this surface exists — the full
+/// walk is what the proxy operator reaches for when the one-liner is not enough.
+pub async fn dry_run(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(runtime) = state.forward_auth() else {
+        return status(StatusCode::NOT_FOUND);
+    };
+    let Some(_scope) = parse_scope(&tenant_id, &environment_id) else {
+        return status(StatusCode::NOT_FOUND);
+    };
+
+    // THE HOP CHECK, EXACTLY AS ON THE CHECK ROUTE: a direct caller names the tenant and
+    // environment in the path, and the trace must not be an oracle for one.
+    let hop = hop_from_headers(&headers);
+    if hop == ProxyHop::Untrusted {
+        return status(StatusCode::FORBIDDEN);
+    }
+
+    let request: DryRunRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return status(StatusCode::BAD_REQUEST),
+    };
+    let pairs: Vec<(String, String)> = request
+        .headers
+        .into_iter()
+        .map(|header| (header.name, header.value))
+        .collect();
+
+    // The check request's own path, exactly as the live route passes it: for the dialects
+    // that read the original request from headers this is ignored, and for ext_authz it is
+    // the one place the original path can come from.
+    let (facts, _must_delete) = match runtime.dialect().describe(
+        hop,
+        &request.method,
+        &format!("/t/{tenant_id}/e/{environment_id}/forward-auth"),
+        &pairs,
+    ) {
+        Ok(described) => described,
+        Err(DialectError::UntrustedHop) => return status(StatusCode::FORBIDDEN),
+        Err(_) => return status(StatusCode::BAD_REQUEST),
+    };
+
+    let explanation = runtime.explain(&facts);
+    let body = serde_json::json!({
+        "decision": explanation.decision,
+        "reason": explanation.reason(),
+        "trace": explanation.trace,
+    });
+    match serde_json::to_string(&body) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(_) => status(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
 /// Whether THIS request arrived through the configured trusted-proxy chain.
 ///
 /// PER REQUEST, AND FAIL CLOSED. This was `state.proxy_hop_trusted()`, a boot-time boolean
@@ -218,6 +317,11 @@ fn hop_from_headers(headers: &HeaderMap) -> ProxyHop {
 }
 
 /// Turn a decision into the response a proxy acts on.
+///
+/// Every response carries the one-line explanation (issue #154 criterion 5) in
+/// [`ironauth_config::FORWARD_EXPLANATION_HEADER`]: only the trusted proxy sees the check
+/// response, so the line is the operator's answer, not an oracle for the protected app's
+/// clients.
 fn render(outcome: &ForwardAuthOutcome, must_delete: &[String]) -> Response {
     let mut response = match outcome.decision.action {
         Action::Allow => status(StatusCode::OK),
@@ -236,6 +340,13 @@ fn render(outcome: &ForwardAuthOutcome, must_delete: &[String]) -> Response {
             response
         }
     };
+
+    if let Ok(value) = axum::http::HeaderValue::from_str(&outcome.reason()) {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static(ironauth_config::FORWARD_EXPLANATION_HEADER),
+            value,
+        );
+    }
 
     // ONLY ON AN ALLOW. `ForwardAuthOutcome` already guarantees `upstream_headers` is empty
     // otherwise; copying unconditionally would depend on that invariant holding forever

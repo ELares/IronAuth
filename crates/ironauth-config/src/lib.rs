@@ -3140,6 +3140,15 @@ pub const FORWARD_DECISION_HEADER: &str = "x-ironauth-forward-decision";
 /// this request, i.e. it arrived through the configured trusted-proxy chain.
 pub const FORWARD_DECISION_HONORED: &str = "honored";
 
+/// The header every forward-auth check response carries: a one-line answer to "why was this
+/// denied" (issue #154 criterion 5).
+///
+/// Only the trusted proxy sees the check response, so the line is not an oracle for clients
+/// of the protected application: the check endpoint answers the proxy, and the proxy acts on
+/// the status code. The full per-rule trace lives on the dry-run surface, which answers the
+/// same question for a hypothetical request.
+pub const FORWARD_EXPLANATION_HEADER: &str = "x-ironauth-forward-explanation";
+
 /// The minimum permitted JWKS `Cache-Control: max-age` (issue #19), in seconds.
 /// A shorter window would make relying parties refetch the key set too often and
 /// undercut the pre-publish lead the rotation choreography depends on.
