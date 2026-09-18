@@ -455,10 +455,19 @@ impl Store {
         // One `acquire` is not the budget -- it is bounded by the pool's own short request
         // bound -- so this retries until the boot tolerance is spent, which is what restores
         // the behaviour `connect()` had.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(boot_tolerance_secs);
+        // A MONOTONIC BOOT BUDGET, not protocol time. This is a constructor taking a URL, so no
+        // Env exists yet to read a Clock from -- the Env is built around the Store this returns
+        // -- and the Clock seam carries no monotonic elapsed to inject. A frozen seam here would
+        // make the retry loop below spin for ever.
+        let budget = std::time::Duration::from_secs(boot_tolerance_secs);
+        let deadline = std::time::Instant::now() + budget; // invariant-allow: time-via-env -- see above
         loop {
-            match pool.acquire().await {
+            let outcome = pool.acquire().await;
+            // READ AFTER THE ATTEMPT, so the attempt's own duration counts against the budget.
+            // On its own line because the exemption marker has to sit on the matching line and
+            // rustfmt moves a trailing comment off a match arm.
+            let now = std::time::Instant::now(); // invariant-allow: time-via-env -- the second half of the same monotonic budget
+            match outcome {
                 Ok(connection) => {
                     drop(connection);
                     break;
@@ -466,7 +475,7 @@ impl Store {
                 // NOT LOGGED. This crate carries no tracing dependency, and adding one so a
                 // retry loop can narrate itself would be the wrong trade: the outcome is
                 // reported either way -- success, or the error the caller already logs.
-                Err(_) if std::time::Instant::now() < deadline => {
+                Err(_) if now < deadline => {
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
                 Err(error) => return Err(error.into()),
