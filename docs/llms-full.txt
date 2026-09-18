@@ -8899,8 +8899,9 @@ BOTH directions, which is what makes this page worth writing a dashboard against
 - a metric emitted and not listed here fails the build, so a series cannot appear on your
   scrape without having been reviewed.
 
-The labels are checked the same way, and the kind is too: a site that emits a label this page
-does not list, or omits one it does, or emits as a gauge what this page calls a counter, fails.
+The labels and kind are checked too: an emitted label this page does not list, a declared
+label absent from every emit site, or a gauge this page calls a counter fails. An individual
+site may emit a subset of the declared labels; the check compares their union across sites.
 
 THAT SENTENCE WAS PUBLISHED BEFORE IT WAS TRUE, which is worth leaving here rather than quietly
 correcting. The label check ran over emit sites resolved through one crate's constants only, so

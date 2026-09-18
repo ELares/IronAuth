@@ -33,13 +33,13 @@
 
 use ironauth_server::metrics::{self, MetricKind};
 
-/// Every emit site in the server crate: which macro, which metric constant, which labels.
+/// Every readable emit site in the workspace: which macro, which metric name, which labels.
 ///
 /// # A TEXT SCAN, and what it therefore cannot see
 ///
-/// It reads `counter!(CONST, "a" => .., "b" => ..)` and the gauge and histogram forms out of the
-/// crate's own source. It does NOT see a call assembled from a variable, a label list built at
-/// runtime, or an emit inside another crate. So a passing scan is not proof that no site
+/// It reads `counter!(CONST, "a" => .., "b" => ..)` and literal-named, gauge and histogram forms
+/// out of workspace production sources. It does NOT see a name assembled at runtime or a label
+/// list built at runtime. So a passing scan is not proof that no site
 /// disagrees; it is proof that no site it can read disagrees, which is the honest claim and is
 /// still the one that catches the change a person actually makes.
 fn emit_sites() -> Vec<(String, String, Vec<String>)> {
@@ -308,9 +308,8 @@ fn workspace_metric_consts() -> std::collections::HashMap<String, String> {
 /// Every metric name the workspace emits from PRODUCTION code.
 ///
 /// Accepts both spellings of the first macro argument: a bare string literal and a constant.
-/// The sibling `emit_sites` accepts only an all-uppercase identifier, so every
-/// literal-named metric was skipped -- which is why the contract covered eleven of the
-/// thirty-eight this workspace emits.
+/// Like `emit_sites`, it resolves both forms across the workspace. The two scans walk the
+/// macro arguments independently and must agree about the metric names they find.
 fn workspace_emitted_metrics() -> std::collections::BTreeSet<String> {
     let consts = workspace_metric_consts();
     let mut names = std::collections::BTreeSet::new();
