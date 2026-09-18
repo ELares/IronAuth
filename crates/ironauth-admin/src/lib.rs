@@ -146,6 +146,7 @@ mod project_grants;
 mod promotion;
 mod provision;
 mod queues;
+mod quota;
 mod ratelimit;
 mod recovery_approvals;
 mod resource_servers;
@@ -404,6 +405,21 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe",
             post(password_hashing::probe_password_hashing),
+        )
+        // The runtime quota-override surface (issue #150 criterion 4): the WRITE half of
+        // "limits change at runtime per tenant via the management API". The table and its
+        // repository shipped in migration 0229 and the refresher applies the rows to the
+        // running enforcer on a tick; this is the first surface that lets an operator reach
+        // the table at all. Static `quota/limits` suffix, matched before the parameterized
+        // routes. A PUT sets one dimension's override and a DELETE restores the configured
+        // tier; both are audited, sudo-gated writes through the acting repository.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits",
+            get(quota::list_quota_limits),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits/{dimension}",
+            put(quota::set_quota_limit).delete(quota::clear_quota_limit),
         )
         // The streaming bulk-import JOB (issue #55): the WRITE half of the migration
         // on-ramp. `POST .../imports` creates a run and streams a newline-delimited

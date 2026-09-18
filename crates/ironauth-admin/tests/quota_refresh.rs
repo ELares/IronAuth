@@ -169,7 +169,30 @@ async fn deleting_an_override_restores_the_configured_tier_without_a_restart() {
     let (tenant, environment) = h.create_tenant("acme", "k-quota-clear").await;
     let scope = scope_of(&tenant, &environment);
     let env = Env::system();
-    let enforcer = generous_enforcer(&env);
+    // A FROZEN clock for the enforcer, advanced explicitly: the final assertion here is
+    // about the override being cleared, not about the wall clock, and the token-bucket
+    // refill between the two spends is timing-dependent (a 1000/s tier needs a full
+    // millisecond to mint the one token the admit costs; on a fast machine the two DB
+    // round-trips between them take less, and the same assertions flip without any code
+    // change). The clock is advanced deterministically instead.
+    let manual_clock = std::sync::Arc::new(ironauth_env::ManualClock::new(
+        std::time::SystemTime::UNIX_EPOCH,
+    ));
+    let clock: std::sync::Arc<dyn ironauth_env::Clock> = manual_clock.clone();
+    let config = QuotaConfig {
+        tenant: ScopeQuotaConfig {
+            requests_per_second: 1_000,
+            requests_burst: 1_000,
+            ..ScopeQuotaConfig::default()
+        },
+        environment: ScopeQuotaConfig {
+            requests_per_second: 1_000,
+            requests_burst: 1_000,
+            ..ScopeQuotaConfig::default()
+        },
+        ..QuotaConfig::default()
+    };
+    let enforcer = Arc::new(QuotaEnforcer::from_config(&config, clock));
 
     store_override(&h, scope, &env, QuotaDimension::Requests.as_str(), 0.0, 0.0).await;
     ironauth_admin::quota_refresh::refresh(h.store(), &[scope], &enforcer)
@@ -187,6 +210,10 @@ async fn deleting_an_override_restores_the_configured_tier_without_a_restart() {
         .expect("refresh");
     assert_eq!(summary.cleared, 1, "{summary:?}");
     assert_eq!(summary.applied, 0, "{summary:?}");
+
+    // Two seconds of frozen time later, the restored tier has refilled the bucket: the
+    // spend is admitted because the override is GONE, not because a millisecond passed.
+    manual_clock.advance(std::time::Duration::from_secs(2));
     assert!(
         admits(&enforcer, scope),
         "deleting the override returns the scope to its configured tier"

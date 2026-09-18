@@ -21007,6 +21007,266 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits": {
+      "get": {
+        "tags": [
+          "quota"
+        ],
+        "summary": "List every stored quota override for this scope.",
+        "operationId": "listQuotaLimits",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every stored quota override for this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuotaLimitsView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or not in this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits/{dimension}": {
+      "put": {
+        "tags": [
+          "quota"
+        ],
+        "summary": "Set one dimension's override for this scope, replacing any existing one.",
+        "operationId": "setQuotaLimit",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "dimension",
+            "in": "path",
+            "description": "The quota dimension to override (requests, token_issuance, hook_seconds, password_hashing)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetQuotaLimitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Stored. The override takes effect on every node within one override-refresh interval; the full set is available from the GET"
+          },
+          "400": {
+            "description": "Malformed body, an unknown dimension, or a non-finite or negative limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent, soft-deleted, or not in this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "quota"
+        ],
+        "summary": "Clear one dimension's override, returning the scope to its configured tier.",
+        "operationId": "clearQuotaLimit",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "dimension",
+            "in": "path",
+            "description": "The quota dimension to clear (requests, token_issuance, hook_seconds, password_hashing)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Cleared. Every node returns the scope to its configured tier within one override-refresh interval"
+          },
+          "400": {
+            "description": "An unknown dimension",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent, soft-deleted, not in this scope, or the dimension has no stored override",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals": {
       "get": {
         "tags": [
@@ -36318,6 +36578,52 @@
           }
         }
       },
+      "QuotaLimitView": {
+        "type": "object",
+        "description": "One stored override, as the management surface renders it.",
+        "required": [
+          "dimension",
+          "refill_per_sec",
+          "burst",
+          "recognized"
+        ],
+        "properties": {
+          "burst": {
+            "type": "number",
+            "format": "double",
+            "description": "The burst capacity."
+          },
+          "dimension": {
+            "type": "string",
+            "description": "The dimension label, as stored (`QuotaDimension::as_str`)."
+          },
+          "recognized": {
+            "type": "boolean",
+            "description": "Whether THIS build can name the dimension. A row written by a newer node during a\nrolling upgrade is listed but not enforceable here; the refresher on a node that can\nname it applies it."
+          },
+          "refill_per_sec": {
+            "type": "number",
+            "format": "double",
+            "description": "The sustained rate, tokens per second."
+          }
+        }
+      },
+      "QuotaLimitsView": {
+        "type": "object",
+        "description": "The full set of stored overrides for a scope.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuotaLimitView"
+            },
+            "description": "Every override, in dimension order."
+          }
+        }
+      },
       "RaiseAccessRequestBody": {
         "type": "object",
         "description": "What a member asks for.",
@@ -38210,6 +38516,26 @@
           "token": {
             "type": "string",
             "description": "The shared bearer a successor system will present to this environment's\ncredential-verification endpoint. Writing it enables the endpoint for this\nenvironment; writing it again rotates it, and the previous value stops working\nthe moment the write commits. It is sealed under this environment's envelope\nkey and is never readable back through any endpoint."
+          }
+        }
+      },
+      "SetQuotaLimitRequest": {
+        "type": "object",
+        "description": "Set (create or replace) one dimension's override.",
+        "required": [
+          "refill_per_sec",
+          "burst"
+        ],
+        "properties": {
+          "burst": {
+            "type": "number",
+            "format": "double",
+            "description": "The burst capacity. Non-negative and finite."
+          },
+          "refill_per_sec": {
+            "type": "number",
+            "format": "double",
+            "description": "The sustained rate, tokens per second. Non-negative and finite."
           }
         }
       },

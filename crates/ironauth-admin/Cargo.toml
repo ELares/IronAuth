@@ -361,6 +361,12 @@ required-features = ["testing"]
 
 # Needs a real database (DATABASE_URL).
 [[test]]
+name = "quota_management"
+path = "tests/quota_management.rs"
+required-features = ["testing"]
+
+# Needs a real database (DATABASE_URL).
+[[test]]
 name = "authzen"
 path = "tests/authzen.rs"
 required-features = ["testing"]

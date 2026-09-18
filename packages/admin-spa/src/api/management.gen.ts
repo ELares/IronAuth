@@ -2907,6 +2907,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List every stored quota override for this scope. */
+        get: operations["listQuotaLimits"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits/{dimension}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Set one dimension's override for this scope, replacing any existing one. */
+        put: operations["setQuotaLimit"];
+        post?: never;
+        /** Clear one dimension's override, returning the scope to its configured tier. */
+        delete: operations["clearQuotaLimit"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals": {
         parameters: {
             query?: never;
@@ -8072,6 +8107,32 @@ export interface components {
              */
             scheduled: number;
         };
+        /** @description One stored override, as the management surface renders it. */
+        QuotaLimitView: {
+            /**
+             * Format: double
+             * @description The burst capacity.
+             */
+            burst: number;
+            /** @description The dimension label, as stored (`QuotaDimension::as_str`). */
+            dimension: string;
+            /**
+             * @description Whether THIS build can name the dimension. A row written by a newer node during a
+             *     rolling upgrade is listed but not enforceable here; the refresher on a node that can
+             *     name it applies it.
+             */
+            recognized: boolean;
+            /**
+             * Format: double
+             * @description The sustained rate, tokens per second.
+             */
+            refill_per_sec: number;
+        };
+        /** @description The full set of stored overrides for a scope. */
+        QuotaLimitsView: {
+            /** @description Every override, in dimension order. */
+            items: components["schemas"]["QuotaLimitView"][];
+        };
         /** @description What a member asks for. */
         RaiseAccessRequestBody: {
             /** @description Why, in the requester's words. */
@@ -9394,6 +9455,19 @@ export interface components {
              *     key and is never readable back through any endpoint.
              */
             token: string;
+        };
+        /** @description Set (create or replace) one dimension's override. */
+        SetQuotaLimitRequest: {
+            /**
+             * Format: double
+             * @description The burst capacity. Non-negative and finite.
+             */
+            burst: number;
+            /**
+             * Format: double
+             * @description The sustained rate, tokens per second. Non-negative and finite.
+             */
+            refill_per_sec: number;
         };
         /** @description What a pause or resume names. */
         SetScimPushActiveRequest: {
@@ -24549,6 +24623,184 @@ export interface operations {
                 };
             };
             /** @description The environment is absent */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listQuotaLimits: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every stored quota override for this scope */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QuotaLimitsView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or not in this scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setQuotaLimit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The quota dimension to override (requests, token_issuance, hook_seconds, password_hashing) */
+                dimension: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetQuotaLimitRequest"];
+            };
+        };
+        responses: {
+            /** @description Stored. The override takes effect on every node within one override-refresh interval; the full set is available from the GET */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed body, an unknown dimension, or a non-finite or negative limit */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent, soft-deleted, or not in this scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    clearQuotaLimit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The quota dimension to clear (requests, token_issuance, hook_seconds, password_hashing) */
+                dimension: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cleared. Every node returns the scope to its configured tier within one override-refresh interval */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description An unknown dimension */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent, soft-deleted, not in this scope, or the dimension has no stored override */
             404: {
                 headers: {
                     [name: string]: unknown;

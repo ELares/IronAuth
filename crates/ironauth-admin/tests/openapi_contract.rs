@@ -101,6 +101,7 @@ fn operation_ids_are_the_stable_set() {
             "authzenEvaluations",
             "bulkRevokeSessions",
             "clearOrgDefaultRole",
+            "clearQuotaLimit",
             "createBan",
             "createConnector",
             "createDcrInitialAccessToken",
@@ -270,6 +271,7 @@ fn operation_ids_are_the_stable_set() {
             "listPermissions",
             "listProjectGrants",
             "listQueueDepths",
+            "listQuotaLimits",
             "listRecoveryApprovals",
             "listRefreshFamilies",
             "listResourceServers",
@@ -360,6 +362,7 @@ fn operation_ids_are_the_stable_set() {
             "setOrgDefaultRole",
             "setOrgGroupParent",
             "setOutboundVerification",
+            "setQuotaLimit",
             "setScimPushConnectionActive",
             "setSecret",
             "setSessionJwtMode",
@@ -598,6 +601,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits/{dimension}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode",
@@ -698,6 +702,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/permissions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/queues",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families/{family_id}",
@@ -859,6 +864,7 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/{connector_id}/active",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/active",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits/{dimension}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates",
@@ -958,7 +964,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        304,
+        307,
         "the documented route count is pinned"
     );
 
