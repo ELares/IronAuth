@@ -8873,13 +8873,23 @@ which CI runs; a hand edit here fails that gate. Do not write this page, write t
 `crates/ironauth-server/tests/metric_contract.rs` checks the contract against the emit sites in
 BOTH directions, which is what makes this page worth writing a dashboard against:
 
-- a metric listed here and emitted nowhere fails the build, so a panel cannot render empty
-  because the series it queries was quietly deleted; and
+- a metric listed here whose emit sites have all been DELETED fails the build, so a panel does
+  not go quiet because the series it queries stopped existing. This is a check on the source,
+  not on coverage: a site that still exists on a path nothing reaches passes it, and only a
+  test that drives the path can say the series is actually produced; and
 - a metric emitted and not listed here fails the build, so a series cannot appear on your
   scrape without having been reviewed.
 
-The labels are checked the same way. A site that emits a label this page does not list, or
-omits one it does, fails.
+The labels are checked the same way, and the kind is too: a site that emits a label this page
+does not list, or omits one it does, or emits as a gauge what this page calls a counter, fails.
+
+THAT SENTENCE WAS PUBLISHED BEFORE IT WAS TRUE, which is worth leaving here rather than quietly
+correcting. The label check ran over emit sites resolved through one crate's constants only, so
+it reached 11 of the 41 metrics below while this page told a dashboard author it reached all of
+them. A `tenant` label added to any of the other 30 emit sites left every test green. The scan
+now resolves a metric named by a string literal and by a constant declared anywhere in the
+workspace, `both_scans_find_the_same_emit_sites` asserts the two independently written walks
+over the tree agree about what an emit site is, and the mutation above now fails.
 
 ## Cardinality
 
@@ -8899,9 +8909,11 @@ The per-tenant view is not missing, it is somewhere else. Per-tenant counts come
 events and usage-metering API, which is authenticated, scoped, and paginated, and where a
 tenant identifier is the point rather than a cardinality hazard.
 
-`no_contract_metric_carries_a_per_principal_label` in the contract test enforces the paragraph
-above, including on any label name ending in `_id`, so this page cannot go on claiming a bound
-the contract has stopped keeping.
+`no_metric_carries_a_per_principal_label` in the contract test enforces the paragraph above,
+including on any label name ending in `_id`. It reads BOTH the contract's declared labels and
+the labels the emit sites actually set, which is the difference between a promise and the
+behaviour: its first version read the contract alone, so adding `tenant` to an emit site put the
+label on the wire with every test green.
 
 | metric | type | labels | meaning |
 | --- | --- | --- | --- |
@@ -8951,12 +8963,16 @@ the contract has stopped keeping.
 
 ## Scope
 
-The server's own metrics. Other crates export their own (`ironauth-fetch` has two), and they
-are not in this contract yet: bringing them in means moving their constants behind one
-registry, which is wider than the contract this page publishes.
-`the_contract_covers_every_metric_this_module_declares` holds that boundary, so a metric added
-to the server's metrics module without a contract entry fails the build rather than quietly
-escaping.
+Every metric this workspace emits, wherever it is emitted from. The contract is DECLARED in the
+server crate and is not limited to it: of the 41 entries, 4 are emitted from `ironauth-server`,
+28 from `ironauth-oidc`, 7 from the binary crate and 2 from `ironauth-fetch`.
+
+Two tests hold that boundary from different sides.
+`the_contract_covers_every_metric_this_module_declares` refuses a metric constant declared in
+the server's metrics module with no contract entry, and
+`the_contract_covers_every_metric_the_workspace_emits` refuses a metric emitted anywhere in the
+workspace with no contract entry. So a new series cannot reach a scrape without appearing on
+this page.
 
 ## Regenerating
 
