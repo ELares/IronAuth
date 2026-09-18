@@ -504,3 +504,65 @@ fn the_contract_covers_every_metric_this_module_declares() {
         );
     }
 }
+
+/// The cardinality bound `docs/METRICS.md` publishes: no series is keyed by a principal.
+///
+/// # What the bound is
+///
+/// A label whose value is a tenant, a client, a user or an environment multiplies every series
+/// it appears on by the number of distinct values a DEPLOYMENT has. That number is unbounded
+/// from this repository's side, so the bound cannot be a threshold on a count; it has to be a
+/// refusal of the label itself. It is also the label class that puts identifiers on a scrape
+/// surface, which is usually protected less carefully than the database holding the same
+/// identifiers.
+///
+/// # Why it is a test rather than a sentence
+///
+/// The published page states the bound, and a statement about the code held in a different
+/// artifact is the thing this repository keeps having to retract. The expectation lives HERE --
+/// the list below is the test's, not the contract's -- and the observation is read from
+/// `CONTRACT`, so the two cannot be the same edit. Adding `tenant` to a metric turns the page's
+/// paragraph false and fails this test in the same commit.
+///
+/// The `_id` suffix rule is what makes it hold for names nobody has thought of yet. A label
+/// ending in `_id` is per-entity by construction, whatever the entity turns out to be called,
+/// so a future `workspace_id` fails without anyone having to remember to extend the list.
+#[test]
+fn no_contract_metric_carries_a_per_principal_label() {
+    const PER_PRINCIPAL: &[&str] = &[
+        "tenant",
+        "client",
+        "environment",
+        "env",
+        "user",
+        "subject",
+        "sub",
+        "account",
+        "org",
+        "organization",
+        "email",
+        "username",
+        "session",
+        "ip",
+        "remote_addr",
+    ];
+
+    for spec in metrics::CONTRACT {
+        for label in spec.labels {
+            assert!(
+                !PER_PRINCIPAL.contains(label),
+                "{} carries the label `{label}`, which is one value per principal: it multiplies \
+                 that metric's series by a count this build does not bound, and docs/METRICS.md \
+                 publishes the opposite. The per-tenant view belongs on the events and usage \
+                 API, which is authenticated and paginated",
+                spec.name
+            );
+            assert!(
+                !label.ends_with("_id"),
+                "{} carries the label `{label}`, and a label ending in `_id` is one value per \
+                 entity by construction. See the cardinality section of docs/METRICS.md",
+                spec.name
+            );
+        }
+    }
+}

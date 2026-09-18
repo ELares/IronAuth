@@ -1668,6 +1668,12 @@ jobs:
         # both generated. A payload schema changed under an unchanged version surfaces here as
         # a diff, which is the registry compatibility check.
         run: scripts/event-catalog.sh
+      - name: metric contract page freshness (issue #152)
+        # The contract itself is checked against the emit sites in both directions by
+        # crates/ironauth-server/tests/metric_contract.rs. This is the PUBLISHING half: the
+        # page a dashboard author reads is generated from the same value, so it cannot go on
+        # listing a label the build stopped emitting.
+        run: scripts/metrics-doc.sh
       - name: JWT verification conformance corpus freshness (issue #118)
         # The one corpus every verifier in issue #118 is judged against. It is deterministic,
         # so a diff is always a real change; the failure this exists to catch is a REMOVED or
