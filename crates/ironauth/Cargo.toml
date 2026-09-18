@@ -23,6 +23,10 @@ metrics.workspace = true
 # connection. Both are rustls/ring only (no openssl/native-tls), so the musl
 # static lane holds.
 ironauth-store.workspace = true
+# The cross-node accelerator seam (issue #146). A DIRECT dependency because the boot path
+# CONSTRUCTS a `HotState` now: it reached the binary transitively before, through two crates
+# that hold one, and nothing here could name the type.
+ironauth-hot.workspace = true
 ironauth-admin.workspace = true
 # The OIDC provider (issue #12) is mounted on the PUBLIC plane when
 # oidc.enabled is set; the store provides the data-plane connection. rustls/ring
@@ -101,7 +105,7 @@ ironbus = ["ironauth-store/ironbus"]
 # BOTH dependents are named, because both depend on `ironauth-hot` and cargo unifies features
 # per crate: naming only one would still enable the backend, and the next reader would have to
 # work out that it arrived through a crate the line does not mention.
-ironcache = ["ironauth-oidc/ironcache", "ironauth-store/ironcache"]
+ironcache = ["ironauth-oidc/ironcache", "ironauth-store/ironcache", "ironauth-hot/ironcache"]
 # Forwarded to the server crate: OTLP trace export off by default so the
 # default build and the musl static lane stay lean and protoc-free.
 otlp = ["ironauth-server/otlp"]

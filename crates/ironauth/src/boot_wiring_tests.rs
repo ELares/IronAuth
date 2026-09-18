@@ -67,7 +67,7 @@ use ironauth_store::Store;
 use ironauth_store::test_support::TestDatabase;
 use serde_json::{Value, json};
 
-use super::assemble_planes;
+use super::{accelerator_declaration_is_honourable, assemble_planes};
 use crate::shared_config::{
     SHARED_BOOT_INPUT_NAMES, SHARED_CONFIG_SECTION_NAMES, SHARED_DERIVED_NAMES, SHARED_OBJECT_NAMES,
 };
@@ -751,6 +751,65 @@ async fn the_configured_acquire_bound_reaches_the_pool() {
         std::time::Duration::from_secs(ironauth_store::DEFAULT_ACQUIRE_TIMEOUT_SECS),
         "and the no-argument constructor must carry the default rather than sqlx's"
     );
+}
+
+/// A DECLARED ACCELERATOR THIS BUILD CANNOT REACH REFUSES TO BOOT (issue #146).
+///
+/// `hot_state.ironcache_addr` is configuration and the client is a cargo feature, so a build
+/// without `ironcache` cannot honour the key. Both ways of not honouring it are worse than
+/// refusing: ignoring it leaves an operator reading an accelerator address in their own file
+/// while every read still pays Postgres, and readiness already reports an accelerator TIER from
+/// this key, so it would report the opposite of what is true.
+///
+/// This test runs in BOTH builds and asserts a different thing in each, because the behaviour
+/// is genuinely different and a test that only ran in one would leave the other unpinned.
+#[test]
+fn a_declared_accelerator_refuses_a_build_that_cannot_reach_it() {
+    let mut hot_state = ironauth_config::HotStateConfig::default();
+    assert!(
+        hot_state.ironcache_addr.is_none(),
+        "the premise: unset is the shipped default, so the row below is about a deployment \
+         that opted in"
+    );
+    assert!(
+        accelerator_declaration_is_honourable(&hot_state).is_ok(),
+        "an unset address is not a refusal -- the covenant is that a deployment is complete \
+         on Postgres alone"
+    );
+
+    hot_state.ironcache_addr = Some("redis://127.0.0.1:1".to_owned());
+    let outcome = accelerator_declaration_is_honourable(&hot_state);
+
+    #[cfg(not(feature = "ironcache"))]
+    {
+        // `expect_err` would need `Debug` on the factory, which is a boxed closure. Matching
+        // says the same thing and needs nothing of the Ok side.
+        let Err(error) = outcome else {
+            panic!("a build without the client must refuse the key");
+        };
+        let rendered = format!("{error}");
+        assert!(
+            rendered.contains("ironcache"),
+            "the refusal must name the feature an operator has to rebuild with: {rendered}"
+        );
+        assert!(
+            !rendered.contains("127.0.0.1"),
+            "and must not echo the address, which is DSN-shaped and can carry a credential: \
+             {rendered}"
+        );
+    }
+
+    #[cfg(feature = "ironcache")]
+    {
+        // A PORT NOBODY IS LISTENING ON, and it is still not a refusal. The check is about the
+        // BUILD, not the cache: a declared accelerator that is down is the outage the covenant
+        // exists for, and refusing on reachability would turn a tolerated failure into a boot
+        // failure.
+        assert!(
+            outcome.is_ok(),
+            "a cache that is DOWN is not a boot refusal in a build that could reach one"
+        );
+    }
 }
 
 /// THE BOOT CONNECT IS NOT BOUNDED BY THE REQUEST BOUND (issue #149).

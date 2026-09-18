@@ -27,6 +27,25 @@ pub enum ServerError {
         /// A short reason naming the rule and the criterion; never echoes credentials.
         reason: String,
     },
+    /// A deployment declared an accelerator this build cannot reach (issue #146).
+    ///
+    /// `hot_state.ironcache_addr` is a configured ADDRESS; the client that talks to it lives
+    /// behind the `ironcache` cargo feature. A build without the feature has no way to honour
+    /// the key, and the two ways of not honouring it are both worse than refusing:
+    ///
+    /// - ignoring it silently leaves an operator reading an accelerator address in their own
+    ///   config file while every read still goes to Postgres, and the only symptom is latency
+    ///   they were not expecting to pay;
+    /// - reporting the accelerator tier from readiness, which this deployment already does,
+    ///   then tells them the opposite of what is true.
+    ///
+    /// So it is a boot refusal, for the reason `InvalidAccessRules` is one: a configuration
+    /// that cannot mean what it says must not start.
+    AcceleratorUnavailable {
+        /// Which key declared it, and what the build would have to have. Never the address:
+        /// a DSN-shaped value can carry a credential.
+        reason: String,
+    },
     /// A listener could not bind its socket (bad address or address in use).
     Bind {
         /// Which plane's address failed (`server.bind` or
@@ -48,6 +67,9 @@ impl fmt::Display for ServerError {
             ServerError::InvalidAccessRules { reason } => {
                 write!(f, "cannot build the configured access rules: {reason}")
             }
+            ServerError::AcceleratorUnavailable { reason } => {
+                write!(f, "cannot attach the configured accelerator: {reason}")
+            }
             ServerError::Bind {
                 field,
                 addr,
@@ -63,7 +85,9 @@ impl std::error::Error for ServerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ServerError::Bind { source, .. } => Some(source),
-            ServerError::InvalidPublicUrl { .. } | ServerError::InvalidAccessRules { .. } => None,
+            ServerError::InvalidPublicUrl { .. }
+            | ServerError::InvalidAccessRules { .. }
+            | ServerError::AcceleratorUnavailable { .. } => None,
         }
     }
 }

@@ -1029,6 +1029,66 @@ struct AssembledPlanes {
 /// this build cannot evaluate (issue #154). Built HERE rather than inside
 /// [`build_oidc_plane`] precisely so it can refuse: that function answers `Option`, so the
 /// same failure there removed the OIDC plane and let the process come up healthy.
+/// Refuse a declared accelerator this build cannot reach (issue #146).
+///
+/// `hot_state.ironcache_addr` is configuration; the client that speaks to it is a cargo
+/// feature. A build without `ironcache` cannot honour the key, and both ways of not honouring it
+/// are worse than refusing:
+///
+/// - ignoring it leaves an operator reading an accelerator address in their own config file
+///   while every read still pays Postgres, and the only symptom is latency they were not
+///   expecting;
+/// - readiness ALREADY reports an accelerator tier from this key, so it would report the
+///   opposite of what is true.
+///
+/// # This checks the DECLARATION, not the cache
+///
+/// It deliberately does not connect. A declared accelerator that is DOWN is the outage the
+/// covenant exists for -- the deployment serves from Postgres and only latency degrades -- so
+/// refusing on reachability would turn a tolerated failure into a boot failure. What cannot be
+/// tolerated is a build with no way to reach one at all, because that is not an outage, it is a
+/// configuration that can never mean what it says.
+///
+/// # Why this does not yet CONSTRUCT one
+///
+/// Because nothing reads it yet, and a value built at boot that no request path consults is the
+/// shape this codebase keeps finding and calling a defect: `PgHotState::new` and
+/// `IronCacheHotState::new` have only ever been called by their own crates' tests. The
+/// construction lands with the read that uses it -- the measurement in `docs/UNIT-COSTS.md`
+/// says that read should be a scoped one against the IronCache tier, where a hit saves eighty
+/// per cent, and NOT the JWKS document, where it costs more than it saves.
+///
+/// # Errors
+///
+/// [`ServerError::AcceleratorUnavailable`] when the key is set and this build cannot honour it.
+// `unnecessary_wraps` fires in the BUILD THAT HAS the feature, where every arm is `Ok` -- and
+// the other build returns an error from the same signature. A `Result` that is infallible under
+// one `cfg` and fallible under another is the honest shape for a check whose whole subject is
+// which build it is running in; splitting it into two functions to satisfy the lint would put
+// the refusal somewhere a reader of the call site cannot see it.
+#[allow(clippy::unnecessary_wraps)]
+fn accelerator_declaration_is_honourable(
+    hot_state: &ironauth_config::HotStateConfig,
+) -> Result<(), ServerError> {
+    if hot_state.ironcache_addr.is_none() {
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "ironcache"))]
+    {
+        return Err(ServerError::AcceleratorUnavailable {
+            reason: "hot_state.ironcache_addr is set and this binary was built without the \
+                     `ironcache` feature, so nothing in it can talk to an accelerator. Rebuild \
+                     with `--features ironcache`, or unset the key and serve from Postgres \
+                     alone"
+                .to_owned(),
+        });
+    }
+
+    #[cfg(feature = "ironcache")]
+    Ok(())
+}
+
 async fn assemble_planes(
     config: &Config,
     env: &Env,
@@ -1054,6 +1114,26 @@ async fn assemble_planes(
     // consumers is what makes that a fact about one object rather than a claim about two that
     // happen to agree. The issuance side is installed regardless of `forward_auth.enabled`,
     // because turning off a proxy surface must not silently turn off a denial policy.
+    // THE ACCELERATOR, IF A DEPLOYMENT DECLARED ONE (issue #146).
+    //
+    // `ironauth-hot` has been a complete, classified, outage-tested layer that nothing
+    // constructs: `PgHotState::new` and `IronCacheHotState::new` appear only in their own
+    // crates' tests, and `hot_state.ironcache_addr` declared an address readiness probed and
+    // reported a tier for while installing no implementation. This is the boot half of that
+    // gap.
+    //
+    // AND ONLY THE IRONCACHE TIER, which is a measurement rather than a preference.
+    // `docs/UNIT-COSTS.md` puts a scoped read at 166us, a hit against the Postgres tier at
+    // 145us and a hit against IronCache at 32 to 33us. A cache hit costs a round trip, so it
+    // returns only what an operation costs ABOVE one: fronting a scoped read with another
+    // scoped read saves thirteen per cent and adds a layer, and fronting it with IronCache
+    // saves eighty. A Postgres-tier accelerator installed by default would be complexity the
+    // numbers do not pay for.
+    //
+    // So an unset `ironcache_addr` installs NOTHING and the deployment behaves exactly as it
+    // does today, which is the covenant: complete on Postgres alone, for ever.
+    accelerator_declaration_is_honourable(&config.hot_state)?;
+
     let access_rules = ironauth_oidc::forward_auth_rules::access_rules_from_config(
         &config.forward_auth,
         &config.oidc.acr_order,
