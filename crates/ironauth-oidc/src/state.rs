@@ -1970,6 +1970,18 @@ impl OidcState {
         self
     }
 
+    /// The installed enforcer, for a caller that must reach the SAME engine the request path
+    /// spends against (issue #150 criterion 4).
+    ///
+    /// THE IDENTITY IS THE POINT, not the type. A refresher that applied stored overrides to a
+    /// second enforcer built from the same config would run, log, and change nothing a request
+    /// ever consults. There is exactly one engine per process and this is how a caller outside
+    /// the request path gets it.
+    #[must_use]
+    pub fn quota_enforcer(&self) -> Option<&Arc<QuotaEnforcer>> {
+        self.quota.as_ref()
+    }
+
     /// Install the inbound lazy-migration hook (issue #56), arming the login path to
     /// verify an unknown identifier's first login against a legacy store. The boot path
     /// builds one hook from the `[oidc.lazy_migration]` config (a dedicated SSRF-hardened

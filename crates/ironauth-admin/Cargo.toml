@@ -20,6 +20,7 @@ ironauth-env.workspace = true
 ironauth-config.workspace = true
 ironauth-connector.workspace = true
 ironauth-store.workspace = true
+ironauth-quota.workspace = true
 # The pure journey artifact library (issue #92): the flow-versions admin surface
 # validates a submitted journey artifact (load-time validate + compile) before the
 # store write, so a load-invalid journey is a precise 400 naming the offending
@@ -350,6 +351,12 @@ required-features = ["testing"]
 [[test]]
 name = "audit_retention"
 path = "tests/audit_retention.rs"
+required-features = ["testing"]
+
+# Needs a real database (DATABASE_URL).
+[[test]]
+name = "quota_refresh"
+path = "tests/quota_refresh.rs"
 required-features = ["testing"]
 
 # Needs a real database (DATABASE_URL).

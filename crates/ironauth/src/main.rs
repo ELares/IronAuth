@@ -375,6 +375,15 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             }
         };
 
+        // THE ENFORCER THE REQUEST PATH HOLDS. Cloned off the assembled plane before it moves
+        // into the router: a refresher applying overrides to a second engine built from the
+        // same config would run, log, and change nothing a request ever consults.
+        let quota_enforcer = planes
+            .oidc
+            .as_ref()
+            .and_then(|plane| plane.state.quota_enforcer())
+            .cloned();
+
         // Capture what the Back-Channel Logout delivery worker (issue #34) needs before
         // config moves into the server (only when OIDC is mounted AND the switch is on).
         let backchannel_inputs = backchannel_worker_inputs(&config, &env);
@@ -390,6 +399,13 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         let scim_push_inputs = scim_push_inputs(&config);
         let log_shipper_inputs = log_shipper_inputs(&config, &env);
         let metrics_sampler_inputs_captured = metrics_sampler_inputs(&config, &env);
+        // CAPTURED HERE for the same reason as its neighbours, plus one of its own: the
+        // enforcer is captured off `planes` further down, before the OIDC plane moves into the
+        // router, so neither half of this refresher can be built at its start site.
+        let quota_refresh_inputs = (
+            config.quota.override_refresh_interval_secs,
+            select_control_dsn(&config),
+        );
         let webhook_inputs = webhook_delivery_inputs(&config, &env);
         let flow_target_inputs = flow_target_delivery_inputs(&config, &env);
         let ssf_push_inputs = ssf_push_inputs(&config, &env);
@@ -715,6 +731,11 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // `metrics_sampler_inputs`.
         let metrics_sampler = start_metrics_sampler(metrics_sampler_inputs_captured).await;
 
+        // The quota-override refresher (issue #150 criterion 4). It needs the enforcer the
+        // REQUEST PATH holds, not one built from the same config: a refresher applying
+        // overrides to a second engine would run, log, and change nothing anyone consults.
+        let quota_refresher = start_quota_refresher(quota_refresh_inputs, quota_enforcer).await;
+
         tracing::info!(base_url = %server.base_url(), "starting ironauth");
 
         let outcome = match server.run(ironauth_server::shutdown_signal()).await {
@@ -786,6 +807,9 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
         // Stopped last: it reads the same table the pools and the reaper write, and a
         // sample racing their shutdown would publish a reading of a queue mid-drain.
+        if let Some(refresher) = quota_refresher {
+            refresher.shutdown().await;
+        }
         if let Some(sampler) = metrics_sampler {
             sampler.shutdown().await;
         }
@@ -3776,6 +3800,113 @@ async fn start_metrics_sampler(inputs: MetricsSamplerInputs) -> Option<MetricsSa
         "outbox depth and lag gauges started"
     );
     Some(MetricsSampler { stop, task })
+}
+
+/// The quota-override refresher's handle, stopped on shutdown like the metrics sampler.
+struct QuotaRefresher {
+    /// Flipped to stop the loop at its next wake or mid-sleep, whichever comes first.
+    stop: tokio::sync::watch::Sender<bool>,
+    /// The refresh task.
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl QuotaRefresher {
+    /// Stop refreshing and wait for the in-flight pass.
+    async fn shutdown(self) {
+        let _ = self.stop.send(true);
+        let _ = self.task.await;
+    }
+}
+
+/// Start the quota-override refresher (issue #150 criterion 4), or return [`None`] with the
+/// reason logged.
+///
+/// # What it closes
+///
+/// The overrides table, its repository and `QuotaEnforcer::set_environment_override` all
+/// existed with no production caller between them: a management write could land in Postgres
+/// and change no node's enforcement, ever. This is the reader.
+///
+/// # Every reason it declines, and why each is a log line rather than a failure
+///
+/// No enforcer means the OIDC plane is not mounted, so nothing spends quota on this instance.
+/// No control DSN means no cross-scope scope list, which is the same condition the metrics
+/// sampler declines on. A zero interval is an operator turning it off. None of the three is a
+/// reason to refuse to boot: the instance serves correctly with its configured tiers, which is
+/// exactly what it did before this existed.
+async fn start_quota_refresher(
+    inputs: (u64, Option<String>),
+    enforcer: Option<Arc<ironauth_quota::QuotaEnforcer>>,
+) -> Option<QuotaRefresher> {
+    let (interval_secs, control_dsn) = inputs;
+    let Some(enforcer) = enforcer else {
+        tracing::debug!("quota override refresh not started: no quota enforcer on this instance");
+        return None;
+    };
+    if interval_secs == 0 {
+        tracing::info!(
+            "quota override refresh disabled: quota.override_refresh_interval_secs is 0, so \
+             stored per-scope limits never apply"
+        );
+        return None;
+    }
+    let Some(control_dsn) = control_dsn else {
+        tracing::warn!(
+            "quota override refresh not started: no control-plane DSN, so the scope list cannot \
+             be read and stored per-scope limits will not apply"
+        );
+        return None;
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "quota override refresh not started: the control-plane store did not connect"
+            );
+            return None;
+        }
+    };
+
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store.clone()));
+    let interval = std::time::Duration::from_secs(interval_secs);
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        loop {
+            match ironauth_admin::quota_refresh::refresh_all(&control_store, &scopes, &enforcer)
+                .await
+            {
+                Ok(summary) => {
+                    if summary.unknown_dimensions > 0 {
+                        tracing::warn!(
+                            unknown_dimensions = summary.unknown_dimensions,
+                            "quota override rows name dimensions this build does not have"
+                        );
+                    }
+                }
+                // THE LIMITS ARE LEFT ALONE. A failed read must not widen or narrow anyone's
+                // quota as a side effect, so a pass that cannot complete changes nothing and
+                // the next one retries.
+                Err(error) => tracing::warn!(
+                    %error,
+                    "quota override refresh pass failed; limits are unchanged"
+                ),
+            }
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                _ = stopped.changed() => break,
+            }
+            if *stopped.borrow() {
+                break;
+            }
+        }
+    });
+
+    tracing::info!(
+        override_refresh_interval_secs = interval_secs,
+        "quota override refresh started"
+    );
+    Some(QuotaRefresher { stop, task })
 }
 
 /// The application clock as microseconds since the Unix epoch.

@@ -2084,6 +2084,7 @@ dependencies = [
  "ironauth-jose",
  "ironauth-journey",
  "ironauth-oidc",
+ "ironauth-quota",
  "ironauth-saml",
  "ironauth-scim",
  "ironauth-store",
