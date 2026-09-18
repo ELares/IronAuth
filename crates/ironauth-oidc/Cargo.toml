@@ -752,6 +752,11 @@ path = "tests/funnel_metrics.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "token_grant_metrics"
+path = "tests/token_grant_metrics.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "webauthn_ceremony"
 path = "tests/webauthn_ceremony.rs"
 required-features = ["testing"]

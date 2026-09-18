@@ -208,17 +208,141 @@ impl fmt::Debug for TokenParams {
 /// SAME body: the scalar fields deserialize normally, and every `resource` value is
 /// collected separately.
 pub async fn token(State(state): State<OidcState>, headers: HeaderMap, body: String) -> Response {
-    let params: TokenParams = match serde_urlencoded::from_str(&body) {
-        Ok(params) => params,
-        Err(_) => {
-            return TokenError::InvalidRequest("the request body is malformed".to_owned())
-                .into_response();
-        }
+    // OUTSIDE THE PARSE, so a body this endpoint could not read is still counted. A rate that
+    // starts at the first successfully deserialized request cannot show a client that has begun
+    // sending something unparsable, which is one of the two shapes an integration breaks in.
+    let started = state.env().clock().monotonic();
+    let Ok(params) = serde_urlencoded::from_str::<TokenParams>(&body) else {
+        let error = TokenError::InvalidRequest("the request body is malformed".to_owned());
+        observe_exchange(&state, GRANT_NONE, error.code(), started);
+        return error.into_response();
     };
+    let grant = grant_label(params.grant_type.as_deref());
     let resources = resource::resources_from_encoded(&body);
     match exchange(&state, &headers, params, resources).await {
-        Ok(response) => response,
-        Err(error) => error.into_response(),
+        Ok(response) => {
+            observe_exchange(&state, grant, "issued", started);
+            response
+        }
+        Err(error) => {
+            let outcome = error.code();
+            observe_exchange(&state, grant, outcome, started);
+            error.into_response()
+        }
+    }
+}
+
+/// The `grant_type` label for a request that named no grant this build services (issue #152).
+///
+/// ONE VALUE FOR ALL OF THEM, and the label is not the client's string. The raw `grant_type` is
+/// attacker controlled and unbounded: using it would let anyone mint a time series per request,
+/// which is the standard way to bring down a Prometheus instance. Every unserviced value
+/// collapses here, and the `outcome` label still separates the cases an operator cares about --
+/// an absent parameter refuses as `invalid_request`, a present but unserviced one (`password`,
+/// a typo, a grant from a newer draft) as `unsupported_grant_type`.
+const GRANT_NONE: &str = "none";
+
+/// Total token requests by grant type and outcome (issue #152).
+const TOKEN_REQUESTS_TOTAL: &str = "ironauth_token_requests_total";
+
+/// Token request latency by grant type (issue #152).
+///
+/// NO `outcome` LABEL, unlike the counter beside it. A histogram carries a series per bucket, so
+/// crossing eight grant labels with sixteen outcome codes is over a hundred series before the
+/// buckets multiply it again. The criterion asks for "issuance rate and latency by grant type":
+/// the rate is where the outcome split earns its cardinality, and a latency percentile is read
+/// per grant.
+const TOKEN_REQUEST_DURATION_SECONDS: &str = "ironauth_token_request_duration_seconds";
+
+/// The stable label for a request's grant type: a serviced grant's wire value, or [`GRANT_NONE`].
+fn grant_label(raw: Option<&str>) -> &'static str {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(GrantType::parse)
+        .map_or(GRANT_NONE, GrantType::as_str)
+}
+
+/// Seconds elapsed since `started`, read off the clock seam.
+///
+/// SPLIT OUT SO IT CAN BE PINNED. The integration test runs a frozen `ManualClock`, so every
+/// duration it observes is zero whether this reads the seam, reads the wall clock, or returns a
+/// constant -- three implementations that render identically, one of which ships a latency panel
+/// that says zero for ever. Nothing in a handler test can tell them apart, because nothing can
+/// advance the clock in the middle of a request. A function taking the clock CAN be handed one
+/// that moves, which is what `elapsed_is_read_from_the_clock_seam` below does.
+fn elapsed_seconds(clock: &dyn ironauth_env::Clock, started: std::time::Instant) -> f64 {
+    clock.monotonic().duration_since(started).as_secs_f64()
+}
+
+/// Record one token request against both metrics.
+fn observe_exchange(
+    state: &OidcState,
+    grant_type: &'static str,
+    outcome: &'static str,
+    started: std::time::Instant,
+) {
+    let elapsed = elapsed_seconds(state.env().clock(), started);
+    metrics::counter!(
+        TOKEN_REQUESTS_TOTAL,
+        "grant_type" => grant_type,
+        "outcome" => outcome,
+    )
+    .increment(1);
+    metrics::histogram!(
+        TOKEN_REQUEST_DURATION_SECONDS,
+        "grant_type" => grant_type,
+    )
+    .record(elapsed);
+}
+
+#[cfg(test)]
+mod issuance_metric_tests {
+    use std::time::Duration;
+
+    use ironauth_env::{Clock, Env};
+
+    use super::{GRANT_NONE, elapsed_seconds, grant_label};
+
+    /// The duration is the clock's, and it MOVES. A constant zero, a wall-clock read, and a
+    /// correct seam read are indistinguishable under the frozen clock the handler tests use; a
+    /// clock this test advances tells them apart.
+    #[test]
+    fn elapsed_is_read_from_the_clock_seam() {
+        let (_env, clock) = Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 7);
+        let started = clock.monotonic();
+        assert!(
+            elapsed_seconds(clock.as_ref(), started).abs() < f64::EPSILON,
+            "nothing has advanced yet"
+        );
+        clock.advance(Duration::from_millis(250));
+        assert!(
+            (elapsed_seconds(clock.as_ref(), started) - 0.25).abs() < f64::EPSILON,
+            "the recorded value tracks the clock, so a constant cannot pass"
+        );
+        clock.advance(Duration::from_millis(750));
+        assert!(
+            (elapsed_seconds(clock.as_ref(), started) - 1.0).abs() < f64::EPSILON,
+            "and keeps tracking it"
+        );
+    }
+
+    /// The label is the PARSED grant or the sentinel, never the caller's string.
+    #[test]
+    fn the_grant_label_is_never_the_callers_string() {
+        assert_eq!(
+            grant_label(Some("client_credentials")),
+            "client_credentials"
+        );
+        assert_eq!(grant_label(Some("  refresh_token  ")), "refresh_token");
+        assert_eq!(grant_label(None), GRANT_NONE);
+        assert_eq!(grant_label(Some("")), GRANT_NONE);
+        assert_eq!(grant_label(Some("   ")), GRANT_NONE);
+        assert_eq!(grant_label(Some("password")), GRANT_NONE);
+        assert_eq!(grant_label(Some("urn:example:anything")), GRANT_NONE);
+        // A value long enough to be an attack on the label store, and one carrying the
+        // exposition's own delimiters.
+        assert_eq!(grant_label(Some(&"a".repeat(4096))), GRANT_NONE);
+        assert_eq!(grant_label(Some("a\"b{c}d\n")), GRANT_NONE);
     }
 }
 

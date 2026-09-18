@@ -427,7 +427,11 @@ pub enum TokenError {
 
 impl TokenError {
     /// The wire `error` value.
-    fn code(&self) -> &'static str {
+    ///
+    /// Also the `outcome` label of `ironauth_token_requests_total`: a refusal's OAuth error code
+    /// is a closed set fixed by the specifications, so it bounds that label's cardinality by
+    /// construction, and it is the word an operator reading the metric would use anyway.
+    pub(crate) fn code(&self) -> &'static str {
         match self {
             TokenError::InvalidRequest(_) => "invalid_request",
             TokenError::InvalidClient { .. } => "invalid_client",
