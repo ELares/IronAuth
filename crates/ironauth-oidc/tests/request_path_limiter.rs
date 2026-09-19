@@ -49,6 +49,7 @@ fn per_ip_burst(burst: f64) -> RateLimitConfig {
         per_tenant: None,
         per_environment: None,
         per_client: None,
+        per_user: None,
     }
 }
 
@@ -148,6 +149,7 @@ async fn a_per_tenant_burst_never_touches_another_tenant() {
             }),
             per_environment: None,
             per_client: None,
+            per_user: None,
         },
     )
     .await;
@@ -241,6 +243,7 @@ async fn a_per_client_burst_throttles_that_client_and_no_other() {
                 per_second: 0.0,
                 burst: 2.0,
             }),
+            per_user: None,
         },
     )
     .await;
@@ -293,6 +296,102 @@ async fn a_per_client_burst_throttles_that_client_and_no_other() {
     );
 }
 
+/// A per-user budget of exactly `burst`, with a refill that never happens inside a test
+/// unless the manual clock advances: the layer that binds only where a VERIFIED subject
+/// is resolved, which is the token endpoint's grants.
+fn per_user_burst(burst: f64) -> RateLimitConfig {
+    RateLimitConfig {
+        per_ip: None,
+        per_tenant: None,
+        per_environment: None,
+        per_client: None,
+        per_user: Some(LimitConfig {
+            per_second: 1.0,
+            burst,
+        }),
+    }
+}
+
+/// The PKCE code-exchange form for the harness's default public client.
+fn code_form_pkce(code: &str, client_id: &str) -> String {
+    common::form(&[
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", common::REDIRECT_URI),
+        ("client_id", client_id),
+        ("code_verifier", common::PKCE_VERIFIER),
+    ])
+}
+
+/// The refresh-token grant form for a public client.
+fn refresh_form(refresh_token: &str, client_id: &str) -> String {
+    common::form(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", client_id),
+    ])
+}
+
+/// A fresh refresh token for a FRESH user, through the real authorize and code paths.
+async fn refresh_token_for(harness: &Harness, client_id: &str) -> String {
+    let code = harness.issue_authenticated_code_pkce(client_id).await;
+    let (status, _, body) = harness.token(&code_form_pkce(&code, client_id)).await;
+    assert_eq!(status, StatusCode::OK, "code exchange: {body}");
+    common::json(&body)["refresh_token"]
+        .as_str()
+        .expect("a refresh token")
+        .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_per_user_burst_throttles_that_subject_and_no_other() {
+    let harness = Harness::start_with_layered_limiter(oidc_config(), per_user_burst(2.0)).await;
+    let client_id = harness.client_id().to_string();
+
+    // ALICE, whose budget of two is spent by: the code exchange (a subject-resolved
+    // spend, one token) and her first refresh (the second). The NEXT refresh is
+    // throttled, with the layer named — even though the token rotated in between, the
+    // SUBJECT is what the bucket keys on.
+    let mut token = refresh_token_for(&harness, &client_id).await; // spends 1
+    let (status, _, body) = harness.token(&refresh_form(&token, &client_id)).await;
+    assert_eq!(status, StatusCode::OK, "first refresh: {body}");
+    token = common::json(&body)["refresh_token"]
+        .as_str()
+        .expect("rotated")
+        .to_owned(); // spends 2
+
+    let (status, headers, _) = harness.token(&refresh_form(&token, &client_id)).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the third spend is refused"
+    );
+    assert_eq!(
+        headers
+            .get(LIMITING_LAYER_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("per_user"),
+        "the layer that refused is the subject layer"
+    );
+
+    // THE THROTTLE DOES NOT CONSUME THE FAMILY: the same token refreshes again once the
+    // advertised window has passed, which is the difference between a throttle and a
+    // revocation.
+    harness.clock().advance(Duration::from_secs(2));
+    let (status, _, body) = harness.token(&refresh_form(&token, &client_id)).await;
+    assert_eq!(status, StatusCode::OK, "recovery after the window: {body}");
+
+    // BOB, A DIFFERENT SUBJECT: his own budget is untouched, even though he shares the
+    // client, the address, the tenant and the environment with alice's requests.
+    let bob = refresh_token_for(&harness, &client_id).await;
+    let (status, _, _) = harness.token(&refresh_form(&bob, &client_id)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "another subject's budget is untouched"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_shipped_default_admits_every_request() {
     // No limits configured: the limiter is INSTALLED (one code path) but every layer is
@@ -304,6 +403,7 @@ async fn the_shipped_default_admits_every_request() {
             per_tenant: None,
             per_environment: None,
             per_client: None,
+            per_user: None,
         },
     )
     .await;

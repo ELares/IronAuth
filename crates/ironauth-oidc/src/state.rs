@@ -2106,6 +2106,7 @@ impl OidcState {
         scope: &Scope,
         headers: &axum::http::HeaderMap,
         client_id: Option<&str>,
+        user: Option<&str>,
     ) -> Option<axum::response::Response> {
         if let Some(limiter) = self.layered_limiter.as_ref() {
             let identity = ironauth_quota::layered::RequestIdentity {
@@ -2116,12 +2117,15 @@ impl OidcState {
                     .get(ironauth_config::PEER_IP_HEADER)
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_owned),
-                user: None,
                 // THE VERIFIED CLIENT, when the handler has resolved one (issue #150
                 // criterion 1): the bucket key is the registered client's identifier,
                 // never attacker-chosen bytes. A `None` here leaves the per-client layer
                 // reported as unenforced when it is configured, never skipped in silence.
                 client: client_id.map(str::to_owned),
+                // THE VERIFIED SUBJECT, when the handler has resolved one (issue #150
+                // criterion 1): the token endpoint's grants key it on the subject from the
+                // code binding or the refresh family.
+                user: user.map(str::to_owned),
                 tenant: Some(scope.tenant().to_string()),
                 environment: Some(scope.environment().to_string()),
             };

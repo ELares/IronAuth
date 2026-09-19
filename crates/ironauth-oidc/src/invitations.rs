@@ -84,7 +84,7 @@ pub async fn accept_invitation(
     };
     // A per-tenant/per-environment request-quota charge (issue #50), like the other
     // public data-plane surfaces; None when no enforcer is installed.
-    if let Some(response) = state.enforce_request_quota(&scope, &headers, None) {
+    if let Some(response) = state.enforce_request_quota(&scope, &headers, None, None) {
         return response;
     }
     let token = body.token.trim();

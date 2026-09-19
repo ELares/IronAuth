@@ -73,6 +73,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `forward_auth.rate_limit.per_environment` | table or unset | unset | Bounds one environment within a tenant. |
 | `forward_auth.rate_limit.per_ip` | table or unset | unset | The only layer that applies before a caller is identified. |
 | `forward_auth.rate_limit.per_tenant` | table or unset | unset | Bounds the customer. |
+| `forward_auth.rate_limit.per_user` | table or unset | unset | Bounds one subject (issue #150 criterion 1). |
 | `forward_auth.rules` | array | empty | The ordered rule list. FIRST MATCH WINS, so order is meaning, not presentation. |
 | `hosted_pages` | table | see fields | Hosted-page render app settings (issue #85): the in-process, server-rendered pages that render from the headless flow contract (login, registration, MFA, recovery, federation), plus the theme seam and the served stylesheet. Off by default and SEPARATE from `flows.enabled`: enabling the headless flow API for native SDKs does NOT also cut the browser login UI over to the flow engine, and vice versa. The actual cutover (retargeting the `/authorize` interaction redirects onto the flow render app) is a later, deliberate change; this toggle default-off ships the seam. |
 | `hosted_pages.enabled` | boolean | `false` | Whether the hosted flow render app is the live browser interaction surface. Off by default: the bootstrap login, consent, and register pages stay the live UI until an operator opts in. Enabling this is independent of `flows.enabled`. |
@@ -339,6 +340,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `quota.request_path_limits.per_environment` | table or unset | unset | Bounds one environment within a tenant. |
 | `quota.request_path_limits.per_ip` | table or unset | unset | The only layer that applies before a caller is identified. |
 | `quota.request_path_limits.per_tenant` | table or unset | unset | Bounds the customer. |
+| `quota.request_path_limits.per_user` | table or unset | unset | Bounds one subject (issue #150 criterion 1). |
 | `quota.tenant` | table | see fields | The per-tenant tier. Bounds the aggregate of all of a tenant's environments; a single tenant cannot exceed it however many environments it runs. |
 | `quota.tenant.hook_seconds_burst` | integer | `120` | Burst capacity for the hook-seconds dimension. 0 means unlimited. |
 | `quota.tenant.hook_seconds_per_second` | integer | `60` | Sustained hook/webhook execution seconds admitted per wall second (the refill rate for the hook-seconds dimension). Bounds how much outbound hook execution time a scope may consume. |

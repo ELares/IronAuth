@@ -460,19 +460,19 @@ pub fn layered_limiter_from_config(
     use ironauth_quota::layered::{LayeredLimiter, LayeredLimits, RateLayer};
 
     let mut limits = LayeredLimits::unlimited();
-    // PER-CLIENT IS MAPPED HERE because the SHARED builder serves surfaces that resolve a
-    // client: the authorization path and the token endpoint key it on the verified client
-    // identifier. A surface that names no client (the forward-auth check) still receives
-    // the layer in its limits, and a request without a key for a CONFIGURED layer is
-    // reported in the outcome's `unenforced` census rather than silently skipped.
-    //
-    // Per-USER is not mapped: no current surface resolves a subject before its limiter
-    // runs, and an unenforceable layer would need a fifth census entry to stay honest.
+    // PER-CLIENT AND PER-USER ARE MAPPED HERE because the SHARED builder serves surfaces
+    // that resolve them: the authorization path keys per-client on the verified client
+    // identifier, and the token endpoint's grants key per-user on the subject resolved
+    // from the code binding or the refresh family. A surface that resolves neither (the
+    // forward-auth check) still receives the layers in its limits, and a request without
+    // a key for a CONFIGURED layer is reported in the outcome's `unenforced` census
+    // rather than silently skipped.
     for (layer, configured) in [
         (RateLayer::PerIp, cfg.per_ip),
         (RateLayer::PerTenant, cfg.per_tenant),
         (RateLayer::PerEnvironment, cfg.per_environment),
         (RateLayer::PerClient, cfg.per_client),
+        (RateLayer::PerUser, cfg.per_user),
     ] {
         if let Some(limit) = configured {
             limits = limits.with(
