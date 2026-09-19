@@ -787,6 +787,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql
       - run: cargo build -p ironauth --bin ironauth
+      # Issue #149 criterion 1: the hard-down chaos tier, induced for real. The test brings
+      # up its OWN cluster with initdb/pg_ctl, kills the postmaster out from under a serving
+      # pool, asserts the documented 503 / readyz surface while healthz and metrics keep
+      # serving, and asserts recovery. It needs the Postgres BINARIES this job installs and
+      # no service; the workspace test job has a service container and no binaries, so the
+      # test skips loudly there and this lane is where it runs.
+      - name: Chaos: the hard-down tier survives a postmaster kill (issue #149)
+        run: |
+          PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
+          cargo test -p ironauth-server --test chaos -- --test-threads=1
       # Issue #121 criterion 1. The measured instant is discovery answering 200, not the
       # process starting: a server that has bound its socket but has no signing key answers
       # 404, and calling that "ready" would let the emulator regress into exactly the state

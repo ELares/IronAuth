@@ -47,6 +47,11 @@ otlp = [
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time"] }
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
+# The chaos suite (issue #149 criterion 1) owns a REAL Postgres cluster: it needs the store's
+# migration runner and the serving role's pool, which the server crate itself deliberately
+# does not depend on. Test-only, and the tests skip loudly when no Postgres install exists.
+ironauth-store.workspace = true
+sqlx.workspace = true
 
 [lints]
 workspace = true
