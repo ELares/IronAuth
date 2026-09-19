@@ -138,7 +138,7 @@ async fn send_inner(
     if !state.sms_otp_enabled() {
         return not_found_json();
     }
-    if let Some(response) = state.enforce_request_quota(&scope, headers) {
+    if let Some(response) = state.enforce_request_quota(&scope, headers, None) {
         return response;
     }
     let Some(purpose) = purpose_or_login(body.purpose.as_deref()) else {
@@ -353,7 +353,7 @@ async fn verify_inner(
     if !state.sms_otp_enabled() {
         return not_found_json();
     }
-    if let Some(response) = state.enforce_request_quota(&scope, &headers) {
+    if let Some(response) = state.enforce_request_quota(&scope, &headers, None) {
         return response;
     }
     let Some(purpose) = purpose_or_login(body.purpose.as_deref()) else {

@@ -380,6 +380,17 @@ impl ResolvedClient<'_> {
         }
     }
 
+    /// The VERIFIED client identifier (issue #150 criterion 1): the per-client rate
+    /// layer's bucket key. For a registered client it is the store's `ClientId`; for a
+    /// CIMD client the document's own id — never attacker-chosen bytes, because this
+    /// resolves AFTER the client was confirmed to exist.
+    pub(crate) fn client_id(&self) -> String {
+        match self {
+            Self::Registered(record) => record.id.to_string(),
+            Self::Cimd(client) => client.id.to_string(),
+        }
+    }
+
     /// The registered `token_endpoint_auth_method`.
     ///
     /// A CIMD client is always `none`, and that is a rule rather than a default: the draft
@@ -907,7 +918,8 @@ async fn issue_code(
     //     environment draws from its tenant too, and the buckets are per-scope, so one
     //     tenant's flood never starves another's login. Under quota (or with no
     //     enforcer installed) the request proceeds untouched.
-    if let Some(response) = state.enforce_request_quota(&scope, headers) {
+    if let Some(response) = state.enforce_request_quota(&scope, headers, Some(&client.client_id()))
+    {
         return Ok(response);
     }
 

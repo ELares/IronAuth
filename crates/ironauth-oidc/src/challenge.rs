@@ -210,7 +210,7 @@ pub async fn authorize_challenge(
     // Charge the per-(tenant, environment) request-rate quota (issue #50) at entry, as every
     // other scoped data-plane handler does (the challenge route carries no route-level quota
     // middleware). Over quota is a uniform 429; no enforcer installed is a pass-through.
-    if let Some(response) = state.enforce_request_quota(&scope, &headers) {
+    if let Some(response) = state.enforce_request_quota(&scope, &headers, None) {
         return response;
     }
 

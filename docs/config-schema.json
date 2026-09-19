@@ -909,6 +909,7 @@
         "rate_limit": {
           "$ref": "#/$defs/RateLimitConfig",
           "default": {
+            "per_client": null,
             "per_environment": null,
             "per_ip": null,
             "per_tenant": null
@@ -2495,6 +2496,7 @@
         "request_path_limits": {
           "$ref": "#/$defs/RateLimitConfig",
           "default": {
+            "per_client": null,
             "per_environment": null,
             "per_ip": null,
             "per_tenant": null
@@ -2536,6 +2538,18 @@
       "additionalProperties": false,
       "description": "Per-layer request-plane rate limits (issue #150 criterion 1).\n\nThe layers are enforced INDEPENDENTLY and a request is admitted only if every applicable\none admits it, so these are separate budgets rather than a precedence list. A layer left\nunset is unlimited, which is the shipped default for all of them: a deployment that has\nnot asked to be rate limited is not.\n\n# Why there is no `per_user` or `per_client` here\n\nThe engine has both layers. The forward-auth check cannot KEY them: the limiter runs\nbefore the session is resolved, deliberately, so the identity it builds carries no subject,\nand a forward-auth check names no OAuth client at all.\n\nThey were offered here once. A configured `per_user` would have been accepted by\nvalidation, inserted into the limiter, and then skipped on every request because the key\nwas absent, so an operator would have read a per-user budget in their own config file and\nhad none. That is the failure `MissingIpPolicy` calls the worse one: a silently unlimited\nsurface that looks healthy until it is found.\n\nThis is the same refusal `rule_from_config` makes for `subject_in_group` and the same one\n`ProxyDialectConfig` makes for Envoy `ext_authz`: a vocabulary must not offer what the\nruntime cannot honour. Adding them back means resolving the session before the limiter,\nwhich is a different ordering decision with its own consequences.",
       "properties": {
+        "per_client": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LimitConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Bounds one verified client (issue #150 criterion 1).\n\nBinds wherever the surface names the VERIFIED client before limiting: the\nauthorization path and the token endpoint resolve the client's registered\nidentifier before the request proceeds, so the bucket key is the real client,\nnever attacker-chosen bytes. The forward-auth check names no client, so a\ndeployment configuring this layer there gets the `unenforced` signal on the\noutcome rather than silent skipping."
+        },
         "per_environment": {
           "anyOf": [
             {
@@ -3488,6 +3502,7 @@
         "dialect": "forward-auth",
         "enabled": false,
         "rate_limit": {
+          "per_client": null,
           "per_environment": null,
           "per_ip": null,
           "per_tenant": null
@@ -3848,6 +3863,7 @@
         "idle_bucket_ttl_secs": 3600,
         "override_refresh_interval_secs": 10,
         "request_path_limits": {
+          "per_client": null,
           "per_environment": null,
           "per_ip": null,
           "per_tenant": null

@@ -48,6 +48,7 @@ fn per_ip_burst(burst: f64) -> RateLimitConfig {
         }),
         per_tenant: None,
         per_environment: None,
+        per_client: None,
     }
 }
 
@@ -146,6 +147,7 @@ async fn a_per_tenant_burst_never_touches_another_tenant() {
                 burst: 2.0,
             }),
             per_environment: None,
+            per_client: None,
         },
     )
     .await;
@@ -228,6 +230,70 @@ async fn a_per_ip_limit_without_a_peer_address_is_a_403_not_a_throttle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_per_client_burst_throttles_that_client_and_no_other() {
+    let harness = Harness::start_with_layered_limiter(
+        oidc_config(),
+        RateLimitConfig {
+            per_ip: None,
+            per_tenant: None,
+            per_environment: None,
+            per_client: Some(LimitConfig {
+                per_second: 0.0,
+                burst: 2.0,
+            }),
+        },
+    )
+    .await;
+    let client_a = harness
+        .create_confidential_client_in(
+            harness.scope(),
+            ironauth_oidc::ClientAuthMethod::Basic,
+            "per-client probe a",
+        )
+        .await
+        .0
+        .to_string();
+    let client_b = harness
+        .create_confidential_client_in(
+            harness.scope(),
+            ironauth_oidc::ClientAuthMethod::Basic,
+            "per-client probe b",
+        )
+        .await
+        .0
+        .to_string();
+
+    // Client A fits its burst twice, then is throttled WITH THE LAYER NAMED — even though
+    // the peer address is the same as client B's later request.
+    for i in 0..2 {
+        let (status, _) = authorize_from(&harness, &client_a, "198.51.100.7").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "client A spend {i} passes");
+    }
+    let (status, headers) = authorize_from(&harness, &client_a, "198.51.100.7").await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "client A is over budget"
+    );
+    assert_eq!(
+        headers
+            .get(LIMITING_LAYER_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("per_client"),
+        "the layer that refused is the client layer, whatever address presented"
+    );
+
+    // CLIENT B, SAME ADDRESS, SAME TENANT: its own budget is untouched. This is the
+    // control that proves the layer is per client and not per address or per tenant.
+    let (status, _) = authorize_from(&harness, &client_b, "198.51.100.7").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "another client has its own budget"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_shipped_default_admits_every_request() {
     // No limits configured: the limiter is INSTALLED (one code path) but every layer is
     // unlimited, so every request proceeds exactly as it did before the limiter existed.
@@ -237,6 +303,7 @@ async fn the_shipped_default_admits_every_request() {
             per_ip: None,
             per_tenant: None,
             per_environment: None,
+            per_client: None,
         },
     )
     .await;

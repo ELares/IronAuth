@@ -139,7 +139,7 @@ pub async fn send(
     if !state.magic_link_enabled() {
         return interaction::invalid_link_page();
     }
-    if let Some(response) = state.enforce_request_quota(&scope, &headers) {
+    if let Some(response) = state.enforce_request_quota(&scope, &headers, None) {
         return response;
     }
     let Some(purpose) = purpose_or_login(body.purpose.as_deref()) else {
@@ -344,7 +344,7 @@ pub async fn consume_post(
     if !state.magic_link_enabled() {
         return interaction::invalid_link_page();
     }
-    if let Some(response) = state.enforce_request_quota(&scope, &headers) {
+    if let Some(response) = state.enforce_request_quota(&scope, &headers, None) {
         return response;
     }
     // CSRF defense-in-depth: a conclusively cross-site POST is a generic 403, before any
