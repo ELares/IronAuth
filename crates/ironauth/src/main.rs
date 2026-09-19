@@ -1805,6 +1805,18 @@ async fn build_oidc_plane(
     // wants no quota expresses it; enforcement then admits every request.
     let quota_enforcer = Arc::new(QuotaEnforcer::from_config(&config.quota, env.clock_arc()));
 
+    // The REQUEST-PLANE layered limiter (issue #150 criterion 1): per-IP, per-tenant and
+    // per-environment token buckets enforced ahead of the quota engine on every
+    // request-path handler that charges quota. Built from `[quota] request_path_limits`
+    // and installed ALWAYS, so a deployment that configured nothing gets the same
+    // all-admit limiter it had before, through the same call site.
+    let request_path_limiter = std::sync::Arc::new(
+        ironauth_oidc::forward_auth_rules::layered_limiter_from_config(
+            &config.quota.request_path_limits,
+            env.clock_arc(),
+        ),
+    );
+
     // The dedicated, admission-controlled Argon2id hashing pool (issue #62): Argon2
     // runs ONLY on these threads, never a tokio protocol-I/O worker, and each hash
     // is admission-controlled through the SAME quota enforcer (the PasswordHashing
@@ -2017,6 +2029,7 @@ async fn build_oidc_plane(
     .with_hosted_pages_enabled(surfaces.hosted_pages)
     .with_diagnostics(&config.diagnostics)
     .with_quota_enforcer(quota_enforcer)
+    .with_layered_limiter(request_path_limiter)
     .with_hashing_pool(hashing_pool)
     .with_password_policy(password_policy, screening_failure, screen_on_login)
     // The email-OTP / magic-link factors (issue #68) deliver through the verification

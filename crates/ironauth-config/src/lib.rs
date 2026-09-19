@@ -6005,6 +6005,24 @@ pub struct QuotaConfig {
     /// allocates a bucket.
     pub idle_bucket_ttl_secs: u64,
 
+    /// The REQUEST-PLANE limiter on the OIDC request paths (issue #150 criterion 1):
+    /// per-IP, per-tenant and per-environment token-bucket layers enforced BEFORE the
+    /// tenant/environment quota engine below.
+    ///
+    /// Every layer is unlimited by default, so a deployment that does not ask for
+    /// request-path limiting is behaviorally unchanged. The per-IP layer is the one that
+    /// can bind before any identity is resolved (the request path knows the policy-resolved
+    /// peer IP from the middleware before it knows the caller); per-tenant and per-environment
+    /// bound the same scope keys the quota engine bounds, and are the layers whose limits are
+    /// enforced even when the tenant's configured quota is unlimited. Per-USER and per-CLIENT
+    /// layers do not exist here because no request-path handler resolves a subject or names a
+    /// client BEFORE the limiter runs; the forward-auth surface documents the same three.
+    ///
+    /// A layer that is configured but whose key the request cannot present is refused per
+    /// the missing-identity policy, and the 429 carries the limiting layer's name and a
+    /// `Retry-After`, per the criterion.
+    pub request_path_limits: RateLimitConfig,
+
     /// How often (in seconds) a node re-reads the stored per-scope quota overrides and applies
     /// them to its running enforcer.
     ///
@@ -6055,6 +6073,10 @@ impl Default for QuotaConfig {
             // answer; a second would multiply a small read by sixty for a difference nobody
             // watching a dashboard can perceive.
             override_refresh_interval_secs: 10,
+            // ALL REQUEST-PATH LAYERS UNLIMITED: the shipped default changes nothing about
+            // how a deployment behaves, and an operator who wants request-plane limiting
+            // writes the layers explicitly.
+            request_path_limits: RateLimitConfig::default(),
         }
     }
 }

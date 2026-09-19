@@ -362,6 +362,7 @@ fn unlimited_quota() -> QuotaConfig {
         usage_thresholds_percent: vec![],
         idle_bucket_ttl_secs: 0,
         override_refresh_interval_secs: 0,
+        request_path_limits: ironauth_config::RateLimitConfig::default(),
     }
 }
 

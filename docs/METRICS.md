@@ -90,6 +90,7 @@ label on the wire with every test green.
 | `ironauth_password_screen_total` | counter | `outcome` | Password screening checks, by outcome |
 | `ironauth_proxy_forwarding_rejected_total` | counter | `reason` | Requests whose forwarding headers were rejected and failed closed |
 | `ironauth_quota_decisions_total` | counter | `decision`, `dimension` | Quota decisions, by dimension and admitted or denied |
+| `ironauth_request_throttled_total` | counter | `layer` | Request-path refusals by the layered limiter, by refusing layer |
 | `ironauth_sms_route_throttled_total` | counter | `route` | SMS sends refused by a per-route throttle |
 | `ironauth_sms_send_hash_rejected_total` | counter | none | SMS sends refused because the recipient hash was rejected |
 | `ironauth_sms_send_refused_total` | counter | `reason` | SMS sends refused, by reason |
@@ -98,7 +99,7 @@ label on the wire with every test green.
 | `ironauth_up` | gauge | none | 1 while the process is serving |
 | `ironauth_verification_send_suppressed_total` | counter | `purpose` | Verification sends suppressed, by purpose |
 
-43 metrics, 12 of them carrying no labels at all.
+44 metrics, 12 of them carrying no labels at all.
 
 ## Scope
 

@@ -377,7 +377,7 @@ impl ForwardAuthRuntime {
             return Ok(None);
         }
         Ok(Some(Self {
-            limiter: limiter_from_config(&cfg.rate_limit, clock.clone()),
+            limiter: layered_limiter_from_config(&cfg.rate_limit, clock.clone()),
             forward_auth: match cfg.decision_cache_ttl_secs {
                 // THE CACHE IS OFF BY DEFAULT (issue #154 criterion 6): a deployment that
                 // has not asked for it gets the same evaluation it always had, and the
@@ -453,7 +453,7 @@ impl ForwardAuthRuntime {
 /// gets a limiter that admits everything rather than no limiter at all: one code path,
 /// whether or not limits are configured, so the admit call site cannot drift into being
 /// conditional and then being forgotten.
-fn limiter_from_config(
+pub fn layered_limiter_from_config(
     cfg: &ironauth_config::RateLimitConfig,
     clock: std::sync::Arc<dyn ironauth_env::Clock>,
 ) -> ironauth_quota::layered::LayeredLimiter {
@@ -1123,7 +1123,7 @@ mod limiter_tests {
         );
 
         for (expected, cfg) in cases {
-            let limiter = limiter_from_config(&cfg, clock());
+            let limiter = layered_limiter_from_config(&cfg, clock());
             assert_eq!(
                 limiter.admit(&as_the_handler_builds_it(), 1.0).decision,
                 Decision::Admitted
@@ -1148,7 +1148,7 @@ mod limiter_tests {
     /// is holding the 429 and whoever is reading the graph to different answers.
     #[test]
     fn the_refusing_layer_is_the_same_string_in_the_header_and_the_metric() {
-        let limiter = limiter_from_config(
+        let limiter = layered_limiter_from_config(
             &RateLimitConfig {
                 per_tenant: Some(LimitConfig {
                     per_second: 0.0,
@@ -1188,7 +1188,8 @@ mod limiter_tests {
     /// returned a limiter refusing everything would satisfy every row.
     #[test]
     fn the_default_configuration_admits_everything() {
-        let limiter = limiter_from_config(&ForwardAuthConfig::default().rate_limit, clock());
+        let limiter =
+            layered_limiter_from_config(&ForwardAuthConfig::default().rate_limit, clock());
         let identity = RequestIdentity {
             ip: Some("198.51.100.7".to_owned()),
             tenant: Some("tnt_1".to_owned()),

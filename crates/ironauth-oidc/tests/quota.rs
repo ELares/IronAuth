@@ -67,6 +67,7 @@ fn request_quota(env_burst: u64) -> QuotaConfig {
         // The override refresher is a boot-path concern (issue #150 criterion 4);
         // these enforcement tests drive the enforcer directly.
         override_refresh_interval_secs: 0,
+        request_path_limits: ironauth_config::RateLimitConfig::default(),
     }
 }
 
@@ -350,6 +351,7 @@ fn tenant_limited_quota(tenant_burst: u64) -> QuotaConfig {
         usage_thresholds_percent: vec![100],
         idle_bucket_ttl_secs: 0,
         override_refresh_interval_secs: 0,
+        request_path_limits: ironauth_config::RateLimitConfig::default(),
     }
 }
 

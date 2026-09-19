@@ -1702,6 +1702,11 @@ required-features = ["testing"]
 path = "tests/forward_auth_trace.rs"
 
 [[test]]
+name = "request_path_limiter"
+required-features = ["testing"]
+path = "tests/request_path_limiter.rs"
+
+[[test]]
 name = "access_rules_three_consumers"
 required-features = ["testing"]
 path = "tests/access_rules_three_consumers.rs"
