@@ -464,6 +464,20 @@ async fn authorization_code_grant(
         return Err(TokenError::InvalidGrant);
     }
 
+    // 5-bis. The REQUEST-PLANE limiter (issue #150 criterion 1) with the VERIFIED
+    //     subject: the code's own binding is the per-user bucket key, and the
+    //     authenticated client is the per-client key. This runs BEFORE the code is
+    //     burned, so a throttled exchange consumes neither the code nor the family;
+    //     the caller can retry after the advertised window.
+    if let Some(response) = state.enforce_request_quota(
+        &scope,
+        headers,
+        Some(authenticated_client.client_id.as_str()),
+        Some(&bindings.subject),
+    ) {
+        return Ok(response);
+    }
+
     // 5b. Resolve the RFC 8707 resource indicators (issue #28) into the access-token
     //     target (its audience set, format, and lifetime). The requested resources
     //     must be valid, allowlisted, and a SUBSET of what was approved at
@@ -2741,6 +2755,20 @@ async fn refresh_token_grant(
     //     offline_access family was opened (issue #21) must not keep minting. Fail
     //     closed (including on a store fault); a normal active user is unaffected.
     ensure_subject_can_authenticate(state, scope, &resolution.subject).await?;
+
+    // 4b-bis. The REQUEST-PLANE limiter (issue #150 criterion 1) with the VERIFIED
+    //     subject: the family's own subject is the per-user bucket key, and the
+    //     authenticated client is the per-client key. This runs BEFORE the redeem, so a
+    //     throttled refresh neither rotates nor consumes the family; the caller can
+    //     retry after the advertised window.
+    if let Some(response) = state.enforce_request_quota(
+        &scope,
+        headers,
+        Some(authenticated_client.client_id.as_str()),
+        Some(&resolution.subject),
+    ) {
+        return Ok(response);
+    }
 
     // 4c. Enforce the family's DPoP binding (RFC 9449 section 5, issue #368 PR3)
     //     BEFORE minting or the atomic redeem. A family issued DPoP-bound can ONLY be

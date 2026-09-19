@@ -1638,6 +1638,14 @@ pub struct RateLimitConfig {
     /// deployment configuring this layer there gets the `unenforced` signal on the
     /// outcome rather than silent skipping.
     pub per_client: Option<LimitConfig>,
+    /// Bounds one subject (issue #150 criterion 1).
+    ///
+    /// Binds wherever the surface resolves a VERIFIED subject before limiting: the token
+    /// endpoint's grants resolve the subject from the code's binding or the refresh
+    /// family before minting, so the bucket key is the real user, never attacker-chosen
+    /// bytes. A surface that resolves no subject before its limiter runs reports the
+    /// layer in the outcome's `unenforced` census when configured, never in silence.
+    pub per_user: Option<LimitConfig>,
 }
 
 /// One token bucket: a sustained rate and the burst it can absorb.
