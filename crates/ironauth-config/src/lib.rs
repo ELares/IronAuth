@@ -1629,6 +1629,15 @@ pub struct RateLimitConfig {
     pub per_tenant: Option<LimitConfig>,
     /// Bounds one environment within a tenant.
     pub per_environment: Option<LimitConfig>,
+    /// Bounds one verified client (issue #150 criterion 1).
+    ///
+    /// Binds wherever the surface names the VERIFIED client before limiting: the
+    /// authorization path and the token endpoint resolve the client's registered
+    /// identifier before the request proceeds, so the bucket key is the real client,
+    /// never attacker-chosen bytes. The forward-auth check names no client, so a
+    /// deployment configuring this layer there gets the `unenforced` signal on the
+    /// outcome rather than silent skipping.
+    pub per_client: Option<LimitConfig>,
 }
 
 /// One token bucket: a sustained rate and the burst it can absorb.

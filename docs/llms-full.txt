@@ -1147,6 +1147,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `forward_auth.dialect` | string | `"forward-auth"` | Which reverse proxy dialect the check request arrives in. |
 | `forward_auth.enabled` | boolean | `false` | Whether the forward-auth surface is served. |
 | `forward_auth.rate_limit` | table | see fields | Request-plane rate limits for the check endpoint (issue #150). |
+| `forward_auth.rate_limit.per_client` | table or unset | unset | Bounds one verified client (issue #150 criterion 1). |
 | `forward_auth.rate_limit.per_environment` | table or unset | unset | Bounds one environment within a tenant. |
 | `forward_auth.rate_limit.per_ip` | table or unset | unset | The only layer that applies before a caller is identified. |
 | `forward_auth.rate_limit.per_tenant` | table or unset | unset | Bounds the customer. |
@@ -1412,6 +1413,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `quota.idle_bucket_ttl_secs` | integer | `3600` | How long (in seconds) an idle per-tenant or per-environment token bucket is retained before the reaper evicts it, bounding the in-memory footprint under legitimate scope churn (an environment deleted, a tenant offboarded). A bucket untouched for this long is dropped; it is re-created full on the next spend, exactly as a never-seen scope would be, so eviction is behaviorally transparent (a scope idle this long has already refilled to full under any normal rate). The default (3600) is one hour. Set it to 0 to disable the reaper (buckets then live for the process lifetime); the key space is still bounded by real tenancy, because only a verified, existing scope ever allocates a bucket. |
 | `quota.override_refresh_interval_secs` | integer | `10` | How often (in seconds) a node re-reads the stored per-scope quota overrides and applies them to its running enforcer. |
 | `quota.request_path_limits` | table | see fields | The REQUEST-PLANE limiter on the OIDC request paths (issue #150 criterion 1): per-IP, per-tenant and per-environment token-bucket layers enforced BEFORE the tenant/environment quota engine below. |
+| `quota.request_path_limits.per_client` | table or unset | unset | Bounds one verified client (issue #150 criterion 1). |
 | `quota.request_path_limits.per_environment` | table or unset | unset | Bounds one environment within a tenant. |
 | `quota.request_path_limits.per_ip` | table or unset | unset | The only layer that applies before a caller is identified. |
 | `quota.request_path_limits.per_tenant` | table or unset | unset | Bounds the customer. |
