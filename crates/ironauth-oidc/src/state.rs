@@ -457,7 +457,15 @@ pub struct OidcState {
     // shared across every request thread. Default: `None`, which disables
     // enforcement entirely (every request admitted, nothing charged) so the
     // many DB-only OIDC tests and a self-hoster who wants no quota are unaffected.
+    /// The per-tenant/per-environment quota enforcer (issue #50), the data plane's
+    /// fairness engine.
     quota: Option<Arc<QuotaEnforcer>>,
+    /// The REQUEST-PLANE layered limiter (issue #150 criterion 1): per-IP,
+    /// per-tenant and per-environment token buckets enforced before the quota
+    /// engine, built from `[quota] request_path_limits`. `None` (the default) when
+    /// the boot path installed none, in which case the request path enforces only
+    /// the quota engine.
+    layered_limiter: Option<Arc<ironauth_quota::layered::LayeredLimiter>>,
     // The inbound lazy-migration hook (issue #56). Kept OUTSIDE `Inner` and installed by
     // the boot path (built from the [oidc.lazy_migration] config with a dedicated
     // SSRF-hardened fetcher and the same env clock), so its circuit breaker's time
@@ -1136,6 +1144,7 @@ impl OidcState {
             portal_widgets_enabled: false,
             token_claims: TokenClaimsConfig::default(),
             quota: None,
+            layered_limiter: None,
             migration_hook: None,
             claims_enrichment_hook: None,
             hook_engine: None,
@@ -1970,6 +1979,22 @@ impl OidcState {
         self
     }
 
+    /// Install the request-plane layered limiter (issue #150 criterion 1), turning
+    /// on per-IP/per-tenant/per-environment limiting ahead of the quota engine.
+    /// The boot path builds one limiter from `[quota] request_path_limits` and
+    /// installs it here ALWAYS, even when every layer is unlimited, so the admit
+    /// call site cannot drift into being conditional. A test installs a
+    /// small-budget limiter to drive the 429 path. With none installed the
+    /// request path enforces only the quota engine.
+    #[must_use]
+    pub fn with_layered_limiter(
+        mut self,
+        limiter: Arc<ironauth_quota::layered::LayeredLimiter>,
+    ) -> Self {
+        self.layered_limiter = Some(limiter);
+        self
+    }
+
     /// The installed enforcer, for a caller that must reach the SAME engine the request path
     /// spends against (issue #150 criterion 4).
     ///
@@ -2068,11 +2093,45 @@ impl OidcState {
     /// Returns [`Some`] `429 Too Many Requests` response when the scope is over
     /// quota: the caller MUST return it and spend nothing further (fail-closed at
     /// the ceiling). Returns [`None`] when the request is admitted (or when no
-    /// enforcer is installed), and the caller proceeds untouched. The spend draws
-    /// from the environment bucket and, by nesting, its tenant bucket, so one
-    /// tenant hitting its limit never consumes another tenant's share.
+    /// enforcer is installed), and the caller proceeds untouched. The REQUEST-PLANE
+    /// layered limiter runs first (per-IP, per-tenant, per-environment from
+    /// `[quota] request_path_limits`): a refusal there short-circuits before the
+    /// quota engine spends anything, so a flood from one address cannot erode the
+    /// tenant's plan-level budget on the way out. The spend then draws from the
+    /// environment bucket and, by nesting, its tenant bucket, so one tenant hitting
+    /// its limit never consumes another tenant's share.
     #[must_use]
-    pub(crate) fn enforce_request_quota(&self, scope: &Scope) -> Option<axum::response::Response> {
+    pub(crate) fn enforce_request_quota(
+        &self,
+        scope: &Scope,
+        headers: &axum::http::HeaderMap,
+    ) -> Option<axum::response::Response> {
+        if let Some(limiter) = self.layered_limiter.as_ref() {
+            let identity = ironauth_quota::layered::RequestIdentity {
+                // THE POLICY-RESOLVED PEER IP, stamped by the same middleware that stamps
+                // the forward-auth hop: the request path cannot trust a client-supplied
+                // address, and this is the one the proxy policy resolved for THIS request.
+                ip: headers
+                    .get(ironauth_config::PEER_IP_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+                user: None,
+                client: None,
+                tenant: Some(scope.tenant().to_string()),
+                environment: Some(scope.environment().to_string()),
+            };
+            let outcome = limiter.admit(&identity, 1.0);
+            if outcome.is_throttled() || outcome.is_unidentified() {
+                if let Some(layer) = outcome.metric_label() {
+                    metrics::counter!(
+                        crate::quota::REQUEST_THROTTLED_TOTAL,
+                        "layer" => layer
+                    )
+                    .increment(1);
+                }
+                return Some(crate::quota::render_limiter_response(&outcome));
+            }
+        }
         crate::quota::enforce_request(self.quota.as_ref()?, scope)
     }
 

@@ -370,6 +370,15 @@ pub const CONTRACT: &[MetricSpec] = &[
         labels: &["layer"],
         help: "Forward-auth checks refused by the request-plane limiter, by refusing layer",
     },
+    // Issue #150 criterion 1: the same limiting layer, on the OIDC request paths (authorize,
+    // challenge, OTP, magic-link, invitation surfaces). The `layer` label is the same stable
+    // string the `x-ratelimit-layer` header carries on the 429.
+    MetricSpec {
+        name: "ironauth_request_throttled_total",
+        kind: MetricKind::Counter,
+        labels: &["layer"],
+        help: "Request-path refusals by the layered limiter, by refusing layer",
+    },
     MetricSpec {
         name: "ironauth_password_hash_admission_rejected_total",
         kind: MetricKind::Counter,

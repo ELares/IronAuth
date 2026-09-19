@@ -1252,6 +1252,7 @@ mod tests {
             usage_thresholds_percent: vec![80, 100],
             idle_bucket_ttl_secs: 0,
             override_refresh_interval_secs: 0,
+            request_path_limits: ironauth_config::RateLimitConfig::default(),
         }
     }
 
@@ -1344,6 +1345,7 @@ mod tests {
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
             override_refresh_interval_secs: 0,
+            request_path_limits: ironauth_config::RateLimitConfig::default(),
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = env("acme", "prod");
@@ -1374,6 +1376,7 @@ mod tests {
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
             override_refresh_interval_secs: 0,
+            request_path_limits: ironauth_config::RateLimitConfig::default(),
         };
         let (enforcer, clock) = enforcer_with(&config);
         let scope = env("acme", "prod");
@@ -1426,6 +1429,7 @@ mod tests {
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
             override_refresh_interval_secs: 0,
+            request_path_limits: ironauth_config::RateLimitConfig::default(),
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = env("acme", "prod");
@@ -1466,6 +1470,7 @@ mod tests {
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
             override_refresh_interval_secs: 0,
+            request_path_limits: ironauth_config::RateLimitConfig::default(),
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = tenant("acme");
@@ -1499,6 +1504,7 @@ mod tests {
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
             override_refresh_interval_secs: 0,
+            request_path_limits: ironauth_config::RateLimitConfig::default(),
         };
         let (enforcer, clock) = enforcer_with(&config);
         let scope = tenant("acme");
@@ -1581,6 +1587,7 @@ mod tests {
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
             override_refresh_interval_secs: 0,
+            request_path_limits: ironauth_config::RateLimitConfig::default(),
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let enforcer = Arc::new(enforcer);
@@ -1622,6 +1629,7 @@ mod tests {
             usage_thresholds_percent: vec![80, 100],
             idle_bucket_ttl_secs: 0,
             override_refresh_interval_secs: 0,
+            request_path_limits: ironauth_config::RateLimitConfig::default(),
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = tenant("acme");
@@ -1653,6 +1661,7 @@ mod tests {
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
             override_refresh_interval_secs: 0,
+            request_path_limits: ironauth_config::RateLimitConfig::default(),
         };
         let (enforcer, clock) = enforcer_with(&config);
         let scope = tenant("acme");
@@ -1712,6 +1721,7 @@ mod tests {
             usage_thresholds_percent: vec![100],
             idle_bucket_ttl_secs: 0,
             override_refresh_interval_secs: 0,
+            request_path_limits: ironauth_config::RateLimitConfig::default(),
         };
         let (enforcer, _clock) = enforcer_with(&config);
         let scope = env("acme", "prod");

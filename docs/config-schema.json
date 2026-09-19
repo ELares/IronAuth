@@ -2492,6 +2492,15 @@
           "minimum": 0,
           "type": "integer"
         },
+        "request_path_limits": {
+          "$ref": "#/$defs/RateLimitConfig",
+          "default": {
+            "per_environment": null,
+            "per_ip": null,
+            "per_tenant": null
+          },
+          "description": "The REQUEST-PLANE limiter on the OIDC request paths (issue #150 criterion 1):\nper-IP, per-tenant and per-environment token-bucket layers enforced BEFORE the\ntenant/environment quota engine below.\n\nEvery layer is unlimited by default, so a deployment that does not ask for\nrequest-path limiting is behaviorally unchanged. The per-IP layer is the one that\ncan bind before any identity is resolved (the request path knows the policy-resolved\npeer IP from the middleware before it knows the caller); per-tenant and per-environment\nbound the same scope keys the quota engine bounds, and are the layers whose limits are\nenforced even when the tenant's configured quota is unlimited. Per-USER and per-CLIENT\nlayers do not exist here because no request-path handler resolves a subject or names a\nclient BEFORE the limiter runs; the forward-auth surface documents the same three.\n\nA layer that is configured but whose key the request cannot present is refused per\nthe missing-identity policy, and the 429 carries the limiting layer's name and a\n`Retry-After`, per the criterion."
+        },
         "tenant": {
           "$ref": "#/$defs/ScopeQuotaConfig",
           "default": {
@@ -3838,6 +3847,11 @@
         },
         "idle_bucket_ttl_secs": 3600,
         "override_refresh_interval_secs": 10,
+        "request_path_limits": {
+          "per_environment": null,
+          "per_ip": null,
+          "per_tenant": null
+        },
         "tenant": {
           "hook_seconds_burst": 120,
           "hook_seconds_per_second": 60,

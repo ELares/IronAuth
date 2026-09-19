@@ -23,6 +23,17 @@ use ironauth_quota::{
 };
 use ironauth_store::Scope;
 
+/// Request-path refusals by the layered limiter, by the layer that refused (issue #150
+/// criterion 1).
+///
+/// The layer is the SAME stable string the `x-ratelimit-layer` header carries, so a
+/// dashboard and a response cannot disagree about what a layer is called. The criterion
+/// asks for the limiting layer "in headers and metrics", and this is the metrics half:
+/// without it an operator can see that a caller was throttled and not which budget it hit,
+/// and the remedies differ (per-IP means slow down, per-tenant means the account is over
+/// its plan).
+pub const REQUEST_THROTTLED_TOTAL: &str = "ironauth_request_throttled_total";
+
 /// Map the resolved persistence scope onto the quota engine's scope. Every OIDC
 /// data-plane request runs in a `(tenant, environment)`, so it is always an
 /// environment scope: the spend draws from BOTH the environment bucket and, by
@@ -80,6 +91,37 @@ fn record(dimension: QuotaDimension, outcome: &QuotaOutcome) {
             "quota saturation threshold crossed"
         );
     }
+}
+
+/// Render the layered limiter's refusal (issue #150 criteria 1 and 3): `429` with the
+/// structured `RateLimit` and legacy `X-RateLimit-*` headers, `Retry-After`, the limiting
+/// layer's name, and a machine-readable body; `403` for a missing-identity refusal, which
+/// is a property of the request rather than of its rate.
+pub(crate) fn render_limiter_response(
+    outcome: &ironauth_quota::layered::LayeredOutcome,
+) -> Response {
+    let status = if outcome.is_unidentified() {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::TOO_MANY_REQUESTS
+    };
+    let body = "{\"error\":\"rate_limited\",\"error_description\":\"the request was refused \
+                by the request-plane limiter\"}";
+    let mut response = (status, body).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    for (name, value) in outcome.headers() {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    response
 }
 
 /// Build the `429 Too Many Requests` short-circuit from a denied outcome: the

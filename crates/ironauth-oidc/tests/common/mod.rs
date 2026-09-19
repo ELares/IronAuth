@@ -243,6 +243,8 @@ pub struct Harness {
     // The quota engine installed on the state, retained so a test can inspect the
     // live bucket count and drive the idle-bucket reaper (issue #50).
     quota: Option<Arc<QuotaEnforcer>>,
+    /// The installed request-plane layered limiter (issue #150), when a test asked for one.
+    limiter: Option<Arc<ironauth_quota::layered::LayeredLimiter>>,
     router: Router,
 }
 
@@ -281,7 +283,7 @@ impl Harness {
     /// Like [`Harness::start`] but with explicit OIDC settings (for the expiry
     /// test, which wants a short code lifetime).
     pub async fn start_with(config: OidcConfig) -> Self {
-        Self::start_inner(config, None, None, None, None).await
+        Self::start_inner(config, None, None, None, None, None).await
     }
 
     /// Like [`Harness::start`] but with the WASM hook engine installed (issue #114).
@@ -308,7 +310,7 @@ impl Harness {
     ) -> Self {
         let runtime = Arc::new(ironauth_oidc::token_hook::HookRuntime::new(engine));
         Self::spawn_epoch_driver(&runtime);
-        Self::start_inner(config, None, None, None, Some(runtime)).await
+        Self::start_inner(config, None, None, None, Some(runtime), None).await
     }
 
     /// As [`Harness::start_with_hook_engine`], with the outbound path a granted hook's requests
@@ -328,7 +330,7 @@ impl Harness {
         let runtime =
             Arc::new(ironauth_oidc::token_hook::HookRuntime::new(engine).with_fetcher(fetcher));
         Self::spawn_epoch_driver(&runtime);
-        Self::start_inner(OidcConfig::default(), None, None, None, Some(runtime)).await
+        Self::start_inner(OidcConfig::default(), None, None, None, Some(runtime), None).await
     }
 
     /// Advance the hook engine's epoch, as the boot path does.
@@ -391,6 +393,7 @@ impl Harness {
             None,
             Some(max_group_depth),
             None,
+            None,
         )
         .await
     }
@@ -399,7 +402,7 @@ impl Harness {
     /// resolver (issue #25), so a `jwks_uri` client's keys resolve through the
     /// fetcher. Confidential PKCE is relaxed via the passed config.
     pub async fn start_with_resolver(config: OidcConfig, resolver: Arc<ClientKeyResolver>) -> Self {
-        Self::start_inner(config, Some(resolver), None, None, None).await
+        Self::start_inner(config, Some(resolver), None, None, None, None).await
     }
 
     /// Like [`Harness::start_with`] but with the tenant/environment quota engine
@@ -407,7 +410,24 @@ impl Harness {
     /// harness's deterministic clock. Used to drive the real `/authorize` request
     /// path into a 429 and to prove tenant fairness end to end.
     pub async fn start_with_quota(config: OidcConfig, quota_config: QuotaConfig) -> Self {
-        Self::start_inner(config, None, Some(quota_config), None, None).await
+        Self::start_inner(config, None, Some(quota_config), None, None, None).await
+    }
+
+    /// The same, with the REQUEST-PLANE layered limiter installed (issue #150): per-IP,
+    /// per-tenant and per-environment limits from `limits`, on the real request path.
+    pub async fn start_with_layered_limiter(
+        config: OidcConfig,
+        limits: ironauth_config::RateLimitConfig,
+    ) -> Self {
+        Self::start_inner(
+            config,
+            None,
+            Some(QuotaConfig::default()),
+            None,
+            None,
+            Some(limits),
+        )
+        .await
     }
 
     async fn start_inner(
@@ -416,6 +436,7 @@ impl Harness {
         quota_config: Option<QuotaConfig>,
         max_group_depth: Option<u32>,
         hook_runtime: Option<Arc<ironauth_oidc::token_hook::HookRuntime>>,
+        layered_limits: Option<ironauth_config::RateLimitConfig>,
     ) -> Self {
         let (db, env, clock, scope, client_id) = Self::seed_common().await;
 
@@ -479,6 +500,24 @@ impl Harness {
             }
             None => (state, None),
         };
+        // The REQUEST-PLANE layered limiter (issue #150), installed on the SAME state the
+        // router is built from exactly as the boot path does: per-IP, per-tenant and
+        // per-environment limits ahead of the quota engine.
+        let (state, limiter) = match layered_limits {
+            Some(limits) => {
+                let limiter = Arc::new(
+                    ironauth_oidc::forward_auth_rules::layered_limiter_from_config(
+                        &limits,
+                        env.clock_arc(),
+                    ),
+                );
+                (
+                    state.with_layered_limiter(Arc::clone(&limiter)),
+                    Some(limiter),
+                )
+            }
+            None => (state, None),
+        };
         // The WASM hook engine (issue #114), installed on the SAME state the router is built
         // from, exactly as the boot path does. Absent unless a test asked for it, which is what
         // makes `a_deployment_with_no_engine_does_not_run_a_deployed_hook` a real control
@@ -507,6 +546,7 @@ impl Harness {
             registry,
             state,
             quota,
+            limiter,
             router,
         }
     }
@@ -574,6 +614,7 @@ impl Harness {
             registry,
             state,
             quota: None,
+            limiter: None,
             router,
         }
     }
@@ -876,6 +917,7 @@ impl Harness {
             registry,
             state,
             quota: None,
+            limiter: None,
             router,
         }
     }
@@ -928,6 +970,7 @@ impl Harness {
             registry,
             state,
             quota: None,
+            limiter: None,
             router,
         }
     }
@@ -1017,6 +1060,11 @@ impl Harness {
     /// The quota engine installed on the state (issue #50), for tests that assert
     /// the live bucket count stays bounded or drive the idle-bucket reaper.
     #[must_use]
+    /// The installed request-plane layered limiter (issue #150), when the test installed one.
+    pub fn layered_limiter(&self) -> Option<&Arc<ironauth_quota::layered::LayeredLimiter>> {
+        self.limiter.as_ref()
+    }
+
     pub fn quota_enforcer(&self) -> &Arc<QuotaEnforcer> {
         self.quota
             .as_ref()

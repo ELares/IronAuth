@@ -43,6 +43,7 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::{CorrelationId, StoreError};
@@ -75,6 +76,7 @@ pub struct AcceptInvitationBody {
 pub async fn accept_invitation(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
     Json(body): Json<AcceptInvitationBody>,
 ) -> Response {
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
@@ -82,7 +84,7 @@ pub async fn accept_invitation(
     };
     // A per-tenant/per-environment request-quota charge (issue #50), like the other
     // public data-plane surfaces; None when no enforcer is installed.
-    if let Some(response) = state.enforce_request_quota(&scope) {
+    if let Some(response) = state.enforce_request_quota(&scope, &headers) {
         return response;
     }
     let token = body.token.trim();

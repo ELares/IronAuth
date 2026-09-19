@@ -106,7 +106,7 @@ pub struct VerifyBody {
 pub async fn send(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<SendBody>,
 ) -> Response {
     // RECORDED ON THE RESPONSE. A conversion rate is sends divided by verifies, so
@@ -117,9 +117,9 @@ pub async fn send(
     crate::funnel::record_otp(
         crate::funnel::OtpChannel::Sms,
         crate::funnel::OtpStage::Send,
-        // The headers are not passed on: this handler never read them, and forwarding an
-        // underscore-prefixed binding just to keep the shapes matching is a lint and a lie.
-        send_inner(state, tenant_id, environment_id, body).await,
+        // THE HEADERS ARE PASSED ON NOW: the request-plane limiter (issue #150) keys the
+        // per-IP layer on the middleware-stamped peer address, which lives in them.
+        send_inner(state, tenant_id, environment_id, &headers, body).await,
     )
 }
 
@@ -128,6 +128,7 @@ async fn send_inner(
     state: OidcState,
     tenant_id: String,
     environment_id: String,
+    headers: &HeaderMap,
     body: SendBody,
 ) -> Response {
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
@@ -137,7 +138,7 @@ async fn send_inner(
     if !state.sms_otp_enabled() {
         return not_found_json();
     }
-    if let Some(response) = state.enforce_request_quota(&scope) {
+    if let Some(response) = state.enforce_request_quota(&scope, headers) {
         return response;
     }
     let Some(purpose) = purpose_or_login(body.purpose.as_deref()) else {
@@ -352,7 +353,7 @@ async fn verify_inner(
     if !state.sms_otp_enabled() {
         return not_found_json();
     }
-    if let Some(response) = state.enforce_request_quota(&scope) {
+    if let Some(response) = state.enforce_request_quota(&scope, &headers) {
         return response;
     }
     let Some(purpose) = purpose_or_login(body.purpose.as_deref()) else {
