@@ -441,6 +441,13 @@ jobs:
       # job installs; everywhere else it skips loudly.
       - name: Chaos: IronBus down, the outbox drains on the poll (issue #149)
         run: cargo test -p ironauth-store --features testing,ironbus --test outbox_chaos -- --test-threads=1
+      # Issue #149 criterion 1: the BACKBONE-ABSENT readiness tier, induced for real. The
+      # test starts a REAL broker, boots a server declaring it in [outbox] ironbus_addr,
+      # KILLS the broker, and asserts the documented 200 degraded: backbone_absent
+      # surface and recovery. Needs the broker this job installs; elsewhere it skips
+      # loudly.
+      - name: Chaos: the backbone-absent tier survives a broker kill (issue #149)
+        run: cargo test -p ironauth-server --test chaos ironbus -- --test-threads=1
       # Webhook delivery, DLQ, and replay under the SAME broker (issue #106, criterion 7).
       #
       # The backbone only decides WHEN the drain runs, never what a consumer does, so
