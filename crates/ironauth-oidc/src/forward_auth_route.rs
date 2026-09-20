@@ -143,7 +143,7 @@ pub async fn check(
         tenant: Some(tenant_id.clone()),
         environment: Some(environment_id.clone()),
     };
-    let admitted = runtime.limiter().admit(&identity, 1.0);
+    let admitted = runtime.limiter().admit(&identity, 1.0).await;
     if admitted.is_throttled() || admitted.is_unidentified() {
         if let Some(layer) = admitted.metric_label() {
             metrics::counter!(THROTTLED_TOTAL, "layer" => layer).increment(1);
@@ -558,8 +558,8 @@ mod tests {
     /// The split is the one `LayeredOutcome` draws and the reason carries over: 429
     /// advertises a remedy, and waiting never produces an address, so telling an
     /// unattributable caller to retry would publish a remedy that cannot work.
-    #[test]
-    fn a_rate_refusal_and_an_unidentified_one_render_differently() {
+    #[tokio::test]
+    async fn a_rate_refusal_and_an_unidentified_one_render_differently() {
         use ironauth_quota::Limit;
         use ironauth_quota::layered::{LayeredLimiter, LayeredLimits, RateLayer, RequestIdentity};
 
@@ -576,10 +576,10 @@ mod tests {
         };
 
         assert_eq!(
-            limiter.admit(&addressed, 1.0).decision,
+            limiter.admit(&addressed, 1.0).await.decision,
             QuotaDecision::Admitted
         );
-        let over_quota = throttled(&limiter.admit(&addressed, 1.0));
+        let over_quota = throttled(&limiter.admit(&addressed, 1.0).await);
         assert_eq!(over_quota.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(
             over_quota.headers().get("x-ratelimit-layer").is_some(),
@@ -588,7 +588,7 @@ mod tests {
 
         // No address, against a limiter that has a per-IP limit configured: the default
         // policy refuses, and it is NOT a throttle.
-        let unidentified = throttled(&limiter.admit(&RequestIdentity::default(), 1.0));
+        let unidentified = throttled(&limiter.admit(&RequestIdentity::default(), 1.0).await);
         assert_eq!(unidentified.status(), StatusCode::FORBIDDEN);
         assert_ne!(
             unidentified.status(),

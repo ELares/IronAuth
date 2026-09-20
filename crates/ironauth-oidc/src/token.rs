@@ -469,12 +469,15 @@ async fn authorization_code_grant(
     //     authenticated client is the per-client key. This runs BEFORE the code is
     //     burned, so a throttled exchange consumes neither the code nor the family;
     //     the caller can retry after the advertised window.
-    if let Some(response) = state.enforce_request_quota(
-        &scope,
-        headers,
-        Some(authenticated_client.client_id.as_str()),
-        Some(&bindings.subject),
-    ) {
+    if let Some(response) = state
+        .enforce_request_quota(
+            &scope,
+            headers,
+            Some(authenticated_client.client_id.as_str()),
+            Some(&bindings.subject),
+        )
+        .await
+    {
         return Ok(response);
     }
 
@@ -2761,12 +2764,15 @@ async fn refresh_token_grant(
     //     authenticated client is the per-client key. This runs BEFORE the redeem, so a
     //     throttled refresh neither rotates nor consumes the family; the caller can
     //     retry after the advertised window.
-    if let Some(response) = state.enforce_request_quota(
-        &scope,
-        headers,
-        Some(authenticated_client.client_id.as_str()),
-        Some(&resolution.subject),
-    ) {
+    if let Some(response) = state
+        .enforce_request_quota(
+            &scope,
+            headers,
+            Some(authenticated_client.client_id.as_str()),
+            Some(&resolution.subject),
+        )
+        .await
+    {
         return Ok(response);
     }
 

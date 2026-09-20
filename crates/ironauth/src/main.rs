@@ -1810,12 +1810,58 @@ async fn build_oidc_plane(
     // request-path handler that charges quota. Built from `[quota] request_path_limits`
     // and installed ALWAYS, so a deployment that configured nothing gets the same
     // all-admit limiter it had before, through the same call site.
-    let request_path_limiter = std::sync::Arc::new(
-        ironauth_oidc::forward_auth_rules::layered_limiter_from_config(
+    //
+    // THE SHARED (L2) TIER (issue #150 criterion 5): when the deployment declared an
+    // accelerator (`hot_state.ironcache_addr`), the buckets live in it, so two nodes
+    // charge ONE budget; a cache that cannot answer falls back to the local bucket and
+    // the outcome reports it. A deployment that did not declare one is L1-only, which is
+    // the Postgres-only mode and the shipped default.
+    #[cfg(feature = "ironcache")]
+    let shared_rates: Option<std::sync::Arc<dyn ironauth_quota::layered::SharedRateStore>> =
+        match config.hot_state.ironcache_addr.as_deref() {
+            Some(addr) => {
+                let url = if addr.starts_with("redis://") {
+                    addr.to_owned()
+                } else {
+                    format!("redis://{addr}")
+                };
+                match ironauth_hot::ironcache::connect(&url).await {
+                    Ok(connection) => {
+                        tracing::info!(%addr, "the request-path limiter's shared rate tier attached");
+                        let keyspace =
+                            ironauth_hot::ironcache::IronCacheKeyspace::new(connection, "rate");
+                        Some(std::sync::Arc::new(
+                            ironauth_oidc::rate_store::HotSharedRates::new(std::sync::Arc::new(
+                                keyspace,
+                            )
+                                as std::sync::Arc<dyn ironauth_hot::HotState>),
+                        ))
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            "the shared rate tier did not connect; this node enforces its local \
+                             buckets only"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+    #[cfg(not(feature = "ironcache"))]
+    let shared_rates: Option<std::sync::Arc<dyn ironauth_quota::layered::SharedRateStore>> = None;
+    let request_path_limiter = std::sync::Arc::new(match shared_rates {
+        Some(store) => ironauth_oidc::forward_auth_rules::layered_limiter_from_config(
+            &config.quota.request_path_limits,
+            env.clock_arc(),
+        )
+        .with_shared_store(store),
+        None => ironauth_oidc::forward_auth_rules::layered_limiter_from_config(
             &config.quota.request_path_limits,
             env.clock_arc(),
         ),
-    );
+    });
 
     // The dedicated, admission-controlled Argon2id hashing pool (issue #62): Argon2
     // runs ONLY on these threads, never a tokio protocol-I/O worker, and each hash

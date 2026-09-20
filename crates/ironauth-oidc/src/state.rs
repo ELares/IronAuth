@@ -2101,7 +2101,7 @@ impl OidcState {
     /// environment bucket and, by nesting, its tenant bucket, so one tenant hitting
     /// its limit never consumes another tenant's share.
     #[must_use]
-    pub(crate) fn enforce_request_quota(
+    pub(crate) async fn enforce_request_quota(
         &self,
         scope: &Scope,
         headers: &axum::http::HeaderMap,
@@ -2129,7 +2129,7 @@ impl OidcState {
                 tenant: Some(scope.tenant().to_string()),
                 environment: Some(scope.environment().to_string()),
             };
-            let outcome = limiter.admit(&identity, 1.0);
+            let outcome = limiter.admit(&identity, 1.0).await;
             if outcome.is_throttled() || outcome.is_unidentified() {
                 if let Some(layer) = outcome.metric_label() {
                     metrics::counter!(
@@ -2139,6 +2139,13 @@ impl OidcState {
                     .increment(1);
                 }
                 return Some(crate::quota::render_limiter_response(&outcome));
+            }
+            // THE ALERTING HALF of criterion 5's fail-open class: a node whose shared
+            // tier cannot answer enforces its local buckets only, and that event is
+            // COUNTED so a deployment that thinks it shares budgets across nodes can
+            // see it does not.
+            if outcome.shared_fell_back {
+                metrics::counter!("ironauth_shared_rate_fallbacks_total").increment(1);
             }
         }
         crate::quota::enforce_request(self.quota.as_ref()?, scope)

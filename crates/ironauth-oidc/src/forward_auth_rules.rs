@@ -1081,8 +1081,8 @@ mod limiter_tests {
     /// someone adds either field back without also resolving a subject before the limiter,
     /// the count stops matching and they have to confront the question rather than ship a
     /// budget that never binds.
-    #[test]
-    fn each_configured_layer_becomes_its_own_budget() {
+    #[tokio::test]
+    async fn each_configured_layer_becomes_its_own_budget() {
         let one = Some(LimitConfig {
             per_second: 0.0,
             burst: 1.0,
@@ -1131,10 +1131,13 @@ mod limiter_tests {
         for (expected, cfg) in cases {
             let limiter = layered_limiter_from_config(&cfg, clock());
             assert_eq!(
-                limiter.admit(&as_the_handler_builds_it(), 1.0).decision,
+                limiter
+                    .admit(&as_the_handler_builds_it(), 1.0)
+                    .await
+                    .decision,
                 Decision::Admitted
             );
-            let refused = limiter.admit(&as_the_handler_builds_it(), 1.0);
+            let refused = limiter.admit(&as_the_handler_builds_it(), 1.0).await;
 
             assert!(refused.is_throttled(), "{expected:?} must bind");
             assert_eq!(
@@ -1152,8 +1155,8 @@ mod limiter_tests {
     /// against a literal, because the harm is not either being wrong on its own: it is a
     /// dashboard and a response disagreeing about what a layer is called, which sends whoever
     /// is holding the 429 and whoever is reading the graph to different answers.
-    #[test]
-    fn the_refusing_layer_is_the_same_string_in_the_header_and_the_metric() {
+    #[tokio::test]
+    async fn the_refusing_layer_is_the_same_string_in_the_header_and_the_metric() {
         let limiter = layered_limiter_from_config(
             &RateLimitConfig {
                 per_tenant: Some(LimitConfig {
@@ -1169,8 +1172,11 @@ mod limiter_tests {
             ..RequestIdentity::default()
         };
 
-        assert_eq!(limiter.admit(&identity, 1.0).decision, Decision::Admitted);
-        let refused = limiter.admit(&identity, 1.0);
+        assert_eq!(
+            limiter.admit(&identity, 1.0).await.decision,
+            Decision::Admitted
+        );
+        let refused = limiter.admit(&identity, 1.0).await;
 
         let label = refused.metric_label().expect("a refusal names its layer");
         let headers = refused.headers();
@@ -1192,8 +1198,8 @@ mod limiter_tests {
     ///
     /// This is the contrast the table above needs: without it, a `limiter_from_config` that
     /// returned a limiter refusing everything would satisfy every row.
-    #[test]
-    fn the_default_configuration_admits_everything() {
+    #[tokio::test]
+    async fn the_default_configuration_admits_everything() {
         let limiter =
             layered_limiter_from_config(&ForwardAuthConfig::default().rate_limit, clock());
         let identity = RequestIdentity {
@@ -1204,7 +1210,7 @@ mod limiter_tests {
 
         for spend in 0..50 {
             assert_eq!(
-                limiter.admit(&identity, 1.0).decision,
+                limiter.admit(&identity, 1.0).await.decision,
                 Decision::Admitted,
                 "spend {spend}: an unconfigured limiter must not limit"
             );

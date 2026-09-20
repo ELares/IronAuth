@@ -561,6 +561,14 @@ jobs:
       # needs the cache BINARIES this job installs; everywhere else it skips loudly.
       - name: Chaos: the accelerator-absent tier survives a cache kill (issue #149)
         run: cargo test -p ironauth-server --test chaos -- --test-threads=1
+      # Issue #150 criterion 5: the shared (L2) rate tier against the REAL cache. Two
+      # limiter "nodes" over one HotSharedRates store must enforce ONE budget, and the
+      # server binary must build with the backend selected. Needs the cache this job
+      # installs; everywhere else it skips loudly.
+      - name: shared rate tier against a real IronCache (issue #150)
+        run: |
+          cargo test -p ironauth-oidc --features testing,ironcache --test rate_l2 -- --test-threads=1
+          cargo check -p ironauth --features ironcache
 
   msrv:
     name: msrv (1.85)

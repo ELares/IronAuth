@@ -168,6 +168,8 @@ mod pow_gate;
 pub mod prm;
 mod probe;
 mod quota;
+#[cfg(feature = "ironcache")]
+pub mod rate_store;
 mod recover;
 pub mod recovery;
 /// The STRUCTURAL recover-factor honesty rule (issue #295): the opaque

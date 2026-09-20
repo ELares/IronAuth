@@ -1697,6 +1697,11 @@ required-features = ["testing"]
 path = "tests/forward_auth_cache.rs"
 
 [[test]]
+name = "rate_l2"
+required-features = ["testing", "ironcache"]
+path = "tests/rate_l2.rs"
+
+[[test]]
 name = "forward_auth_trace"
 required-features = ["testing"]
 path = "tests/forward_auth_trace.rs"
