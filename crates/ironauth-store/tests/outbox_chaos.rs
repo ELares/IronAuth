@@ -19,6 +19,7 @@
 
 #![cfg(feature = "ironbus")]
 
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -136,20 +137,29 @@ impl BusGuard {
     }
 
     fn spawn(&mut self) {
-        let child = Command::new(&self.bin)
+        // `ironbus dev` FORKS a `serve` child that owns the listener; killing the parent
+        // leaves the port open. Spawn the whole tree in its own process group and kill
+        // the GROUP, so the listener dies with the broker.
+        let mut command = Command::new(&self.bin);
+        command
             .args(["dev", "--addr"])
             .arg(format!("127.0.0.1:{}", self.port))
+            .process_group(0)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("ironbus dev spawns");
+            .stderr(std::process::Stdio::null());
+        let child = command.spawn().expect("ironbus dev spawns");
         self.child = Some(child);
     }
 
-    /// Kill the broker out from under the backbone.
+    /// Kill the whole broker process group out from under the backbone.
     fn kill(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
+        if let Some(child) = self.child.take() {
+            // `kill -9 -<pid>` signals every member of the group: the `dev` parent and
+            // the `serve` child that owns the listener.
+            let _ = Command::new("kill")
+                .args(["-9", &format!("-{}", child.id())])
+                .status();
+            let mut child = child;
             let _ = child.wait();
         }
     }

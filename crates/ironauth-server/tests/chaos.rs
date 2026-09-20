@@ -27,6 +27,7 @@
 
 mod common;
 
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -98,6 +99,26 @@ async fn postgres_dies_the_probe_marks_hard_down_and_recovers() {
         eventually(|| get(app.clone(), "/readyz"), Duration::from_secs(60)).await;
     assert_eq!(status, StatusCode::OK, "recovered: {body}");
     assert_eq!(body, "ready\n");
+}
+
+/// Poll `/readyz` until its body EQUALS `expected` or `timeout` elapses, returning the
+/// last `(status, body)` either way.
+///
+/// The readiness probe notices a killed broker asynchronously (the socket check fails on
+/// the next pass), so asserting the degraded body demands waiting FOR it, not merely
+/// polling until a 200 appears.
+async fn eventually_body(
+    app: axum::Router,
+    expected: &str,
+    timeout: Duration,
+) -> (StatusCode, String) {
+    let deadline = Instant::now() + timeout;
+    let mut last = get(app.clone(), "/readyz").await;
+    while Instant::now() < deadline && last.2 != expected {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        last = get(app.clone(), "/readyz").await;
+    }
+    (last.0, last.2)
 }
 
 /// Poll `f` until it answers or `timeout` elapses, returning the LAST answer either way.
@@ -497,4 +518,139 @@ impl ironauth_server::DatabaseProbe for FixedProbe {
         let health = self.0;
         Box::pin(async move { health })
     }
+}
+
+/// CHAOS: the BACKBONE-ABSENT tier, induced for real (issue #149 criterion 1).
+///
+/// The hard-down and accelerator-absent rows are now induced for real; this completes the
+/// set — a REAL IronBus broker answering, then dying, then coming back, with the
+/// readiness probe reporting the documented degraded tier throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn ironbus_dies_the_probe_marks_degraded_and_recovers() {
+    let Some(bin) = ironbus_bin() else {
+        eprintln!(
+            "SKIPPED: no `ironbus` broker binary on this host, so the backbone-absent chaos \
+             tier was NOT verified. Install it (cargo install --git \
+             https://github.com/ELares/IronBus ironbus-cli) or run with IRONBUS_BIN set."
+        );
+        return;
+    };
+    let port = free_port();
+    let mut broker = BusGuard::start(&bin, port);
+    wait_for_port(port, Duration::from_secs(30));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to listen on");
+    let db_port = listener.local_addr().expect("a bound address").port();
+    let server = server_from(&format!(
+        "[database]\nurl = \"postgres://ironauth@127.0.0.1:{db_port}/ironauth\"\n\
+         [outbox]\nironbus_addr = \"127.0.0.1:{port}\"\n"
+    ))
+    .with_database_probe(std::sync::Arc::new(FixedProbe(DatabaseHealth::Serving)));
+    let app = server.management_app();
+
+    // BROKER UP: the declared backbone answers, so the instance is fully ready.
+    let (status, _, body) =
+        eventually(|| get(app.clone(), "/readyz"), Duration::from_secs(30)).await;
+    assert_eq!(status, StatusCode::OK, "broker up: {body}");
+    assert_eq!(body, "ready\n");
+
+    // THE FAILURE, INDUCED: kill the broker out from under the probe.
+    broker.kill();
+
+    // DEGRADED, NOT DOWN: 200 with the documented token, because every flow still
+    // completes and the outbox drains on the Postgres poll.
+    let (status, body) = eventually_body(
+        app.clone(),
+        "degraded: backbone_absent\n",
+        Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "degraded stays a 200: {body}");
+    assert_eq!(
+        body, "degraded: backbone_absent\n",
+        "the body is the matrix's stable token"
+    );
+
+    // RECOVERY: the broker comes back on the SAME port, and the probe returns to ready.
+    broker.restart();
+    wait_for_port(port, Duration::from_secs(30));
+    let (status, body) = eventually_body(app.clone(), "ready\n", Duration::from_secs(60)).await;
+    assert_eq!(status, StatusCode::OK, "recovered: {body}");
+    assert_eq!(body, "ready\n");
+}
+
+/// A real `ironbus` broker on a test-chosen port, killed and restarted on demand.
+struct BusGuard {
+    bin: PathBuf,
+    port: u16,
+    child: Option<std::process::Child>,
+}
+
+impl BusGuard {
+    fn start(bin: &std::path::Path, port: u16) -> Self {
+        let mut guard = Self {
+            bin: bin.to_owned(),
+            port,
+            child: None,
+        };
+        guard.spawn();
+        guard
+    }
+
+    fn spawn(&mut self) {
+        // `ironbus dev` FORKS a `serve` child that owns the listener; killing the parent
+        // leaves the port open. Spawn the whole tree in its own process group and kill
+        // the GROUP, so the listener dies with the broker.
+        let mut command = Command::new(&self.bin);
+        command
+            .args(["dev", "--addr"])
+            .arg(format!("127.0.0.1:{}", self.port))
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = command.spawn().expect("ironbus dev spawns");
+        self.child = Some(child);
+    }
+
+    /// Kill the whole broker process group out from under the probe.
+    fn kill(&mut self) {
+        if let Some(child) = self.child.take() {
+            // `kill -9 -<pid>` signals every member of the group: the `dev` parent and
+            // the `serve` child that owns the listener.
+            let _ = Command::new("kill")
+                .args(["-9", &format!("-{}", child.id())])
+                .status();
+            let mut child = child;
+            let _ = child.wait();
+        }
+    }
+
+    /// Bring the broker back on the same port.
+    fn restart(&mut self) {
+        self.spawn();
+    }
+}
+
+impl Drop for BusGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// The `ironbus` broker binary: `IRONBUS_BIN`, then PATH.
+fn ironbus_bin() -> Option<PathBuf> {
+    if let Some(bin) = std::env::var_os("IRONBUS_BIN") {
+        let bin = PathBuf::from(bin);
+        if bin.is_file() {
+            return Some(bin);
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("ironbus");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
