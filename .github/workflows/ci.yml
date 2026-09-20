@@ -548,6 +548,12 @@ jobs:
       # exit status is not behind a pipe, and it costs one already-cached binary.
       - name: the seam's own suites, with the feature enabled
         run: cargo test -p ironauth-hot --features ironcache
+      # Issue #149 criterion 1: the ACCELERATOR-ABSENT chaos tier, induced for real. The test
+      # starts a REAL IronCache server, boots a server with it declared, KILLS the cache, and
+      # asserts the documented `200 degraded: accelerator_absent` surface and recovery. It
+      # needs the cache BINARIES this job installs; everywhere else it skips loudly.
+      - name: Chaos: the accelerator-absent tier survives a cache kill (issue #149)
+        run: cargo test -p ironauth-server --test chaos -- --test-threads=1
 
   msrv:
     name: msrv (1.85)

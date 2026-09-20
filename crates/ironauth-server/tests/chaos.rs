@@ -333,3 +333,168 @@ fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to bind");
     listener.local_addr().expect("a bound address").port()
 }
+
+/// CHAOS: the ACCELERATOR-ABSENT tier, induced for real (issue #149 criterion 1).
+///
+/// The degraded tiers were driven through dead ADDRESSES by `management_plane`: the cache
+/// that never answered. This is the other shape — a REAL IronCache server answering, then
+/// dying, then coming back — because the matrix row says the tier is about the accelerator
+/// that was working and stopped, not the address that never worked.
+///
+/// Degraded is SERVING: `/readyz` answers `200 degraded: accelerator_absent` (a 503 would
+/// pull the pod out of its Service because an OPTIONAL component is down), and recovery
+/// restores `200 ready`. Liveness and metrics are untouched throughout (the hard-down test
+/// asserts that half; a degraded tier by construction leaves them serving).
+///
+/// The skip is loud, never silent: no `ironcache` binary on the host prints exactly what
+/// was not verified. CI's `ironcache-matrix` job installs the server and runs this test.
+#[tokio::test(flavor = "multi_thread")]
+async fn ironcache_dies_the_probe_marks_degraded_and_recovers() {
+    let Some(bin) = ironcache_bin() else {
+        eprintln!(
+            "SKIPPED: no `ironcache` server binary on this host, so the accelerator-absent \
+             chaos tier was NOT verified. Install it (cargo install --git \
+             https://github.com/ELares/IronCache ironcache) or run with IRONCACHE_BIN set."
+        );
+        return;
+    };
+    let port = free_port();
+    let mut cache = CacheGuard::start(&bin, port);
+    wait_for_port(port, Duration::from_secs(30));
+
+    // A SERVING DATABASE PROBE, so the only variable in this test is the cache: the DB
+    // answer is fixed, exactly as `management_plane`'s degraded tests shape it.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to listen on");
+    let db_port = listener.local_addr().expect("a bound address").port();
+    let server = server_from(&format!(
+        "[database]\nurl = \"postgres://ironauth@127.0.0.1:{db_port}/ironauth\"\n\
+         [hot_state]\nironcache_addr = \"127.0.0.1:{port}\"\n"
+    ))
+    .with_database_probe(std::sync::Arc::new(FixedProbe(DatabaseHealth::Serving)));
+    let app = server.management_app();
+
+    // CACHE UP: the declared accelerator answers, so the instance is fully ready.
+    let (status, _, body) =
+        eventually(|| get(app.clone(), "/readyz"), Duration::from_secs(30)).await;
+    assert_eq!(status, StatusCode::OK, "cache up: {body}");
+    assert_eq!(body, "ready\n");
+
+    // THE FAILURE, INDUCED: kill the cache server out from under the probe.
+    cache.kill();
+
+    // DEGRADED, NOT DOWN: 200 with the documented token, because every flow still
+    // completes and only the accelerator is missing.
+    let (status, _, body) =
+        eventually(|| get(app.clone(), "/readyz"), Duration::from_secs(30)).await;
+    assert_eq!(status, StatusCode::OK, "degraded stays a 200: {body}");
+    assert_eq!(
+        body, "degraded: accelerator_absent\n",
+        "the body is the matrix's stable token"
+    );
+
+    // RECOVERY: the cache comes back on the SAME port, and the probe returns to ready.
+    cache.restart();
+    wait_for_port(port, Duration::from_secs(30));
+    let (status, _, body) =
+        eventually(|| get(app.clone(), "/readyz"), Duration::from_secs(60)).await;
+    assert_eq!(status, StatusCode::OK, "recovered: {body}");
+    assert_eq!(body, "ready\n");
+}
+
+/// A real IronCache server on a test-chosen port, killed and restarted on demand.
+struct CacheGuard {
+    bin: PathBuf,
+    port: u16,
+    child: Option<std::process::Child>,
+}
+
+impl CacheGuard {
+    fn start(bin: &PathBuf, port: u16) -> Self {
+        let mut guard = Self {
+            bin: bin.clone(),
+            port,
+            child: None,
+        };
+        guard.spawn();
+        guard
+    }
+
+    /// Launch the server (or relaunch it after a kill).
+    fn spawn(&mut self) {
+        let child = Command::new(&self.bin)
+            .args(["server", "--port"])
+            .arg(self.port.to_string())
+            .arg("--metrics-addr")
+            .arg("off")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("ironcache server spawns");
+        self.child = Some(child);
+    }
+
+    /// Kill the server out from under the probe.
+    fn kill(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Bring the server back on the same port.
+    fn restart(&mut self) {
+        self.spawn();
+    }
+}
+
+impl Drop for CacheGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// The `ironcache` server binary: the `IRONCACHE_BIN` variable, then PATH.
+fn ironcache_bin() -> Option<PathBuf> {
+    if let Some(bin) = std::env::var_os("IRONCACHE_BIN") {
+        let bin = PathBuf::from(bin);
+        if bin.is_file() {
+            return Some(bin);
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("ironcache");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Poll a TCP port until something accepts, or `timeout` elapses.
+fn wait_for_port(port: u16, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "nothing is listening on {port} within the wait"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The fixed database answer for the degraded-tier chaos: the cache is the only variable.
+#[derive(Debug)]
+struct FixedProbe(DatabaseHealth);
+
+impl ironauth_server::DatabaseProbe for FixedProbe {
+    fn check(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DatabaseHealth> + Send + '_>> {
+        let health = self.0;
+        Box::pin(async move { health })
+    }
+}
