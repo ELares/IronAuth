@@ -373,6 +373,14 @@ pub const CONTRACT: &[MetricSpec] = &[
     // Issue #150 criterion 1: the same limiting layer, on the OIDC request paths (authorize,
     // challenge, OTP, magic-link, invitation surfaces). The `layer` label is the same stable
     // string the `x-ratelimit-layer` header carries on the 429.
+    // Issue #150 criterion 5: the shared (L2) bucket tier's fail-open class, counted so a
+    // deployment that configured the accelerator can see when a node stops sharing budgets.
+    MetricSpec {
+        name: "ironauth_shared_rate_fallbacks_total",
+        kind: MetricKind::Counter,
+        labels: &[],
+        help: "Admits enforced by the local bucket because the shared rate tier could not answer",
+    },
     MetricSpec {
         name: "ironauth_request_throttled_total",
         kind: MetricKind::Counter,

@@ -16,6 +16,7 @@ async-trait = "0.1"
 http.workspace = true
 ironauth-env.workspace = true
 ironauth-config.workspace = true
+ironauth-hot.workspace = true
 ironauth-server.workspace = true
 metrics.workspace = true
 # The management API (issue #11) is mounted on the management plane when a

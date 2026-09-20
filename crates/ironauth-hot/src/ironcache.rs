@@ -166,7 +166,7 @@ impl IronCacheHotState {
     /// TTL a caller can construct. It is written defensively anyway because a `PX 0` is rejected
     /// by the server, and an operation that failed because of an arithmetic edge would surface
     /// as [`HotError::Unavailable`] -- an accelerator outage that is not one.
-    fn px(ttl: Ttl) -> u64 {
+    pub(crate) fn px(ttl: Ttl) -> u64 {
         u64::try_from(ttl.duration().as_millis())
             .unwrap_or(u64::MAX)
             .max(1)
@@ -178,7 +178,7 @@ impl IronCacheHotState {
     /// connection reset than on a timeout than on a server error: all three mean this tier did
     /// not answer, and [`crate::Tiered`] responds to all three by going to the durable tier.
     /// Splitting them would be a distinction with no consumer.
-    fn unavailable(error: &redis::RedisError) -> HotError {
+    pub(crate) fn unavailable(error: &redis::RedisError) -> HotError {
         // THE SERVER ANSWERED SOMETHING THIS CANNOT USE is a different fact from IT DID NOT
         // ANSWER, and `HotError` has a variant for each. `Parse` and `UnexpectedReturnType` are
         // the two kinds `redis` 1.7 reports when a reply arrived and could not be turned into
@@ -288,6 +288,111 @@ impl HotState for IronCacheHotState {
 ///
 /// # It is TIME-BOXED, because the client underneath is not
 ///
+/// A [`HotState`] over a raw connection with a caller-supplied keyspace, for a use whose
+/// KEY itself carries the scope (the rate counter: the layered limiter is multi-tenant, so
+/// the scope cannot be bound to the connection).
+///
+/// [`IronCacheHotState`] is the scope-bound shape; this is the sibling for a keyspace that
+/// must span tenants. The key is `{NAMESPACE}:{keyspace}:{use}:{key}` with NAMESPACE the
+/// crate's fixed literal, so two deployments pointing at one server still do not collide.
+#[derive(Debug)]
+pub struct IronCacheKeyspace {
+    connection: ConnectionManager,
+    keyspace: String,
+}
+
+impl IronCacheKeyspace {
+    /// Bind a connection and a keyspace prefix.
+    ///
+    /// # Panics
+    ///
+    /// If `keyspace` is empty or contains the key separator, for the same reason the
+    /// scope-bound sibling panics: an ambiguous key is a cross-tenant read.
+    #[must_use]
+    pub fn new(connection: ConnectionManager, keyspace: &str) -> Self {
+        assert!(
+            !keyspace.is_empty() && !keyspace.contains(SEPARATOR),
+            "a keyspace is empty or contains {SEPARATOR:?}, which makes the key encoding              ambiguous between tenants"
+        );
+        Self {
+            connection,
+            keyspace: keyspace.to_owned(),
+        }
+    }
+
+    /// The one place a key is built.
+    fn redis_key(&self, r#use: &'static HotUse, key: &str) -> String {
+        format!("{NAMESPACE}:{}:{}:{key}", self.keyspace, r#use.name())
+    }
+}
+
+impl HotState for IronCacheKeyspace {
+    fn get<'a>(&'a self, r#use: &'static HotUse, key: &'a str) -> Answer<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            let mut connection = self.connection.clone();
+            let value: Option<Vec<u8>> = connection
+                .get(self.redis_key(r#use, key))
+                .await
+                .map_err(|error| IronCacheHotState::unavailable(&error))?;
+            Ok(value)
+        })
+    }
+
+    fn put<'a>(
+        &'a self,
+        r#use: &'static HotUse,
+        key: &'a str,
+        value: &'a [u8],
+        ttl: Ttl,
+    ) -> Answer<'a, ()> {
+        Box::pin(async move {
+            let mut connection = self.connection.clone();
+            let _: () = redis::cmd("SET")
+                .arg(self.redis_key(r#use, key))
+                .arg(value)
+                .arg("PX")
+                .arg(IronCacheHotState::px(ttl))
+                .query_async(&mut connection)
+                .await
+                .map_err(|error| IronCacheHotState::unavailable(&error))?;
+            Ok(())
+        })
+    }
+
+    fn put_if_absent<'a>(
+        &'a self,
+        r#use: &'static HotUse,
+        key: &'a str,
+        value: &'a [u8],
+        ttl: Ttl,
+    ) -> Answer<'a, bool> {
+        Box::pin(async move {
+            let mut connection = self.connection.clone();
+            let outcome: Option<String> = redis::cmd("SET")
+                .arg(self.redis_key(r#use, key))
+                .arg(value)
+                .arg("NX")
+                .arg("PX")
+                .arg(IronCacheHotState::px(ttl))
+                .query_async(&mut connection)
+                .await
+                .map_err(|error| IronCacheHotState::unavailable(&error))?;
+            Ok(outcome.is_some())
+        })
+    }
+
+    fn delete<'a>(&'a self, r#use: &'static HotUse, key: &'a str) -> Answer<'a, ()> {
+        Box::pin(async move {
+            let mut connection = self.connection.clone();
+            let _: i64 = connection
+                .del(self.redis_key(r#use, key))
+                .await
+                .map_err(|error| IronCacheHotState::unavailable(&error))?;
+            Ok(())
+        })
+    }
+}
+
 /// `ConnectionManager::new` performs the first connection itself and RETRIES WITH BACKOFF before
 /// giving up. Measured against an address nothing listens on, that was about nine seconds in the runs
 /// this was developed against. The backoff is retried and jittered, so that is an observation

@@ -918,8 +918,9 @@ async fn issue_code(
     //     environment draws from its tenant too, and the buckets are per-scope, so one
     //     tenant's flood never starves another's login. Under quota (or with no
     //     enforcer installed) the request proceeds untouched.
-    if let Some(response) =
-        state.enforce_request_quota(&scope, headers, Some(&client.client_id()), None)
+    if let Some(response) = state
+        .enforce_request_quota(&scope, headers, Some(&client.client_id()), None)
+        .await
     {
         return Ok(response);
     }

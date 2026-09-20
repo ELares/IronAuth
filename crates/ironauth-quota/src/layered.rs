@@ -328,6 +328,13 @@ pub struct LayeredOutcome {
     /// Kept apart from an over-quota denial because the remedies have nothing in common: an
     /// over-quota caller should wait, and an unidentified one will never succeed by waiting.
     pub missing_identity: bool,
+    /// Whether the shared (L2) bucket store could not answer and the local (L1) bucket
+    /// enforced instead (issue #150 criterion 5). `false` with no store attached.
+    ///
+    /// THE ALERTING HALF of the criterion's "L2 unavailability degrades to L1-only ... with
+    /// alerting": a caller that graphs this field can see a deployment that thinks it is
+    /// sharing budgets across nodes and is not.
+    pub shared_fell_back: bool,
 }
 
 /// The header naming the layer that refused a request.
@@ -410,6 +417,7 @@ impl LayeredOutcome {
             },
             unenforced,
             missing_identity: true,
+            shared_fell_back: false,
         }
     }
 }
@@ -419,6 +427,111 @@ impl LayeredOutcome {
 struct LayerBucket {
     tokens: f64,
     last: Instant,
+}
+
+/// The serialized state of one bucket in the SHARED (L2) tier (issue #150 criterion 5).
+///
+/// The shared bucket's refill basis is WALL-CLOCK epoch micros, not [`Instant`]: two nodes
+/// charge the same key, and a process-local monotonic instant is not comparable across
+/// processes. The seam's clock answers `now_utc` for this, and the direction of an NTP
+/// step is chosen deliberately — a backward step clamps the elapsed time to zero (no
+/// refill, the under-admitting direction), and a forward step briefly over-refills. Both
+/// are bounded by the step, which the seam's own clock contract already warns about.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BucketState {
+    /// Tokens available.
+    pub tokens: f64,
+    /// The last refill instant, epoch microseconds (wall clock).
+    pub last_epoch_micros: i64,
+}
+
+impl BucketState {
+    /// A full bucket as of `now_epoch_micros`.
+    #[must_use]
+    pub fn full(limit: Limit, now_epoch_micros: i64) -> Self {
+        Self {
+            tokens: limit.burst(),
+            last_epoch_micros: now_epoch_micros,
+        }
+    }
+
+    /// The fixed-width encoding: 8 bytes of f64 LE followed by 8 bytes of i64 LE.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(&self.tokens.to_le_bytes());
+        out.extend_from_slice(&self.last_epoch_micros.to_le_bytes());
+        out
+    }
+
+    /// Decode, or `None` for bytes this build cannot read (an older writer, a foreign
+    /// writer). `None` is a MISS, which is the safe direction: the bucket starts full.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 16 {
+            return None;
+        }
+        let tokens = f64::from_le_bytes(bytes[0..8].try_into().ok()?);
+        let last = i64::from_le_bytes(bytes[8..16].try_into().ok()?);
+        if !tokens.is_finite() || tokens < 0.0 {
+            return None;
+        }
+        Some(Self {
+            tokens,
+            last_epoch_micros: last,
+        })
+    }
+
+    /// Refill up to `limit`'s burst based on the wall-clock elapsed since `last`.
+    fn refill(&mut self, limit: Limit, now_epoch_micros: i64) {
+        let elapsed = std::time::Duration::from_micros(
+            u64::try_from(now_epoch_micros - self.last_epoch_micros).unwrap_or(0),
+        )
+        .as_secs_f64();
+        self.tokens = (self.tokens + elapsed * limit.refill_per_sec()).min(limit.burst());
+        self.last_epoch_micros = now_epoch_micros;
+    }
+}
+
+/// What a shared bucket read answered.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SharedRead {
+    /// The stored state.
+    Some(BucketState),
+    /// No entry: the bucket has never been charged on any node.
+    None,
+    /// The store could not answer. The caller falls back to its local bucket.
+    Unavailable,
+}
+
+/// What a shared bucket write answered.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SharedWrite {
+    /// The write landed.
+    Ok,
+    /// The store could not be written. The caller keeps its local fallback state.
+    Unavailable,
+}
+
+/// The seam the SHARED (L2) bucket tier is attached through (issue #150 criterion 5).
+///
+/// A trait rather than a concrete store for the same reason the engine's other seams are:
+/// the store can be the real cache in production and a fake in tests, and the fallback
+/// semantics live HERE where every implementor inherits them. [`SharedRead::Unavailable`]
+/// and [`SharedWrite::Unavailable`] are the documented fail-open class of the rate
+/// counter: an unavailable L2 costs cross-node accuracy, never an admission or a refusal.
+pub trait SharedRateStore: Send + Sync {
+    /// Read the bucket for `key`.
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = SharedRead> + Send + 'a>>;
+    /// Write the bucket for `key`.
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        state: &'a BucketState,
+    ) -> std::pin::Pin<Box<dyn Future<Output = SharedWrite> + Send + 'a>>;
 }
 
 impl LayerBucket {
@@ -440,12 +553,25 @@ impl LayerBucket {
 ///
 /// Every method takes `&self` and serializes through one mutex, so a check-and-charge is
 /// atomic and a burst arriving on many threads cannot oversell a bucket.
+///
+/// # Two tiers of bucket state (issue #150 criterion 5)
+///
+/// The local buckets are the L1 tier: always present, always works, and the whole story
+/// for Postgres-only mode. A [`SharedRateStore`] can be attached as the L2 tier for
+/// cross-node accuracy: every admit then reads and writes the bucket THROUGH the shared
+/// store, so two nodes charging the same key share one budget. The local bucket is the
+/// fallback when the shared store cannot answer, which is the documented fail-open class
+/// of the rate counter (see `ironauth_hot`'s `RATE_COUNTER`): a cache outage costs
+/// cross-node accuracy, never an admission or a refusal.
 pub struct LayeredLimiter {
     limits: LayeredLimits,
     clock: std::sync::Arc<dyn Clock>,
     state: std::sync::Mutex<HashMap<(RateLayer, LayerKey), LayerBucket>>,
     max_buckets: usize,
     missing_ip: MissingIpPolicy,
+    /// The shared (L2) bucket store, when attached. `None` keeps the L1-only behavior
+    /// byte-for-byte.
+    shared: Option<std::sync::Arc<dyn SharedRateStore>>,
 }
 
 /// How many buckets a limiter retains before it reclaims.
@@ -454,6 +580,13 @@ pub struct LayeredLimiter {
 /// the map grows with exactly the traffic a limiter exists to survive: a review measured
 /// 5000 retained buckets after 5000 distinct addresses, with nothing reclaiming them.
 pub const DEFAULT_MAX_BUCKETS: usize = 100_000;
+
+/// Where a layer's bucket state came from during a shared-tier admit (issue #150
+/// criterion 5): the shared store, or the local fallback when it cannot answer.
+enum Source {
+    Shared,
+    Local,
+}
 
 impl LayeredLimiter {
     /// Build a limiter with `limits`, reading time through `clock`.
@@ -465,7 +598,18 @@ impl LayeredLimiter {
             state: std::sync::Mutex::new(HashMap::new()),
             max_buckets: DEFAULT_MAX_BUCKETS,
             missing_ip: MissingIpPolicy::default(),
+            shared: None,
         }
+    }
+
+    /// Attach the SHARED (L2) bucket store (issue #150 criterion 5). With one attached,
+    /// every admit reads and writes the buckets through it, so two nodes charging the
+    /// same key share one budget; when it cannot answer, the local bucket enforces and
+    /// the outcome reports the fallback.
+    #[must_use]
+    pub fn with_shared_store(mut self, store: std::sync::Arc<dyn SharedRateStore>) -> Self {
+        self.shared = Some(store);
+        self
     }
 
     /// Choose what a configured per-IP limit does when a request presents no address.
@@ -564,8 +708,20 @@ impl LayeredLimiter {
     ///
     /// Panics only if the internal lock is poisoned, which happens after a panic while it
     /// was held.
-    #[must_use]
-    pub fn admit(&self, identity: &RequestIdentity, cost: f64) -> LayeredOutcome {
+    ///
+    /// With a shared (L2) store attached (issue #150 criterion 5) the buckets are read
+    /// and written through it, so two nodes charging the same key share one budget; a
+    /// store that cannot answer falls back to the local bucket and the outcome reports
+    /// it. With none attached this is the L1-only path, byte-for-byte unchanged.
+    pub async fn admit(&self, identity: &RequestIdentity, cost: f64) -> LayeredOutcome {
+        match &self.shared {
+            None => self.admit_local(identity, cost),
+            Some(store) => self.admit_shared(store.as_ref(), identity, cost).await,
+        }
+    }
+
+    /// The L1-only path: one locked check-and-charge over the local buckets.
+    fn admit_local(&self, identity: &RequestIdentity, cost: f64) -> LayeredOutcome {
         let cost = cost.max(0.0);
         let now = self.clock.monotonic();
         let mut state = self.state.lock().expect("layered limiter lock poisoned");
@@ -660,6 +816,7 @@ impl LayeredLimiter {
                 snapshot,
                 unenforced,
                 missing_identity: false,
+                shared_fell_back: false,
             };
         }
 
@@ -690,6 +847,7 @@ impl LayeredLimiter {
                 snapshot: snapshot_for(limit, after + cost, after, cost, true),
                 unenforced,
                 missing_identity: false,
+                shared_fell_back: false,
             },
             // No layer applied at all: unlimited by configuration.
             None => LayeredOutcome {
@@ -705,9 +863,188 @@ impl LayeredLimiter {
                 },
                 unenforced,
                 missing_identity: false,
+                shared_fell_back: false,
             },
         }
     }
+
+    /// The shared (L2) path: buckets resolve through `store`, with the local bucket as the
+    /// fallback when the store cannot answer (issue #150 criterion 5).
+    ///
+    /// THE LOCAL LOCK IS NOT HELD ACROSS AN AWAIT. The L1 fallback buckets and the shared
+    /// buckets are touched in two phases — resolve (read) first, then charge — and the
+    /// read-modify-write of a shared bucket is the store's own atomicity boundary. Two nodes
+    /// racing the same key can each read the same state and one spend is lost: the overshoot
+    /// is bounded by the store's stall bounds, and it is the documented cost of the
+    /// fail-open class, never an admission or a refusal invented by the cache.
+    #[allow(clippy::too_many_lines)] // The mirror of `admit_local`; splitting it would obscure
+    // the resolve-then-charge ordering the shared tier depends on.
+    async fn admit_shared(
+        &self,
+        store: &dyn SharedRateStore,
+        identity: &RequestIdentity,
+        cost: f64,
+    ) -> LayeredOutcome {
+        let cost = cost.max(0.0);
+        let now = self.clock.monotonic();
+        let now_epoch_micros = epoch_micros(self.clock.now_utc());
+        let mut fell_back = false;
+
+        let mut evaluated: Vec<(RateLayer, LayerKey, Limit, f64, Source)> = Vec::new();
+        let mut unenforced: Vec<RateLayer> = Vec::new();
+        let mut refuse_for_missing_ip = false;
+        for layer in LAYER_ORDER {
+            let Some(limit) = self.limits.get(layer) else {
+                continue;
+            };
+            let Some(key) = identity.key_for(layer) else {
+                unenforced.push(layer);
+                if layer == RateLayer::PerIp && self.missing_ip == MissingIpPolicy::Deny {
+                    refuse_for_missing_ip = true;
+                }
+                continue;
+            };
+            if refuse_for_missing_ip {
+                continue;
+            }
+            match store.get(&shared_key(layer, &key)).await {
+                SharedRead::Some(mut bucket) => {
+                    bucket.refill(limit, now_epoch_micros);
+                    evaluated.push((layer, key, limit, bucket.tokens, Source::Shared));
+                }
+                // Never charged on any node: start full. The bucket is created on the charge
+                // below, exactly as a first local spend creates its bucket full.
+                SharedRead::None => {
+                    evaluated.push((layer, key, limit, limit.burst(), Source::Shared));
+                }
+                // THE DOCUMENTED FAIL-OPEN CLASS: the store cannot answer, so the LOCAL bucket
+                // enforces this layer for this spend and the outcome reports the fallback.
+                SharedRead::Unavailable => {
+                    fell_back = true;
+                    let mut state = self.state.lock().expect("layered limiter lock poisoned");
+                    let bucket = state
+                        .entry((layer, key.clone()))
+                        .or_insert_with(|| LayerBucket::full(limit, now));
+                    bucket.refill(limit, now);
+                    evaluated.push((layer, key, limit, bucket.tokens, Source::Local));
+                }
+            }
+        }
+
+        if refuse_for_missing_ip {
+            return LayeredOutcome::refused_for_missing_ip(unenforced);
+        }
+
+        let denier = evaluated
+            .iter()
+            .find(|(_, _, _, tokens, _)| *tokens < cost)
+            .map(|(layer, _, limit, tokens, _)| (*layer, *limit, *tokens));
+
+        if let Some((layer, limit, tokens)) = denier {
+            let mut snapshot = snapshot_for(limit, tokens, tokens, cost, false);
+            let longest = evaluated
+                .iter()
+                .filter(|(_, _, _, other_tokens, _)| *other_tokens < cost)
+                .filter_map(|(_, _, other_limit, other_tokens, _)| {
+                    snapshot_for(*other_limit, *other_tokens, *other_tokens, cost, false)
+                        .retry_after_secs
+                })
+                .max();
+            snapshot.retry_after_secs = longest;
+            return LayeredOutcome {
+                decision: Decision::Denied,
+                limiting_layer: Some(layer),
+                snapshot,
+                unenforced,
+                missing_identity: false,
+                shared_fell_back: fell_back,
+            };
+        }
+
+        // Every applicable layer has capacity, so charge them all. A shared layer writes its
+        // new state back; a fallback layer decrements in place.
+        for (layer, key, _limit, tokens, source) in &evaluated {
+            match source {
+                Source::Local => {
+                    let mut state = self.state.lock().expect("layered limiter lock poisoned");
+                    if let Some(bucket) = state.get_mut(&(*layer, key.clone())) {
+                        bucket.tokens -= cost;
+                    }
+                }
+                Source::Shared => {
+                    let bucket = BucketState {
+                        tokens: *tokens - cost,
+                        last_epoch_micros: now_epoch_micros,
+                    };
+                    if store.put(&shared_key(*layer, key), &bucket).await
+                        == SharedWrite::Unavailable
+                    {
+                        // The write failed; the read already accounted the bucket. The next
+                        // spend re-reads the store, and the local fallback below re-enforces.
+                        fell_back = true;
+                    }
+                }
+            }
+        }
+
+        let binding = evaluated
+            .iter()
+            .map(|(layer, _, limit, tokens, _)| (*layer, *limit, *tokens - cost))
+            .min_by(|a, b| {
+                let left = a.2 / a.1.burst().max(f64::MIN_POSITIVE);
+                let right = b.2 / b.1.burst().max(f64::MIN_POSITIVE);
+                left.partial_cmp(&right)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+        match binding {
+            Some((_, limit, after)) => LayeredOutcome {
+                decision: Decision::Admitted,
+                limiting_layer: None,
+                snapshot: snapshot_for(limit, after + cost, after, cost, true),
+                unenforced,
+                missing_identity: false,
+                shared_fell_back: fell_back,
+            },
+            None => LayeredOutcome {
+                decision: Decision::Admitted,
+                limiting_layer: None,
+                snapshot: RateLimitSnapshot {
+                    limit: None,
+                    remaining: None,
+                    reset_secs: 0,
+                    retry_after_secs: None,
+                    denied: false,
+                    policy_window_secs: None,
+                },
+                unenforced,
+                missing_identity: false,
+                shared_fell_back: fell_back,
+            },
+        }
+    }
+}
+
+/// The shared-store key for one layer's bucket: the layer and its key, in a shape the
+/// store does not need to understand.
+fn shared_key(layer: RateLayer, key: &LayerKey) -> String {
+    match key {
+        LayerKey::Single(value) => format!("{}:{value}", layer.as_str()),
+        LayerKey::Scoped {
+            tenant,
+            environment,
+        } => format!("{}:{tenant}:{environment}", layer.as_str()),
+    }
+}
+
+/// The wall-clock instant in epoch microseconds, for the shared bucket's refill basis.
+fn epoch_micros(now: std::time::SystemTime) -> i64 {
+    i64::try_from(
+        now.duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is at or after the epoch")
+            .as_micros(),
+    )
+    .expect("an epoch microsecond instant fits in i64")
 }
 
 /// Build the header snapshot for one bucket.
@@ -803,6 +1140,38 @@ mod tests {
         }
     }
 
+    /// The test-only synchronous wrapper: `admit` is async (the shared tier awaits its
+    /// store), and a test wants the outcome, not a future. The crate is deliberately
+    /// tokio-free, and every future these tests drive resolves immediately (the shared
+    /// store is a fake), so a minimal poll loop is all the executor these need.
+    fn admit(limiter: &LayeredLimiter, identity: &RequestIdentity, cost: f64) -> LayeredOutcome {
+        block_on(limiter.admit(identity, cost))
+    }
+
+    /// Drive an immediately-resolving future. See [`admit`]; a future that yields
+    /// `Pending` is a test bug (a fake store must answer at once) and is refused.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        fn noop_raw() -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(|_| noop_raw(), |_| (), |_| (), |_| ());
+
+        // The raw waker is never dereferenced (its data pointer is null and every vtable
+        // method is a no-op), so the `unsafe` contract of `from_raw` holds trivially.
+        #[allow(unsafe_code)]
+        let waker = unsafe { Waker::from_raw(noop_raw()) };
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(outcome) => outcome,
+            Poll::Pending => {
+                panic!("a test future yielded Pending: the fake store must answer at once")
+            }
+        }
+    }
+
     /// CRITERION 1, in its own words: "each layer blocking while the other four admit".
     ///
     /// Driven off `RateLayer::all()` rather than five hand-written cases, so a sixth layer
@@ -815,7 +1184,7 @@ mod tests {
             let (limiter, _clock) =
                 limiter(LayeredLimits::unlimited().with(layer, Limit::new(0.0, 1.0)));
 
-            let first = limiter.admit(&everyone(), 1.0);
+            let first = admit(&limiter, &everyone(), 1.0);
             assert_eq!(
                 first.decision,
                 Decision::Admitted,
@@ -824,7 +1193,7 @@ mod tests {
             );
             assert_eq!(first.limiting_layer, None);
 
-            let second = limiter.admit(&everyone(), 1.0);
+            let second = admit(&limiter, &everyone(), 1.0);
             assert_eq!(
                 second.decision,
                 Decision::Denied,
@@ -853,8 +1222,11 @@ mod tests {
                 .with(RateLayer::PerEnvironment, Limit::new(0.0, 1.0)),
         );
 
-        assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
-        let denied = limiter.admit(&everyone(), 1.0);
+        assert_eq!(
+            admit(&limiter, &everyone(), 1.0).decision,
+            Decision::Admitted
+        );
+        let denied = admit(&limiter, &everyone(), 1.0);
         assert_eq!(denied.decision, Decision::Denied);
         assert_eq!(denied.limiting_layer, Some(RateLayer::PerEnvironment));
     }
@@ -882,10 +1254,13 @@ mod tests {
 
         // Spend the environment's single token, then drive denials through it. Each denial
         // evaluates the per-IP layer FIRST and must leave it unbilled.
-        assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+        assert_eq!(
+            admit(&limiter, &everyone(), 1.0).decision,
+            Decision::Admitted
+        );
         for attempt in 0..5 {
             assert_eq!(
-                limiter.admit(&everyone(), 1.0).decision,
+                admit(&limiter, &everyone(), 1.0).decision,
                 Decision::Denied,
                 "attempt {attempt} is refused by the environment layer"
             );
@@ -900,13 +1275,13 @@ mod tests {
         };
         for spend in 0..9 {
             assert_eq!(
-                limiter.admit(&ip_only, 1.0).decision,
+                admit(&limiter, &ip_only, 1.0).decision,
                 Decision::Admitted,
                 "per-IP spend {spend} must be available: denials charge nothing"
             );
         }
         assert_eq!(
-            limiter.admit(&ip_only, 1.0).decision,
+            admit(&limiter, &ip_only, 1.0).decision,
             Decision::Denied,
             "and the budget really was ten, so the nine above were not free"
         );
@@ -928,7 +1303,7 @@ mod tests {
 
         for spend in 0..50 {
             assert_eq!(
-                limiter.admit(&anonymous, 1.0).decision,
+                admit(&limiter, &anonymous, 1.0).decision,
                 Decision::Admitted,
                 "spend {spend}: an unauthenticated request must not draw on a per-user bucket"
             );
@@ -955,10 +1330,10 @@ mod tests {
             ..RequestIdentity::default()
         };
 
-        assert_eq!(limiter.admit(&first, 1.0).decision, Decision::Admitted);
-        assert_eq!(limiter.admit(&first, 1.0).decision, Decision::Denied);
+        assert_eq!(admit(&limiter, &first, 1.0).decision, Decision::Admitted);
+        assert_eq!(admit(&limiter, &first, 1.0).decision, Decision::Denied);
         assert_eq!(
-            limiter.admit(&second, 1.0).decision,
+            admit(&limiter, &second, 1.0).decision,
             Decision::Admitted,
             "a different tenant's environment named prod is a different bucket"
         );
@@ -976,8 +1351,11 @@ mod tests {
                 .with(RateLayer::PerIp, Limit::new(0.0, 1.0))
                 .with(RateLayer::PerTenant, Limit::new(0.0, 1.0)),
         );
-        assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
-        let denied = limiter.admit(&everyone(), 1.0);
+        assert_eq!(
+            admit(&limiter, &everyone(), 1.0).decision,
+            Decision::Admitted
+        );
+        let denied = admit(&limiter, &everyone(), 1.0);
         assert_eq!(denied.decision, Decision::Denied);
         assert_eq!(
             denied.limiting_layer,
@@ -991,9 +1369,12 @@ mod tests {
     fn a_denial_reports_a_retry_after_that_the_refill_honours() {
         let (limiter, clock) =
             limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(1.0, 1.0)));
-        assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+        assert_eq!(
+            admit(&limiter, &everyone(), 1.0).decision,
+            Decision::Admitted
+        );
 
-        let denied = limiter.admit(&everyone(), 1.0);
+        let denied = admit(&limiter, &everyone(), 1.0);
         assert_eq!(denied.decision, Decision::Denied);
         let wait = denied
             .snapshot
@@ -1003,7 +1384,7 @@ mod tests {
 
         clock.advance(Duration::from_secs(wait));
         assert_eq!(
-            limiter.admit(&everyone(), 1.0).decision,
+            admit(&limiter, &everyone(), 1.0).decision,
             Decision::Admitted,
             "waiting the advertised time must actually be enough"
         );
@@ -1022,9 +1403,12 @@ mod tests {
     fn a_sub_second_deficit_still_reports_a_whole_second() {
         let (limiter, _clock) =
             limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(2.0, 1.0)));
-        assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+        assert_eq!(
+            admit(&limiter, &everyone(), 1.0).decision,
+            Decision::Admitted
+        );
 
-        let denied = limiter.admit(&everyone(), 1.0);
+        let denied = admit(&limiter, &everyone(), 1.0);
         assert_eq!(denied.decision, Decision::Denied);
         assert_eq!(
             denied.snapshot.retry_after_secs,
@@ -1100,7 +1484,7 @@ mod tests {
     fn the_shipped_default_limits_nothing() {
         let (limiter, _clock) = limiter(LayeredLimits::unlimited());
         for _ in 0..100 {
-            let outcome = limiter.admit(&everyone(), 1.0);
+            let outcome = admit(&limiter, &everyone(), 1.0);
             assert_eq!(outcome.decision, Decision::Admitted);
             assert_eq!(outcome.limiting_layer, None);
             assert_eq!(outcome.snapshot.limit, None);
@@ -1135,13 +1519,13 @@ mod tests {
         let (limiter, _clock) = limiter(
             LayeredLimits::unlimited().with(RateLayer::PerEnvironment, Limit::new(0.0, 1.0)),
         );
-        assert_eq!(limiter.admit(&sneaky, 1.0).decision, Decision::Admitted);
+        assert_eq!(admit(&limiter, &sneaky, 1.0).decision, Decision::Admitted);
         assert_eq!(
-            limiter.admit(&victim, 1.0).decision,
+            admit(&limiter, &victim, 1.0).decision,
             Decision::Admitted,
             "the second tenant has its own budget"
         );
-        assert_eq!(limiter.admit(&sneaky, 1.0).decision, Decision::Denied);
+        assert_eq!(admit(&limiter, &sneaky, 1.0).decision, Decision::Denied);
     }
 
     /// The tenant half of the environment key still carries: same environment name under
@@ -1165,8 +1549,8 @@ mod tests {
         let (limiter, _clock) = limiter(
             LayeredLimits::unlimited().with(RateLayer::PerEnvironment, Limit::new(0.0, 1.0)),
         );
-        assert_eq!(limiter.admit(&one, 1.0).decision, Decision::Admitted);
-        assert_eq!(limiter.admit(&two, 1.0).decision, Decision::Admitted);
+        assert_eq!(admit(&limiter, &one, 1.0).decision, Decision::Admitted);
+        assert_eq!(admit(&limiter, &two, 1.0).decision, Decision::Admitted);
     }
 
     /// THE ADMISSION SNAPSHOT NAMES THE TIGHTEST BUCKET, measured as a fraction of each
@@ -1197,17 +1581,20 @@ mod tests {
         // absolute tokens -- literally the failure the comment in `admit` warns about --
         // survived it.
         for _ in 0..5 {
-            assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+            assert_eq!(
+                admit(&limiter, &everyone(), 1.0).decision,
+                Decision::Admitted
+            );
         }
         let ip_only = RequestIdentity {
             ip: everyone().ip,
             ..RequestIdentity::default()
         };
         for _ in 0..75 {
-            assert_eq!(limiter.admit(&ip_only, 1.0).decision, Decision::Admitted);
+            assert_eq!(admit(&limiter, &ip_only, 1.0).decision, Decision::Admitted);
         }
 
-        let outcome = limiter.admit(&everyone(), 0.0);
+        let outcome = admit(&limiter, &everyone(), 0.0);
         assert_eq!(outcome.decision, Decision::Admitted);
         assert_eq!(
             outcome.snapshot.limit,
@@ -1227,9 +1614,12 @@ mod tests {
             limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.5, 10.0)));
 
         for _ in 0..10 {
-            assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+            assert_eq!(
+                admit(&limiter, &everyone(), 1.0).decision,
+                Decision::Admitted
+            );
         }
-        let denied = limiter.admit(&everyone(), 1.0);
+        let denied = admit(&limiter, &everyone(), 1.0);
         assert_eq!(denied.decision, Decision::Denied);
         assert_eq!(
             denied.snapshot.reset_secs, 20,
@@ -1244,14 +1634,14 @@ mod tests {
         // Wait exactly the advertised retry-after and the request lands.
         clock.advance(Duration::from_secs(2));
         assert_eq!(
-            limiter.admit(&everyone(), 1.0).decision,
+            admit(&limiter, &everyone(), 1.0).decision,
             Decision::Admitted,
             "the advertised retry-after must actually be long enough"
         );
 
         // `remaining` FLOORS: a partial token is not a request anyone can spend.
         clock.advance(Duration::from_secs(3));
-        let partial = limiter.admit(&everyone(), 0.0);
+        let partial = admit(&limiter, &everyone(), 0.0);
         assert_eq!(
             partial.snapshot.remaining,
             Some(1),
@@ -1270,9 +1660,12 @@ mod tests {
         let (limiter, _clock) =
             limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(3.0, 10.0)));
         for _ in 0..10 {
-            assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+            assert_eq!(
+                admit(&limiter, &everyone(), 1.0).decision,
+                Decision::Admitted
+            );
         }
-        let denied = limiter.admit(&everyone(), 1.0);
+        let denied = admit(&limiter, &everyone(), 1.0);
         assert_eq!(denied.decision, Decision::Denied);
         assert_eq!(
             denied.snapshot.reset_secs, 4,
@@ -1294,8 +1687,11 @@ mod tests {
                     .with(narrow, Limit::new(0.0, 1.0))
                     .with(wide, Limit::new(0.0, 1.0)),
             );
-            assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
-            let denied = limiter.admit(&everyone(), 1.0);
+            assert_eq!(
+                admit(&limiter, &everyone(), 1.0).decision,
+                Decision::Admitted
+            );
+            let denied = admit(&limiter, &everyone(), 1.0);
             assert_eq!(
                 denied.limiting_layer,
                 Some(narrow),
@@ -1324,10 +1720,10 @@ mod tests {
             tenant: Some("tnt_1".to_owned()),
             ..RequestIdentity::default()
         };
-        assert_eq!(limiter.admit(&victim, 1.0).decision, Decision::Admitted);
-        assert_eq!(limiter.admit(&victim, 1.0).decision, Decision::Admitted);
+        assert_eq!(admit(&limiter, &victim, 1.0).decision, Decision::Admitted);
+        assert_eq!(admit(&limiter, &victim, 1.0).decision, Decision::Admitted);
         assert_eq!(
-            limiter.admit(&victim, 1.0).decision,
+            admit(&limiter, &victim, 1.0).decision,
             Decision::Denied,
             "the victim address is exhausted before the flood starts"
         );
@@ -1339,7 +1735,7 @@ mod tests {
                 tenant: Some("tnt_1".to_owned()),
                 ..RequestIdentity::default()
             };
-            let _ = limiter.admit(&flood, 1.0);
+            let _ = admit(&limiter, &flood, 1.0);
         }
 
         let retained = limiter.bucket_count();
@@ -1348,7 +1744,7 @@ mod tests {
             "state must stay at or under the ceiling, retained {retained}"
         );
         assert_eq!(
-            limiter.admit(&victim, 1.0).decision,
+            admit(&limiter, &victim, 1.0).decision,
             Decision::Denied,
             "a flood must not wash out a bucket that still owes: that would be the DoS"
         );
@@ -1381,8 +1777,8 @@ mod tests {
             client: Some("cli_sticky".to_owned()),
             ..RequestIdentity::default()
         };
-        assert_eq!(limiter.admit(&client, 1.0).decision, Decision::Admitted);
-        assert_eq!(limiter.admit(&client, 1.0).decision, Decision::Denied);
+        assert_eq!(admit(&limiter, &client, 1.0).decision, Decision::Admitted);
+        assert_eq!(admit(&limiter, &client, 1.0).decision, Decision::Denied);
 
         // Flood with addresses, then let every per-IP bucket refill to full.
         for n in 0..200_u32 {
@@ -1390,12 +1786,13 @@ mod tests {
                 ip: Some(format!("203.0.113.{}.{}", n / 256, n % 256)),
                 ..RequestIdentity::default()
             };
-            let _ = limiter.admit(&flood, 1.0);
+            let _ = admit(&limiter, &flood, 1.0);
         }
         clock.advance(Duration::from_secs(60));
 
         // One more request runs reclamation with everything refilled.
-        let _ = limiter.admit(
+        let _ = admit(
+            &limiter,
             &RequestIdentity {
                 ip: Some("203.0.113.250".to_owned()),
                 ..RequestIdentity::default()
@@ -1404,7 +1801,7 @@ mod tests {
         );
 
         assert_eq!(
-            limiter.admit(&client, 1.0).decision,
+            admit(&limiter, &client, 1.0).decision,
             Decision::Denied,
             "the only bucket carrying a deficit must survive a sweep of full ones"
         );
@@ -1443,10 +1840,13 @@ mod tests {
         let (limiter, _clock) =
             limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.5, 4.0)));
         for _ in 0..4 {
-            assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+            assert_eq!(
+                admit(&limiter, &everyone(), 1.0).decision,
+                Decision::Admitted
+            );
         }
 
-        let denied = limiter.admit(&everyone(), 1.0);
+        let denied = admit(&limiter, &everyone(), 1.0);
         assert_eq!(denied.decision, Decision::Denied);
         assert!(
             denied.is_throttled(),
@@ -1480,9 +1880,12 @@ mod tests {
         for layer in RateLayer::all() {
             let (limiter, _clock) =
                 limiter(LayeredLimits::unlimited().with(layer, Limit::new(0.0, 1.0)));
-            assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+            assert_eq!(
+                admit(&limiter, &everyone(), 1.0).decision,
+                Decision::Admitted
+            );
 
-            let denied = limiter.admit(&everyone(), 1.0);
+            let denied = admit(&limiter, &everyone(), 1.0);
             assert_eq!(denied.limiting_layer, Some(layer));
 
             let headers = denied.headers();
@@ -1508,7 +1911,7 @@ mod tests {
     fn an_admission_does_not_name_a_limiting_layer() {
         let (limiter, _clock) =
             limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.0, 10.0)));
-        let admitted = limiter.admit(&everyone(), 1.0);
+        let admitted = admit(&limiter, &everyone(), 1.0);
         assert_eq!(admitted.decision, Decision::Admitted);
         assert!(!admitted.is_throttled());
 
@@ -1532,7 +1935,7 @@ mod tests {
     #[test]
     fn an_unlimited_request_advertises_no_budget() {
         let (limiter, _clock) = limiter(LayeredLimits::unlimited());
-        let admitted = limiter.admit(&everyone(), 1.0);
+        let admitted = admit(&limiter, &everyone(), 1.0);
         assert_eq!(admitted.decision, Decision::Admitted);
         assert!(
             admitted.headers().is_empty(),
@@ -1548,9 +1951,12 @@ mod tests {
     fn a_limit_that_never_refills_sends_no_retry_after() {
         let (limiter, _clock) =
             limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.0, 1.0)));
-        assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+        assert_eq!(
+            admit(&limiter, &everyone(), 1.0).decision,
+            Decision::Admitted
+        );
 
-        let denied = limiter.admit(&everyone(), 1.0);
+        let denied = admit(&limiter, &everyone(), 1.0);
         let headers = denied.headers();
         assert_eq!(header(&headers, "retry-after"), None);
         assert_eq!(
@@ -1571,7 +1977,7 @@ mod tests {
         let (limiter, _clock) =
             limiter(LayeredLimits::unlimited().with(RateLayer::PerUser, Limit::new(3.0, 7.0)));
         for spend in 0..8 {
-            let outcome = limiter.admit(&everyone(), 1.0);
+            let outcome = admit(&limiter, &everyone(), 1.0);
             let headers = outcome.headers();
             let structured = header(&headers, "ratelimit").expect("structured header");
             let limit = header(&headers, "x-ratelimit-limit").expect("legacy limit");
@@ -1601,9 +2007,12 @@ mod tests {
                 .with(RateLayer::PerIp, Limit::new(1.0, 1.0))
                 .with(RateLayer::PerTenant, Limit::new(0.01, 1.0)),
         );
-        assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+        assert_eq!(
+            admit(&limiter, &everyone(), 1.0).decision,
+            Decision::Admitted
+        );
 
-        let denied = limiter.admit(&everyone(), 1.0);
+        let denied = admit(&limiter, &everyone(), 1.0);
         assert_eq!(denied.decision, Decision::Denied);
         assert_eq!(
             denied.limiting_layer,
@@ -1619,7 +2028,7 @@ mod tests {
         // And obeying it works, which is the whole promise.
         clock.advance(Duration::from_secs(100));
         assert_eq!(
-            limiter.admit(&everyone(), 1.0).decision,
+            admit(&limiter, &everyone(), 1.0).decision,
             Decision::Admitted,
             "a client that waits the advertised time must be admitted"
         );
@@ -1636,7 +2045,7 @@ mod tests {
             let (limiter, clock) = limiter(
                 LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(refill, burst)),
             );
-            let denied = limiter.admit(&everyone(), cost);
+            let denied = admit(&limiter, &everyone(), cost);
             assert_eq!(
                 denied.decision,
                 Decision::Denied,
@@ -1649,7 +2058,10 @@ mod tests {
 
             // Proof it really is unsatisfiable: a long wait does not help.
             clock.advance(Duration::from_secs(100_000));
-            assert_eq!(limiter.admit(&everyone(), cost).decision, Decision::Denied);
+            assert_eq!(
+                admit(&limiter, &everyone(), cost).decision,
+                Decision::Denied
+            );
         }
     }
 
@@ -1663,7 +2075,7 @@ mod tests {
     fn a_refusal_never_reports_a_budget_the_caller_cannot_spend() {
         let (limiter, _clock) =
             limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.5, 4.0)));
-        let denied = limiter.admit(&everyone(), 5.0);
+        let denied = admit(&limiter, &everyone(), 5.0);
         assert_eq!(denied.decision, Decision::Denied);
         assert_eq!(
             denied.snapshot.remaining,
@@ -1685,7 +2097,7 @@ mod tests {
 
         let mut windows = Vec::new();
         for _ in 0..5 {
-            let outcome = limiter.admit(&everyone(), 1.0);
+            let outcome = admit(&limiter, &everyone(), 1.0);
             windows.push(header(&outcome.headers(), "ratelimit-policy").map(str::to_owned));
         }
         assert_eq!(
@@ -1720,9 +2132,12 @@ mod tests {
     fn a_block_that_never_lifts_still_signals_to_the_edge() {
         let (limiter, _clock) =
             limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.0, 1.0)));
-        assert_eq!(limiter.admit(&everyone(), 1.0).decision, Decision::Admitted);
+        assert_eq!(
+            admit(&limiter, &everyone(), 1.0).decision,
+            Decision::Admitted
+        );
 
-        let denied = limiter.admit(&everyone(), 1.0);
+        let denied = admit(&limiter, &everyone(), 1.0);
         let headers = denied.headers();
         assert_eq!(
             header(&headers, "retry-after"),
@@ -1751,10 +2166,13 @@ mod tests {
         let (limiter, clock) =
             limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.5, 2.0)));
         // Drain, then refill exactly half a token.
-        assert_eq!(limiter.admit(&everyone(), 2.0).decision, Decision::Admitted);
+        assert_eq!(
+            admit(&limiter, &everyone(), 2.0).decision,
+            Decision::Admitted
+        );
         clock.advance(Duration::from_secs(1));
 
-        let denied = limiter.admit(&everyone(), 1.0);
+        let denied = admit(&limiter, &everyone(), 1.0);
         assert_eq!(denied.decision, Decision::Denied);
         assert_eq!(
             denied.snapshot.retry_after_secs,
@@ -1777,7 +2195,7 @@ mod tests {
             ..everyone()
         };
 
-        let outcome = limiter.admit(&anonymous, 1.0);
+        let outcome = admit(&limiter, &anonymous, 1.0);
 
         assert_eq!(
             outcome.decision,
@@ -1857,12 +2275,11 @@ mod tests {
         ];
 
         let (refusing, _c1) = limiter(limits());
-        let refused = refusing.admit(&nobody, 1.0);
+        let refused = admit(&refusing, &nobody, 1.0);
 
         let (skipping, _c2) = limiter(limits());
-        let skipped = skipping
-            .with_missing_ip_policy(MissingIpPolicy::Skip)
-            .admit(&nobody, 1.0);
+        let skipping = skipping.with_missing_ip_policy(MissingIpPolicy::Skip);
+        let skipped = admit(&skipping, &nobody, 1.0);
 
         assert!(refused.missing_identity);
         assert_eq!(skipped.decision, Decision::Admitted);
@@ -1896,7 +2313,7 @@ mod tests {
             ..RequestIdentity::default()
         };
 
-        let outcome = limiter.admit(&no_address, 1.0);
+        let outcome = admit(&limiter, &no_address, 1.0);
 
         assert!(outcome.missing_identity);
         assert_eq!(
@@ -1920,7 +2337,7 @@ mod tests {
             ..everyone()
         };
 
-        let outcome = limiter.admit(&anonymous, 1.0);
+        let outcome = admit(&limiter, &anonymous, 1.0);
 
         assert_eq!(outcome.decision, Decision::Admitted);
         assert!(!outcome.missing_identity);
@@ -1944,13 +2361,12 @@ mod tests {
         };
 
         let (unlimited, _c1) = limiter(LayeredLimits::unlimited());
-        let no_limit_configured = unlimited.admit(&anonymous, 1.0);
+        let no_limit_configured = admit(&unlimited, &anonymous, 1.0);
 
         let (configured, _c2) =
             limiter(LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(1.0, 10.0)));
-        let address_missing = configured
-            .with_missing_ip_policy(MissingIpPolicy::Skip)
-            .admit(&anonymous, 1.0);
+        let configured = configured.with_missing_ip_policy(MissingIpPolicy::Skip);
+        let address_missing = admit(&configured, &anonymous, 1.0);
 
         assert_eq!(no_limit_configured.decision, Decision::Admitted);
         assert_eq!(address_missing.decision, Decision::Admitted);
@@ -1979,7 +2395,7 @@ mod tests {
             ..everyone()
         };
 
-        let outcome = limiter.admit(&unauthenticated, 1.0);
+        let outcome = admit(&limiter, &unauthenticated, 1.0);
 
         assert_eq!(
             outcome.decision,
@@ -2007,7 +2423,8 @@ mod tests {
         );
 
         for _ in 0..5 {
-            let refused = limiter.admit(
+            let refused = admit(
+                &limiter,
                 &RequestIdentity {
                     ip: None,
                     ..everyone()
@@ -2017,11 +2434,146 @@ mod tests {
             assert!(refused.missing_identity);
         }
 
-        let identified = limiter.admit(&everyone(), 2.0);
+        let identified = admit(&limiter, &everyone(), 2.0);
         assert_eq!(
             identified.decision,
             Decision::Admitted,
             "the per-tenant burst of 2 was never spent by the five refusals"
         );
+    }
+
+    /// CRITERION 5: two limiters sharing one store enforce ONE budget across them (the
+    /// cross-node shape: each limiter is a node).
+    #[test]
+    fn two_limiters_share_one_budget_through_the_store() {
+        let store = Arc::new(FakeSharedStore::new());
+        let limits = LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(1.0, 2.0));
+        let (node_a, clock_a) = limiter(limits.clone());
+        let node_a = node_a.with_shared_store(Arc::clone(&store) as Arc<dyn SharedRateStore>);
+        let (node_b, clock_b) = limiter(limits);
+        let node_b = node_b.with_shared_store(Arc::clone(&store) as Arc<dyn SharedRateStore>);
+
+        // Node A spends the shared burst of two.
+        assert!(admit(&node_a, &everyone(), 1.0).decision.is_admitted());
+        assert!(admit(&node_a, &everyone(), 1.0).decision.is_admitted());
+
+        // NODE B's next spend is refused: the budget lived in the store, not in A's
+        // memory. Without the L2 this exact request would have been admitted.
+        let refused = admit(&node_b, &everyone(), 1.0);
+        assert!(
+            !refused.decision.is_admitted(),
+            "the shared budget is exhausted"
+        );
+        assert_eq!(refused.limiting_layer, Some(RateLayer::PerIp));
+        assert!(!refused.shared_fell_back, "the store answered");
+
+        // The refill basis is WALL CLOCK, read through each node's seam: both nodes'
+        // clocks advance together, so the shared bucket's `last` is two seconds in the
+        // past and the same key can spend again.
+        clock_a.advance(Duration::from_secs(2));
+        clock_b.advance(Duration::from_secs(2));
+        assert!(
+            admit(&node_b, &everyone(), 1.0).decision.is_admitted(),
+            "after the window the shared bucket refills"
+        );
+    }
+
+    /// CRITERION 5: a store that cannot answer falls back to the LOCAL bucket (L1-only),
+    /// and the outcome says so — the alerting half of the fail-open class.
+    #[test]
+    fn an_unavailable_store_falls_back_to_the_local_bucket_and_says_so() {
+        let store = Arc::new(FakeSharedStore::new());
+        store
+            .unavailable
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let limits = LayeredLimits::unlimited().with(RateLayer::PerIp, Limit::new(0.0, 1.0));
+        let (limiter, _clock) = limiter(limits);
+        let limiter = limiter.with_shared_store(Arc::clone(&store) as Arc<dyn SharedRateStore>);
+
+        // The store cannot answer, so the LOCAL bucket enforces: the first spend admits,
+        // the second is refused, and every outcome reports the fallback.
+        let first = admit(&limiter, &everyone(), 1.0);
+        assert!(first.decision.is_admitted());
+        assert!(
+            first.shared_fell_back,
+            "the fallback is REPORTED, not silent"
+        );
+
+        let second = admit(&limiter, &everyone(), 1.0);
+        assert!(
+            !second.decision.is_admitted(),
+            "the local bucket still enforces"
+        );
+        assert!(second.shared_fell_back);
+    }
+
+    /// The stored bucket round-trips its encoding, and a foreign or malformed payload is
+    /// a miss (the safe direction: the bucket starts full).
+    #[test]
+    fn the_bucket_state_round_trips_and_foreign_bytes_are_a_miss() {
+        let state = BucketState {
+            tokens: 12.5,
+            last_epoch_micros: 1_700_000_000_000_000,
+        };
+        assert_eq!(BucketState::decode(&state.encode()), Some(state));
+        for foreign in [Vec::new(), vec![0u8; 15], vec![0u8; 17], {
+            // Negative tokens are not a state this build writes (the sign byte
+            // flipped).
+            let mut bytes = state.encode();
+            bytes[7] ^= 0x80;
+            bytes
+        }] {
+            assert_eq!(BucketState::decode(&foreign), None, "{foreign:?}");
+        }
+    }
+
+    /// The fake shared store: an in-memory map, with an outage switch. Its futures
+    /// resolve immediately, which the test block_on requires.
+    struct FakeSharedStore {
+        buckets: std::sync::Mutex<std::collections::HashMap<String, BucketState>>,
+        unavailable: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeSharedStore {
+        fn new() -> Self {
+            Self {
+                buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
+                unavailable: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl SharedRateStore for FakeSharedStore {
+        fn get<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> std::pin::Pin<Box<dyn Future<Output = SharedRead> + Send + 'a>> {
+            Box::pin(async move {
+                if self.unavailable.load(std::sync::atomic::Ordering::Relaxed) {
+                    return SharedRead::Unavailable;
+                }
+                match self.buckets.lock().expect("store lock").get(key) {
+                    Some(state) => SharedRead::Some(*state),
+                    None => SharedRead::None,
+                }
+            })
+        }
+
+        fn put<'a>(
+            &'a self,
+            key: &'a str,
+            state: &'a BucketState,
+        ) -> std::pin::Pin<Box<dyn Future<Output = SharedWrite> + Send + 'a>> {
+            Box::pin(async move {
+                if self.unavailable.load(std::sync::atomic::Ordering::Relaxed) {
+                    return SharedWrite::Unavailable;
+                }
+                self.buckets
+                    .lock()
+                    .expect("store lock")
+                    .insert(key.to_owned(), *state);
+                SharedWrite::Ok
+            })
+        }
     }
 }
