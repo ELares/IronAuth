@@ -437,3 +437,98 @@ fn the_peer_ip_header_is_the_documented_one() {
         "the tests send the header exactly as the middleware stamps it"
     );
 }
+
+/// CRITERION 2, INDUCED UNDER LOAD: one tenant driven to saturation does not reduce
+/// another tenant's admitted throughput AT ALL — the bound is zero interference, not a
+/// margin. Both tenants have the same per-tenant budget; a concurrent storm saturates one
+/// while the other is measured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_noisy_tenant_storm_never_reduces_a_quiet_tenant_s_throughput() {
+    const BUDGET: u64 = 3;
+    const RACERS: usize = 8;
+    const PER_RACER: usize = 30;
+
+    let harness = Harness::start_with_layered_limiter(
+        oidc_config(),
+        RateLimitConfig {
+            per_ip: None,
+            per_tenant: Some(LimitConfig {
+                per_second: 0.0,
+                burst: 3.0,
+            }),
+            per_environment: None,
+            per_client: None,
+            per_user: None,
+        },
+    )
+    .await;
+    let noisy = harness
+        .create_confidential_client_in(
+            harness.scope(),
+            ironauth_oidc::ClientAuthMethod::Basic,
+            "noisy tenant",
+        )
+        .await
+        .0
+        .to_string();
+    let quiet_scope = harness.provision_foreign_scope().await;
+    let quiet = harness
+        .create_confidential_client_in(
+            quiet_scope,
+            ironauth_oidc::ClientAuthMethod::Basic,
+            "quiet tenant",
+        )
+        .await
+        .0
+        .to_string();
+
+    let noisy_admitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let quiet_admitted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut tasks = Vec::with_capacity(RACERS * 2);
+    for (client_id, counter, label) in [
+        (&noisy, &noisy_admitted, "noisy"),
+        (&quiet, &quiet_admitted, "quiet"),
+    ] {
+        for _ in 0..RACERS {
+            let router = harness.router();
+            let client_id = client_id.clone();
+            let counter = std::sync::Arc::clone(counter);
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..PER_RACER {
+                    let request = Request::builder()
+                        .method("GET")
+                        .uri(format!("/authorize?client_id={client_id}"))
+                        .body(Body::empty())
+                        .expect("request builds");
+                    let (status, _, _) = common::send_through(router.clone(), request).await;
+                    match status {
+                        StatusCode::BAD_REQUEST => {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        StatusCode::TOO_MANY_REQUESTS => {}
+                        other => panic!("{label}: unexpected status {other}"),
+                    }
+                }
+            }));
+        }
+    }
+    for task in tasks {
+        task.await.expect("task joins");
+    }
+
+    let noisy_total = noisy_admitted.load(std::sync::atomic::Ordering::SeqCst);
+    let quiet_total = quiet_admitted.load(std::sync::atomic::Ordering::SeqCst);
+    // The noisy tenant hit its budget (exactly: the per-tenant bucket is one atomic
+    // check-and-charge in L1 mode).
+    assert_eq!(
+        noisy_total, BUDGET,
+        "the noisy tenant saturated at its budget"
+    );
+    // THE FAIRNESS BOUND: the quiet tenant's admitted throughput is EXACTLY its own
+    // budget, whatever the storm beside it did. Zero interference, not a margin.
+    assert_eq!(
+        quiet_total, BUDGET,
+        "the quiet tenant's admitted throughput must equal its own budget under the \
+         noisy tenant's storm"
+    );
+}

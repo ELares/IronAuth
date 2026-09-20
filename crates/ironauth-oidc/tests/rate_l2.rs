@@ -204,3 +204,102 @@ fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to bind");
     listener.local_addr().expect("a bound address").port()
 }
+
+/// CRITERION 2, IN THE SHARED TIER: a noisy tenant's storm over the shared store does not
+/// reduce a quiet tenant's admitted throughput. The read-modify-write race a storm
+/// produces is real — the noisy tenant's own budget may overshoot by one spend per
+/// concurrent node — but the quiet tenant's KEY is separate, so its admitted throughput
+/// is exactly its own budget. That is the documented fairness bound with the L2 attached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_noisy_tenant_storm_never_reduces_a_quiet_tenant_s_budget_in_the_shared_tier() {
+    const BUDGET: u64 = 3;
+    const RACERS: usize = 8;
+    const PER_RACER: usize = 30;
+    // THE QUIET TENANT SENDS SEQUENTIALLY: the read-modify-write race is real, and its
+    // overshoot is bounded per key by the number of nodes concurrently charging THAT key.
+    // Measuring the quiet tenant's admitted count under its OWN concurrency would measure
+    // the race, not the fairness. One sequential spender has no race on its key, so its
+    // admitted count must be EXACTLY its budget whatever the noisy storm beside it does.
+    let Some(bin) = ironcache_bin() else {
+        eprintln!(
+            "SKIPPED: no `ironcache` server binary on this host, so the shared-tier \
+             fairness-under-load bound was NOT verified against a real cache."
+        );
+        return;
+    };
+    let port = free_port();
+    let mut cache = CacheGuard::start(&bin, port);
+    wait_for_port(port, Duration::from_secs(30));
+    let connection = ironauth_hot::ironcache::connect(&format!("redis://127.0.0.1:{port}"))
+        .await
+        .expect("the cache connects");
+    let keyspace = ironauth_hot::ironcache::IronCacheKeyspace::new(connection, "rate");
+    let shared: Arc<dyn ironauth_quota::layered::SharedRateStore> = Arc::new(HotSharedRates::new(
+        Arc::new(keyspace) as Arc<dyn ironauth_hot::HotState>,
+    ));
+
+    let mut limits = LayeredLimits::unlimited();
+    limits = limits.with(RateLayer::PerTenant, Limit::new(0.0, 3.0));
+    let clock: Arc<dyn ironauth_env::Clock> =
+        Arc::new(ManualClock::new(std::time::SystemTime::UNIX_EPOCH));
+    let limiter =
+        Arc::new(LayeredLimiter::new(limits, clock).with_shared_store(Arc::clone(&shared)));
+
+    // Two tenants, one per-tenant key each.
+    let noisy = RequestIdentity {
+        ip: None,
+        user: None,
+        client: None,
+        tenant: Some("tnt_noisy".to_owned()),
+        environment: Some("env_1".to_owned()),
+    };
+    let quiet = RequestIdentity {
+        tenant: Some("tnt_quiet".to_owned()),
+        ..noisy.clone()
+    };
+
+    let noisy_admitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let quiet_admitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut tasks = Vec::with_capacity(RACERS + 1);
+    for _ in 0..RACERS {
+        let limiter = Arc::clone(&limiter);
+        let identity = noisy.clone();
+        let counter = Arc::clone(&noisy_admitted);
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..PER_RACER {
+                let outcome = limiter.admit(&identity, 1.0).await;
+                if outcome.decision.is_admitted() {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }));
+    }
+    // The quiet tenant, sequential: its key is never raced by its own senders.
+    for _ in 0..(RACERS * PER_RACER) {
+        let outcome = limiter.admit(&quiet, 1.0).await;
+        if outcome.decision.is_admitted() {
+            quiet_admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    for task in tasks {
+        task.await.expect("task joins");
+    }
+
+    // THE DOCUMENTED BOUNDS. The noisy tenant may overshoot its burst by the racer count
+    // (the read-modify-write race, one lost spend per concurrent node — that is the cost
+    // of the fail-open class, and it is bounded, never an invented refusal).
+    let noisy_total = noisy_admitted.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        noisy_total >= BUDGET,
+        "the noisy tenant saturated: {noisy_total}"
+    );
+    // THE QUIET TENANT: exactly its own budget, whatever the storm beside it did. The
+    // race cannot cross keys, so the fairness bound is zero interference here too.
+    let quiet_total = quiet_admitted.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        quiet_total, BUDGET,
+        "the quiet tenant's admitted throughput equals its own budget in the shared tier"
+    );
+
+    cache.kill();
+}
