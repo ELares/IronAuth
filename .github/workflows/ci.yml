@@ -434,6 +434,13 @@ jobs:
       # single failing job rather than two that have to be compared by hand.
       - name: outbox suites (postgres drain + ironbus backbone)
         run: cargo test -p ironauth-store --features testing,ironbus --test outbox --test outbox_ironbus
+      # Issue #149 criterion 4: the IronBus-down chaos tier, induced for real. The test
+      # starts a REAL broker and a real worker pool attached to it, KILLS the broker, and
+      # asserts a message enqueued with the bus down still drains on the Postgres poll with
+      # no loss, then recovers when the broker returns. It needs the broker BINARIES this
+      # job installs; everywhere else it skips loudly.
+      - name: Chaos: IronBus down, the outbox drains on the poll (issue #149)
+        run: cargo test -p ironauth-store --features testing,ironbus --test outbox_chaos -- --test-threads=1
       # Webhook delivery, DLQ, and replay under the SAME broker (issue #106, criterion 7).
       #
       # The backbone only decides WHEN the drain runs, never what a consumer does, so

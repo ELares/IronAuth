@@ -139,6 +139,11 @@ path = "tests/outbox_ironbus.rs"
 required-features = ["testing", "ironbus"]
 
 [[test]]
+name = "outbox_chaos"
+path = "tests/outbox_chaos.rs"
+required-features = ["testing", "ironbus"]
+
+[[test]]
 name = "hot_state"
 path = "tests/hot_state.rs"
 required-features = ["testing"]
