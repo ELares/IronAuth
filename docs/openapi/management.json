@@ -3740,6 +3740,112 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/backups": {
+      "post": {
+        "tags": [
+          "backups"
+        ],
+        "summary": "Trigger an on-demand encrypted backup.",
+        "description": "The request is audited and the runner is woken; the backup itself is performed by the\nnext available pass and watched through the backup metrics.",
+        "operationId": "triggerBackup",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "The request was recorded and the runner was woken; the backup itself is watched through the backup metrics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupRequestAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The Idempotency-Key header is absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/brands": {
       "get": {
         "tags": [
@@ -31037,6 +31143,25 @@
               "null"
             ],
             "description": "The stored override, or `null` when the environment inherits the deployment\ndefault."
+          }
+        }
+      },
+      "BackupRequestAccepted": {
+        "type": "object",
+        "description": "The accepted response: the request is queued, not performed.",
+        "required": [
+          "recorded",
+          "requested_at_unix_micros"
+        ],
+        "properties": {
+          "recorded": {
+            "type": "boolean",
+            "description": "Whether the request was recorded as an audited admin-action row."
+          },
+          "requested_at_unix_micros": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The unix-micros instant the request was accepted."
           }
         }
       },

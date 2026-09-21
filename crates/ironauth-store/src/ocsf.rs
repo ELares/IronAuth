@@ -398,6 +398,10 @@ const ENTITY_MANAGEMENT_DOMAINS: &[&str] = &[
     "upstream_token_grant",
     "usage",
     "webhook",
+    // Requesting an on-demand backup (issue #153) is an operator act over the platform's
+    // backup posture: filed under entity management so the row lands in the admin-action
+    // retention stream, where compliance looks for it.
+    "backup",
 ];
 
 /// The OCSF class for an action's wire string.
