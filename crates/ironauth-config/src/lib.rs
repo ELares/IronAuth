@@ -1389,9 +1389,12 @@ pub struct HotStateConfig {
     /// serving the JWKS document and written on the miss, in production source on the public
     /// plane.
     ///
-    /// WHAT IS MISSING IS THE BOOT WIRING, which is a narrower gap than "no consumer". Nothing
-    /// outside tests calls `with_jwks_hot_state`, so `jwks_hot` is `None` in every shipped
-    /// binary and the accelerator is never consulted however this key is set.
+    /// WHAT THIS KEY ATTACHES IS THE REQUEST-PATH LIMITER'S SHARED (L2) TIER (issue #150
+    /// criterion 5): the layered limiter's buckets live in the cache when this key is set, so
+    /// two nodes charge ONE budget. That is a real production caller — `IronCacheKeyspace`
+    /// over the `rate` keyspace — and it is the difference between "declares an address" and
+    /// "installs a HotState implementation", which is exactly the gap this paragraph used to
+    /// describe as unfilled.
     ///
     /// #1322 CHANGED ONLY HOW THE BACKEND IS SELECTED, and the first version of this paragraph
     /// claimed much more than that. It said the IronCache backend "could not be BUILT into the
@@ -1427,10 +1430,14 @@ pub struct HotStateConfig {
     /// measures 32 to 33 us, an eighty per cent saving on the same read, and about ninety-three
     /// per cent in front of a resolved tenant config, which is three scoped transactions.
     ///
-    /// "WOULD", BECAUSE SETTING THIS KEY ATTACHES NOTHING TODAY. It declares an address that
-    /// readiness probes and reports a tier for; it installs no `HotState` implementation, so no
-    /// read changes path however it is set. That is the sentence above about the boot wiring,
-    /// restated so the figures here are not read as a description of what this key does.
+    /// THE JWKS USE IS DELIBERATELY NOT ATTACHED. The seam exists and is tested, and the
+    /// measured figures above are why the boot path does not install it: a hit there saves a
+    /// render and adds a validation parse, netting about 0.6 us for a fresh environment's
+    /// three keys, against a 20 us round trip on the same machine — so attaching it would make
+    /// the JWKS endpoint SLOWER, and leaving it unset is the faster configuration. What the
+    /// key DOES attach is the rate-counter keyspace of the request-path limiter, which is the
+    /// one use whose alternative (a scoped read, measured at 166 us) the figures say is worth
+    /// accelerating. The remaining uses stay unwired pending a boot-time seam.
     ///
     /// The figures are in `docs/UNIT-COSTS.md`, measured by a different instrument from the
     /// database rows they are compared against, and they are HITS, so a deployment's benefit is
