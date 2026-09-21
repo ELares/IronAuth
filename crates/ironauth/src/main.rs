@@ -36,7 +36,7 @@ use ironauth_config::{
     FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, IDENTITY_CHAINING_FEATURE, Loaded,
     NATIVE_SSO_FEATURE, ORG_SCOPED_CLIENTS_FEATURE, OidcConfig, OutboxConfig,
     PORTAL_WIDGETS_FEATURE, PasswordPolicyConfig, RISK_SIGNALS_FEATURE, ScreeningFailurePolicy,
-    ScreeningProvider, TRANSACTION_TOKENS_FEATURE, WASM_HOOKS_FEATURE, WebhooksConfig,
+    ScreeningProvider, Secret, TRANSACTION_TOKENS_FEATURE, WASM_HOOKS_FEATURE, WebhooksConfig,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -399,6 +399,9 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         let scim_push_inputs = scim_push_inputs(&config);
         let log_shipper_inputs = log_shipper_inputs(&config, &env);
         let metrics_sampler_inputs_captured = metrics_sampler_inputs(&config, &env);
+        // Captured BEFORE config and env are moved into the workers below: the scheduler
+        // needs the section resolved and the master material read once, at boot.
+        let backup_scheduler_inputs_captured = backup_scheduler_inputs(&config, &env);
         // CAPTURED HERE for the same reason as its neighbours, plus one of its own: the
         // enforcer is captured off `planes` further down, before the OIDC plane moves into the
         // router, so neither half of this refresher can be built at its start site.
@@ -736,6 +739,15 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // overrides to a second engine would run, log, and change nothing anyone consults.
         let quota_refresher = start_quota_refresher(quota_refresh_inputs, quota_enforcer).await;
 
+        // THE SCHEDULED BACKUP RUNNER (issue #153). Its own switch, like every other worker
+        // here, and OFF by default: the failure mode of backups being off is a larger restore
+        // gap, and the failure mode of them being on by accident is an outbound push this
+        // deployment did not intend.
+        let backup_scheduler = match backup_scheduler_inputs_captured {
+            Some(inputs) => start_backup_scheduler(inputs).await,
+            None => None,
+        };
+
         tracing::info!(base_url = %server.base_url(), "starting ironauth");
 
         let outcome = match server.run(ironauth_server::shutdown_signal()).await {
@@ -801,6 +813,12 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // sequence exists to avoid.
         if let Some(sweep) = ldap_sweep {
             sweep.abort();
+        }
+        // AND THE SCHEDULED BACKUP RUNNER. Aborted rather than awaited for the same reason:
+        // a pass has no cleanup to finish, and a backup this tick did not take is still due
+        // on the next boot.
+        if let Some(scheduler) = backup_scheduler {
+            scheduler.abort();
         }
         if let Some(shipper) = log_shipper {
             shipper.shutdown().await;
@@ -9060,14 +9078,6 @@ fn backup_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
-    let Some(pg_dump) = postgres_tool("pg_dump") else {
-        eprintln!(
-            "ironauth backup: cannot find pg_dump. Set PG_BIN to the PostgreSQL bin\n\
-             directory (the one holding initdb), or add it to PATH."
-        );
-        return ExitCode::FAILURE;
-    };
-
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -9079,63 +9089,14 @@ fn backup_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
     };
     runtime.block_on(async {
-        let store = match Store::connect(&url).await {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!("ironauth backup: cannot connect: {error}");
+        let sealed = match sealed_backup_dump(&url, &material).await {
+            Ok(sealed) => sealed,
+            Err(message) => {
+                eprintln!("ironauth backup: {message}");
                 return ExitCode::FAILURE;
             }
         };
-        match store.sees_through_row_level_security().await {
-            Ok(true) => {}
-            Ok(false) => {
-                eprintln!(
-                    "ironauth backup: REFUSING to back up. The connected role is subject to\n\
-                     row-level security, so every tenant-scoped table would dump zero rows with\n\
-                     no error, and the empty backup would verify against its own checksum.\n\
-                     Connect as a SUPERUSER or a role granted BYPASSRLS; the schema owner is not\n\
-                     enough, because these tables are FORCE ROW LEVEL SECURITY."
-                );
-                return ExitCode::FAILURE;
-            }
-            Err(error) => {
-                eprintln!("ironauth backup: cannot check the connected role: {error}");
-                return ExitCode::FAILURE;
-            }
-        }
-
-        let dump = match std::process::Command::new(&pg_dump)
-            .args(["--no-owner", "--no-privileges", "--dbname", &url])
-            .output()
-        {
-            Ok(output) if output.status.success() => output.stdout,
-            Ok(output) => {
-                eprintln!(
-                    "ironauth backup: pg_dump failed:\\n{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                return ExitCode::FAILURE;
-            }
-            Err(error) => {
-                eprintln!("ironauth backup: cannot run pg_dump: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        // A dump with no CREATE TABLE recovers nothing. pg_dump of an empty database is header
-        // comments only; refusing it is the same discipline kek-backup applies to an empty row
-        // set: the backup would verify, restore cleanly, and recover nothing.
-        if !dump
-            .windows(b"CREATE TABLE".len())
-            .any(|w| w == b"CREATE TABLE")
-        {
-            eprintln!(
-                "ironauth backup: the dump contains no CREATE TABLE. REFUSING to write an\n\
-                 empty backup: it would verify against its own checksum and recover nothing."
-            );
-            return ExitCode::FAILURE;
-        }
-
-        let sealed = ironauth_jose::SealedBackup::seal(&dump, &material, BACKUP_CONTEXT);
+        // The dump+seal pipeline now lives in sealed_backup_dump; what follows writes it.
         if let Err(error) = std::fs::write(&out, sealed.as_bytes()) {
             eprintln!("ironauth backup: cannot write {out}: {error}");
             return ExitCode::FAILURE;
@@ -9153,6 +9114,431 @@ fn backup_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
         );
         ExitCode::SUCCESS
     })
+}
+
+/// The metric names the scheduled backup runner owns (issue #153 criterion: "backup
+/// success/age exposed in the metric contract").
+const BACKUP_SUCCESS_TOTAL: &str = "ironauth_backup_success_total";
+const BACKUP_FAILURE_TOTAL: &str = "ironauth_backup_failure_total";
+const BACKUP_LAST_SUCCESS_TIMESTAMP_SECONDS: &str =
+    "ironauth_backup_last_success_timestamp_seconds";
+
+/// Everything the scheduled backup runner needs, resolved once at boot.
+struct BackupSchedulerInputs {
+    /// The BYPASSRLS DSN for `pg_dump` (backup.url).
+    url: String,
+    /// The master-key material the seal derives from (the server's `database.master_key`).
+    material: Vec<u8>,
+    /// The S3-compatible endpoint, bucket, prefix and region for the push.
+    endpoint: String,
+    bucket: String,
+    prefix: String,
+    region: String,
+    /// The `<access key>:<secret>` credential.
+    credential: String,
+    /// Seconds between passes.
+    interval_secs: u64,
+    /// How long a backup object is kept; 0 keeps forever.
+    retention_secs: u64,
+    env: Env,
+}
+
+/// Resolve the scheduled-backup inputs, or return [`None`] with every refusal logged.
+fn backup_scheduler_inputs(config: &Config, env: &Env) -> Option<BackupSchedulerInputs> {
+    let backup = &config.backup;
+    if !backup.enabled {
+        return None;
+    }
+    let Some(url) = (|| {
+        let secret = backup.url.as_ref()?;
+        Some(secret.resolve().ok()?.expose().to_string())
+    })()
+    .or_else(|| {
+        tracing::error!(
+            "scheduled backups NOT running: backup.url is not set or could not be resolved, \
+             and a scheduled backup needs a BYPASSRLS DSN to dump every row"
+        );
+        None
+    }) else {
+        tracing::error!(
+            "scheduled backups NOT running: backup.url is not set, and a scheduled backup              needs a BYPASSRLS DSN to dump every row"
+        );
+        return None;
+    };
+    let Some(material) = (|| {
+        let secret = config.database.master_key.as_ref()?;
+        Some(secret.resolve().ok()?.expose().as_bytes().to_vec())
+    })()
+        .or_else(|| {
+            tracing::error!(
+                "scheduled backups NOT running: database.master_key could not be resolved,                  and the backup is sealed under it"
+            );
+            None
+        })
+    else {
+        return None;
+    };
+    let (Some(endpoint), Some(bucket)) = (backup.s3_endpoint.clone(), backup.s3_bucket.clone())
+    else {
+        tracing::error!(
+            "scheduled backups NOT running: backup.s3_endpoint and backup.s3_bucket must both              be set (validation should have refused this config, and did not)"
+        );
+        return None;
+    };
+    let Some(credential) = backup
+        .s3_credential
+        .as_ref()
+        .map(Secret::resolve)
+        .and_then(|result| result.ok())
+        .and_then(|secret| secret.expose().to_string().into())
+    else {
+        tracing::error!(
+            "scheduled backups NOT running: backup.s3_credential could not be resolved"
+        );
+        return None;
+    };
+    Some(BackupSchedulerInputs {
+        url,
+        material,
+        endpoint,
+        bucket,
+        prefix: backup.s3_prefix.clone(),
+        region: backup.s3_region.clone(),
+        credential,
+        interval_secs: backup.interval_secs,
+        retention_secs: backup.retention_secs,
+        env: env.clone(),
+    })
+}
+
+/// Start the scheduled backup runner, or [`None`] with the reason logged.
+async fn start_backup_scheduler(
+    inputs: BackupSchedulerInputs,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let fetcher = match ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default()) {
+        Ok(fetcher) => fetcher,
+        Err(error) => {
+            tracing::error!("scheduled backups NOT running: cannot start the fetcher: {error}");
+            return None;
+        }
+    };
+    let handle = tokio::spawn(backup_scheduler_loop(inputs, fetcher));
+    tracing::info!("scheduled backups running");
+    Some(handle)
+}
+
+/// Describe the backup metrics once, so `/metrics` carries their HELP and TYPE. Called from
+/// the runner's first pass.
+fn describe_backup_metrics() {
+    metrics::describe_counter!(
+        BACKUP_SUCCESS_TOTAL,
+        "Scheduled encrypted-backup passes that pushed and (when configured) pruned successfully"
+    );
+    metrics::describe_counter!(
+        BACKUP_FAILURE_TOTAL,
+        "Scheduled encrypted-backup passes that failed, by the log line that says why"
+    );
+    metrics::describe_gauge!(
+        BACKUP_LAST_SUCCESS_TIMESTAMP_SECONDS,
+        "Unix seconds of the last successful scheduled backup push; a dashboard derives age"
+    );
+}
+
+/// The runner loop: one pass immediately (a fresh boot's data is the point of the first
+/// backup, and the interval's clock starts at boot rather than at last backup), then every
+/// interval.
+async fn backup_scheduler_loop(inputs: BackupSchedulerInputs, fetcher: ironauth_fetch::Fetcher) {
+    describe_backup_metrics();
+    loop {
+        run_backup_pass(&inputs, &fetcher).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(inputs.interval_secs)).await;
+    }
+}
+
+/// One backup pass: dump+seal, push the sealed object, prune past-retention objects, and
+/// update the metrics. Every failure path logs its own reason and increments the failure
+/// counter; a failed pass never blocks the next interval.
+async fn run_backup_pass(inputs: &BackupSchedulerInputs, fetcher: &ironauth_fetch::Fetcher) {
+    let sealed = match sealed_backup_dump(&inputs.url, &inputs.material).await {
+        Ok(sealed) => sealed,
+        Err(message) => {
+            tracing::error!("scheduled backup pass FAILED: {message}");
+            metrics::counter!(BACKUP_FAILURE_TOTAL).increment(1);
+            return;
+        }
+    };
+    let now = inputs.env.clock().now_utc();
+    let key = ironauth_admin::backup_s3::object_key(&inputs.prefix, now);
+    let body = sealed.as_bytes().to_vec();
+    let body_len = body.len();
+    let payload_hash = ironauth_admin::sigv4::sha256_hex(&body);
+    let host = inputs
+        .endpoint
+        .split("://")
+        .nth(1)
+        .unwrap_or(&inputs.endpoint)
+        .trim_end_matches('/')
+        .to_owned();
+    let path = format!("/{}/{}", inputs.bucket, key);
+    let headers = vec![
+        ("host".to_string(), host.clone()),
+        ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+        (
+            "x-amz-date".to_string(),
+            ironauth_admin::backup_s3::sigv4_timestamps(now).1,
+        ),
+    ];
+    let canonical = ironauth_admin::sigv4::CanonicalRequest {
+        method: "PUT",
+        path: &path,
+        query: &[],
+        headers: headers.clone(),
+        payload_hash: &payload_hash,
+    };
+    let scope = ironauth_admin::sigv4::credential_scope(
+        &ironauth_admin::backup_s3::sigv4_timestamps(now).0,
+        &inputs.region,
+        "s3",
+    );
+    let to_sign = ironauth_admin::sigv4::string_to_sign(
+        &ironauth_admin::backup_s3::sigv4_timestamps(now).1,
+        &scope,
+        &canonical.render(),
+    );
+    let signature = ironauth_admin::sigv4::sign(
+        &inputs
+            .credential
+            .split_once(':')
+            .map(|(_, secret)| secret)
+            .unwrap_or(""),
+        &ironauth_admin::backup_s3::sigv4_timestamps(now).0,
+        &inputs.region,
+        "s3",
+        &to_sign,
+    );
+    let authorization = ironauth_admin::sigv4::authorization_header(
+        inputs
+            .credential
+            .split_once(':')
+            .map(|(access, _)| access)
+            .unwrap_or(""),
+        &scope,
+        &canonical.signed_headers(),
+        &signature,
+    );
+    let mut request = ironauth_fetch::FetchRequest::new(
+        ironauth_fetch::FetchPurpose::LogStreamDelivery,
+        http::Method::PUT,
+        format!("{}{path}", inputs.endpoint.trim_end_matches('/')),
+    )
+    .body(body);
+    for (name, value) in [("authorization", authorization)] {
+        let (Ok(name), Ok(value)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(&value),
+        ) else {
+            tracing::error!("scheduled backup pass FAILED: a required header could not be encoded");
+            metrics::counter!(BACKUP_FAILURE_TOTAL).increment(1);
+            return;
+        };
+        request = request.header(name, value);
+    }
+    match fetcher.fetch(request).await {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            tracing::error!(
+                "scheduled backup pass FAILED: the endpoint answered {} for key {key}",
+                response.status().as_u16()
+            );
+            metrics::counter!(BACKUP_FAILURE_TOTAL).increment(1);
+            return;
+        }
+        Err(error) => {
+            tracing::error!("scheduled backup pass FAILED: cannot push {key}: {error}");
+            metrics::counter!(BACKUP_FAILURE_TOTAL).increment(1);
+            return;
+        }
+    }
+    metrics::counter!(BACKUP_SUCCESS_TOTAL).increment(1);
+    metrics::gauge!(BACKUP_LAST_SUCCESS_TIMESTAMP_SECONDS).set(
+        now.duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+    );
+    tracing::info!(key = %key, bytes = %body_len, "scheduled backup pushed");
+
+    // The retention prune: list the prefix, prune keys strictly older than the window, and
+    // delete them. A prune failure logs but does NOT fail the pass: the backup itself is
+    // safe, and a failed prune is a growing bucket, not a lost restore point.
+    if inputs.retention_secs > 0 {
+        prune_old_backups(inputs, fetcher, now).await;
+    }
+}
+
+/// List the backup prefix and delete every key older than the retention window.
+async fn prune_old_backups(
+    inputs: &BackupSchedulerInputs,
+    fetcher: &ironauth_fetch::Fetcher,
+    now: std::time::SystemTime,
+) {
+    let list_prefix = ironauth_admin::backup_s3::retention_list_prefix(&inputs.prefix);
+    let (url, headers) = ironauth_admin::backup_s3::list_request(
+        &inputs.endpoint,
+        &inputs.bucket,
+        &list_prefix,
+        &inputs.region,
+        &inputs.credential,
+        now,
+    );
+    let mut request = ironauth_fetch::FetchRequest::new(
+        ironauth_fetch::FetchPurpose::LogStreamDelivery,
+        http::Method::GET,
+        url,
+    );
+    for (name, value) in headers {
+        let (Ok(name), Ok(value)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(&value),
+        ) else {
+            tracing::error!("backup retention: a list header could not be encoded");
+            return;
+        };
+        request = request.header(name, value);
+    }
+    let listing = match fetcher.fetch(request).await {
+        Ok(response) if response.status().is_success() => response.body().to_vec(),
+        Ok(response) => {
+            tracing::error!(
+                "backup retention: the listing answered {}",
+                response.status().as_u16()
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::error!("backup retention: cannot list: {error}");
+            return;
+        }
+    };
+    let Some(keys) = ironauth_admin::backup_s3::keys_from_listing(&listing) else {
+        tracing::error!(
+            "backup retention: the listing response did not parse; refusing to conclude the              prune (an unparsed response must not read as an empty prune)"
+        );
+        return;
+    };
+    let prune =
+        ironauth_admin::backup_s3::prune_set(&keys, &inputs.prefix, now, inputs.retention_secs);
+    if prune.is_empty() {
+        return;
+    }
+    tracing::info!(objects = %prune.len(), "backup retention: pruning");
+    for key in prune {
+        let (url, headers) = ironauth_admin::backup_s3::delete_request(
+            &inputs.endpoint,
+            &inputs.bucket,
+            &key,
+            &inputs.region,
+            &inputs.credential,
+            now,
+        );
+        let mut request = ironauth_fetch::FetchRequest::new(
+            ironauth_fetch::FetchPurpose::LogStreamDelivery,
+            http::Method::DELETE,
+            url,
+        );
+        for (name, value) in headers {
+            let (Ok(name), Ok(value)) = (
+                http::HeaderName::from_bytes(name.as_bytes()),
+                http::HeaderValue::from_str(&value),
+            ) else {
+                tracing::error!("backup retention: a delete header could not be encoded");
+                return;
+            };
+            request = request.header(name, value);
+        }
+        match fetcher.fetch(request).await {
+            Ok(response) if response.status().is_success() => {
+                tracing::info!(key = %key, "backup retention: deleted");
+            }
+            Ok(response) => {
+                tracing::error!(
+                    "backup retention: the endpoint answered {} deleting {key}",
+                    response.status().as_u16()
+                );
+            }
+            Err(error) => {
+                tracing::error!("backup retention: cannot delete {key}: {error}");
+            }
+        }
+    }
+}
+
+/// Produce a sealed logical backup of the primary store: connect, refuse an RLS-subjected
+/// role, run `pg_dump`, refuse an empty dump, and seal under the master material.
+///
+/// Shared by the `ironauth storage backup` command and the scheduled backup runner (issue
+/// #153): the two must produce the SAME artifact for the same store, because the restore
+/// side of the criterion does not know (or care) which half produced the file.
+async fn sealed_backup_dump(
+    url: &str,
+    material: &[u8],
+) -> Result<ironauth_jose::SealedBackup, String> {
+    let store = Store::connect(url)
+        .await
+        .map_err(|error| format!("cannot connect: {error}"))?;
+    match store.sees_through_row_level_security().await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(
+                "REFUSING to back up. The connected role is subject to row-level security, so\n\
+                 every tenant-scoped table would dump zero rows with no error, and the empty\n\
+                 backup would verify against its own checksum. Connect as a SUPERUSER or a\n\
+                 role granted BYPASSRLS; the schema owner is not enough, because these tables\n\
+                 are FORCE ROW LEVEL SECURITY."
+                    .to_string(),
+            );
+        }
+        Err(error) => {
+            return Err(format!("cannot check the connected role: {error}"));
+        }
+    }
+    let Some(pg_dump) = postgres_tool("pg_dump") else {
+        return Err(
+            "cannot find pg_dump. Set PG_BIN to the PostgreSQL bin directory (the one\n\
+             holding initdb), or add it to PATH."
+                .to_string(),
+        );
+    };
+    let dump = match std::process::Command::new(&pg_dump)
+        .args(["--no-owner", "--no-privileges", "--dbname", url])
+        .output()
+    {
+        Ok(output) if output.status.success() => output.stdout,
+        Ok(output) => {
+            return Err(format!(
+                "pg_dump failed:\\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Err(error) => return Err(format!("cannot run pg_dump: {error}")),
+    };
+    // A dump with no CREATE TABLE recovers nothing. pg_dump of an empty database is header
+    // comments only; refusing it is the same discipline kek-backup applies to an empty row
+    // set: the backup would verify, restore cleanly, and recover nothing.
+    if !dump
+        .windows(b"CREATE TABLE".len())
+        .any(|w| w == b"CREATE TABLE")
+    {
+        return Err(
+            "the dump contains no CREATE TABLE. REFUSING to write an empty backup: it would\n\
+             verify against its own checksum and recover nothing."
+                .to_string(),
+        );
+    }
+    Ok(ironauth_jose::SealedBackup::seal(
+        &dump,
+        material,
+        BACKUP_CONTEXT,
+    ))
 }
 
 /// `ironauth storage restore --url DSN --in FILE --master-key ID:env:VAR [--i-will-overwrite]` — apply

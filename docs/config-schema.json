@@ -409,6 +409,82 @@
         }
       ]
     },
+    "BackupConfig": {
+      "additionalProperties": false,
+      "description": "Scheduled encrypted backups to S3-compatible object storage (issue #153).\n\nOFF by default and off again without a DSN, so a deployment that never opens this\nsection pushes nothing. The `url` must name a role that sees every row (a superuser or\nBYPASSRLS), because the backup is a logical dump of the whole primary store and a\nrole subject to `FORCE ROW LEVEL SECURITY` would dump zero rows with no error \u2014 the\nrunner probes this and refuses the run, exactly like `ironauth storage backup` does.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Whether THIS process takes scheduled backups. OFF by default.",
+          "type": "boolean"
+        },
+        "interval_secs": {
+          "default": 86400,
+          "description": "Seconds between backup passes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retention_secs": {
+          "default": 0,
+          "description": "How long a backup object is kept, in seconds. `0` means keep forever \u2014 the same\ndefault direction as audit retention: the failure mode of retention being off is a\nlarger bucket, and the failure mode of it being on by accident is a deleted\nrestore point. Only one of those is recoverable.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "s3_bucket": {
+          "default": null,
+          "description": "The bucket on that endpoint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "s3_credential": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Secret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The secret holding `<access key id>:<secret access key>`, the shape every S3 tool\ntakes. Named as `ID:env:VAR` or `ID:file:PATH`, like the log sink's credential."
+        },
+        "s3_endpoint": {
+          "default": null,
+          "description": "The S3-compatible endpoint (an `https` URL) the sealed backups are pushed to.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "s3_prefix": {
+          "default": "ironauth-backups",
+          "description": "The object-key prefix, defaulting to `ironauth-backups`.",
+          "type": "string"
+        },
+        "s3_region": {
+          "default": "us-east-1",
+          "description": "The S3 region for signing, defaulting to `us-east-1`.",
+          "type": "string"
+        },
+        "url": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Secret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The DSN for the backup's `pg_dump` connection. MUST name a superuser or BYPASSRLS\nrole; the runner refuses a run when the connected role is subject to row-level\nsecurity. [`None`] disables the schedule however `enabled` is set."
+        }
+      },
+      "type": "object"
+    },
     "ByokConfig": {
       "additionalProperties": false,
       "description": "Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).\n\nNOT IMPLEMENTED, and declared anyway (issue #459). No boot path on either plane\nreads this section, so no value in it changes any behaviour. Startup REFUSES a\nnon-default value rather than accept one it will ignore, because `enabled = true`\notherwise reads as \"customer-managed keys protect this deployment\" and nothing\nimplements that.\n\nThe STORE half of BYOK does exist (migration 0031's `tenant_byok_bindings`,\n`enroll_byok`, and the `ironauth-kms` drivers), which is why the section is kept\nrather than deleted: this is the switch that would gate it once the read path is\nwired through an external KMS. Until then the honest state is that it is off and\ncannot be turned on.",
@@ -3437,6 +3513,21 @@
         "interval_secs": 3600
       },
       "description": "Audit retention (issue #109): the per-stream windows, and whether THIS process\nsweeps to them.\n\nSeparate windows per stream is the point rather than a convenience. The admin\ntrail answers \"who changed this configuration\", which a compliance regime usually\nwants kept for years, and the authentication trail answers \"who signed in\", which\nis high volume and usually wanted for months. One window forces the short\nrequirement onto the long one or the long storage bill onto the short one."
+    },
+    "backup": {
+      "$ref": "#/$defs/BackupConfig",
+      "default": {
+        "enabled": false,
+        "interval_secs": 86400,
+        "retention_secs": 0,
+        "s3_bucket": null,
+        "s3_credential": null,
+        "s3_endpoint": null,
+        "s3_prefix": "ironauth-backups",
+        "s3_region": "us-east-1",
+        "url": null
+      },
+      "description": "Scheduled encrypted backups to S3-compatible object storage (issue #153): whether\nTHIS process takes a logical backup of the primary store on an interval and pushes\nit, sealed under the platform master key, to the configured bucket.\n\nOFF by default. The failure mode of backups being off is a larger restore gap; the\nfailure mode of them being on by accident is an outbound push this deployment did\nnot intend \u2014 and the section's S3 endpoint and credential are exactly the kind of\nconfiguration a repository scan should not be able to enable silently."
     },
     "byok": {
       "$ref": "#/$defs/ByokConfig",

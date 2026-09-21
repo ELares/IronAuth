@@ -54,6 +54,9 @@ label on the wire with every test green.
 
 | metric | type | labels | meaning |
 | --- | --- | --- | --- |
+| `ironauth_backup_failure_total` | counter | none | Scheduled encrypted-backup passes that failed |
+| `ironauth_backup_last_success_timestamp_seconds` | gauge | none | Unix seconds of the last successful scheduled backup push; a dashboard derives age |
+| `ironauth_backup_success_total` | counter | none | Scheduled encrypted-backup passes that pushed and (when configured) pruned successfully |
 | `ironauth_connector_healthy` | gauge | `connector` | Whether an upstream connector's last probe succeeded |
 | `ironauth_connector_upstream_error_total` | counter | `connector`, `kind` | Upstream connector calls that failed, by failure kind |
 | `ironauth_connector_upstream_success_total` | counter | `connector` | Upstream connector calls that succeeded |
@@ -100,7 +103,7 @@ label on the wire with every test green.
 | `ironauth_up` | gauge | none | 1 while the process is serving |
 | `ironauth_verification_send_suppressed_total` | counter | `purpose` | Verification sends suppressed, by purpose |
 
-45 metrics, 13 of them carrying no labels at all.
+48 metrics, 16 of them carrying no labels at all.
 
 ## Scope
 

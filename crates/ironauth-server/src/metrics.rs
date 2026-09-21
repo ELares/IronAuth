@@ -284,6 +284,24 @@ pub const CONTRACT: &[MetricSpec] = &[
         help: "Authentications refused for attempting a weaker factor than the policy allows",
     },
     MetricSpec {
+        name: "ironauth_backup_success_total",
+        kind: MetricKind::Counter,
+        labels: &[],
+        help: "Scheduled encrypted-backup passes that pushed and (when configured) pruned successfully",
+    },
+    MetricSpec {
+        name: "ironauth_backup_failure_total",
+        kind: MetricKind::Counter,
+        labels: &[],
+        help: "Scheduled encrypted-backup passes that failed",
+    },
+    MetricSpec {
+        name: "ironauth_backup_last_success_timestamp_seconds",
+        kind: MetricKind::Gauge,
+        labels: &[],
+        help: "Unix seconds of the last successful scheduled backup push; a dashboard derives age",
+    },
+    MetricSpec {
         name: "ironauth_lazy_migration_breaker_state",
         kind: MetricKind::Gauge,
         labels: &[],

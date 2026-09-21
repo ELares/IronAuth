@@ -95,6 +95,8 @@ mod access_requests;
 mod access_review;
 mod agents;
 mod audit_retention;
+/// AWS SigV4 signing for the S3 log sink (issue #110).
+pub mod backup_s3;
 pub mod certificate_expiry;
 pub mod certificate_notices;
 pub mod certificate_pin_requests;
@@ -164,7 +166,6 @@ mod signing_algorithm;
 mod signing_interop;
 mod signup_forms;
 mod signup_quarantine;
-/// AWS SigV4 signing for the S3 log sink (issue #110).
 pub mod sigv4;
 mod sms_otp;
 mod state;

@@ -1391,6 +1391,7 @@ impl LogSink for S3LogSink {
             let canonical = crate::sigv4::CanonicalRequest {
                 method: "PUT",
                 path: &path,
+                query: &[],
                 headers: signed_headers.clone(),
                 payload_hash: &payload_hash,
             };
@@ -1420,7 +1421,7 @@ impl LogSink for S3LogSink {
 /// Derived from the passed instant rather than read from a clock here, so a test can pin
 /// it. Returns [`None`] before the epoch, which cannot happen in practice and is refused
 /// rather than wrapped into a signature that would be rejected for an unrelated reason.
-fn sigv4_timestamps(at: std::time::SystemTime) -> Option<(String, String)> {
+pub(crate) fn sigv4_timestamps(at: std::time::SystemTime) -> Option<(String, String)> {
     let secs = at
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .ok()?
