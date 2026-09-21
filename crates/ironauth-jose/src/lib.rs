@@ -143,6 +143,7 @@
 //! # fn tracing_reason(_r: ironauth_jose::RejectReason) {}
 //! ```
 
+pub mod backup;
 mod claims;
 mod cnf;
 mod crypto;
@@ -174,6 +175,7 @@ pub mod xmlenc;
 
 pub mod seams;
 
+pub use backup::{BackupOpenError, SealedBackup};
 pub use claims::VerifiedClaims;
 pub use cnf::{CnfError, Confirmation};
 /// Test-only `DPoP` proof-minting helpers (the `test-util` feature), for a

@@ -8540,9 +8540,11 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
         Some("rekey") => {}
         Some("kek-backup") => return kek_backup_command(args),
         Some("kek-restore") => return kek_restore_command(args),
+        Some("backup") => return backup_command(args),
+        Some("restore") => return restore_command(args),
         _ => {
             eprintln!(
-                "ironauth storage: expected a subcommand: rekey, kek-backup, or kek-restore."
+                "ironauth storage: expected a subcommand: rekey, kek-backup, kek-restore, backup, or restore."
             );
             eprintln!(
                 "usage: ironauth storage rekey --url DSN --from-master-key KEY \
@@ -8552,6 +8554,12 @@ fn storage(args: &mut impl Iterator<Item = String>) -> ExitCode {
             );
             eprintln!("       ironauth storage kek-backup --url DSN --out FILE");
             eprintln!("       ironauth storage kek-restore --url DSN --in FILE");
+            eprintln!(
+                "       ironauth storage backup --url DSN --out FILE --master-key ID:env:VAR"
+            );
+            eprintln!(
+                "       ironauth storage restore --url DSN --in FILE --master-key ID:env:VAR"
+            );
             return ExitCode::FAILURE;
         }
     }
@@ -8996,6 +9004,374 @@ fn kek_restore_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
 /// bearing: the `file` form trims one trailing newline, the shape `echo secret > file` produces.
 /// A reader that kept the newline would derive a DIFFERENT key from the same file the server
 /// reads, which is the whole class of bug this function exists to close.
+
+/// The AEAD context every sealed backup is bound to. A file sealed under any other context is
+/// refused, so a backup cannot be replayed as a different artifact.
+const BACKUP_CONTEXT: &[u8] = b"ironauth logical backup v1";
+
+/// `ironauth storage backup --url DSN --out FILE --master-key ID:env:VAR` — the logical backup half of
+/// issue #153.
+///
+/// Runs `pg_dump` against the primary store (the Postgres logical backup tool, discovered via
+/// `$PG_BIN` or `PATH` the same way the chaos tests find `initdb`), then seals the dump with
+/// the master key BEFORE the file exists anywhere: the artifact is ciphertext from the moment
+/// it is written, and the AEAD tag doubles as the checksum, verified on write and on restore.
+fn backup_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let mut url: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut master_key: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => {
+                if !take_flag(args, "backup", "--url", &mut url) {
+                    return ExitCode::FAILURE;
+                }
+            }
+            "--out" => {
+                if !take_flag(args, "backup", "--out", &mut out) {
+                    return ExitCode::FAILURE;
+                }
+            }
+            "--master-key" => {
+                if !take_flag(args, "backup", "--master-key", &mut master_key) {
+                    return ExitCode::FAILURE;
+                }
+            }
+            other => {
+                eprintln!("ironauth backup: unrecognized argument '{other}'");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let (Some(url), Some(out), Some(master_key)) = (url, out, master_key) else {
+        eprintln!(
+            "ironauth backup: --url, --out and --master-key are all required.\n\
+             The master key is named ID:env:VAR or ID:file:PATH, the same way `database.master_key`\n\
+             names the secret the server derives its wrapping key from."
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(material) = resolve_master_material(&master_key) else {
+        eprintln!(
+            "ironauth backup: a master key is ID:env:VAR or ID:file:PATH. The secret is named\n\
+             the same way `database.master_key` names it. The backup is sealed with a\n\
+             domain-separated derivation from this secret, so the SAME secret must be named\n\
+             to restore."
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(pg_dump) = postgres_tool("pg_dump") else {
+        eprintln!(
+            "ironauth backup: cannot find pg_dump. Set PG_BIN to the PostgreSQL bin\n\
+             directory (the one holding initdb), or add it to PATH."
+        );
+        return ExitCode::FAILURE;
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ironauth backup: cannot start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async {
+        let store = match Store::connect(&url).await {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("ironauth backup: cannot connect: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match store.sees_through_row_level_security().await {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "ironauth backup: REFUSING to back up. The connected role is subject to\n\
+                     row-level security, so every tenant-scoped table would dump zero rows with\n\
+                     no error, and the empty backup would verify against its own checksum.\n\
+                     Connect as a SUPERUSER or a role granted BYPASSRLS; the schema owner is not\n\
+                     enough, because these tables are FORCE ROW LEVEL SECURITY."
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("ironauth backup: cannot check the connected role: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+
+        let dump = match std::process::Command::new(&pg_dump)
+            .args(["--no-owner", "--no-privileges", "--dbname", &url])
+            .output()
+        {
+            Ok(output) if output.status.success() => output.stdout,
+            Ok(output) => {
+                eprintln!(
+                    "ironauth backup: pg_dump failed:\\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("ironauth backup: cannot run pg_dump: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        // A dump with no CREATE TABLE recovers nothing. pg_dump of an empty database is header
+        // comments only; refusing it is the same discipline kek-backup applies to an empty row
+        // set: the backup would verify, restore cleanly, and recover nothing.
+        if !dump
+            .windows(b"CREATE TABLE".len())
+            .any(|w| w == b"CREATE TABLE")
+        {
+            eprintln!(
+                "ironauth backup: the dump contains no CREATE TABLE. REFUSING to write an\n\
+                 empty backup: it would verify against its own checksum and recover nothing."
+            );
+            return ExitCode::FAILURE;
+        }
+
+        let sealed = ironauth_jose::SealedBackup::seal(&dump, &material, BACKUP_CONTEXT);
+        if let Err(error) = std::fs::write(&out, sealed.as_bytes()) {
+            eprintln!("ironauth backup: cannot write {out}: {error}");
+            return ExitCode::FAILURE;
+        }
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(sealed.as_bytes());
+        let checksum = hex::encode(digest);
+        println!(
+            "backup: {} bytes of encrypted logical backup written to {} (sealed under a\n\
+             derivation from the named master key; restore it with the SAME key, or it\n\
+             refuses).\n\
+             SHA-256 of the encrypted file: {}",
+            sealed.as_bytes().len(),
+            out,
+            checksum
+        );
+        ExitCode::SUCCESS
+    })
+}
+
+/// `ironauth storage restore --url DSN --in FILE --master-key ID:env:VAR [--i-will-overwrite]` — apply
+/// a sealed logical backup to a fresh database (issue #153).
+///
+/// Opens the file (refusing on a checksum mismatch, a wrong key, or a foreign file), refuses to
+/// clobber a database that already holds the schema unless the operator says it out loud, and
+/// applies the SQL in ONE transaction through `psql`.
+fn restore_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
+    let mut url: Option<String> = None;
+    let mut input: Option<String> = None;
+    let mut master_key: Option<String> = None;
+    let mut acknowledged_overwrite = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--url" => {
+                if !take_flag(args, "restore", "--url", &mut url) {
+                    return ExitCode::FAILURE;
+                }
+            }
+            "--in" => {
+                if !take_flag(args, "restore", "--in", &mut input) {
+                    return ExitCode::FAILURE;
+                }
+            }
+            "--master-key" => {
+                if !take_flag(args, "restore", "--master-key", &mut master_key) {
+                    return ExitCode::FAILURE;
+                }
+            }
+            "--i-will-overwrite" => acknowledged_overwrite = true,
+            other => {
+                eprintln!("ironauth restore: unrecognized argument '{other}'");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let (Some(url), Some(input), Some(master_key)) = (url, input, master_key) else {
+        eprintln!(
+            "ironauth restore: --url, --in and --master-key are all required.\n\
+             The master key must be the one the backup was sealed with; any other key, or any\n\
+             tampered file, is refused."
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(material) = resolve_master_material(&master_key) else {
+        eprintln!(
+            "ironauth restore: a master key is ID:env:VAR or ID:file:PATH. The secret is named\n\
+             the same way `database.master_key` names it, and must be the one used to back up."
+        );
+        return ExitCode::FAILURE;
+    };
+    let bytes = match std::fs::read(&input) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("ironauth restore: cannot read {input}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let sql = match ironauth_jose::SealedBackup::open(
+        &ironauth_jose::SealedBackup::from_bytes(bytes),
+        &material,
+        BACKUP_CONTEXT,
+    ) {
+        Ok(sql) => sql,
+        Err(error) => {
+            eprintln!("ironauth restore: REFUSING. {error}.");
+            eprintln!(
+                "\nNothing was written. The file is refused before any connection is made, so\n\
+                 a wrong key, a tampered byte, or a file of another build changes nothing."
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ironauth restore: cannot start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let refuse = runtime.block_on(async {
+        let store = match Store::connect(&url).await {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("ironauth restore: cannot connect: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        // The target-empty guard: restoring over an existing deployment would strand its data
+        // behind the backup's contents. The ledger existing with rows means a live deployment.
+        let live = match store.has_applied_migrations().await {
+            Ok(live) => live,
+            Err(error) => {
+                eprintln!("ironauth restore: cannot probe the target: {error}");
+                let mut source = std::error::Error::source(&error);
+                while let Some(cause) = source {
+                    eprintln!("  caused by: {cause}");
+                    source = cause.source();
+                }
+                return ExitCode::FAILURE;
+            }
+        };
+        if live && !acknowledged_overwrite {
+            eprintln!(
+                "ironauth restore: REFUSING. The target database already holds the schema.\n\
+                 Restoring over it would strand the deployment's current data behind the\n\
+                 backup's contents. Re-run with --i-will-overwrite only with a plan."
+            );
+            return ExitCode::FAILURE;
+        }
+        ExitCode::SUCCESS
+    });
+    if refuse != ExitCode::SUCCESS {
+        return refuse;
+    }
+
+    let Some(psql) = postgres_tool("psql") else {
+        eprintln!(
+            "ironauth restore: cannot find psql. Set PG_BIN to the PostgreSQL bin\n\
+             directory, or add it to PATH."
+        );
+        return ExitCode::FAILURE;
+    };
+    let mut child = match std::process::Command::new(&psql)
+        .args([
+            "--single-transaction",
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--dbname",
+            &url,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("ironauth restore: cannot run psql: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    {
+        use std::io::Write as _;
+        let Some(mut stdin) = child.stdin.take() else {
+            eprintln!("ironauth restore: cannot open psql's stdin");
+            return ExitCode::FAILURE;
+        };
+        if let Err(error) = stdin.write_all(&sql) {
+            eprintln!("ironauth restore: cannot write the backup to psql: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("ironauth restore: cannot wait for psql: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !status.success() {
+        eprintln!(
+            "ironauth restore: psql failed. Because --single-transaction was used, the\n\
+             database is exactly as it was."
+        );
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "restore: applied in one transaction. Verify with `ironauth doctor --url` the\n\
+         target, and read a secret on a scope you expected to recover."
+    );
+    ExitCode::SUCCESS
+}
+
+/// Resolve a master key name (`ID:env:VAR` or `ID:file:PATH`) to its material bytes, the same
+/// resolution `parse_master_key` performs. The backup seal derives its own key from THIS
+/// material with a domain-separated label, so the secret is the one the server uses while no
+/// keystream is shared with the wrapping use.
+fn resolve_master_material(text: &str) -> Option<Vec<u8>> {
+    let (id, rest) = text.split_once(':')?;
+    if !master_key_id_is_valid(id) {
+        return None;
+    }
+    let secret = rest
+        .strip_prefix("env:")
+        .map(|var| ironauth_config::Secret::Env(var.to_owned()))
+        .or_else(|| {
+            rest.strip_prefix("file:")
+                .map(|path| ironauth_config::Secret::File(std::path::PathBuf::from(path)))
+        })?;
+    let material = secret.resolve().ok()?;
+    Some(material.expose().as_bytes().to_vec())
+}
+
+/// Find a PostgreSQL tool (`pg_dump`, `psql`) the way the chaos tests find `initdb`:
+/// `$PG_BIN/<name>` if set, else `name` on `PATH`.
+fn postgres_tool(name: &str) -> Option<std::path::PathBuf> {
+    if let Some(pg_bin) = std::env::var_os("PG_BIN") {
+        let candidate = std::path::PathBuf::from(pg_bin).join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 fn parse_master_key(text: &str) -> Option<ironauth_jose::MasterKey> {
     let (id, rest) = text.split_once(':')?;
     if !master_key_id_is_valid(id) {
