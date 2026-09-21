@@ -432,8 +432,19 @@ jobs:
           exit 1
       # Both lanes, in one invocation, so a divergence between them shows up as a
       # single failing job rather than two that have to be compared by hand.
+      # #147 criterion 3: the bus wake latency vs the poll budget, both numbers recorded as
+      # a CI artifact (written by the bench test in outbox_ironbus.rs).
       - name: outbox suites (postgres drain + ironbus backbone)
         run: cargo test -p ironauth-store --features testing,ironbus --test outbox --test outbox_ironbus
+        env:
+          IRONBUS_BACKBONE_LATENCY_JSON: ${{ github.workspace }}/outbox-backbone-latency.json
+      - name: record the backbone latency artifact (#147 c3)
+        if: always()
+        uses: actions/upload-artifact@ff4a2771b20de53f2e9e83d73487a1e9ec0cb13b # v5
+        with:
+          name: outbox-backbone-latency
+          path: ${{ github.workspace }}/outbox-backbone-latency.json
+          if-no-files-found: error
       # Issue #149 criterion 4: the IronBus-down chaos tier, induced for real. The test
       # starts a REAL broker and a real worker pool attached to it, KILLS the broker, and
       # asserts a message enqueued with the bus down still drains on the Postgres poll with
