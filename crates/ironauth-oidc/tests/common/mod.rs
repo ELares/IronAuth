@@ -1073,6 +1073,12 @@ impl Harness {
 
     /// The seeded scope.
     #[must_use]
+    /// The database's owner pool, for the migration runner a rolling-upgrade test drives
+    /// against the booted store.
+    pub fn pool(&self) -> &sqlx::PgPool {
+        self.db.owner_pool()
+    }
+
     pub fn scope(&self) -> Scope {
         self.scope
     }
