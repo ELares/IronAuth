@@ -9,6 +9,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The backup command's checksum and hex encoding (issue #153). Both crates are already in the
+# workspace lock file; no new supply-chain surface.
+sha2 = "0.10"
+hex = "0.4"
 # The dev capture sink implements the same async delivery seam the production sender does
 # (issue #111). Already in the lock file; no new supply-chain surface.
 async-trait = "0.1"
@@ -126,6 +130,8 @@ ironauth-fetch = { workspace = true, features = ["test-harness"] }
 # audited repository the enforcement path reads.
 ironauth-store = { workspace = true, features = ["testing"] }
 ironauth-env = { workspace = true }
+# The backup CLI test (issue #153) reads the restored data back through a second pool.
+sqlx = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # The boot-wiring harness (issue #414) derives its subject list from the serialized shape
 # of `Config` itself and compares whole config sections across the two plane states as

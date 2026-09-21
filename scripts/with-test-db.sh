@@ -68,6 +68,10 @@ PG_BIN_DIR="$(find_pg_bin)" || {
   exit 1
 }
 
+# Export the discovery result so tests that shell out to PostgreSQL tools (pg_dump for the
+# backup command, issue #153) find the SAME binaries this script starts.
+export PG_BIN="${PG_BIN_DIR}"
+
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/ironauth-pg.XXXXXX")"
 PGDATA="${WORKDIR}/data"
 SOCKDIR="${WORKDIR}/sock"

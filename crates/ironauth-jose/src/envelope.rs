@@ -71,7 +71,7 @@ pub const NONCE_BYTES: usize = NONCE_LEN;
 /// The domain-separation label mixed in when deriving a master key from
 /// externally supplied key material (a configured secret), so the derivation is
 /// bound to this purpose and cannot collide with any other keyed use.
-const MASTER_DERIVE_LABEL: &[u8] = b"ironauth.envelope.master-key.derive.v1";
+pub(crate) const MASTER_DERIVE_LABEL: &[u8] = b"ironauth.envelope.master-key.derive.v1";
 
 /// The domain-separation label mixed in when deriving the blind-index subkey from
 /// the master key, so the HMAC key used for searchable indexes is cryptographically

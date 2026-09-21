@@ -332,6 +332,28 @@ impl Store {
         Ok(row.get::<bool, _>("unrestricted"))
     }
 
+    /// Whether the target database already holds the migration ledger with at least one applied
+    /// migration — i.e. whether it is a live deployment rather than a fresh one (issue #153).
+    ///
+    /// The restore command refuses to apply a backup over a live deployment unless the operator
+    /// acknowledges the overwrite. `to_regclass` makes this cheap on a database that has never
+    /// seen IronAuth, and the EXISTS makes a created-but-empty ledger count as fresh.
+    pub async fn has_applied_migrations(&self) -> Result<bool, crate::StoreError> {
+        // Two queries, not one: PostgreSQL plans BOTH sides of an AND, so an EXISTS over a
+        // table that does not exist errors at plan time even when the left side is false.
+        let ledger: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('_schema_migrations')::text")
+                .fetch_one(&self.pool)
+                .await?;
+        if ledger.is_none() {
+            return Ok(false);
+        }
+        let row = sqlx::query("SELECT EXISTS (SELECT 1 FROM _schema_migrations) AS live")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<bool, _>("live"))
+    }
+
     /// Rewrap every live tenant KEK from one platform master key to another (issue #153).
     ///
     /// The pool stays private, as everywhere else on this type. See [`crate::rekey`] for what
