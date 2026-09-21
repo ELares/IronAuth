@@ -377,6 +377,7 @@ fn operation_ids_are_the_stable_set() {
             "storeAgentVaultConnection",
             "suspendTenant",
             "testTokenHook",
+            "triggerBackup",
             "unassignOrgGroupRole",
             "unassignOrgMembershipRole",
             "unassignOrgRolePermission",
@@ -755,6 +756,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/order",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/test",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/backups",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/verify",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/config/promotion/apply",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/config/promotion/plan",
@@ -964,7 +966,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        307,
+        308,
         "the documented route count is pinned"
     );
 

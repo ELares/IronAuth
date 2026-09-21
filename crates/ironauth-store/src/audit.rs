@@ -1257,6 +1257,12 @@ pub enum Action {
     /// refused and this security event is written. The row targets the `pky_`
     /// credential; the `detail` records the stored and presented BE values.
     WebauthnBackupEligibilityMismatch,
+    /// An operator requested an on-demand backup through the management API (issue #153).
+    ///
+    /// The platform's backups are scheduled; a request is the durable, audited record that
+    /// the operator asked for one NOW. The runner performs the next available pass; the row
+    /// is the answer to "who asked, when, and with which idempotency key".
+    BackupRequested,
     /// A WebAuthn assertion presented a REGRESSING signature counter (issue #65):
     /// the credential's stored counter did not advance, a possible cloned
     /// authenticator. The row targets the `pky_` credential; the `detail` records
@@ -1980,6 +1986,7 @@ impl Action {
             Action::WebauthnCredentialRemove => "webauthn.credential.remove",
             Action::WebauthnCloneDetected => "webauthn.clone.detected",
             Action::WebauthnBackupEligibilityMismatch => "webauthn.backup_eligibility.mismatch",
+            Action::BackupRequested => "backup.requested",
             Action::TotpEnrollBegin => "account.totp.enroll_begin",
             Action::TotpActivate => "account.totp.activate",
             Action::TotpVerify => "account.totp.verify",

@@ -97,6 +97,8 @@ mod agents;
 mod audit_retention;
 /// AWS SigV4 signing for the S3 log sink (issue #110).
 pub mod backup_s3;
+pub mod backup_trigger;
+pub mod backups;
 pub mod certificate_expiry;
 pub mod certificate_notices;
 pub mod certificate_pin_requests;
@@ -228,6 +230,11 @@ pub use state::{
 #[allow(clippy::too_many_lines)]
 pub fn management_router(state: AdminState) -> Router {
     Router::new()
+        // On-demand backups (issue #153): record an audited request and wake the runner.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/backups",
+            post(backups::trigger_backup),
+        )
         // The operator plane: the root of the four-level resource model (issue
         // #41), a documented read surface above tenants.
         .route("/v1/operators", get(operators::list_operators))

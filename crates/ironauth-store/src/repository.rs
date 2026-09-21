@@ -1792,6 +1792,20 @@ impl ActingStore<'_> {
     ///
     /// `None` is accepted and is a no-op, so a caller that has an `Option` from a request header
     /// does not have to branch.
+    /// On-demand backup requests (issue #153).
+    ///
+    /// The platform's backups are scheduled; a request is the durable, audited record that
+    /// an operator asked for one NOW through the management API. The runner performs the
+    /// next available pass; this repo writes the record and nothing else.
+    #[must_use]
+    pub fn backup_requests(&self) -> BackupRequestRepo<'_> {
+        BackupRequestRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting.clone(),
+        }
+    }
+
     #[must_use]
     pub fn via(mut self, entry_path: Option<EntryPath>) -> Self {
         if let Some(entry_path) = entry_path {
@@ -48515,6 +48529,66 @@ fn decode_error(what: &str, value: &str) -> StoreError {
 }
 
 /// Log stream configuration.
+/// The on-demand backup request repository (issue #153).
+///
+/// `request_backup` is an AUDITED write and nothing else: the audit row is the durable
+/// record (who asked, when, with which idempotency key), and the runner performs the next
+/// available pass whether or not this process is the one running it. There is deliberately
+/// no command table for this request: a request issued while the scheduler is down is
+/// honoured by the next boot's first pass, and a command row would only duplicate the
+/// audit row's answer to "who asked".
+pub struct BackupRequestRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl BackupRequestRepo<'_> {
+    /// Record that an operator requested an on-demand backup, in ONE transaction with the
+    /// audit row and the caller's idempotency record.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn request_backup(
+        &self,
+        env: &Env,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::BackupRequested,
+                target: &BackupRequestTarget,
+            },
+            async move |tx| {
+                insert_idempotency(tx, idempotency).await?;
+                Ok(())
+            },
+            false,
+            Some("requested via the management API"),
+        )
+        .await
+    }
+}
+
+/// The audit target for a backup request: the platform's backup posture, one kind, one id.
+struct BackupRequestTarget;
+
+impl AuditTarget for BackupRequestTarget {
+    fn audit_target_kind(&self) -> &'static str {
+        "backup"
+    }
+
+    fn audit_target_id(&self) -> String {
+        "backup".to_owned()
+    }
+}
+
 pub struct LogStreamRepo<'a> {
     store: &'a Store,
     scope: Scope,

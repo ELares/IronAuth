@@ -402,6 +402,11 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // Captured BEFORE config and env are moved into the workers below: the scheduler
         // needs the section resolved and the master material read once, at boot.
         let backup_scheduler_inputs_captured = backup_scheduler_inputs(&config, &env);
+        // The on-demand trigger exists only when a runner will run: the endpoint still
+        // records and answers 202 without one, but there is nothing to wake.
+        let backup_trigger = backup_scheduler_inputs_captured
+            .is_some()
+            .then(|| std::sync::Arc::new(ironauth_admin::backup_trigger::BackupTrigger::new()));
         // CAPTURED HERE for the same reason as its neighbours, plus one of its own: the
         // enforcer is captured off `planes` further down, before the OIDC plane moves into the
         // router, so neither half of this refresher can be built at its start site.
@@ -502,7 +507,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             .map(|state| state.log_shipper().running_handle());
         let management = planes.management.map(|state| {
             tracing::info!("management API mounted on the management plane");
-            ironauth_admin::management_router(state)
+            ironauth_admin::management_router(state.with_backup_trigger(backup_trigger.clone()))
         });
         // Keep a clone of the management router (if any) for the admin console's
         // same-origin proxy (issue #90, PR 2): the browser reaches the management
@@ -743,9 +748,9 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // here, and OFF by default: the failure mode of backups being off is a larger restore
         // gap, and the failure mode of them being on by accident is an outbound push this
         // deployment did not intend.
-        let backup_scheduler = match backup_scheduler_inputs_captured {
-            Some(inputs) => start_backup_scheduler(inputs).await,
-            None => None,
+        let backup_scheduler = match (backup_scheduler_inputs_captured, backup_trigger) {
+            (Some(inputs), Some(trigger)) => start_backup_scheduler(inputs, trigger).await,
+            _ => None,
         };
 
         tracing::info!(base_url = %server.base_url(), "starting ironauth");
@@ -9216,6 +9221,7 @@ fn backup_scheduler_inputs(config: &Config, env: &Env) -> Option<BackupScheduler
 /// Start the scheduled backup runner, or [`None`] with the reason logged.
 async fn start_backup_scheduler(
     inputs: BackupSchedulerInputs,
+    trigger: std::sync::Arc<ironauth_admin::backup_trigger::BackupTrigger>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let fetcher = match ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default()) {
         Ok(fetcher) => fetcher,
@@ -9224,7 +9230,7 @@ async fn start_backup_scheduler(
             return None;
         }
     };
-    let handle = tokio::spawn(backup_scheduler_loop(inputs, fetcher));
+    let handle = tokio::spawn(backup_scheduler_loop(inputs, fetcher, trigger));
     tracing::info!("scheduled backups running");
     Some(handle)
 }
@@ -9249,11 +9255,21 @@ fn describe_backup_metrics() {
 /// The runner loop: one pass immediately (a fresh boot's data is the point of the first
 /// backup, and the interval's clock starts at boot rather than at last backup), then every
 /// interval.
-async fn backup_scheduler_loop(inputs: BackupSchedulerInputs, fetcher: ironauth_fetch::Fetcher) {
+async fn backup_scheduler_loop(
+    inputs: BackupSchedulerInputs,
+    fetcher: ironauth_fetch::Fetcher,
+    trigger: std::sync::Arc<ironauth_admin::backup_trigger::BackupTrigger>,
+) {
     describe_backup_metrics();
     loop {
         run_backup_pass(&inputs, &fetcher).await;
-        tokio::time::sleep(tokio::time::Duration::from_secs(inputs.interval_secs)).await;
+        // Wake on the on-demand trigger OR on the interval, whichever comes first: an
+        // operator's request is "now", and a sleeping interval must not stand between it
+        // and the next pass.
+        tokio::select! {
+            _ = trigger.notified() => {}
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(inputs.interval_secs)) => {}
+        }
     }
 }
 
@@ -9542,7 +9558,6 @@ async fn sealed_backup_dump(
         BACKUP_CONTEXT,
     ))
 }
-
 
 /// `ironauth storage restore --url DSN --in FILE --master-key ID:env:VAR [--i-will-overwrite]` — apply
 /// a sealed logical backup to a fresh database (issue #153).

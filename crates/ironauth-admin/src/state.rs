@@ -173,6 +173,10 @@ struct Inner {
     // feature, because `HookRuntime` is uninhabited there. The draft endpoint then answers a
     // clean refusal rather than being absent from the surface.
     hook_runtime: Option<Arc<ironauth_oidc::token_hook::HookRuntime>>,
+    // The on-demand backup trigger (issue #153), shared with the scheduled backup runner.
+    // `None` when this process runs no scheduler: the endpoint still records the audited
+    // request and answers 202, and the next boot's first pass honours it.
+    backup_trigger: Option<Arc<crate::backup_trigger::BackupTrigger>>,
     env: Env,
     // Wrapped in SecretString so it cannot leak through Debug/logs; the value is
     // reachable only via `.expose()` at the constant-time comparison site.
@@ -405,6 +409,7 @@ impl AdminState {
                 // the control store.
                 data_store: None,
                 hook_runtime: None,
+                backup_trigger: None,
                 env,
                 bootstrap_operator_token,
                 bootstrap_operator_id: OperatorId::from_seed_bytes(BOOTSTRAP_SEED),
@@ -1185,6 +1190,25 @@ impl AdminState {
 
     /// The control-plane store.
     #[must_use]
+    /// The on-demand backup trigger, when this process runs a scheduled backup runner.
+    #[must_use]
+    pub fn backup_trigger(&self) -> Option<Arc<crate::backup_trigger::BackupTrigger>> {
+        self.inner.backup_trigger.clone()
+    }
+
+    /// Attach the on-demand backup trigger to the state, so the management endpoint can
+    /// wake the runner. A no-op for a state built without a runner.
+    #[must_use]
+    pub fn with_backup_trigger(
+        mut self,
+        trigger: Option<Arc<crate::backup_trigger::BackupTrigger>>,
+    ) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("the state is freshly built")
+            .backup_trigger = trigger;
+        self
+    }
+
     pub fn store(&self) -> &Store {
         &self.inner.store
     }
