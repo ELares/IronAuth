@@ -587,6 +587,13 @@ jobs:
         run: |
           cargo test -p ironauth-oidc --features testing,ironcache --test rate_l2 -- --test-threads=1
           cargo check -p ironauth --features ironcache
+      # #146 CRITERION 6, MADE REAL FOR THE WHOLE REQUEST PATH: the FULL oidc suite runs
+      # with the cache attached. The seam suites and rate_l2 cover the seam; this is the
+      # "the full test suite passes in both modes" evidence — a divergence in dual mode
+      # shows up as a failing job here rather than in a deployment. The binaries are
+      # already built by the steps above; the cost is the run.
+      - name: the full oidc suite in dual mode (issue #146)
+        run: cargo test -p ironauth-oidc --features testing,ironcache
 
   msrv:
     name: msrv (1.85)
