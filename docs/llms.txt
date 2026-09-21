@@ -23,6 +23,7 @@ both files and fails if either drifts.
 - [Integrating applications and automation](docs/INTEGRATIONS.md): Use IronAuth's public protocols for application sign-in and its management
 - [Recovering a wrapped KEK hierarchy](docs/KEK-RECOVERY.md): Issue #153 criteria 4 and 6.
 - [The metric contract](docs/METRICS.md): Every series this build exports, with its type, its labels and what it means. GENERATED from
+- [Multi-Region Replication on the Event Backbone (issue #155, EXPLORATORY)](docs/MULTI-REGION-REPLICATION.md): Status: **design note** — pinned assumptions recorded before code hardens, per the
 - [Running and operating IronAuth](docs/OPERATIONS.md): IronAuth runs as one server binary with PostgreSQL as its required persistent
 - [Measured startup and idle footprint](docs/PERFORMANCE.md): Issue #152 criterion 3 asks for RSS idle and startup time against the stated targets, with
 - [IronAuth documentation](docs/README.md): Start with the task you want to complete, then use the references for the
