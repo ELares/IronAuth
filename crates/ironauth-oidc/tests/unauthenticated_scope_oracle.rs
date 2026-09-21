@@ -187,6 +187,18 @@ fn cases() -> Vec<Case> {
             body: "",
             live_status: StatusCode::NOT_FOUND,
         },
+        // THE DRY-RUN TRACE (issue #154 criterion 5), driven with the surface OFF for the
+        // same reason the check above is: with `[forward_auth]` at its default the handler
+        // returns 404 before any store call, so the live and ghost answers are the same
+        // 404, and the feature gate is pinned not to be a scope oracle.
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/forward-auth/dry-run",
+            query: "",
+            method: "POST",
+            content_type: "application/json",
+            body: "{}",
+            live_status: StatusCode::NOT_FOUND,
+        },
         // THE RISC RECEIVER (issue #144), DRIVEN rather than excluded. It is the one route
         // of the sixteen registered here that is mounted UNCONDITIONALLY, so unlike the SSF
         // six its path exists and something can be compared.
