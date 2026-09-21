@@ -458,6 +458,7 @@ run "diagnostics redaction corpus (a sentinel in any free-form diagnostic field 
 run "canonicalization seam (every identifier comparison routes through the one seam)" scripts/canonicalization-seam.sh
 
 run "hashing pool boundary (every request-path hash routes through the admission-controlled pool)" scripts/hashing-pool-boundary.sh
+run "no request-path connections (the storage seam a cross-region call would need, issue #155)" scripts/no-request-path-connections.sh
 
 run "http audit (ironauth-fetch is the only outbound HTTP path)" scripts/http-audit.sh
 

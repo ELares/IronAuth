@@ -158,6 +158,21 @@ pub const ACCESS_REQUEST_APPROVAL_FEATURE: &str = "access-request-approval";
 /// an upgrade cannot silently start accepting a different contract.
 pub const ACCESS_REQUEST_APPROVAL_VERSION: &str = "access-request-approval-1";
 
+/// Multi-region replication on the event backbone (issue #155, EXPLORATORY).
+pub const MULTI_REGION_REPLICATION_FEATURE: &str = "multi-region-replication";
+
+/// The shape acknowledged by an operator enabling [`MULTI_REGION_REPLICATION_FEATURE`].
+///
+/// A counter rather than a draft revision: what an operator acknowledges here is
+/// IronAuth's OWN replication design, recorded in docs/MULTI-REGION-REPLICATION.md. The
+/// feature is EXPLORATORY: replication of the outbox event stream from a home region to
+/// followers is not built, so enabling the flag today changes nothing but the ack — the
+/// registration is what makes "unavailable without the experimental ack" true the day the
+/// code lands, and the pinned assumptions (single writer region per environment,
+/// asynchronous-only cross-region flows, Postgres-only plus optional IronBus transport,
+/// operator-initiated failover) are the design note's.
+pub const MULTI_REGION_REPLICATION_VERSION: &str = "multi-region-replication-1";
+
 /// Device-posture policy predicates (issue #145 criterion 5, EXPLORATORY).
 pub const DEVICE_POSTURE_FEATURE: &str = "device-posture-policy-hooks";
 
@@ -481,6 +496,22 @@ impl FeatureRegistry {
         ));
     }
 
+    /// Registers multi-region replication (issue #155, EXPLORATORY).
+    ///
+    /// Nothing is built yet: the registration is the gate. The issue requires the feature
+    /// to be unavailable without the experimental ack from the M1 maturity ladder, so the
+    /// flag exists and is registered before the code does, and the design note (the
+    /// issue's own first deliverable — "design assumptions written down before code
+    /// hardens") records what enabling it will acknowledge.
+    pub fn register_multi_region_replication(&mut self) {
+        self.register(Feature::experimental(
+            MULTI_REGION_REPLICATION_FEATURE,
+            "Multi-region replication on the event backbone (issue #155, EXPLORATORY):              the ordered outbox event stream replicates from a tenant's home region to              follower regions, with explicit tunable RPO, operator-initiated failover, and              cross-region flows asynchronous only. NOT BUILT: this registration is the              ack gate the issue requires, and enabling the flag today changes nothing.              The pinned assumptions and graduation trigger are recorded in              docs/MULTI-REGION-REPLICATION.md.",
+            MULTI_REGION_REPLICATION_VERSION,
+            "docs/MULTI-REGION-REPLICATION.md",
+        ));
+    }
+
     /// Registers device-posture policy predicates (issue #145 criterion 5, EXPLORATORY).
     pub fn register_device_posture(&mut self) {
         self.register(Feature::experimental(
@@ -580,6 +611,7 @@ impl FeatureRegistry {
         registry.register_wasm_hooks();
         registry.register_access_request_approval();
         registry.register_device_posture();
+        registry.register_multi_region_replication();
         registry.register_portal_widgets();
         registry
     }
