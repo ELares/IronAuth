@@ -264,6 +264,16 @@ pub struct Config {
     /// requirement onto the long one or the long storage bill onto the short one.
     pub audit_retention: AuditRetentionConfig,
 
+    /// Scheduled encrypted backups to S3-compatible object storage (issue #153): whether
+    /// THIS process takes a logical backup of the primary store on an interval and pushes
+    /// it, sealed under the platform master key, to the configured bucket.
+    ///
+    /// OFF by default. The failure mode of backups being off is a larger restore gap; the
+    /// failure mode of them being on by accident is an outbound push this deployment did
+    /// not intend — and the section's S3 endpoint and credential are exactly the kind of
+    /// configuration a repository scan should not be able to enable silently.
+    pub backup: BackupConfig,
+
     /// SIEM log stream shipping (issue #110): whether THIS process ships configured
     /// streams to their sinks, and how often.
     ///
@@ -647,6 +657,67 @@ impl Default for AuditRetentionConfig {
             authentication_retention_secs: 0,
             batch: 1_000,
             interval_secs: 60 * 60,
+        }
+    }
+}
+
+/// Scheduled encrypted backups to S3-compatible object storage (issue #153).
+///
+/// OFF by default and off again without a DSN, so a deployment that never opens this
+/// section pushes nothing. The `url` must name a role that sees every row (a superuser or
+/// BYPASSRLS), because the backup is a logical dump of the whole primary store and a
+/// role subject to `FORCE ROW LEVEL SECURITY` would dump zero rows with no error — the
+/// runner probes this and refuses the run, exactly like `ironauth storage backup` does.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct BackupConfig {
+    /// Whether THIS process takes scheduled backups. OFF by default.
+    pub enabled: bool,
+
+    /// Seconds between backup passes.
+    pub interval_secs: u64,
+
+    /// The DSN for the backup's `pg_dump` connection. MUST name a superuser or BYPASSRLS
+    /// role; the runner refuses a run when the connected role is subject to row-level
+    /// security. [`None`] disables the schedule however `enabled` is set.
+    pub url: Option<Secret>,
+
+    /// The S3-compatible endpoint (an `https` URL) the sealed backups are pushed to.
+    pub s3_endpoint: Option<String>,
+
+    /// The bucket on that endpoint.
+    pub s3_bucket: Option<String>,
+
+    /// The object-key prefix, defaulting to `ironauth-backups`.
+    pub s3_prefix: String,
+
+    /// The S3 region for signing, defaulting to `us-east-1`.
+    pub s3_region: String,
+
+    /// The secret holding `<access key id>:<secret access key>`, the shape every S3 tool
+    /// takes. Named as `ID:env:VAR` or `ID:file:PATH`, like the log sink's credential.
+    pub s3_credential: Option<Secret>,
+
+    /// How long a backup object is kept, in seconds. `0` means keep forever — the same
+    /// default direction as audit retention: the failure mode of retention being off is a
+    /// larger bucket, and the failure mode of it being on by accident is a deleted
+    /// restore point. Only one of those is recoverable.
+    pub retention_secs: u64,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 24 * 60 * 60,
+            url: None,
+            s3_endpoint: None,
+            s3_bucket: None,
+            s3_prefix: "ironauth-backups".to_owned(),
+            s3_region: "us-east-1".to_owned(),
+            s3_credential: None,
+            // FOREVER, not "immediately".
+            retention_secs: 0,
         }
     }
 }
@@ -6452,6 +6523,7 @@ impl Config {
         validate_risc_receiver(&self.risc_receiver)?;
         validate_forward_auth(&self.forward_auth, &self.proxy, self.oidc.enabled)?;
         validate_scim_push(&self.scim_push)?;
+        validate_backup(&self.backup)?;
         validate_certificate_expiry(&self.certificate_expiry)?;
         check_oidc_lifetime(
             "oidc.authorization_code_ttl_secs",
@@ -6661,6 +6733,48 @@ fn validate_certificate_expiry(expiry: &CertificateExpiryConfig) -> Result<(), C
 }
 
 /// Refuse a `scim_push` section that would run the worker without pausing.
+fn validate_backup(backup: &BackupConfig) -> Result<(), ConfigError> {
+    if !backup.enabled {
+        return Ok(());
+    }
+    if backup.url.is_none() {
+        return Err(ConfigError::Invalid {
+            message: "backup.url must be set when backup.enabled is true: the runner needs a                       DSN naming a superuser or BYPASSRLS role to dump every row"
+                .to_string(),
+        });
+    }
+    if backup.s3_endpoint.is_none() || backup.s3_bucket.is_none() {
+        return Err(ConfigError::Invalid {
+            message: "backup.s3_endpoint and backup.s3_bucket must both be set when                       backup.enabled is true"
+                .to_string(),
+        });
+    }
+    if let Some(endpoint) = &backup.s3_endpoint {
+        if !endpoint.starts_with("https://") {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "backup.s3_endpoint ({endpoint}) must be an https URL: the push rides                      the SSRF-hardened outbound path, and a plaintext endpoint is refused"
+                ),
+            });
+        }
+    }
+    if backup.s3_credential.is_none() {
+        return Err(ConfigError::Invalid {
+            message: "backup.s3_credential must be set when backup.enabled is true: an                       `<access key id>:<secret access key>` secret, named ID:env:VAR or                       ID:file:PATH"
+                .to_string(),
+        });
+    }
+    if backup.retention_secs > 0 && backup.retention_secs < 60 {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "backup.retention_secs ({}) must be 0 (keep forever) or at least 60",
+                backup.retention_secs
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn validate_scim_push(scim_push: &ScimPushConfig) -> Result<(), ConfigError> {
     if scim_push.enabled && scim_push.interval_secs == 0 {
         return Err(ConfigError::Invalid {
@@ -12652,6 +12766,45 @@ enabled = true
         assert!(err.to_string().contains("https"), "{err}");
         let ok = "[password_policy]\nhibp_base_url = \"https://mirror.example.test\"\n";
         Config::from_toml_str(ok, "<inline>").expect("https base loads");
+    }
+
+    /// The backup section refuses to be enabled half-configured: a schedule with no DSN,
+    /// no S3 endpoint, or no credential is a startup failure, and a plaintext endpoint is
+    /// refused because the push rides the SSRF-hardened outbound path.
+    #[test]
+    fn the_backup_section_refuses_a_half_configured_schedule() {
+        let cases = [
+            ("[backup]\nenabled = true\n", "backup.url must be set"),
+            (
+                "[backup]\nenabled = true\nurl = \"ID:env:BACKUP_URL\"\n",
+                "s3_endpoint and backup.s3_bucket must both be set",
+            ),
+            (
+                "[backup]\nenabled = true\nurl = \"ID:env:BACKUP_URL\"\n\
+                 s3_endpoint = \"http://s3.internal\"\ns3_bucket = \"b\"\n\
+                 s3_credential = \"ID:env:BACKUP_CRED\"\n",
+                "must be an https URL",
+            ),
+            (
+                "[backup]\nenabled = true\nurl = \"ID:env:BACKUP_URL\"\n\
+                 s3_endpoint = \"https://s3.example.test\"\ns3_bucket = \"b\"\n\
+                 s3_credential = \"ID:env:BACKUP_CRED\"\nretention_secs = 10\n",
+                "at least 60",
+            ),
+        ];
+        for (toml, expected) in cases {
+            let err = Config::from_toml_str(toml, "<inline>").expect_err("refused");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?} in: {err}"
+            );
+        }
+        let ok = "[backup]\nenabled = true\nurl = \"ID:env:BACKUP_URL\"\n\
+                  s3_endpoint = \"https://s3.example.test\"\ns3_bucket = \"b\"\n\
+                  s3_credential = \"ID:env:BACKUP_CRED\"\n";
+        Config::from_toml_str(ok, "<inline>").expect("a complete section loads");
+        // OFF stays valid however little it says.
+        Config::from_toml_str("", "<inline>").expect("empty loads");
     }
 
     #[test]

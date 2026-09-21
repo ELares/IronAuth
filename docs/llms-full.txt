@@ -1114,6 +1114,16 @@ at the top of the file, or map it in `.taplo.toml`).
 | `audit_retention.database_url` | string or table or unset | unset | The connection for the `ironauth_audit_retention` role (migration 0136), which is the ONLY role granted DELETE on `audit_log` and `audit_chain`. |
 | `audit_retention.enabled` | boolean | `false` | Whether THIS process sweeps expired audit rows. OFF by default. |
 | `audit_retention.interval_secs` | integer | `3600` | Seconds between sweeps. |
+| `backup` | table | see fields | Scheduled encrypted backups to S3-compatible object storage (issue #153): whether THIS process takes a logical backup of the primary store on an interval and pushes it, sealed under the platform master key, to the configured bucket. |
+| `backup.enabled` | boolean | `false` | Whether THIS process takes scheduled backups. OFF by default. |
+| `backup.interval_secs` | integer | `86400` | Seconds between backup passes. |
+| `backup.retention_secs` | integer | `0` | How long a backup object is kept, in seconds. `0` means keep forever — the same default direction as audit retention: the failure mode of retention being off is a larger bucket, and the failure mode of it being on by accident is a deleted restore point. Only one of those is recoverable. |
+| `backup.s3_bucket` | string or unset | unset | The bucket on that endpoint. |
+| `backup.s3_credential` | string or table or unset | unset | The secret holding `<access key id>:<secret access key>`, the shape every S3 tool takes. Named as `ID:env:VAR` or `ID:file:PATH`, like the log sink's credential. |
+| `backup.s3_endpoint` | string or unset | unset | The S3-compatible endpoint (an `https` URL) the sealed backups are pushed to. |
+| `backup.s3_prefix` | string | `"ironauth-backups"` | The object-key prefix, defaulting to `ironauth-backups`. |
+| `backup.s3_region` | string | `"us-east-1"` | The S3 region for signing, defaulting to `us-east-1`. |
+| `backup.url` | string or table or unset | unset | The DSN for the backup's `pg_dump` connection. MUST name a superuser or BYPASSRLS role; the runner refuses a run when the connected role is subject to row-level security. [`None`] disables the schedule however `enabled` is set. |
 | `byok` | table | see fields | Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49). NOT IMPLEMENTED (issue #459): no boot path reads this section, so no value in it changes any behaviour, and startup REFUSES a non-default value rather than accept one it will ignore. It WOULD let a customer-managed root key wrap a tenant's key-encryption key, so revoking it crypto-shreds the tenant; the store half of that exists, the config path to it does not. |
 | `byok.enabled` | boolean | `false` | NOT IMPLEMENTED (issue #459). Nothing in the workspace reads this section, so setting this changes no behaviour, and startup REFUSES a non-default value rather than accept a capability it does not have. Left declared because the store half of BYOK does exist; this is the switch that would gate it. |
 | `byok.endpoint` | string or unset | unset | NOT IMPLEMENTED (issue #459): nothing reads it and a set value is refused at startup. Would be the external KMS/HSM endpoint URL for an external `provider`, routed through the SSRF-hardened fetcher. |
@@ -9031,6 +9041,9 @@ label on the wire with every test green.
 
 | metric | type | labels | meaning |
 | --- | --- | --- | --- |
+| `ironauth_backup_failure_total` | counter | none | Scheduled encrypted-backup passes that failed |
+| `ironauth_backup_last_success_timestamp_seconds` | gauge | none | Unix seconds of the last successful scheduled backup push; a dashboard derives age |
+| `ironauth_backup_success_total` | counter | none | Scheduled encrypted-backup passes that pushed and (when configured) pruned successfully |
 | `ironauth_connector_healthy` | gauge | `connector` | Whether an upstream connector's last probe succeeded |
 | `ironauth_connector_upstream_error_total` | counter | `connector`, `kind` | Upstream connector calls that failed, by failure kind |
 | `ironauth_connector_upstream_success_total` | counter | `connector` | Upstream connector calls that succeeded |
@@ -9077,7 +9090,7 @@ label on the wire with every test green.
 | `ironauth_up` | gauge | none | 1 while the process is serving |
 | `ironauth_verification_send_suppressed_total` | counter | `purpose` | Verification sends suppressed, by purpose |
 
-45 metrics, 13 of them carrying no labels at all.
+48 metrics, 16 of them carrying no labels at all.
 
 ## Scope
 

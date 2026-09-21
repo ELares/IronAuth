@@ -66,6 +66,11 @@ pub struct CanonicalRequest<'a> {
     pub method: &'a str,
     /// The URI path, already encoded.
     pub path: &'a str,
+    /// The query string as (key, value) pairs, already percent-encoded, and empty for a
+    /// request without one. Sorted here, not by the caller: SigV4 signs the SORTED query,
+    /// and a signature computed over a differently-ordered query is refused with a 403 that
+    /// says nothing about ordering.
+    pub query: &'a [(String, String)],
     /// Headers to sign, as (lowercase name, trimmed value). Sorted here, not by the caller.
     pub headers: Vec<(String, String)>,
     /// Lowercase hex SHA-256 of the body.
@@ -90,8 +95,31 @@ impl CanonicalRequest<'_> {
         let signed_headers = self.signed_headers();
         format!(
             "{}\n{}\n\n{}\n{}\n{}",
-            self.method, self.path, canonical_headers, signed_headers, self.payload_hash
+            self.method,
+            self.uri(),
+            canonical_headers,
+            signed_headers,
+            self.payload_hash
         )
+    }
+
+    /// The canonical URI: the path, and the sorted, joined query when there is one.
+    #[must_use]
+    pub fn uri(&self) -> String {
+        if self.query.is_empty() {
+            return self.path.to_owned();
+        }
+        let mut query = self.query.to_vec();
+        query.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        use std::fmt::Write as _;
+        let mut joined = String::new();
+        for (index, (key, value)) in query.iter().enumerate() {
+            if index > 0 {
+                joined.push('&');
+            }
+            let _ = write!(joined, "{key}={value}");
+        }
+        format!("{}?{}", self.path, joined)
     }
 
     /// The semicolon-joined, sorted, lowercase header names.
@@ -159,6 +187,53 @@ mod tests {
 
     /// RFC 4231 test case 1, so the HMAC underneath is a KNOWN-ANSWER check rather than
     /// this module agreeing with itself.
+    /// The canonical URI sorts the query pairs and joins them with `&`, the ordering S3
+    /// recomputes when it verifies the signature.
+    #[test]
+    fn the_canonical_uri_sorts_the_query_pairs() {
+        let request = CanonicalRequest {
+            method: "GET",
+            path: "/bucket",
+            query: &[
+                (
+                    "prefix".to_string(),
+                    "ironauth-backups%2F20240101".to_string(),
+                ),
+                ("list-type".to_string(), "2".to_string()),
+            ],
+            headers: vec![("host".to_string(), "s3.example".to_string())],
+            payload_hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        };
+        assert_eq!(
+            request.uri(),
+            "/bucket?list-type=2&prefix=ironauth-backups%2F20240101"
+        );
+        // The rendered canonical request carries the same sorted URI.
+        assert!(
+            request
+                .render()
+                .starts_with("GET\n/bucket?list-type=2&prefix=")
+        );
+    }
+
+    /// A request without a query renders a bare path, so a caller that forgets the field
+    /// signs exactly what an endpoint without query parameters expects.
+    #[test]
+    fn a_request_without_a_query_renders_a_bare_path() {
+        let request = CanonicalRequest {
+            method: "DELETE",
+            path: "/bucket/ironauth-backups%2F20240101%2F20240101T000000Z.bin",
+            query: &[],
+            headers: vec![("host".to_string(), "s3.example".to_string())],
+            payload_hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        };
+        assert!(
+            request
+                .render()
+                .starts_with("DELETE\n/bucket/ironauth-backups%2F")
+        );
+    }
+
     #[test]
     fn hmac_sha256_matches_the_rfc_4231_vector() {
         let key = [0x0b_u8; 20];
@@ -182,6 +257,7 @@ mod tests {
         let request = CanonicalRequest {
             method: "PUT",
             path: "/bucket/key",
+            query: &[],
             headers: vec![
                 ("x-amz-date".to_string(), "20240101T000000Z".to_string()),
                 ("host".to_string(), "s3.example".to_string()),
