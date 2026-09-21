@@ -9078,6 +9078,7 @@ fn backup_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
+
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -9097,6 +9098,7 @@ fn backup_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
             }
         };
         // The dump+seal pipeline now lives in sealed_backup_dump; what follows writes it.
+
         if let Err(error) = std::fs::write(&out, sealed.as_bytes()) {
             eprintln!("ironauth backup: cannot write {out}: {error}");
             return ExitCode::FAILURE;
@@ -9540,6 +9542,7 @@ async fn sealed_backup_dump(
         BACKUP_CONTEXT,
     ))
 }
+
 
 /// `ironauth storage restore --url DSN --in FILE --master-key ID:env:VAR [--i-will-overwrite]` — apply
 /// a sealed logical backup to a fresh database (issue #153).
