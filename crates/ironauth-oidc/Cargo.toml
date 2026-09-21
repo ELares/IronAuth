@@ -336,6 +336,11 @@ required-features = ["testing", "wasm-hooks"]
 # plus the terminal mints a session with the honest amr. Over a real database (DATABASE_URL); see
 # scripts/with-test-db.sh.
 [[test]]
+name = "login_identifier_migration"
+path = "tests/login_identifier_migration.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "flow_login_flip"
 path = "tests/flow_login_flip.rs"
 required-features = ["testing"]
