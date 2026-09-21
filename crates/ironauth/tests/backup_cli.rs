@@ -16,6 +16,7 @@ use ironauth_env::Env;
 use sqlx::PgPool;
 
 use ironauth_store::test_support::TestDatabase;
+use ironauth_store::{CorrelationId, NewSession, SessionId};
 
 /// Write a master-key secret to its own file and return the `ID:file:PATH` name.
 fn secret(name: &str, secret: &str) -> String {
@@ -90,7 +91,34 @@ async fn fresh_database(name: &str) -> String {
 async fn restore_into_a_fresh_database_yields_the_backed_up_store() {
     let database = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0B0A_C001);
-    database.seed_scope(&env).await;
+    let scope = database.seed_scope(&env).await;
+
+    // A REAL session through the same path a login uses, so the restore's "sessions remain
+    // valid" claim is about a row the validation path recognises, not a hand-shaped one.
+    let session_id = SessionId::generate(&env, &scope);
+    let absolute_expires_micros = 4_000_000_000_000_000_i64;
+    database
+        .store()
+        .scoped(scope)
+        .acting(database.test_actor(&env), CorrelationId::generate(&env))
+        .sessions()
+        .rotate(
+            &env,
+            &session_id,
+            None,
+            NewSession {
+                impersonation: None,
+                subject: "usr_restore_probe",
+                auth_methods: "pwd",
+                auth_time_micros: 1_700_000_000_000_000,
+                idle_expires_micros: absolute_expires_micros,
+                absolute_expires_micros,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("create a session");
 
     let out = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("backup-{}.bin", std::process::id()))
@@ -135,7 +163,27 @@ async fn restore_into_a_fresh_database_yields_the_backed_up_store() {
         .expect("read the target environments");
     assert_eq!(environments, 1, "the seeded environment must survive");
     pool.close().await;
+
+    // THE "SESSIONS REMAIN VALID" CRITERION: the session created before the backup is
+    // read back on the RESTORED instance through the same validation path the runtime
+    // uses (revoked/ended/superseded/expiry guards), and it resolves with the subject it
+    // had. The restore did not reset, re-mint, or orphan it.
+    let restored = ironauth_store::Store::connect(&target)
+        .await
+        .expect("connect to the restored store");
+    let restored_session = restored
+        .scoped(scope)
+        .sessions()
+        .get(&session_id, 1_700_000_000_000_000 + 3_600_000_000, idle_ttl)
+        .await
+        .expect("read the restored session");
+    let session = restored_session.expect("the restored session must resolve as valid");
+    assert_eq!(session.subject.as_str(), "usr_restore_probe");
+    restored.close_pool_for_test().await;
 }
+
+/// An idle TTL inside the session's window, so the validation path reads it as live.
+const idle_ttl: i64 = 3_600_000_000;
 
 /// THE CHECKSUM-MISMATCH CRITERION AT THE COMMAND: a single flipped byte in the encrypted file
 /// refuses, and the target is left untouched.
