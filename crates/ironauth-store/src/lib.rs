@@ -105,6 +105,7 @@ pub mod rar;
 pub mod recovery;
 mod redirect;
 pub mod rekey;
+pub mod replication;
 mod repository;
 pub mod risk;
 mod scope;

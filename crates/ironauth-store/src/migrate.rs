@@ -1974,6 +1974,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0231_tenant_quota_limits_scope_fk.sql"),
         },
+        // EXPAND (issue #155, EXPLORATORY): the follower-side replication cursor table.
+        // Inert until a replication shipper runs; nothing else writes it.
+        Migration {
+            version: 232,
+            name: "replication_cursors",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0232_replication_cursors.sql"),
+        },
     ]
 }
 
