@@ -141,6 +141,20 @@ pub async fn apply_event(
     )
     .await?;
     copy_row(home, follower, table, entity_id, tenant_id, environment_id).await?;
+    // A user's identity is more than the users row: the multi-identifier surface lives
+    // in `user_identifiers`, and a login through ANY identifier must resolve on the
+    // follower, not just the primary one the users row carries.
+    if table == "users" {
+        copy_children(
+            home,
+            follower,
+            "user_identifiers",
+            entity_id,
+            tenant_id,
+            environment_id,
+        )
+        .await?;
+    }
     Ok(AppliedEvent {
         event_type: event_type.to_owned(),
         copied: Some(table.to_owned()),
@@ -278,6 +292,52 @@ pub async fn promote_scope(
     ] {
         copy_scope_rows(home, follower, table, tenant_id, environment_id, conflict).await?;
     }
+    Ok(())
+}
+
+/// Copy every row of `table` owned by `entity_id` (a `user_id`-shaped column), the
+/// child rows the entity's own copy does not carry.
+///
+/// # Errors
+///
+/// [`sqlx::Error`] on a persistence failure.
+async fn copy_children(
+    home: &PgPool,
+    follower: &PgPool,
+    table: &str,
+    entity_id: &str,
+    tenant_id: &str,
+    environment_id: &str,
+) -> Result<(), sqlx::Error> {
+    let rows: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT row_to_json(t)::text FROM {table} t \
+         WHERE user_id = $1 AND tenant_id = $2 AND environment_id = $3"
+    ))
+    .bind(entity_id)
+    .bind(tenant_id)
+    .bind(environment_id)
+    .fetch_all(home)
+    .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut tx = follower.begin().await?;
+    sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+        .bind(environment_id)
+        .execute(&mut *tx)
+        .await?;
+    let statement = format!(
+        "INSERT INTO {table} SELECT * FROM json_populate_record(NULL::{table}, $1::json) \
+         ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id"
+    );
+    for json in &rows {
+        sqlx::query(&statement).bind(json).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 

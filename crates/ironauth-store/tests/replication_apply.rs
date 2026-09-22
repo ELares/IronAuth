@@ -19,7 +19,10 @@ use ironauth_env::Env;
 use ironauth_store::replication::ReplicationShipper;
 use ironauth_store::replication_apply::{apply_envelopes, shipped_domain_events};
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{CorrelationId, NewOutboxMessage, WEBHOOK_EVENT_CONSUMER};
+use ironauth_store::{
+    CorrelationId, IdentifierType, NewOutboxMessage, NewUserIdentifier, UniquenessMode,
+    UserIdentifierId, WEBHOOK_EVENT_CONSUMER,
+};
 
 /// THE ACCEPTANCE CRITERION'S INTEGRATION TEST: a home-region user becomes queryable
 /// on the follower within the replication pass.
@@ -120,4 +123,96 @@ async fn a_home_user_is_queryable_on_the_follower_after_ship_and_apply() {
         .await
         .expect("count the follower users");
     assert_eq!(count, 1, "a re-apply must not duplicate");
+}
+
+/// THE WIDENING: a secondary identifier on the multi-identifier surface resolves on the
+/// follower too — a login through ANY identifier works after failover, not just the
+/// primary one the users row carries.
+#[tokio::test]
+async fn a_secondary_identifier_resolves_on_the_follower_after_apply() {
+    let home = TestDatabase::start().await;
+    let follower = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0F0A_02);
+    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0F0A_02);
+    let scope = home.seed_scope(&env).await;
+    follower.seed_scope(&follow_env).await;
+
+    const PHC_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aGFzaGhhc2hoYXNo";
+    let (actor, corr) = (home.test_actor(&env), CorrelationId::generate(&env));
+    let user_id = home
+        .store()
+        .scoped(scope)
+        .acting(actor, corr)
+        .users()
+        .register(&env, "primary@example.test", PHC_HASH, None)
+        .await
+        .expect("register the home user");
+    let identifier_id = UserIdentifierId::generate(&env, &scope);
+    home.store()
+        .scoped(scope)
+        .acting(home.test_actor(&env), CorrelationId::generate(&env))
+        .user_identifiers()
+        .add(
+            &env,
+            NewUserIdentifier {
+                id: &identifier_id,
+                user_id: &user_id,
+                identifier_type: IdentifierType::Email,
+                raw: "secondary@example.test",
+                verified: false,
+                mode: ironauth_store::UniquenessMode::EnvironmentWide,
+                org: None,
+            },
+            None,
+        )
+        .await
+        .expect("add the secondary identifier");
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt-apply-secondary",
+        "user.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        0,
+        &serde_json::json!({ "user_id": user_id.to_string(), "state": "active" }),
+    )
+    .expect("a registered event type");
+    home.store()
+        .scoped(scope)
+        .outbox()
+        .append_event(
+            &env,
+            &NewOutboxMessage {
+                consumer: WEBHOOK_EVENT_CONSUMER,
+                idempotency_key: "evt-apply-secondary",
+                ordering_key: &user_id.to_string(),
+                payload: envelope,
+            },
+        )
+        .await
+        .expect("enqueue the event");
+
+    let shipper = ReplicationShipper::new(home.owner_pool().clone(), follower.owner_pool().clone());
+    shipper.ship(1_000).await.expect("the stream ships");
+    let events = shipped_domain_events(follower.owner_pool())
+        .await
+        .expect("the shipped domain events");
+    apply_envelopes(home.owner_pool(), follower.owner_pool(), &events)
+        .await
+        .expect("the apply runs");
+
+    // The secondary identifier resolves on the follower through the same read the login
+    // path uses.
+    let resolved = follower
+        .store()
+        .scoped(scope)
+        .user_identifiers()
+        .resolve(IdentifierType::Email, "secondary@example.test")
+        .await
+        .expect("the follower resolution runs");
+    assert_eq!(resolved.len(), 1, "the secondary identifier resolves");
+    assert_eq!(
+        resolved[0].user_id, user_id,
+        "to the SAME user the home created"
+    );
 }
