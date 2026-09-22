@@ -1051,6 +1051,24 @@ fn resource_cases(base: &str, ids: &Ids) -> Vec<Case> {
     } = ids;
     vec![
         Case {
+            label: "quota.setQuotaLimit",
+            method: "PUT",
+            path: format!("{base}/quota/limits/qty_requests"),
+            body: Some(body_of(&serde_json::json!({ "limit": 100 }))),
+        },
+        Case {
+            label: "quota.clearQuotaLimit",
+            method: "DELETE",
+            path: format!("{base}/quota/limits/qty_requests"),
+            body: None,
+        },
+        Case {
+            label: "backups.triggerBackup",
+            method: "POST",
+            path: format!("{base}/backups"),
+            body: None,
+        },
+        Case {
             label: "sessions.bulkRevokeSessions",
             method: "POST",
             path: format!("{base}/sessions/revoke"),
