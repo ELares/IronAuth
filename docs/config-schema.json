@@ -2799,6 +2799,25 @@
       },
       "type": "object"
     },
+    "ReplicationConfig": {
+      "additionalProperties": false,
+      "description": "Replication settings (issue #155, EXPLORATORY): the operator-chosen lag bound the\noutbox-stream replication shipper alerts at.\n\nOFF by default, like every worker here. The shipper's boot wiring is a later slice;\nthis section exists so the chosen lag bound is config, and a deployment that never\nopens it alerts on nothing. The alerting default direction mirrors audit retention:\nthe failure mode of alerting being off is a silent lag, and the failure mode of it\nbeing on by accident is noise.",
+      "properties": {
+        "alert_threshold_messages": {
+          "default": 0,
+          "description": "The lag bound, in stream positions: a partition whose lag exceeds it is alerted.\n`0` disables alerting.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Whether the replication shipper is wired at boot (a later slice; currently inert).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "RiscReceiverConfig": {
       "additionalProperties": false,
       "description": "The Google Cross-Account Protection receiver (issue #144).\n\nGoogle Cross-Account Protection is a RISC transmitter: when a Google account is believed\ncompromised, disabled or purged, Google pushes a signed Security Event Token to receivers\nthat have registered for it. For a deployment whose users sign in WITH Google, consuming\nthat stream closes a real account-takeover path -- the attacker holds the upstream\naccount, and without this the local sessions minted from it keep working.\n\n# Why this is its own section and not a third-party signal source\n\nIssue #144 puts the general-purpose case out of scope on purpose: \"only the Google\nCross-Account Protection consumer ships here\", and \"this receiver deliberately applies\nits own fixed, per-environment configured action set so the Google consumer never depends\non an experimental feature.\" The typed third-party risk-signal seam is\nexperimental-flagged; a protection that ends sessions must not be reachable only when an\nexperiment is switched on.\n\n# Nothing here has a usable default\n\nEvery field that names the transmitter -- the issuer, its keys, the algorithms, the\nconnector its subjects belong to -- is empty by default and validated when `enabled` is\nset. A receiver with a default issuer would either accept nothing or, worse, accept\nsomething.",
@@ -3991,6 +4010,14 @@
         ]
       },
       "description": "Per-tenant and per-environment quota fairness settings (issue #50). The\noperator-plane noisy-neighbor guard: nested token buckets that keep one\ntenant or environment from starving another. Safe defaults, fully tunable\n(the tunability principle); a burst of 0 for a dimension means unlimited\n(the single-tenant self-hoster posture)."
+    },
+    "replication": {
+      "$ref": "#/$defs/ReplicationConfig",
+      "default": {
+        "alert_threshold_messages": 0,
+        "enabled": false
+      },
+      "description": "Replication (issue #155, EXPLORATORY): the operator-chosen lag bound the\noutbox-stream replication shipper alerts at. OFF by default."
     },
     "risc_receiver": {
       "$ref": "#/$defs/RiscReceiverConfig",

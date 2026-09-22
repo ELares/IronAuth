@@ -38,6 +38,22 @@ use sqlx::{PgPool, Row};
 /// The batch bound: how many home rows one pass may copy per (tenant, environment).
 pub const BATCH_LIMIT: i64 = 1_000;
 
+/// The lag gauge: replication lag in stream positions, per partition (issue #155
+/// criterion: "replication lag is exported per tenant in the metric contract with
+/// alerting thresholds").
+pub const REPLICATION_LAG_MESSAGES: &str = "ironauth_replication_lag_messages";
+
+/// The shipped counter: home stream rows copied per partition.
+pub const REPLICATION_SHIPPED_TOTAL: &str = "ironauth_replication_shipped_total";
+
+/// Whether `lag` breaches `threshold`. A threshold of zero disables alerting, matching
+/// the audit-retention default direction: the failure mode of alerting being off is a
+/// silent lag, and the failure mode of it being on by accident is noise.
+#[must_use]
+pub fn breaches_threshold(lag: i64, threshold: u64) -> bool {
+    threshold > 0 && lag > i64::try_from(threshold).unwrap_or(i64::MAX)
+}
+
 /// One (tenant, environment) partition's shipped position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicationCursor {
@@ -95,6 +111,9 @@ struct StreamRow {
 pub struct ReplicationShipper {
     home: PgPool,
     follower: PgPool,
+    /// The operator's chosen lag bound: a partition whose lag exceeds it is alerted.
+    /// Zero disables alerting.
+    alert_threshold_messages: u64,
 }
 
 impl ReplicationShipper {
@@ -110,7 +129,18 @@ impl ReplicationShipper {
             !std::ptr::eq(&home, &follower),
             "a replication shipper must not point at itself"
         );
-        Self { home, follower }
+        Self {
+            home,
+            follower,
+            alert_threshold_messages: 0,
+        }
+    }
+
+    /// Set the lag bound the operator chose; a partition whose lag exceeds it is alerted.
+    #[must_use]
+    pub fn with_alert_threshold(mut self, messages: u64) -> Self {
+        self.alert_threshold_messages = messages;
+        self
     }
 
     /// One ship pass: for every partition the follower has a cursor for (or every
@@ -122,6 +152,14 @@ impl ReplicationShipper {
     /// [`sqlx::Error`] on a persistence failure. A failed pass changes nothing: the
     /// cursor advance is in the same transaction as the copy.
     pub async fn ship(&self, batch_limit: i64) -> Result<ShipReport, sqlx::Error> {
+        metrics::describe_gauge!(
+            REPLICATION_LAG_MESSAGES,
+            "Replication lag in outbox-stream positions, per (tenant, environment) partition (issue #155)"
+        );
+        metrics::describe_counter!(
+            REPLICATION_SHIPPED_TOTAL,
+            "Home outbox-stream rows copied to the follower, per partition (issue #155)"
+        );
         let mut report = ShipReport {
             partitions: Vec::new(),
         };
@@ -159,6 +197,28 @@ impl ReplicationShipper {
             let partition = self
                 .ship_partition(&tenant_id, &environment_id, cursor, batch_limit)
                 .await?;
+            metrics::gauge!(
+                REPLICATION_LAG_MESSAGES,
+                "tenant_id" => partition.tenant_id.clone(),
+                "environment_id" => partition.environment_id.clone(),
+            )
+            .set(partition.lag_messages as f64);
+            metrics::counter!(
+                REPLICATION_SHIPPED_TOTAL,
+                "tenant_id" => partition.tenant_id.clone(),
+                "environment_id" => partition.environment_id.clone(),
+            )
+            .increment(u64::try_from(partition.copied).unwrap_or(0));
+            // THE ALERT: the operator chose the lag bound; the system reports the breach.
+            if breaches_threshold(partition.lag_messages, self.alert_threshold_messages) {
+                tracing::warn!(
+                    tenant_id = %partition.tenant_id,
+                    environment_id = %partition.environment_id,
+                    lag_messages = partition.lag_messages,
+                    threshold = self.alert_threshold_messages,
+                    "replication lag exceeded the configured bound"
+                );
+            }
             report.partitions.push(partition);
         }
         Ok(report)
@@ -281,5 +341,24 @@ impl ReplicationShipper {
             home_max_sequence: home_max.unwrap_or(max_shipped),
             lag_messages: home_max.unwrap_or(max_shipped) - max_shipped,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::breaches_threshold;
+
+    #[test]
+    fn a_threshold_of_zero_disables_alerting() {
+        assert!(!breaches_threshold(10_000, 0), "zero disables");
+    }
+
+    #[test]
+    fn a_lag_past_the_bound_breaches_and_at_it_does_not() {
+        assert!(
+            !breaches_threshold(100, 100),
+            "at the bound is not a breach"
+        );
+        assert!(breaches_threshold(101, 100), "past the bound is a breach");
     }
 }

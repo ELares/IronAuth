@@ -1439,6 +1439,9 @@ at the top of the file, or map it in `.taplo.toml`).
 | `quota.tenant.token_issuance_burst` | integer | `200` | Burst capacity for the token-issuance dimension. 0 means unlimited. |
 | `quota.tenant.token_issuance_per_second` | integer | `100` | Sustained token issuance per second (the refill rate for the token-issuance dimension: access, ID, and refresh tokens minted). |
 | `quota.usage_thresholds_percent` | array | `[80, 100]` | The usage percentages (1 to 100) at which a saturation webhook fires per dimension, so operators see pressure before the hard limit. The default (`[80, 100]`) warns at 80 percent and again at the limit. An empty list disables saturation webhooks. At most `QUOTA_MAX_USAGE_THRESHOLDS` entries; each must be between 1 and 100. |
+| `replication` | table | see fields | Replication (issue #155, EXPLORATORY): the operator-chosen lag bound the outbox-stream replication shipper alerts at. OFF by default. |
+| `replication.alert_threshold_messages` | integer | `0` | The lag bound, in stream positions: a partition whose lag exceeds it is alerted. `0` disables alerting. |
+| `replication.enabled` | boolean | `false` | Whether the replication shipper is wired at boot (a later slice; currently inert). |
 | `risc_receiver` | table | see fields | The Google Cross-Account Protection RISC receiver (issue #144). OFF by default, so the default boot mounts no receiver endpoint and accepts no inbound SET. |
 | `risc_receiver.algorithms` | array | empty | The JWS algorithm allowlist an inbound SET may be signed with, as JOSE `alg` names. |
 | `risc_receiver.audience` | string | `""` | The `aud` an inbound SET must carry. |
@@ -9081,6 +9084,8 @@ label on the wire with every test green.
 | `ironauth_password_screen_total` | counter | `outcome` | Password screening checks, by outcome |
 | `ironauth_proxy_forwarding_rejected_total` | counter | `reason` | Requests whose forwarding headers were rejected and failed closed |
 | `ironauth_quota_decisions_total` | counter | `decision`, `dimension` | Quota decisions, by dimension and admitted or denied |
+| `ironauth_replication_lag_messages` | gauge | `environment_id`, `tenant_id` | Replication lag in outbox-stream positions, per (tenant, environment) partition (issue #155) |
+| `ironauth_replication_shipped_total` | counter | `environment_id`, `tenant_id` | Home outbox-stream rows copied to the follower, per partition (issue #155) |
 | `ironauth_request_throttled_total` | counter | `layer` | Request-path refusals by the layered limiter, by refusing layer |
 | `ironauth_shared_rate_fallbacks_total` | counter | none | Admits enforced by the local bucket because the shared rate tier could not answer |
 | `ironauth_sms_route_throttled_total` | counter | `route` | SMS sends refused by a per-route throttle |
@@ -9091,7 +9096,7 @@ label on the wire with every test green.
 | `ironauth_up` | gauge | none | 1 while the process is serving |
 | `ironauth_verification_send_suppressed_total` | counter | `purpose` | Verification sends suppressed, by purpose |
 
-48 metrics, 16 of them carrying no labels at all.
+50 metrics, 16 of them carrying no labels at all.
 
 ## Scope
 

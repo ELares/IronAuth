@@ -15,6 +15,10 @@ repository.workspace = true
 autotests = false
 
 [dependencies]
+# The replication shipper's lag gauges and shipped counters (issue #155).
+metrics.workspace = true
+# The replication shipper's lag-breach alert (issue #155).
+tracing.workspace = true
 ironauth-env.workspace = true
 # The hot-state interface this crate supplies the always-present implementation of (#146).
 ironauth-hot.workspace = true
