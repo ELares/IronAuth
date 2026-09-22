@@ -128,7 +128,6 @@ impl SealedBackup {
     /// # Panics
     ///
     /// Panics if `master_key` is not 32 bytes - the derivation guarantees the length for
-
     /// every material this module is handed, so a wrong-length key is a programming error.
     pub fn open(&self, master_key: &[u8], context: &[u8]) -> Result<Vec<u8>, BackupOpenError> {
         if !self.bytes.starts_with(MAGIC)
