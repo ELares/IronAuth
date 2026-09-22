@@ -22,6 +22,7 @@
 //! plaintext metadata. `open` refuses on a wrong key, a tampered byte, or a foreign magic:
 //! the AEAD tag IS the checksum the criterion asks for, verified on write and on restore.
 
+use ironauth_env::Entropy as _;
 use ring::aead::{AES_256_GCM, Aad as RingAad, LessSafeKey, Nonce, UnboundKey};
 
 /// The derivation label: a domain-separated `HMAC-SHA256(master, label)`, the same pattern
@@ -100,8 +101,7 @@ impl SealedBackup {
             UnboundKey::new(&AES_256_GCM, &seal_key(master_key)).expect("32-byte AES-256-GCM key");
         let key = LessSafeKey::new(unbound);
         let mut nonce_bytes = [0_u8; NONCE_LEN];
-        use ironauth_env::Entropy as _;
-        ironauth_env::OsEntropy::default().fill_bytes(&mut nonce_bytes);
+        ironauth_env::OsEntropy.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
         // The in_out region must be a Vec: ring's bound is `Extend`, which a bare slice does
         // not satisfy. The plaintext runs to the end of the Vec and the tag is appended onto
@@ -124,6 +124,11 @@ impl SealedBackup {
     ///
     /// [`BackupOpenError`] on a foreign file, an unverifiable tag (the checksum mismatch the
     /// criterion names), or a context mismatch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `master_key` is not 32 bytes — the derivation guarantees the length for
+    /// every material this module is handed, so a wrong-length key is a programming error.
     pub fn open(&self, master_key: &[u8], context: &[u8]) -> Result<Vec<u8>, BackupOpenError> {
         if !self.bytes.starts_with(MAGIC)
             || self.bytes.len() < MAGIC.len() + 1 + NONCE_LEN + TAG_LEN

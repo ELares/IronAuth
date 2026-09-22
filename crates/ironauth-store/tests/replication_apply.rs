@@ -28,16 +28,17 @@ use ironauth_store::{
 /// on the follower within the replication pass.
 #[tokio::test]
 async fn a_home_user_is_queryable_on_the_follower_after_ship_and_apply() {
+    const PHC_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aGFzaGhhc2hoYXNo";
     let home = TestDatabase::start().await;
     let follower = TestDatabase::start().await;
-    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0F0A_01);
-    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0F0A_01);
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0F0A_0001);
+    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0F0A_0001);
     let scope = home.seed_scope(&env).await;
     follower.seed_scope(&follow_env).await;
 
     // A real user in the home region, through the same registration path the login
     // surface uses.
-    const PHC_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aGFzaGhhc2hoYXNo";
+
     let (actor, corr) = (home.test_actor(&env), CorrelationId::generate(&env));
     let user_id = home
         .store()
@@ -130,14 +131,14 @@ async fn a_home_user_is_queryable_on_the_follower_after_ship_and_apply() {
 /// primary one the users row carries.
 #[tokio::test]
 async fn a_secondary_identifier_resolves_on_the_follower_after_apply() {
+    const PHC_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aGFzaGhhc2hoYXNo";
     let home = TestDatabase::start().await;
     let follower = TestDatabase::start().await;
-    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0F0A_02);
-    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0F0A_02);
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0F0A_0002);
+    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0F0A_0002);
     let scope = home.seed_scope(&env).await;
     follower.seed_scope(&follow_env).await;
 
-    const PHC_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aGFzaGhhc2hoYXNo";
     let (actor, corr) = (home.test_actor(&env), CorrelationId::generate(&env));
     let user_id = home
         .store()
@@ -160,7 +161,7 @@ async fn a_secondary_identifier_resolves_on_the_follower_after_apply() {
                 identifier_type: IdentifierType::Email,
                 raw: "secondary@example.test",
                 verified: false,
-                mode: ironauth_store::UniquenessMode::EnvironmentWide,
+                mode: UniquenessMode::EnvironmentWide,
                 org: None,
             },
             None,
@@ -222,14 +223,14 @@ async fn a_secondary_identifier_resolves_on_the_follower_after_apply() {
 /// password hash to the WebAuthn factor surface.
 #[tokio::test]
 async fn a_passkey_registered_on_home_is_present_on_the_follower_after_apply() {
+    const PHC_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aGFzaGhhc2hoYXNo";
     let home = TestDatabase::start().await;
     let follower = TestDatabase::start().await;
-    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0F0A_03);
-    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0F0A_03);
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0F0A_0003);
+    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0F0A_0003);
     let scope = home.seed_scope(&env).await;
     follower.seed_scope(&follow_env).await;
 
-    const PHC_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aGFzaGhhc2hoYXNo";
     let (actor, corr) = (home.test_actor(&env), CorrelationId::generate(&env));
     let user_id = home
         .store()

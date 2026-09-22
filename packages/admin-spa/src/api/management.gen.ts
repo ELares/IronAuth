@@ -582,6 +582,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/backups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Trigger an on-demand encrypted backup.
+         * @description The request is audited and the runner is woken; the backup itself is performed by the
+         *     next available pass and watched through the backup metrics.
+         */
+        post: operations["triggerBackup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/brands": {
         parameters: {
             query?: never;
@@ -4622,6 +4643,16 @@ export interface components {
              *     default.
              */
             posture?: string | null;
+        };
+        /** @description The accepted response: the request is queued, not performed. */
+        BackupRequestAccepted: {
+            /** @description Whether the request was recorded as an audited admin-action row. */
+            recorded: boolean;
+            /**
+             * Format: int64
+             * @description The unix-micros instant the request was accepted.
+             */
+            requested_at_unix_micros: number;
         };
         /** @description A page of bans. */
         BanList: {
@@ -13458,6 +13489,79 @@ export interface operations {
             };
             /** @description The environment is absent or soft-deleted */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    triggerBackup: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The request was recorded and the runner was woken; the backup itself is watched through the backup metrics */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BackupRequestAccepted"];
+                };
+            };
+            /** @description The Idempotency-Key header is absent */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or fresh privilege required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

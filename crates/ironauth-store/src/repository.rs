@@ -1802,10 +1802,13 @@ impl ActingStore<'_> {
         BackupRequestRepo {
             store: self.store,
             scope: self.scope,
-            acting: self.acting.clone(),
+            acting: self.acting,
         }
     }
 
+    /// Record that every audit row written through this store arrived by `entry_path`.
+    ///
+    /// [`None`] is accepted and is a no-op.
     #[must_use]
     pub fn via(mut self, entry_path: Option<EntryPath>) -> Self {
         if let Some(entry_path) = entry_path {
@@ -32650,6 +32653,7 @@ impl HotStateInvalidationRepo<'_> {
 /// worth a typed variant: in a transactional outbox a producer does not retry an enqueue on its
 /// own, so a duplicate means two domain writes claimed one mutation handle, which is a caller
 /// bug rather than a condition to recover from.
+#[allow(dead_code)] // the caller rides the ironcache feature gate; see the hot-state wiring
 pub(crate) async fn enqueue_hot_invalidation_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     env: &Env,
@@ -48589,6 +48593,8 @@ impl AuditTarget for BackupRequestTarget {
     }
 }
 
+/// The per-scope log-stream repository (issue #110): dead letters, replays, and the
+/// deliveries' positions.
 pub struct LogStreamRepo<'a> {
     store: &'a Store,
     scope: Scope,
@@ -51317,6 +51323,9 @@ impl ActingManagementStore<'_> {
     /// Both planes need it because an agent tool drives both: deleting a user is environment
     /// plane and deleting an ENVIRONMENT is management plane, and criterion 5 says "every
     /// mutation" rather than "every mutation on one of the two planes".
+    /// Record that every audit row written through this store arrived by `entry_path`.
+    ///
+    /// [`None`] is accepted and is a no-op.
     #[must_use]
     pub fn via(mut self, entry_path: Option<EntryPath>) -> Self {
         if let Some(entry_path) = entry_path {

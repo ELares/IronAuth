@@ -54,8 +54,8 @@ async fn append_event(db: &TestDatabase, env: &Env, scope: ironauth_store::Scope
         .expect("enqueue the event");
 }
 
-/// The follower's message rows, in follower drain order: (id, consumer, idempotency_key,
-/// ordering_key, payload).
+/// The follower's message rows, in follower drain order: (`id`, `consumer`, `idempotency_key`,
+/// `ordering_key`, `payload`).
 async fn follower_stream(
     db: &TestDatabase,
 ) -> Vec<(String, String, String, String, serde_json::Value)> {
@@ -85,12 +85,12 @@ async fn follower_stream(
 async fn the_ordered_stream_replicates_and_lag_drops_to_zero() {
     let home = TestDatabase::start().await;
     let follower = TestDatabase::start().await;
-    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0C0A_01);
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0C0A_0001);
     // The SAME deterministic env seeds the SAME (tenant, environment) ids on both
     // databases — the follower's replica must hold the pinned tenants' rows, which is
     // what the FKs require. TWO same-seeded envs, one per database: a SHARED env would
     // advance its entropy across the databases and seed DIFFERENT ids on the follower.
-    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0C0A_01);
+    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0C0A_0001);
     // BOTH scopes are seeded on BOTH databases BEFORE anything enqueues: the enqueue
     // draws message ids off the same env, and a draw between two seeds would shift one
     // database's sequence relative to the other.
@@ -117,14 +117,32 @@ async fn the_ordered_stream_replicates_and_lag_drops_to_zero() {
         );
     }
 
-    // The follower holds the same rows, in the same order.
-    let shipped = follower_stream(&follower).await;
-    assert_eq!(shipped.len(), 6);
-    assert_eq!(shipped[0].2, "evt-repl-0");
-    assert_eq!(shipped[1].2, "evt-repl-1");
-    assert_eq!(shipped[4].2, "evt-repl-4");
-    assert_eq!(shipped[5].2, "evt-repl-other");
-    for (id, consumer, _key, ordering, payload) in &shipped {
+    // The follower holds the same rows. The WITHIN-partition order is the guarantee (the
+    // shipper reads home's sequence order per partition); the CROSS-partition interleave
+    // on the follower is its own identity sequence, which nothing promises, so the
+    // assertion is per partition.
+    let stream = follower_stream(&follower).await;
+    assert_eq!(stream.len(), 6);
+    let keys: Vec<&str> = stream
+        .iter()
+        .map(|(_, _, key, _, _)| key.as_str())
+        .collect();
+    assert!(
+        keys.windows(5).any(|w| w
+            == [
+                "evt-repl-0",
+                "evt-repl-1",
+                "evt-repl-2",
+                "evt-repl-3",
+                "evt-repl-4"
+            ]),
+        "the scope's events arrive in home order, contiguously: {keys:?}"
+    );
+    assert!(
+        keys.contains(&"evt-repl-other"),
+        "the second partition's event is present"
+    );
+    for (id, consumer, _key, ordering, payload) in &stream {
         assert_eq!(consumer, WEBHOOK_EVENT_CONSUMER);
         assert_eq!(ordering, "usr_repl_probe");
         assert_eq!(
@@ -154,8 +172,8 @@ async fn the_ordered_stream_replicates_and_lag_drops_to_zero() {
 async fn a_bounded_pass_is_resumable_and_converges() {
     let home = TestDatabase::start().await;
     let follower = TestDatabase::start().await;
-    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0C0A_02);
-    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0C0A_02);
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0C0A_0002);
+    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0C0A_0002);
     let scope = home.seed_scope(&env).await;
     follower.seed_scope(&follow_env).await;
     for index in 0..7 {
@@ -188,7 +206,7 @@ async fn a_bounded_pass_is_resumable_and_converges() {
     for partition in &third.partitions {
         assert_eq!(partition.lag_messages, 0);
     }
-    let shipped = follower_stream(&follower).await;
-    assert_eq!(shipped.len(), 7);
-    assert_eq!(shipped[6].2, "evt-resume-6");
+    let stream = follower_stream(&follower).await;
+    assert_eq!(stream.len(), 7);
+    assert_eq!(stream[6].2, "evt-resume-6");
 }

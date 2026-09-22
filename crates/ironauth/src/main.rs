@@ -752,7 +752,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // gap, and the failure mode of them being on by accident is an outbound push this
         // deployment did not intend.
         let backup_scheduler = match (backup_scheduler_inputs_captured, backup_trigger) {
-            (Some(inputs), Some(trigger)) => start_backup_scheduler(inputs, trigger).await,
+            (Some(inputs), Some(trigger)) => start_backup_scheduler(inputs, trigger),
             _ => None,
         };
         // THE REPLICATION SHIPPER (issue #155). Its own switch, OFF by default, and it
@@ -9042,7 +9042,6 @@ fn kek_restore_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
 /// bearing: the `file` form trims one trailing newline, the shape `echo secret > file` produces.
 /// A reader that kept the newline would derive a DIFFERENT key from the same file the server
 /// reads, which is the whole class of bug this function exists to close.
-
 /// The AEAD context every sealed backup is bound to. A file sealed under any other context is
 /// refused, so a backup cannot be replayed as a different artifact.
 const BACKUP_CONTEXT: &[u8] = b"ironauth logical backup v1";
@@ -9246,6 +9245,7 @@ async fn start_replication_shipper(
 /// wake (a stream event enqueued, or the promotion signal) starts the next pass
 /// immediately instead of on the interval — the carrier lowers lag and is never a
 /// prerequisite (an unreachable broker falls back to the interval with a logged reason).
+#[allow(clippy::too_many_lines)]
 async fn replication_shipper_loop(
     shipper: ironauth_store::replication::ReplicationShipper,
     interval_secs: u64,
@@ -9374,17 +9374,16 @@ fn backup_scheduler_inputs(config: &Config, env: &Env) -> Option<BackupScheduler
         );
         return None;
     };
-    let Some(material) = (|| {
-        let secret = config.database.master_key.as_ref()?;
-        Some(secret.resolve().ok()?.expose().as_bytes().to_vec())
-    })()
-        .or_else(|| {
-            tracing::error!(
-                "scheduled backups NOT running: database.master_key could not be resolved,                  and the backup is sealed under it"
-            );
-            None
-        })
+    let Some(material) = config
+        .database
+        .master_key
+        .as_ref()
+        .and_then(|secret| secret.resolve().ok())
+        .map(|secret| secret.expose().as_bytes().to_vec())
     else {
+        tracing::error!(
+            "scheduled backups NOT running: database.master_key could not be resolved,                  and the backup is sealed under it"
+        );
         return None;
     };
     let (Some(endpoint), Some(bucket)) = (backup.s3_endpoint.clone(), backup.s3_bucket.clone())
@@ -9398,7 +9397,7 @@ fn backup_scheduler_inputs(config: &Config, env: &Env) -> Option<BackupScheduler
         .s3_credential
         .as_ref()
         .map(Secret::resolve)
-        .and_then(|result| result.ok())
+        .and_then(Result::ok)
         .and_then(|secret| secret.expose().to_string().into())
     else {
         tracing::error!(
@@ -9421,7 +9420,7 @@ fn backup_scheduler_inputs(config: &Config, env: &Env) -> Option<BackupScheduler
 }
 
 /// Start the scheduled backup runner, or [`None`] with the reason logged.
-async fn start_backup_scheduler(
+fn start_backup_scheduler(
     inputs: BackupSchedulerInputs,
     trigger: std::sync::Arc<ironauth_admin::backup_trigger::BackupTrigger>,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -9469,8 +9468,8 @@ async fn backup_scheduler_loop(
         // operator's request is "now", and a sleeping interval must not stand between it
         // and the next pass.
         tokio::select! {
-            _ = trigger.notified() => {}
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(inputs.interval_secs)) => {}
+            () = trigger.notified() => {}
+            () = tokio::time::sleep(tokio::time::Duration::from_secs(inputs.interval_secs)) => {}
         }
     }
 }
@@ -9478,6 +9477,7 @@ async fn backup_scheduler_loop(
 /// One backup pass: dump+seal, push the sealed object, prune past-retention objects, and
 /// update the metrics. Every failure path logs its own reason and increments the failure
 /// counter; a failed pass never blocks the next interval.
+#[allow(clippy::too_many_lines)]
 async fn run_backup_pass(inputs: &BackupSchedulerInputs, fetcher: &ironauth_fetch::Fetcher) {
     let sealed = match sealed_backup_dump(&inputs.url, &inputs.material).await {
         Ok(sealed) => sealed,
@@ -9526,11 +9526,10 @@ async fn run_backup_pass(inputs: &BackupSchedulerInputs, fetcher: &ironauth_fetc
         &canonical.render(),
     );
     let signature = ironauth_admin::sigv4::sign(
-        &inputs
+        inputs
             .credential
             .split_once(':')
-            .map(|(_, secret)| secret)
-            .unwrap_or(""),
+            .map_or("", |(_, secret)| secret),
         &ironauth_admin::backup_s3::sigv4_timestamps(now).0,
         &inputs.region,
         "s3",
@@ -9540,8 +9539,7 @@ async fn run_backup_pass(inputs: &BackupSchedulerInputs, fetcher: &ironauth_fetc
         inputs
             .credential
             .split_once(':')
-            .map(|(access, _)| access)
-            .unwrap_or(""),
+            .map_or("", |(access, _)| access),
         &scope,
         &canonical.signed_headers(),
         &signature,
@@ -9552,17 +9550,16 @@ async fn run_backup_pass(inputs: &BackupSchedulerInputs, fetcher: &ironauth_fetc
         format!("{}{path}", inputs.endpoint.trim_end_matches('/')),
     )
     .body(body);
-    for (name, value) in [("authorization", authorization)] {
-        let (Ok(name), Ok(value)) = (
-            http::HeaderName::from_bytes(name.as_bytes()),
-            http::HeaderValue::from_str(&value),
-        ) else {
-            tracing::error!("scheduled backup pass FAILED: a required header could not be encoded");
-            metrics::counter!(BACKUP_FAILURE_TOTAL).increment(1);
-            return;
-        };
-        request = request.header(name, value);
-    }
+    let (name, value) = ("authorization", authorization);
+    let (Ok(name), Ok(value)) = (
+        http::HeaderName::from_bytes(name.as_bytes()),
+        http::HeaderValue::from_str(&value),
+    ) else {
+        tracing::error!("scheduled backup pass FAILED: a required header could not be encoded");
+        metrics::counter!(BACKUP_FAILURE_TOTAL).increment(1);
+        return;
+    };
+    request = request.header(name, value);
     match fetcher.fetch(request).await {
         Ok(response) if response.status().is_success() => {}
         Ok(response) => {
@@ -9582,8 +9579,7 @@ async fn run_backup_pass(inputs: &BackupSchedulerInputs, fetcher: &ironauth_fetc
     metrics::counter!(BACKUP_SUCCESS_TOTAL).increment(1);
     metrics::gauge!(BACKUP_LAST_SUCCESS_TIMESTAMP_SECONDS).set(
         now.duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0),
+            .map_or(0.0, |d| d.as_secs_f64()),
     );
     tracing::info!(key = %key, bytes = %body_len, "scheduled backup pushed");
 
@@ -9767,6 +9763,7 @@ async fn sealed_backup_dump(
 /// Opens the file (refusing on a checksum mismatch, a wrong key, or a foreign file), refuses to
 /// clobber a database that already holds the schema unless the operator says it out loud, and
 /// applies the SQL in ONE transaction through `psql`.
+#[allow(clippy::too_many_lines)]
 fn restore_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
     let mut url: Option<String> = None;
     let mut input: Option<String> = None;

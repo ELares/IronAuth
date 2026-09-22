@@ -338,6 +338,9 @@ impl Store {
     /// The restore command refuses to apply a backup over a live deployment unless the operator
     /// acknowledges the overwrite. `to_regclass` makes this cheap on a database that has never
     /// seen IronAuth, and the EXISTS makes a created-but-empty ledger count as fresh.
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
     pub async fn has_applied_migrations(&self) -> Result<bool, crate::StoreError> {
         // Two queries, not one: PostgreSQL plans BOTH sides of an AND, so an EXISTS over a
         // table that does not exist errors at plan time even when the left side is false.

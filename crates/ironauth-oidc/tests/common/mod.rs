@@ -1057,10 +1057,8 @@ impl Harness {
         &self.db
     }
 
-    /// The quota engine installed on the state (issue #50), for tests that assert
-    /// the live bucket count stays bounded or drive the idle-bucket reaper.
-    #[must_use]
     /// The installed request-plane layered limiter (issue #150), when the test installed one.
+    #[must_use]
     pub fn layered_limiter(&self) -> Option<&Arc<ironauth_quota::layered::LayeredLimiter>> {
         self.limiter.as_ref()
     }
@@ -1073,14 +1071,15 @@ impl Harness {
 
     /// The seeded scope.
     #[must_use]
-    /// The database's owner pool, for the migration runner a rolling-upgrade test drives
-    /// against the booted store.
-    pub fn pool(&self) -> &sqlx::PgPool {
-        self.db.owner_pool()
-    }
-
     pub fn scope(&self) -> Scope {
         self.scope
+    }
+
+    /// The database's owner pool, for the migration runner a rolling-upgrade test drives
+    /// against the booted store.
+    #[must_use]
+    pub fn pool(&self) -> &sqlx::PgPool {
+        self.db.owner_pool()
     }
 
     /// The installed WASM hook runtime, if this harness has one (issue #114).

@@ -727,6 +727,25 @@ mod tests {
              credential is not one of them.",
         ),
         (
+            "backup",
+            Reach::OnePlaneOrNoState,
+            "consumed once at boot to build the scheduled encrypted-backup runner (issue \
+             #153), a background task that answers no request and owns its own \
+             connections. No plane state holds it: the runner dumps and pushes the sealed \
+             artifact on its interval, and handing the section to a plane would suggest \
+             a request path can push a backup, which none does.",
+        ),
+        (
+            "replication",
+            Reach::OnePlaneOrNoState,
+            "consumed once at boot to build the outbox-stream replication shipper (issue \
+             #155, EXPLORATORY), a background task that answers no request and owns its \
+             own home and follower connections. No plane state holds it: the shipper \
+             copies the ordered stream on its interval (or the carrier wake), and handing \
+             the section to a plane would suggest a request path can ship the stream, \
+             which none does.",
+        ),
+        (
             "dev_mode",
             Reach::OnePlaneOrNoState,
             "a scalar, not a section: it relaxes the literal-secret warning at load and \

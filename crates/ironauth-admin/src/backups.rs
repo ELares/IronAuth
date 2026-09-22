@@ -63,6 +63,11 @@ pub struct BackupRequestAccepted {
 ///
 /// The request is audited and the runner is woken; the backup itself is performed by the
 /// next available pass and watched through the backup metrics.
+///
+/// # Errors
+///
+/// [`ApiError`] on an unauthorized or malformed request; the documented statuses map
+/// from the handler's fence and store calls.
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/backups",

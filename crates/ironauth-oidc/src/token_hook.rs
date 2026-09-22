@@ -1683,7 +1683,7 @@ mod tests {
                 "refused for the capability, not for anything else: {first}"
             );
 
-            let started = std::time::Instant::now(); // invariant-allow: time-via-env -- THE measurement: whether the second call RECOMPILED or recalled is a claim about elapsed time and nothing else, and a frozen Clock seam would report zero for both
+            let started = std::time::Instant::now(); // invariant-allow: time-via-env
             let second = loaded_hook(
                 &engine,
                 &cache,

@@ -327,7 +327,7 @@ async fn a_sync_target_that_exceeds_its_timeout_triggers_the_failure_policy() {
     // directions: a FORWARDS step inflates the span and fails a test nothing was slow for,
     // and a backwards step deflates it and hides a real overrun. `dispatch_sync` reads a
     // monotonic source at its own call site for the same reason.
-    let started = std::time::Instant::now(); // invariant-allow: time-via-env -- measuring REAL elapsed time of a real network timeout; the Clock seam is a frozen ManualClock under this harness, so reading it measures the seam and not the timeout
+    let started = std::time::Instant::now(); // invariant-allow: time-via-env
     let (status, body) = signup(&harness, "timedout@example.test").await;
     let elapsed = started.elapsed();
     assert_ne!(

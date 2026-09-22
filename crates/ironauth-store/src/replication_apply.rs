@@ -36,7 +36,6 @@
 //! on the copy transaction, exactly as the shipper's copy transaction carries them.
 
 use sqlx::PgPool;
-use sqlx::Row;
 
 /// The domain-event consumer whose stream the apply consumes.
 pub const DOMAIN_EVENT_CONSUMER: &str = "webhook.event";
@@ -48,13 +47,14 @@ pub struct AppliedEvent {
     pub event_type: String,
     /// The entity row copied, when the type was one the applier owns.
     pub copied: Option<String>,
-    /// Why an unowned type was skipped.
+    /// Why an unowned type was skipped, when it was.
     pub skipped_reason: Option<String>,
 }
 
 /// The event-apply result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyReport {
+    /// The per-event outcomes, in stream order.
     pub applied: Vec<AppliedEvent>,
 }
 
@@ -275,9 +275,7 @@ async fn copy_scope_rows(
         .await?;
     let statement = format!(
         "INSERT INTO {table} SELECT * FROM json_populate_record(NULL::{table}, $1::json) \
-         ON CONFLICT ({conflict_column}) DO UPDATE SET {conflict_column} = EXCLUDED.{conflict_column}",
-        table = table,
-        conflict_column = conflict_column,
+         ON CONFLICT ({conflict_column}) DO UPDATE SET {conflict_column} = EXCLUDED.{conflict_column}"
     );
     for json in &rows {
         sqlx::query(&statement).bind(json).execute(&mut *tx).await?;

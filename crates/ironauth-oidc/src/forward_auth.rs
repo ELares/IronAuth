@@ -791,7 +791,7 @@ mod tests {
     /// comes from the seam clock, and this is a plain wall-clock instant so a test can
     /// advance it explicitly when it needs to cross a TTL.
     fn now() -> std::time::Instant {
-        std::time::Instant::now()
+        std::time::Instant::now() // invariant-allow: time-via-env
     }
 
     fn open() -> ForwardAuth {

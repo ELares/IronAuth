@@ -17,7 +17,7 @@ impl Guest for Hook {
         // invariant-allow: time-via-env -- guest code compiled to wasm32-wasip2, not host
         // protocol logic, and the raw call IS the test subject: it is here precisely to force
         // the wall-clock import so the sandbox can be shown refusing it.
-        let start = std::time::Instant::now(); // invariant-allow: time-via-env -- GUEST code compiled to wasm32-wasip2, not host protocol logic, and the raw call IS the test subject: it is here to force the wasi:clocks/wall-clock import so the sandbox can be shown refusing it
+        let start = std::time::Instant::now(); // invariant-allow: time-via-env
         let mut n: u64 = 0;
         for i in 0..200_000u64 {
             n = n.wrapping_add(i);

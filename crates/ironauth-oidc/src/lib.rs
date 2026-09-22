@@ -320,6 +320,10 @@ pub mod token_hook {
     /// # Errors
     ///
     /// Never: `HookRuntime` is uninhabited, so no caller can reach this body.
+    #[allow(
+        clippy::unused_async,
+        reason = "the wasm-hooks sibling awaits; the signatures must match"
+    )]
     pub async fn run_record(
         runtime: &HookRuntime,
         invocation: &Invocation<'_>,

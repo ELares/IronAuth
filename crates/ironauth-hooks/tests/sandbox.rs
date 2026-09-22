@@ -346,7 +346,7 @@ fn the_monotonic_clock_is_present_and_tells_a_hook_nothing() {
 fn a_hook_cannot_wait() {
     let engine = HookEngine::new().expect("engine");
     let hook = engine.load(&guest(SLEEPER)).expect("load");
-    let started = std::time::Instant::now(); // invariant-allow: time-via-env -- a TIMING harness: the assertion is that a 30-second sleep did NOT take 30 seconds, which is a claim about real elapsed time and cannot be made against a frozen seam
+    let started = std::time::Instant::now(); // invariant-allow: time-via-env
     let outcome = hook
         .customize(&engine, &Limits::claim_shaping(), &request())
         .expect("the wait is answered immediately, so the hook completes");
@@ -400,7 +400,7 @@ fn a_hook_cannot_poll_an_unbounded_list() {
 fn a_hook_cannot_wait_on_an_instant() {
     let engine = HookEngine::new().expect("engine");
     let hook = engine.load(&guest(INSTANT_WAITER)).expect("load");
-    let started = std::time::Instant::now(); // invariant-allow: time-via-env -- a TIMING harness: the assertion is that a wait until the end of time returned promptly, which is a claim about real elapsed time
+    let started = std::time::Instant::now(); // invariant-allow: time-via-env
     hook.customize(&engine, &Limits::claim_shaping(), &request())
         .expect("a wait on an instant is answered immediately");
     let elapsed = started.elapsed();
@@ -420,7 +420,7 @@ fn a_hook_cannot_wait_on_an_instant() {
 fn a_hook_cannot_exhaust_the_host_resource_table() {
     let engine = HookEngine::new().expect("engine");
     let hook = engine.load(&guest(POLLABLE_LEAK)).expect("load");
-    let started = std::time::Instant::now(); // invariant-allow: time-via-env -- a TIMING harness: an unbounded table would make this run until the host is out of memory, so the bound is a real elapsed one
+    let started = std::time::Instant::now(); // invariant-allow: time-via-env
     // The CAP is what decides, shown by moving only the cap. The guest asks for 3000
     // pollables: under a cap of 512 it must be refused, under 8192 it must succeed. Asserting
     // only that something stopped it would not distinguish the cap from fuel -- an unbounded
@@ -713,7 +713,7 @@ fn the_default_limits_bound_a_runaway_hook() {
 fn the_default_fuel_stops_a_runaway_quickly() {
     let engine = HookEngine::new().expect("engine");
     let spinner = engine.load(&guest(FUEL_BOMB)).expect("load");
-    let started = std::time::Instant::now(); // invariant-allow: time-via-env -- a TIMING harness: the claim is that the DEFAULT budget aborts a runaway in a bounded wall-clock time, which is what makes it a usable default
+    let started = std::time::Instant::now(); // invariant-allow: time-via-env
     let error = spinner
         .customize(&engine, &Limits::claim_shaping(), &request())
         .expect_err("the default fuel must stop an infinite loop");

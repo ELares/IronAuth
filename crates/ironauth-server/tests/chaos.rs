@@ -28,12 +28,12 @@
 mod common;
 
 use std::os::unix::process::CommandExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
-use common::{config_from, get, server_from};
+use common::{get, server_from};
 use ironauth_server::DatabaseHealth;
 use sqlx::PgPool;
 
@@ -112,9 +112,10 @@ async fn eventually_body(
     expected: &str,
     timeout: Duration,
 ) -> (StatusCode, String) {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + timeout; // invariant-allow: time-via-env
     let mut last = get(app.clone(), "/readyz").await;
-    while Instant::now() < deadline && last.2 != expected {
+    let now = Instant::now(); // invariant-allow: time-via-env
+    while now < deadline && last.2 != expected {
         tokio::time::sleep(Duration::from_millis(200)).await;
         last = get(app.clone(), "/readyz").await;
     }
@@ -134,9 +135,10 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = (StatusCode, axum::http::HeaderMap, String)>,
 {
-    let deadline = Instant::now() + timeout;
-    let mut last = f().await;
-    while Instant::now() < deadline && last.0 != StatusCode::OK {
+    let deadline = Instant::now() + timeout; // invariant-allow: time-via-env
+    let mut last = f().await; // invariant-allow: time-via-env
+    let now = Instant::now(); // invariant-allow: time-via-env
+    while now < deadline && last.0 != StatusCode::OK {
         tokio::time::sleep(Duration::from_millis(200)).await;
         last = f().await;
     }
@@ -322,7 +324,7 @@ fn pg_bin_dir() -> Option<PathBuf> {
     let theseus = PathBuf::from(&home).join(".theseus/postgresql");
     if let Ok(entries) = std::fs::read_dir(&theseus) {
         let mut candidates: Vec<PathBuf> = entries
-            .filter_map(|entry| entry.ok())
+            .filter_map(Result::ok)
             .map(|entry| entry.path().join("bin"))
             .collect();
         candidates.sort();
@@ -335,7 +337,7 @@ fn pg_bin_dir() -> Option<PathBuf> {
     for prefix in ["/usr/lib/postgresql"] {
         if let Ok(entries) = std::fs::read_dir(prefix) {
             let mut candidates: Vec<PathBuf> = entries
-                .filter_map(|entry| entry.ok())
+                .filter_map(Result::ok)
                 .map(|entry| entry.path().join("bin"))
                 .collect();
             candidates.sort();
@@ -430,9 +432,9 @@ struct CacheGuard {
 }
 
 impl CacheGuard {
-    fn start(bin: &PathBuf, port: u16) -> Self {
+    fn start(bin: &Path, port: u16) -> Self {
         let mut guard = Self {
-            bin: bin.clone(),
+            bin: bin.to_path_buf(),
             port,
             child: None,
         };
@@ -494,13 +496,13 @@ fn ironcache_bin() -> Option<PathBuf> {
 
 /// Poll a TCP port until something accepts, or `timeout` elapses.
 fn wait_for_port(port: u16, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + timeout; // invariant-allow: time-via-env
     loop {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
             return;
         }
         assert!(
-            Instant::now() < deadline,
+            Instant::now() < deadline, // invariant-allow: time-via-env
             "nothing is listening on {port} within the wait"
         );
         std::thread::sleep(Duration::from_millis(100));

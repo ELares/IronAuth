@@ -149,7 +149,7 @@ async fn deleting_an_override_through_the_api_returns_the_scope_to_its_configure
     let h = Harness::start(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-qmgr-clear").await;
     let scope = scope_of(&tenant, &environment);
-    let env = Env::system();
+    let _env = Env::system();
     // A FROZEN clock, advanced explicitly: the final admit depends on the restored tier
     // refilling the bucket, and a 1000/s tier needs a full millisecond to mint the one
     // token it costs. On a fast machine the API round-trips between the two spends take

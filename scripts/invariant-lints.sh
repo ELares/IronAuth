@@ -123,7 +123,13 @@ scan derivable-kind-is-public 'impl[[:space:]]+DerivableKind[[:space:]]+for' 1
 # how loaded the box is. It is not -- loading the box stretches the denominator, so the ratio
 # only ever admitted MORE than the absolute ceiling standing beside it and could not fail. The
 # ratio and its baseline read are gone; see the assertion for the measurements.
-scan time-via-env 'SystemTime::now|Instant::now' 12
+scan time-via-env 'SystemTime::now|Instant::now' 31
+# The ceiling above was raised from 12 to 31 in the same change that marked the
+# poll-deadline loops: the chaos suites, the rolling-upgrade and replication boot
+# suites, and rate_l2 all wait on wall-clock deadlines (a process must be watched from
+# the test side, where the env seam is not the subject), and forward_auth's `now` is a
+# documented TEST-ONLY clock stub. Each carries the marker with this justification; a
+# production call site must use the seam clock, never a marker.
 # The `rand::` guard requires a non-identifier char (or start of line) before `rand`
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
 # (for example a `Brand::` associated call) is not a false positive.

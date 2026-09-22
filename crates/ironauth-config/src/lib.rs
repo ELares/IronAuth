@@ -1524,9 +1524,9 @@ pub struct HotStateConfig {
     ///
     /// WHAT THIS KEY ATTACHES IS THE REQUEST-PATH LIMITER'S SHARED (L2) TIER (issue #150
     /// criterion 5): the layered limiter's buckets live in the cache when this key is set, so
-    /// two nodes charge ONE budget. That is a real production caller — `IronCacheKeyspace`
+    /// two nodes charge ONE budget. That is a real production caller — [`IronCacheKeyspace`]
     /// over the `rate` keyspace — and it is the difference between "declares an address" and
-    /// "installs a HotState implementation", which is exactly the gap this paragraph used to
+    /// "installs a `HotState` implementation", which is exactly the gap this paragraph used to
     /// describe as unfilled.
     ///
     /// #1322 CHANGED ONLY HOW THE BACKEND IS SELECTED, and the first version of this paragraph
@@ -6822,8 +6822,7 @@ fn validate_replication(
         let Some(secret) = secret else { continue };
         if secret
             .resolve()
-            .map(|resolved| resolved.expose() == database_url)
-            .unwrap_or(false)
+            .is_ok_and(|resolved| resolved.expose() == database_url)
         {
             return Err(ConfigError::Invalid {
                 message: format!(
