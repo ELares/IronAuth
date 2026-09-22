@@ -432,6 +432,11 @@ jobs:
           exit 1
       # Both lanes, in one invocation, so a divergence between them shows up as a
       # single failing job rather than two that have to be compared by hand.
+      # #155 criterion 4 (dual-transport): the replication correctness suite, IRONBUS-
+      # CARRIED — the wake drives the pass (the interval is five minutes, so only a wake
+      # can), with the same end-to-end assertions as the Postgres-only run.
+      - name: replication correctness suite, IronBus-carried (issue #155)
+        run: cargo test -p ironauth --features testing,ironbus --test replication_boot_ironbus
       # #147 criterion 3: the bus wake latency vs the poll budget, both numbers recorded as
       # a CI artifact (written by the bench test in outbox_ironbus.rs).
       - name: outbox suites (postgres drain + ironbus backbone)
