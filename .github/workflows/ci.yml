@@ -437,6 +437,37 @@ jobs:
       # can), with the same end-to-end assertions as the Postgres-only run.
       - name: replication correctness suite, IronBus-carried (issue #155)
         run: cargo test -p ironauth --features testing,ironbus --test replication_boot_ironbus
+      # #155 criterion 4, the informational half: per-carrier lag measured under
+      # netem-injected inter-region latency, published as an artifact. NO RELATIVE
+      # THRESHOLD — the numbers are evidence for the graduation assessment, never a gate.
+      # The loopback delay applies to every connection the tests make, exactly the
+      # inter-region RTT the demo runs under.
+      - name: per-carrier lag under netem inter-region latency (issue #155, informational)
+        if: always()
+        run: |
+          set -euo pipefail
+          sudo tc qdisc add dev lo root netem delay 50ms || echo "netem unavailable; skipping the injection"
+          set +e
+          scripts/with-test-db.sh env IRONBUS_ADDR=127.0.0.1:17654 \
+            REGION_REPLICATION_LAG_JSON="${{ github.workspace }}/replication-lag-postgres.json" \
+            cargo test -p ironauth --features testing,ironbus --test replication_boot
+          PG_ONLY_EXIT=$?
+          scripts/with-test-db.sh env IRONBUS_ADDR=127.0.0.1:17654 \
+            REGION_REPLICATION_LAG_JSON="${{ github.workspace }}/replication-lag-ironbus.json" \
+            cargo test -p ironauth --features testing,ironbus --test replication_boot_ironbus
+          IRONBUS_EXIT=$?
+          set -e
+          sudo tc qdisc del dev lo root netem 2>/dev/null || true
+          [ "$PG_ONLY_EXIT" -eq 0 ] && [ "$IRONBUS_EXIT" -eq 0 ] || exit 1
+      - name: record the replication lag artifacts (#155)
+        if: always()
+        uses: actions/upload-artifact@ff4a2771b20de53f2e9e83d73487a1e9ec0cb13b # v5
+        with:
+          name: replication-lag-under-netem
+          path: |
+            ${{ github.workspace }}/replication-lag-postgres.json
+            ${{ github.workspace }}/replication-lag-ironbus.json
+          if-no-files-found: warn
       # #147 criterion 3: the bus wake latency vs the poll budget, both numbers recorded as
       # a CI artifact (written by the bench test in outbox_ironbus.rs).
       - name: outbox suites (postgres drain + ironbus backbone)

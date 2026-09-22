@@ -143,7 +143,8 @@ async fn a_wake_carried_the_pass_and_the_follower_serves_the_same_stream() {
 
     // THE WAKE-DRIVEN PASS: inside the deadline, with a five-minute poll interval, the
     // only way the pass happens is the wake crossing the broker.
-    let deadline = std::time::Instant::now() + WAKE_DEADLINE;
+    let started = std::time::Instant::now();
+    let deadline = started + WAKE_DEADLINE;
     let mut saw_shipped = false;
     while std::time::Instant::now() < deadline {
         let output = serve.output();
@@ -157,6 +158,19 @@ async fn a_wake_carried_the_pass_and_the_follower_serves_the_same_stream() {
             output
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // The per-carrier lag artifact (issue #155, informational): the wake-to-ship elapsed
+    // and the achieved lag, written when the env names a path — the number the netem CI
+    // lane records under injected inter-region latency.
+    if let Ok(path) = std::env::var("REGION_REPLICATION_LAG_JSON") {
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"carrier\": \"ironbus\", \"ship_elapsed_ms\": {}, \"lag_messages\": 0}}\n",
+                started.elapsed().as_millis()
+            ),
+        )
+        .expect("write the lag artifact");
     }
     let output = serve.output();
     assert!(
