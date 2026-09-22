@@ -143,7 +143,10 @@ pub async fn apply_event(
     copy_row(home, follower, table, entity_id, tenant_id, environment_id).await?;
     // A user's identity is more than the users row: the multi-identifier surface lives
     // in `user_identifiers`, and a login through ANY identifier must resolve on the
-    // follower, not just the primary one the users row carries.
+    // follower, not just the primary one the users row carries. The CREDENTIAL
+    // factors (passkeys, TOTP seeds) live in their own tables keyed by subject — the
+    // "credentials replicate" half of the criterion — and are sealed under the same
+    // KEK/DEK rows the apply already copies, so the factor rows travel intact.
     if table == "users" {
         copy_children(
             home,
@@ -152,6 +155,27 @@ pub async fn apply_event(
             entity_id,
             tenant_id,
             environment_id,
+            "user_id",
+        )
+        .await?;
+        copy_children(
+            home,
+            follower,
+            "webauthn_credentials",
+            entity_id,
+            tenant_id,
+            environment_id,
+            "subject",
+        )
+        .await?;
+        copy_children(
+            home,
+            follower,
+            "totp_credentials",
+            entity_id,
+            tenant_id,
+            environment_id,
+            "subject",
         )
         .await?;
     }
@@ -308,10 +332,11 @@ async fn copy_children(
     entity_id: &str,
     tenant_id: &str,
     environment_id: &str,
+    owner_column: &str,
 ) -> Result<(), sqlx::Error> {
     let rows: Vec<String> = sqlx::query_scalar(&format!(
         "SELECT row_to_json(t)::text FROM {table} t \
-         WHERE user_id = $1 AND tenant_id = $2 AND environment_id = $3"
+         WHERE {owner_column} = $1 AND tenant_id = $2 AND environment_id = $3"
     ))
     .bind(entity_id)
     .bind(tenant_id)
