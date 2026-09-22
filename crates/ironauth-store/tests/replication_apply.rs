@@ -3,14 +3,14 @@
 //! The follower's event-APPLY, against two real databases (issue #155).
 //!
 //! The shipper tests prove the ordered stream lands on the follower; this is the other
-//! half of the acceptance criterion — "users, credentials, and environment config
+//! half of the acceptance criterion - "users, credentials, and environment config
 //! created in the home region are queryable in the follower within the configured lag
 //! bound, verified by an integration test." A user registered in the home region, its
 //! `user.created` event shipped, and the apply run makes the user QUERYABLE on the
 //! follower through the same read path the runtime uses.
 //!
 //! The copy rides `row_to_json` + `json_populate_record`, so the sealed columns, the
-//! blind indexes, and the password hash all travel byte-for-byte — the drift gate: a
+//! blind indexes, and the password hash all travel byte-for-byte - the drift gate: a
 //! migration that changes a replicated table's shape is exercised by this test.
 
 use std::time::SystemTime;
@@ -127,7 +127,7 @@ async fn a_home_user_is_queryable_on_the_follower_after_ship_and_apply() {
 }
 
 /// THE WIDENING: a secondary identifier on the multi-identifier surface resolves on the
-/// follower too — a login through ANY identifier works after failover, not just the
+/// follower too - a login through ANY identifier works after failover, not just the
 /// primary one the users row carries.
 #[tokio::test]
 async fn a_secondary_identifier_resolves_on_the_follower_after_apply() {
@@ -219,7 +219,7 @@ async fn a_secondary_identifier_resolves_on_the_follower_after_apply() {
 }
 
 /// THE CREDENTIAL-FACTOR WIDENING: a passkey registered on home is present on the
-/// follower after the apply — the "credentials replicate" half extended beyond the
+/// follower after the apply - the "credentials replicate" half extended beyond the
 /// password hash to the WebAuthn factor surface.
 #[tokio::test]
 async fn a_passkey_registered_on_home_is_present_on_the_follower_after_apply() {

@@ -6,7 +6,7 @@
 //! runs pass the same correctness suite." The Postgres-only run is `replication_boot.rs`
 //! (the poll drives the pass); THIS run attaches the carrier and proves the wake drives
 //! it: the interval is set to FIVE MINUTES, so only a bus wake can make the pass happen
-//! inside the deadline — a pass that arrives is proof the wake crossed the broker, and
+//! inside the deadline - a pass that arrives is proof the wake crossed the broker, and
 //! the end-to-end assertions are the SAME suite as the Postgres-only run's.
 
 #![cfg(feature = "ironbus")]
@@ -164,7 +164,7 @@ async fn a_wake_carried_the_pass_and_the_follower_serves_the_same_stream() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     // The per-carrier lag artifact (issue #155, informational): the wake-to-ship elapsed
-    // and the achieved lag, written when the env names a path — the number the netem CI
+    // and the achieved lag, written when the env names a path - the number the netem CI
     // lane records under injected inter-region latency.
     if let Ok(path) = std::env::var("REGION_REPLICATION_LAG_JSON") {
         let elapsed = started.elapsed().as_millis();
@@ -212,7 +212,7 @@ async fn a_wake_carried_the_pass_and_the_follower_serves_the_same_stream() {
         "the follower is caught up to the home stream"
     );
     eprintln!(
-        "REGION_REPLICATION_CARRIER wake-driven pass, lag_messages=0 — the same \
+        "REGION_REPLICATION_CARRIER wake-driven pass, lag_messages=0 - the same \
          correctness suite as the Postgres-only run"
     );
 }

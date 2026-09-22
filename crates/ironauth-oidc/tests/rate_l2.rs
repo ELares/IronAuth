@@ -6,7 +6,7 @@
 //! sharing one store enforce ONE budget, and an unavailable store falls back to the local
 //! bucket with the outcome reporting it. What a fake cannot show is the IMPLEMENTATION: the
 //! buckets actually living in a real cache, so two NODES (processes) share one budget. This
-//! drives the whole chain — a real `ironcache` server, the `HotSharedRates` impl over the
+//! drives the whole chain - a real `ironcache` server, the `HotSharedRates` impl over the
 //! `RATE_COUNTER` keyspace, and two limiters attached to it.
 //!
 //! The skip is loud, never silent: no `ironcache` binary prints exactly what was not
@@ -207,8 +207,8 @@ fn free_port() -> u16 {
 
 /// CRITERION 2, IN THE SHARED TIER: a noisy tenant's storm over the shared store does not
 /// reduce a quiet tenant's admitted throughput. The read-modify-write race a storm
-/// produces is real — the noisy tenant's own budget may overshoot by one spend per
-/// concurrent node — but the quiet tenant's KEY is separate, so its admitted throughput
+/// produces is real - the noisy tenant's own budget may overshoot by one spend per
+/// concurrent node - but the quiet tenant's KEY is separate, so its admitted throughput
 /// is exactly its own budget. That is the documented fairness bound with the L2 attached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_noisy_tenant_storm_never_reduces_a_quiet_tenant_s_budget_in_the_shared_tier() {
@@ -286,7 +286,7 @@ async fn a_noisy_tenant_storm_never_reduces_a_quiet_tenant_s_budget_in_the_share
     }
 
     // THE DOCUMENTED BOUNDS. The noisy tenant may overshoot its burst by the racer count
-    // (the read-modify-write race, one lost spend per concurrent node — that is the cost
+    // (the read-modify-write race, one lost spend per concurrent node - that is the cost
     // of the fail-open class, and it is bounded, never an invented refusal).
     let noisy_total = noisy_admitted.load(std::sync::atomic::Ordering::SeqCst);
     assert!(

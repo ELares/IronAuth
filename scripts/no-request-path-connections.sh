@@ -12,9 +12,9 @@
 # code, which is precisely the seam a synchronous cross-region call (or any
 # second-database coupling) would have to come through.
 #
-# The lint scans the crates that serve requests — ironauth-oidc (the OIDC/authorize/login
+# The lint scans the crates that serve requests - ironauth-oidc (the OIDC/authorize/login
 # surface), and the helper crates it calls from handlers (hot, journey, screening,
-# quota, connector) — for connection construction:
+# quota, connector) - for connection construction:
 #
 #     Store::connect        ironauth_store::Store::connect
 #     PgPool::connect       sqlx::PgPool::connect / connect_with

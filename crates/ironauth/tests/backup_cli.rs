@@ -86,7 +86,7 @@ async fn fresh_database(name: &str) -> String {
 }
 
 /// THE ACCEPTANCE CRITERION: restore from a backup yields a working instance with the data it
-/// had — the migration ledger complete and every seeded row present.
+/// had - the migration ledger complete and every seeded row present.
 #[tokio::test]
 async fn restore_into_a_fresh_database_yields_the_backed_up_store() {
     let database = TestDatabase::start().await;

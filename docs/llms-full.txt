@@ -1117,7 +1117,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `backup` | table | see fields | Scheduled encrypted backups to S3-compatible object storage (issue #153): whether THIS process takes a logical backup of the primary store on an interval and pushes it, sealed under the platform master key, to the configured bucket. |
 | `backup.enabled` | boolean | `false` | Whether THIS process takes scheduled backups. OFF by default. |
 | `backup.interval_secs` | integer | `86400` | Seconds between backup passes. |
-| `backup.retention_secs` | integer | `0` | How long a backup object is kept, in seconds. `0` means keep forever — the same default direction as audit retention: the failure mode of retention being off is a larger bucket, and the failure mode of it being on by accident is a deleted restore point. Only one of those is recoverable. |
+| `backup.retention_secs` | integer | `0` | How long a backup object is kept, in seconds. `0` means keep forever - the same default direction as audit retention: the failure mode of retention being off is a larger bucket, and the failure mode of it being on by accident is a deleted restore point. Only one of those is recoverable. |
 | `backup.s3_bucket` | string or unset | unset | The bucket on that endpoint. |
 | `backup.s3_credential` | string or table or unset | unset | The secret holding `<access key id>:<secret access key>`, the shape every S3 tool takes. Named as `ID:env:VAR` or `ID:file:PATH`, like the log sink's credential. |
 | `backup.s3_endpoint` | string or unset | unset | The S3-compatible endpoint (an `https` URL) the sealed backups are pushed to. |
@@ -1443,9 +1443,9 @@ at the top of the file, or map it in `.taplo.toml`).
 | `replication.alert_threshold_messages` | integer | `0` | The lag bound, in stream positions: a partition whose lag exceeds it is alerted. `0` disables alerting. |
 | `replication.enabled` | boolean | `false` | Whether the replication shipper is wired at boot. OFF by default. |
 | `replication.follower_database_url` | string or table or unset | unset | The FOLLOWER's database URL: the regional replica this process ships the ordered outbox stream to. MUST differ from `home_database_url` (a shipper pointed at itself is a configuration error, not a mode) and must authenticate as a role with SELECT and INSERT on `outbox_messages` and the column-scoped UPDATE on `replication_cursors` (the app role holds all three). [`None`] disables the shipper however `enabled` is set. |
-| `replication.home_database_url` | string or table or unset | unset | The HOME region's database URL for the stream READS. MUST name a superuser or BYPASSRLS role, for the same reason `ironauth storage backup` and the doctor demand one: `outbox_messages` is FORCE ROW LEVEL SECURITY, and a role subject to the policies sees only the rows its session settings name — it cannot even enumerate the partitions to ship. [`None`] disables the shipper however `enabled` is set. |
+| `replication.home_database_url` | string or table or unset | unset | The HOME region's database URL for the stream READS. MUST name a superuser or BYPASSRLS role, for the same reason `ironauth storage backup` and the doctor demand one: `outbox_messages` is FORCE ROW LEVEL SECURITY, and a role subject to the policies sees only the rows its session settings name - it cannot even enumerate the partitions to ship. [`None`] disables the shipper however `enabled` is set. |
 | `replication.interval_secs` | integer | `60` | Seconds between ship passes. A pass is bounded by its own batch limits. |
-| `replication.ironbus_addr` | string or unset | unset | The optional IronBus carrier (issue #155): when set, the shipper's pass loop WAITS on the backbone instead of sleeping the interval out — a wake (a stream event enqueued, or the operator's promotion) starts the next pass immediately. The carrier lowers lag; it is never a prerequisite. Unset means Postgres-only, the shipped default. |
+| `replication.ironbus_addr` | string or unset | unset | The optional IronBus carrier (issue #155): when set, the shipper's pass loop WAITS on the backbone instead of sleeping the interval out - a wake (a stream event enqueued, or the operator's promotion) starts the next pass immediately. The carrier lowers lag; it is never a prerequisite. Unset means Postgres-only, the shipped default. |
 | `risc_receiver` | table | see fields | The Google Cross-Account Protection RISC receiver (issue #144). OFF by default, so the default boot mounts no receiver endpoint and accepts no inbound SET. |
 | `risc_receiver.algorithms` | array | empty | The JWS algorithm allowlist an inbound SET may be signed with, as JOSE `alg` names. |
 | `risc_receiver.audience` | string | `""` | The `aud` an inbound SET must carry. |
@@ -8525,7 +8525,7 @@ write this page, write the generator.
 
 Each tier is one *optional* component whose absence degrades rather than stops the
 deployment. Degraded is SERVING: every flow still completes, and only latency or timeliness
-suffers. That is why `/readyz` answers `200` for a degraded tier — a `503` would have a
+suffers. That is why `/readyz` answers `200` for a degraded tier - a `503` would have a
 Kubernetes readiness probe pull the pod out of its Service because an optional component is
 down, turning an accelerator outage into an availability outage. HARD DOWN is the only `503`,
 because Postgres is the tier everything is complete on.
@@ -8556,14 +8556,14 @@ generator. The attachment column is pinned by the wiring tests in `readiness.rs`
 | tier | token | absent component | how it attaches | request paths | RPO / RTO | operator signal |
 | --- | --- | --- | --- | --- | --- | --- |
 | `backbone_absent` | `backbone_absent` | the async backbone (IronBus) is unreachable | `outbox.ironbus_addr` set but not answering | none: no request path consults the backbone; outbox work accumulates in Postgres and drains on recovery, because the drain is a Postgres poll and the backbone only decides WHEN it runs | RPO 0 (nothing is dropped; the outbox is the store of record and the drain resumes on recovery). RTO: delivery latency degrades to the poll interval; no request path is affected | `/readyz` answers `200 degraded: backbone_absent`; queue-lag metrics rise and recover as the drain catches up |
-| `accelerator_absent` | `accelerator_absent` | the shared hot-state accelerator (IronCache) is unreachable | `hot_state.ironcache_addr` set but not answering | none today: `ironauth-hot` is not a dependency of any crate that serves a request, so this is a LATENCY tier — reported only when a deployment declared the accelerator, and reported for reachability, never for correctness | RPO 0 / RTO: latency only. `ironauth_hot::Tiered`'s outage tests measure every answer identical with the accelerator failing every call | `/readyz` answers `200 degraded: accelerator_absent` |
+| `accelerator_absent` | `accelerator_absent` | the shared hot-state accelerator (IronCache) is unreachable | `hot_state.ironcache_addr` set but not answering | none today: `ironauth-hot` is not a dependency of any crate that serves a request, so this is a LATENCY tier - reported only when a deployment declared the accelerator, and reported for reachability, never for correctness | RPO 0 / RTO: latency only. `ironauth_hot::Tiered`'s outage tests measure every answer identical with the accelerator failing every call | `/readyz` answers `200 degraded: accelerator_absent` |
 
 ## Combined failures
 
 Two rules, each pinned by a test:
 
 - **The database dominates.** Whatever else is absent, an unreachable or unqueryable database
-  is hard down — `503` — because Postgres is the tier everything is complete on
+  is hard down - `503` - because Postgres is the tier everything is complete on
   (`an_unreachable_database_is_hard_down_whatever_else_answers`). There is no degraded tier
   above a down database.
 - **Among optional components, the first declared names the tier.** `ReadinessProbe` reports
@@ -9132,15 +9132,15 @@ Source: docs/MULTI-REGION-REPLICATION.md
 
 # Multi-Region Replication on the Event Backbone (issue #155, EXPLORATORY)
 
-Status: **design note** — pinned assumptions recorded before code hardens, per the
+Status: **design note** - pinned assumptions recorded before code hardens, per the
 issue's own requirement. Nothing on this page is built. The `multi-region-replication`
 feature is registered in the experimental ack gate (`features.rs`) and is deliberately
 inert: enabling the flag today acknowledges this design note and changes nothing.
 
 ## Why this mechanism and not the incumbents'
 
-Keycloak's multi-site guidance requires sub-10ms RTT between sites — effectively
-multi-AZ, not multi-region — because its Infinispan coupling is synchronous. The
+Keycloak's multi-site guidance requires sub-10ms RTT between sites - effectively
+multi-AZ, not multi-region - because its Infinispan coupling is synchronous. The
 hyperscaler offerings sidestep the hard part by pinning identity data to one geography.
 Cognito's June 2026 capability and Auth0's private-cloud offering set the bar this
 issue targets: users, credentials, and configuration replicate across regions with
@@ -9149,7 +9149,7 @@ issue targets: users, credentials, and configuration replicate across regions wi
 IronAuth's architecture already points at a different mechanism: the transactional
 outbox produces an **ordered event stream** (every mutation is a row, every row is a
 stream event, transactions and audit are one). Replicating that stream asynchronously
-gives an explicit, tunable **RPO** instead of a hidden RTT ceiling — the lag bound is a
+gives an explicit, tunable **RPO** instead of a hidden RTT ceiling - the lag bound is a
 number the operator chooses and the system reports, not a physics constraint.
 
 ## The pinned assumptions
@@ -9164,7 +9164,7 @@ bumps `MULTI_REGION_REPLICATION_VERSION` and invalidates existing acks.
 2. **Cross-region flows are asynchronous only.** No synchronous cross-region database
    call may exist on any request path. This is enforced structurally, not by
    convention: the request-path crates never construct a database connection (the
-   `no-request-path-connections` lint in the gate pins that — the request path receives
+   `no-request-path-connections` lint in the gate pins that - the request path receives
    its `Store` from boot wiring, so a connection constructed in request code would be a
    new database target chosen by the request, which is the seam a synchronous
    cross-region call would have to come through).
@@ -9188,7 +9188,7 @@ bumps `MULTI_REGION_REPLICATION_VERSION` and invalidates existing acks.
 
 - **RPO as a first-class metric**: replication lag exported per tenant in the metric
   contract, with configurable alerting thresholds.
-- **The failover demo**: a scripted, repeatable promotion that preserves logins — an
+- **The failover demo**: a scripted, repeatable promotion that preserves logins - an
   existing session and a refresh token from before failover both work after promotion,
   with the achieved RPO documented from the run.
 - **Catch-up**: users, credentials, and config created in the home region are queryable
@@ -9196,7 +9196,7 @@ bumps `MULTI_REGION_REPLICATION_VERSION` and invalidates existing acks.
 - **Dual-transport correctness**: both the Postgres-only and the IronBus-carried runs
   pass the same correctness suite; per-carrier lag is measured under netem-injected
   inter-region latency and published as CI artifacts (informational, no relative
-  threshold — whether IronBus lowers lag on real hardware is a graduation-assessment
+  threshold - whether IronBus lowers lag on real hardware is a graduation-assessment
   question, not a CI gate).
 - **The architectural lint** (already landed): `scripts/no-request-path-connections.sh`,
   in the gate, pins that no request-path crate constructs a connection.

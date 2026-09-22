@@ -85,14 +85,14 @@ async fn a_signal_crosses_the_broker_and_wakes_the_drain() {
 ///
 /// The comparison the criterion asks for is between the two ways the drain learns of a
 /// message: the Postgres-only mode wakes at most once per `outbox.poll_interval_secs` (5
-/// seconds by default — the drain sleeps the full interval), and the bus mode wakes when
+/// seconds by default - the drain sleeps the full interval), and the bus mode wakes when
 /// the signal crosses the broker. The bus wake is measured the same way the existing
 /// signal test measures it (a second connection produces the wake, which is the real
 /// two-process shape), and the poll budget is the config default, stated as its source so
 /// the number cannot be read as measured.
 ///
 /// The result is always printed as one machine-readable line, and additionally written to
-/// `IRONBUS_BACKBONE_LATENCY_JSON` when that env var names a path — the release workflow
+/// `IRONBUS_BACKBONE_LATENCY_JSON` when that env var names a path - the release workflow
 /// pattern (`UNIT_COSTS_JSON`), so the numbers become CI artifacts rather than scrollback.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_bus_wake_latency_is_recorded_beside_the_poll_budget() {

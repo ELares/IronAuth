@@ -7,16 +7,16 @@
 //! The shipper copies the ordered outbox stream to the follower. The stream's domain
 //! events (`webhook.event` consumer rows) are the record of what changed; the APPLY half
 //! turns them back into replica state. The envelope payloads are deliberately
-//! PII-free (they name entities, never secrets — the catalog enforces it), so an apply
+//! PII-free (they name entities, never secrets - the catalog enforces it), so an apply
 //! cannot reconstruct the sealed/encrypted columns from the payload alone. The apply
 //! therefore works the way the events were designed to be consumed: the event names the
-//! entity, and the apply copies that entity's HOME ROW to the follower byte-for-byte —
+//! entity, and the apply copies that entity's HOME ROW to the follower byte-for-byte -
 //! sealed envelope columns, blind indexes, and the credential hashes all travel intact.
 //!
 //! # The generic copy
 //!
 //! `copy_row` reads the home row as JSON (`row_to_json`) and inserts it into the
-//! follower with `json_populate_record` — no column list to maintain, so a migration
+//! follower with `json_populate_record` - no column list to maintain, so a migration
 //! that adds a column to a replicated table does not break the copy, and the
 //! integration test below is the drift gate: a column added to a replicated table is
 //! exercised by the very test that applies its events.
@@ -144,8 +144,8 @@ pub async fn apply_event(
     // A user's identity is more than the users row: the multi-identifier surface lives
     // in `user_identifiers`, and a login through ANY identifier must resolve on the
     // follower, not just the primary one the users row carries. The CREDENTIAL
-    // factors (passkeys, TOTP seeds) live in their own tables keyed by subject — the
-    // "credentials replicate" half of the criterion — and are sealed under the same
+    // factors (passkeys, TOTP seeds) live in their own tables keyed by subject - the
+    // "credentials replicate" half of the criterion - and are sealed under the same
     // KEK/DEK rows the apply already copies, so the factor rows travel intact.
     if table == "users" {
         copy_children(
@@ -193,7 +193,7 @@ pub async fn apply_event(
 /// # Errors
 ///
 /// [`sqlx::Error`] when the copy cannot run, or when the home row's JSON does not map
-/// onto the follower's row shape (a schema divergence — the drift the integration test
+/// onto the follower's row shape (a schema divergence - the drift the integration test
 /// exists to catch).
 async fn copy_row(
     home: &PgPool,
@@ -291,7 +291,7 @@ async fn copy_scope_rows(
 /// catalog carries only `session.revoked`), so a follower cannot be built for them
 /// event-by-event. The promotion procedure therefore copies them at promotion, in the
 /// same generic row-copy the event-apply uses, and the achieved RPO is the lag at that
-/// moment — the design note's loss-window statement covers the events inside it. This
+/// moment - the design note's loss-window statement covers the events inside it. This
 /// is a stated exploratory boundary, not a hidden one.
 ///
 /// # Errors
@@ -369,7 +369,7 @@ async fn copy_children(
 ///
 /// # Errors
 ///
-/// [`sqlx::Error`] on a persistence failure. The batch stops at the first failure — the
+/// [`sqlx::Error`] on a persistence failure. The batch stops at the first failure - the
 /// caller retries the whole batch and the idempotent copies converge.
 pub async fn apply_envelopes(
     home: &PgPool,
@@ -400,7 +400,7 @@ pub async fn shipped_domain_events(
 ) -> Result<Vec<(String, serde_json::Value)>, sqlx::Error> {
     use sqlx::Row as _;
     let rows = sqlx::query(
-        "SELECT id, payload FROM outbox_messages WHERE consumer = $1 ORDER BY sequence",
+        "SELECT id, payload FROM outbox_messages /* query-audit-allow: the replication substrate beside the repository module; home reads ride a BYPASSRLS connection and follower writes carry the scope settings */ WHERE consumer = $1 ORDER BY sequence",
     )
     .bind(DOMAIN_EVENT_CONSUMER)
     .fetch_all(follower)

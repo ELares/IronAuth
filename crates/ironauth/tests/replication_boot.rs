@@ -7,7 +7,7 @@
 //! (`tests/replication.rs`). What is only reachable here is the WIRING: whether a
 //! deployed process with `[replication] enabled = true` actually connects the home and
 //! follower pools, ships the ordered stream, writes the follower's cursor, and reports
-//! the pass — the same gap the retention-boot suite exists to close for that sweeper.
+//! the pass - the same gap the retention-boot suite exists to close for that sweeper.
 //!
 //! The binary runs on the SYSTEM clock; the fixture rows are enqueued through a
 //! DETERMINISTIC env pinned to the epoch, and the waits count polls rather than sleep a

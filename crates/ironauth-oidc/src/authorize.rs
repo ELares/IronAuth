@@ -382,7 +382,7 @@ impl ResolvedClient<'_> {
 
     /// The VERIFIED client identifier (issue #150 criterion 1): the per-client rate
     /// layer's bucket key. For a registered client it is the store's `ClientId`; for a
-    /// CIMD client the document's own id — never attacker-chosen bytes, because this
+    /// CIMD client the document's own id - never attacker-chosen bytes, because this
     /// resolves AFTER the client was confirmed to exist.
     pub(crate) fn client_id(&self) -> String {
         match self {

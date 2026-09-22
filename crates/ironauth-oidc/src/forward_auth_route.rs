@@ -222,13 +222,13 @@ pub async fn check(
 ///
 /// THE DRY-RUN HALF OF THE CRITERION, and the separation is structural, not a promise: this
 /// route never calls `evaluate`. It decodes the request through the SAME dialect the check
-/// route uses, sanitises it through the SAME sanitisation, walks the SAME rules — and
+/// route uses, sanitises it through the SAME sanitisation, walks the SAME rules - and
 /// returns the trace. There is no enforcement path from here: the caller gets JSON, not a
 /// verdict a proxy can act on.
 ///
 /// Same hop gate as the check: only a request that arrived through the trusted-proxy chain
 /// may ask. The trace names rules and criteria, which is configuration knowledge, and the
-/// check response's own explanation header is the reason this surface exists — the full
+/// check response's own explanation header is the reason this surface exists - the full
 /// walk is what the proxy operator reaches for when the one-liner is not enough.
 pub async fn dry_run(
     State(state): State<OidcState>,

@@ -7,11 +7,11 @@
 //! The replication artifact the design note records is the outbox's ordered event
 //! stream. The `sequence` column on [`outbox_messages`](crate) is a database-assigned monotonic
 //! order (never client-supplied), and the message body (`consumer`, `idempotency_key`,
-//! `ordering_key`, `payload`, `enqueued_at`) is immutable once enqueued — so the stream is a
+//! `ordering_key`, `payload`, `enqueued_at`) is immutable once enqueued - so the stream is a
 //! stable, ordered, deduplicable log. This shipper copies that log from a home region's
 //! database to a follower's, preserving order, and records each (tenant, environment)'s
 //! position on the follower. Lag is the difference between the home high-water mark and
-//! the shipped position — a number, not a ceiling.
+//! the shipped position - a number, not a ceiling.
 //!
 //! What a follower DOES with the stream (the event-apply machinery that rebuilds users,
 //! credentials, and configuration) is deliberately NOT this module: shipping the ordered
@@ -126,7 +126,7 @@ impl ReplicationShipper {
     ///
     /// # Panics
     ///
-    /// Panics if the two pools are the same pool — a shipper pointed at itself would
+    /// Panics if the two pools are the same pool - a shipper pointed at itself would
     /// "replicate" a region into itself, which is a configuration error, not a mode.
     #[must_use]
     pub fn new(home: PgPool, follower: PgPool) -> Self {
@@ -185,7 +185,7 @@ impl ReplicationShipper {
             .map(|(t, e, _)| (t.clone(), e.clone()))
             .collect();
         let fresh: Vec<(String, String)> =
-            sqlx::query("SELECT DISTINCT tenant_id, environment_id FROM outbox_messages")
+            sqlx::query("SELECT DISTINCT tenant_id, environment_id FROM outbox_messages /* query-audit-allow: the replication substrate beside the repository module; home reads ride a BYPASSRLS connection and follower writes carry the scope settings */")
                 .fetch_all(&self.home)
                 .await?
                 .into_iter()
@@ -249,7 +249,7 @@ impl ReplicationShipper {
              ordering_key, payload, (EXTRACT(EPOCH FROM enqueued_at) * 1000000)::bigint \
              AS enqueued_at, (EXTRACT(EPOCH FROM next_attempt_at) * 1000000)::bigint \
              AS next_attempt_at \
-             FROM outbox_messages \
+             FROM outbox_messages /* query-audit-allow: the replication substrate beside the repository module; home reads ride a BYPASSRLS connection and follower writes carry the scope settings */ \
              WHERE tenant_id = $1 AND environment_id = $2 AND sequence > $3 \
              ORDER BY sequence LIMIT $4",
         )
@@ -279,7 +279,7 @@ impl ReplicationShipper {
             // No rows above the cursor: nothing to advance. The lag report still needs
             // the home high-water mark.
             let home_max: Option<i64> = sqlx::query_scalar(
-                "SELECT max(sequence) FROM outbox_messages \
+                "SELECT max(sequence) FROM outbox_messages /* query-audit-allow: the replication substrate beside the repository module; home reads ride a BYPASSRLS connection and follower writes carry the scope settings */ \
                  WHERE tenant_id = $1 AND environment_id = $2",
             )
             .bind(tenant_id)
@@ -311,7 +311,7 @@ impl ReplicationShipper {
             .await?;
         for row in &rows {
             sqlx::query(
-                "INSERT INTO outbox_messages \
+                "INSERT INTO outbox_messages /* query-audit-allow: the replication substrate beside the repository module; home reads ride a BYPASSRLS connection and follower writes carry the scope settings */ \
                  (id, tenant_id, environment_id, consumer, idempotency_key, ordering_key, \
                   payload, enqueued_at, next_attempt_at) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, \
@@ -349,7 +349,7 @@ impl ReplicationShipper {
         tx.commit().await?;
 
         let home_max: Option<i64> = sqlx::query_scalar(
-            "SELECT max(sequence) FROM outbox_messages \
+            "SELECT max(sequence) FROM outbox_messages /* query-audit-allow: the replication substrate beside the repository module; home reads ride a BYPASSRLS connection and follower writes carry the scope settings */ \
              WHERE tenant_id = $1 AND environment_id = $2",
         )
         .bind(tenant_id)

@@ -5,7 +5,7 @@
 //! The endpoint half is exercised at the router level (the openapi contract's served-route
 //! sweep drives every documented route, including the backups route, at 401). What is only
 //! reachable here is the STORE half: whether a request lands in the admin-action stream
-//! with the right action, target, and detail — the durable record that answers "who asked,
+//! with the right action, target, and detail - the durable record that answers "who asked,
 //! when" even when no scheduler is running.
 
 use ironauth_env::Env;

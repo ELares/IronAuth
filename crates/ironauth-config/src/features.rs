@@ -166,7 +166,7 @@ pub const MULTI_REGION_REPLICATION_FEATURE: &str = "multi-region-replication";
 /// A counter rather than a draft revision: what an operator acknowledges here is
 /// IronAuth's OWN replication design, recorded in docs/MULTI-REGION-REPLICATION.md. The
 /// feature is EXPLORATORY: replication of the outbox event stream from a home region to
-/// followers is not built, so enabling the flag today changes nothing but the ack — the
+/// followers is not built, so enabling the flag today changes nothing but the ack - the
 /// registration is what makes "unavailable without the experimental ack" true the day the
 /// code lands, and the pinned assumptions (single writer region per environment,
 /// asynchronous-only cross-region flows, Postgres-only plus optional IronBus transport,
@@ -501,7 +501,7 @@ impl FeatureRegistry {
     /// Nothing is built yet: the registration is the gate. The issue requires the feature
     /// to be unavailable without the experimental ack from the M1 maturity ladder, so the
     /// flag exists and is registered before the code does, and the design note (the
-    /// issue's own first deliverable — "design assumptions written down before code
+    /// issue's own first deliverable - "design assumptions written down before code
     /// hardens") records what enabling it will acknowledge.
     pub fn register_multi_region_replication(&mut self) {
         self.register(Feature::experimental(

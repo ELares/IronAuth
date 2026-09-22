@@ -8,7 +8,7 @@
 //! The SEAL lives in `ironauth-jose::backup` and the runner (which runs `pg_dump`, refuses
 //! an RLS-subjected role or an empty dump, and PUTs the sealed bytes) lives in the binary.
 //! This module is the pure S3 half: everything that must be testable without a database and
-//! without a network — and it is, structurally, the same way the `SigV4` module is. The
+//! without a network - and it is, structurally, the same way the `SigV4` module is. The
 //! end-to-end signature against a real S3-compatible endpoint belongs to the same
 //! conformance run the log sink's PUT documents, because it cannot be verified here.
 
@@ -30,7 +30,7 @@ const MIN_RETENTION_SECS: u64 = 60;
 /// `<prefix>/<yyyymmdd>/<yyyymmddThhmmssZ>.bin`. A day-ordered layout is what makes a
 /// retention LIST cheap: the runner lists `{prefix}/{date}/` for the dates older than the
 /// window and deletes every object it finds there, without listing the whole bucket.
-/// A timestamped key means a retried run creates a second object — the accepted semantics
+/// A timestamped key means a retried run creates a second object - the accepted semantics
 /// for backups (at least once with occasional duplicates), where the log sink's
 /// batch-derived key would be the wrong shape because a NEW backup must never overwrite
 /// an OLD one.
@@ -95,7 +95,7 @@ pub fn prune_set(
 
 /// The production instant embedded in an object key, in unix seconds.
 ///
-/// Returns `None` for a key that is not ours (a foreign object in the prefix) — foreign
+/// Returns `None` for a key that is not ours (a foreign object in the prefix) - foreign
 /// objects are never pruned, because deleting what the layout does not own is how a prune
 /// pass eats the bucket.
 fn embedded_timestamp_secs(key: &str, prefix: &str) -> Option<u64> {
@@ -153,7 +153,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
 /// The S3-compatible responses the runner targets all render `ListObjectsV2` as XML with
 /// `<Contents><Key>...</Key></Contents>` entries. The parser matches the `Key` element
 /// text inside `Contents`, and refuses a response with no `<Contents>` at all rather than
-/// returning an empty prune set — an empty set from an actually-empty listing and an empty
+/// returning an empty prune set - an empty set from an actually-empty listing and an empty
 /// set from an unparsed response are indistinguishable, and only one of them should
 /// conclude a prune pass.
 #[must_use]
@@ -261,7 +261,7 @@ pub fn delete_request(
 ///
 /// # Panics
 ///
-/// Panics when the credential has no `:` — the caller validates before any request is
+/// Panics when the credential has no `:` - the caller validates before any request is
 /// signed, so this is a programmer error.
 fn split_credential(credential: &str) -> (&str, &str) {
     let (access, secret) = credential

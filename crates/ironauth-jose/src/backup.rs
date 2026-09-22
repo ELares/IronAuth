@@ -8,7 +8,7 @@
 //! The envelope seals per-tenant COLUMNS under the scope's DEK/KEK hierarchy, which is the
 //! right machinery when the reader is a running server that can resolve the hierarchy.
 //! A BACKUP is read by a future restore, possibly on a fresh machine, before any of that
-//! exists — so it is sealed under the operator-held master key directly, with its own
+//! exists - so it is sealed under the operator-held master key directly, with its own
 //! domain-separated derivation so no other use of the same master key shares a keystream.
 //!
 //! The derivation mirrors `envelope::MasterKey::derive`: `HMAC-SHA256(master, label)` gives
@@ -18,7 +18,7 @@
 //!
 //! # The file shape
 //!
-//! `magic(8) || version(1) || nonce(12) || ciphertext || tag(16)` — one sealed blob, no
+//! `magic(8) || version(1) || nonce(12) || ciphertext || tag(16)` - one sealed blob, no
 //! plaintext metadata. `open` refuses on a wrong key, a tampered byte, or a foreign magic:
 //! the AEAD tag IS the checksum the criterion asks for, verified on write and on restore.
 
@@ -127,7 +127,7 @@ impl SealedBackup {
     ///
     /// # Panics
     ///
-    /// Panics if `master_key` is not 32 bytes — the derivation guarantees the length for
+    /// Panics if `master_key` is not 32 bytes - the derivation guarantees the length for
     /// every material this module is handed, so a wrong-length key is a programming error.
     pub fn open(&self, master_key: &[u8], context: &[u8]) -> Result<Vec<u8>, BackupOpenError> {
         if !self.bytes.starts_with(MAGIC)
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn round_trips_under_the_same_key_and_context() {
-        let plaintext = b"CREATE TABLE sessions (...);\\nCOPY sessions FROM ...;";
+        let plaintext = b"CREATE TABLE sessions (...);\\nCOPY sessions FROM ...;"; // query-audit-allow: test-only literal, no SQL executes
         let sealed = SealedBackup::seal(plaintext, MASTER, CONTEXT);
         assert_eq!(
             SealedBackup::open(&sealed, MASTER, CONTEXT).expect("opens"),

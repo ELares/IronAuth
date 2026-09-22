@@ -10,17 +10,17 @@
 //! The demo, in one test:
 //!
 //! 1. A user signs in on the HOME region through the real harness flows (login, consent,
-//!    authorize, token exchange) — a session cookie and a refresh token exist before any
+//!    authorize, token exchange) - a session cookie and a refresh token exist before any
 //!    failover.
 //! 2. The replication pass ships the ordered stream and applies it: the user's rows
 //!    (with the credential hash) become queryable on the FOLLOWER.
 //! 3. THE PROMOTION: the procedure copies the session-relevant state the event stream
-//!    does not carry (sessions, refresh families, refresh tokens, grants) — a stated
-//!    exploratory boundary, since those tables have no creation events — and the
+//!    does not carry (sessions, refresh families, refresh tokens, grants) - a stated
+//!    exploratory boundary, since those tables have no creation events - and the
 //!    achieved RPO (the lag at that moment) is recorded.
 //! 4. AFTER PROMOTION, the follower serves: the session resolves through the runtime's
 //!    read guard, and the refresh token resolves through the token endpoint's own
-//!    validation read — both from before failover, both still working.
+//!    validation read - both from before failover, both still working.
 
 mod common;
 use common::{
@@ -204,7 +204,7 @@ async fn a_promoted_follower_serves_a_pre_failover_session_and_refresh_token() {
 
     eprintln!(
         "REGION_FAILOVER_DEMO achieved_rpo_messages={achieved_rpo_messages} \
-         rpo_at_promotion={rpo_at_promotion} — session and refresh token served by the \
+         rpo_at_promotion={rpo_at_promotion} - session and refresh token served by the \
          promoted follower"
     );
 }

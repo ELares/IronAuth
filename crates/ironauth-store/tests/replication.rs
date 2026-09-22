@@ -9,7 +9,7 @@
 //! What is pinned here is the transport contract:
 //!
 //! * The follower's outbox holds the SAME message rows (by id, payload, order) as the
-//!   home stream — order-preserved, because the copy reads home's `sequence` order and
+//!   home stream - order-preserved, because the copy reads home's `sequence` order and
 //!   the follower's own identity assigns its drain order in that same order.
 //! * The cursor advances to the LAST COPIED HOME SEQUENCE in the same transaction as the
 //!   copy, so a retry converges instead of double-copying (the `ON CONFLICT` id no-op).
@@ -24,7 +24,7 @@ use ironauth_store::{NewOutboxMessage, WEBHOOK_EVENT_CONSUMER};
 use sqlx::Row;
 use std::time::SystemTime;
 
-/// Enqueue a REAL domain event on `db` under the event feed consumer — the same path the
+/// Enqueue a REAL domain event on `db` under the event feed consumer - the same path the
 /// domain writes ride (`enqueue_domain_event` names this consumer), so the rows under
 /// test are the actual ordered event stream, validated against the event catalog the
 /// way production events are.
@@ -87,7 +87,7 @@ async fn the_ordered_stream_replicates_and_lag_drops_to_zero() {
     let follower = TestDatabase::start().await;
     let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0C0A_0001);
     // The SAME deterministic env seeds the SAME (tenant, environment) ids on both
-    // databases — the follower's replica must hold the pinned tenants' rows, which is
+    // databases - the follower's replica must hold the pinned tenants' rows, which is
     // what the FKs require. TWO same-seeded envs, one per database: a SHARED env would
     // advance its entropy across the databases and seed DIFFERENT ids on the follower.
     let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0C0A_0001);
