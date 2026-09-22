@@ -143,7 +143,8 @@ async fn a_wired_boot_ships_the_stream_to_the_follower() {
 
     // THE PASS, watched in the process's own log: the wired shipper must announce
     // itself and ship the pending event.
-    let deadline = std::time::Instant::now() + SHIP_DEADLINE;
+    let started = std::time::Instant::now();
+    let deadline = started + SHIP_DEADLINE;
     let mut saw_running = false;
     let mut saw_shipped = false;
     while std::time::Instant::now() < deadline {
@@ -161,6 +162,18 @@ async fn a_wired_boot_ships_the_stream_to_the_follower() {
             output
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // The per-carrier lag artifact (issue #155, informational): the elapsed-to-ship and
+    // the achieved lag, written when the env names a path.
+    if let Ok(path) = std::env::var("REGION_REPLICATION_LAG_JSON") {
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"carrier\": \"postgres-only\", \"ship_elapsed_ms\": {}, \"lag_messages\": 0}}\n",
+                started.elapsed().as_millis()
+            ),
+        )
+        .expect("write the lag artifact");
     }
     let output = serve.output();
     assert!(saw_running, "the shipper announced itself:\n{output}");
