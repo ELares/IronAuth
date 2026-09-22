@@ -167,6 +167,11 @@ name = "rekey_cli_guard"
 # observes the `serve` call site itself: replacing that call with a no-op left every other
 # test green. Same gating as the CLI suite above.
 [[test]]
+name = "replication_boot_ironbus"
+path = "tests/replication_boot_ironbus.rs"
+required-features = ["testing", "ironbus"]
+
+[[test]]
 name = "replication_boot"
 path = "tests/replication_boot.rs"
 

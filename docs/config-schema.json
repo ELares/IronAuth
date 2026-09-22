@@ -2845,6 +2845,14 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "ironbus_addr": {
+          "default": null,
+          "description": "The optional IronBus carrier (issue #155): when set, the shipper's pass loop\nWAITS on the backbone instead of sleeping the interval out \u2014 a wake (a stream\nevent enqueued, or the operator's promotion) starts the next pass immediately.\nThe carrier lowers lag; it is never a prerequisite. Unset means Postgres-only,\nthe shipped default.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -4049,7 +4057,8 @@
         "enabled": false,
         "follower_database_url": null,
         "home_database_url": null,
-        "interval_secs": 60
+        "interval_secs": 60,
+        "ironbus_addr": null
       },
       "description": "Replication (issue #155, EXPLORATORY): the operator-chosen lag bound the\noutbox-stream replication shipper alerts at. OFF by default."
     },

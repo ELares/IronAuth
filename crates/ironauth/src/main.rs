@@ -9155,6 +9155,8 @@ struct ReplicationShipperInputs {
     alert_threshold_messages: u64,
     /// Seconds between ship passes.
     interval_secs: u64,
+    /// The optional IronBus carrier: the pass loop waits on it instead of the interval.
+    ironbus_addr: Option<String>,
 }
 
 /// Resolve the replication shipper inputs, or return [`None`] with every refusal logged.
@@ -9200,6 +9202,7 @@ fn replication_shipper_inputs(config: &Config) -> Option<ReplicationShipperInput
         follower_url,
         alert_threshold_messages: replication.alert_threshold_messages,
         interval_secs: replication.interval_secs,
+        ironbus_addr: replication.ironbus_addr.clone(),
     })
 }
 
@@ -9227,17 +9230,51 @@ async fn start_replication_shipper(
     };
     let shipper = ironauth_store::replication::ReplicationShipper::new(home_pool, follower_pool)
         .with_alert_threshold(inputs.alert_threshold_messages);
-    let handle = tokio::spawn(replication_shipper_loop(shipper, inputs.interval_secs));
+    let handle = tokio::spawn(replication_shipper_loop(
+        shipper,
+        inputs.interval_secs,
+        inputs.ironbus_addr,
+    ));
     tracing::info!("replication shipper running");
     Some(handle)
 }
 
 /// The shipper loop: one pass at boot, then every interval. Every pass logs its report
 /// (per-partition lag); the metrics and the threshold alert are the shipper's own.
+///
+/// With the IronBus carrier configured, the wait between passes is the backbone's: a
+/// wake (a stream event enqueued, or the promotion signal) starts the next pass
+/// immediately instead of on the interval — the carrier lowers lag and is never a
+/// prerequisite (an unreachable broker falls back to the interval with a logged reason).
 async fn replication_shipper_loop(
     shipper: ironauth_store::replication::ReplicationShipper,
     interval_secs: u64,
+    ironbus_addr: Option<String>,
 ) {
+    // The carrier is feature-gated exactly as the outbox backbone is: without the
+    // `ironbus` feature the loop polls on the interval, Postgres-only.
+    #[cfg(feature = "ironbus")]
+    let wait = match ironbus_addr.as_deref().filter(|a| !a.is_empty()) {
+        Some(addr) => match ironauth_store::outbox_ironbus::IronBusBackbone::connect(addr) {
+            Ok(backbone) => {
+                tracing::info!("replication carrier attached: wakes arrive via IronBus");
+                BackboneWait::Some(backbone)
+            }
+            Err(error) => {
+                tracing::error!(
+                    "replication carrier NOT attached ({error}); the pass loop polls on the \
+                     interval, Postgres-only"
+                );
+                BackboneWait::None
+            }
+        },
+        None => BackboneWait::None,
+    };
+    #[cfg(not(feature = "ironbus"))]
+    let wait = {
+        let _ = &ironbus_addr;
+        BackboneWait::None
+    };
     loop {
         match shipper.ship(ironauth_store::replication::BATCH_LIMIT).await {
             Ok(report) => {
@@ -9257,8 +9294,42 @@ async fn replication_shipper_loop(
                 tracing::error!("replication pass FAILED: {error}");
             }
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+        #[cfg(feature = "ironbus")]
+        match &wait {
+            BackboneWait::Some(backbone) => {
+                // The backbone's own wait sleeps the interval and wakes on a notify; a
+                // degraded backbone (broker down) sleeps it out, exactly the poll-only
+                // behaviour — the carrier lowers lag, never gates it.
+                backbone
+                    .wait(
+                        "ironauth-replication",
+                        tokio::time::Duration::from_secs(interval_secs),
+                    )
+                    .await;
+            }
+            BackboneWait::None => {
+                tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+            }
+        }
+        #[cfg(not(feature = "ironbus"))]
+        {
+            let _ = &wait;
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+        }
     }
+}
+
+/// The optional carrier handle, so the loop's two wait paths are explicit.
+#[cfg(feature = "ironbus")]
+enum BackboneWait {
+    Some(ironauth_store::outbox_ironbus::IronBusBackbone),
+    None,
+}
+
+/// Without the `ironbus` feature there is no carrier to wait on: the loop polls.
+#[cfg(not(feature = "ironbus"))]
+enum BackboneWait {
+    None,
 }
 
 /// Everything the scheduled backup runner needs, resolved once at boot.

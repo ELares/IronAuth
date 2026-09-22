@@ -701,6 +701,13 @@ pub struct ReplicationConfig {
 
     /// Seconds between ship passes. A pass is bounded by its own batch limits.
     pub interval_secs: u64,
+
+    /// The optional IronBus carrier (issue #155): when set, the shipper's pass loop
+    /// WAITS on the backbone instead of sleeping the interval out — a wake (a stream
+    /// event enqueued, or the operator's promotion) starts the next pass immediately.
+    /// The carrier lowers lag; it is never a prerequisite. Unset means Postgres-only,
+    /// the shipped default.
+    pub ironbus_addr: Option<String>,
 }
 
 impl Default for ReplicationConfig {
@@ -711,6 +718,7 @@ impl Default for ReplicationConfig {
             follower_database_url: None,
             alert_threshold_messages: 0,
             interval_secs: 60,
+            ironbus_addr: None,
         }
     }
 }
