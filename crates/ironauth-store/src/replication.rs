@@ -286,6 +286,18 @@ impl ReplicationShipper {
         }
 
         let mut tx = self.follower.begin().await?;
+        // The follower's outbox_messages is FORCE ROW LEVEL SECURITY with the scope
+        // policy: the INSERT's WITH CHECK compares the row against the session settings,
+        // so the copy transaction must carry this partition's scope. `set_config(..., true)`
+        // is transaction-local and parameterized (SET LOCAL cannot take a bind).
+        sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+            .bind(environment_id)
+            .execute(&mut *tx)
+            .await?;
         for row in &rows {
             sqlx::query(
                 "INSERT INTO outbox_messages \

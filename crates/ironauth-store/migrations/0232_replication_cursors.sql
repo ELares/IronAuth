@@ -28,5 +28,7 @@ CREATE TABLE replication_cursors (
 -- The #31 lesson: no table-wide UPDATE for the data-plane role. The cursor advance is
 -- exactly two columns, so the grant is column-scoped; the control role (the management
 -- surface's lag reader) gets the same two.
-GRANT SELECT, UPDATE (shipped_sequence, updated_at) ON replication_cursors
+-- The shipper's position advance is an upsert, so INSERT is granted (a fresh partition's
+-- first cursor row); the UPDATE half stays column-scoped.
+GRANT SELECT, INSERT, UPDATE (shipped_sequence, updated_at) ON replication_cursors
     TO ironauth_app, ironauth_control;
