@@ -5,14 +5,14 @@
 //!
 //! The mechanism under test is the trait-schema version arc: the ACTIVE schema declares
 //! which trait fields are login identifiers (`x-ironauth: {"identifier": true}`). Activating
-//! a new schema version IS the online migration — the runner never takes the store down —
+//! a new schema version IS the online migration - the runner never takes the store down -
 //! and the `BackfillLoginIndex` job rebuilds the index for users who never write again.
 //!
 //! The store half (which field resolves, the case/whitespace folding, the
 //! miss-not-wrong-answer property) is pinned in `ironauth-store`'s `trait_login_index.rs`.
 //! What is only reachable here is the END TO END claim: an operator moves the identifier
 //! annotation, runs the backfill, and real `/login` traffic succeeds before, during, and
-//! after — a login in the migration window is a clean miss, never a wrong answer or a
+//! after - a login in the migration window is a clean miss, never a wrong answer or a
 //! crash, and the case-insensitivity of the identifier holds across the move.
 
 mod common;
@@ -29,7 +29,7 @@ const SCHEMA_HANDLE_IDENTIFIER: &str = r#"{"type":"object","properties":{
     "nickname":{"type":"string"}
 }}"#;
 
-/// Schema v2 — the ONLINE MIGRATION: the identifier mode moves to `nickname`, and `handle`
+/// Schema v2 - the ONLINE MIGRATION: the identifier mode moves to `nickname`, and `handle`
 /// stops being a login identifier. This is exactly the "sign-in identifier mode changes as
 /// an online migration" the criterion names.
 const SCHEMA_NICKNAME_IDENTIFIER: &str = r#"{"type":"object","properties":{
@@ -203,7 +203,7 @@ async fn the_identifier_mode_moves_as_an_online_migration_with_logins_succeeding
 
     // DURING THE MIGRATION (before the backfill): both paths are CLEAN MISSES. The old
     // identifier no longer resolves (the mode moved), and the new one has no index rows
-    // yet — a miss, never a wrong answer, never a crash. Logins are still served.
+    // yet - a miss, never a wrong answer, never a crash. Logins are still served.
     let (status, headers, body) = login(&harness, &return_to, "Ada.Lovelace").await;
     assert_clean_miss(status, &body, "the old identifier after the move");
     assert!(
@@ -223,7 +223,7 @@ async fn the_identifier_mode_moves_as_an_online_migration_with_logins_succeeding
     assert_logged_in(status, &headers, "the differently-cased new identifier");
 }
 
-/// The `handle` still identifies the user for EVERYTHING that is not login — the move
+/// The `handle` still identifies the user for EVERYTHING that is not login - the move
 /// shrank the LOGIN surface, it did not rename the account. The subject the migrated
 /// login resolves is the SAME user the handle resolved before the move.
 #[tokio::test]

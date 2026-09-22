@@ -7,7 +7,7 @@
 //! deliberately narrow:
 //!
 //! - The request is an AUDITED record: who asked, when, and with which idempotency key,
-//!   written in one transaction. That record is the durable command — a request issued
+//!   written in one transaction. That record is the durable command - a request issued
 //!   while the scheduler is down is honoured by the next boot's first pass.
 //! - The response is `202` BEFORE any backup exists, because the endpoint enqueues rather
 //!   than performs: a count or a status here would describe a pass that has not run.

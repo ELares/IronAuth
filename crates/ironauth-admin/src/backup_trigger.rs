@@ -8,8 +8,8 @@
 //! The trigger is NOT the command. The management endpoint writes the audited record
 //! (who asked, when, with which idempotency key) through the store, and answers 202
 //! whatever this process can do about it: a request issued while the scheduler is down
-//! is honoured by the next boot's first pass. The trigger is the LATENCY half — waking
-//! the runner the moment a request lands, instead of waiting out the interval — and it
+//! is honoured by the next boot's first pass. The trigger is the LATENCY half - waking
+//! the runner the moment a request lands, instead of waiting out the interval - and it
 //! is deliberately optional: `signal()` on a trigger nobody awaits is a no-op, so a
 //! management plane mounted without a runner still records and still answers.
 
@@ -39,7 +39,7 @@ impl BackupTrigger {
     /// `notify_one`, deliberately not `notify_waiters`: the latter wakes only waiters that
     /// are waiting RIGHT NOW, so a signal that lands while a pass is running would be
     /// lost and the runner would sleep out the whole interval. `notify_one` stores a
-    /// permit when nobody is waiting, so a signal during a pass wakes the NEXT wait —
+    /// permit when nobody is waiting, so a signal during a pass wakes the NEXT wait -
     /// which is exactly the "an operator asked, and the next available pass performs it"
     /// contract.
     pub fn signal(&self) {
@@ -61,7 +61,7 @@ mod tests {
         let trigger = BackupTrigger::new();
         trigger.signal();
         // The signal is not missed: `notify_one` stores a permit when nobody is waiting,
-        // so a runner that had not yet awaited is woken when it does — and a signal that
+        // so a runner that had not yet awaited is woken when it does - and a signal that
         // lands mid-pass wakes the next wait.
         let woken =
             tokio::time::timeout(std::time::Duration::from_secs(1), trigger.notified()).await;

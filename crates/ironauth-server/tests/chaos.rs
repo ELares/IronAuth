@@ -6,7 +6,7 @@
 //! > documented serving/failing endpoint sets, in CI.
 //!
 //! The readiness unit tests and `management_plane` drive the tiers through dead ADDRESSES and
-//! fixed probes: the failure is declared, not induced. This file does the other thing — it
+//! fixed probes: the failure is declared, not induced. This file does the other thing - it
 //! brings up a REAL Postgres cluster, boots a server against it, KILLS the postmaster with
 //! `pg_ctl stop -m immediate`, asserts the documented hard-down surface, and RESTARTS it and
 //! asserts recovery. That is the failure class the criterion's matrix row is about: the
@@ -15,7 +15,7 @@
 //! # What the hard-down tier documents, asserted here
 //!
 //! `/readyz` flips to `503 not ready: database unreachable` (hard down is the only 503),
-//! while `/healthz` and `/metrics` keep serving — liveness and scrape must not die with the
+//! while `/healthz` and `/metrics` keep serving - liveness and scrape must not die with the
 //! database. On recovery, `/readyz` returns to `200 ready`. The same body tokens the failure
 //! matrix publishes are what this test pins against the live server.
 //!
@@ -360,8 +360,8 @@ fn free_port() -> u16 {
 /// CHAOS: the ACCELERATOR-ABSENT tier, induced for real (issue #149 criterion 1).
 ///
 /// The degraded tiers were driven through dead ADDRESSES by `management_plane`: the cache
-/// that never answered. This is the other shape — a REAL IronCache server answering, then
-/// dying, then coming back — because the matrix row says the tier is about the accelerator
+/// that never answered. This is the other shape - a REAL IronCache server answering, then
+/// dying, then coming back - because the matrix row says the tier is about the accelerator
 /// that was working and stopped, not the address that never worked.
 ///
 /// Degraded is SERVING: `/readyz` answers `200 degraded: accelerator_absent` (a 503 would
@@ -525,7 +525,7 @@ impl ironauth_server::DatabaseProbe for FixedProbe {
 /// CHAOS: the BACKBONE-ABSENT tier, induced for real (issue #149 criterion 1).
 ///
 /// The hard-down and accelerator-absent rows are now induced for real; this completes the
-/// set — a REAL IronBus broker answering, then dying, then coming back, with the
+/// set - a REAL IronBus broker answering, then dying, then coming back, with the
 /// readiness probe reporting the documented degraded tier throughout.
 #[tokio::test(flavor = "multi_thread")]
 async fn ironbus_dies_the_probe_marks_degraded_and_recovers() {

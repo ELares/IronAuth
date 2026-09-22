@@ -6,8 +6,8 @@
 //! # Why the document is generated
 //!
 //! Criterion 5 asks that the failure matrix "be generated from test output, so docs cannot
-//! drift from behavior". The readiness surface ships its contract as types — `Readiness`,
-//! [`DegradedTier`] — and the tests pin the wire format through the real handler. What was
+//! drift from behavior". The readiness surface ships its contract as types - `Readiness`,
+//! [`DegradedTier`] - and the tests pin the wire format through the real handler. What was
 //! missing was the PUBLISHED half: an operator who wants the per-tier runbook has to read
 //! source today.
 //!
@@ -89,7 +89,7 @@ const TIER_ROWS: [(&str, &str, &str, &str, &str, &str); 2] = [
         "accelerator_absent",
         "the shared hot-state accelerator (IronCache) is unreachable",
         "`hot_state.ironcache_addr` set but not answering",
-        "none today: `ironauth-hot` is not a dependency of any crate that serves a request, so this is a LATENCY tier — reported only when a deployment declared the accelerator, and reported for reachability, never for correctness",
+        "none today: `ironauth-hot` is not a dependency of any crate that serves a request, so this is a LATENCY tier - reported only when a deployment declared the accelerator, and reported for reachability, never for correctness",
         "RPO 0 / RTO: latency only. `ironauth_hot::Tiered`'s outage tests measure every answer identical with the accelerator failing every call",
         "`/readyz` answers `200 degraded: accelerator_absent`",
     ),
@@ -139,7 +139,7 @@ write this page, write the generator.
 
 Each tier is one *optional* component whose absence degrades rather than stops the
 deployment. Degraded is SERVING: every flow still completes, and only latency or timeliness
-suffers. That is why `/readyz` answers `200` for a degraded tier — a `503` would have a
+suffers. That is why `/readyz` answers `200` for a degraded tier - a `503` would have a
 Kubernetes readiness probe pull the pod out of its Service because an optional component is
 down, turning an accelerator outage into an availability outage. HARD DOWN is the only `503`,
 because Postgres is the tier everything is complete on.
@@ -169,7 +169,7 @@ const FOOTER: &str = r"
 Two rules, each pinned by a test:
 
 - **The database dominates.** Whatever else is absent, an unreachable or unqueryable database
-  is hard down — `503` — because Postgres is the tier everything is complete on
+  is hard down - `503` - because Postgres is the tier everything is complete on
   (`an_unreachable_database_is_hard_down_whatever_else_answers`). There is no degraded tier
   above a down database.
 - **Among optional components, the first declared names the tier.** `ReadinessProbe` reports

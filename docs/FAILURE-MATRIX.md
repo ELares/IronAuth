@@ -10,7 +10,7 @@ write this page, write the generator.
 
 Each tier is one *optional* component whose absence degrades rather than stops the
 deployment. Degraded is SERVING: every flow still completes, and only latency or timeliness
-suffers. That is why `/readyz` answers `200` for a degraded tier — a `503` would have a
+suffers. That is why `/readyz` answers `200` for a degraded tier - a `503` would have a
 Kubernetes readiness probe pull the pod out of its Service because an optional component is
 down, turning an accelerator outage into an availability outage. HARD DOWN is the only `503`,
 because Postgres is the tier everything is complete on.
@@ -41,14 +41,14 @@ generator. The attachment column is pinned by the wiring tests in `readiness.rs`
 | tier | token | absent component | how it attaches | request paths | RPO / RTO | operator signal |
 | --- | --- | --- | --- | --- | --- | --- |
 | `backbone_absent` | `backbone_absent` | the async backbone (IronBus) is unreachable | `outbox.ironbus_addr` set but not answering | none: no request path consults the backbone; outbox work accumulates in Postgres and drains on recovery, because the drain is a Postgres poll and the backbone only decides WHEN it runs | RPO 0 (nothing is dropped; the outbox is the store of record and the drain resumes on recovery). RTO: delivery latency degrades to the poll interval; no request path is affected | `/readyz` answers `200 degraded: backbone_absent`; queue-lag metrics rise and recover as the drain catches up |
-| `accelerator_absent` | `accelerator_absent` | the shared hot-state accelerator (IronCache) is unreachable | `hot_state.ironcache_addr` set but not answering | none today: `ironauth-hot` is not a dependency of any crate that serves a request, so this is a LATENCY tier — reported only when a deployment declared the accelerator, and reported for reachability, never for correctness | RPO 0 / RTO: latency only. `ironauth_hot::Tiered`'s outage tests measure every answer identical with the accelerator failing every call | `/readyz` answers `200 degraded: accelerator_absent` |
+| `accelerator_absent` | `accelerator_absent` | the shared hot-state accelerator (IronCache) is unreachable | `hot_state.ironcache_addr` set but not answering | none today: `ironauth-hot` is not a dependency of any crate that serves a request, so this is a LATENCY tier - reported only when a deployment declared the accelerator, and reported for reachability, never for correctness | RPO 0 / RTO: latency only. `ironauth_hot::Tiered`'s outage tests measure every answer identical with the accelerator failing every call | `/readyz` answers `200 degraded: accelerator_absent` |
 
 ## Combined failures
 
 Two rules, each pinned by a test:
 
 - **The database dominates.** Whatever else is absent, an unreachable or unqueryable database
-  is hard down — `503` — because Postgres is the tier everything is complete on
+  is hard down - `503` - because Postgres is the tier everything is complete on
   (`an_unreachable_database_is_hard_down_whatever_else_answers`). There is no degraded tier
   above a down database.
 - **Among optional components, the first declared names the tier.** `ReadinessProbe` reports

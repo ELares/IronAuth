@@ -9,15 +9,15 @@
 //! A real two-binary version skew cannot be run in one test process, so the harness stands
 //! for the two versions the same way the framework itself does: the migration phases ARE
 //! the difference between the binaries. The database starts at the FULL production chain
-//! (state N). The upgrade applies the additive half of an N+1 release — a test-only
-//! EXPAND + MIGRATE chain whose CONTRACT step is DEFERRED by default — while a sustained
+//! (state N). The upgrade applies the additive half of an N+1 release - a test-only
+//! EXPAND + MIGRATE chain whose CONTRACT step is DEFERRED by default - while a sustained
 //! stream of `/login` traffic is in flight. The runner's default is what makes this a
 //! ROLLING upgrade: the deployment sits in the state where the previous binary and the new
 //! one can BOTH serve, which is exactly the state `contract_gate.rs` proves the old
 //! binary's own reads still work in.
 //!
 //! What is asserted is the criterion's numbers: every login in the stream succeeded (zero
-//! failed), every session the stream minted — and every session minted BEFORE the upgrade —
+//! failed), every session the stream minted - and every session minted BEFORE the upgrade -
 //! still validates through the runtime's read guard after it (zero lost), and the store is
 //! in the both-binaries-serve state (expanded shape in place, contract deferred, old shape
 //! still readable).
@@ -33,7 +33,7 @@ use ironauth_store::{Migration, MigrationRunner, Phase};
 use tokio::time::sleep;
 
 /// The N+1 release's chain, TEST-ONLY (versions above the production chain): one EXPAND,
-/// one MIGRATE backfill, and one CONTRACT that the runner defers by default — the rolling
+/// one MIGRATE backfill, and one CONTRACT that the runner defers by default - the rolling
 /// upgrade never takes the old shape away while the old binary is still serving.
 fn upgrade_chain() -> Vec<Migration> {
     vec![
@@ -135,7 +135,7 @@ async fn a_rolling_upgrade_under_login_load_loses_no_logins_and_no_sessions() {
 
     // THE SYNTHETIC LOAD with the upgrade landing MID-STREAM: a sustained stream of
     // logins, ~10ms apart, and between the tenth and eleventh the N+1 additive half is
-    // applied — a login stream that genuinely spans the upgrade window, with outcomes
+    // applied - a login stream that genuinely spans the upgrade window, with outcomes
     // asserted rather than timing.
     let mut report = None;
     let mut minted = Vec::new();
@@ -152,7 +152,7 @@ async fn a_rolling_upgrade_under_login_load_loses_no_logins_and_no_sessions() {
         if index == 10 {
             // THE ROLLING UPGRADE: the additive half of the N+1 release, inside the live
             // stream. The runner reconciles the FULL chain (the shipped chain the database
-            // already holds, plus the test-only N+1 additions) — exactly what a release
+            // already holds, plus the test-only N+1 additions) - exactly what a release
             // candidate's runner does.
             let full_chain = ironauth_store::chain()
                 .into_iter()

@@ -434,7 +434,7 @@ struct LayerBucket {
 /// The shared bucket's refill basis is WALL-CLOCK epoch micros, not [`Instant`]: two nodes
 /// charge the same key, and a process-local monotonic instant is not comparable across
 /// processes. The seam's clock answers `now_utc` for this, and the direction of an NTP
-/// step is chosen deliberately — a backward step clamps the elapsed time to zero (no
+/// step is chosen deliberately - a backward step clamps the elapsed time to zero (no
 /// refill, the under-admitting direction), and a forward step briefly over-refills. Both
 /// are bounded by the step, which the seam's own clock contract already warns about.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -872,7 +872,7 @@ impl LayeredLimiter {
     /// fallback when the store cannot answer (issue #150 criterion 5).
     ///
     /// THE LOCAL LOCK IS NOT HELD ACROSS AN AWAIT. The L1 fallback buckets and the shared
-    /// buckets are touched in two phases — resolve (read) first, then charge — and the
+    /// buckets are touched in two phases - resolve (read) first, then charge - and the
     /// read-modify-write of a shared bucket is the store's own atomicity boundary. Two nodes
     /// racing the same key can each read the same state and one spend is lost: the overshoot
     /// is bounded by the store's stall bounds, and it is the documented cost of the
@@ -2479,7 +2479,7 @@ mod tests {
     }
 
     /// CRITERION 5: a store that cannot answer falls back to the LOCAL bucket (L1-only),
-    /// and the outcome says so — the alerting half of the fail-open class.
+    /// and the outcome says so - the alerting half of the fail-open class.
     #[test]
     fn an_unavailable_store_falls_back_to_the_local_bucket_and_says_so() {
         let store = Arc::new(FakeSharedStore::new());

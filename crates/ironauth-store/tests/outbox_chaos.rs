@@ -8,7 +8,7 @@
 //! `outbox_ironbus.rs` proves the backbone's CONTRACT (a signal wakes, an absent broker is
 //! a construction error, a deadline is honoured). What it cannot see is the WORKER: a real
 //! drain running against a real broker that DIES mid-run, and whether a message enqueued
-//! with the bus down still arrives. This file drives the whole thing — a real `ironbus`
+//! with the bus down still arrives. This file drives the whole thing - a real `ironbus`
 //! broker, a real worker pool attached to it, a real Postgres, and a killed broker.
 //!
 //! The design makes the outcome a design consequence rather than a hope: a backbone that
@@ -275,14 +275,15 @@ async fn ironbus_dies_the_outbox_drains_on_the_poll_with_no_loss() {
     // THE FAILURE, INDUCED: kill the broker out from under the backbone.
     broker.kill();
 
-    // NO LOSS, NO BLOCK. The message enqueued with the bus down still drains — the
-    // backbone degrades to PollOnly and the poll deadline is never removed — within a
+    // NO LOSS, NO BLOCK. The message enqueued with the bus down still drains - the
+    // backbone degrades to PollOnly and the poll deadline is never removed - within a
     // few poll intervals. This is criterion 4's "accumulate and drain with no loss":
     // the queue holds the work and the Postgres poll delivers it.
     enqueue(&db, &env, scope, "down-1").await;
     wait_handled(&consumer, 2, Duration::from_secs(10)).await;
     // The reader notices the death (asynchronously); when it does, wait is PollOnly.
-    // NOT LOAD-BEARING — the drain is — but it is the mechanism the design names.
+    // NOT LOAD-BEARING - the drain is - but it is the mechanism the design names.
+
     let deadline = Instant::now() + Duration::from_secs(10); // invariant-allow: time-via-env
     let now = Instant::now(); // invariant-allow: time-via-env
     while !concrete.is_degraded() && now < deadline {
@@ -290,7 +291,7 @@ async fn ironbus_dies_the_outbox_drains_on_the_poll_with_no_loss() {
     }
 
     // RECOVERY: the broker comes back on the same port, and the same backbone delivers
-    // again — a reconnect, not a restart of the process.
+    // again - a reconnect, not a restart of the process.
     broker.restart();
     wait_for_port(port, Duration::from_secs(30));
     enqueue(&db, &env, scope, "back-1").await;

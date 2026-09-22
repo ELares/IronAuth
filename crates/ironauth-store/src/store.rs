@@ -333,7 +333,7 @@ impl Store {
     }
 
     /// Whether the target database already holds the migration ledger with at least one applied
-    /// migration — i.e. whether it is a live deployment rather than a fresh one (issue #153).
+    /// migration - i.e. whether it is a live deployment rather than a fresh one (issue #153).
     ///
     /// The restore command refuses to apply a backup over a live deployment unless the operator
     /// acknowledges the overwrite. `to_regclass` makes this cheap on a database that has never

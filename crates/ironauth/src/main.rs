@@ -836,7 +836,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
         // AND THE REPLICATION SHIPPER. Aborted rather than awaited for the same reason: a
         // pass has no cleanup to finish, and the position it stopped at is the follower's
-        // durable cursor — the next boot resumes there.
+        // durable cursor - the next boot resumes there.
         if let Some(shipper) = replication_shipper {
             shipper.abort();
         }
@@ -9046,7 +9046,7 @@ fn kek_restore_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
 /// refused, so a backup cannot be replayed as a different artifact.
 const BACKUP_CONTEXT: &[u8] = b"ironauth logical backup v1";
 
-/// `ironauth storage backup --url DSN --out FILE --master-key ID:env:VAR` — the logical backup half of
+/// `ironauth storage backup --url DSN --out FILE --master-key ID:env:VAR` - the logical backup half of
 /// issue #153.
 ///
 /// Runs `pg_dump` against the primary store (the Postgres logical backup tool, discovered via
@@ -9243,7 +9243,7 @@ async fn start_replication_shipper(
 ///
 /// With the IronBus carrier configured, the wait between passes is the backbone's: a
 /// wake (a stream event enqueued, or the promotion signal) starts the next pass
-/// immediately instead of on the interval — the carrier lowers lag and is never a
+/// immediately instead of on the interval - the carrier lowers lag and is never a
 /// prerequisite (an unreachable broker falls back to the interval with a logged reason).
 #[allow(clippy::too_many_lines)]
 async fn replication_shipper_loop(
@@ -9299,7 +9299,7 @@ async fn replication_shipper_loop(
             BackboneWait::Some(backbone) => {
                 // The backbone's own wait sleeps the interval and wakes on a notify; a
                 // degraded backbone (broker down) sleeps it out, exactly the poll-only
-                // behaviour — the carrier lowers lag, never gates it.
+                // behaviour - the carrier lowers lag, never gates it.
                 backbone
                     .wait(
                         "ironauth-replication",
@@ -9757,7 +9757,7 @@ async fn sealed_backup_dump(
     ))
 }
 
-/// `ironauth storage restore --url DSN --in FILE --master-key ID:env:VAR [--i-will-overwrite]` — apply
+/// `ironauth storage restore --url DSN --in FILE --master-key ID:env:VAR [--i-will-overwrite]` - apply
 /// a sealed logical backup to a fresh database (issue #153).
 ///
 /// Opens the file (refusing on a checksum mismatch, a wrong key, or a foreign file), refuses to

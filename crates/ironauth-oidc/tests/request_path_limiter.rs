@@ -117,7 +117,7 @@ async fn a_per_ip_burst_throttles_with_the_limiting_layer_named() {
     );
 
     // THE OTHER ADDRESS IS UNAFFECTED: the per-IP bucket is per address, so this is the
-    // control that proves the layer — not some wider budget — refused.
+    // control that proves the layer - not some wider budget - refused.
     let (status, _) = authorize_from(&harness, &client_id, "198.51.100.8").await;
     assert_eq!(
         status,
@@ -216,7 +216,7 @@ async fn a_per_ip_limit_without_a_peer_address_is_a_403_not_a_throttle() {
         .to_string();
 
     // NO peer-address header: the request presents no key for the one configured layer.
-    // That is a property of the request, not of its rate, so the answer is 403 — 429
+    // That is a property of the request, not of its rate, so the answer is 403 - 429
     // would advertise a wait that can never produce an address.
     let request = Request::builder()
         .method("GET")
@@ -266,7 +266,7 @@ async fn a_per_client_burst_throttles_that_client_and_no_other() {
         .0
         .to_string();
 
-    // Client A fits its burst twice, then is throttled WITH THE LAYER NAMED — even though
+    // Client A fits its burst twice, then is throttled WITH THE LAYER NAMED - even though
     // the peer address is the same as client B's later request.
     for i in 0..2 {
         let (status, _) = authorize_from(&harness, &client_a, "198.51.100.7").await;
@@ -350,7 +350,7 @@ async fn a_per_user_burst_throttles_that_subject_and_no_other() {
 
     // ALICE, whose budget of two is spent by: the code exchange (a subject-resolved
     // spend, one token) and her first refresh (the second). The NEXT refresh is
-    // throttled, with the layer named — even though the token rotated in between, the
+    // throttled, with the layer named - even though the token rotated in between, the
     // SUBJECT is what the bucket keys on.
     let mut token = refresh_token_for(&harness, &client_id).await; // spends 1
     let (status, _, body) = harness.token(&refresh_form(&token, &client_id)).await;
@@ -439,7 +439,7 @@ fn the_peer_ip_header_is_the_documented_one() {
 }
 
 /// CRITERION 2, INDUCED UNDER LOAD: one tenant driven to saturation does not reduce
-/// another tenant's admitted throughput AT ALL — the bound is zero interference, not a
+/// another tenant's admitted throughput AT ALL - the bound is zero interference, not a
 /// margin. Both tenants have the same per-tenant budget; a concurrent storm saturates one
 /// while the other is measured.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

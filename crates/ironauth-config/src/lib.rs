@@ -270,7 +270,7 @@ pub struct Config {
     ///
     /// OFF by default. The failure mode of backups being off is a larger restore gap; the
     /// failure mode of them being on by accident is an outbound push this deployment did
-    /// not intend — and the section's S3 endpoint and credential are exactly the kind of
+    /// not intend - and the section's S3 endpoint and credential are exactly the kind of
     /// configuration a repository scan should not be able to enable silently.
     pub backup: BackupConfig,
 
@@ -682,7 +682,7 @@ pub struct ReplicationConfig {
     /// The HOME region's database URL for the stream READS. MUST name a superuser or
     /// BYPASSRLS role, for the same reason `ironauth storage backup` and the doctor
     /// demand one: `outbox_messages` is FORCE ROW LEVEL SECURITY, and a role subject to
-    /// the policies sees only the rows its session settings name — it cannot even
+    /// the policies sees only the rows its session settings name - it cannot even
     /// enumerate the partitions to ship. [`None`] disables the shipper however `enabled`
     /// is set.
     pub home_database_url: Option<Secret>,
@@ -703,7 +703,7 @@ pub struct ReplicationConfig {
     pub interval_secs: u64,
 
     /// The optional IronBus carrier (issue #155): when set, the shipper's pass loop
-    /// WAITS on the backbone instead of sleeping the interval out — a wake (a stream
+    /// WAITS on the backbone instead of sleeping the interval out - a wake (a stream
     /// event enqueued, or the operator's promotion) starts the next pass immediately.
     /// The carrier lowers lag; it is never a prerequisite. Unset means Postgres-only,
     /// the shipped default.
@@ -728,7 +728,7 @@ impl Default for ReplicationConfig {
 /// OFF by default and off again without a DSN, so a deployment that never opens this
 /// section pushes nothing. The `url` must name a role that sees every row (a superuser or
 /// BYPASSRLS), because the backup is a logical dump of the whole primary store and a
-/// role subject to `FORCE ROW LEVEL SECURITY` would dump zero rows with no error — the
+/// role subject to `FORCE ROW LEVEL SECURITY` would dump zero rows with no error - the
 /// runner probes this and refuses the run, exactly like `ironauth storage backup` does.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -760,7 +760,7 @@ pub struct BackupConfig {
     /// takes. Named as `ID:env:VAR` or `ID:file:PATH`, like the log sink's credential.
     pub s3_credential: Option<Secret>,
 
-    /// How long a backup object is kept, in seconds. `0` means keep forever — the same
+    /// How long a backup object is kept, in seconds. `0` means keep forever - the same
     /// default direction as audit retention: the failure mode of retention being off is a
     /// larger bucket, and the failure mode of it being on by accident is a deleted
     /// restore point. Only one of those is recoverable.
@@ -1524,8 +1524,9 @@ pub struct HotStateConfig {
     ///
     /// WHAT THIS KEY ATTACHES IS THE REQUEST-PATH LIMITER'S SHARED (L2) TIER (issue #150
     /// criterion 5): the layered limiter's buckets live in the cache when this key is set, so
-    /// two nodes charge ONE budget. That is a real production caller — [`IronCacheKeyspace`]
-    /// over the `rate` keyspace — and it is the difference between "declares an address" and
+    /// two nodes charge ONE budget. That is a real production caller - [`IronCacheKeyspace`]
+    /// over the `rate` keyspace - and it is the difference between "declares an address" and
+
     /// "installs a `HotState` implementation", which is exactly the gap this paragraph used to
     /// describe as unfilled.
     ///
@@ -1566,7 +1567,7 @@ pub struct HotStateConfig {
     /// THE JWKS USE IS DELIBERATELY NOT ATTACHED. The seam exists and is tested, and the
     /// measured figures above are why the boot path does not install it: a hit there saves a
     /// render and adds a validation parse, netting about 0.6 us for a fresh environment's
-    /// three keys, against a 20 us round trip on the same machine — so attaching it would make
+    /// three keys, against a 20 us round trip on the same machine - so attaching it would make
     /// the JWKS endpoint SLOWER, and leaving it unset is the faster configuration. What the
     /// key DOES attach is the rate-counter keyspace of the request-path limiter, which is the
     /// one use whose alternative (a scoped read, measured at 166 us) the figures say is worth
