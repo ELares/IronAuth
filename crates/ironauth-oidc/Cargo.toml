@@ -336,6 +336,11 @@ required-features = ["testing", "wasm-hooks"]
 # plus the terminal mints a session with the honest amr. Over a real database (DATABASE_URL); see
 # scripts/with-test-db.sh.
 [[test]]
+name = "region_failover_demo"
+path = "tests/region_failover_demo.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "rolling_upgrade"
 path = "tests/rolling_upgrade.rs"
 required-features = ["testing"]

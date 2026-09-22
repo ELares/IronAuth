@@ -121,9 +121,25 @@ pub async fn apply_event(
             skipped_reason: Some("the envelope carries no scope".to_string()),
         });
     }
-    copy_scope_rows(home, follower, "tenant_keks", tenant_id, environment_id).await?;
+    copy_scope_rows(
+        home,
+        follower,
+        "tenant_keks",
+        tenant_id,
+        environment_id,
+        "id",
+    )
+    .await?;
     // The DEKs the sealed columns were sealed under (wrapped by the KEKs above).
-    copy_scope_rows(home, follower, "tenant_deks", tenant_id, environment_id).await?;
+    copy_scope_rows(
+        home,
+        follower,
+        "tenant_deks",
+        tenant_id,
+        environment_id,
+        "id",
+    )
+    .await?;
     copy_row(home, follower, table, entity_id, tenant_id, environment_id).await?;
     Ok(AppliedEvent {
         event_type: event_type.to_owned(),
@@ -169,8 +185,8 @@ async fn copy_row(
         .execute(&mut *tx)
         .await?;
     // `json_populate_record(NULL::users, $1)` fills a record of the table's CURRENT
-    // shape from the JSON's matching keys; the upsert makes a re-apply converge. The
-    // jsonb cast goes through json_populate_record's json input.
+    // shape from the JSON's matching keys; the upsert on the entity id makes a re-apply
+    // converge. The jsonb cast goes through json_populate_record's json input.
     let statement = format!(
         "INSERT INTO {table} SELECT * FROM json_populate_record(NULL::{table}, $1::json) \
          ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id"
@@ -197,6 +213,7 @@ async fn copy_scope_rows(
     table: &str,
     tenant_id: &str,
     environment_id: &str,
+    conflict_column: &str,
 ) -> Result<(), sqlx::Error> {
     let rows: Vec<String> = sqlx::query_scalar(&format!(
         "SELECT row_to_json(t)::text FROM {table} t \
@@ -220,12 +237,47 @@ async fn copy_scope_rows(
         .await?;
     let statement = format!(
         "INSERT INTO {table} SELECT * FROM json_populate_record(NULL::{table}, $1::json) \
-         ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id"
+         ON CONFLICT ({conflict_column}) DO UPDATE SET {conflict_column} = EXCLUDED.{conflict_column}",
+        table = table,
+        conflict_column = conflict_column,
     );
     for json in &rows {
         sqlx::query(&statement).bind(json).execute(&mut *tx).await?;
     }
     tx.commit().await?;
+    Ok(())
+}
+
+/// THE PROMOTION STEP (issue #155's failover demo): copy the session-relevant state
+/// the event stream does not carry.
+///
+/// Sessions, refresh families, refresh tokens, and grants have NO creation events (the
+/// catalog carries only `session.revoked`), so a follower cannot be built for them
+/// event-by-event. The promotion procedure therefore copies them at promotion, in the
+/// same generic row-copy the event-apply uses, and the achieved RPO is the lag at that
+/// moment — the design note's loss-window statement covers the events inside it. This
+/// is a stated exploratory boundary, not a hidden one.
+///
+/// # Errors
+///
+/// [`sqlx::Error`] on a persistence failure. The copy is idempotent (upserts).
+pub async fn promote_scope(
+    home: &PgPool,
+    follower: &PgPool,
+    tenant_id: &str,
+    environment_id: &str,
+) -> Result<(), sqlx::Error> {
+    // FK order: grants root the families, families root the tokens.
+    // FK order (grants root the families, families root the tokens), and the per-table
+    // conflict column: `refresh_tokens` keys on `token_digest`, the rest on `id`.
+    for (table, conflict) in [
+        ("grants", "id"),
+        ("refresh_families", "id"),
+        ("refresh_tokens", "token_digest"),
+        ("sessions", "id"),
+    ] {
+        copy_scope_rows(home, follower, table, tenant_id, environment_id, conflict).await?;
+    }
     Ok(())
 }
 
