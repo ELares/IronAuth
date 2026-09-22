@@ -1188,8 +1188,6 @@ impl AdminState {
         self.inner.sudo_mode_window_secs
     }
 
-    /// The control-plane store.
-    #[must_use]
     /// The on-demand backup trigger, when this process runs a scheduled backup runner.
     #[must_use]
     pub fn backup_trigger(&self) -> Option<Arc<crate::backup_trigger::BackupTrigger>> {
@@ -1198,6 +1196,11 @@ impl AdminState {
 
     /// Attach the on-demand backup trigger to the state, so the management endpoint can
     /// wake the runner. A no-op for a state built without a runner.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state was already cloned (the trigger is attached to the freshly
+    /// built state, before it is shared).
     #[must_use]
     pub fn with_backup_trigger(
         mut self,
@@ -1209,6 +1212,8 @@ impl AdminState {
         self
     }
 
+    /// The control-plane store the management surface serves from.
+    #[must_use]
     pub fn store(&self) -> &Store {
         &self.inner.store
     }

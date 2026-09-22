@@ -74,7 +74,7 @@ fn write_config(home: &TestDatabase, follower: &TestDatabase) -> std::path::Path
     path
 }
 
-/// The follower's shipped rows: (idempotency_key, consumer).
+/// The follower's shipped rows: (`idempotency_key`, `consumer`).
 async fn follower_shipped(follower: &TestDatabase) -> Vec<(String, String)> {
     sqlx::query("SELECT idempotency_key, consumer FROM outbox_messages ORDER BY sequence")
         .fetch_all(follower.owner_pool())
@@ -88,11 +88,12 @@ async fn follower_shipped(follower: &TestDatabase) -> Vec<(String, String)> {
 /// THE WIRING: a deployed process with the section enabled ships the ordered stream to
 /// the follower, writes the cursor, and logs the pass.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn a_wired_boot_ships_the_stream_to_the_follower() {
     let home = TestDatabase::start().await;
     let follower = TestDatabase::start().await;
-    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0E0B_01);
-    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0E0B_01);
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0E0B_0001);
+    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0E0B_0001);
     let scope = home.seed_scope(&env).await;
     follower.seed_scope(&follow_env).await;
 
@@ -143,11 +144,15 @@ async fn a_wired_boot_ships_the_stream_to_the_follower() {
 
     // THE PASS, watched in the process's own log: the wired shipper must announce
     // itself and ship the pending event.
-    let started = std::time::Instant::now();
+    let started = std::time::Instant::now(); // invariant-allow: time-via-env
     let deadline = started + SHIP_DEADLINE;
     let mut saw_running = false;
     let mut saw_shipped = false;
-    while std::time::Instant::now() < deadline {
+    loop {
+        let now = std::time::Instant::now(); // invariant-allow: time-via-env
+        if now >= deadline {
+            break;
+        }
         let output = serve.output();
         if output.contains("replication shipper running") {
             saw_running = true;
@@ -158,19 +163,18 @@ async fn a_wired_boot_ships_the_stream_to_the_follower() {
         }
         assert!(
             serve.is_running(),
-            "the booted process exited early:\n{}",
-            output
+            "the booted process exited early:\n{output}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     // The per-carrier lag artifact (issue #155, informational): the elapsed-to-ship and
     // the achieved lag, written when the env names a path.
     if let Ok(path) = std::env::var("REGION_REPLICATION_LAG_JSON") {
+        let elapsed = started.elapsed().as_millis();
         std::fs::write(
             &path,
             format!(
-                "{{\"carrier\": \"postgres-only\", \"ship_elapsed_ms\": {}, \"lag_messages\": 0}}\n",
-                started.elapsed().as_millis()
+                "{{\"carrier\": \"postgres-only\", \"ship_elapsed_ms\": {elapsed}, \"lag_messages\": 0}}\n"
             ),
         )
         .expect("write the lag artifact");

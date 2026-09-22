@@ -47,7 +47,6 @@ impl BackupTrigger {
     }
 
     /// A future that resolves when the next [`signal`](Self::signal) fires.
-    #[must_use]
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
     }
@@ -60,7 +59,6 @@ mod tests {
     #[tokio::test]
     async fn a_signalled_trigger_wakes_the_awaiting_runner() {
         let trigger = BackupTrigger::new();
-        let trigger_two = BackupTrigger::new();
         trigger.signal();
         // The signal is not missed: `notify_one` stores a permit when nobody is waiting,
         // so a runner that had not yet awaited is woken when it does — and a signal that

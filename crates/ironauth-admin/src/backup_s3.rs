@@ -34,6 +34,11 @@ const MIN_RETENTION_SECS: u64 = 60;
 /// for backups (at least once with occasional duplicates), where the log sink's
 /// batch-derived key would be the wrong shape because a NEW backup must never overwrite
 /// an OLD one.
+///
+/// # Panics
+///
+/// Panics if `instant` is before the Unix epoch: a signing clock before the epoch is a
+/// configuration error this module refuses to paper over.
 #[must_use]
 pub fn object_key(prefix: &str, instant: SystemTime) -> String {
     let (date, timestamp) = crate::log_shipper::sigv4_timestamps(instant)
@@ -46,7 +51,7 @@ pub fn object_key(prefix: &str, instant: SystemTime) -> String {
 /// the keys whose embedded timestamp is strictly older than the window. A backup taken
 /// 23h59m ago under a 24h retention is kept, whatever its date directory says.
 ///
-/// With a retention_secs of zero (keep forever) the caller never lists at all.
+/// With a `retention_secs` of zero (keep forever) the caller never lists at all.
 ///
 /// # The listing is one pass, and the prune self-bounds it
 ///
@@ -62,6 +67,10 @@ pub fn retention_list_prefix(prefix: &str) -> String {
 
 /// The keys to delete from a listing: those whose embedded timestamp is strictly older
 /// than the window.
+///
+/// # Panics
+///
+/// Panics if `now` is before the Unix epoch (see [`object_key`]).
 #[must_use]
 pub fn prune_set(
     keys: &[String],
@@ -79,11 +88,7 @@ pub fn prune_set(
         .expect("the clock is after the epoch")
         .as_secs();
     keys.iter()
-        .filter(|key| {
-            embedded_timestamp_secs(key, prefix)
-                .map(|seconds| seconds < cutoff)
-                .unwrap_or(false)
-        })
+        .filter(|key| embedded_timestamp_secs(key, prefix).is_some_and(|seconds| seconds < cutoff))
         .cloned()
         .collect()
 }
@@ -113,8 +118,13 @@ fn embedded_timestamp_secs(key: &str, prefix: &str) -> Option<u64> {
     let hour: u32 = timestamp[9..11].parse().ok()?;
     let minute: u32 = timestamp[11..13].parse().ok()?;
     let second: u32 = timestamp[13..15].parse().ok()?;
-    let days = days_from_civil(year as i64, month, day)?;
-    Some(days as u64 * 86_400 + (hour as u64 * 3600 + minute as u64 * 60 + second as u64))
+    let days = days_from_civil(i64::from(year), month, day)?;
+    Some(
+        u64::try_from(days).ok()? * 86_400
+            + u64::from(hour) * 3600
+            + u64::from(minute) * 60
+            + u64::from(second),
+    )
 }
 
 /// Days since the epoch for a civil date, the inverse of the shipper's `civil_from_days`
@@ -126,7 +136,8 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
     let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
     let yoe = y.rem_euclid(400);
-    let doy = (153 * (month as i64 + if month > 2 { -3 } else { 9 }) + 2) / 5 + day as i64 - 1;
+    let doy =
+        (153 * (i64::from(month) + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     Some(era * 146_097 + doe - 719_468)
 }
@@ -155,13 +166,9 @@ pub fn keys_from_listing(body: &[u8]) -> Option<Vec<String>> {
     let mut rest = text;
     while let Some(start) = rest.find("<Contents>") {
         let after_contents = &rest[start + "<Contents>".len()..];
-        let Some(key_start) = after_contents.find("<Key>") else {
-            return None;
-        };
+        let key_start = after_contents.find("<Key>")?;
         let after_key = &after_contents[key_start + "<Key>".len()..];
-        let Some(key_end) = after_key.find("</Key>") else {
-            return None;
-        };
+        let key_end = after_key.find("</Key>")?;
         keys.push(after_key[..key_end].to_owned());
         rest = &after_contents[key_start + after_key[..key_end].len() + "<Key></Key>".len()..];
     }
@@ -264,6 +271,10 @@ fn split_credential(credential: &str) -> (&str, &str) {
 }
 
 /// The signing timestamps, from the clock seam so a test can pin them.
+///
+/// # Panics
+///
+/// Panics if `instant` is before the Unix epoch (see [`object_key`]).
 #[must_use]
 pub fn sigv4_timestamps(instant: SystemTime) -> (String, String) {
     crate::log_shipper::sigv4_timestamps(instant).expect("the signing clock is after the epoch")
@@ -305,7 +316,6 @@ pub const fn min_retention_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironauth_env::Env;
 
     fn instant_at(seconds: u64) -> SystemTime {
         std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds)
@@ -377,7 +387,7 @@ mod tests {
         let key = object_key("ironauth-backups", instant);
         let seconds = key
             .strip_prefix("ironauth-backups/")
-            .and_then(|rest| embedded_timestamp_secs(key.as_str(), "ironauth-backups"))
+            .and_then(|_| embedded_timestamp_secs(key.as_str(), "ironauth-backups"))
             .expect("the builder's own key parses");
         assert_eq!(seconds, 1_704_067_200);
     }

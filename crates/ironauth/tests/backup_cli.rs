@@ -174,7 +174,7 @@ async fn restore_into_a_fresh_database_yields_the_backed_up_store() {
     let restored_session = restored
         .scoped(scope)
         .sessions()
-        .get(&session_id, 1_700_000_000_000_000 + 3_600_000_000, idle_ttl)
+        .get(&session_id, 1_700_000_000_000_000 + 3_600_000_000, IDLE_TTL)
         .await
         .expect("read the restored session");
     let session = restored_session.expect("the restored session must resolve as valid");
@@ -183,7 +183,7 @@ async fn restore_into_a_fresh_database_yields_the_backed_up_store() {
 }
 
 /// An idle TTL inside the session's window, so the validation path reads it as live.
-const idle_ttl: i64 = 3_600_000_000;
+const IDLE_TTL: i64 = 3_600_000_000;
 
 /// THE CHECKSUM-MISMATCH CRITERION AT THE COMMAND: a single flipped byte in the encrypted file
 /// refuses, and the target is left untouched.

@@ -117,7 +117,7 @@ async fn payments(State(requirement): State<Requirement>, headers: HeaderMap) ->
 /// part of the AS, so it legitimately reads the host wall clock directly rather than the
 /// server's determinism seam.
 fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now() // invariant-allow: time-via-env -- standalone sample RS, outside the server clock seam
+    std::time::SystemTime::now() // invariant-allow: time-via-env
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }

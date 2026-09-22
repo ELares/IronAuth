@@ -5,9 +5,9 @@
 //! # What this ships, and why it is the first slice
 //!
 //! The replication artifact the design note records is the outbox's ordered event
-//! stream. The `sequence` column on `outbox_messages` is a database-assigned monotonic
-//! order (never client-supplied), and the message body (consumer, idempotency_key,
-//! ordering_key, payload, enqueued_at) is immutable once enqueued — so the stream is a
+//! stream. The `sequence` column on [`outbox_messages`](crate) is a database-assigned monotonic
+//! order (never client-supplied), and the message body (`consumer`, `idempotency_key`,
+//! `ordering_key`, `payload`, `enqueued_at`) is immutable once enqueued — so the stream is a
 //! stable, ordered, deduplicable log. This shipper copies that log from a home region's
 //! database to a follower's, preserving order, and records each (tenant, environment)'s
 //! position on the follower. Lag is the difference between the home high-water mark and
@@ -57,8 +57,11 @@ pub fn breaches_threshold(lag: i64, threshold: u64) -> bool {
 /// One (tenant, environment) partition's shipped position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicationCursor {
+    /// The tenant partition.
     pub tenant_id: &'static str,
+    /// The environment partition.
     pub environment_id: &'static str,
+    /// The highest home stream position shipped for the partition.
     pub shipped_sequence: i64,
 }
 
@@ -72,7 +75,9 @@ pub struct ShipReport {
 /// One (tenant, environment)'s slice of a pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionReport {
+    /// The tenant partition.
     pub tenant_id: String,
+    /// The environment partition.
     pub environment_id: String,
     /// The home rows copied this pass.
     pub copied: i64,
@@ -125,10 +130,11 @@ impl ReplicationShipper {
     /// "replicate" a region into itself, which is a configuration error, not a mode.
     #[must_use]
     pub fn new(home: PgPool, follower: PgPool) -> Self {
-        assert!(
-            !std::ptr::eq(&home, &follower),
-            "a replication shipper must not point at itself"
-        );
+        // NO self-pointer assert HERE: two Pool VALUES never compare equal by address even
+        // when they name the same database (each pool is its own Arc), so the assert was
+        // ineffective for its purpose. The real gate is the config validation, which
+        // refuses a follower DSN equal to the home DSN and a home DSN equal to
+        // `database.url`.
         Self {
             home,
             follower,
@@ -193,10 +199,14 @@ impl ReplicationShipper {
                 .collect();
         partitions.extend(fresh.into_iter().map(|(t, e)| (t, e, 0_i64)));
 
-        for (tenant_id, environment_id, mut cursor) in partitions {
+        for (tenant_id, environment_id, cursor) in partitions {
             let partition = self
                 .ship_partition(&tenant_id, &environment_id, cursor, batch_limit)
                 .await?;
+            // The gauge's unit is f64; the lag is an integer position. The cast loses
+            // nothing for any lag a deployment can reach (2^52 positions), which is
+            // stated because the lint flags the cast.
+            #[allow(clippy::cast_precision_loss)]
             metrics::gauge!(
                 REPLICATION_LAG_MESSAGES,
                 "tenant_id" => partition.tenant_id.clone(),
@@ -226,11 +236,12 @@ impl ReplicationShipper {
 
     /// Ship one partition: copy home rows above the cursor, advance the cursor in the
     /// same transaction, return the report.
+    #[allow(clippy::too_many_lines)]
     async fn ship_partition(
         &self,
         tenant_id: &str,
         environment_id: &str,
-        mut cursor: i64,
+        cursor: i64,
         batch_limit: i64,
     ) -> Result<PartitionReport, sqlx::Error> {
         let rows: Vec<StreamRow> = sqlx::query(

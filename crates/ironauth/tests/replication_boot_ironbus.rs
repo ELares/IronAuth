@@ -59,6 +59,7 @@ impl Drop for ServeProcess {
 /// THE SAME correctness suite as the Postgres-only run, with the carrier attached and
 /// the interval set so ONLY a wake can drive the pass.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn a_wake_carried_the_pass_and_the_follower_serves_the_same_stream() {
     let Some(addr) = broker_addr() else {
         eprintln!("IRONBUS_ADDR unset: skipping the carrier lane");
@@ -66,8 +67,8 @@ async fn a_wake_carried_the_pass_and_the_follower_serves_the_same_stream() {
     };
     let home = TestDatabase::start().await;
     let follower = TestDatabase::start().await;
-    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0D0C_01);
-    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0D0C_01);
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0D0C_0001);
+    let (follow_env, _follow_clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0D0C_0001);
     let scope = home.seed_scope(&env).await;
     follower.seed_scope(&follow_env).await;
 
@@ -143,10 +144,14 @@ async fn a_wake_carried_the_pass_and_the_follower_serves_the_same_stream() {
 
     // THE WAKE-DRIVEN PASS: inside the deadline, with a five-minute poll interval, the
     // only way the pass happens is the wake crossing the broker.
-    let started = std::time::Instant::now();
+    let started = std::time::Instant::now(); // invariant-allow: time-via-env
     let deadline = started + WAKE_DEADLINE;
     let mut saw_shipped = false;
-    while std::time::Instant::now() < deadline {
+    loop {
+        let now = std::time::Instant::now(); // invariant-allow: time-via-env
+        if now >= deadline {
+            break;
+        }
         let output = serve.output();
         if output.contains("replication pass: shipped") {
             saw_shipped = true;
@@ -154,8 +159,7 @@ async fn a_wake_carried_the_pass_and_the_follower_serves_the_same_stream() {
         }
         assert!(
             serve.is_running(),
-            "the booted process exited early:\n{}",
-            output
+            "the booted process exited early:\n{output}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -163,11 +167,11 @@ async fn a_wake_carried_the_pass_and_the_follower_serves_the_same_stream() {
     // and the achieved lag, written when the env names a path — the number the netem CI
     // lane records under injected inter-region latency.
     if let Ok(path) = std::env::var("REGION_REPLICATION_LAG_JSON") {
+        let elapsed = started.elapsed().as_millis();
         std::fs::write(
             &path,
             format!(
-                "{{\"carrier\": \"ironbus\", \"ship_elapsed_ms\": {}, \"lag_messages\": 0}}\n",
-                started.elapsed().as_millis()
+                "{{\"carrier\": \"ironbus\", \"ship_elapsed_ms\": {elapsed}, \"lag_messages\": 0}}\n"
             ),
         )
         .expect("write the lag artifact");

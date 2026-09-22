@@ -20,6 +20,7 @@
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 /// The `SigV4` algorithm identifier.
 pub const ALGORITHM: &str = "AWS4-HMAC-SHA256";
@@ -67,7 +68,7 @@ pub struct CanonicalRequest<'a> {
     /// The URI path, already encoded.
     pub path: &'a str,
     /// The query string as (key, value) pairs, already percent-encoded, and empty for a
-    /// request without one. Sorted here, not by the caller: SigV4 signs the SORTED query,
+    /// request without one. Sorted here, not by the caller: `SigV4` signs the SORTED query,
     /// and a signature computed over a differently-ordered query is refused with a 403 that
     /// says nothing about ordering.
     pub query: &'a [(String, String)],
@@ -111,7 +112,6 @@ impl CanonicalRequest<'_> {
         }
         let mut query = self.query.to_vec();
         query.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-        use std::fmt::Write as _;
         let mut joined = String::new();
         for (index, (key, value)) in query.iter().enumerate() {
             if index > 0 {

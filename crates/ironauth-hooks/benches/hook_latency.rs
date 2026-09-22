@@ -114,7 +114,7 @@ fn main() {
 
     let mut cold_samples = Vec::with_capacity(COLD_ITERATIONS);
     for _ in 0..COLD_ITERATIONS {
-        let started = std::time::Instant::now(); // invariant-allow: time-via-env -- THE measurement: elapsed time is this benchmark's entire output, and a bench target is not protocol logic (it is not compiled into the server), which is what the rule protects
+        let started = std::time::Instant::now(); // invariant-allow: time-via-env
         // `load_precompiled + instantiate + call`: the SAME sequence the dispatch makes on a
         // cache miss for a row whose artifact key matches this build.
         //
@@ -135,7 +135,7 @@ fn main() {
     hook.customize(&engine, &limits, &request).expect("warm up");
     let mut warm_samples = Vec::with_capacity(WARM_ITERATIONS);
     for _ in 0..WARM_ITERATIONS {
-        let started = std::time::Instant::now(); // invariant-allow: time-via-env -- the warm half of the same measurement; same reasoning as the cold loop above
+        let started = std::time::Instant::now(); // invariant-allow: time-via-env
         hook.customize(&engine, &limits, &request).expect("call");
         warm_samples.push(started.elapsed().as_nanos());
     }

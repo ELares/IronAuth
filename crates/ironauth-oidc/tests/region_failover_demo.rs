@@ -33,6 +33,7 @@ use ironauth_store::replication_apply::{apply_envelopes, promote_scope, shipped_
 use ironauth_store::test_support::TestDatabase;
 
 /// THE DEMO.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn a_promoted_follower_serves_a_pre_failover_session_and_refresh_token() {
     let home = Harness::start_store_backed().await;
@@ -164,8 +165,7 @@ async fn a_promoted_follower_serves_a_pre_failover_session_and_refresh_token() {
         .partitions
         .iter()
         .find(|p| p.copied > 0)
-        .map(|p| p.lag_messages)
-        .unwrap_or(0);
+        .map_or(0, |p| p.lag_messages);
     promote_scope(
         home.pool(),
         follower.owner_pool(),

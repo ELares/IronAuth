@@ -2528,7 +2528,7 @@ mod tests {
     }
 
     /// The fake shared store: an in-memory map, with an outage switch. Its futures
-    /// resolve immediately, which the test block_on requires.
+    /// resolve immediately, which the test `block_on` requires.
     struct FakeSharedStore {
         buckets: std::sync::Mutex<std::collections::HashMap<String, BucketState>>,
         unavailable: std::sync::atomic::AtomicBool,

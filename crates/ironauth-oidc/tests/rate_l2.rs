@@ -187,13 +187,13 @@ fn ironcache_bin() -> Option<PathBuf> {
 
 /// Poll a TCP port until something accepts, or `timeout` elapses.
 fn wait_for_port(port: u16, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + timeout; // invariant-allow: time-via-env
     loop {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
             return;
         }
         assert!(
-            Instant::now() < deadline,
+            Instant::now() < deadline, // invariant-allow: time-via-env
             "nothing is listening on {port} within the wait"
         );
         std::thread::sleep(Duration::from_millis(100));

@@ -81,7 +81,7 @@ async fn probe(harness: &Harness, path: &str) -> (StatusCode, u128) {
             r#"{"identifier":"probe@exit.test","password":"probe"}"#,
         ))
         .expect("request builds");
-    let start = std::time::Instant::now(); // invariant-allow: time-via-env -- a TIMING harness measures elapsed wall time by definition; it is `#[ignore]`d, asserts no wall clock, and is not protocol logic
+    let start = std::time::Instant::now(); // invariant-allow: time-via-env
     let (status, _headers, _body) = harness.send(request).await;
     let elapsed = start.elapsed().as_nanos(); // invariant-allow: time-via-env -- the second half of the same measurement; the Clock seam has no monotonic elapsed and injecting one would measure the seam
     (status, elapsed)

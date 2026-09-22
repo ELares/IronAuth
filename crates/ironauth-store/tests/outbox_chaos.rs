@@ -104,13 +104,13 @@ async fn enqueue(db: &TestDatabase, env: &Env, scope: Scope, key: &str) {
 
 /// Wait until `consumer` has handled at least `count` messages, or fail after `timeout`.
 async fn wait_handled(consumer: &Arc<ScriptedConsumer>, count: usize, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + timeout; // invariant-allow: time-via-env
     loop {
         if consumer.handled().len() >= count {
             return;
         }
         assert!(
-            Instant::now() < deadline,
+            Instant::now() < deadline, // invariant-allow: time-via-env
             "the drain did not deliver {count} messages within {timeout:?}: handled={:?}",
             consumer.handled()
         );
@@ -196,13 +196,13 @@ fn ironbus_bin() -> Option<PathBuf> {
 
 /// Poll a TCP port until something accepts, or `timeout` elapses.
 fn wait_for_port(port: u16, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + timeout; // invariant-allow: time-via-env
     loop {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
             return;
         }
         assert!(
-            Instant::now() < deadline,
+            Instant::now() < deadline, // invariant-allow: time-via-env
             "nothing is listening on {port} within the wait"
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -283,8 +283,9 @@ async fn ironbus_dies_the_outbox_drains_on_the_poll_with_no_loss() {
     wait_handled(&consumer, 2, Duration::from_secs(10)).await;
     // The reader notices the death (asynchronously); when it does, wait is PollOnly.
     // NOT LOAD-BEARING — the drain is — but it is the mechanism the design names.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !concrete.is_degraded() && Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(10); // invariant-allow: time-via-env
+    let now = Instant::now(); // invariant-allow: time-via-env
+    while !concrete.is_degraded() && now < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
