@@ -106,6 +106,7 @@ pub mod recovery;
 mod redirect;
 pub mod rekey;
 pub mod replication;
+pub mod replication_apply;
 mod repository;
 pub mod risk;
 mod scope;
