@@ -23,6 +23,7 @@ ironauth-config.workspace = true
 ironauth-hot.workspace = true
 ironauth-server.workspace = true
 metrics.workspace = true
+sqlx = { workspace = true }
 # The management API (issue #11) is mounted on the management plane when a
 # bootstrap operator token is configured; the store provides the control-plane
 # connection. Both are rustls/ring only (no openssl/native-tls), so the musl
@@ -165,6 +166,10 @@ name = "rekey_cli_guard"
 # against a throwaway database and watches the queue. It is the only thing in the tree that
 # observes the `serve` call site itself: replacing that call with a no-op left every other
 # test green. Same gating as the CLI suite above.
+[[test]]
+name = "replication_boot"
+path = "tests/replication_boot.rs"
+
 [[test]]
 name = "serve_retention_boot"
 required-features = ["testing"]

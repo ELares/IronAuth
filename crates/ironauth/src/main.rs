@@ -402,6 +402,9 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // Captured BEFORE config and env are moved into the workers below: the scheduler
         // needs the section resolved and the master material read once, at boot.
         let backup_scheduler_inputs_captured = backup_scheduler_inputs(&config, &env);
+        // Captured early for the same reason as its neighbours: config moves into the
+        // workers below.
+        let replication_shipper_inputs_captured = replication_shipper_inputs(&config);
         // The on-demand trigger exists only when a runner will run: the endpoint still
         // records and answers 202 without one, but there is nothing to wake.
         let backup_trigger = backup_scheduler_inputs_captured
@@ -752,6 +755,12 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             (Some(inputs), Some(trigger)) => start_backup_scheduler(inputs, trigger).await,
             _ => None,
         };
+        // THE REPLICATION SHIPPER (issue #155). Its own switch, OFF by default, and it
+        // needs the home pool: the shipper reads the home stream and writes the follower.
+        let replication_shipper = match replication_shipper_inputs_captured {
+            Some(inputs) => start_replication_shipper(inputs).await,
+            None => None,
+        };
 
         tracing::info!(base_url = %server.base_url(), "starting ironauth");
 
@@ -824,6 +833,12 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // on the next boot.
         if let Some(scheduler) = backup_scheduler {
             scheduler.abort();
+        }
+        // AND THE REPLICATION SHIPPER. Aborted rather than awaited for the same reason: a
+        // pass has no cleanup to finish, and the position it stopped at is the follower's
+        // durable cursor — the next boot resumes there.
+        if let Some(shipper) = replication_shipper {
+            shipper.abort();
         }
         if let Some(shipper) = log_shipper {
             shipper.shutdown().await;
@@ -9129,6 +9144,122 @@ const BACKUP_SUCCESS_TOTAL: &str = "ironauth_backup_success_total";
 const BACKUP_FAILURE_TOTAL: &str = "ironauth_backup_failure_total";
 const BACKUP_LAST_SUCCESS_TIMESTAMP_SECONDS: &str =
     "ironauth_backup_last_success_timestamp_seconds";
+
+/// Everything the replication shipper needs, resolved once at boot (issue #155).
+struct ReplicationShipperInputs {
+    /// The home region's database URL (the server's own `database.url`).
+    home_url: String,
+    /// The follower's regional database URL.
+    follower_url: String,
+    /// The operator's chosen lag bound; 0 disables alerting.
+    alert_threshold_messages: u64,
+    /// Seconds between ship passes.
+    interval_secs: u64,
+}
+
+/// Resolve the replication shipper inputs, or return [`None`] with every refusal logged.
+fn replication_shipper_inputs(config: &Config) -> Option<ReplicationShipperInputs> {
+    let replication = &config.replication;
+    if !replication.enabled {
+        return None;
+    }
+    let Some(home) = replication.home_database_url.as_ref().map(Secret::resolve) else {
+        tracing::error!(
+            "replication shipper NOT running: replication.home_database_url is not set \
+             (validation should have refused this config, and did not)"
+        );
+        return None;
+    };
+    let Some(home_url) = home
+        .ok()
+        .and_then(|secret| secret.expose().to_string().into())
+    else {
+        tracing::error!("replication shipper NOT running: the home DSN could not be resolved");
+        return None;
+    };
+    let Some(follower) = replication
+        .follower_database_url
+        .as_ref()
+        .map(Secret::resolve)
+    else {
+        tracing::error!(
+            "replication shipper NOT running: replication.follower_database_url is not set \
+             (validation should have refused this config, and did not)"
+        );
+        return None;
+    };
+    let Some(follower_url) = follower
+        .ok()
+        .and_then(|secret| secret.expose().to_string().into())
+    else {
+        tracing::error!("replication shipper NOT running: the follower DSN could not be resolved");
+        return None;
+    };
+    Some(ReplicationShipperInputs {
+        home_url,
+        follower_url,
+        alert_threshold_messages: replication.alert_threshold_messages,
+        interval_secs: replication.interval_secs,
+    })
+}
+
+/// Start the replication shipper: a pass at boot, then every interval.
+async fn start_replication_shipper(
+    inputs: ReplicationShipperInputs,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let home_pool = match sqlx::PgPool::connect(&inputs.home_url).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            tracing::error!(
+                "replication shipper NOT running: cannot connect to the home region: {error}"
+            );
+            return None;
+        }
+    };
+    let follower_pool = match sqlx::PgPool::connect(&inputs.follower_url).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            tracing::error!(
+                "replication shipper NOT running: cannot connect to the follower: {error}"
+            );
+            return None;
+        }
+    };
+    let shipper = ironauth_store::replication::ReplicationShipper::new(home_pool, follower_pool)
+        .with_alert_threshold(inputs.alert_threshold_messages);
+    let handle = tokio::spawn(replication_shipper_loop(shipper, inputs.interval_secs));
+    tracing::info!("replication shipper running");
+    Some(handle)
+}
+
+/// The shipper loop: one pass at boot, then every interval. Every pass logs its report
+/// (per-partition lag); the metrics and the threshold alert are the shipper's own.
+async fn replication_shipper_loop(
+    shipper: ironauth_store::replication::ReplicationShipper,
+    interval_secs: u64,
+) {
+    loop {
+        match shipper.ship(ironauth_store::replication::BATCH_LIMIT).await {
+            Ok(report) => {
+                for partition in &report.partitions {
+                    if partition.copied > 0 {
+                        tracing::info!(
+                            tenant_id = %partition.tenant_id,
+                            environment_id = %partition.environment_id,
+                            copied = partition.copied,
+                            lag_messages = partition.lag_messages,
+                            "replication pass: shipped"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!("replication pass FAILED: {error}");
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+    }
+}
 
 /// Everything the scheduled backup runner needs, resolved once at boot.
 struct BackupSchedulerInputs {

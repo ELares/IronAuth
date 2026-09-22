@@ -676,19 +676,41 @@ impl Default for AuditRetentionConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct ReplicationConfig {
-    /// Whether the replication shipper is wired at boot (a later slice; currently inert).
+    /// Whether the replication shipper is wired at boot. OFF by default.
     pub enabled: bool,
+
+    /// The HOME region's database URL for the stream READS. MUST name a superuser or
+    /// BYPASSRLS role, for the same reason `ironauth storage backup` and the doctor
+    /// demand one: `outbox_messages` is FORCE ROW LEVEL SECURITY, and a role subject to
+    /// the policies sees only the rows its session settings name — it cannot even
+    /// enumerate the partitions to ship. [`None`] disables the shipper however `enabled`
+    /// is set.
+    pub home_database_url: Option<Secret>,
+
+    /// The FOLLOWER's database URL: the regional replica this process ships the ordered
+    /// outbox stream to. MUST differ from `home_database_url` (a shipper pointed at
+    /// itself is a configuration error, not a mode) and must authenticate as a role with
+    /// SELECT and INSERT on `outbox_messages` and the column-scoped UPDATE on
+    /// `replication_cursors` (the app role holds all three). [`None`] disables the
+    /// shipper however `enabled` is set.
+    pub follower_database_url: Option<Secret>,
 
     /// The lag bound, in stream positions: a partition whose lag exceeds it is alerted.
     /// `0` disables alerting.
     pub alert_threshold_messages: u64,
+
+    /// Seconds between ship passes. A pass is bounded by its own batch limits.
+    pub interval_secs: u64,
 }
 
 impl Default for ReplicationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            home_database_url: None,
+            follower_database_url: None,
             alert_threshold_messages: 0,
+            interval_secs: 60,
         }
     }
 }
@@ -6556,6 +6578,7 @@ impl Config {
         validate_forward_auth(&self.forward_auth, &self.proxy, self.oidc.enabled)?;
         validate_scim_push(&self.scim_push)?;
         validate_backup(&self.backup)?;
+        validate_replication(&self.replication, self.database.url.expose())?;
         validate_certificate_expiry(&self.certificate_expiry)?;
         check_oidc_lifetime(
             "oidc.authorization_code_ttl_secs",
@@ -6765,6 +6788,65 @@ fn validate_certificate_expiry(expiry: &CertificateExpiryConfig) -> Result<(), C
 }
 
 /// Refuse a `scim_push` section that would run the worker without pausing.
+fn validate_replication(
+    replication: &ReplicationConfig,
+    database_url: &str,
+) -> Result<(), ConfigError> {
+    if !replication.enabled {
+        return Ok(());
+    }
+    if replication.home_database_url.is_none() {
+        return Err(ConfigError::Invalid {
+            message: "replication.home_database_url must be set when replication.enabled                       is true: the shipper needs a BYPASSRLS DSN to read the home stream                       (outbox_messages is FORCE ROW LEVEL SECURITY)"
+                .to_string(),
+        });
+    }
+    if replication.follower_database_url.is_none() {
+        return Err(ConfigError::Invalid {
+            message: "replication.follower_database_url must be set when replication.enabled                       is true: the shipper needs the follower's regional database URL"
+                .to_string(),
+        });
+    }
+    for (name, secret) in [
+        ("home", &replication.home_database_url),
+        ("follower", &replication.follower_database_url),
+    ] {
+        let Some(secret) = secret else { continue };
+        if secret
+            .resolve()
+            .map(|resolved| resolved.expose() == database_url)
+            .unwrap_or(false)
+        {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "replication.{name}_database_url must differ from database.url: a shipper                           pointed at its own region would replicate a region into itself"
+                ),
+            });
+        }
+    }
+    if let (Some(home), Some(follower)) = (
+        &replication.home_database_url,
+        &replication.follower_database_url,
+    ) {
+        let (Some(home), Some(follower)) = (
+            home.resolve().ok().map(|s| s.expose().to_owned()),
+            follower.resolve().ok().map(|s| s.expose().to_owned()),
+        ) else {
+            return Err(ConfigError::Invalid {
+                message: "replication.home_database_url and follower_database_url must both                           resolve"
+                    .to_string(),
+            });
+        };
+        if home == follower {
+            return Err(ConfigError::Invalid {
+                message: "replication.home_database_url and follower_database_url must differ:                           a shipper reading and writing the same database would loop the stream                           into itself"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_backup(backup: &BackupConfig) -> Result<(), ConfigError> {
     if !backup.enabled {
         return Ok(());
@@ -12837,6 +12919,27 @@ enabled = true
         Config::from_toml_str(ok, "<inline>").expect("a complete section loads");
         // OFF stays valid however little it says.
         Config::from_toml_str("", "<inline>").expect("empty loads");
+    }
+
+    /// The replication section refuses to be enabled without a follower, and refuses a
+    /// shipper pointed at its own region.
+    #[test]
+    fn the_replication_section_refuses_a_self_pointed_or_missing_follower() {
+        let no_follower = "[replication]\nenabled = true\n";
+        let err = Config::from_toml_str(no_follower, "<inline>").expect_err("refused");
+        assert!(
+            err.to_string().contains("home_database_url must be set"),
+            "{err}"
+        );
+        let self_pointed = "[database]\nurl = \"postgres://a@localhost:5432/ironauth\"\n\
+                            [replication]\nenabled = true\n\
+                            home_database_url = \"postgres://a@localhost:5432/ironauth\"\n\
+                            follower_database_url = \"postgres://b@localhost:5432/follower\"\n";
+        let err = Config::from_toml_str(self_pointed, "<inline>").expect_err("refused");
+        assert!(
+            err.to_string().contains("must differ from database.url"),
+            "{err}"
+        );
     }
 
     #[test]
