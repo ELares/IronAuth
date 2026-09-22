@@ -274,6 +274,10 @@ pub struct Config {
     /// configuration a repository scan should not be able to enable silently.
     pub backup: BackupConfig,
 
+    /// Replication (issue #155, EXPLORATORY): the operator-chosen lag bound the
+    /// outbox-stream replication shipper alerts at. OFF by default.
+    pub replication: ReplicationConfig,
+
     /// SIEM log stream shipping (issue #110): whether THIS process ships configured
     /// streams to their sinks, and how often.
     ///
@@ -657,6 +661,34 @@ impl Default for AuditRetentionConfig {
             authentication_retention_secs: 0,
             batch: 1_000,
             interval_secs: 60 * 60,
+        }
+    }
+}
+
+/// Replication settings (issue #155, EXPLORATORY): the operator-chosen lag bound the
+/// outbox-stream replication shipper alerts at.
+///
+/// OFF by default, like every worker here. The shipper's boot wiring is a later slice;
+/// this section exists so the chosen lag bound is config, and a deployment that never
+/// opens it alerts on nothing. The alerting default direction mirrors audit retention:
+/// the failure mode of alerting being off is a silent lag, and the failure mode of it
+/// being on by accident is noise.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct ReplicationConfig {
+    /// Whether the replication shipper is wired at boot (a later slice; currently inert).
+    pub enabled: bool,
+
+    /// The lag bound, in stream positions: a partition whose lag exceeds it is alerted.
+    /// `0` disables alerting.
+    pub alert_threshold_messages: u64,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            alert_threshold_messages: 0,
         }
     }
 }

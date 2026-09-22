@@ -361,6 +361,9 @@ at the top of the file, or map it in `.taplo.toml`).
 | `quota.tenant.token_issuance_burst` | integer | `200` | Burst capacity for the token-issuance dimension. 0 means unlimited. |
 | `quota.tenant.token_issuance_per_second` | integer | `100` | Sustained token issuance per second (the refill rate for the token-issuance dimension: access, ID, and refresh tokens minted). |
 | `quota.usage_thresholds_percent` | array | `[80, 100]` | The usage percentages (1 to 100) at which a saturation webhook fires per dimension, so operators see pressure before the hard limit. The default (`[80, 100]`) warns at 80 percent and again at the limit. An empty list disables saturation webhooks. At most `QUOTA_MAX_USAGE_THRESHOLDS` entries; each must be between 1 and 100. |
+| `replication` | table | see fields | Replication (issue #155, EXPLORATORY): the operator-chosen lag bound the outbox-stream replication shipper alerts at. OFF by default. |
+| `replication.alert_threshold_messages` | integer | `0` | The lag bound, in stream positions: a partition whose lag exceeds it is alerted. `0` disables alerting. |
+| `replication.enabled` | boolean | `false` | Whether the replication shipper is wired at boot (a later slice; currently inert). |
 | `risc_receiver` | table | see fields | The Google Cross-Account Protection RISC receiver (issue #144). OFF by default, so the default boot mounts no receiver endpoint and accepts no inbound SET. |
 | `risc_receiver.algorithms` | array | empty | The JWS algorithm allowlist an inbound SET may be signed with, as JOSE `alg` names. |
 | `risc_receiver.audience` | string | `""` | The `aud` an inbound SET must carry. |

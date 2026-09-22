@@ -284,6 +284,18 @@ pub const CONTRACT: &[MetricSpec] = &[
         help: "Authentications refused for attempting a weaker factor than the policy allows",
     },
     MetricSpec {
+        name: "ironauth_replication_lag_messages",
+        kind: MetricKind::Gauge,
+        labels: &["tenant_id", "environment_id"],
+        help: "Replication lag in outbox-stream positions, per (tenant, environment) partition (issue #155)",
+    },
+    MetricSpec {
+        name: "ironauth_replication_shipped_total",
+        kind: MetricKind::Counter,
+        labels: &["tenant_id", "environment_id"],
+        help: "Home outbox-stream rows copied to the follower, per partition (issue #155)",
+    },
+    MetricSpec {
         name: "ironauth_backup_success_total",
         kind: MetricKind::Counter,
         labels: &[],
