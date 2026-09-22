@@ -8,6 +8,7 @@
 //! stream. The `sequence` column on [`outbox_messages`](crate) is a database-assigned monotonic
 //! order (never client-supplied), and the message body (`consumer`, `idempotency_key`,
 //! `ordering_key`, `payload`, `enqueued_at`) is immutable once enqueued - so the stream is a
+
 //! stable, ordered, deduplicable log. This shipper copies that log from a home region's
 //! database to a follower's, preserving order, and records each (tenant, environment)'s
 //! position on the follower. Lag is the difference between the home high-water mark and

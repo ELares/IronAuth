@@ -1526,6 +1526,7 @@ pub struct HotStateConfig {
     /// criterion 5): the layered limiter's buckets live in the cache when this key is set, so
     /// two nodes charge ONE budget. That is a real production caller - [`IronCacheKeyspace`]
     /// over the `rate` keyspace - and it is the difference between "declares an address" and
+
     /// "installs a `HotState` implementation", which is exactly the gap this paragraph used to
     /// describe as unfilled.
     ///

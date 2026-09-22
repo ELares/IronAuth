@@ -283,6 +283,7 @@ async fn ironbus_dies_the_outbox_drains_on_the_poll_with_no_loss() {
     wait_handled(&consumer, 2, Duration::from_secs(10)).await;
     // The reader notices the death (asynchronously); when it does, wait is PollOnly.
     // NOT LOAD-BEARING - the drain is - but it is the mechanism the design names.
+
     let deadline = Instant::now() + Duration::from_secs(10); // invariant-allow: time-via-env
     let now = Instant::now(); // invariant-allow: time-via-env
     while !concrete.is_degraded() && now < deadline {
