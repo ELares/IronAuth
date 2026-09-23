@@ -3607,6 +3607,16 @@ async fn no_management_operation_answers_a_server_error_against_a_live_environme
     for (index, case) in all_cases(&fixture).iter().enumerate() {
         let (status, body) = drive(&h, case, &format!("k-live-{index}")).await;
         if status.is_server_error() {
+            // THE ONE NAMED EXCEPTION, with its reason: token hooks are a feature-gated
+            // surface whose endpoint is mounted UNCONDITIONALLY and answers 503
+            // "not_configured" when this build has no WASM runtime. That is a
+            // configuration answer, not the missing-control-grant 500 this sweep exists
+            // to catch: a deployment without the feature cannot reach the runtime, and
+            // the 503 tells the operator exactly that. Every other 5xx on the surface is
+            // still a failure.
+            if case.label == "token_hooks.testTokenHook" && status == StatusCode::SERVICE_UNAVAILABLE && body.contains("not_configured") {
+                continue;
+            }
             failures.push(format!(
                 "{} {} {} -> {status}: {body}",
                 case.label, case.method, case.path
