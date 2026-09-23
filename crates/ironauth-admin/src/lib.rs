@@ -69,6 +69,7 @@ mod impersonation;
 mod imports;
 mod input;
 mod invitations;
+mod key_rotation;
 mod keys;
 mod locales;
 mod messages;
@@ -413,6 +414,22 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe",
             post(password_hashing::probe_password_hashing),
+        )
+        // The signing-key rotation surface (issue #160): the read-only state view, the
+        // manual trigger, and the break-glass path. Static `signing/rotation` suffix;
+        // `advance` and `break-glass` are matched by their own segments, before any
+        // parameterized sibling.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation",
+            get(key_rotation::list_signing_key_rotation),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation/advance",
+            post(key_rotation::advance_signing_key_rotation),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation/break-glass",
+            post(key_rotation::break_glass_signing_key_rotation),
         )
         // The runtime quota-override surface (issue #150 criterion 4): the WRITE half of
         // "limits change at runtime per tenant via the management API". The table and its

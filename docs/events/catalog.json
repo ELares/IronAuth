@@ -370,6 +370,16 @@
       "type": "backchannel_request.decided"
     },
     {
+      "domain": "backup",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "backup.requested"
+    },
+    {
       "domain": "ban",
       "payload_schema": {
         "additionalProperties": false,
@@ -2715,6 +2725,33 @@
       "type": "project_grant.withdrawn"
     },
     {
+      "domain": "quota",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "burst": {
+            "type": "number"
+          },
+          "cleared": {
+            "type": "boolean"
+          },
+          "dimension": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "refill_per_sec": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "dimension"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "quota.limit_changed"
+    },
+    {
       "domain": "recovery_approval",
       "payload_schema": {
         "additionalProperties": false,
@@ -3134,6 +3171,61 @@
       },
       "payload_schema_version": 1,
       "type": "session_token_template.set"
+    },
+    {
+      "domain": "signing_key",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "withdrawn": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "withdrawn"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "signing_key.break_glass"
+    },
+    {
+      "domain": "signing_key",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "promoted": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "provisioned": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "retired": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "retiring": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "signing_key.rotation_advanced"
     },
     {
       "domain": "signup_form",

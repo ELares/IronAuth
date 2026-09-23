@@ -3210,6 +3210,23 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "POST",
             format!("{base}/backups"),
         ),
+        // ---- the signing-key rotation surface (issue #160) ----
+        Case::empty(
+            "signing.listSigningKeyRotation",
+            "GET",
+            format!("{base}/signing/rotation"),
+        ),
+        Case::empty(
+            "signing.advanceSigningKeyRotation",
+            "POST",
+            format!("{base}/signing/rotation/advance"),
+        ),
+        Case::json(
+            "signing.breakGlassSigningKeyRotation",
+            "POST",
+            format!("{base}/signing/rotation/break-glass"),
+            &serde_json::json!({ "confirmed": false }),
+        ),
         // ---- sessions ----
         Case::empty("sessions.listSessions", "GET", format!("{base}/sessions")),
         Case::empty(

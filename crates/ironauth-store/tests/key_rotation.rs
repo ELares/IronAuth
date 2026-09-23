@@ -6,7 +6,7 @@
 //! retired) completes on a test cadence with zero verification failures for an RP that
 //! caches JWKS at the documented max TTL." The zero-failure property is structural: at
 //! every instant the published JWKS contains every key that could still sign a live
-//! token — the successor is published a full pre-publication window before it signs,
+//! token - the successor is published a full pre-publication window before it signs,
 //! and the outgoing head stays published until its last token expires. This test drives
 //! the machine on a test cadence and asserts the key set's transitions happen exactly
 //! at the boundaries.
@@ -60,7 +60,7 @@ async fn provision_day_one_head(
         .expect("provision the day-one head");
 }
 
-/// The published key set for the scope at `now`, by kid: the serving filter's rule —
+/// The published key set for the scope at `now`, by kid: the serving filter's rule -
 /// published from `publish_at`, withdrawn after `expire_at`.
 async fn published_kids(db: &TestDatabase, scope: ironauth_store::Scope, now: i64) -> Vec<String> {
     let keys = db

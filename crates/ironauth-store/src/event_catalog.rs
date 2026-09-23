@@ -1759,6 +1759,37 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A manual rotation trigger advanced the state machine (issue #160). The report
+        // travels: the successor kids, the retiring kids, and whether anything was seeded,
+        // so an integrator watching the stream sees the handoff without polling the keys.
+        "signing_key.rotation_advanced",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "provisioned": {"type": "array", "items": {"type": "string"}},
+                "promoted": {"type": "array", "items": {"type": "string"}},
+                "retiring": {"type": "array", "items": {"type": "string"}},
+                "retired": {"type": "array", "items": {"type": "string"}}
+            }
+        }"#,
+    ),
+    (
+        // A break-glass rotation was invoked with explicit confirmation (issue #160). The
+        // withdrawn kids travel; the verification breakage is the documented price.
+        "signing_key.break_glass",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "withdrawn": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["withdrawn"]
+        }"#,
+    ),
+    (
         // The stream is gone AND so is every dead letter it recorded, which is why this
         // matters more than a configuration tidy-up: an operator watching for undelivered
         // audit will never see those again, and the event is the only notice they get.
