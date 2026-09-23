@@ -198,6 +198,113 @@ async fn a_full_rotation_completes_with_the_key_set_transitioning_at_the_boundar
     .await
     .expect("the retired audit row");
     assert_eq!(retired_audits, 1);
+}
+
+/// THE BREAK-GLASS CRITERION: an explicit rotate-now-and-revoke operation that
+/// promotes a fresh key immediately, withdraws the compromised key NOW (no retirement
+/// window), requires the confirmation flag, and audits the invocation with the actor.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn break_glass_rotates_immediately_and_only_with_explicit_confirmation() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x41);
+    let scope = db.seed_scope(&env).await;
+    let t0 = 10_000_000_i64;
+    provision_day_one_head(&db, &env, scope, t0).await;
+    let actor = db.test_actor(&env);
+    let machine =
+        RotationStateMachine::new(db.store(), scope, actor, CorrelationId::generate(&env));
+    let now = t0 + 1_000_000;
+
+    // WITHOUT the confirmation flag the operation refuses outright.
+    let refused = machine.break_glass(&env, now, false).await;
+    assert!(
+        refused.is_err(),
+        "the confirmation flag is mandatory, not advisory"
+    );
+
+    // WITH the flag: the compromised key is withdrawn immediately (its expiry is NOW,
+    // not lifetime+buffer), a fresh successor signs, and the invocation is audited.
+    let report = machine
+        .break_glass(&env, now, true)
+        .await
+        .expect("the break-glass runs");
+    assert_eq!(report.provisioned.len(), 1, "a fresh successor is minted");
+    assert_eq!(
+        report.promoted.len(),
+        1,
+        "the successor is promoted immediately"
+    );
+    assert_eq!(report.retired.len(), 1, "the compromised key is withdrawn");
+
+    let keys = db
+        .store()
+        .scoped(scope)
+        .signing_keys()
+        .list()
+        .await
+        .expect("list the keys");
+    let outgoing = keys
+        .iter()
+        .find(|key| key.retire_at_unix_micros.is_some())
+        .expect("the compromised key has its retirement stamped");
+    assert_eq!(
+        outgoing.retire_at_unix_micros,
+        Some(now),
+        "the compromised key retired at the break-glass instant"
+    );
+    assert_eq!(
+        outgoing.expire_at_unix_micros,
+        Some(now),
+        "the compromised key expired IMMEDIATELY: no retirement window"
+    );
+    assert_eq!(
+        published_kids(&db, scope, now).await.len(),
+        1,
+        "the JWKS holds only the fresh successor"
+    );
+
+    // The three audit rows: the invocation (with the acting actor), the promotion, and
+    // the withdrawal.
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE tenant_id = $1 AND environment_id = $2          AND action IN ('signing_key.break_glass', 'signing_key.promoted',                         'signing_key.retired')",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("the break-glass audit rows");
+    assert_eq!(audits, 3, "invocation + promotion + withdrawal all audited");
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn a_full_rotation_is_idempotent_at_a_given_instant() {
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x42);
+    let scope = db.seed_scope(&env).await;
+    let t0 = 10_000_000_i64;
+    provision_day_one_head(&db, &env, scope, t0).await;
+    let actor = db.test_actor(&env);
+    let policy = test_policy();
+    let machine =
+        RotationStateMachine::new(db.store(), scope, actor, CorrelationId::generate(&env));
+
+    let pre_pub_point = t0 + 9_900_000_000;
+    machine
+        .advance(&env, policy, pre_pub_point, 1_000)
+        .await
+        .expect("the tick runs");
+    let rotation_point = t0 + 10_000_000_000;
+    machine
+        .advance(&env, policy, rotation_point, 1_000)
+        .await
+        .expect("the tick runs");
+    let withdrawal_point = rotation_point + 1_000_000_000 + 50_000_000;
+    machine
+        .advance(&env, policy, withdrawal_point, 1_000)
+        .await
+        .expect("the tick runs");
 
     // Idempotence: re-running the tick at the same instant does nothing new.
     let again = machine

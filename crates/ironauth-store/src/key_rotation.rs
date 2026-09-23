@@ -191,7 +191,9 @@ impl<'a> RotationStateMachine<'a> {
                 let key = self
                     .seed_successor(env, algorithm, material_kind, rotation_micros, policy)
                     .await?;
-                report.provisioned.push((algorithm.to_owned(), key));
+                report
+                    .provisioned
+                    .push((algorithm.to_owned(), key.to_string()));
             }
 
             // 2. PROMOTE: when a key's activation instant arrived, it IS the head by the
@@ -257,7 +259,7 @@ impl<'a> RotationStateMachine<'a> {
         material_kind: SigningKeyMaterialKind,
         rotation_micros: i64,
         policy: RotationPolicy,
-    ) -> Result<String, StoreError> {
+    ) -> Result<SigningKeyId, StoreError> {
         let id = SigningKeyId::generate(env, &self.scope);
         let material: Vec<u8> = match material_kind {
             SigningKeyMaterialKind::Ed25519Seed => {
@@ -288,7 +290,79 @@ impl<'a> RotationStateMachine<'a> {
             .signing_keys()
             .provision(env, key)
             .await?;
-        Ok(id.to_string())
+        Ok(id)
+    }
+
+    /// THE BREAK-GLASS OPERATION (issue #160): for every algorithm the environment
+    /// signs with, mint a FRESH successor and rotate to it immediately, withdrawing the
+    /// current key NOW (no pre-publication, no retirement window — the verification
+    /// breakage that entails is the documented price of a compromise). Refuses without
+    /// `confirmed`, and the invocation is audited with the acting actor.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Invalid`] if `confirmed` is false; [`StoreError`] otherwise if a
+    /// transition fails (each rotation is one transaction, so a failure rolls back).
+    pub async fn break_glass(
+        &self,
+        env: &Env,
+        now_micros: i64,
+        confirmed: bool,
+    ) -> Result<RotationReport, StoreError> {
+        // The confirmation check comes FIRST: a refused invocation must leave no trace
+        // (no successor provisioned, nothing audited).
+        if !confirmed {
+            return Err(StoreError::Invalid);
+        }
+        let mut report = RotationReport {
+            provisioned: Vec::new(),
+            promoted: Vec::new(),
+            retiring: Vec::new(),
+            retired: Vec::new(),
+        };
+        let keys = self.store.scoped(self.scope).signing_keys().list().await?;
+        for (algorithm, material_kind) in ALGORITHMS {
+            let Some(head) = keys
+                .iter()
+                .filter(|key| {
+                    key.algorithm == algorithm
+                        && key.retire_at_unix_micros.is_none()
+                        && key.activate_at_unix_micros <= now_micros
+                })
+                .max_by_key(|key| key.activate_at_unix_micros)
+            else {
+                continue;
+            };
+            let successor_id = self
+                .seed_successor(
+                    env,
+                    algorithm,
+                    material_kind,
+                    now_micros,
+                    RotationPolicy {
+                        cadence_secs: 0,
+                        pre_publication_secs: 0,
+                        retirement_buffer_secs: 0,
+                    },
+                )
+                .await?;
+            self.store
+                .scoped(self.scope)
+                .acting(self.acting.actor(), self.acting.correlation())
+                .signing_keys()
+                .break_glass(env, &successor_id, &head.id, now_micros, confirmed)
+                .await?;
+            report
+                .provisioned
+                .push((algorithm.to_owned(), successor_id.to_string()));
+            report
+                .promoted
+                .push((algorithm.to_owned(), successor_id.to_string()));
+            report
+                .retired
+                .push((algorithm.to_owned(), head.id.to_string()));
+        }
+        Ok(report)
     }
 }
 
