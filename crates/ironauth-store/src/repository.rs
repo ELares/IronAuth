@@ -11841,6 +11841,89 @@ pub struct ActingSigningKeyRepo<'a> {
 }
 
 impl ActingSigningKeyRepo<'_> {
+    /// THE BREAK-GLASS ROTATION (issue #160): promote a FRESH successor and withdraw
+    /// the compromised head IMMEDIATELY (its expiry is now, not lifetime+buffer — the
+    /// verification breakage that entails is the documented price), in ONE transaction
+    /// with the invocation, promoted, and retired audit rows. Refuses without
+    /// `confirmed`, and the invocation row carries the acting actor by construction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either identifier is out of this scope;
+    /// [`StoreError::Invalid`] if `confirmed` is false — the confirmation flag is
+    /// mandatory, not advisory; [`StoreError::Database`] on a persistence failure.
+    pub async fn break_glass(
+        &self,
+        env: &Env,
+        pending: &SigningKeyId,
+        outgoing: &SigningKeyId,
+        now_micros: i64,
+        confirmed: bool,
+    ) -> Result<(), StoreError> {
+        if !confirmed {
+            return Err(StoreError::Invalid);
+        }
+        if pending.scope() != self.scope || outgoing.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "UPDATE signing_keys SET retire_at = \
+                 (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval), \
+                 expire_at = \
+                 (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(outgoing.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(now_micros)
+        .execute(&mut *tx)
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SigningKeyBreakGlass,
+                target: outgoing,
+            },
+            Some("the compromised key is withdrawn immediately; the successor was promoted"),
+        )
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SigningKeyPromoted,
+                target: pending,
+            },
+            Some("break-glass promotion"),
+        )
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SigningKeyRetired,
+                target: outgoing,
+            },
+            Some("break-glass withdrawal: expired immediately, no retirement window"),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// The rotation handoff (issue #160): promote `pending` to the head and mark
     /// `outgoing` retiring with its expiry, in ONE transaction with the two audit rows
     /// (`signing_key.promoted` for the successor, `signing_key.retiring` for the

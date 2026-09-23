@@ -672,6 +672,9 @@ pub enum Action {
     /// A per-environment signing key was provisioned (issue #19). Covers both a
     /// day-one key and a manually rotated-in successor.
     SigningKeyProvision,
+    /// A break-glass rotation was invoked with explicit confirmation (issue #160): the
+    /// compromised key was withdrawn immediately and a fresh successor promoted.
+    SigningKeyBreakGlass,
     /// A rotation state machine handoff (issue #160): a pre-published successor became
     /// the current signing key, retiring the previous head.
     SigningKeyPromoted,
@@ -1875,6 +1878,7 @@ impl Action {
             Action::ConsentRevoke => "consent.revoke",
             Action::ConsentSkipped => "consent.skip",
             Action::SigningKeyProvision => "signing_key.provision",
+            Action::SigningKeyBreakGlass => "signing_key.break_glass",
             Action::SigningKeyPromoted => "signing_key.promoted",
             Action::SigningKeyRetiring => "signing_key.retiring",
             Action::SigningKeyRetired => "signing_key.retired",
