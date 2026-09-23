@@ -3342,6 +3342,60 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List every key's rotation state and the next scheduled rotation. */
+        get: operations["listSigningKeyRotation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation/advance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Run the machine's tick now: the manual trigger. */
+        post: operations["advanceSigningKeyRotation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation/break-glass": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * The rotate-now-and-revoke path: a fresh successor immediately, the compromised key
+         *     withdrawn NOW. The confirmation flag is mandatory.
+         */
+        post: operations["breakGlassSigningKeyRotation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine": {
         parameters: {
             query?: never;
@@ -4736,6 +4790,11 @@ export interface components {
             tokens: Record<string, never>;
             /** @description The stored dark-mode token variants, if authored. */
             tokens_dark?: Record<string, never>;
+        };
+        /** @description The break-glass request: the confirmation flag is mandatory, not advisory. */
+        BreakGlassRequest: {
+            /** @description Must be `true`. A refused invocation leaves no trace. */
+            confirmed: boolean;
         };
         /**
          * @description The result of a BULK session revocation (issue #32). States the post-condition; see
@@ -8610,6 +8669,40 @@ export interface components {
              */
             overlap_seconds?: number | null;
         };
+        /** @description One key's lifecycle view, as the management surface renders it. */
+        RotationKeyView: {
+            /**
+             * Format: int64
+             * @description The activation instant, epoch milliseconds.
+             */
+            activate_at: number;
+            /** @description The JOSE algorithm. */
+            algorithm: string;
+            /**
+             * Format: int64
+             * @description The expiry instant, epoch milliseconds (absent while published).
+             */
+            expire_at?: number | null;
+            /** @description The JOSE kid. */
+            kid: string;
+            /**
+             * Format: int64
+             * @description The next scheduled rotation for the current head, epoch milliseconds.
+             */
+            next_rotation_at?: number | null;
+            /**
+             * Format: int64
+             * @description The pre-publication instant, epoch milliseconds.
+             */
+            publish_at: number;
+            /**
+             * Format: int64
+             * @description The handoff instant, epoch milliseconds (absent while head).
+             */
+            retire_at?: number | null;
+            /** @description The derived state. */
+            state: string;
+        };
         /** @description A page of routing rules. */
         RoutingRuleListView: {
             /** @description Every rule in this environment, by evaluation priority. */
@@ -9601,6 +9694,11 @@ export interface components {
         SetVariableRequest: {
             /** @description The value to store. */
             value: string;
+        };
+        /** @description The full state of the machine for a scope. */
+        SigningKeyRotationView: {
+            /** @description Every key, in store order. */
+            keys: components["schemas"]["RotationKeyView"][];
         };
         /** @description One interop-table row as surfaced by the recommendations endpoint. */
         SigningRecommendationView: {
@@ -26787,6 +26885,171 @@ export interface operations {
             };
             /** @description Idempotency-Key reused with a different request */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listSigningKeyRotation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every signing key's rotation state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SigningKeyRotationView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or not in this scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    advanceSigningKeyRotation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tick ran; every transition was audited and the summary event emitted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent, soft-deleted, or not in this scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    breakGlassSigningKeyRotation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BreakGlassRequest"];
+            };
+        };
+        responses: {
+            /** @description The compromised key was withdrawn immediately; the fresh successor signs */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The confirmation flag was not `true` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent, soft-deleted, or not in this scope */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
