@@ -1069,6 +1069,18 @@ fn resource_cases(base: &str, ids: &Ids) -> Vec<Case> {
             body: None,
         },
         Case {
+            label: "signing.advanceSigningKeyRotation",
+            method: "POST",
+            path: format!("{base}/signing/rotation/advance"),
+            body: Some(body_of(&serde_json::json!({}))),
+        },
+        Case {
+            label: "signing.breakGlassSigningKeyRotation",
+            method: "POST",
+            path: format!("{base}/signing/rotation/break-glass"),
+            body: Some(body_of(&serde_json::json!({ "confirmed": false }))),
+        },
+        Case {
             label: "sessions.bulkRevokeSessions",
             method: "POST",
             path: format!("{base}/sessions/revoke"),
