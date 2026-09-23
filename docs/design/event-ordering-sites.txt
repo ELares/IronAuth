@@ -59,6 +59,7 @@ crates/ironauth-store/src/repository.rs:delete:7
 crates/ironauth-store/src/repository.rs:delete_with_event:23
 crates/ironauth-store/src/repository.rs:deploy:1
 crates/ironauth-store/src/repository.rs:disable:1
+crates/ironauth-store/src/repository.rs:emit:1
 crates/ironauth-store/src/repository.rs:enable:1
 crates/ironauth-store/src/repository.rs:enqueue:2
 crates/ironauth-store/src/repository.rs:enqueue_all:1

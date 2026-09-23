@@ -410,6 +410,18 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("listQuotaLimits", ManagementPermission::Read),
     ("setQuotaLimit", ManagementPermission::WriteConfig),
     ("clearQuotaLimit", ManagementPermission::WriteConfig),
+    // The signing-key rotation surface (issue #160): the state view is a read; the
+    // manual trigger and the break-glass path change which keys sign, which is
+    // environment configuration.
+    ("listSigningKeyRotation", ManagementPermission::Read),
+    (
+        "advanceSigningKeyRotation",
+        ManagementPermission::WriteConfig,
+    ),
+    (
+        "breakGlassSigningKeyRotation",
+        ManagementPermission::WriteConfig,
+    ),
     ("triggerBackup", ManagementPermission::WriteConfig),
     (
         "replayLogStreamDeadLetters",
@@ -841,6 +853,9 @@ const PERMISSION_PROVEN: &[&str] = &[
     "setQuotaLimit",
     "clearQuotaLimit",
     "listQuotaLimits",
+    "listSigningKeyRotation",
+    "advanceSigningKeyRotation",
+    "breakGlassSigningKeyRotation",
     // The four above are proven by `delegated_admin.rs`: read-only is refused naming
     // write_config for the backup trigger and the quota writes, write-only is refused
     // naming read for the quota listing.
@@ -1155,12 +1170,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        247,
+        250,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        103,
+        106,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

@@ -1217,6 +1217,92 @@ async fn listing_quota_limits_requires_read() {
     );
 }
 
+/// The signing-key rotation surface's permission pins (issue #160): the state view is a
+/// read; the manual trigger and the break-glass path are configuration writes. Each is
+/// driven in the DIRECTION that proves the specific permission.
+#[tokio::test]
+async fn listing_signing_key_rotation_requires_read() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "rls-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "rls-mint").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_users"],
+    )
+    .await;
+    let (status, _, body) = h
+        .get_as(
+            &format!("/v1/tenants/{tenant}/environments/{environment}/signing/rotation"),
+            &secret,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write-only key read the rotation state: {body}"
+    );
+    assert!(
+        body.contains("management.read"),
+        "the refusal does not name read: {body}"
+    );
+}
+
+#[tokio::test]
+async fn advancing_signing_key_rotation_requires_write_config() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "ras-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ras-mint").await;
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h
+        .post_as(
+            &format!("/v1/tenants/{tenant}/environments/{environment}/signing/rotation/advance"),
+            &secret,
+            "ras-idem",
+            "{}",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "read-only advanced the rotation: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal does not name write_config: {body}"
+    );
+}
+
+#[tokio::test]
+async fn breaking_glass_requires_write_config() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "rbg-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "rbg-mint").await;
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h
+        .post_as(
+            &format!(
+                "/v1/tenants/{tenant}/environments/{environment}/signing/rotation/break-glass"
+            ),
+            &secret,
+            "rbg-idem",
+            r#"{"confirmed": true}"#,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "read-only broke the glass: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal does not name write_config: {body}"
+    );
+}
+
+
 /// A read-granted credential may not mint a portal link, and the refusal NAMES `write_config`.
 ///
 /// The permission pin for this surface, and only that. The confinement half is the test below

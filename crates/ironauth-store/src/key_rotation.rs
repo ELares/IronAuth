@@ -9,14 +9,14 @@
 //! (published from `publish_at`, withdrawn after `expire_at`). The state machine
 //! DRIVES those columns on a timer:
 //!
-//! - **pending** — a successor provisioned with `publish_at` in the past and
+//! - **pending** - a successor provisioned with `publish_at` in the past and
 //!   `activate_at` in the future: it appears in the JWKS (pre-publication, sized to
 //!   cache TTL + max token lifetime + buffer) but signs nothing yet.
-//! - **current** — `activate_at` reached, `retire_at` NULL: the head, signing every
+//! - **current** - `activate_at` reached, `retire_at` NULL: the head, signing every
 //!   new token.
-//! - **retiring** — a successor was promoted and this key's `retire_at` was set at
+//! - **retiring** - a successor was promoted and this key's `retire_at` was set at
 //!   the handoff instant; it stays published until the last token it signed expires.
-//! - **retired** — `expire_at` reached: withdrawn from the JWKS by the serving
+//! - **retired** - `expire_at` reached: withdrawn from the JWKS by the serving
 //!   filter, the row kept for audit.
 //!
 //! # The tick
@@ -225,7 +225,7 @@ impl<'a> RotationStateMachine<'a> {
             }
 
             // 3. WITHDRAW: the serving filter handles the JWKS side; record the keys
-            //    whose expiry passed — idempotently, so a re-taken pass (a crashed
+            //    whose expiry passed - idempotently, so a re-taken pass (a crashed
             //    timer) does not re-audit a withdrawal that already happened.
             for key in algo_keys.iter().filter(|key| {
                 key.expire_at_micros
@@ -295,7 +295,7 @@ impl<'a> RotationStateMachine<'a> {
 
     /// THE BREAK-GLASS OPERATION (issue #160): for every algorithm the environment
     /// signs with, mint a FRESH successor and rotate to it immediately, withdrawing the
-    /// current key NOW (no pre-publication, no retirement window — the verification
+    /// current key NOW (no pre-publication, no retirement window - the verification
     /// breakage that entails is the documented price of a compromise). Refuses without
     /// `confirmed`, and the invocation is audited with the acting actor.
     ///
@@ -364,6 +364,86 @@ impl<'a> RotationStateMachine<'a> {
         }
         Ok(report)
     }
+}
+
+/// One signing key's ADMIN-SURFACE view (issue #160): the derived state and the
+/// instants that matter to an operator, including the next scheduled rotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationKeyView {
+    /// The JOSE kid.
+    pub kid: String,
+    /// The JOSE algorithm.
+    pub algorithm: String,
+    /// The derived state.
+    pub state: KeyState,
+    /// The pre-publication instant, epoch microseconds.
+    pub publish_at_unix_micros: i64,
+    /// The activation instant, epoch microseconds.
+    pub activate_at_unix_micros: i64,
+    /// The handoff instant, when this key is no longer the head (absent while head).
+    pub retire_at_unix_micros: Option<i64>,
+    /// The expiry instant, when the JWKS withdraws it (absent while published).
+    pub expire_at_unix_micros: Option<i64>,
+    /// The next rotation instant for the key that is the head: its activation plus the
+    /// cadence. The successor is seeded a pre-publication window before it.
+    pub next_rotation_at_unix_micros: Option<i64>,
+}
+
+/// The four derived states of the rotation machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyState {
+    /// Published, not yet signing.
+    Pending,
+    /// Signing every new token.
+    Current,
+    /// A successor took over; still published until its last token expires.
+    Retiring,
+    /// Expired and withdrawn from the JWKS; kept for audit.
+    Retired,
+}
+
+/// The admin-surface projection of the machine: every key's derived state and the
+/// next scheduled rotation for the current head, under `policy` at `now_micros`.
+#[must_use]
+pub fn rotation_key_views(
+    records: &[crate::SigningKeyRecord],
+    policy: RotationPolicy,
+    now_micros: i64,
+) -> Vec<RotationKeyView> {
+    records
+        .iter()
+        .map(|key| {
+            let state = if key
+                .expire_at_unix_micros
+                .is_some_and(|expire| expire <= now_micros)
+            {
+                KeyState::Retired
+            } else if key.retire_at_unix_micros.is_some() {
+                KeyState::Retiring
+            } else if key.activate_at_unix_micros > now_micros {
+                KeyState::Pending
+            } else {
+                KeyState::Current
+            };
+            RotationKeyView {
+                kid: key.id.to_string(),
+                algorithm: key.algorithm.clone(),
+                state,
+                publish_at_unix_micros: key.publish_at_unix_micros,
+                activate_at_unix_micros: key.activate_at_unix_micros,
+                retire_at_unix_micros: key.retire_at_unix_micros,
+                expire_at_unix_micros: key.expire_at_unix_micros,
+                next_rotation_at_unix_micros: if state == KeyState::Current {
+                    Some(
+                        key.activate_at_unix_micros
+                            .saturating_add(micros(policy.cadence_secs)),
+                    )
+                } else {
+                    None
+                },
+            }
+        })
+        .collect()
 }
 
 /// Seconds to microseconds, saturating.

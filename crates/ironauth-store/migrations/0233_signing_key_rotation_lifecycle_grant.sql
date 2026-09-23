@@ -12,3 +12,6 @@
 -- EXPAND: additive grant only; nothing existing changes.
 GRANT UPDATE (retire_at, expire_at) ON signing_keys TO ironauth_app;
 GRANT UPDATE (retire_at, expire_at) ON signing_keys TO ironauth_control;
+-- The management plane (the admin surface's store) lists the keys for the rotation
+-- state view (issue #160); 0005 granted the app role only.
+GRANT SELECT ON signing_keys TO ironauth_control;

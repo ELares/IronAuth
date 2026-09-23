@@ -1397,6 +1397,17 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The standalone event-emit surface (issue #160): enqueue a built domain event in
+    /// its own transaction. The rotation handlers announce a manual advance or a
+    /// break-glass from the machine's REPORT here.
+    #[must_use]
+    pub fn events(&self) -> EventEmitRepo<'a> {
+        EventEmitRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The read-only signing-key repository for this scope (issue #19). Lists and
     /// fetches the environment's signing keys; provisioning lives on
     /// [`ActingStore::signing_keys`]. The scope is fixed here, so a key of another
@@ -11834,6 +11845,35 @@ impl EnvironmentGuardrailRepo<'_> {
 /// The mutating signing-key repository (issue #19). Reachable only through
 /// [`ScopedStore::acting`], so every provision carries an actor and correlation
 /// id, and routes through the module's single audited-write primitive.
+/// The durable event-emit surface (issue #160): enqueue one already-built domain event
+/// in its own transaction. The rotation handlers use it to announce a manual advance or
+/// a break-glass from the machine's REPORT, which the machine itself cannot know until
+/// its transitions have run (each transition is its own audited transaction; the summary
+/// event is a side-channel notice, and the outbox row is the durability).
+pub struct EventEmitRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl EventEmitRepo<'_> {
+    /// Enqueue `event` for the scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn emit(&self, env: &Env, event: &DomainEvent<'_>) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        enqueue_domain_event(&mut tx, env, scope, Some(event)).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+/// The mutating signing-key repository for a scope and actor (issue #19): every
+/// provision, handoff, and break-glass writes its audit rows in the same transaction,
+/// through the module's single audited-write primitive. Constructed via
+/// [`ActingScopedStore::signing_keys`], so every call carries an actor and correlation.
 pub struct ActingSigningKeyRepo<'a> {
     store: &'a Store,
     scope: Scope,
@@ -11842,7 +11882,7 @@ pub struct ActingSigningKeyRepo<'a> {
 
 impl ActingSigningKeyRepo<'_> {
     /// THE BREAK-GLASS ROTATION (issue #160): promote a FRESH successor and withdraw
-    /// the compromised head IMMEDIATELY (its expiry is now, not lifetime+buffer — the
+    /// the compromised head IMMEDIATELY (its expiry is now, not lifetime+buffer - the
     /// verification breakage that entails is the documented price), in ONE transaction
     /// with the invocation, promoted, and retired audit rows. Refuses without
     /// `confirmed`, and the invocation row carries the acting actor by construction.
@@ -11850,7 +11890,7 @@ impl ActingSigningKeyRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if either identifier is out of this scope;
-    /// [`StoreError::Invalid`] if `confirmed` is false — the confirmation flag is
+    /// [`StoreError::Invalid`] if `confirmed` is false - the confirmation flag is
     /// mandatory, not advisory; [`StoreError::Database`] on a persistence failure.
     pub async fn break_glass(
         &self,

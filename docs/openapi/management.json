@@ -24226,6 +24226,240 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation": {
+      "get": {
+        "tags": [
+          "signing"
+        ],
+        "summary": "List every key's rotation state and the next scheduled rotation.",
+        "operationId": "listSigningKeyRotation",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every signing key's rotation state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SigningKeyRotationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or not in this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation/advance": {
+      "post": {
+        "tags": [
+          "signing"
+        ],
+        "summary": "Run the machine's tick now: the manual trigger.",
+        "operationId": "advanceSigningKeyRotation",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The tick ran; every transition was audited and the summary event emitted"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent, soft-deleted, or not in this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation/break-glass": {
+      "post": {
+        "tags": [
+          "signing"
+        ],
+        "summary": "The rotate-now-and-revoke path: a fresh successor immediately, the compromised key\nwithdrawn NOW. The confirmation flag is mandatory.",
+        "operationId": "breakGlassSigningKeyRotation",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BreakGlassRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The compromised key was withdrawn immediately; the fresh successor signs"
+          },
+          "400": {
+            "description": "The confirmation flag was not `true`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent, soft-deleted, or not in this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine": {
       "get": {
         "tags": [
@@ -31347,6 +31581,19 @@
           }
         }
       },
+      "BreakGlassRequest": {
+        "type": "object",
+        "description": "The break-glass request: the confirmation flag is mandatory, not advisory.",
+        "required": [
+          "confirmed"
+        ],
+        "properties": {
+          "confirmed": {
+            "type": "boolean",
+            "description": "Must be `true`. A refused invocation leaves no trace."
+          }
+        }
+      },
       "BulkRevocationView": {
         "type": "object",
         "description": "The result of a BULK session revocation (issue #32). States the post-condition; see\n[`SessionRevocationView`] for why.",
@@ -37481,6 +37728,65 @@
           }
         }
       },
+      "RotationKeyView": {
+        "type": "object",
+        "description": "One key's lifecycle view, as the management surface renders it.",
+        "required": [
+          "kid",
+          "algorithm",
+          "state",
+          "publish_at",
+          "activate_at"
+        ],
+        "properties": {
+          "activate_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The activation instant, epoch milliseconds."
+          },
+          "algorithm": {
+            "type": "string",
+            "description": "The JOSE algorithm."
+          },
+          "expire_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The expiry instant, epoch milliseconds (absent while published)."
+          },
+          "kid": {
+            "type": "string",
+            "description": "The JOSE kid."
+          },
+          "next_rotation_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The next scheduled rotation for the current head, epoch milliseconds."
+          },
+          "publish_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The pre-publication instant, epoch milliseconds."
+          },
+          "retire_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The handoff instant, epoch milliseconds (absent while head)."
+          },
+          "state": {
+            "type": "string",
+            "description": "The derived state."
+          }
+        }
+      },
       "RoutingRuleListView": {
         "type": "object",
         "description": "A page of routing rules.",
@@ -38823,6 +39129,22 @@
           "value": {
             "type": "string",
             "description": "The value to store."
+          }
+        }
+      },
+      "SigningKeyRotationView": {
+        "type": "object",
+        "description": "The full state of the machine for a scope.",
+        "required": [
+          "keys"
+        ],
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RotationKeyView"
+            },
+            "description": "Every key, in store order."
           }
         }
       },
