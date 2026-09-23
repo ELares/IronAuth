@@ -3188,6 +3188,28 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "POST",
             format!("{base}/usage/publish"),
         ),
+        // ---- quota limits and backups (this session's management surface) ----
+        Case::empty(
+            "quota.listQuotaLimits",
+            "GET",
+            format!("{base}/quota/limits"),
+        ),
+        Case::json(
+            "quota.setQuotaLimit",
+            "PUT",
+            format!("{base}/quota/limits/qty_requests"),
+            &serde_json::json!({ "limit": 100 }),
+        ),
+        Case::empty(
+            "quota.clearQuotaLimit",
+            "DELETE",
+            format!("{base}/quota/limits/qty_requests"),
+        ),
+        Case::empty(
+            "backups.triggerBackup",
+            "POST",
+            format!("{base}/backups"),
+        ),
         // ---- sessions ----
         Case::empty("sessions.listSessions", "GET", format!("{base}/sessions")),
         Case::empty(
