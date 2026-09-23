@@ -278,6 +278,12 @@ pub struct Config {
     /// outbox-stream replication shipper alerts at. OFF by default.
     pub replication: ReplicationConfig,
 
+    /// Automated signing-key rotation (issue #160): whether THIS process runs the
+    /// rotation state machine's timer, and the per-environment policy it uses. OFF by
+    /// default: the machine's keys rotate on the cadence only when an operator wires
+    /// the timer, exactly like the replication shipper.
+    pub signing_rotation: SigningRotationConfig,
+
     /// SIEM log stream shipping (issue #110): whether THIS process ships configured
     /// streams to their sinks, and how often.
     ///
@@ -719,6 +725,54 @@ impl Default for ReplicationConfig {
             alert_threshold_messages: 0,
             interval_secs: 60,
             ironbus_addr: None,
+        }
+    }
+}
+
+/// Automated signing-key rotation (issue #160).
+///
+/// OFF by default. The timer's pass is IDEMPOTENT (re-running at the same instant does
+/// nothing new), which is also the HA story: two nodes advancing the same environment
+/// at the same instant converge, so "single execution" needs no leader lease.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct SigningRotationConfig {
+    /// Whether the rotation timer is wired at boot. OFF by default.
+    pub enabled: bool,
+
+    /// Seconds between a key's activation and its successor's activation. The safe
+    /// default is about 90 days; a shorter cadence only widens the compromise blast
+    /// radius nothing else in this product accepts, and the pre-publication window
+    /// must stay comfortably below it.
+    pub cadence_secs: u64,
+
+    /// Seconds before the rotation instant the successor appears in the published
+    /// JWKS: cache TTL + max token lifetime + buffer. An RP caching at the max TTL
+    /// must never see a miss, which is what this window exists for.
+    pub pre_publication_secs: u64,
+
+    /// Seconds past the last signed token's expiry a retiring key stays published.
+    pub retirement_buffer_secs: u64,
+
+    /// The assumed access-token lifetime the machine uses to size a retiring key's
+    /// expiry, in seconds. The OIDC side's configured value is the real one; this is
+    /// the seam where it enters the machine.
+    pub max_token_lifetime_secs: u64,
+
+    /// Seconds between timer passes. A pass is idempotent, so an over-long interval
+    /// only delays a scheduled rotation by the interval; it never skips one.
+    pub interval_secs: u64,
+}
+
+impl Default for SigningRotationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cadence_secs: 90 * 24 * 60 * 60,
+            pre_publication_secs: 24 * 60 * 60,
+            retirement_buffer_secs: 24 * 60 * 60,
+            max_token_lifetime_secs: 3600,
+            interval_secs: 3600,
         }
     }
 }
@@ -6588,6 +6642,7 @@ impl Config {
         validate_scim_push(&self.scim_push)?;
         validate_backup(&self.backup)?;
         validate_replication(&self.replication, self.database.url.expose())?;
+        validate_signing_rotation(&self.signing_rotation)?;
         validate_certificate_expiry(&self.certificate_expiry)?;
         check_oidc_lifetime(
             "oidc.authorization_code_ttl_secs",
@@ -6851,6 +6906,41 @@ fn validate_replication(
                     .to_string(),
             });
         }
+    }
+    Ok(())
+}
+
+/// Validate the signing-rotation section: the windows must make sense together, because
+/// the machine will not question them - a pre-publication window bigger than the cadence
+/// means the successor is published after its own rotation instant, and a zero cadence
+/// makes the machine's "idempotent" pass a real work unit.
+fn validate_signing_rotation(rotation: &SigningRotationConfig) -> Result<(), ConfigError> {
+    if !rotation.enabled {
+        return Ok(());
+    }
+    if rotation.cadence_secs == 0 {
+        return Err(ConfigError::Invalid {
+            message: "signing_rotation.cadence_secs must be nonzero when signing_rotation.enabled                       is true: a zero cadence would rotate on every pass"
+                .to_string(),
+        });
+    }
+    if rotation.pre_publication_secs >= rotation.cadence_secs {
+        return Err(ConfigError::Invalid {
+            message: "signing_rotation.pre_publication_secs must stay below the cadence: a                       successor published after its own rotation instant defeats the                       pre-publication window"
+                .to_string(),
+        });
+    }
+    if rotation.max_token_lifetime_secs == 0 {
+        return Err(ConfigError::Invalid {
+            message: "signing_rotation.max_token_lifetime_secs must be nonzero: a retiring                       key's expiry is sized from it"
+                .to_string(),
+        });
+    }
+    if rotation.interval_secs == 0 {
+        return Err(ConfigError::Invalid {
+            message: "signing_rotation.interval_secs must be nonzero when the timer is enabled"
+                .to_string(),
+        });
     }
     Ok(())
 }

@@ -1302,7 +1302,6 @@ async fn breaking_glass_requires_write_config() {
     );
 }
 
-
 /// A read-granted credential may not mint a portal link, and the refusal NAMES `write_config`.
 ///
 /// The permission pin for this surface, and only that. The confinement half is the test below
