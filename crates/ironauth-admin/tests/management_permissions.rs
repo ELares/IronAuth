@@ -837,6 +837,13 @@ const PERMISSION_PROVEN: &[&str] = &[
     // holding only `management.read` is refused, and the refusal names the permission it
     // lacked. Proven the moment the operation shipped, because the classification alone is not
     // enforcement -- it records an intention nothing compares against the call.
+    "triggerBackup",
+    "setQuotaLimit",
+    "clearQuotaLimit",
+    "listQuotaLimits",
+    // The four above are proven by `delegated_admin.rs`: read-only is refused naming
+    // write_config for the backup trigger and the quota writes, write-only is refused
+    // naming read for the quota listing.
     "createPortalLink",
     // The organization CONTACT surface (issue #141), proven by
     // `the_contact_surface_splits_writing_the_list_from_reading_it`: all three operations in
@@ -1148,12 +1155,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        243,
+        247,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        99,
+        103,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

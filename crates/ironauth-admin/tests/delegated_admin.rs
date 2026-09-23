@@ -1108,6 +1108,115 @@ async fn a_confined_credential_cannot_touch_a_sibling_organizations_stream() {
     assert_stream_reads(&h, &secret, &streams, &own_stream, StatusCode::OK).await;
 }
 
+/// The on-demand backup trigger's permission pin: a credential holding only
+/// `management.read` must be refused, and the refusal must name `write_config` - the
+/// classification records an intention, and this is the comparison that keeps it honest.
+#[tokio::test]
+async fn triggering_a_backup_requires_write_config() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "bk-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "bk-mint").await;
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    let (status, _, body) = h
+        .post_as(
+            &format!("/v1/tenants/{tenant}/environments/{environment}/backups"),
+            &secret,
+            "bk-trigger",
+            "{}",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential triggered an on-demand backup: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal does not name write_config: {body}"
+    );
+}
+
+/// The quota override routes' permission pins: setting and clearing an override are
+/// configuration writes, and the listing is a read. Each is driven in the DIRECTION that
+/// proves the specific permission.
+#[tokio::test]
+async fn setting_a_quota_limit_requires_write_config() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "ql-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ql-mint").await;
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h
+        .put_as(
+            &format!("/v1/tenants/{tenant}/environments/{environment}/quota/limits/qty_requests"),
+            &secret,
+            &serde_json::json!({ "refill_per_sec": 1.0, "burst": 1.0 }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "read-only set a limit: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal does not name write_config: {body}"
+    );
+}
+
+#[tokio::test]
+async fn clearing_a_quota_limit_requires_write_config() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "qlc-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "qlc-mint").await;
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h
+        .delete_as(
+            &format!("/v1/tenants/{tenant}/environments/{environment}/quota/limits/qty_requests"),
+            &secret,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "read-only cleared a limit: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal does not name write_config: {body}"
+    );
+}
+
+#[tokio::test]
+async fn listing_quota_limits_requires_read() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "qll-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "qll-mint").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_users"],
+    )
+    .await;
+    let (status, _, body) = h
+        .get_as(
+            &format!("/v1/tenants/{tenant}/environments/{environment}/quota/limits"),
+            &secret,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write-only key listed limits: {body}"
+    );
+    assert!(
+        body.contains("management.read"),
+        "the refusal does not name read: {body}"
+    );
+}
+
 /// A read-granted credential may not mint a portal link, and the refusal NAMES `write_config`.
 ///
 /// The permission pin for this surface, and only that. The confinement half is the test below
