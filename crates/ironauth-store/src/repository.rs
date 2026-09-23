@@ -88403,11 +88403,6 @@ impl ActingQuotaLimitsRepo<'_> {
         .await
     }
 
-    /// Clear one dimension's override, returning the scope to the configured default.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError`] if the write fails.
     /// As [`Self::set`], additionally announcing `quota.limit_changed` in the SAME
     /// transaction (issue #150 criterion 4).
     ///
@@ -88462,6 +88457,11 @@ impl ActingQuotaLimitsRepo<'_> {
         .await
     }
 
+    /// Clear one dimension's override, returning the scope to the configured default.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the write fails.
     pub async fn clear(&self, env: &Env, dimension: &str) -> Result<(), StoreError> {
         let scope = self.scope;
         let target = QuotaLimitTarget::new(dimension);
