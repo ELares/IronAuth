@@ -3746,7 +3746,7 @@
           "backups"
         ],
         "summary": "Trigger an on-demand encrypted backup.",
-        "description": "The request is audited and the runner is woken; the backup itself is performed by the\nnext available pass and watched through the backup metrics.",
+        "description": "The request is audited and the runner is woken; the backup itself is performed by the\nnext available pass and watched through the backup metrics.\n\n# Errors\n\n[`ApiError`] on an unauthorized or malformed request; the documented statuses map\nfrom the handler's fence and store calls.",
         "operationId": "triggerBackup",
         "parameters": [
           {
