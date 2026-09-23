@@ -192,16 +192,22 @@ pub async fn set_quota_limit(
     }
 
     let request: SetQuotaLimitRequest = parse_json(&body)?;
+    let (actor, corr) = (actor, CorrelationId::generate(state.env()));
+    let pending = quota_limit_event(&state, scope, &dimension, &request);
     state
         .store()
         .scoped(scope)
-        .acting(actor, CorrelationId::generate(state.env()))
+        .acting(actor, corr)
         .quota_limits()
-        .set(
+        .set_with_event(
             state.env(),
             &dimension,
             request.refill_per_sec,
             request.burst,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await
         .map_err(|error| match error {
@@ -260,10 +266,73 @@ pub async fn clear_quota_limit(
         return Err(ApiError::NotFound);
     }
 
+    let pending = quota_cleared_event(&state, scope, &dimension);
     scope_store
         .acting(actor, CorrelationId::generate(state.env()))
         .quota_limits()
-        .clear(state.env(), &dimension)
+        .clear_with_event(
+            state.env(),
+            &dimension,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// The `quota.limit_changed` event for a set.
+fn quota_limit_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    dimension: &str,
+    request: &SetQuotaLimitRequest,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!(
+        "evt_{}",
+        ironauth_store::CorrelationId::generate(state.env())
+    );
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "quota.limit_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "dimension": dimension,
+            "refill_per_sec": request.refill_per_sec,
+            "burst": request.burst,
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject: dimension.to_owned(),
+        envelope,
+    })
+}
+
+/// The `quota.limit_changed` event for a clear.
+fn quota_cleared_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    dimension: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!(
+        "evt_{}",
+        ironauth_store::CorrelationId::generate(state.env())
+    );
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "quota.limit_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "dimension": dimension, "cleared": true }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject: dimension.to_owned(),
+        envelope,
+    })
 }

@@ -1729,6 +1729,36 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // An operator asked for an on-demand backup (issue #153). The runner performs the
+        // next available pass; this event is the notice that the request was recorded and
+        // audited, for integrators watching the stream.
+        "backup.requested",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {}
+        }"#,
+    ),
+    (
+        // A quota override was set or cleared (issue #150 criterion 4). The effective
+        // values travel (or `cleared: true`), so an integrator watching the stream can
+        // mirror what the data plane enforces without polling the listing.
+        "quota.limit_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "dimension": {"type": "string", "minLength": 1},
+                "refill_per_sec": {"type": "number"},
+                "burst": {"type": "number"},
+                "cleared": {"type": "boolean"}
+            },
+            "required": ["dimension"]
+        }"#,
+    ),
+    (
         // The stream is gone AND so is every dead letter it recorded, which is why this
         // matters more than a configuration tidy-up: an operator watching for undelivered
         // audit will never see those again, and the event is the only notice they get.

@@ -124,12 +124,29 @@ pub async fn trigger_backup(
     })
     .map_err(|_| ApiError::Internal)?;
 
+    let id = format!(
+        "evt_{}",
+        ironauth_store::CorrelationId::generate(state.env())
+    );
+    let pending = ironauth_store::event_catalog::envelope(
+        &id,
+        "backup.requested",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({}),
+    )
+    .map(|envelope| crate::events::PendingEvent {
+        id,
+        subject: scope.tenant().to_string(),
+        envelope,
+    });
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .backup_requests()
-        .request_backup(
+        .request_backup_with_event(
             state.env(),
             Some(ironauth_store::IdempotencyWrite {
                 credential_ref: &credential_ref,
@@ -138,6 +155,10 @@ pub async fn trigger_backup(
                 response_status: 202,
                 response_body: &body_string,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await?;
 
