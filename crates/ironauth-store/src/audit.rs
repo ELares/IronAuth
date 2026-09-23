@@ -672,6 +672,14 @@ pub enum Action {
     /// A per-environment signing key was provisioned (issue #19). Covers both a
     /// day-one key and a manually rotated-in successor.
     SigningKeyProvision,
+    /// A rotation state machine handoff (issue #160): a pre-published successor became
+    /// the current signing key, retiring the previous head.
+    SigningKeyPromoted,
+    /// The previous head's handoff instant: marked retiring, still published until its
+    /// last signed token expires (issue #160).
+    SigningKeyRetiring,
+    /// A retiring key's expiry passed: withdrawn from the JWKS, kept for audit (issue #160).
+    SigningKeyRetired,
     /// A resource server was registered (issue #29). Records the audience and the
     /// access-token format a registered protected API receives.
     ResourceServerRegister,
@@ -1867,6 +1875,9 @@ impl Action {
             Action::ConsentRevoke => "consent.revoke",
             Action::ConsentSkipped => "consent.skip",
             Action::SigningKeyProvision => "signing_key.provision",
+            Action::SigningKeyPromoted => "signing_key.promoted",
+            Action::SigningKeyRetiring => "signing_key.retiring",
+            Action::SigningKeyRetired => "signing_key.retired",
             Action::ResourceServerRegister => "resource_server.register",
             Action::ResourceServerPermissionClaimsSet => "resource_server.permission_claims.set",
             Action::RefreshTokenIssue => "refresh_token.issue",

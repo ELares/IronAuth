@@ -11841,6 +11841,123 @@ pub struct ActingSigningKeyRepo<'a> {
 }
 
 impl ActingSigningKeyRepo<'_> {
+    /// The rotation handoff (issue #160): promote `pending` to the head and mark
+    /// `outgoing` retiring with its expiry, in ONE transaction with the two audit rows
+    /// (`signing_key.promoted` for the successor, `signing_key.retiring` for the
+    /// outgoing head). A crash mid-handoff rolls back, leaving the environment with a
+    /// current key.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn promote(
+        &self,
+        env: &Env,
+        pending: &SigningKeyId,
+        outgoing: &SigningKeyId,
+        now_micros: i64,
+        expire_micros: i64,
+    ) -> Result<(), StoreError> {
+        if pending.scope() != self.scope || outgoing.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "UPDATE signing_keys SET retire_at = \
+                 (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval), \
+                 expire_at = \
+                 (TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(outgoing.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(now_micros)
+        .bind(expire_micros)
+        .execute(&mut *tx)
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SigningKeyPromoted,
+                target: pending,
+            },
+            Some("the outgoing head retired in the same handoff"),
+        )
+        .await?;
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SigningKeyRetiring,
+                target: outgoing,
+            },
+            Some(&format!(
+                "expires at unix_micros {expire_micros}; still published until then"
+            )),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The withdrawal audit row (issue #160): a retiring key's expiry passed and the
+    /// serving filter withdrew it. The JWKS side needs no column change; the audit is
+    /// the transition's record.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn mark_withdrawn(&self, env: &Env, id: &SigningKeyId) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // Idempotent: a re-taken pass (a crashed timer) must not re-audit a withdrawal
+        // that already happened. The existence check rides the SCOPED transaction
+        // because `audit_log` is FORCE RLS and an unscoped read sees zero rows.
+        let already: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM audit_log \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+               AND action = 'signing_key.retired' AND target_id = $3)",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        if already {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SigningKeyRetired,
+                target: id,
+            },
+            Some("withdrawn from the JWKS; kept for audit"),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Provision a signing key (a day-one key or a manually rotated-in successor)
     /// and audit `signing_key.provision` in the same transaction.
     ///
