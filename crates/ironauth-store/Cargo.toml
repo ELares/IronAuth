@@ -138,6 +138,11 @@ axum = { workspace = true, default-features = false }
 # a clean error; the deadline is honoured when nothing arrives), because durability, ordering, and
 # retries are the outbox's own and unchanged in either mode.
 [[test]]
+name = "key_rotation"
+path = "tests/key_rotation.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "replication_apply"
 path = "tests/replication_apply.rs"
 required-features = ["testing"]

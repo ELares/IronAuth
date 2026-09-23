@@ -3614,7 +3614,10 @@ async fn no_management_operation_answers_a_server_error_against_a_live_environme
             // to catch: a deployment without the feature cannot reach the runtime, and
             // the 503 tells the operator exactly that. Every other 5xx on the surface is
             // still a failure.
-            if case.label == "token_hooks.testTokenHook" && status == StatusCode::SERVICE_UNAVAILABLE && body.contains("not_configured") {
+            if case.label == "token_hooks.testTokenHook"
+                && status == StatusCode::SERVICE_UNAVAILABLE
+                && body.contains("not_configured")
+            {
                 continue;
             }
             failures.push(format!(

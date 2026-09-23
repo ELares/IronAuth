@@ -77,6 +77,7 @@ pub mod identity_fact;
 pub mod impersonation;
 pub mod interchange;
 pub mod kek_backup;
+pub mod key_rotation;
 pub mod locale_bundle;
 pub mod log_stream;
 pub mod message_consumer;

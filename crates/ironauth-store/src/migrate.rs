@@ -1982,6 +1982,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0232_replication_cursors.sql"),
         },
+        // EXPAND (issue #160): the rotation state machine's column-scoped lifecycle
+        // grant, restoring what 0106 revoked for exactly the two columns the machine
+        // stamps.
+        Migration {
+            version: 233,
+            name: "signing_key_rotation_lifecycle_grant",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0233_signing_key_rotation_lifecycle_grant.sql"),
+        },
     ]
 }
 
