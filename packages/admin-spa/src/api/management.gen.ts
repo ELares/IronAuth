@@ -595,6 +595,11 @@ export interface paths {
          * Trigger an on-demand encrypted backup.
          * @description The request is audited and the runner is woken; the backup itself is performed by the
          *     next available pass and watched through the backup metrics.
+         *
+         *     # Errors
+         *
+         *     [`ApiError`] on an unauthorized or malformed request; the documented statuses map
+         *     from the handler's fence and store calls.
          */
         post: operations["triggerBackup"];
         delete?: never;
