@@ -405,6 +405,12 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // question; requesting a replay ships those audit events to a third-party sink, which
     // is why it sits with the configuration writes rather than with the read.
     ("listLogStreamDeadLetters", ManagementPermission::Read),
+    // This session's management surface: the quota override routes and the on-demand
+    // backup trigger, all enforced in their handlers.
+    ("listQuotaLimits", ManagementPermission::Read),
+    ("setQuotaLimit", ManagementPermission::WriteConfig),
+    ("clearQuotaLimit", ManagementPermission::WriteConfig),
+    ("triggerBackup", ManagementPermission::WriteConfig),
     (
         "replayLogStreamDeadLetters",
         ManagementPermission::WriteConfig,
