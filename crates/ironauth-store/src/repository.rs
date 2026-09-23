@@ -48559,6 +48559,22 @@ impl BackupRequestRepo<'_> {
         env: &Env,
         idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
+        self.request_backup_with_event(env, idempotency, None).await
+    }
+
+    /// As [`Self::request_backup`], additionally announcing `backup.requested` in the
+    /// SAME transaction (issue #153): a management write that emits no event is
+    /// invisible to every integrator watching the stream.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::request_backup`].
+    pub async fn request_backup_with_event(
+        &self,
+        env: &Env,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         write_audited_detailed(
             AuditedWrite {
@@ -48571,6 +48587,7 @@ impl BackupRequestRepo<'_> {
             },
             async move |tx| {
                 insert_idempotency(tx, idempotency).await?;
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -88391,6 +88408,60 @@ impl ActingQuotaLimitsRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError`] if the write fails.
+    /// As [`Self::set`], additionally announcing `quota.limit_changed` in the SAME
+    /// transaction (issue #150 criterion 4).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set`].
+    pub async fn set_with_event(
+        &self,
+        env: &Env,
+        dimension: &str,
+        refill_per_sec: f64,
+        burst: f64,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if !refill_per_sec.is_finite() || !burst.is_finite() || refill_per_sec < 0.0 || burst < 0.0
+        {
+            return Err(StoreError::Invalid);
+        }
+        let scope = self.scope;
+        let target = QuotaLimitTarget::new(dimension);
+        let dimension = dimension.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::QuotaLimitSet,
+                target: &target,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO tenant_quota_limits \
+                       (tenant_id, environment_id, dimension, refill_per_sec, burst, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, now()) \
+                     ON CONFLICT (tenant_id, environment_id, dimension) DO UPDATE \
+                       SET refill_per_sec = EXCLUDED.refill_per_sec, \
+                           burst = EXCLUDED.burst, updated_at = EXCLUDED.updated_at",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&dimension)
+                .bind(refill_per_sec)
+                .bind(burst)
+                .execute(&mut **tx)
+                .await?;
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
     pub async fn clear(&self, env: &Env, dimension: &str) -> Result<(), StoreError> {
         let scope = self.scope;
         let target = QuotaLimitTarget::new(dimension);
@@ -88414,6 +88485,49 @@ impl ActingQuotaLimitsRepo<'_> {
                 .bind(&dimension)
                 .execute(&mut **tx)
                 .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// As [`Self::clear`], additionally announcing `quota.limit_changed` (cleared) in
+    /// the SAME transaction (issue #150 criterion 4): a management write that emits no
+    /// event is invisible to every integrator watching the stream.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::clear`].
+    pub async fn clear_with_event(
+        &self,
+        env: &Env,
+        dimension: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let target = QuotaLimitTarget::new(dimension);
+        let dimension = dimension.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::QuotaLimitCleared,
+                target: &target,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "DELETE FROM tenant_quota_limits \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND dimension = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&dimension)
+                .execute(&mut **tx)
+                .await?;
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
