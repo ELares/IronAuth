@@ -405,6 +405,8 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // Captured early for the same reason as its neighbours: config moves into the
         // workers below.
         let replication_shipper_inputs_captured = replication_shipper_inputs(&config);
+        let rotation_timer_inputs_captured =
+            rotation_timer_inputs(&config, planes.readiness_store.clone()).await;
         // The on-demand trigger exists only when a runner will run: the endpoint still
         // records and answers 202 without one, but there is nothing to wake.
         let backup_trigger = backup_scheduler_inputs_captured
@@ -762,6 +764,11 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             None => None,
         };
 
+        // THE SIGNING-KEY ROTATION TIMER (issue #160). Its own switch, OFF by default.
+        // The pass is idempotent (a re-taken pass converges), which is also the HA
+        // story: two nodes advancing the same environment at the same instant agree.
+        let rotation_timer = rotation_timer_inputs_captured.map(start_rotation_timer);
+
         tracing::info!(base_url = %server.base_url(), "starting ironauth");
 
         let outcome = match server.run(ironauth_server::shutdown_signal()).await {
@@ -833,6 +840,12 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // on the next boot.
         if let Some(scheduler) = backup_scheduler {
             scheduler.abort();
+        }
+        // AND THE ROTATION TIMER. Aborted rather than awaited for the same reason: a
+        // pass has no cleanup to finish, and a rotation this tick did not take is still
+        // due on the next boot - the pass is idempotent, so a re-taken pass converges.
+        if let Some(timer) = rotation_timer {
+            timer.abort();
         }
         // AND THE REPLICATION SHIPPER. Aborted rather than awaited for the same reason: a
         // pass has no cleanup to finish, and the position it stopped at is the follower's
@@ -9145,6 +9158,79 @@ const BACKUP_LAST_SUCCESS_TIMESTAMP_SECONDS: &str =
     "ironauth_backup_last_success_timestamp_seconds";
 
 /// Everything the replication shipper needs, resolved once at boot (issue #155).
+struct RotationTimerInputs {
+    /// The APP store: the machine's transitions ride the app role's column-scoped
+    /// lifecycle grants. Cloned off the assembled serving store.
+    app_store: Store,
+    /// The CONTROL store: the pass enumerates `environments`, which only the control
+    /// role may read (every scope-enumerating worker uses the control DSN for this).
+    control_store: Store,
+    /// The rotation policy from the strict config layer.
+    policy: ironauth_store::key_rotation::RotationPolicy,
+    /// The assumed access-token lifetime for the retiring keys' expiry.
+    max_token_lifetime_secs: u64,
+    /// Seconds between passes.
+    interval_secs: u64,
+    env: Env,
+}
+
+/// Resolve the rotation-timer inputs, or return [`None`] with every refusal logged.
+async fn rotation_timer_inputs(
+    config: &Config,
+    app_store: Option<Store>,
+) -> Option<RotationTimerInputs> {
+    let rotation = &config.signing_rotation;
+    if !rotation.enabled {
+        return None;
+    }
+    let Some(app_store) = app_store else {
+        tracing::error!("signing-key rotation timer NOT running: no plane opened a serving store");
+        return None;
+    };
+    let Some(control_dsn) = select_control_dsn(config) else {
+        tracing::error!(
+            "signing-key rotation timer NOT running: no control-plane DSN (set              admin.control_database_url, or run in dev_mode). The pass enumerates              `environments`, which only the ironauth_control role may read"
+        );
+        return None;
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "signing-key rotation timer NOT running: control-plane connect failed"
+            );
+            return None;
+        }
+    };
+    Some(RotationTimerInputs {
+        app_store,
+        control_store,
+        policy: ironauth_store::key_rotation::RotationPolicy {
+            cadence_secs: rotation.cadence_secs,
+            pre_publication_secs: rotation.pre_publication_secs,
+            retirement_buffer_secs: rotation.retirement_buffer_secs,
+        },
+        max_token_lifetime_secs: rotation.max_token_lifetime_secs,
+        interval_secs: rotation.interval_secs,
+        env: Env::system(),
+    })
+}
+
+/// Start the rotation timer's pass loop.
+fn start_rotation_timer(inputs: RotationTimerInputs) -> tokio::task::JoinHandle<()> {
+    let timer = ironauth_store::rotation_timer::RotationTimer::new(
+        inputs.app_store,
+        inputs.control_store,
+        inputs.policy,
+        inputs.max_token_lifetime_secs,
+        std::time::Duration::from_secs(inputs.interval_secs),
+    );
+    let env = inputs.env;
+    tracing::info!("signing-key rotation timer running");
+    tokio::spawn(async move { timer.run(&env).await })
+}
+
 struct ReplicationShipperInputs {
     /// The home region's database URL (the server's own `database.url`).
     home_url: String,

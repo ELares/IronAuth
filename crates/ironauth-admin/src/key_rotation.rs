@@ -9,15 +9,15 @@
 //!   head. Read-only; an operator inspects the machine without touching it.
 //! - `POST /signing/rotation/advance` runs the machine's tick NOW (the manual trigger):
 //!   seeds a successor when the pre-publication point is due, promotes due pending keys,
-//!   and records withdrawals. The trigger is naturally idempotent — re-running at the
-//!   same instant does nothing new, which is exactly the crashed-timer property — so no
+//!   and records withdrawals. The trigger is naturally idempotent - re-running at the
+//!   same instant does nothing new, which is exactly the crashed-timer property - so no
 //!   Idempotency-Key machinery is warranted. Every transition is audited in its own
 //!   transaction; the summary domain event (`signing_key.rotation_advanced`) is emitted
 //!   after the machine returns its report.
 //! - `POST /signing/rotation/break-glass` is the rotate-now-and-revoke path a real
 //!   compromise requires: a fresh successor is minted and promoted immediately and the
 //!   compromised key is withdrawn NOW, accepting the verification breakage that entails.
-//!   The request MUST carry `confirmed: true` — a refused invocation leaves no trace —
+//!   The request MUST carry `confirmed: true` - a refused invocation leaves no trace -
 //!   and the invocation is audited with the acting actor.
 
 use axum::body::Bytes;

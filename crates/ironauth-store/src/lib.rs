@@ -110,6 +110,7 @@ pub mod replication;
 pub mod replication_apply;
 mod repository;
 pub mod risk;
+pub mod rotation_timer;
 mod scope;
 pub mod session_token_store;
 pub mod signup_form;

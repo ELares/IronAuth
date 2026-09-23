@@ -277,6 +277,71 @@ async fn break_glass_rotates_immediately_and_only_with_explicit_confirmation() {
     assert_eq!(audits, 3, "invocation + promotion + withdrawal all audited");
 }
 
+/// THE DURABLE-TIMER CRITERION: a pass over the WHOLE database advances every
+/// environment that has a head, and rotation state survives the timer's restarts (a
+/// re-run of the same pass converges - nothing double-fires). Two environments with
+/// the same clock never see a shared or cross-published key: every successor is
+/// minted under its own scope.
+#[tokio::test]
+async fn the_database_wide_pass_advances_every_environment_and_converges_on_replay() {
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x43);
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    let t0 = 10_000_000_i64;
+    provision_day_one_head(&db, &env, scope_a, t0).await;
+    provision_day_one_head(&db, &env, scope_b, t0).await;
+    let policy = test_policy();
+    let timer = ironauth_store::rotation_timer::RotationTimer::new(
+        db.store().clone(),
+        db.control_store().clone(),
+        policy,
+        1_000,
+        std::time::Duration::from_secs(3600),
+    );
+
+    // The first pass at the pre-publication point: both environments seed their
+    // successors. The kids are scope-minted: each environment's keys never cross.
+    clock.advance(std::time::Duration::from_secs(9_910));
+    timer
+        .pass(&env)
+        .await
+        .expect("the pass runs at the pre-publication point");
+    assert_eq!(
+        published_kids(&db, scope_a, t0 + 9_900_000_000).await.len(),
+        2
+    );
+    assert_eq!(
+        published_kids(&db, scope_b, t0 + 9_900_000_000).await.len(),
+        2
+    );
+    let kids_a: std::collections::BTreeSet<String> =
+        published_kids(&db, scope_a, t0 + 9_900_000_000)
+            .await
+            .into_iter()
+            .collect();
+    let kids_b: std::collections::BTreeSet<String> =
+        published_kids(&db, scope_b, t0 + 9_900_000_000)
+            .await
+            .into_iter()
+            .collect();
+    assert!(
+        kids_a.is_disjoint(&kids_b),
+        "two environments never share a kid"
+    );
+
+    // Replaying the pass converges: no duplicate successor.
+    timer.pass(&env).await.expect("the replay runs");
+    assert_eq!(
+        published_kids(&db, scope_a, t0 + 9_900_000_000).await.len(),
+        2
+    );
+    assert_eq!(
+        published_kids(&db, scope_b, t0 + 9_900_000_000).await.len(),
+        2
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn a_full_rotation_is_idempotent_at_a_given_instant() {

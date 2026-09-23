@@ -3311,6 +3311,53 @@
       },
       "type": "object"
     },
+    "SigningRotationConfig": {
+      "additionalProperties": false,
+      "description": "Automated signing-key rotation (issue #160).\n\nOFF by default. The timer's pass is IDEMPOTENT (re-running at the same instant does\nnothing new), which is also the HA story: two nodes advancing the same environment\nat the same instant converge, so \"single execution\" needs no leader lease.",
+      "properties": {
+        "cadence_secs": {
+          "default": 7776000,
+          "description": "Seconds between a key's activation and its successor's activation. The safe\ndefault is about 90 days; a shorter cadence only widens the compromise blast\nradius nothing else in this product accepts, and the pre-publication window\nmust stay comfortably below it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Whether the rotation timer is wired at boot. OFF by default.",
+          "type": "boolean"
+        },
+        "interval_secs": {
+          "default": 3600,
+          "description": "Seconds between timer passes. A pass is idempotent, so an over-long interval\nonly delays a scheduled rotation by the interval; it never skips one.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_token_lifetime_secs": {
+          "default": 3600,
+          "description": "The assumed access-token lifetime the machine uses to size a retiring key's\nexpiry, in seconds. The OIDC side's configured value is the real one; this is\nthe seam where it enters the machine.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pre_publication_secs": {
+          "default": 86400,
+          "description": "Seconds before the rotation instant the successor appears in the published\nJWKS: cache TTL + max token lifetime + buffer. An RP caching at the max TTL\nmust never see a miss, which is what this window exists for.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retirement_buffer_secs": {
+          "default": 86400,
+          "description": "Seconds past the last signed token's expiry a retiring key stays published.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "SsfConfig": {
       "additionalProperties": false,
       "description": "The Shared Signals Framework transmitter (issue #143).\n\nSSF 1.0, CAEP 1.0 and RISC 1.0 are FINAL specifications, so this is not on the experimental\nfeature ladder the way `global-token-revocation` is -- that gate exists for an unadopted\ndraft whose wire format may still move. What this switch is for is what `scim.enabled` is\nfor: a deployment opts into a protocol surface, and one that has not opted in should be\nindistinguishable from one that does not implement it.",
@@ -4104,6 +4151,18 @@
         "shutdown_grace_secs": 25
       },
       "description": "HTTP server settings."
+    },
+    "signing_rotation": {
+      "$ref": "#/$defs/SigningRotationConfig",
+      "default": {
+        "cadence_secs": 7776000,
+        "enabled": false,
+        "interval_secs": 3600,
+        "max_token_lifetime_secs": 3600,
+        "pre_publication_secs": 86400,
+        "retirement_buffer_secs": 86400
+      },
+      "description": "Automated signing-key rotation (issue #160): whether THIS process runs the\nrotation state machine's timer, and the per-environment policy it uses. OFF by\ndefault: the machine's keys rotate on the cadence only when an operator wires\nthe timer, exactly like the replication shipper."
     },
     "ssf": {
       "$ref": "#/$defs/SsfConfig",
