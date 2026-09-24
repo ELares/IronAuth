@@ -959,7 +959,7 @@ async fn validate_metadata(
     check_only(metadata, "response_types", "code")?;
     check_only(metadata, "grant_types", "authorization_code")?;
 
-    let auth_method = validate_auth_method(metadata)?;
+    let auth_method = validate_auth_method(metadata, state.mtls_anchors().is_some())?;
 
     let redirect_uris = validate_redirect_uris(metadata, &application_type, guardrails)?;
 
@@ -1009,6 +1009,7 @@ async fn validate_metadata(
 /// provider never stores a client registered for a method it cannot honor.
 fn validate_auth_method(
     metadata: &serde_json::Map<String, Value>,
+    tls_auth_armed: bool,
 ) -> Result<ClientAuthMethod, RegistrationError> {
     let raw = match metadata.get("token_endpoint_auth_method") {
         None => DEFAULT_AUTH_METHOD,
@@ -1040,6 +1041,31 @@ fn validate_auth_method(
                 ));
             }
             Ok(ClientAuthMethod::SelfSignedTlsClientAuth)
+        }
+        // The PKI method (issue #159): registrable ONLY when the deployment armed a
+        // trust bundle (a chain cannot validate against a bundle nothing configured)
+        // and with the expected subject REQUIRED, so a client without a subject would
+        // register and fail every request.
+        Some(ClientAuthMethod::TlsClientAuth) => {
+            if !tls_auth_armed {
+                return Err(RegistrationError::metadata(
+                    "tls_client_auth is not available: this deployment has no configured \
+                     trust anchors (mtls.trust_anchor_certs)",
+                ));
+            }
+            let Some(Value::String(subject)) = metadata.get("tls_client_auth_subject_dn") else {
+                return Err(RegistrationError::metadata(
+                    "tls_client_auth requires tls_client_auth_subject_dn (the exact \
+                     subject distinguished name every presented certificate must match, \
+                     RFC 8705 section 2.1.2)",
+                ));
+            };
+            if subject.trim().is_empty() {
+                return Err(RegistrationError::metadata(
+                    "tls_client_auth_subject_dn must not be empty",
+                ));
+            }
+            Ok(ClientAuthMethod::TlsClientAuth)
         }
         Some(method) if ClientAuthMethod::ALL.contains(&method) => Ok(method),
         _ => Err(RegistrationError::metadata(
@@ -1625,7 +1651,7 @@ mod tests {
     fn omitted_metadata_takes_the_spec_defaults() {
         let m = meta(r#"{"redirect_uris":["https://rp.example/cb"]}"#);
         assert_eq!(
-            validate_auth_method(&m).expect("method"),
+            validate_auth_method(&m, false).expect("method"),
             ClientAuthMethod::Basic
         );
         // An omitted id_token_signed_response_alg records the environment's ACTUAL
@@ -1644,13 +1670,32 @@ mod tests {
 
     #[test]
     fn client_secret_jwt_and_unknown_methods_are_rejected() {
-        for method in ["client_secret_jwt", "tls_client_auth", "made_up"] {
+        for method in ["client_secret_jwt", "made_up"] {
             let m = meta(&format!(r#"{{"token_endpoint_auth_method":"{method}"}}"#));
             assert!(
-                validate_auth_method(&m).is_err(),
+                validate_auth_method(&m, false).is_err(),
                 "{method} must be rejected"
             );
         }
+        // tls_client_auth (issue #159) is rejected WITHOUT armed trust anchors, and
+        // accepted WITH them plus the required subject.
+        let unarmed = meta(r#"{"token_endpoint_auth_method":"tls_client_auth"}"#);
+        assert!(
+            validate_auth_method(&unarmed, false).is_err(),
+            "an unarmed deployment cannot register the PKI method"
+        );
+        let armed = meta(
+            r#"{"token_endpoint_auth_method":"tls_client_auth",                  "tls_client_auth_subject_dn":"CN=client.example"}"#,
+        );
+        assert!(
+            validate_auth_method(&armed, true).is_ok(),
+            "an armed deployment registers the PKI method with a subject"
+        );
+        let subjectless = meta(r#"{"token_endpoint_auth_method":"tls_client_auth"}"#);
+        assert!(
+            validate_auth_method(&subjectless, true).is_err(),
+            "a subject-less PKI registration is refused"
+        );
         // The four advertised methods are accepted.
         for method in [
             "client_secret_basic",
@@ -1659,7 +1704,10 @@ mod tests {
             "none",
         ] {
             let m = meta(&format!(r#"{{"token_endpoint_auth_method":"{method}"}}"#));
-            assert!(validate_auth_method(&m).is_ok(), "{method} is supported");
+            assert!(
+                validate_auth_method(&m, false).is_ok(),
+                "{method} is supported"
+            );
         }
     }
 

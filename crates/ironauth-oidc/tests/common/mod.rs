@@ -3656,6 +3656,55 @@ impl Harness {
         Ok(id)
     }
 
+    /// Register a client for `tls_client_auth` (the PKI method, issue #159) with the
+    /// expected subject. The harness must have armed the trust anchors first
+    /// ([`Harness::arm_mtls_anchors`]) or the store's method validation refuses it.
+    pub async fn create_tls_client_auth_client(
+        &self,
+        subject_dn: &str,
+    ) -> Result<ClientId, ironauth_store::StoreError> {
+        let (actor, corr) = self.seeding_actor();
+        let id = self
+            .store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .create_jwt_auth(
+                &self.env,
+                NewJwtAuthClient {
+                    display_name: "tls-auth client",
+                    auth_method: ClientAuthMethod::TlsClientAuth.as_str(),
+                    jwks: None,
+                    jwks_uri: None,
+                    signing_alg: None,
+                    tls_client_auth_cert: None,
+                    tls_client_auth_subject_dn: Some(subject_dn),
+                },
+            )
+            .await?;
+        self.register_default_redirect(&id).await;
+        Ok(id)
+    }
+
+    /// Arm the PKI method's trust anchors on the state the router runs (issue #159).
+    /// The router is REBUILT, matching `with_scim_warning_lead` next door: the router
+    /// captures the state it was built from, so installing on the state afterwards
+    /// without rebuilding leaves every request served by the state as it was.
+    pub fn arm_mtls_anchors(&mut self, anchor_pems: &[String]) {
+        let anchors = anchor_pems
+            .iter()
+            .map(|pem| {
+                ironauth_jose::mtls::parse_presented_certificate(pem).expect("the anchor parses")
+            })
+            .collect::<Vec<_>>();
+        let state = self
+            .state
+            .clone()
+            .with_mtls_anchors(std::sync::Arc::new(anchors));
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Register a client for `self_signed_tls_client_auth` with its registered
     /// certificate (issue #159). A certificate-less registration is a store CHECK
     /// violation, surfaced as [`ironauth_store::StoreError::Conflict`].

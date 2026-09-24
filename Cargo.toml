@@ -146,7 +146,7 @@ utoipa = { version = "5", features = ["axum_extras"] }
 # the workspace (see the sqlx note above): aws-lc would add a C toolchain dependency and
 # break the musl static lane.
 ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
-x509-parser = { version = "0.18", default-features = false }
+x509-parser = { version = "0.18", default-features = false, features = ["verify"] }
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring-native-roots",

@@ -29,6 +29,85 @@ pub enum CertificateError {
     Unparsable,
     /// The presented certificate is expired (or not yet valid) at the request instant.
     NotValidNow,
+    /// The presented chain's signatures do not verify up to a configured trust anchor.
+    UntrustedChain,
+    /// The presented certificate's subject does not match the registered expectation
+    /// (RFC 8705 section 2.1.2).
+    SubjectMismatch,
+}
+
+/// Validate a presented certificate against the trust anchors (issue #159, the PKI
+/// method): every link's signature must verify up to a configured anchor, the
+/// presented certificate must be valid at `unix_seconds`, and its subject must match
+/// `expected_subject` (RFC 8705 section 2.1.2: the exact subject distinguished name).
+///
+/// The chain arrives as the presented leaf followed by its intermediates, each PEM
+/// encoded. The topmost presented certificate must be DIRECTLY signed by a configured
+/// anchor (the anchors are the trust boundary; an intermediate that walks up to an
+/// anchor is accepted only when that topmost cert is itself an intermediate the
+/// anchor signed).
+///
+/// # Errors
+///
+/// [`CertificateError`] for every failure, uniformly.
+///
+/// # Panics
+///
+/// On the internal `expect` of the last chain link: the links were all parsed at the
+/// top of the walk, so this is unreachable in practice and only declared because the
+/// panic is possible by construction.
+pub fn validate_tls_client_chain(
+    chain_pems: &[String],
+    anchors: &[ParsedClientCertificate],
+    expected_subject: &str,
+    unix_seconds: i64,
+) -> Result<ParsedClientCertificate, CertificateError> {
+    let Some((head, tail)) = chain_pems.split_first() else {
+        return Err(CertificateError::Unparsable);
+    };
+    let presented = parse_presented_certificate(head)?;
+    if !certificate_valid_at(&presented.certificate(), unix_seconds) {
+        return Err(CertificateError::NotValidNow);
+    }
+    if certificate_subject_dn(&presented.certificate()) != expected_subject {
+        return Err(CertificateError::SubjectMismatch);
+    }
+
+    // Walk the chain: each link's signature must verify against the NEXT certificate
+    // (the issuer), and the final link against one of the configured anchors. The
+    // links are parsed FIRST and held by index, so the borrowed views never dangle.
+    let mut links = Vec::with_capacity(tail.len() + 1);
+    links.push(presented.clone());
+    for link in tail {
+        links.push(parse_presented_certificate(link)?);
+    }
+    for i in 0..links.len() - 1 {
+        let subject = links[i].certificate();
+        if !certificate_valid_at(&subject, unix_seconds) {
+            return Err(CertificateError::NotValidNow);
+        }
+        let issuer = links[i + 1].certificate();
+        if !certificate_valid_at(&issuer, unix_seconds) {
+            return Err(CertificateError::NotValidNow);
+        }
+        subject
+            .verify_signature(Some(issuer.public_key()))
+            .map_err(|_| CertificateError::UntrustedChain)?;
+    }
+    // The topmost presented cert signed by a configured anchor.
+    let topmost = links
+        .last()
+        .expect("at least the presented cert")
+        .certificate();
+    for anchor in anchors {
+        if topmost
+            .verify_signature(Some(anchor.certificate().public_key()))
+            .is_ok()
+        {
+            return Ok(presented);
+        }
+    }
+    Err(CertificateError::UntrustedChain)
 }
 
 /// Parse a PEM-encoded client certificate.
@@ -214,6 +293,96 @@ mod tests {
         let a = parse_presented_certificate(&leaf).expect("a parses");
         let b = parse_presented_certificate(&leaf).expect("b parses");
         assert!(same_certificate(&a.certificate(), &b.certificate()));
+    }
+
+    /// A CA-signed leaf chain validates against the anchor with a matching subject.
+    #[test]
+    fn a_ca_signed_chain_validates_against_its_anchor() {
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let ca = ca_params.self_signed(&ca_key).expect("the CA generates");
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let mut leaf_params = CertificateParams::default();
+        leaf_params.not_before = time::OffsetDateTime::now_utc() - Duration::from_secs(60);
+        leaf_params.not_after = time::OffsetDateTime::now_utc() + Duration::from_secs(3600);
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .expect("the leaf generates");
+        let anchor = parse_presented_certificate(&ca.pem()).expect("the anchor parses");
+        let subject = certificate_subject_dn(
+            &parse_presented_certificate(&leaf.pem())
+                .expect("parses")
+                .certificate(),
+        );
+        let now = SystemTime::now() // invariant-allow: time-via-env (test cert
+        // validity windows anchored to real wall-clock)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("post-epoch")
+            .as_secs()
+            .try_into()
+            .expect("representable");
+        let validated = validate_tls_client_chain(&[leaf.pem()], &[anchor], &subject, now)
+            .expect("the chain validates");
+        assert_eq!(validated.thumbprint.len(), 43);
+    }
+
+    /// A leaf from a DIFFERENT CA does not validate against the anchor.
+    #[test]
+    fn a_foreign_ca_leaf_is_an_untrusted_chain() {
+        let key_a = KeyPair::generate().expect("key a");
+        let ca_a = CertificateParams::default()
+            .self_signed(&key_a)
+            .expect("ca a");
+        let key_b = KeyPair::generate().expect("key b");
+        let ca_b = CertificateParams::default()
+            .self_signed(&key_b)
+            .expect("ca b");
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf = CertificateParams::default()
+            .signed_by(&leaf_key, &ca_a, &key_a)
+            .expect("leaf under ca a");
+        let anchor_b = parse_presented_certificate(&ca_b.pem()).expect("anchor b parses");
+        let subject = certificate_subject_dn(
+            &parse_presented_certificate(&leaf.pem())
+                .expect("parses")
+                .certificate(),
+        );
+        let now = SystemTime::now() // invariant-allow: time-via-env (test cert
+        // validity windows anchored to real wall-clock)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("post-epoch")
+            .as_secs()
+            .try_into()
+            .expect("representable");
+        assert!(matches!(
+            validate_tls_client_chain(&[leaf.pem()], &[anchor_b], &subject, now),
+            Err(CertificateError::UntrustedChain)
+        ));
+    }
+
+    /// A subject that does not match the registered expectation is refused.
+    #[test]
+    fn a_subject_mismatch_is_refused() {
+        let key = KeyPair::generate().expect("key");
+        let ca = CertificateParams::default().self_signed(&key).expect("ca");
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf = CertificateParams::default()
+            .signed_by(&leaf_key, &ca, &key)
+            .expect("leaf");
+        let anchor = parse_presented_certificate(&ca.pem()).expect("anchor parses");
+        let now = SystemTime::now() // invariant-allow: time-via-env (test cert
+        // validity windows anchored to real wall-clock)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("post-epoch")
+            .as_secs()
+            .try_into()
+            .expect("representable");
+        assert!(matches!(
+            validate_tls_client_chain(&[leaf.pem()], &[anchor], "CN=wrong", now),
+            Err(CertificateError::SubjectMismatch)
+        ));
     }
 
     #[test]

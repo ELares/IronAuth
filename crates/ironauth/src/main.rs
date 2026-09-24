@@ -2079,6 +2079,7 @@ async fn build_oidc_plane(
         ),
         None => OidcState::new(store, env, registry, oidc_config, issuer_base),
     }
+    .with_mtls_anchors(mtls_anchors(&config.mtls))
     .with_org_provisioning(org_provisioning)
     .with_global_token_revocation_enabled(surfaces.global_revocation)
     .with_ssf(&config.ssf)
@@ -6135,6 +6136,25 @@ fn select_control_dsn(config: &Config) -> Option<String> {
          ironauth_control, not the data-plane role)."
     );
     None
+}
+/// Parse the `[mtls]` trust-anchor bundle (issue #159). A bundle whose entries do
+/// not parse REFUSES the PKI method entirely, with the reason logged at boot (a
+/// typo'd PEM would otherwise arm a method whose every chain fails per request).
+fn mtls_anchors(
+    mtls: &ironauth_config::MtlsConfig,
+) -> std::sync::Arc<Vec<ironauth_jose::mtls::ParsedClientCertificate>> {
+    let mut anchors = Vec::with_capacity(mtls.trust_anchor_certs.len());
+    for pem in &mtls.trust_anchor_certs {
+        let Ok(anchor) = ironauth_jose::mtls::parse_presented_certificate(pem) else {
+            tracing::error!(
+                "tls_client_auth NOT armed: mtls.trust_anchor_certs contains an entry \
+                 that does not parse as a certificate PEM"
+            );
+            return std::sync::Arc::new(Vec::new());
+        };
+        anchors.push(anchor);
+    }
+    std::sync::Arc::new(anchors)
 }
 
 /// Resolve the platform envelope master key from config (issue #48).
