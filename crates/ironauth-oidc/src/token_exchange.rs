@@ -655,6 +655,7 @@ async fn authenticate_for_exchange(
         client_secret: params.client_secret.as_deref(),
         client_assertion: params.client_assertion.as_deref(),
         client_assertion_type: params.client_assertion_type.as_deref(),
+        client_certificate: None,
     };
     let via_basic = is_basic_scheme(authorization);
     // Recover the scope from the CLAIMED client id so the scoped authentication can run,
@@ -666,6 +667,7 @@ async fn authenticate_for_exchange(
         inputs.client_secret,
         inputs.client_assertion,
         inputs.client_assertion_type,
+        inputs.client_certificate,
     )
     .map_err(|_| TokenError::InvalidClient { via_basic })?;
     let scope = ironauth_store::ClientId::parse_declared_scope(presented.client_id())

@@ -132,6 +132,7 @@ const JWT_BEARER_METHOD_MARKER: &str = "jwt-bearer";
 /// public `DISALLOWED_M2M_SCOPES` floor, the one refusal that keeps the spec-exact
 /// code; [`TokenError::ServerError`] on a signing, persistence, or allowlist-read
 /// fault.
+#[allow(clippy::too_many_lines)]
 pub async fn jwt_bearer_grant(
     state: &OidcState,
     headers: &HeaderMap,
@@ -158,6 +159,7 @@ pub async fn jwt_bearer_grant(
         client_secret: params.client_secret.as_deref(),
         client_assertion: params.client_assertion.as_deref(),
         client_assertion_type: params.client_assertion_type.as_deref(),
+        client_certificate: None,
     };
     let presented = parse_presented(
         inputs.authorization,
@@ -165,6 +167,7 @@ pub async fn jwt_bearer_grant(
         inputs.client_secret,
         inputs.client_assertion,
         inputs.client_assertion_type,
+        inputs.client_certificate,
     )
     .map_err(|_| TokenError::InvalidClient {
         via_basic: is_basic_scheme(authorization),

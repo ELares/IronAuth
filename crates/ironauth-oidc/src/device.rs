@@ -270,6 +270,7 @@ async fn enforce_consent_lockdown(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn device_authorization_inner(
     state: &OidcState,
     headers: &HeaderMap,
@@ -288,6 +289,7 @@ async fn device_authorization_inner(
         client_secret: params.client_secret.as_deref(),
         client_assertion: params.client_assertion.as_deref(),
         client_assertion_type: params.client_assertion_type.as_deref(),
+        client_certificate: None,
     };
     let (client, scope) = client_auth::authenticate_client_self_scoped(state, inputs)
         .await
@@ -842,6 +844,7 @@ pub(crate) async fn authenticate_token_client(
         client_secret: params.client_secret.as_deref(),
         client_assertion: params.client_assertion.as_deref(),
         client_assertion_type: params.client_assertion_type.as_deref(),
+        client_certificate: None,
     };
     client_auth::authenticate_client(state, scope, inputs)
         .await

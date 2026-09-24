@@ -331,6 +331,7 @@ async fn authenticate(
         client_secret: params.client_secret.as_deref(),
         client_assertion: params.client_assertion.as_deref(),
         client_assertion_type: params.client_assertion_type.as_deref(),
+        client_certificate: None,
     };
 
     // Peek the presented client identifier to recover the scope. A parse failure is
@@ -342,6 +343,7 @@ async fn authenticate(
         inputs.client_secret,
         inputs.client_assertion,
         inputs.client_assertion_type,
+        inputs.client_certificate,
     )
     .map_err(map_parse_error)?;
     let Ok(scoped) = ClientId::parse_declared_scope(presented.client_id()) else {

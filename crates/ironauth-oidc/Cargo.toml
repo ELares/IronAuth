@@ -162,6 +162,7 @@ ironcache = ["ironauth-hot/ironcache"]
 testing = ["ironauth-store/testing", "ironauth-saml/test-util"]
 
 [dev-dependencies]
+rcgen = { workspace = true, features = ["pem"] }
 # Test senders implement the same async seam the production one does.
 async-trait = "0.1"
 # net + io-util let the #25 client-assertion test stand up an in-process loopback
@@ -1720,6 +1721,11 @@ path = "tests/rate_l2.rs"
 name = "forward_auth_trace"
 required-features = ["testing"]
 path = "tests/forward_auth_trace.rs"
+
+[[test]]
+name = "mtls"
+path = "tests/mtls.rs"
+required-features = ["testing"]
 
 [[test]]
 name = "request_path_limiter"

@@ -938,6 +938,8 @@ impl Harness {
                     jwks: None,
                     jwks_uri: None,
                     token_endpoint_auth_signing_alg: None,
+                    tls_client_auth_cert: None,
+                    tls_client_auth_subject_dn: None,
                     registration_access_token_hash: &token_hash,
                     registration_uri_base: "https://issuer.test/connect/register",
                     quarantined: true,

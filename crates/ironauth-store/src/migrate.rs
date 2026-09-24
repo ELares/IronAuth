@@ -1991,6 +1991,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0233_signing_key_rotation_lifecycle_grant.sql"),
         },
+        // EXPAND (issue #159): the RFC 8705 mTLS client-auth metadata columns.
+        Migration {
+            version: 234,
+            name: "client_tls_client_auth",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0234_client_tls_client_auth.sql"),
+        },
     ]
 }
 

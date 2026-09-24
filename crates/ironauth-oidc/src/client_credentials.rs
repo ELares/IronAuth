@@ -194,6 +194,7 @@ pub async fn client_credentials_grant(
         client_secret: params.client_secret.as_deref(),
         client_assertion: params.client_assertion.as_deref(),
         client_assertion_type: params.client_assertion_type.as_deref(),
+        client_certificate: None,
     };
 
     // 1 and 2, or the attested pair already computed above. The two authentication paths
@@ -213,6 +214,7 @@ pub async fn client_credentials_grant(
             inputs.client_secret,
             inputs.client_assertion,
             inputs.client_assertion_type,
+            inputs.client_certificate,
         )
         .map_err(|_| TokenError::InvalidClient {
             via_basic: is_basic_scheme(authorization),

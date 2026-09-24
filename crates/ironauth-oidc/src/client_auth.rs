@@ -136,6 +136,16 @@ pub enum ClientAuthMethod {
     ClientSecretJwt,
     /// `none`: a public client (PKCE only), no secret.
     None,
+    /// `self_signed_tls_client_auth` (RFC 8705, issue #159): the client presents THE
+    /// registered certificate, and the server accepts it by exact DER equality plus
+    /// validity at the request instant. No CA or trust-anchor configuration stands
+    /// between this method and its first caller.
+    SelfSignedTlsClientAuth,
+    /// `tls_client_auth` (RFC 8705, issue #159, PKI method): the client presents a
+    /// certificate validated against the configured trust anchors, matched to the
+    /// registered expected subject (RFC 8705 section 2.1.2). Recognized; the chain
+    /// validation surface lands with its configuration.
+    TlsClientAuth,
     /// `attest_jwt_client_auth`: an attestation minted by a trusted attester plus a
     /// proof of possession signed with the key it bound
     /// (draft-ietf-oauth-attestation-based-client-auth, issue #133). PROTOTYPE:
@@ -183,6 +193,8 @@ impl ClientAuthMethod {
             ClientAuthMethod::ClientSecretJwt => "client_secret_jwt",
             ClientAuthMethod::None => "none",
             ClientAuthMethod::AttestJwt => "attest_jwt_client_auth",
+            ClientAuthMethod::SelfSignedTlsClientAuth => "self_signed_tls_client_auth",
+            ClientAuthMethod::TlsClientAuth => "tls_client_auth",
         }
     }
 
@@ -198,6 +210,8 @@ impl ClientAuthMethod {
             "client_secret_jwt" => Some(ClientAuthMethod::ClientSecretJwt),
             "none" => Some(ClientAuthMethod::None),
             "attest_jwt_client_auth" => Some(ClientAuthMethod::AttestJwt),
+            "self_signed_tls_client_auth" => Some(ClientAuthMethod::SelfSignedTlsClientAuth),
+            "tls_client_auth" => Some(ClientAuthMethod::TlsClientAuth),
             _ => None,
         }
     }
@@ -240,6 +254,15 @@ pub enum PresentedClientAuth {
         /// The presented secret, if any (absent for a public client).
         secret: Option<String>,
     },
+    /// An mTLS client certificate (RFC 8705, issue #159): the PEM forwarded from the
+    /// TLS termination (direct or a trusted proxy), the only credential the two mTLS
+    /// methods accept.
+    Certificate {
+        /// The client identifier the request authenticated as.
+        client_id: String,
+        /// The presented certificate, PEM-encoded.
+        certificate_pem: String,
+    },
     /// A JWT client assertion (`private_key_jwt` / `client_secret_jwt`).
     Assertion {
         /// The client identifier (from a `client_id` form field, or the
@@ -256,7 +279,8 @@ impl PresentedClientAuth {
     pub fn client_id(&self) -> &str {
         match self {
             PresentedClientAuth::Secret { client_id, .. }
-            | PresentedClientAuth::Assertion { client_id, .. } => client_id,
+            | PresentedClientAuth::Assertion { client_id, .. }
+            | PresentedClientAuth::Certificate { client_id, .. } => client_id,
         }
     }
 
@@ -367,6 +391,10 @@ pub struct ClientAuthInputs<'a> {
     pub client_assertion: Option<&'a str>,
     /// The `client_assertion_type` form field, if present.
     pub client_assertion_type: Option<&'a str>,
+    /// The client certificate, PEM-encoded, forwarded from the TLS termination (direct
+    /// TLS or a trusted proxy; the proxy gate is the caller's). `None` when the
+    /// connection presented none.
+    pub client_certificate: Option<&'a str>,
 }
 
 /// Authenticate a client from the presented request inputs (issues #20 and #25).
@@ -390,6 +418,7 @@ pub struct ClientAuthInputs<'a> {
 /// coherent attempt; [`ClientAuthError::InvalidClient`] for every authentication
 /// failure (unknown client, wrong or replayed credential, mismatched or
 /// unsupported method).
+#[allow(clippy::too_many_lines)]
 pub async fn authenticate_client(
     state: &OidcState,
     scope: Scope,
@@ -401,6 +430,7 @@ pub async fn authenticate_client(
         inputs.client_secret,
         inputs.client_assertion,
         inputs.client_assertion_type,
+        inputs.client_certificate,
     ) {
         Ok(presented) => presented,
         Err(error) => {
@@ -586,6 +616,7 @@ pub async fn authenticate_client_self_scoped(
         inputs.client_secret,
         inputs.client_assertion,
         inputs.client_assertion_type,
+        inputs.client_certificate,
     )
     .map_err(map_parse_error)?;
     // Recover the scope the client id declares. A malformed client id is the uniform
@@ -601,6 +632,7 @@ pub async fn authenticate_client_self_scoped(
 
 /// The post-parse half of [`authenticate_client`]: resolve the client and verify
 /// the presented credentials against its registered method.
+#[allow(clippy::too_many_lines)]
 async fn authenticate_presented(
     state: &OidcState,
     scope: Scope,
@@ -610,7 +642,9 @@ async fn authenticate_presented(
     let client_id_str = presented.client_id().to_owned();
     let (assertion_alg, assertion_kid) = match presented {
         PresentedClientAuth::Assertion { assertion, .. } => peek_assertion_header(assertion),
-        PresentedClientAuth::Secret { .. } => (None, None),
+        PresentedClientAuth::Secret { .. } | PresentedClientAuth::Certificate { .. } => {
+            (None, None)
+        }
     };
 
     // A helper that records the diagnostic and returns the opaque invalid_client.
@@ -688,6 +722,38 @@ async fn authenticate_presented(
             }
         },
 
+        // self_signed_tls_client_auth registered, a certificate presented: the whole
+        // authentication is exact DER equality with the registered certificate, valid
+        // at the request instant. No CA stands between this method and its caller.
+        (
+            ClientAuthMethod::SelfSignedTlsClientAuth,
+            PresentedClientAuth::Certificate {
+                certificate_pem, ..
+            },
+        ) => {
+            match authenticate_self_signed_certificate(&record, certificate_pem, now_secs(state)) {
+                Ok(()) => Ok(AuthenticatedClient {
+                    client_id: client_id_str,
+                    auth_method: registered,
+                    allow_bearer_tokens: record.allow_bearer_tokens,
+                    grant_types: record.grant_types.clone(),
+                    token_exchange_impersonation_allowed: record
+                        .token_exchange_impersonation_allowed,
+                    token_exchange_refresh_allowed: record.token_exchange_refresh_allowed,
+                }),
+                Err(reason) => {
+                    fail!(&method_str, reason);
+                }
+            }
+        }
+
+        // tls_client_auth (the PKI method) is recognized but its chain validation is
+        // not yet shipped: a client registered for it fails closed until the trust-anchor
+        // surface lands.
+        (ClientAuthMethod::TlsClientAuth, PresentedClientAuth::Certificate { .. }) => {
+            fail!(&method_str, ClientAuthDiagnosticReason::MethodMismatch);
+        }
+
         // private_key_jwt registered, an assertion presented: verify it.
         (ClientAuthMethod::PrivateKeyJwt, PresentedClientAuth::Assertion { assertion, .. }) => {
             match verify_private_key_assertion(state, scope, &client_id_str, &record, assertion)
@@ -747,6 +813,7 @@ pub fn parse_presented(
     body_client_secret: Option<&str>,
     body_client_assertion: Option<&str>,
     body_client_assertion_type: Option<&str>,
+    certificate_pem: Option<&str>,
 ) -> Result<PresentedClientAuth, ClientAuthParseError> {
     let basic = match authorization {
         Some(value) if is_basic(value) => {
@@ -789,6 +856,21 @@ pub fn parse_presented(
     // A `client_assertion_type` without an assertion is an incomplete attempt.
     if assertion_type.is_some() {
         return Err(ClientAuthParseError::MissingAssertion);
+    }
+
+    // The mTLS certificate path (RFC 8705, issue #159): a certificate is the method's
+    // ONLY credential, so it is mutually exclusive with every other presentation.
+    if let Some(certificate_pem) = trimmed(certificate_pem) {
+        if basic.is_some() || body_secret.is_some() || assertion.is_some() {
+            return Err(ClientAuthParseError::MultipleMethods);
+        }
+        let client_id = body_id
+            .ok_or(ClientAuthParseError::MissingClientId)?
+            .to_owned();
+        return Ok(PresentedClientAuth::Certificate {
+            client_id,
+            certificate_pem: certificate_pem.to_owned(),
+        });
     }
 
     // The secret / public path (#20).
@@ -838,6 +920,46 @@ enum SecretAuthError {
 
 /// Verify a secret-based (or public) presentation against the client's registered
 /// method. Only called when the registered method is Basic/Post/None.
+/// The self-signed mTLS authentication (RFC 8705, issue #159): the presented
+/// certificate must be the REGISTERED one (exact DER equality) and valid at the
+/// request instant. Both properties are checked in one place so the wire outcome is
+/// one opaque failure; the reason is recorded out of band.
+///
+/// # Errors
+///
+/// [`ClientAuthDiagnosticReason::BadCertificate`] for every failure.
+/// The request instant, in unix seconds, from the clock seam.
+fn now_secs(state: &OidcState) -> i64 {
+    state
+        .env()
+        .clock()
+        .now_utc()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+fn authenticate_self_signed_certificate(
+    record: &ClientAuthRecord,
+    presented_pem: &str,
+    now_unix_secs: i64,
+) -> Result<(), ClientAuthDiagnosticReason> {
+    let Some(registered_pem) = record.tls_client_auth_cert.as_deref() else {
+        return Err(ClientAuthDiagnosticReason::BadCertificate);
+    };
+    let presented = ironauth_jose::mtls::parse_presented_certificate(presented_pem)
+        .map_err(|_| ClientAuthDiagnosticReason::BadCertificate)?;
+    let registered = ironauth_jose::mtls::parse_presented_certificate(registered_pem)
+        .map_err(|_| ClientAuthDiagnosticReason::BadCertificate)?;
+    if !ironauth_jose::mtls::same_certificate(&presented.certificate(), &registered.certificate())
+        || !ironauth_jose::mtls::certificate_valid_at(&presented.certificate(), now_unix_secs)
+    {
+        return Err(ClientAuthDiagnosticReason::BadCertificate);
+    }
+    Ok(())
+}
+
 fn authenticate_secret(
     record: &ClientAuthRecord,
     registered: ClientAuthMethod,
@@ -851,6 +973,14 @@ fn authenticate_secret(
         ClientAuthMethod::None => {
             // Public client: no secret must be presented (guaranteed by the method
             // match above, but assert defensively).
+            if presented_secret.is_some() {
+                return Err(SecretAuthError::MethodMismatch);
+            }
+            Ok(())
+        }
+        ClientAuthMethod::SelfSignedTlsClientAuth | ClientAuthMethod::TlsClientAuth => {
+            // The mTLS methods present a certificate, not a secret: any secret on
+            // the same request is a method mismatch.
             if presented_secret.is_some() {
                 return Err(SecretAuthError::MethodMismatch);
             }
@@ -1519,6 +1649,9 @@ mod tests {
             jwks_uri: None,
             token_endpoint_auth_signing_alg: None,
             refresh_rotation: None,
+            tls_client_auth_cert: None,
+            tls_client_auth_subject_dn: None,
+
             // The strict posture, matching the column default: these fixtures test
             // authentication, and a fixture that quietly relaxed the DPoP default
             // would be the wrong shape to reason from.
@@ -1555,6 +1688,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("parse");
         let PresentedClientAuth::Secret { method, secret, .. } = &ok else {
@@ -1566,6 +1700,7 @@ mod tests {
 
         let bad = parse_presented(
             Some(&basic_header("cli_x", "wrong")),
+            None,
             None,
             None,
             None,
@@ -1585,7 +1720,8 @@ mod tests {
     fn a_mismatched_method_is_a_method_mismatch_both_directions() {
         // Registered basic, presented post.
         let basic_client = secret_record(ClientAuthMethod::Basic, Some("s"));
-        let via_post = parse_presented(None, Some("cli_x"), Some("s"), None, None).expect("parse");
+        let via_post =
+            parse_presented(None, Some("cli_x"), Some("s"), None, None, None).expect("parse");
         let PresentedClientAuth::Secret { method, secret, .. } = &via_post else {
             panic!("secret variant");
         };
@@ -1603,7 +1739,8 @@ mod tests {
     #[test]
     fn public_client_authenticates_without_a_secret_but_rejects_one() {
         let public = secret_record(ClientAuthMethod::None, None);
-        let no_secret = parse_presented(None, Some("cli_x"), None, None, None).expect("parse");
+        let no_secret =
+            parse_presented(None, Some("cli_x"), None, None, None, None).expect("parse");
         let PresentedClientAuth::Secret { method, secret, .. } = &no_secret else {
             panic!("secret variant");
         };
@@ -1613,7 +1750,8 @@ mod tests {
         );
 
         let with_secret =
-            parse_presented(None, Some("cli_x"), Some("unexpected"), None, None).expect("parse");
+            parse_presented(None, Some("cli_x"), Some("unexpected"), None, None, None)
+                .expect("parse");
         // A public client that presents a secret parses as Post, so the method
         // does not match the registered None.
         let PresentedClientAuth::Secret { method, secret, .. } = &with_secret else {
@@ -1633,6 +1771,7 @@ mod tests {
             Some("s"),
             Some("a.b.c"),
             Some(JWT_BEARER_ASSERTION_TYPE),
+            None,
         )
         .expect_err("secret and assertion");
         assert_eq!(err, ClientAuthParseError::MultipleMethods);
@@ -1646,6 +1785,7 @@ mod tests {
             None,
             Some("a.b.c"),
             Some(JWT_BEARER_ASSERTION_TYPE),
+            None,
         )
         .expect_err("basic and assertion");
         assert_eq!(err, ClientAuthParseError::MultipleMethods);
@@ -1653,12 +1793,19 @@ mod tests {
 
     #[test]
     fn an_assertion_without_the_bearer_type_is_rejected() {
-        let err = parse_presented(None, Some("cli_x"), None, Some("a.b.c"), None)
+        let err = parse_presented(None, Some("cli_x"), None, Some("a.b.c"), None, None)
             .expect_err("missing type");
         assert_eq!(err, ClientAuthParseError::UnsupportedAssertionType);
 
-        let err = parse_presented(None, Some("cli_x"), None, Some("a.b.c"), Some("wrong"))
-            .expect_err("wrong type");
+        let err = parse_presented(
+            None,
+            Some("cli_x"),
+            None,
+            Some("a.b.c"),
+            Some("wrong"),
+            None,
+        )
+        .expect_err("wrong type");
         assert_eq!(err, ClientAuthParseError::UnsupportedAssertionType);
     }
 
@@ -1670,6 +1817,7 @@ mod tests {
             None,
             None,
             Some(JWT_BEARER_ASSERTION_TYPE),
+            None,
         )
         .expect_err("type without assertion");
         assert_eq!(err, ClientAuthParseError::MissingAssertion);
@@ -1689,6 +1837,7 @@ mod tests {
             None,
             Some(&assertion),
             Some(JWT_BEARER_ASSERTION_TYPE),
+            None,
         )
         .expect("parse");
         assert_eq!(parsed.client_id(), "cli_sub");
@@ -1700,6 +1849,7 @@ mod tests {
             None,
             Some(&assertion),
             Some(JWT_BEARER_ASSERTION_TYPE),
+            None,
         )
         .expect_err("id conflict");
         assert_eq!(err, ClientAuthParseError::ClientIdMismatch);
@@ -1713,6 +1863,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect_err("mismatched client_id");
         assert_eq!(err, ClientAuthParseError::ClientIdMismatch);
@@ -1720,7 +1871,7 @@ mod tests {
 
     #[test]
     fn missing_client_id_is_a_parse_error() {
-        let err = parse_presented(None, None, None, None, None).expect_err("no client id");
+        let err = parse_presented(None, None, None, None, None, None).expect_err("no client id");
         assert_eq!(err, ClientAuthParseError::MissingClientId);
     }
 

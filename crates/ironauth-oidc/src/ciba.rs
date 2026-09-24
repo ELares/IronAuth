@@ -320,6 +320,7 @@ async fn authenticated_caller(
         client_secret: params.client_secret.as_deref(),
         client_assertion: params.client_assertion.as_deref(),
         client_assertion_type: params.client_assertion_type.as_deref(),
+        client_certificate: None,
     };
     let (client, scope) = client_auth::authenticate_client_self_scoped(state, inputs)
         .await

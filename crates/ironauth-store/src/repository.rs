@@ -3151,6 +3151,12 @@ pub struct ClientAuthRecord {
     /// algorithm its assertions must be signed with (a per-client allowlist), or
     /// `None` to allow the supported asymmetric set.
     pub token_endpoint_auth_signing_alg: Option<String>,
+    /// The registered client certificate PEM for `self_signed_tls_client_auth`
+    /// (issue #159): the exact certificate every request must present.
+    pub tls_client_auth_cert: Option<String>,
+    /// The expected subject distinguished name for `tls_client_auth` (RFC 8705
+    /// section 2.1.2), or `None` while the SAN-based alternatives are unshipped.
+    pub tls_client_auth_subject_dn: Option<String>,
     /// The client's refresh-token rotation override (issue #21): `Some("always")`
     /// to rotate on every refresh, `Some("threshold")` to rotate only past the
     /// configured fraction of TTL, or `None` to derive the policy from the client's
@@ -3187,6 +3193,14 @@ impl fmt::Debug for ClientAuthRecord {
             .field("auth_method", &self.auth_method)
             .field("has_secret", &self.secret_hash.is_some())
             .field("has_jwks", &self.jwks.is_some())
+            .field(
+                "has_tls_client_auth_cert",
+                &self.tls_client_auth_cert.is_some(),
+            )
+            .field(
+                "tls_client_auth_subject_dn",
+                &self.tls_client_auth_subject_dn,
+            )
             .field("jwks_uri", &self.jwks_uri)
             .field(
                 "token_endpoint_auth_signing_alg",
@@ -3229,6 +3243,12 @@ pub struct NewJwtAuthClient<'a> {
     /// The pinned `token_endpoint_auth_signing_alg`, or `None` to allow the
     /// supported asymmetric set.
     pub signing_alg: Option<&'a str>,
+    /// The registered client certificate PEM for `self_signed_tls_client_auth`
+    /// (issue #159), or `None`.
+    pub tls_client_auth_cert: Option<&'a str>,
+    /// The expected subject distinguished name for `tls_client_auth` (issue #159),
+    /// or `None`.
+    pub tls_client_auth_subject_dn: Option<&'a str>,
 }
 
 /// A dynamically registered client's stored configuration (issue #30), read
@@ -3342,6 +3362,12 @@ pub struct NewDynamicClient<'a> {
     pub jwks_uri: Option<&'a str>,
     /// The pinned `token_endpoint_auth_signing_alg`, or `None`.
     pub token_endpoint_auth_signing_alg: Option<&'a str>,
+    /// The registered client certificate PEM for `self_signed_tls_client_auth`
+    /// (issue #159), or `None` for any other method.
+    pub tls_client_auth_cert: Option<&'a str>,
+    /// The expected subject distinguished name for `tls_client_auth` (issue #159),
+    /// or `None` while the SAN-based alternatives are unshipped.
+    pub tls_client_auth_subject_dn: Option<&'a str>,
     /// The SHA-256 (hex) of the freshly minted registration access token.
     pub registration_access_token_hash: &'a str,
     /// The base of the RFC 7592 client configuration endpoint
@@ -3526,7 +3552,8 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT display_name, token_endpoint_auth_method, secret_hash, \
-             jwks, jwks_uri, token_endpoint_auth_signing_alg, refresh_rotation, \
+             jwks, jwks_uri, token_endpoint_auth_signing_alg, tls_client_auth_cert, \
+             tls_client_auth_subject_dn, refresh_rotation, \
              allow_bearer_tokens, grant_types, \
              token_exchange_impersonation_allowed, token_exchange_refresh_allowed \
              FROM clients \
@@ -3546,6 +3573,8 @@ impl ClientRepo<'_> {
             jwks: row.get("jwks"),
             jwks_uri: row.get("jwks_uri"),
             token_endpoint_auth_signing_alg: row.get("token_endpoint_auth_signing_alg"),
+            tls_client_auth_cert: row.get("tls_client_auth_cert"),
+            tls_client_auth_subject_dn: row.get("tls_client_auth_subject_dn"),
             refresh_rotation: row.get("refresh_rotation"),
             allow_bearer_tokens: row.get("allow_bearer_tokens"),
             grant_types: row.get("grant_types"),
@@ -5311,8 +5340,9 @@ impl ActingClientRepo<'_> {
                     "INSERT INTO clients \
                      (id, tenant_id, environment_id, display_name, \
                       token_endpoint_auth_method, jwks, jwks_uri, \
-                      token_endpoint_auth_signing_alg) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                      token_endpoint_auth_signing_alg, tls_client_auth_cert, \
+                      tls_client_auth_subject_dn) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -5322,12 +5352,15 @@ impl ActingClientRepo<'_> {
                 .bind(client.jwks)
                 .bind(client.jwks_uri)
                 .bind(client.signing_alg)
+                .bind(client.tls_client_auth_cert)
+                .bind(client.tls_client_auth_subject_dn)
                 .execute(&mut **tx)
                 .await;
                 match result {
                     Ok(_) => Ok(()),
-                    // A key-source CHECK violation (both jwks and jwks_uri set, or a
-                    // keyless private_key_jwt) is a caller-facing conflict, not a
+                    // A key-source CHECK violation (both jwks and jwks_uri set, a
+                    // keyless private_key_jwt, or a self-signed mTLS client without
+                    // its registered certificate) is a caller-facing conflict, not a
                     // persistence fault.
                     Err(error) if is_check_violation(&error) => Err(StoreError::Conflict),
                     Err(error) => Err(error.into()),
@@ -6536,11 +6569,12 @@ impl ActingClientRepo<'_> {
                      (id, tenant_id, environment_id, display_name, \
                       token_endpoint_auth_method, secret_hash, redirect_uris, \
                       application_type, id_token_signed_response_alg, jwks, jwks_uri, \
-                      token_endpoint_auth_signing_alg, registration_client_uri, \
+                      token_endpoint_auth_signing_alg, tls_client_auth_cert, \
+                      tls_client_auth_subject_dn, registration_client_uri, \
                       registration_access_token_hash, quarantined, dcr_policy_chain, \
                       dcr_registered) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                             $15, $16, true)",
+                             $15, $16, $17, $18, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -6554,6 +6588,8 @@ impl ActingClientRepo<'_> {
                 .bind(params.jwks)
                 .bind(params.jwks_uri)
                 .bind(params.token_endpoint_auth_signing_alg)
+                .bind(params.tls_client_auth_cert)
+                .bind(params.tls_client_auth_subject_dn)
                 .bind(&client_uri)
                 .bind(params.registration_access_token_hash)
                 .bind(params.quarantined)
@@ -12907,6 +12943,9 @@ pub enum ClientAuthDiagnosticReason {
     MethodMismatch,
     /// A presented secret did not match the client's stored hash.
     BadSecret,
+    /// The presented client certificate is not the registered one, or is not valid at
+    /// the request instant (issue #159).
+    BadCertificate,
     /// A JWT assertion did not verify for a reason that is not one of the specific
     /// variants below (a malformed structure, a claims-shape problem, a wrong
     /// `iss`, a missing required claim, or no usable verification key). The coarse
@@ -13066,6 +13105,7 @@ impl ClientAuthDiagnosticReason {
             ClientAuthDiagnosticReason::UnknownClient => "unknown_client",
             ClientAuthDiagnosticReason::MethodMismatch => "method_mismatch",
             ClientAuthDiagnosticReason::BadSecret => "bad_secret",
+            ClientAuthDiagnosticReason::BadCertificate => "bad_certificate",
             ClientAuthDiagnosticReason::AssertionInvalid => "assertion_invalid",
             ClientAuthDiagnosticReason::AssertionBadSignature => "assertion_bad_signature",
             ClientAuthDiagnosticReason::AssertionExpired => "assertion_expired",

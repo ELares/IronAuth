@@ -1740,6 +1740,7 @@ async fn authenticated(
         client_secret: None,
         client_assertion: None,
         client_assertion_type: None,
+        client_certificate: None,
     };
     let (client, scope) = authenticate_client_self_scoped(state, inputs).await.ok()?;
     // A PUBLIC CLIENT IS REFUSED. A `client_id` is not a secret, and a stream decides where

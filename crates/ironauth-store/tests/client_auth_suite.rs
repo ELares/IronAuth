@@ -389,6 +389,8 @@ async fn registering_with_both_jwks_and_jwks_uri_is_a_conflict() {
                 jwks: Some(r#"{"keys":[]}"#),
                 jwks_uri: Some("https://client.test/jwks.json"),
                 signing_alg: None,
+                tls_client_auth_cert: None,
+                tls_client_auth_subject_dn: None,
             },
         )
         .await;
@@ -421,6 +423,8 @@ async fn a_keyless_private_key_jwt_registration_is_rejected() {
                 jwks: None,
                 jwks_uri: None,
                 signing_alg: None,
+                tls_client_auth_cert: None,
+                tls_client_auth_subject_dn: None,
             },
         )
         .await;
@@ -443,6 +447,8 @@ async fn a_keyless_private_key_jwt_registration_is_rejected() {
                 jwks: Some(r#"{"keys":[]}"#),
                 jwks_uri: None,
                 signing_alg: None,
+                tls_client_auth_cert: None,
+                tls_client_auth_subject_dn: None,
             },
         )
         .await;
@@ -471,6 +477,8 @@ async fn registering_client_secret_jwt_is_rejected_loud() {
                 jwks: None,
                 jwks_uri: None,
                 signing_alg: None,
+                tls_client_auth_cert: None,
+                tls_client_auth_subject_dn: None,
             },
         )
         .await;

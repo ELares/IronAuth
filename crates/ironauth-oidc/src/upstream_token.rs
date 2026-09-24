@@ -98,6 +98,7 @@ pub async fn retrieve_upstream_token(
         client_secret: form.client_secret.as_deref(),
         client_assertion: form.client_assertion.as_deref(),
         client_assertion_type: form.client_assertion_type.as_deref(),
+        client_certificate: None,
     };
     let authenticated = match client_auth::authenticate_client(&state, scope, inputs).await {
         Ok(client) => client,
