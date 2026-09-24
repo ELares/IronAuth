@@ -53,6 +53,7 @@ default = []
 test-util = []
 
 [dev-dependencies]
+futures-util.workspace = true
 rcgen = { workspace = true, features = ["pem"] }
 time = { version = "0.3", default-features = false, features = ["std"] }
 # trybuild drives the compile-fail proofs that the private primitives are

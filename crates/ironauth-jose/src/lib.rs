@@ -150,6 +150,7 @@ mod crypto;
 mod dpop;
 pub mod envelope;
 mod error;
+pub mod external_signer;
 mod header;
 mod json;
 mod jwks;
