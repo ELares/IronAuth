@@ -305,6 +305,7 @@ serde_json = "1.0"
 # SAME crate axum already uses for form/query extraction, so no new crate enters the
 # graph; permissive, MSRV 1.85 and musl clean.
 serde_urlencoded = "0.7"
+futures-util = "0.3"
 
 # HTTP runtime and middleware (see docs/adr/0001-http-runtime.md). Pure Rust,
 # musl-static friendly; no TLS crate on the default path (a terminating proxy
