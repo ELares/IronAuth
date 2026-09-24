@@ -500,6 +500,7 @@ async fn issue(
             // would say the token belongs to an agent while its own subject says it does not. The
             // agent is the actor at this door, and RFC 8693 `act` is where an actor belongs.
             agent: None,
+            confirmation: None,
         },
         &target,
     )
@@ -528,6 +529,7 @@ async fn issue(
             jti,
             expires_at_unix_micros: *expires_at_unix_micros,
             dpop_jkt: None,
+            cnf_x5t_s256: None,
         }),
     };
 

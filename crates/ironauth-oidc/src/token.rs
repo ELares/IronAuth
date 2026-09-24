@@ -630,6 +630,7 @@ async fn authorization_code_grant(
             // #368), else None for a plain bearer token. Stored so a resource-server
             // verify (a follow-up) can require a matching proof.
             dpop_jkt,
+            cnf_x5t_s256: None,
         }),
     };
 
@@ -3240,6 +3241,7 @@ fn refresh_access_records<'a>(
                 // (RFC 9449, issue #368 PR3) so it stays sender-constrained across
                 // rotations; [`None`] for an unbound family leaves it bearer.
                 dpop_jkt,
+                cnf_x5t_s256: None,
             }),
         ),
     }

@@ -14,6 +14,7 @@
 
 mod common;
 
+use base64::Engine as _;
 use std::time::{Duration, SystemTime};
 
 use axum::http::StatusCode;
@@ -212,6 +213,117 @@ async fn the_token_endpoint_authenticates_an_mtls_client_end_to_end() {
         status,
         StatusCode::UNAUTHORIZED,
         "a substituted certificate is refused at the token endpoint: {response}"
+    );
+}
+
+/// THE BOUND-TOKEN CRITERION (RFC 8705 section 3): a client-credentials exchange
+/// over an mTLS-authenticated connection mints an access token bound via cnf
+/// x5t#S256, and introspection surfaces the binding.
+#[tokio::test]
+async fn an_mtls_exchange_mints_a_certificate_bound_token() {
+    let h = Harness::start().await;
+    advance_to_now(&h);
+    let cert = fresh_leaf_pem();
+    let client = h
+        .create_self_signed_mtls_client(&cert)
+        .await
+        .expect("the mTLS client registers");
+    let client_id = client.to_string();
+    let body = common::form(&[
+        ("grant_type", "client_credentials"),
+        ("client_id", &client_id),
+    ]);
+    let escaped = percent_escape(&cert);
+    let (status, _, response) = h.token_with_certificate(&body, &escaped).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the mTLS exchange succeeds: {response}"
+    );
+    let tokens: serde_json::Value = serde_json::from_str(&response).expect("token json");
+    let access = tokens["access_token"].as_str().expect("access token");
+
+    // Introspect as a SECOND confidential client (the mTLS client's method cannot
+    // authenticate to /introspect; the introspection credential is its own).
+    let (introspector, secret) = h
+        .create_confidential_client(ironauth_oidc::ClientAuthMethod::Basic)
+        .await;
+    let thumbprint = ironauth_jose::mtls::parse_presented_certificate(&cert)
+        .expect("the cert parses")
+        .thumbprint;
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/introspect")
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(format!("{introspector}:{secret}"))
+            ),
+        )
+        .body(axum::body::Body::from(common::form(&[("token", access)])))
+        .expect("request builds");
+    let (status, _, body) = h.send(request).await;
+    assert_eq!(status, StatusCode::OK, "introspect: {body}");
+    let introspected: serde_json::Value = serde_json::from_str(&body).expect("introspection json");
+    assert_eq!(introspected["active"], true, "the token is active: {body}");
+    assert_eq!(
+        introspected["cnf"]["x5t#S256"].as_str(),
+        Some(thumbprint.as_str()),
+        "introspection reports the certificate thumbprint: {body}"
+    );
+}
+
+/// THE JWT FORM OF THE BINDING: under a JWT access-token format, the minted token
+/// itself carries `cnf.x5t#S256`, not only the introspection record.
+#[tokio::test]
+async fn an_mtls_exchange_mints_a_jwt_bound_via_its_cnf_claim() {
+    let h = Harness::start_with(ironauth_config::OidcConfig {
+        default_access_token_format: ironauth_config::TokenFormat::AtJwt,
+        ..ironauth_config::OidcConfig::default()
+    })
+    .await;
+    advance_to_now(&h);
+    let cert = fresh_leaf_pem();
+    let client = h
+        .create_self_signed_mtls_client(&cert)
+        .await
+        .expect("the mTLS client registers");
+    let client_id = client.to_string();
+    let body = common::form(&[
+        ("grant_type", "client_credentials"),
+        ("client_id", &client_id),
+    ]);
+    let escaped = percent_escape(&cert);
+    let (status, _, response) = h.token_with_certificate(&body, &escaped).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the mTLS exchange succeeds: {response}"
+    );
+    let tokens: serde_json::Value = serde_json::from_str(&response).expect("token json");
+    let access = tokens["access_token"].as_str().expect("access token");
+
+    // The at+jwt token's payload carries the binding.
+    let payload = access.split('.').nth(1).expect("the payload segment");
+    let claims: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("the payload decodes"),
+    )
+    .expect("the payload is json");
+    let thumbprint = ironauth_jose::mtls::parse_presented_certificate(&cert)
+        .expect("the cert parses")
+        .thumbprint;
+    assert_eq!(
+        claims["cnf"]["x5t#S256"].as_str(),
+        Some(thumbprint.as_str()),
+        "the minted JWT embeds cnf x5t#S256: {claims}"
     );
 }
 

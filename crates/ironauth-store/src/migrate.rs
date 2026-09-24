@@ -1998,6 +1998,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0234_client_tls_client_auth.sql"),
         },
+        // EXPAND (issue #159): the certificate-bound opaque-token confirmation.
+        Migration {
+            version: 235,
+            name: "cnf_x5t_s256",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0235_cnf_x5t_s256.sql"),
+        },
     ]
 }
 

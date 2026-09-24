@@ -487,6 +487,7 @@ async fn issue_device_tokens(
             expires_at_unix_micros: *expires_at_unix_micros,
             // The device-authorization grant carries no DPoP proof: a bearer token.
             dpop_jkt: None,
+            cnf_x5t_s256: None,
         }),
     };
 

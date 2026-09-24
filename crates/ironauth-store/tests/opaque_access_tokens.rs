@@ -84,6 +84,7 @@ async fn issue_code(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn an_opaque_token_records_digest_only_and_resolves_to_its_live_claims() {
     let db = TestDatabase::start().await;
     let env = Env::system();
@@ -115,6 +116,7 @@ async fn an_opaque_token_records_digest_only_and_resolves_to_its_live_claims() {
                 jti: &jti,
                 expires_at_unix_micros: FAR_FUTURE_MICROS,
                 dpop_jkt: None,
+                cnf_x5t_s256: None,
             }),
             Duration::ZERO,
         )
@@ -239,6 +241,7 @@ async fn grant_chain_revocation_flips_an_opaque_token_inactive() {
                 jti: &jti,
                 expires_at_unix_micros: FAR_FUTURE_MICROS,
                 dpop_jkt: None,
+                cnf_x5t_s256: None,
             }),
             Duration::ZERO,
         )
@@ -307,6 +310,7 @@ async fn an_expired_opaque_token_does_not_resolve() {
                 jti: &jti,
                 expires_at_unix_micros: 1_000_000,
                 dpop_jkt: None,
+                cnf_x5t_s256: None,
             }),
             Duration::ZERO,
         )
@@ -368,6 +372,7 @@ async fn an_opaque_token_never_resolves_across_scopes() {
                 jti: &jti,
                 expires_at_unix_micros: FAR_FUTURE_MICROS,
                 dpop_jkt: None,
+                cnf_x5t_s256: None,
             }),
             Duration::ZERO,
         )

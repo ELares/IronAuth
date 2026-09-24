@@ -1,0 +1,14 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The certificate-bound access-token confirmation (issue #159).
+--
+-- RFC 8705 section 3: when a token is issued over an mTLS-authenticated
+-- connection, it carries cnf x5t#S256 -- the base64url SHA-256 thumbprint of
+-- the client certificate -- so a resource server can require the matching
+-- certificate on presentation. The JWT form embeds the claim at mint time;
+-- the opaque form stores the thumbprint HERE, the same role the dpop_jkt
+-- column (migration 0082) plays for DPoP-bound tokens, so introspection
+-- resolves the binding either way.
+--
+-- EXPAND: additive column; existing rows are unaffected (NULL = bearer token).
+ALTER TABLE opaque_access_tokens ADD COLUMN cnf_x5t_s256 text;

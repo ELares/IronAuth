@@ -1039,6 +1039,7 @@ async fn mint_and_persist(
             // would assert that the token belongs to an agent when its own `sub` says otherwise.
             // The agent is the actor at this door, and RFC 8693 `act` is where an actor belongs.
             agent: None,
+            confirmation: None,
         },
         &target,
     )
@@ -1079,6 +1080,7 @@ async fn mint_and_persist(
             expires_at_unix_micros: *expires_at_unix_micros,
             // The JWT bearer assertion grant carries no DPoP proof: a bearer token.
             dpop_jkt: None,
+            cnf_x5t_s256: None,
         }),
     };
     state
