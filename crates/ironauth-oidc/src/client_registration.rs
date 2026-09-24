@@ -298,6 +298,13 @@ pub async fn register(
         tls_client_auth_subject_dn: metadata
             .get("tls_client_auth_subject_dn")
             .and_then(|value| value.as_str()),
+        // RFC 8705 section 5 (issue #159): the client's declaration that it will
+        // call the published mTLS aliases. Absent or false means the endpoints at
+        // the normal base, where the certificate header is optional.
+        use_mtls_endpoint_aliases: metadata
+            .get("use_mtls_endpoint_aliases")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         registration_access_token_hash: &registration_token_hash,
         registration_uri_base: &registration_uri_base,
         quarantined: authz.quarantined,

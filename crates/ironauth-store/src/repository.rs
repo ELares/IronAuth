@@ -3128,6 +3128,10 @@ pub struct ClientScopePolicy {
 /// hash, so a struct dump or a `tracing` field never spills it (its presence is
 /// reported as a bool instead).
 #[derive(Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the record's booleans are the client's registered posture flags: bearer-token permission, grant types, exchange allowances, and the mTLS declaration, each independently consumed"
+)]
 pub struct ClientAuthRecord {
     /// The client's display name (shown on the consent screen).
     pub display_name: String,
@@ -3157,6 +3161,8 @@ pub struct ClientAuthRecord {
     /// The expected subject distinguished name for `tls_client_auth` (RFC 8705
     /// section 2.1.2), or `None` while the SAN-based alternatives are unshipped.
     pub tls_client_auth_subject_dn: Option<String>,
+    /// The client's RFC 8705 `use_mtls_endpoint_aliases` declaration (issue #159).
+    pub use_mtls_endpoint_aliases: bool,
     /// The client's refresh-token rotation override (issue #21): `Some("always")`
     /// to rotate on every refresh, `Some("threshold")` to rotate only past the
     /// configured fraction of TTL, or `None` to derive the policy from the client's
@@ -3201,6 +3207,7 @@ impl fmt::Debug for ClientAuthRecord {
                 "tls_client_auth_subject_dn",
                 &self.tls_client_auth_subject_dn,
             )
+            .field("use_mtls_endpoint_aliases", &self.use_mtls_endpoint_aliases)
             .field("jwks_uri", &self.jwks_uri)
             .field(
                 "token_endpoint_auth_signing_alg",
@@ -3368,6 +3375,9 @@ pub struct NewDynamicClient<'a> {
     /// The expected subject distinguished name for `tls_client_auth` (issue #159),
     /// or `None` while the SAN-based alternatives are unshipped.
     pub tls_client_auth_subject_dn: Option<&'a str>,
+    /// The RFC 8705 `use_mtls_endpoint_aliases` declaration (issue #159): whether
+    /// this client will call the published mTLS aliases.
+    pub use_mtls_endpoint_aliases: bool,
     /// The SHA-256 (hex) of the freshly minted registration access token.
     pub registration_access_token_hash: &'a str,
     /// The base of the RFC 7592 client configuration endpoint
@@ -3553,7 +3563,7 @@ impl ClientRepo<'_> {
         let row = sqlx::query(
             "SELECT display_name, token_endpoint_auth_method, secret_hash, \
              jwks, jwks_uri, token_endpoint_auth_signing_alg, tls_client_auth_cert, \
-             tls_client_auth_subject_dn, refresh_rotation, \
+             tls_client_auth_subject_dn, use_mtls_endpoint_aliases, refresh_rotation, \
              allow_bearer_tokens, grant_types, \
              token_exchange_impersonation_allowed, token_exchange_refresh_allowed \
              FROM clients \
@@ -3575,6 +3585,7 @@ impl ClientRepo<'_> {
             token_endpoint_auth_signing_alg: row.get("token_endpoint_auth_signing_alg"),
             tls_client_auth_cert: row.get("tls_client_auth_cert"),
             tls_client_auth_subject_dn: row.get("tls_client_auth_subject_dn"),
+            use_mtls_endpoint_aliases: row.get("use_mtls_endpoint_aliases"),
             refresh_rotation: row.get("refresh_rotation"),
             allow_bearer_tokens: row.get("allow_bearer_tokens"),
             grant_types: row.get("grant_types"),
@@ -6570,11 +6581,12 @@ impl ActingClientRepo<'_> {
                       token_endpoint_auth_method, secret_hash, redirect_uris, \
                       application_type, id_token_signed_response_alg, jwks, jwks_uri, \
                       token_endpoint_auth_signing_alg, tls_client_auth_cert, \
-                      tls_client_auth_subject_dn, registration_client_uri, \
+                      tls_client_auth_subject_dn, use_mtls_endpoint_aliases, \
+                      registration_client_uri, \
                       registration_access_token_hash, quarantined, dcr_policy_chain, \
                       dcr_registered) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                             $15, $16, $17, $18, true)",
+                             $15, $16, $17, $18, $19, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -6590,6 +6602,7 @@ impl ActingClientRepo<'_> {
                 .bind(params.token_endpoint_auth_signing_alg)
                 .bind(params.tls_client_auth_cert)
                 .bind(params.tls_client_auth_subject_dn)
+                .bind(params.use_mtls_endpoint_aliases)
                 .bind(&client_uri)
                 .bind(params.registration_access_token_hash)
                 .bind(params.quarantined)

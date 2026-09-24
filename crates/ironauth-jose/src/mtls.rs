@@ -317,7 +317,7 @@ mod tests {
                 .certificate(),
         );
         let now = SystemTime::now() // invariant-allow: time-via-env (test cert
-        // validity windows anchored to real wall-clock)
+            // validity windows anchored to real wall-clock)
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("post-epoch")
             .as_secs()
@@ -350,7 +350,7 @@ mod tests {
                 .certificate(),
         );
         let now = SystemTime::now() // invariant-allow: time-via-env (test cert
-        // validity windows anchored to real wall-clock)
+            // validity windows anchored to real wall-clock)
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("post-epoch")
             .as_secs()
@@ -373,7 +373,7 @@ mod tests {
             .expect("leaf");
         let anchor = parse_presented_certificate(&ca.pem()).expect("anchor parses");
         let now = SystemTime::now() // invariant-allow: time-via-env (test cert
-        // validity windows anchored to real wall-clock)
+            // validity windows anchored to real wall-clock)
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("post-epoch")
             .as_secs()

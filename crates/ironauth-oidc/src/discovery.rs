@@ -185,6 +185,31 @@ pub struct DiscoveryEndpoint {
 /// under the issuer path, like `jwks_uri`), so the generator emits it directly as
 /// `{issuer}/connect/register` and only when
 /// [`DiscoveryCapabilities::registration_endpoint_enabled`] is set.
+/// The endpoints RFC 8705 section 5 aliases under `mtls_endpoint_aliases` (issue
+/// #159): the token, revocation, and introspection endpoints, whose alias URLs a
+/// `use_mtls_endpoint_aliases` client calls. The paths are the SAME the registry
+/// advertises at the normal base; only the host differs.
+pub const MTLS_ALIASED_ENDPOINTS: &[DiscoveryEndpoint] = &[
+    DiscoveryEndpoint {
+        metadata_key: "token_endpoint",
+        path: "/token",
+    },
+    DiscoveryEndpoint {
+        metadata_key: "revocation_endpoint",
+        path: "/revoke",
+    },
+    DiscoveryEndpoint {
+        metadata_key: "introspection_endpoint",
+        path: "/introspect",
+    },
+];
+
+/// The deployment-root endpoints this build serves (see the module doc for the
+/// full story). The generator loops over this registry, so an endpoint appears in
+/// discovery iff it is served; `registration_endpoint` (issue #30) is NOT here: it
+/// is PER ENVIRONMENT (served under the issuer path, like `jwks_uri`), so the
+/// generator emits it directly as `{issuer}/connect/register` and only when
+/// [`DiscoveryCapabilities::registration_endpoint_enabled`] is set.
 pub const ADVERTISED_ENDPOINTS: &[DiscoveryEndpoint] = &[
     DiscoveryEndpoint {
         metadata_key: "authorization_endpoint",
@@ -289,6 +314,12 @@ pub struct DiscoveryCapabilities {
     /// so discovery's `require_pushed_authorization_requests` reflects exactly what
     /// the authorization endpoint enforces. `false` by default (PAR is optional).
     require_pushed_authorization_requests: bool,
+    /// The mTLS alias base URL (issue #159, RFC 8705 section 5): when set, discovery
+    /// publishes `mtls_endpoint_aliases` pointing at this base, and a client with
+    /// `use_mtls_endpoint_aliases` true calls those endpoints. `None` (the default)
+    /// publishes no aliases: the endpoints are served at `public_url` and mTLS
+    /// clients authenticate there through the certificate header.
+    mtls_endpoint_aliases_base: Option<String>,
     /// Whether the Dynamic Client Registration endpoint is enabled (issue #30). When
     /// `true`, the document advertises the per-environment `registration_endpoint`
     /// (`{issuer}/connect/register`); when `false` the field is absent, so discovery
@@ -367,6 +398,14 @@ impl DiscoveryCapabilities {
         caps.with_registration_endpoint(config.registration_enabled)
             .with_session_management(config.session_management_enabled)
             .with_frontchannel_logout(config.frontchannel_logout_enabled)
+    }
+
+    /// Arm the RFC 8705 `mtls_endpoint_aliases` (issue #159) at `base`, the
+    /// mTLS-terminating host serving the same paths. An empty base publishes nothing.
+    #[must_use]
+    pub fn with_mtls_endpoint_aliases_base(mut self, base: Option<String>) -> Self {
+        self.mtls_endpoint_aliases_base = base.filter(|value| !value.is_empty());
+        self
     }
 
     /// Declare whether OIDC Session Management 1.0 is enabled (issue #39), so
@@ -522,6 +561,22 @@ pub fn discovery_document(
             endpoint.metadata_key.to_owned(),
             json!(format!("{base}{}", endpoint.path)),
         );
+    }
+
+    // The RFC 8705 section 5 mTLS endpoint aliases (issue #159): the SAME endpoints
+    // under the configured mTLS-terminating base, so a client with
+    // `use_mtls_endpoint_aliases` true calls a host whose proxy requires the client
+    // certificate. Published ONLY when an operator configured the base, so discovery
+    // never names a host nothing serves.
+    if let Some(base) = &capabilities.mtls_endpoint_aliases_base {
+        let mut aliases = serde_json::Map::new();
+        for endpoint in MTLS_ALIASED_ENDPOINTS {
+            aliases.insert(
+                endpoint.metadata_key.to_owned(),
+                json!(format!("{base}{}", endpoint.path)),
+            );
+        }
+        document.insert("mtls_endpoint_aliases".to_owned(), json!(aliases));
     }
 
     // The Dynamic Client Registration endpoint (issue #30) is PER ENVIRONMENT, like

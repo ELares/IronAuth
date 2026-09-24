@@ -3313,6 +3313,14 @@
           "description": "Socket address the management plane listens on. Liveness, readiness,\nand the Prometheus metrics endpoint live here so the data plane is\nnever probed publicly; bind it to a private interface.",
           "type": "string"
         },
+        "mtls_public_url": {
+          "default": null,
+          "description": "The mTLS-terminating base URL for the RFC 8705 `mtls_endpoint_aliases`\n(issue #159): the host where a TLS-terminating proxy requires client\ncertificates and forwards the SAME paths this server serves. Unset (the\ndefault) publishes no aliases: the endpoints are served at `public_url` and\nmTLS clients authenticate there through the certificate header. Must be an\nhttps URL when set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "public_url": {
           "default": null,
           "description": "Externally visible base URL (scheme and host) used to mint issuer and\nendpoint URLs. Unset means single-host development behind the bind\naddress. The scheme, host, and issuer always derive from this value,\nnever from request headers (see the `[proxy]` policy).",
@@ -4175,6 +4183,7 @@
       "default": {
         "bind": "127.0.0.1:8443",
         "management_bind": "127.0.0.1:9443",
+        "mtls_public_url": null,
         "public_url": null,
         "shutdown_grace_secs": 25
       },

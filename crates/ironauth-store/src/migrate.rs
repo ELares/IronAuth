@@ -2005,6 +2005,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0235_cnf_x5t_s256.sql"),
         },
+        // EXPAND (issue #159): the client's use_mtls_endpoint_aliases declaration.
+        Migration {
+            version: 236,
+            name: "use_mtls_endpoint_aliases",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0236_use_mtls_endpoint_aliases.sql"),
+        },
     ]
 }
 

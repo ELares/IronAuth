@@ -550,6 +550,7 @@ mod tests {
     fn server_with_url(url: &str) -> ServerConfig {
         ServerConfig {
             public_url: Some(url.to_owned()),
+            mtls_public_url: None,
             ..ServerConfig::default()
         }
     }
