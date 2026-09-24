@@ -126,10 +126,13 @@ pub struct ClientContext {
 }
 
 /// The evaluated trusted-proxy policy.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ProxyPolicy {
     trusted_hops: u32,
     trust_forwarded: bool,
+    /// The configured client-certificate header name (issue #159); empty disables
+    /// client-certificate delivery.
+    client_certificate_header: String,
 }
 
 impl ProxyPolicy {
@@ -139,7 +142,15 @@ impl ProxyPolicy {
         Self {
             trusted_hops: proxy.trusted_hops,
             trust_forwarded: proxy.trust_forwarded,
+            client_certificate_header: proxy.client_certificate_header.clone(),
         }
+    }
+
+    /// The configured client-certificate header name (issue #159); empty disables
+    /// delivery.
+    #[must_use]
+    pub fn client_certificate_header(&self) -> &str {
+        &self.client_certificate_header
     }
 
     /// Whether the policy consults forwarding headers at all.
@@ -354,7 +365,57 @@ mod tests {
         ProxyPolicy {
             trusted_hops: hops,
             trust_forwarded: true,
+            client_certificate_header: "x-ssl-client-cert".to_owned(),
         }
+    }
+
+    /// THE MTLS CERT GATE (issue #159): a certificate header is stamped onto
+    /// `CLIENT_CERT_HEADER` ONLY when the request arrived through the trusted chain and
+    /// the deployment configured a header name; otherwise the header is REMOVED, so a
+    /// direct request cannot present a certificate and a spoofed stamp cannot survive.
+    #[test]
+    fn the_client_certificate_rides_only_the_trusted_chain() {
+        let stamped = crate::observe::stamp_client_certificate; // (unit seam)
+        let _ = stamped;
+        // 1. Trusted chain, configured header: the certificate is stamped.
+        let policy = trust(1);
+        let mut hs = headers(&[
+            ("x-forwarded-for", "1.2.3.4"),
+            ("x-ssl-client-cert", "CERT-PEM"),
+        ]);
+        assert_eq!(
+            policy.resolve_client_ip(PEER, &hs).decision,
+            ForwardDecision::Honored
+        );
+        crate::observe::stamp_client_certificate(&mut hs, &policy, true);
+        assert_eq!(
+            hs.get(ironauth_config::CLIENT_CERT_HEADER)
+                .map(|v| v.to_str().unwrap()),
+            Some("CERT-PEM")
+        );
+
+        // 2. Direct (no trusted chain): a presented certificate header is NOT stamped,
+        // and a SPOOFED stamp is removed.
+        let policy = zero_trust();
+        let mut hs = headers(&[
+            ("x-ssl-client-cert", "CERT-PEM"),
+            ("x-ironauth-client-cert", "SPOOFED"),
+        ]);
+        crate::observe::stamp_client_certificate(&mut hs, &policy, false);
+        assert!(
+            hs.get(ironauth_config::CLIENT_CERT_HEADER).is_none(),
+            "a direct request cannot present a certificate"
+        );
+
+        // 3. Trusted chain but NO configured header name: nothing is stamped.
+        let policy = ProxyPolicy {
+            trusted_hops: 1,
+            trust_forwarded: true,
+            client_certificate_header: String::new(),
+        };
+        let mut hs = headers(&[("x-forwarded-for", "1.2.3.4")]);
+        crate::observe::stamp_client_certificate(&mut hs, &policy, true);
+        assert!(hs.get(ironauth_config::CLIENT_CERT_HEADER).is_none());
     }
 
     #[test]
@@ -376,6 +437,7 @@ mod tests {
         let policy = ProxyPolicy {
             trusted_hops: 2,
             trust_forwarded: false,
+            client_certificate_header: String::new(),
         };
         let hs = headers(&[("x-forwarded-for", "1.2.3.4, 5.6.7.8")]);
         assert_eq!(

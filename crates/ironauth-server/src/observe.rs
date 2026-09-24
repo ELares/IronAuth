@@ -15,10 +15,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::extract::{ConnectInfo, FromRequestParts, MatchedPath, Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
-use ironauth_config::{FORWARD_DECISION_HEADER, FORWARD_DECISION_HONORED, PEER_IP_HEADER};
+use ironauth_config::{
+    CLIENT_CERT_HEADER, FORWARD_DECISION_HEADER, FORWARD_DECISION_HONORED, PEER_IP_HEADER,
+};
 use tracing::Instrument;
 
 use crate::AppState;
@@ -54,6 +56,33 @@ fn method_label(method: &Method) -> &'static str {
         Method::CONNECT => "CONNECT",
         Method::TRACE => "TRACE",
         _ => OTHER_METHOD,
+    }
+}
+
+/// Stamp the trusted-proxy-admitted client certificate onto [`CLIENT_CERT_HEADER`]
+/// (issue #159). The deployment's configured `client_certificate_header` is read ONLY
+/// when `honored` (the request arrived through the trusted chain), and the value is
+/// `insert`ed - REPLACING anything a client supplied, so a direct request cannot
+/// present a certificate. An empty configured header name disables delivery.
+pub(crate) fn stamp_client_certificate(
+    headers: &mut HeaderMap,
+    policy: &crate::proxy::ProxyPolicy,
+    honored: bool,
+) {
+    let configured = policy.client_certificate_header();
+    if !honored || configured.is_empty() {
+        headers.remove(CLIENT_CERT_HEADER);
+        return;
+    }
+    let Some(cert) = headers
+        .get(configured)
+        .and_then(|value| value.to_str().ok())
+    else {
+        headers.remove(CLIENT_CERT_HEADER);
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(cert) {
+        headers.insert(CLIENT_CERT_HEADER, value);
     }
 }
 
@@ -122,6 +151,14 @@ pub async fn observe(State(state): State<AppState>, mut req: Request, next: Next
         req.headers_mut()
             .remove(HeaderName::from_static(FORWARD_DECISION_HEADER));
     }
+
+    // THE MUTUAL-TLS CLIENT CERTIFICATE (issue #159), on the same terms: a TLS-
+    // terminating proxy's client-certificate header is read ONLY when the request
+    // arrived through the trusted chain, and its value is re-stamped onto
+    // CLIENT_CERT_HEADER with the same `insert`-replaces semantics - a direct request
+    // cannot present a certificate, and a request that never passed this middleware
+    // carries nothing. An empty configured header name disables delivery.
+    stamp_client_certificate(req.headers_mut(), &state.policy, forwarding_honored);
 
     let span = tracing::info_span!(
         "http_request",
