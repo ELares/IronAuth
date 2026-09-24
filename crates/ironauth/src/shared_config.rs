@@ -746,6 +746,15 @@ mod tests {
              which none does.",
         ),
         (
+            "signing_rotation",
+            Reach::OnePlaneOrNoState,
+            "consumed once at boot to build the signing-key rotation timer (issue #160), a \
+             background task that answers no request and drives the machine's transitions \
+             on its interval. No plane state holds it: the timer advances every \
+             environment in the database, and handing the section to a plane would \
+             suggest a request path can rotate signing keys, which none does.",
+        ),
+        (
             "dev_mode",
             Reach::OnePlaneOrNoState,
             "a scalar, not a section: it relaxes the literal-secret warning at load and \
