@@ -109,7 +109,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      inbound RISC SET replay, log stream dead letter abandoned, access grant requests, \
      hot state, hot state invalidation cursors, hot state column scoped updates, per-tenant quota limits, \
      readiness can read the ledger, tenant quota limits scope key, replication cursors, \
-     signing key rotation lifecycle grant";
+     signing key rotation lifecycle grant, \
+     client tls client auth";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -740,7 +741,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        233,
+        234,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -784,7 +785,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193,
             194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210,
             211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227,
-            228, 229, 230, 231, 232, 233
+            228, 229, 230, 231, 232, 233, 234
         ]
     );
     let phase_of = |version: i64| async move {

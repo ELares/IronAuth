@@ -292,6 +292,12 @@ pub async fn register(
         jwks: validated.jwks.as_deref(),
         jwks_uri: validated.jwks_uri.as_deref(),
         token_endpoint_auth_signing_alg: validated.token_endpoint_auth_signing_alg.as_deref(),
+        tls_client_auth_cert: metadata
+            .get("tls_client_auth_cert")
+            .and_then(|value| value.as_str()),
+        tls_client_auth_subject_dn: metadata
+            .get("tls_client_auth_subject_dn")
+            .and_then(|value| value.as_str()),
         registration_access_token_hash: &registration_token_hash,
         registration_uri_base: &registration_uri_base,
         quarantined: authz.quarantined,
@@ -1016,6 +1022,25 @@ fn validate_auth_method(
     match ClientAuthMethod::parse(raw) {
         // Only a method the suite ADVERTISES is registrable: client_secret_jwt is
         // recognized but inert (issue #25), so it is not in ALL and is refused here.
+        // self_signed_tls_client_auth (issue #159) is registrable too, with its
+        // registered certificate REQUIRED (below); tls_client_auth (the PKI method)
+        // stays refused until its chain-validation surface lands.
+        Some(ClientAuthMethod::SelfSignedTlsClientAuth) => {
+            let Some(Value::String(cert_pem)) = metadata.get("tls_client_auth_cert") else {
+                return Err(RegistrationError::metadata(
+                    "self_signed_tls_client_auth requires tls_client_auth_cert (the \
+                     exact client certificate PEM every request must present)",
+                ));
+            };
+            // A certificate that does not PARSE would register a client whose every
+            // request must fail: refuse it LOUD at registration.
+            if ironauth_jose::mtls::parse_presented_certificate(cert_pem).is_err() {
+                return Err(RegistrationError::metadata(
+                    "tls_client_auth_cert is not a parseable PEM certificate",
+                ));
+            }
+            Ok(ClientAuthMethod::SelfSignedTlsClientAuth)
+        }
         Some(method) if ClientAuthMethod::ALL.contains(&method) => Ok(method),
         _ => Err(RegistrationError::metadata(
             "token_endpoint_auth_method is not supported by this provider",

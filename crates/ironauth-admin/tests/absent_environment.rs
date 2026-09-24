@@ -1040,6 +1040,7 @@ fn environment_child_cases(base: &str, ids: &Ids) -> Vec<Case> {
 
 /// The environment-scoped writes that address a session, a quarantined signup, a
 /// permission, a resource server, or a recovery approval.
+#[allow(clippy::too_many_lines)]
 fn resource_cases(base: &str, ids: &Ids) -> Vec<Case> {
     let Ids {
         user,

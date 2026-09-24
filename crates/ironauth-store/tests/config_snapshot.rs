@@ -108,6 +108,8 @@ async fn seed_fixture(db: &TestDatabase, env: &Env, scope: Scope) -> String {
                 jwks: Some(PUBLIC_JWKS),
                 jwks_uri: None,
                 signing_alg: Some("EdDSA"),
+                tls_client_auth_cert: None,
+                tls_client_auth_subject_dn: None,
             },
         )
         .await
@@ -423,6 +425,8 @@ async fn export_projects_a_private_bearing_client_jwks_to_its_public_half() {
                 jwks: Some(PRIVATE_JWKS),
                 jwks_uri: None,
                 signing_alg: Some("RS256"),
+                tls_client_auth_cert: None,
+                tls_client_auth_subject_dn: None,
             },
         )
         .await

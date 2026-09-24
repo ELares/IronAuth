@@ -203,6 +203,7 @@ async fn present(
         ClientAuthInputs {
             client_assertion: Some(assertion),
             client_assertion_type: Some(JWT_BEARER_ASSERTION_TYPE),
+            client_certificate: None,
             ..ClientAuthInputs::default()
         },
     )
@@ -335,6 +336,7 @@ async fn the_rfc7523_claim_rules_are_enforced_with_opaque_errors_and_diagnostics
                 client_id: Some(&cid),
                 client_assertion: Some(&no_sub),
                 client_assertion_type: Some(JWT_BEARER_ASSERTION_TYPE),
+                client_certificate: None,
                 ..ClientAuthInputs::default()
             },
         )
@@ -448,6 +450,7 @@ async fn dual_authentication_methods_are_rejected_as_invalid_request() {
             client_secret: Some("a-secret"),
             client_assertion: Some(&assertion),
             client_assertion_type: Some(JWT_BEARER_ASSERTION_TYPE),
+            client_certificate: None,
             ..ClientAuthInputs::default()
         },
     )

@@ -13,6 +13,7 @@ repository.workspace = true
 # verify entry point. Auto-discovery stays on (no per-test required-features).
 
 [dependencies]
+x509-parser.workspace = true
 # The crypto backend is ring's low-level signature primitives DIRECTLY (no
 # high-level JOSE crate: those carry the very CVE classes this core closes). ring
 # is already in the tree via rustls; this is a direct edge, no new crate, no
@@ -52,6 +53,8 @@ default = []
 test-util = []
 
 [dev-dependencies]
+rcgen = { workspace = true, features = ["pem"] }
+time = { version = "0.3", default-features = false, features = ["std"] }
 # trybuild drives the compile-fail proofs that the private primitives are
 # unreachable from outside the crate.
 trybuild.workspace = true

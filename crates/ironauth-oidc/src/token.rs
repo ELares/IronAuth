@@ -1077,6 +1077,7 @@ async fn authenticate_client(
         client_secret: params.client_secret.as_deref(),
         client_assertion: params.client_assertion.as_deref(),
         client_assertion_type: params.client_assertion_type.as_deref(),
+        client_certificate: None,
     };
     client_auth::authenticate_client(state, scope, inputs)
         .await

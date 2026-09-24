@@ -3629,6 +3629,38 @@ impl Harness {
                     jwks,
                     jwks_uri,
                     signing_alg,
+                    tls_client_auth_cert: None,
+                    tls_client_auth_subject_dn: None,
+                },
+            )
+            .await?;
+        self.register_default_redirect(&id).await;
+        Ok(id)
+    }
+
+    /// Register a client for `self_signed_tls_client_auth` with its registered
+    /// certificate (issue #159). A certificate-less registration is a store CHECK
+    /// violation, surfaced as [`ironauth_store::StoreError::Conflict`].
+    pub async fn create_self_signed_mtls_client(
+        &self,
+        cert_pem: &str,
+    ) -> Result<ClientId, ironauth_store::StoreError> {
+        let (actor, corr) = self.seeding_actor();
+        let id = self
+            .store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .clients()
+            .create_jwt_auth(
+                &self.env,
+                NewJwtAuthClient {
+                    display_name: "self-signed mTLS client",
+                    auth_method: ClientAuthMethod::SelfSignedTlsClientAuth.as_str(),
+                    jwks: None,
+                    jwks_uri: None,
+                    signing_alg: None,
+                    tls_client_auth_cert: Some(cert_pem),
+                    tls_client_auth_subject_dn: None,
                 },
             )
             .await?;

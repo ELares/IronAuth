@@ -161,6 +161,7 @@ pub async fn global_token_revocation(
         client_secret: None,
         client_assertion: None,
         client_assertion_type: None,
+        client_certificate: None,
     };
     let Ok((client, scope)) = authenticate_client_self_scoped(&state, inputs).await else {
         return unauthorized();

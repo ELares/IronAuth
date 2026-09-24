@@ -652,6 +652,7 @@ async fn the_shared_aud_policy_governs_this_grant_and_client_assertions_identica
             ClientAuthInputs {
                 client_assertion: Some(&client_assertion),
                 client_assertion_type: Some(JWT_BEARER_ASSERTION_TYPE),
+                client_certificate: None,
                 ..ClientAuthInputs::default()
             },
         )

@@ -893,6 +893,7 @@ async fn enforce_client_auth_parity(
         client_secret: auth.client_secret,
         client_assertion: auth.client_assertion,
         client_assertion_type: auth.client_assertion_type,
+        client_certificate: None,
     };
     match client_auth::authenticate_client(state, scope, inputs).await {
         // Binding re-check (mirrors token.rs step 5): the authenticated client MUST be the bound
