@@ -1308,6 +1308,21 @@
       },
       "type": "object"
     },
+    "MtlsConfig": {
+      "additionalProperties": false,
+      "description": "The mutual-TLS trust-anchor configuration (issue #159): the CA bundle the\n`tls_client_auth` PKI method validates presented chains against.\n\nEmpty by default, which leaves the method unregistrable (a chain cannot validate\nagainst a bundle nothing configured). This crate carries no `ironauth-jose`\ndependency, so the parse check lives at the serve layer's boot: a configured\nbundle whose entries do not parse refuses the method's registration there.",
+      "properties": {
+        "trust_anchor_certs": {
+          "default": [],
+          "description": "The trusted root (or intermediate) CA certificates, PEM-encoded, one entry\nper element. A presented certificate chain is accepted when every link's\nsignature verifies and the topmost presented cert is signed by one of these.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "OidcConfig": {
       "additionalProperties": false,
       "description": "OIDC provider settings (issue #12).\n\nThe public authorization and token endpoints. Lifetimes are configurable (the\ntunability principle) with safe defaults, never a baked-in one-way choice: the\nauthorization code is short-lived and single-use, the access token a little\nlonger. Mounting is opt-in so the default (and database-free) boot is\nunchanged.",
@@ -3772,6 +3787,13 @@
         "providers": []
       },
       "description": "Outbound message delivery (issue #111)."
+    },
+    "mtls": {
+      "$ref": "#/$defs/MtlsConfig",
+      "default": {
+        "trust_anchor_certs": []
+      },
+      "description": "Mutual-TLS client authentication (issue #159): the PKI method's trust\nanchors. Empty by default, which leaves `tls_client_auth` unregistrable:\na chain cannot validate against a bundle nothing configured."
     },
     "oidc": {
       "$ref": "#/$defs/OidcConfig",

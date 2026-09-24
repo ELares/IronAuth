@@ -37,7 +37,7 @@ use rcgen::{CertificateParams, KeyPair, KeyUsagePurpose};
 
 /// The harness's deterministic clock starts at the UNIX epoch; a test advances it to
 /// the REAL now so the auth instant lands inside every cert's validity window.
-fn advance_to_now(h: &Harness) {
+fn advance_to_now(h: &mut Harness) {
     let now = SystemTime::now() // invariant-allow: time-via-env (the harness clock is
         // advanced to REAL now so the auth instant lands inside the test certs' validity
         // windows; the certs themselves are anchored to the same real wall-clock).
@@ -93,8 +93,8 @@ async fn authenticate(
 /// The registered certificate authenticates; the client id is the wire claim.
 #[tokio::test]
 async fn the_registered_certificate_authenticates() {
-    let h = Harness::start().await;
-    advance_to_now(&h);
+    let mut h = Harness::start().await;
+    advance_to_now(&mut h);
     let cert = fresh_leaf_pem();
     let client = h
         .create_self_signed_mtls_client(&cert)
@@ -109,8 +109,8 @@ async fn the_registered_certificate_authenticates() {
 /// not the registered one.
 #[tokio::test]
 async fn a_different_certificate_is_rejected() {
-    let h = Harness::start().await;
-    advance_to_now(&h);
+    let mut h = Harness::start().await;
+    advance_to_now(&mut h);
     let registered = fresh_leaf_pem();
     let substituted = fresh_leaf_pem();
     assert_ne!(registered, substituted, "two fresh leaves differ");
@@ -132,8 +132,8 @@ async fn a_different_certificate_is_rejected() {
 /// method demands validity at the request instant as well as DER equality.
 #[tokio::test]
 async fn an_expired_registered_certificate_is_rejected() {
-    let h = Harness::start().await;
-    advance_to_now(&h);
+    let mut h = Harness::start().await;
+    advance_to_now(&mut h);
     let expired = leaf_pem(
         SystemTime::now() - Duration::from_secs(7200), // invariant-allow: time-via-env
         SystemTime::now() - Duration::from_secs(3600), // invariant-allow: time-via-env
@@ -155,8 +155,8 @@ async fn an_expired_registered_certificate_is_rejected() {
 /// A certificate-less request is rejected for a method that requires one.
 #[tokio::test]
 async fn a_certificate_less_request_is_rejected() {
-    let h = Harness::start().await;
-    advance_to_now(&h);
+    let mut h = Harness::start().await;
+    advance_to_now(&mut h);
     let cert = fresh_leaf_pem();
     let client = h
         .create_self_signed_mtls_client(&cert)
@@ -177,8 +177,8 @@ async fn a_certificate_less_request_is_rejected() {
 /// certificate header, and a substituted certificate is refused.
 #[tokio::test]
 async fn the_token_endpoint_authenticates_an_mtls_client_end_to_end() {
-    let h = Harness::start().await;
-    advance_to_now(&h);
+    let mut h = Harness::start().await;
+    advance_to_now(&mut h);
     let cert = fresh_leaf_pem();
     let client = h
         .create_self_signed_mtls_client(&cert)
@@ -221,8 +221,8 @@ async fn the_token_endpoint_authenticates_an_mtls_client_end_to_end() {
 /// x5t#S256, and introspection surfaces the binding.
 #[tokio::test]
 async fn an_mtls_exchange_mints_a_certificate_bound_token() {
-    let h = Harness::start().await;
-    advance_to_now(&h);
+    let mut h = Harness::start().await;
+    advance_to_now(&mut h);
     let cert = fresh_leaf_pem();
     let client = h
         .create_self_signed_mtls_client(&cert)
@@ -283,12 +283,12 @@ async fn an_mtls_exchange_mints_a_certificate_bound_token() {
 /// itself carries `cnf.x5t#S256`, not only the introspection record.
 #[tokio::test]
 async fn an_mtls_exchange_mints_a_jwt_bound_via_its_cnf_claim() {
-    let h = Harness::start_with(ironauth_config::OidcConfig {
+    let mut h = Harness::start_with(ironauth_config::OidcConfig {
         default_access_token_format: ironauth_config::TokenFormat::AtJwt,
         ..ironauth_config::OidcConfig::default()
     })
     .await;
-    advance_to_now(&h);
+    advance_to_now(&mut h);
     let cert = fresh_leaf_pem();
     let client = h
         .create_self_signed_mtls_client(&cert)
@@ -327,13 +327,99 @@ async fn an_mtls_exchange_mints_a_jwt_bound_via_its_cnf_claim() {
     );
 }
 
+/// A test CA + leaf under it (the PKI method's fixtures).
+fn test_ca_and_leaf() -> (String, String) {
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let ca = ca_params.self_signed(&ca_key).expect("the CA generates");
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let mut leaf_params = CertificateParams::default();
+    leaf_params.not_before = (SystemTime::now() - Duration::from_secs(60)).into(); // invariant-allow: time-via-env
+    leaf_params.not_after = (SystemTime::now() + Duration::from_secs(3600)).into(); // invariant-allow: time-via-env
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &ca, &ca_key)
+        .expect("the leaf generates");
+    (ca.pem(), leaf.pem())
+}
+
+/// THE PKI METHOD (RFC 8705 `tls_client_auth`): a chain validating against the
+/// deployment's trust anchors with a matching subject authenticates; a foreign CA
+/// and a subject mismatch fail closed.
+#[tokio::test]
+async fn the_pki_method_validates_the_chain_and_subject() {
+    let (ca_pem, leaf_pem) = test_ca_and_leaf();
+    let mut h = Harness::start().await;
+    advance_to_now(&mut h);
+    h.arm_mtls_anchors(&[ca_pem]);
+    let subject = ironauth_jose::mtls::certificate_subject_dn(
+        &ironauth_jose::mtls::parse_presented_certificate(&leaf_pem)
+            .expect("parses")
+            .certificate(),
+    );
+    let client = h
+        .create_tls_client_auth_client(&subject)
+        .await
+        .expect("the PKI client registers");
+
+    let body = common::form(&[
+        ("grant_type", "client_credentials"),
+        ("client_id", &client.to_string()),
+    ]);
+    let escaped = percent_escape(&leaf_pem);
+    let (status, _, response) = h.token_with_certificate(&body, &escaped).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the PKI method authenticates: {response}"
+    );
+
+    // A leaf from a DIFFERENT CA is refused by THIS deployment's anchors, even with a
+    // registered subject that matches the attacker's leaf.
+    let (_, other_leaf) = test_ca_and_leaf();
+    let other_subject = ironauth_jose::mtls::certificate_subject_dn(
+        &ironauth_jose::mtls::parse_presented_certificate(&other_leaf)
+            .expect("parses")
+            .certificate(),
+    );
+    let attacker = h
+        .create_tls_client_auth_client(&other_subject)
+        .await
+        .expect("the attacker's client registers");
+    let body_attacker = common::form(&[
+        ("grant_type", "client_credentials"),
+        ("client_id", &attacker.to_string()),
+    ]);
+    let (status, _, response) = h
+        .token_with_certificate(&body_attacker, &percent_escape(&other_leaf))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a foreign-CA leaf is refused: {response}"
+    );
+
+    // A subject mismatch on the SAME trust anchors is refused: the registered client
+    // cannot authenticate with a different-subject leaf.
+    let (_, other_leaf) = test_ca_and_leaf();
+    let (status, _, response) = h
+        .token_with_certificate(&body, &percent_escape(&other_leaf))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a subject mismatch is refused: {response}"
+    );
+}
+
 /// The method's registered method is the ONE the seam enforces: a client
 /// registered for mTLS cannot authenticate any other way, and the out-of-band
 /// diagnostic records the certificate failure (the wire stays opaque).
 #[tokio::test]
 async fn the_seam_enforces_the_registered_method_and_records_the_diagnostic() {
-    let h = Harness::start().await;
-    advance_to_now(&h);
+    let mut h = Harness::start().await;
+    advance_to_now(&mut h);
     let cert = fresh_leaf_pem();
     let client = h
         .create_self_signed_mtls_client(&cert)

@@ -255,6 +255,9 @@ pub struct OidcState {
     /// `None` is a uniform 404 on the check path, so a deployment that did not ask for a
     /// forward-auth surface does not advertise one.
     forward_auth: Option<Arc<crate::forward_auth_rules::ForwardAuthRuntime>>,
+    /// The PKI method's trust anchors (issue #159), absent until the boot path parses
+    /// the configured `[mtls]` bundle.
+    mtls_anchors: Option<Arc<Vec<ironauth_jose::mtls::ParsedClientCertificate>>>,
     /// The deployment's access rules, for the consumers that are not the forward-auth check
     /// (issue #154 criterion 4).
     ///
@@ -1166,6 +1169,7 @@ impl OidcState {
             breach_provider: None,
             federation: None,
             attesters: None,
+            mtls_anchors: None,
             transaction_token_domain: None,
             identity_chaining_enabled: false,
             native_sso_enabled: false,
@@ -1215,6 +1219,24 @@ impl OidcState {
             Some(registry) => self.with_attesters(registry),
             None => self,
         }
+    }
+
+    /// Install the PKI method's trust anchors (issue #159): the parsed `[mtls]` CA
+    /// bundle. When nothing is installed the method stays unregistrable, exactly like
+    /// the attesters' "installed and usable are one condition".
+    #[must_use]
+    pub fn with_mtls_anchors(
+        mut self,
+        anchors: Arc<Vec<ironauth_jose::mtls::ParsedClientCertificate>>,
+    ) -> Self {
+        self.mtls_anchors = Some(anchors);
+        self
+    }
+
+    /// The armed trust anchors, when the deployment configured a bundle (issue #159).
+    #[must_use]
+    pub fn mtls_anchors(&self) -> Option<&Arc<Vec<ironauth_jose::mtls::ParsedClientCertificate>>> {
+        self.mtls_anchors.as_ref()
     }
 
     /// Install the trust domain transaction tokens are minted for (issue #133, PROTOTYPE).

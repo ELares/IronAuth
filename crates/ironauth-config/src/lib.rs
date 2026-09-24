@@ -278,6 +278,11 @@ pub struct Config {
     /// outbox-stream replication shipper alerts at. OFF by default.
     pub replication: ReplicationConfig,
 
+    /// Mutual-TLS client authentication (issue #159): the PKI method's trust
+    /// anchors. Empty by default, which leaves `tls_client_auth` unregistrable:
+    /// a chain cannot validate against a bundle nothing configured.
+    pub mtls: MtlsConfig,
+
     /// Automated signing-key rotation (issue #160): whether THIS process runs the
     /// rotation state machine's timer, and the per-environment policy it uses. OFF by
     /// default: the machine's keys rotate on the cadence only when an operator wires
@@ -762,6 +767,22 @@ pub struct SigningRotationConfig {
     /// Seconds between timer passes. A pass is idempotent, so an over-long interval
     /// only delays a scheduled rotation by the interval; it never skips one.
     pub interval_secs: u64,
+}
+
+/// The mutual-TLS trust-anchor configuration (issue #159): the CA bundle the
+/// `tls_client_auth` PKI method validates presented chains against.
+///
+/// Empty by default, which leaves the method unregistrable (a chain cannot validate
+/// against a bundle nothing configured). This crate carries no `ironauth-jose`
+/// dependency, so the parse check lives at the serve layer's boot: a configured
+/// bundle whose entries do not parse refuses the method's registration there.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct MtlsConfig {
+    /// The trusted root (or intermediate) CA certificates, PEM-encoded, one entry
+    /// per element. A presented certificate chain is accepted when every link's
+    /// signature verifies and the topmost presented cert is signed by one of these.
+    pub trust_anchor_certs: Vec<String>,
 }
 
 impl Default for SigningRotationConfig {

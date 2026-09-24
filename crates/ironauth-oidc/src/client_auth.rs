@@ -758,12 +758,28 @@ async fn authenticate_presented(
             }
         }
 
-        // tls_client_auth (the PKI method) is recognized but its chain validation is
-        // not yet shipped: a client registered for it fails closed until the trust-anchor
-        // surface lands.
-        (ClientAuthMethod::TlsClientAuth, PresentedClientAuth::Certificate { .. }) => {
-            fail!(&method_str, ClientAuthDiagnosticReason::MethodMismatch);
-        }
+        // tls_client_auth (the PKI method, issue #159): the presented certificate's
+        // chain validates against the deployment's trust anchors AND its subject
+        // matches the registered expectation (RFC 8705 section 2.1.2).
+        (
+            ClientAuthMethod::TlsClientAuth,
+            PresentedClientAuth::Certificate {
+                certificate_pem, ..
+            },
+        ) => match authenticate_tls_client_auth(state, &record, certificate_pem, now_secs(state)) {
+            Ok(thumbprint) => Ok(AuthenticatedClient {
+                client_id: client_id_str,
+                auth_method: registered,
+                certificate_thumbprint: Some(thumbprint),
+                allow_bearer_tokens: record.allow_bearer_tokens,
+                grant_types: record.grant_types.clone(),
+                token_exchange_impersonation_allowed: record.token_exchange_impersonation_allowed,
+                token_exchange_refresh_allowed: record.token_exchange_refresh_allowed,
+            }),
+            Err(reason) => {
+                fail!(&method_str, reason);
+            }
+        },
 
         // private_key_jwt registered, an assertion presented: verify it.
         (ClientAuthMethod::PrivateKeyJwt, PresentedClientAuth::Assertion { assertion, .. }) => {
@@ -932,6 +948,40 @@ enum SecretAuthError {
 
 /// Verify a secret-based (or public) presentation against the client's registered
 /// method. Only called when the registered method is Basic/Post/None.
+/// The PKI mTLS authentication (RFC 8705, issue #159): the presented certificate's
+/// chain validates against the deployment's trust anchors and its subject matches the
+/// registered expectation. Both properties are checked in one place so the wire
+/// outcome is one opaque failure; the reason is recorded out of band. The armed
+/// anchors are the state's: a deployment without a bundle could not have registered
+/// the method.
+///
+/// # Errors
+///
+/// [`ClientAuthDiagnosticReason::BadCertificate`] for every failure.
+fn authenticate_tls_client_auth(
+    state: &OidcState,
+    record: &ClientAuthRecord,
+    presented_pem: &str,
+    now_unix_secs: i64,
+) -> Result<String, ClientAuthDiagnosticReason> {
+    let Some(anchors) = state.mtls_anchors() else {
+        return Err(ClientAuthDiagnosticReason::BadCertificate);
+    };
+    let Some(expected_subject) = record.tls_client_auth_subject_dn.as_deref() else {
+        return Err(ClientAuthDiagnosticReason::BadCertificate);
+    };
+    // The proxy forwards the client's leaf; the chain-validation seam accepts the
+    // leaf alone (signed directly by an anchor) or a full chain.
+    ironauth_jose::mtls::validate_tls_client_chain(
+        std::slice::from_ref(&presented_pem.to_owned()),
+        anchors,
+        expected_subject,
+        now_unix_secs,
+    )
+    .map(|parsed| parsed.thumbprint)
+    .map_err(|_| ClientAuthDiagnosticReason::BadCertificate)
+}
+
 /// The self-signed mTLS authentication (RFC 8705, issue #159): the presented
 /// certificate must be the REGISTERED one (exact DER equality) and valid at the
 /// request instant. Both properties are checked in one place so the wire outcome is

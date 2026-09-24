@@ -123,13 +123,15 @@ scan derivable-kind-is-public 'impl[[:space:]]+DerivableKind[[:space:]]+for' 1
 # how loaded the box is. It is not -- loading the box stretches the denominator, so the ratio
 # only ever admitted MORE than the absolute ceiling standing beside it and could not fail. The
 # ratio and its baseline read are gone; see the assertion for the measurements.
-scan time-via-env 'SystemTime::now|Instant::now' 38
+scan time-via-env 'SystemTime::now|Instant::now' 43
 # The ceiling above was raised from 12 to 31 in the same change that marked the
 # poll-deadline loops: the chaos suites, the rolling-upgrade and replication boot
 # suites, and rate_l2 all wait on wall-clock deadlines (a process must be watched from
 # the test side, where the env seam is not the subject), and forward_auth's `now` is a
 # documented TEST-ONLY clock stub. Each carries the marker with this justification; a
 # production call site must use the seam clock, never a marker.
+# 38 -> 43: the PKI method's chain-validation tests (issue #159) anchor their cert
+# windows to the same real wall-clock the harness clock is advanced to.
 # 36 -> 38: the mTLS certificate suites grew a second cert validity line in the
 # expired-certificate test.
 # 31 -> 36: the mTLS certificate suites (issue #159). A test certificate's validity
