@@ -1713,6 +1713,7 @@ mod tests {
             refresh_rotation: None,
             tls_client_auth_cert: None,
             tls_client_auth_subject_dn: None,
+            use_mtls_endpoint_aliases: false,
 
             // The strict posture, matching the column default: these fixtures test
             // authentication, and a fixture that quietly relaxed the DPoP default

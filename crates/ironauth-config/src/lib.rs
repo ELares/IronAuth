@@ -2630,6 +2630,14 @@ pub struct ServerConfig {
     /// never from request headers (see the `[proxy]` policy).
     pub public_url: Option<String>,
 
+    /// The mTLS-terminating base URL for the RFC 8705 `mtls_endpoint_aliases`
+    /// (issue #159): the host where a TLS-terminating proxy requires client
+    /// certificates and forwards the SAME paths this server serves. Unset (the
+    /// default) publishes no aliases: the endpoints are served at `public_url` and
+    /// mTLS clients authenticate there through the certificate header. Must be an
+    /// https URL when set.
+    pub mtls_public_url: Option<String>,
+
     /// Maximum seconds to drain in-flight requests after a shutdown signal
     /// before the process exits regardless. Zero exits without draining.
     pub shutdown_grace_secs: u64,
@@ -2641,6 +2649,7 @@ impl Default for ServerConfig {
             bind: "127.0.0.1:8443".to_owned(),
             management_bind: "127.0.0.1:9443".to_owned(),
             public_url: None,
+            mtls_public_url: None,
             shutdown_grace_secs: 25,
         }
     }

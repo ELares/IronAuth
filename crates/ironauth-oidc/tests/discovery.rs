@@ -850,3 +850,47 @@ async fn discovery_advertises_the_registered_authorization_details_types() {
         "a deployment that registered nothing must not advertise an empty list: {doc}"
     );
 }
+
+/// RFC 8705 section 5 (issue #159): the `mtls_endpoint_aliases` member appears
+/// ONLY when an operator configured the alias base, and names the token,
+/// revocation, and introspection endpoints under it. Without the base, the member
+/// is absent: discovery never names a host nothing serves.
+#[test]
+fn mtls_endpoint_aliases_are_published_only_when_armed() {
+    let policy = SigningPolicy::new(vec![JwsAlgorithm::Es256]).expect("policy");
+    let issuer = "https://issuer.test/t/tnt/e/env";
+    let jwks_uri = format!("{issuer}/jwks.json");
+
+    // Unarmed: no aliases member at all.
+    let doc = discovery_document(
+        issuer,
+        ISSUER_BASE,
+        &jwks_uri,
+        &policy,
+        &DiscoveryCapabilities::default(),
+    );
+    assert!(
+        doc.get("mtls_endpoint_aliases").is_none(),
+        "an unarmed deployment publishes no aliases"
+    );
+
+    // Armed: the aliases point at the mTLS-terminating base, same paths.
+    let caps = DiscoveryCapabilities::default()
+        .with_mtls_endpoint_aliases_base(Some("https://mtls.issuer.test".to_owned()));
+    let doc = discovery_document(issuer, ISSUER_BASE, &jwks_uri, &policy, &caps);
+    let aliases = &doc["mtls_endpoint_aliases"];
+    assert_eq!(
+        aliases["token_endpoint"],
+        json!("https://mtls.issuer.test/token")
+    );
+    assert_eq!(
+        aliases["revocation_endpoint"],
+        json!("https://mtls.issuer.test/revoke")
+    );
+    assert_eq!(
+        aliases["introspection_endpoint"],
+        json!("https://mtls.issuer.test/introspect")
+    );
+    // The normal endpoints are unchanged: a plain client is unaffected.
+    assert_eq!(doc["token_endpoint"], json!("https://issuer.test/token"));
+}

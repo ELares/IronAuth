@@ -413,6 +413,75 @@ async fn the_pki_method_validates_the_chain_and_subject() {
     );
 }
 
+/// THE DECLARATION (RFC 8705 section 5): a client registering
+/// `use_mtls_endpoint_aliases: true` has the declaration stored and readable
+/// through the auth record.
+#[tokio::test]
+async fn the_use_mtls_endpoint_aliases_declaration_is_stored() {
+    let mut h = Harness::start().await;
+    advance_to_now(&mut h);
+    let cert = fresh_leaf_pem();
+    let client = h
+        .create_self_signed_mtls_client(&cert)
+        .await
+        .expect("the mTLS client registers");
+    let record = h
+        .store()
+        .scoped(h.scope())
+        .clients()
+        .auth_record(&client)
+        .await
+        .expect("the record reads");
+    assert!(
+        !record.use_mtls_endpoint_aliases,
+        "the default is no declaration"
+    );
+
+    // A DYNAMIC registration declaring the flag stores it, readable back through
+    // the same record.
+    let (actor, corr) = h.seeding_actor();
+    let declared = h
+        .store()
+        .scoped(h.scope())
+        .acting(actor, corr)
+        .clients()
+        .register_dynamic(
+            h.env(),
+            ironauth_store::NewDynamicClient {
+                display_name: "declaring client",
+                auth_method: "none",
+                secret_hash: None,
+                redirect_uris: &["https://client.example/callback".to_owned()],
+                application_type: "web",
+                id_token_signed_response_alg: "EdDSA",
+                jwks: None,
+                jwks_uri: None,
+                token_endpoint_auth_signing_alg: None,
+                tls_client_auth_cert: None,
+                tls_client_auth_subject_dn: None,
+                use_mtls_endpoint_aliases: true,
+                registration_access_token_hash: "hash",
+                registration_uri_base: "https://issuer.test/connect/register",
+                quarantined: false,
+                dcr_policy_chain: None,
+            },
+            None,
+        )
+        .await
+        .expect("the dynamic registration succeeds");
+    let record = h
+        .store()
+        .scoped(h.scope())
+        .clients()
+        .auth_record(&declared.id)
+        .await
+        .expect("the record reads");
+    assert!(
+        record.use_mtls_endpoint_aliases,
+        "the declaration is stored and readable"
+    );
+}
+
 /// The method's registered method is the ONE the seam enforces: a client
 /// registered for mTLS cannot authenticate any other way, and the out-of-band
 /// diagnostic records the certificate failure (the wire stays opaque).

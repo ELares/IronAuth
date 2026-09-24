@@ -1,0 +1,13 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The use_mtls_endpoint_aliases client declaration (issue #159, RFC 8705
+-- section 5).
+--
+-- A client that declares the flag MUST call the published mtls_endpoint_aliases
+-- for its token, revocation, and introspection requests, i.e. the endpoints
+-- under the mTLS-terminating host whose proxy requires the client certificate.
+-- The declaration is stored so the server can surface it (and, in a future
+-- hardening slice, refuse a certificate-less call from a declaring client).
+--
+-- EXPAND: additive column; existing rows default to false (no declaration).
+ALTER TABLE clients ADD COLUMN use_mtls_endpoint_aliases boolean NOT NULL DEFAULT false;
