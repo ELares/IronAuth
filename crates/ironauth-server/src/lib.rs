@@ -181,7 +181,7 @@ impl Server {
     fn state(&self) -> AppState {
         AppState {
             env: self.env.clone(),
-            policy: self.policy,
+            policy: self.policy.clone(),
             site: Arc::clone(&self.site),
             readiness: Arc::clone(&self.readiness),
             metrics: self.metrics.clone(),

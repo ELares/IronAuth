@@ -16,6 +16,20 @@ mod common;
 
 use std::time::{Duration, SystemTime};
 
+use axum::http::StatusCode;
+
+/// The proxy's escaped certificate form: percent-encode every byte (a header value
+/// cannot carry the PEM's newlines).
+fn percent_escape(pem: &str) -> String {
+    pem.as_bytes()
+        .iter()
+        .fold(String::with_capacity(pem.len() * 3), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{byte:02X}");
+            out
+        })
+}
+
 use common::Harness;
 use ironauth_oidc::{ClientAuthInputs, ClientAuthMethod, authenticate_client};
 use rcgen::{CertificateParams, KeyPair, KeyUsagePurpose};
@@ -154,6 +168,50 @@ async fn a_certificate_less_request_is_rejected() {
             Err(ironauth_oidc::ClientAuthError::InvalidClient { .. })
         ),
         "a certificate-less request must fail closed: {result:?}"
+    );
+}
+
+/// END TO END THROUGH THE TOKEN ENDPOINT: a client registered for
+/// `self_signed_tls_client_auth` exchanges client credentials over the stamped
+/// certificate header, and a substituted certificate is refused.
+#[tokio::test]
+async fn the_token_endpoint_authenticates_an_mtls_client_end_to_end() {
+    let h = Harness::start().await;
+    advance_to_now(&h);
+    let cert = fresh_leaf_pem();
+    let client = h
+        .create_self_signed_mtls_client(&cert)
+        .await
+        .expect("the mTLS client registers");
+    let client_id = client.to_string();
+    let body = common::form(&[
+        ("grant_type", "client_credentials"),
+        ("client_id", &client_id),
+    ]);
+    // The proxy's escaped form: the PEM's newlines cannot ride a header value.
+    let escaped = percent_escape(&cert);
+    let (status, _, response) = h.token_with_certificate(&body, &escaped).await;
+    let diagnostics = h.client_auth_diagnostics(&client_id).await;
+    eprintln!(
+        "mtls diagnostics: {:?}",
+        diagnostics
+            .iter()
+            .map(|d| d.failure_reason.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the mTLS client exchanges tokens: {response}"
+    );
+
+    let substituted = fresh_leaf_pem();
+    let escaped_sub = percent_escape(&substituted);
+    let (status, _, response) = h.token_with_certificate(&body, &escaped_sub).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a substituted certificate is refused at the token endpoint: {response}"
     );
 }
 

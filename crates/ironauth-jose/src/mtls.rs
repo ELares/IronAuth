@@ -66,7 +66,7 @@ pub fn certificate_valid_at(cert: &X509Certificate<'_>, unix_seconds: i64) -> bo
 }
 
 /// Whether the presented certificate IS the registered one: exact DER equality. This is
-/// the entire self-signed method's test — a different certificate, however otherwise
+/// the entire self-signed method's test - a different certificate, however otherwise
 /// well-formed, is not the registered one.
 #[must_use]
 pub fn same_certificate(presented: &X509Certificate<'_>, registered: &X509Certificate<'_>) -> bool {

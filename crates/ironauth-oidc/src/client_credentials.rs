@@ -188,13 +188,21 @@ pub async fn client_credentials_grant(
 
     let attested = attested_client(state, headers, &params, authorization).await?;
 
+    // The mTLS client certificate (issue #159): the trusted-proxy middleware stamped
+    // CLIENT_CERT_HEADER ONLY for requests that arrived through the trusted chain; the
+    // proxy's escaped form is decoded back to the PEM before the seam parses it.
+    let client_certificate = headers
+        .get(ironauth_config::CLIENT_CERT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(crate::util::percent_decode);
+
     let inputs = ClientAuthInputs {
         authorization,
         client_id: params.client_id.as_deref(),
         client_secret: params.client_secret.as_deref(),
         client_assertion: params.client_assertion.as_deref(),
         client_assertion_type: params.client_assertion_type.as_deref(),
-        client_certificate: None,
+        client_certificate: client_certificate.as_deref(),
     };
 
     // 1 and 2, or the attested pair already computed above. The two authentication paths

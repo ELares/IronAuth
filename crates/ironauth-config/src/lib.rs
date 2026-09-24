@@ -2754,6 +2754,15 @@ pub struct ProxyConfig {
     /// every forwarding header regardless of `trusted_hops`. Both this and a
     /// non-zero `trusted_hops` are required before any header is consulted.
     pub trust_forwarded: bool,
+
+    /// The reverse proxy's client-certificate header (issue #159): the header a
+    /// TLS-terminating proxy fills with the client certificate PEM it accepted.
+    /// Read ONLY when the request arrived through the trusted-proxy chain (the
+    /// same gate as the forwarding headers) and re-stamped onto
+    /// [`CLIENT_CERT_HEADER`], so a client that reaches the endpoint directly
+    /// cannot present one. The default names nginx's `$ssl_client_escaped_cert`.
+    /// An EMPTY value disables client-certificate delivery entirely.
+    pub client_certificate_header: String,
 }
 
 /// Observability settings.
@@ -3347,6 +3356,16 @@ pub const PEER_IP_HEADER: &str = "x-ironauth-peer-ip";
 /// including the header being absent, is untrusted: a handler that cannot tell must not
 /// guess in the direction that admits a request.
 pub const FORWARD_DECISION_HEADER: &str = "x-ironauth-forward-decision";
+
+/// The header carrying the mTLS client certificate the trusted-proxy policy admitted
+/// (issue #159).
+///
+/// Stamped by the server's request middleware exactly as [`PEER_IP_HEADER`] is: the
+/// deployment's configured `client_certificate_header` is read ONLY when the request
+/// arrived through the trusted-proxy chain, and its value is `insert`ed here -
+/// REPLACING any value a client tried to supply, so a direct request cannot present a
+/// certificate, and a request that never passed the middleware carries nothing.
+pub const CLIENT_CERT_HEADER: &str = "x-ironauth-client-cert";
 
 /// The [`FORWARD_DECISION_HEADER`] value meaning the forwarding headers were honoured for
 /// this request, i.e. it arrived through the configured trusted-proxy chain.

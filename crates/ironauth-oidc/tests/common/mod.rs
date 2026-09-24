@@ -2229,6 +2229,24 @@ impl Harness {
         self.token_with_auth(form, None).await
     }
 
+    /// `POST /token` carrying the mTLS client certificate the trusted-proxy
+    /// middleware stamps (issue #159): the test mimics the middleware by inserting
+    /// [`ironauth_config::CLIENT_CERT_HEADER`] itself.
+    pub async fn token_with_certificate(
+        &self,
+        form: &str,
+        certificate_pem: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(ironauth_config::CLIENT_CERT_HEADER, certificate_pem)
+            .body(Body::from(form.to_owned()))
+            .expect("request builds");
+        self.send(request).await
+    }
+
     /// `POST /token` with an optional `Authorization` header (for
     /// `client_secret_basic`).
     pub async fn token_with_auth(

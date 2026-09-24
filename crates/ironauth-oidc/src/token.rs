@@ -1071,13 +1071,23 @@ async fn authenticate_client(
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
+    // The mTLS client certificate (issue #159): the trusted-proxy middleware stamped
+    // CLIENT_CERT_HEADER ONLY when this request arrived through the trusted chain, so
+    // a value here is the certificate the deployment's TLS termination accepted. The
+    // proxy's escaped form (a header cannot carry the PEM's newlines; nginx's
+    // $ssl_client_escaped_cert is URL-encoded) is decoded back to the PEM before the
+    // seam parses it.
+    let client_certificate = headers
+        .get(ironauth_config::CLIENT_CERT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(crate::util::percent_decode);
     let inputs = ClientAuthInputs {
         authorization,
         client_id: params.client_id.as_deref(),
         client_secret: params.client_secret.as_deref(),
         client_assertion: params.client_assertion.as_deref(),
         client_assertion_type: params.client_assertion_type.as_deref(),
-        client_certificate: None,
+        client_certificate: client_certificate.as_deref(),
     };
     client_auth::authenticate_client(state, scope, inputs)
         .await

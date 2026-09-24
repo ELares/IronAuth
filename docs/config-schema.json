@@ -2484,6 +2484,11 @@
       "additionalProperties": false,
       "description": "Trusted-proxy policy.\n\nForwarding headers (RFC 7239 `Forwarded`, `X-Forwarded-For`,\n`X-Forwarded-Proto`, `X-Forwarded-Host`) and the `Host` header are an\naccount-takeover class when trusted blindly. The default trusts NOTHING:\n`trusted_hops = 0` and `trust_forwarded = false` mean the effective client\nIP is the transport peer and the scheme, host, and issuer derive entirely\nfrom `server.public_url`. Only when the server genuinely runs behind a\nfixed number of trusted reverse proxies should these be raised, and even\nthen scheme and issuer stay config-derived.",
       "properties": {
+        "client_certificate_header": {
+          "default": "",
+          "description": "The reverse proxy's client-certificate header (issue #159): the header a\nTLS-terminating proxy fills with the client certificate PEM it accepted.\nRead ONLY when the request arrived through the trusted-proxy chain (the\nsame gate as the forwarding headers) and re-stamped onto\n[`CLIENT_CERT_HEADER`], so a client that reaches the endpoint directly\ncannot present one. The default names nginx's `$ssl_client_escaped_cert`.\nAn EMPTY value disables client-certificate delivery entirely.",
+          "type": "string"
+        },
         "trust_forwarded": {
           "default": false,
           "description": "Whether to honor forwarding headers at all. False (the default) ignores\nevery forwarding header regardless of `trusted_hops`. Both this and a\nnon-zero `trusted_hops` are required before any header is consulted.",
@@ -4053,6 +4058,7 @@
     "proxy": {
       "$ref": "#/$defs/ProxyConfig",
       "default": {
+        "client_certificate_header": "",
         "trust_forwarded": false,
         "trusted_hops": 0
       },
