@@ -1025,6 +1025,10 @@ pub struct ClientCredentialsMintRequest<'a> {
     /// because that is what the client resolves to on every issuance there and changing it
     /// would break every existing consumer; the agent identity sits beside it.
     pub agent: Option<AgentTokenIdentity<'a>>,
+    /// The certificate-bound confirmation (issue #159): the x5t#S256 thumbprint of
+    /// the client certificate this exchange authenticated with, `None` for a bearer
+    /// token. The minted JWT embeds it as `cnf`, and the opaque record stores it.
+    pub confirmation: Option<&'a Confirmation>,
     /// The custom claims to embed: the per-client static ones, AFTER this client's
     /// declarative mapping and its deployed hook have shaped them (issue #113 criterion 1).
     ///
@@ -1316,13 +1320,18 @@ pub fn mint_client_credentials_access_token(
     let minted = match target.format {
         TokenFormat::AtJwt => {
             let jti = IssuedTokenId::generate(state.env(), &request.scope);
-            let claims = build_client_credentials_access_token_claims(
+            let mut claims = build_client_credentials_access_token_claims(
                 request,
                 iat,
                 access_exp,
                 &jti.to_string(),
                 &target.aud_claim(),
             );
+            if let Some(confirmation) = request.confirmation {
+                if let serde_json::Value::Object(object) = &mut claims {
+                    confirmation.embed_in_claims(object);
+                }
+            }
             let token = sign_jws_with_policy(
                 policy,
                 signer,
@@ -3031,6 +3040,7 @@ mod tests {
             ),
             act: None,
             agent: None,
+            confirmation: None,
         };
         let cc_claims = build_client_credentials_access_token_claims(
             &cc_request,
@@ -3104,6 +3114,7 @@ mod tests {
             custom_claims: empty_mapped_extra(),
             act: None,
             agent: None,
+            confirmation: None,
         };
         let claims = build_client_credentials_access_token_claims(
             &request,
@@ -3292,6 +3303,7 @@ mod tests {
             custom_claims: custom,
             act: None,
             agent: None,
+            confirmation: None,
         }
     }
 

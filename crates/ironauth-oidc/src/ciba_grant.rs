@@ -211,6 +211,7 @@ async fn issue_ciba_tokens(
             jti,
             expires_at_unix_micros: *expires_at_unix_micros,
             dpop_jkt: None,
+            cnf_x5t_s256: None,
         }),
     };
 

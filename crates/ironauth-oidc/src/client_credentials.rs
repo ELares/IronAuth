@@ -293,8 +293,20 @@ pub async fn client_credentials_grant(
         })?;
 
     // 4-6. Resolve the principal, mint the access token, persist the machine grant,
-    //      and build the response.
-    mint_and_persist(state, scope, &client_id, requested_scope.as_deref()).await
+    //      and build the response. An mTLS-authenticated exchange (issue #159) binds
+    //      the minted token: cnf x5t#S256, the certificate thumbprint.
+    let confirmation = authenticated
+        .certificate_thumbprint
+        .as_ref()
+        .map(|thumbprint| ironauth_jose::Confirmation::X5tS256(thumbprint.clone()));
+    mint_and_persist(
+        state,
+        scope,
+        &client_id,
+        requested_scope.as_deref(),
+        confirmation.as_ref(),
+    )
+    .await
 }
 
 /// Resolve the client's service-account principal, mint the M2M access token, record
@@ -313,6 +325,7 @@ async fn mint_and_persist(
     scope: Scope,
     client_id: &ClientId,
     requested_scope: Option<&str>,
+    confirmation: Option<&ironauth_jose::Confirmation>,
 ) -> Result<Response, TokenError> {
     // The STABLE service-account principal (the token's sub), minted lazily on the
     // first issuance and read back every time after, so `sub` is consistent across
@@ -406,6 +419,7 @@ async fn mint_and_persist(
                 linked_user_id: a.linked_user_id.as_str(),
                 organization_id: a.organization_id.as_str(),
             }),
+            confirmation,
         },
         &target,
     )
@@ -438,6 +452,9 @@ async fn mint_and_persist(
             expires_at_unix_micros: *expires_at_unix_micros,
             // The client-credentials grant carries no DPoP proof: a bearer token.
             dpop_jkt: None,
+            // The certificate-bound confirmation (issue #159) when this exchange
+            // authenticated over mTLS; None leaves an unbound bearer token.
+            cnf_x5t_s256: confirmation.map(ironauth_jose::Confirmation::value),
         }),
     };
     state

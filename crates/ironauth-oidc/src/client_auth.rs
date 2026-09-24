@@ -333,6 +333,10 @@ pub struct AuthenticatedClient {
     /// public client. A confidential method here means a real secret / assertion was
     /// verified (a `none` client proves only possession of its non-secret id).
     pub auth_method: ClientAuthMethod,
+    /// The certificate-bound confirmation (issue #159): the x5t#S256 thumbprint of
+    /// the certificate this request authenticated with, `None` for every other
+    /// method. A token issued to this client over this exchange is bound to it.
+    pub certificate_thumbprint: Option<String>,
     /// Whether this client may obtain plain BEARER tokens (issue #124, RFC 9449).
     ///
     /// Read from the registration the authentication just verified, so the token
@@ -579,6 +583,7 @@ pub async fn authenticate_attested(
         // lines away in another file.
         client_id: attested.client_id,
         auth_method: ClientAuthMethod::AttestJwt,
+        certificate_thumbprint: None,
         allow_bearer_tokens: record.allow_bearer_tokens,
         grant_types: record.grant_types.clone(),
         token_exchange_impersonation_allowed: record.token_exchange_impersonation_allowed,
@@ -709,6 +714,7 @@ async fn authenticate_presented(
             Ok(()) => Ok(AuthenticatedClient {
                 client_id: client_id_str,
                 auth_method: registered,
+                certificate_thumbprint: None,
                 allow_bearer_tokens: record.allow_bearer_tokens,
                 grant_types: record.grant_types.clone(),
                 token_exchange_impersonation_allowed: record.token_exchange_impersonation_allowed,
@@ -732,15 +738,20 @@ async fn authenticate_presented(
             },
         ) => {
             match authenticate_self_signed_certificate(&record, certificate_pem, now_secs(state)) {
-                Ok(()) => Ok(AuthenticatedClient {
-                    client_id: client_id_str,
-                    auth_method: registered,
-                    allow_bearer_tokens: record.allow_bearer_tokens,
-                    grant_types: record.grant_types.clone(),
-                    token_exchange_impersonation_allowed: record
-                        .token_exchange_impersonation_allowed,
-                    token_exchange_refresh_allowed: record.token_exchange_refresh_allowed,
-                }),
+                Ok(()) => {
+                    let parsed = ironauth_jose::mtls::parse_presented_certificate(certificate_pem)
+                        .expect("the seam already parsed this certificate");
+                    Ok(AuthenticatedClient {
+                        client_id: client_id_str,
+                        auth_method: registered,
+                        certificate_thumbprint: Some(parsed.thumbprint),
+                        allow_bearer_tokens: record.allow_bearer_tokens,
+                        grant_types: record.grant_types.clone(),
+                        token_exchange_impersonation_allowed: record
+                            .token_exchange_impersonation_allowed,
+                        token_exchange_refresh_allowed: record.token_exchange_refresh_allowed,
+                    })
+                }
                 Err(reason) => {
                     fail!(&method_str, reason);
                 }
@@ -762,6 +773,7 @@ async fn authenticate_presented(
                 Ok(()) => Ok(AuthenticatedClient {
                     client_id: client_id_str,
                     auth_method: registered,
+                    certificate_thumbprint: None,
                     allow_bearer_tokens: record.allow_bearer_tokens,
                     grant_types: record.grant_types.clone(),
                     token_exchange_impersonation_allowed: record

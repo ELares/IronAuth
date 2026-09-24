@@ -602,10 +602,15 @@ async fn resolve_opaque(
         // self-contained claims, so its audiences are recorded on the row and
         // reported here exactly as minted (a single string, or an array).
         aud: active.audiences,
-        // The jkt recorded on the row at issuance. An opaque token has no claims to
-        // inspect, so this response is the ONLY place its binding is observable: a
-        // resource server holding one cannot discover it any other way.
-        confirmation: active.dpop_jkt.map(Confirmation::Jkt),
+        // The confirmation recorded on the row at issuance. An opaque token has no
+        // claims to inspect, so this response is the ONLY place its binding is
+        // observable: a resource server holding one cannot discover it any other way.
+        // A DPoP-bound token reports `jkt`; a certificate-bound token (issue #159)
+        // reports `x5t#S256`.
+        confirmation: active
+            .dpop_jkt
+            .map(Confirmation::Jkt)
+            .or_else(|| active.cnf_x5t_s256.map(Confirmation::X5tS256)),
     })
 }
 

@@ -753,6 +753,7 @@ async fn seed_opaque_token_with_audience(
                 jti: &jti,
                 expires_at_unix_micros: FAR_FUTURE_MICROS,
                 dpop_jkt: None,
+                cnf_x5t_s256: None,
             }),
             Duration::ZERO,
         )

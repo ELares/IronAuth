@@ -2072,6 +2072,7 @@ async fn an_opaque_token_keeps_its_audiences_and_its_dpop_binding() {
                     jti: &jti,
                     expires_at_unix_micros: FAR_FUTURE_MICROS,
                     dpop_jkt: Some("thumbprint-of-the-clients-key"),
+                    cnf_x5t_s256: None,
                 }),
             },
         )
@@ -2499,6 +2500,7 @@ async fn an_opaque_token_claiming_another_identity_is_refused() {
                         jti: &jti,
                         expires_at_unix_micros: FAR_FUTURE_MICROS,
                         dpop_jkt: None,
+                        cnf_x5t_s256: None,
                     }),
                 },
             )
@@ -2556,6 +2558,7 @@ async fn a_foreign_scope_opaque_jti_is_refused() {
                     jti: &foreign_jti,
                     expires_at_unix_micros: FAR_FUTURE_MICROS,
                     dpop_jkt: None,
+                    cnf_x5t_s256: None,
                 }),
             },
         )
@@ -2620,6 +2623,7 @@ async fn every_issued_token_is_metered_including_the_opaque_one() {
                     jti: &jti,
                     expires_at_unix_micros: FAR_FUTURE_MICROS,
                     dpop_jkt: None,
+                    cnf_x5t_s256: None,
                 }),
             },
         )
@@ -2662,6 +2666,7 @@ async fn every_issued_token_is_metered_including_the_opaque_one() {
                     jti: &prod_jti,
                     expires_at_unix_micros: FAR_FUTURE_MICROS,
                     dpop_jkt: None,
+                    cnf_x5t_s256: None,
                 }),
             },
         )
@@ -2928,6 +2933,7 @@ async fn the_opaque_row_carries_the_redemptions_identity_and_scope() {
                     jti: &jti,
                     expires_at_unix_micros: FAR_FUTURE_MICROS,
                     dpop_jkt: None,
+                    cnf_x5t_s256: None,
                 }),
             },
         )
@@ -3037,6 +3043,7 @@ async fn an_opaque_token_may_not_widen_the_approved_scope() {
                         jti: &jti,
                         expires_at_unix_micros: FAR_FUTURE_MICROS,
                         dpop_jkt: None,
+                        cnf_x5t_s256: None,
                     }),
                 },
             )
@@ -3107,6 +3114,7 @@ async fn an_opaque_struct_naming_a_different_grant_is_refused() {
                     jti: &jti,
                     expires_at_unix_micros: FAR_FUTURE_MICROS,
                     dpop_jkt: None,
+                    cnf_x5t_s256: None,
                 }),
             },
         )
@@ -3441,6 +3449,7 @@ async fn scope_containment_is_case_sensitive_whole_token_and_closed_when_absent(
                         jti: &jti,
                         expires_at_unix_micros: FAR_FUTURE_MICROS,
                         dpop_jkt: None,
+                        cnf_x5t_s256: None,
                     }),
                 },
             )
@@ -3579,6 +3588,7 @@ async fn each_issued_token_is_recorded_and_metered_under_its_own_kind() {
                     jti: &jti,
                     expires_at_unix_micros: FAR_FUTURE_MICROS,
                     dpop_jkt: None,
+                    cnf_x5t_s256: None,
                 }),
             },
         )

@@ -1146,6 +1146,7 @@ async fn an_opaque_rotation_meters_its_access_token() {
                     jti: &opaque_jti,
                     expires_at_unix_micros: FAR_FUTURE_MICROS,
                     dpop_jkt: None,
+                    cnf_x5t_s256: None,
                 }),
                 grace: Duration::from_secs(0),
             },

@@ -10158,6 +10158,7 @@ impl AuthorizationRepo<'_> {
         let row = sqlx::query(
             "SELECT t.subject AS subject, t.client_id AS client_id, t.audience AS audience, \
              t.audiences AS audiences, t.scope AS scope, t.jti AS jti, t.dpop_jkt AS dpop_jkt, \
+             t.cnf_x5t_s256 AS cnf_x5t_s256, \
              (EXTRACT(EPOCH FROM t.expires_at) * 1000000)::bigint AS expires_us, \
              (EXTRACT(EPOCH FROM t.created_at) * 1000000)::bigint AS issued_us \
              FROM opaque_access_tokens t \
@@ -10192,6 +10193,7 @@ impl AuthorizationRepo<'_> {
                 scope: row.get("scope"),
                 jti: row.get("jti"),
                 dpop_jkt: row.get("dpop_jkt"),
+                cnf_x5t_s256: row.get("cnf_x5t_s256"),
                 expires_at_unix_micros: row.get("expires_us"),
                 issued_at_unix_micros: row.get("issued_us"),
             }
@@ -10532,9 +10534,10 @@ impl ActingAuthorizationRepo<'_> {
                 sqlx::query(
                     "INSERT INTO opaque_access_tokens \
                      (token_digest, tenant_id, environment_id, grant_id, subject, \
-                      client_id, audience, audiences, scope, jti, expires_at, dpop_jkt) \
+                      client_id, audience, audiences, scope, jti, expires_at, dpop_jkt, \
+                      cnf_x5t_s256) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, $12)",
+                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, $12, $13)",
                 )
                 .bind(opaque.token_digest)
                 .bind(scope.tenant().to_string())
@@ -10548,6 +10551,7 @@ impl ActingAuthorizationRepo<'_> {
                 .bind(opaque.jti.to_string())
                 .bind(opaque.expires_at_unix_micros)
                 .bind(opaque.dpop_jkt)
+                .bind(opaque.cnf_x5t_s256)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -15263,6 +15267,9 @@ pub struct NewOpaqueAccessToken<'a> {
     /// [`Some`], a resource-server verify (a later follow-up) requires a `DPoP`
     /// proof whose key thumbprint equals this value.
     pub dpop_jkt: Option<&'a str>,
+    /// The certificate-bound confirmation (issue #159): the x5t#S256 thumbprint of
+    /// the client certificate the token was issued over, [`None`] for a bearer token.
+    pub cnf_x5t_s256: Option<&'a str>,
 }
 
 impl fmt::Debug for NewOpaqueAccessToken<'_> {
@@ -15303,6 +15310,9 @@ pub struct ActiveOpaqueToken {
     /// resource server verifying this token requires a `DPoP` proof whose key
     /// thumbprint equals this value.
     pub dpop_jkt: Option<String>,
+    /// The certificate-bound confirmation (issue #159): the x5t#S256 thumbprint the
+    /// token was issued over, `None` for a bearer token.
+    pub cnf_x5t_s256: Option<String>,
     /// The token's expiry, in microseconds since the Unix epoch (the clock seam
     /// value the row was written with). The RFC 7662 introspection response (issue
     /// #22) reports this as `exp`. Reading it does NOT change the resolve semantics:
