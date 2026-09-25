@@ -423,6 +423,7 @@ async fn mint_and_persist(
         },
         &target,
     )
+    .await
     .map_err(|refusal| match refusal {
         crate::tokens::MintRefusal::Policy { .. } => TokenError::AccessDenied,
         crate::tokens::MintRefusal::Signing => TokenError::ServerError,

@@ -22,7 +22,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Map, Value};
 
-use crate::policy::TokenTyp;
+use crate::policy::{JwsAlgorithm, TokenTyp};
 use crate::redact::Redacted;
 use crate::sign;
 use crate::signing_key::SigningKey;
@@ -299,7 +299,11 @@ fn build_header(
 }
 
 /// The JWS signing input: `base64url(header) || '.' || base64url(payload)`.
-fn signing_input(header: &[u8], payload: &[u8]) -> String {
+///
+/// PUBLIC because the external-signer path (issue #161) builds the input here -
+/// exactly the bytes a remote backend must sign - and then assembles the compact
+/// form itself, without ever holding the private key.
+pub fn signing_input(header: &[u8], payload: &[u8]) -> String {
     format!(
         "{}.{}",
         URL_SAFE_NO_PAD.encode(header),
@@ -308,7 +312,10 @@ fn signing_input(header: &[u8], payload: &[u8]) -> String {
 }
 
 /// Assemble the compact serialization from the signing input and signature.
-fn assemble(signing_input: &str, signature: &[u8]) -> String {
+///
+/// PUBLIC for the same reason as [`signing_input`]: the external-signer path
+/// (issue #161) assembles a token from the backend's raw signature.
+pub fn assemble(signing_input: &str, signature: &[u8]) -> String {
     format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
 }
 
@@ -337,6 +344,24 @@ pub fn protected_header(key: &SigningKey, options: &EmissionOptions) -> Result<V
         key.kid(),
         options.typ.as_deref(),
     )
+}
+
+/// The protected header for the external-signer path (issue #161): the SAME
+/// [`build_header`] the local mint uses, parameterized by the kid and algorithm a
+/// remote backend was selected for. The `typ` still comes from `options` (the
+/// [`TokenTyp`](crate::TokenTyp) declaration), never from a bare string, so the
+/// typ-via-declaration invariant holds on this path too.
+///
+/// # Errors
+///
+/// [`SignError::Header`] if the header cannot be serialized (it does not for the
+/// fixed shape; surfaced for completeness).
+pub fn protected_header_with(
+    kid: &str,
+    algorithm: JwsAlgorithm,
+    options: &EmissionOptions,
+) -> Result<Vec<u8>, SignError> {
+    build_header(options.alg_name(algorithm), Some(kid), options.typ.as_deref())
 }
 
 /// The EXACT length of unpadded `base64url` over `n` bytes.
