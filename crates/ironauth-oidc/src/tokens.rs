@@ -62,16 +62,15 @@ use std::time::{Duration, SystemTime};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_jose::{
-    Confirmation, EmissionOptions, JwsAlgorithm, SigningKey, SigningPolicy, TokenTyp,
-    compact_len, protected_header, protected_header_with, sign_jws_with_policy,
-    signing_input,
+    Confirmation, EmissionOptions, JwsAlgorithm, SigningKey, SigningPolicy, TokenTyp, compact_len,
+    protected_header, protected_header_with, sign_jws_with_policy, signing_input,
 };
-use std::sync::Arc;
 use ironauth_store::{
     IssuedTokenId, RefreshTokenId, Scope, TokenFormat, opaque_access_token_digest,
     refresh_token_digest,
 };
 use serde_json::json;
+use std::sync::Arc;
 
 use crate::authn;
 use crate::permission_budget::{self, PermissionBudget, PermissionBudgetOutcome, PermissionStatus};
@@ -1722,10 +1721,8 @@ async fn sign_through_backend(
             bytes = input.len(),
             "signing input exceeds the 3 KB warning threshold (issue #161)"
         );
-        metrics::counter!(
-            ironauth_jose::external_signer::SIGNING_INPUT_OVERSIZED_METRIC
-        )
-        .increment(1);
+        metrics::counter!(ironauth_jose::external_signer::SIGNING_INPUT_OVERSIZED_METRIC)
+            .increment(1);
     }
     ironauth_jose::external_signer::guard_signing_input_size(
         input.as_bytes(),
