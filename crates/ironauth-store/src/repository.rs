@@ -11616,6 +11616,11 @@ pub enum SigningKeyMaterialKind {
     EcdsaPkcs8,
     /// An RSA PKCS#1 `RSAPrivateKey` DER document.
     RsaPkcs1Der,
+    /// A REMOTE-REFERENCE key (issue #161): the material is the kid itself (the
+    /// key lives in an external signer backend's boundary, named by the kid). The
+    /// mint never loads material for one - the backend signs - and the loader
+    /// refuses it defensively.
+    RemoteReference,
 }
 
 impl SigningKeyMaterialKind {
@@ -11626,6 +11631,7 @@ impl SigningKeyMaterialKind {
             SigningKeyMaterialKind::Ed25519Seed => "ed25519_seed",
             SigningKeyMaterialKind::EcdsaPkcs8 => "ecdsa_pkcs8",
             SigningKeyMaterialKind::RsaPkcs1Der => "rsa_pkcs1_der",
+            SigningKeyMaterialKind::RemoteReference => "remote_reference",
         }
     }
 
@@ -11636,6 +11642,7 @@ impl SigningKeyMaterialKind {
             "ed25519_seed" => Some(SigningKeyMaterialKind::Ed25519Seed),
             "ecdsa_pkcs8" => Some(SigningKeyMaterialKind::EcdsaPkcs8),
             "rsa_pkcs1_der" => Some(SigningKeyMaterialKind::RsaPkcs1Der),
+            "remote_reference" => Some(SigningKeyMaterialKind::RemoteReference),
             _ => None,
         }
     }

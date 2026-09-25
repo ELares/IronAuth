@@ -35,6 +35,10 @@ pub struct RotationTimer {
     policy: RotationPolicy,
     max_token_lifetime_secs: u64,
     interval: Duration,
+    /// The remote-key seeding (issue #161): the provisioner a remote deployment's
+    /// machine asks before storing a REMOTE-REFERENCE successor. `None` for the
+    /// local key store.
+    provisioner: Option<Box<dyn crate::key_rotation::RemoteKeyProvisioner>>,
 }
 
 impl RotationTimer {
@@ -53,7 +57,20 @@ impl RotationTimer {
             policy,
             max_token_lifetime_secs,
             interval,
+            provisioner: None,
         }
+    }
+
+    /// Arm remote-key seeding (issue #161): the timer's machine then stores
+    /// REMOTE references and asks `provisioner` to confirm each key before
+    /// storing it.
+    #[must_use]
+    pub fn with_remote_seeding(
+        mut self,
+        provisioner: Box<dyn crate::key_rotation::RemoteKeyProvisioner>,
+    ) -> Self {
+        self.provisioner = Some(provisioner);
+        self
     }
 
     /// The pass loop. Runs until the task is cancelled; a failed pass is logged and
@@ -87,12 +104,15 @@ impl RotationTimer {
                 continue;
             };
             let scope = crate::Scope::new(tenant, environment);
-            let machine = RotationStateMachine::new(
+            let mut machine = RotationStateMachine::new(
                 &self.app_store,
                 scope,
                 ActorRef::agent(crate::AgentId::generate(env)),
                 CorrelationId::generate(env),
             );
+            if let Some(provisioner) = self.provisioner.as_deref() {
+                machine = machine.with_remote_seeding(provisioner);
+            }
             let report = machine
                 .advance(env, self.policy, now_micros, self.max_token_lifetime_secs)
                 .await?;

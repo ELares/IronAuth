@@ -342,6 +342,74 @@ async fn the_database_wide_pass_advances_every_environment_and_converges_on_repl
     );
 }
 
+/// THE OUTAGE CRITERION (issue #161): a backend that cannot confirm its keys
+/// (an outage) makes the seed fail, and the machine then refuses to promote -
+/// the previous current key stays ACTIVE, exactly one key in the set.
+#[tokio::test]
+async fn a_backend_outage_during_seeding_leaves_the_previous_current_key_active() {
+    struct OutagedProvisioner;
+    impl ironauth_store::key_rotation::RemoteKeyProvisioner for OutagedProvisioner {
+        fn ensure_remote_key(&self, _kid: &str, _algorithm: &str) -> Result<(), ()> {
+            Err(())
+        }
+    }
+
+    let db = TestDatabase::start().await;
+    let (env, _clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x44);
+    let scope = db.seed_scope(&env).await;
+    let t0 = 10_000_000_i64;
+    provision_day_one_head(&db, &env, scope, t0).await;
+    let actor = db.test_actor(&env);
+    let policy = test_policy();
+    let provisioner = OutagedProvisioner;
+    let machine = RotationStateMachine::new(db.store(), scope, actor, CorrelationId::generate(&env))
+        .with_remote_seeding(&provisioner);
+
+    // The pre-publication point: the seed is due, the backend is OUT. The advance
+    // fails, and the key set is unchanged - the previous current key is active.
+    let outcome = machine
+        .advance(&env, policy, t0 + 9_900_000_000, 1_000)
+        .await;
+    assert!(outcome.is_err(), "an outage refuses the seed");
+    assert_eq!(
+        published_kids(&db, scope, t0 + 9_900_000_000).await.len(),
+        1,
+        "the previous current key stays active, exactly one key"
+    );
+
+    // The backend recovers: the same advance now seeds normally.
+    struct RecoveredProvisioner;
+    impl ironauth_store::key_rotation::RemoteKeyProvisioner for RecoveredProvisioner {
+        fn ensure_remote_key(&self, _kid: &str, _algorithm: &str) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+    let recovered = RecoveredProvisioner;
+    let machine = RotationStateMachine::new(
+        db.store(),
+        scope,
+        db.test_actor(&env),
+        CorrelationId::generate(&env),
+    )
+    .with_remote_seeding(&recovered);
+    let report = machine
+        .advance(&env, policy, t0 + 9_900_000_000, 1_000)
+        .await
+        .expect("the recovered backend seeds");
+    assert_eq!(report.provisioned.len(), 1, "the successor is seeded");
+    let keys = db
+        .store()
+        .scoped(scope)
+        .signing_keys()
+        .list()
+        .await
+        .expect("list the keys");
+    assert!(
+        keys.iter().any(|key| key.material_kind.as_str() == "remote_reference"),
+        "the remote deployment's successor is a REMOTE reference"
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn a_full_rotation_is_idempotent_at_a_given_instant() {
