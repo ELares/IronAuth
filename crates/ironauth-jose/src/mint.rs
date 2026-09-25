@@ -361,7 +361,11 @@ pub fn protected_header_with(
     algorithm: JwsAlgorithm,
     options: &EmissionOptions,
 ) -> Result<Vec<u8>, SignError> {
-    build_header(options.alg_name(algorithm), Some(kid), options.typ.as_deref())
+    build_header(
+        options.alg_name(algorithm),
+        Some(kid),
+        options.typ.as_deref(),
+    )
 }
 
 /// The EXACT length of unpadded `base64url` over `n` bytes.

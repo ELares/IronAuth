@@ -41,9 +41,9 @@ use axum::http::Method;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use ironauth_config::Secret;
-use ironauth_fetch::{FetchError, FetchLimits, FetchRequest, FetchResponse, Fetcher};
-use ironauth_jose::external_signer::{ExternalSigner, ExternalSignerError};
+use ironauth_fetch::{FetchError, FetchLimits, FetchRequest, Fetcher};
 use ironauth_jose::JwsAlgorithm;
+use ironauth_jose::external_signer::{ExternalSigner, ExternalSignerError};
 
 /// The Vault transit signer (issue #161).
 pub struct VaultTransitSigner {
@@ -131,25 +131,25 @@ impl ExternalSigner for VaultTransitSigner {
                 Method::POST,
                 url,
             )
-                .header(
-                    axum::http::header::CONTENT_TYPE,
-                    axum::http::HeaderValue::from_static("application/json"),
-                )
-                .header(
-                    axum::http::header::ACCEPT,
-                    axum::http::HeaderValue::from_static("application/json"),
-                )
-                .header(
-                    axum::http::header::AUTHORIZATION,
-                    axum::http::HeaderValue::from_str(&format!("Bearer {exposed}"))
-                        .map_err(|_| ExternalSignerError::Backend)?,
-                )
-                .body(serde_json::to_vec(&body).map_err(|_| ExternalSignerError::Backend)?)
-                .timeout(timeout)
-                // The fetch seam refuses plaintext http by default (the SSRF
-                // posture); the TEST stub is plaintext, so it opts in. Production
-                // configs point at the vault's https address.
-                .allow_plaintext_http();
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            )
+            .header(
+                axum::http::header::ACCEPT,
+                axum::http::HeaderValue::from_static("application/json"),
+            )
+            .header(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&format!("Bearer {exposed}"))
+                    .map_err(|_| ExternalSignerError::Backend)?,
+            )
+            .body(serde_json::to_vec(&body).map_err(|_| ExternalSignerError::Backend)?)
+            .timeout(timeout)
+            // The fetch seam refuses plaintext http by default (the SSRF
+            // posture); the TEST stub is plaintext, so it opts in. Production
+            // configs point at the vault's https address.
+            .allow_plaintext_http();
             let response = self.http.fetch(request).await;
             #[cfg(test)]
             if let Err(ref error) = response {
@@ -195,8 +195,6 @@ fn vault_algorithm(alg: JwsAlgorithm) -> (&'static str, Option<&'static str>) {
     }
 }
 
-
-
 /// Map a fetch failure to the signer's boundary (issue #161): timeouts and
 /// throttles are retryable and distinct; everything else is opaque.
 fn map_fetch_error(error: FetchError) -> ExternalSignerError {
@@ -204,16 +202,6 @@ fn map_fetch_error(error: FetchError) -> ExternalSignerError {
         return ExternalSignerError::Timeout;
     }
     ExternalSignerError::Backend
-}
-
-/// The signature the vault returns, parsed from its envelope.
-fn parse_signature(payload: &serde_json::Value) -> Option<Vec<u8>> {
-    let signature = payload
-        .get("data")
-        .and_then(|data| data.get("signature"))
-        .and_then(|value| value.as_str())?;
-    let raw = signature.rsplit_once(':').map(|(_, encoded)| encoded)?;
-    STANDARD.decode(raw).ok()
 }
 
 #[cfg(test)]
@@ -246,16 +234,20 @@ mod tests {
                     let mut buf = [0_u8; 8192];
                     let _ = socket.read(&mut buf).await;
                     let text = String::from_utf8_lossy(&buf);
-                    let body = text.split_once("
+                    let body = text
+                        .split_once(
+                            "
 
-").map_or("", |(_, body)| body.trim());
+",
+                        )
+                        .map_or("", |(_, body)| body.trim());
                     let value: serde_json::Value =
                         serde_json::from_str(body).unwrap_or_else(|_| serde_json::json!({}));
                     let input = STANDARD
                         .decode(value["input"].as_str().unwrap_or(""))
                         .unwrap_or_default();
-                    let sig = ironauth_jose::sign_detached(&router_key, &input)
-                        .expect("the stub signs");
+                    let sig =
+                        ironauth_jose::sign_detached(&router_key, &input).expect("the stub signs");
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         serde_json::json!({
@@ -264,7 +256,7 @@ mod tests {
                             }
                         })
                         .to_string()
-                            .len(),
+                        .len(),
                         serde_json::json!({
                             "data": {
                                 "signature": format!("vault:v1:{}", STANDARD.encode(&sig))
@@ -298,13 +290,8 @@ mod tests {
             resolver,
             dialer,
         );
-        let signer = VaultTransitSigner::from_fetcher(
-            addr,
-            "transit",
-            token,
-            Duration::from_secs(5),
-            http,
-        );
+        let signer =
+            VaultTransitSigner::from_fetcher(addr, "transit", token, Duration::from_secs(5), http);
         let input = b"the full signing input, exactly as PureEdDSA demands";
         let sig = signer
             .sign("test-kid", JwsAlgorithm::EdDsa, input)
