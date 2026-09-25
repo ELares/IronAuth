@@ -45,6 +45,72 @@ use ironauth_fetch::{FetchError, FetchLimits, FetchRequest, Fetcher};
 use ironauth_jose::JwsAlgorithm;
 use ironauth_jose::external_signer::{ExternalSigner, ExternalSignerError};
 
+/// The vault-side key provisioner (issue #161): confirms a pre-provisioned transit
+/// key named by a kid exists, so the rotation machine stores a REMOTE-REFERENCE
+/// successor only when the backend actually has the key. An outage (the vault
+/// down) errors, and the machine then refuses to promote - the previous current
+/// key stays active.
+pub struct VaultKeyProvisioner {
+    addr: String,
+    mount: String,
+    token: Arc<Secret>,
+    timeout: Duration,
+}
+
+impl VaultKeyProvisioner {
+    /// Build the provisioner; the token resolution failures map to a backend
+    /// error at the call.
+    #[must_use]
+    pub fn new(addr: impl Into<String>, mount: impl Into<String>, token: Secret, timeout: Duration) -> Self {
+        Self {
+            addr: addr.into(),
+            mount: mount.into(),
+            token: Arc::new(token),
+            timeout,
+        }
+    }
+}
+
+impl ironauth_store::key_rotation::RemoteKeyProvisioner for VaultKeyProvisioner {
+    fn ensure_remote_key(&self, kid: &str, _algorithm: &str) -> Result<(), ()> {
+        let url = format!("{}/v1/{}/keys/{kid}", self.addr, self.mount);
+        let token = Arc::clone(&self.token);
+        let timeout = self.timeout;
+        // The check is a HEAD-style read; the vault transit API answers 404 for a
+        // missing key, and any non-success (including the timeout) is an outage.
+        // The tokio runtime is present at every call site (the machine's pass).
+        tokio::runtime::Handle::current().block_on(async move {
+            let Ok(resolved) = token.resolve() else {
+                return Err(());
+            };
+            let request = ironauth_fetch::FetchRequest::get(
+                ironauth_fetch::FetchPurpose::ExternalSigner,
+                url,
+            )
+            .header(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&format!(
+                    "Bearer {}",
+                    resolved.expose()
+                ))
+                .map_err(|_| ())?,
+            )
+            .timeout(timeout)
+            .allow_plaintext_http();
+            let response = ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default())
+                .map_err(|_| ())?
+                .fetch(request)
+                .await
+                .map_err(|_| ())?;
+            if response.status().is_success() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        })
+    }
+}
+
 /// The Vault transit signer (issue #161).
 pub struct VaultTransitSigner {
     http: Fetcher,

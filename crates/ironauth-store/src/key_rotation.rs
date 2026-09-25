@@ -105,11 +105,40 @@ struct KeyLifecycle {
     expire_at_micros: Option<i64>,
 }
 
+/// The remote-key verification seam (issue #161): before a REMOTE-REFERENCE
+/// successor is stored, the machine asks the backend to ensure the key exists
+/// (a pre-provisioned vault key named by the kid). An outage (the backend down)
+/// errors, and the machine then refuses to promote - the previous current key
+/// stays active, which is the issue's outage criterion.
+pub trait RemoteKeyProvisioner: Send + Sync {
+    /// Ensure the remote key named `kid` exists for `algorithm`.
+    ///
+    /// # Errors
+    ///
+    /// On any backend failure (a timeout, a missing key, an auth refusal); the
+    /// machine treats every error the same: no successor, no promotion.
+    fn ensure_remote_key(&self, kid: &str, algorithm: &str) -> Result<(), ()>;
+}
+
+/// How the machine seeds successors (issue #161).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedMode {
+    /// Generate the material locally and store it (the encrypted-at-rest key
+    /// store; the default).
+    Local,
+    /// Store a REMOTE reference (the kid names a pre-provisioned key in an
+    /// external backend's boundary); the backend must confirm the key exists
+    /// before the reference is stored.
+    RemoteReference,
+}
+
 /// The rotation state machine for one scope.
 pub struct RotationStateMachine<'a> {
     store: &'a Store,
     scope: Scope,
     acting: ActingContext,
+    seed_mode: SeedMode,
+    provisioner: Option<&'a (dyn RemoteKeyProvisioner + Send + Sync)>,
 }
 
 impl<'a> RotationStateMachine<'a> {
@@ -125,7 +154,22 @@ impl<'a> RotationStateMachine<'a> {
             store,
             scope,
             acting: ActingContext::new(actor, correlation),
+            seed_mode: SeedMode::Local,
+            provisioner: None,
         }
+    }
+
+    /// Select the seeding mode (issue #161): `RemoteReference` with a
+    /// [`RemoteKeyProvisioner`] for a deployment whose signing backend is
+    /// external.
+    #[must_use]
+    pub fn with_remote_seeding(
+        mut self,
+        provisioner: &'a (dyn RemoteKeyProvisioner + Send + Sync),
+    ) -> Self {
+        self.seed_mode = SeedMode::RemoteReference;
+        self.provisioner = Some(provisioner);
+        self
     }
 
     /// One timer tick: seed successors due for pre-publication, promote due pending
@@ -261,17 +305,43 @@ impl<'a> RotationStateMachine<'a> {
         policy: RotationPolicy,
     ) -> Result<SigningKeyId, StoreError> {
         let id = SigningKeyId::generate(env, &self.scope);
-        let material: Vec<u8> = match material_kind {
-            SigningKeyMaterialKind::Ed25519Seed => {
-                let mut seed = [0_u8; 32];
-                env.entropy().fill_bytes(&mut seed);
-                seed.to_vec()
+        let (material_kind, material): (SigningKeyMaterialKind, Vec<u8>) = match self.seed_mode {
+            // A remote deployment: the kid names a pre-provisioned key in the
+            // backend's boundary. The provisioner MUST confirm it exists first -
+            // an outage (the backend down) errors, and the machine then refuses to
+            // promote, leaving the previous current key active (issue #161's
+            // outage criterion).
+            SeedMode::RemoteReference => {
+                let Some(provisioner) = self.provisioner else {
+                    return Err(StoreError::Invalid);
+                };
+                provisioner
+                    .ensure_remote_key(&id.to_string(), algorithm)
+                    .map_err(|()| StoreError::Invalid)?;
+                (
+                    SigningKeyMaterialKind::RemoteReference,
+                    id.to_string().into_bytes(),
+                )
             }
-            SigningKeyMaterialKind::EcdsaPkcs8 => {
-                generate_ecdsa_p256_pkcs8_der(env.entropy()).map_err(|_| StoreError::Encryption)?
-            }
-            SigningKeyMaterialKind::RsaPkcs1Der => {
-                generate_rsa_pkcs1_der(env.entropy()).map_err(|_| StoreError::Encryption)?
+            SeedMode::Local => {
+                let material: Vec<u8> = match material_kind {
+                    SigningKeyMaterialKind::Ed25519Seed => {
+                        let mut seed = [0_u8; 32];
+                        env.entropy().fill_bytes(&mut seed);
+                        seed.to_vec()
+                    }
+                    SigningKeyMaterialKind::EcdsaPkcs8 => {
+                        generate_ecdsa_p256_pkcs8_der(env.entropy())
+                            .map_err(|_| StoreError::Encryption)?
+                    }
+                    SigningKeyMaterialKind::RsaPkcs1Der => {
+                        generate_rsa_pkcs1_der(env.entropy()).map_err(|_| StoreError::Encryption)?
+                    }
+                    SigningKeyMaterialKind::RemoteReference => {
+                        return Err(StoreError::Invalid);
+                    }
+                };
+                (material_kind, material)
             }
         };
         let key = NewSigningKey {

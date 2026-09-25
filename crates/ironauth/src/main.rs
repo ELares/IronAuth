@@ -9247,6 +9247,9 @@ struct RotationTimerInputs {
     max_token_lifetime_secs: u64,
     /// Seconds between passes.
     interval_secs: u64,
+    /// The remote-key provisioner (issue #161) for a vault signing backend; the
+    /// timer then stores REMOTE references with a pre-store confirmation.
+    provisioner: Option<Box<dyn ironauth_store::key_rotation::RemoteKeyProvisioner>>,
     env: Env,
 }
 
@@ -9289,19 +9292,43 @@ async fn rotation_timer_inputs(
         },
         max_token_lifetime_secs: rotation.max_token_lifetime_secs,
         interval_secs: rotation.interval_secs,
+        provisioner: match config.signing.backend {
+            ironauth_config::SigningBackend::Vault => {
+                let Some(secret) = &config.signing.vault.token else {
+                    tracing::error!(
+                        "rotation timer NOT running with remote seeding: signing.vault.token \
+                         is unset"
+                    );
+                    return None;
+                };
+                Some(Box::new(ironauth_oidc::vault_sign::VaultKeyProvisioner::new(
+                    config.signing.vault.addr.clone(),
+                    config.signing.vault.mount.clone(),
+                    secret.clone(),
+                    std::time::Duration::from_secs(config.signing.vault.timeout_secs),
+                )))
+            }
+            ironauth_config::SigningBackend::Local => None,
+        },
         env: Env::system(),
     })
 }
 
 /// Start the rotation timer's pass loop.
 fn start_rotation_timer(inputs: RotationTimerInputs) -> tokio::task::JoinHandle<()> {
-    let timer = ironauth_store::rotation_timer::RotationTimer::new(
+    let mut timer = ironauth_store::rotation_timer::RotationTimer::new(
         inputs.app_store,
         inputs.control_store,
         inputs.policy,
         inputs.max_token_lifetime_secs,
         std::time::Duration::from_secs(inputs.interval_secs),
     );
+    // A remote signing backend (issue #161): the timer's machine stores REMOTE
+    // references and asks the backend to confirm each key before storing it - an
+    // outage refuses the seed and the previous current key stays active.
+    if let Some(provisioner) = inputs.provisioner {
+        timer = timer.with_remote_seeding(provisioner);
+    }
     let env = inputs.env;
     tracing::info!("signing-key rotation timer running");
     tokio::spawn(async move { timer.run(&env).await })
