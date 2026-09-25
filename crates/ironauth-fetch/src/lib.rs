@@ -165,6 +165,11 @@ pub enum FetchPurpose {
     /// It also carries RECIPIENT PII in its body where a webhook carries an event, which is a
     /// reason to be able to police them separately.
     MessageDelivery,
+    /// Signing through an external signer backend (issue #161): an operator-chosen
+    /// Vault/OpenBao transit engine. The URL is fixed at boot (never request-derived)
+    /// and the payload is a raw signing input, so its own purpose keeps the series
+    /// readable against the crypto backends' failure budgets.
+    ExternalSigner,
     /// Shipping a batch of audit events to an operator-configured SIEM sink
     /// (issue #110). Distinct from [`FetchPurpose::WebhookDelivery`] because the
     /// two answer to different operators and carry different payloads: a webhook
@@ -277,6 +282,7 @@ impl FetchPurpose {
             FetchPurpose::WebhookDelivery => "webhook_delivery",
             FetchPurpose::SsfPush => "ssf_push",
             FetchPurpose::MessageDelivery => "message_delivery",
+            FetchPurpose::ExternalSigner => "external_signer",
             FetchPurpose::LogStreamDelivery => "log_stream_delivery",
             FetchPurpose::FlowTarget => "flow_target",
             FetchPurpose::Logo => "logo",
