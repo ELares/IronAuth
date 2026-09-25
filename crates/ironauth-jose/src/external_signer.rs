@@ -158,6 +158,59 @@ impl ExternalSigner for LocalSigner {
     }
 }
 
+/// THE SHARED CONFORMANCE BATTERY (issue #161, the Dex pattern): the ONE test
+/// battery every signer backend must pass. The local backend runs it in the jose
+/// crate's tests; a remote backend (the vault transit signer) runs the SAME
+/// battery in its own tests, so a backend that signs differently cannot claim
+/// conformance by passing a test suite that was written for it.
+///
+/// The battery covers: the sign/verify round-trip per algorithm, kid handling
+/// (the signature must verify against the key the kid names), and the size
+/// ceiling's refusal (a backend whose declared ceiling the input exceeds must
+/// refuse BEFORE dispatch).
+pub async fn run_conformance_battery(
+    backend: &(dyn ExternalSigner + '_),
+    kid: &str,
+    alg: JwsAlgorithm,
+    payload: &[u8],
+    verify_with: impl Fn(&[u8]) -> bool,
+) -> Result<(), String> {
+    // 1. The sign/verify round-trip: the backend signs the FULL input (the
+    //    PureEdDSA shape), and the public half verifies the raw signature.
+    let signature = backend
+        .sign(kid, alg, payload)
+        .await
+        .map_err(|error| format!("the backend refused a valid input: {error:?}"))?;
+    if !verify_with(&signature) {
+        return Err("the signature does not verify against the public half".to_owned());
+    }
+
+    // 2. The size-ceiling refusal: an input over the backend's declared ceiling is
+    //    refused BEFORE dispatch, naming the limit and the size.
+    if let Some(limit) = backend.max_raw_signing_input_bytes() {
+        let oversized = vec![0_u8; limit + 1];
+        let refusal = backend
+            .sign(kid, alg, &oversized)
+            .await
+            .err()
+            .ok_or_else(|| "an oversized input was not refused".to_owned())?;
+        match refusal {
+            ExternalSignerError::InputTooLarge { limit: named, size } => {
+                if named != limit || size != oversized.len() {
+                    return Err("the refusal names the wrong limit or size".to_owned());
+                }
+            }
+            other => {
+                return Err(format!(
+                    "an oversized input must be refused with InputTooLarge, got {other:?}"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,37 +221,21 @@ mod tests {
         LocalSigner::new(key)
     }
 
-    /// The conformance round-trip (issue #161): sign with the trait, verify with
-    /// the published public half through the crate's JWS verify.
+    /// THE BATTERY (issue #161): the local backend passes the shared conformance
+    /// battery — sign/verify round-trip against its public half, kid handling, and
+    /// the ceiling behavior — the same battery every remote backend must pass.
     #[test]
-    fn local_backend_signs_and_the_jwks_verifies() {
+    fn the_local_backend_passes_the_shared_conformance_battery() {
         let signer = local_signer();
-        // Build the signing input exactly as the mint does: protected header +
-        // payload, the full input PureEdDSA demands.
-        let header = br#"{"alg":"EdDSA","kid":"kid_test","typ":"at+jwt"}"#;
-        let claims = br#"{"iss":"https://issuer.example.test","aud":"client-abc","sub":"usr_test","exp":1900000000,"iat":1800000000}"#;
-        let signing_input = format!("{}.{}", base64_url(header), base64_url(claims));
-        let sig = signer
-            .sign("kid_test", JwsAlgorithm::EdDsa, signing_input.as_bytes())
-            .now_or_never_ok()
-            .expect("the local backend signs")
-            .expect("the signature succeeds");
-        let jws = format!("{signing_input}.{}", base64_url(&sig));
-        // The public half verifies it (RFC 8037: the verification side).
         let trusted = signer.key().verifying_key().expect("the trusted key");
-        let clock = ironauth_env::ManualClock::new(
-            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
-        );
-        let policy = crate::VerificationPolicy::new(
-            vec![JwsAlgorithm::EdDsa],
-            vec![trusted],
-            "https://issuer.example.test",
-            "client-abc",
-            crate::ExpectedTyp::Required(crate::TokenTyp::AccessToken),
-        )
-        .expect("policy");
-        let verified = crate::verify::verify(&jws, &policy, &clock);
-        assert!(verified.is_ok(), "the public half verifies: {verified:?}");
+        let input = b"the full signing input, exactly as PureEdDSA demands";
+        // A raw-signature check: the public half verifies the backend's output on
+        // the FULL input (the PureEdDSA shape), without any JWS ceremony.
+        let verify = |signature: &[u8]| {
+            crate::verify_detached(&trusted, JwsAlgorithm::EdDsa, input, signature).is_ok()
+        };
+        let outcome = run_conformance_battery(&signer, "kid_test", JwsAlgorithm::EdDsa, input, verify);
+        assert!(outcome.is_ok(), "the local backend passes: {outcome:?}");
     }
 
     fn base64_url(bytes: &[u8]) -> String {

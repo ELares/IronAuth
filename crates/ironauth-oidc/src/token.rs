@@ -1976,7 +1976,7 @@ async fn mint_tokens(
             access_extra_claims,
         },
         target,
-    )
+    ).await
     .map_err(|refusal| match refusal {
         tokens::MintRefusal::Policy { .. } => TokenError::AccessDenied,
         tokens::MintRefusal::Signing => TokenError::ServerError,
@@ -3147,7 +3147,7 @@ async fn mint_refresh_access(
             access_extra_claims: &access_extra_claims,
         },
         target,
-    )
+    ).await
     .map_err(|refusal| match refusal {
         tokens::MintRefusal::Policy { .. } => TokenError::AccessDenied,
         tokens::MintRefusal::Signing => TokenError::ServerError,
