@@ -258,6 +258,10 @@ pub struct OidcState {
     /// The PKI method's trust anchors (issue #159), absent until the boot path parses
     /// the configured `[mtls]` bundle.
     mtls_anchors: Option<Arc<Vec<ironauth_jose::mtls::ParsedClientCertificate>>>,
+    /// The signing backend (issue #161): `Some` when the deployment selected a
+    /// remote backend (a Vault transit engine), `None` for the local encrypted-
+    /// at-rest key store. The mint consults this before signing.
+    signer_backend: Option<Arc<dyn ironauth_jose::external_signer::ExternalSigner>>,
     /// The deployment's access rules, for the consumers that are not the forward-auth check
     /// (issue #154 criterion 4).
     ///
@@ -1170,6 +1174,7 @@ impl OidcState {
             federation: None,
             attesters: None,
             mtls_anchors: None,
+            signer_backend: None,
             transaction_token_domain: None,
             identity_chaining_enabled: false,
             native_sso_enabled: false,
@@ -1237,6 +1242,26 @@ impl OidcState {
     #[must_use]
     pub fn mtls_anchors(&self) -> Option<&Arc<Vec<ironauth_jose::mtls::ParsedClientCertificate>>> {
         self.mtls_anchors.as_ref()
+    }
+
+    /// Install the signing backend (issue #161): the mint consults it before
+    /// signing when a deployment selected a remote signer. `None` (the default)
+    /// means the local encrypted-at-rest key store.
+    #[must_use]
+    pub fn with_signer_backend(
+        mut self,
+        backend: Option<Arc<dyn ironauth_jose::external_signer::ExternalSigner>>,
+    ) -> Self {
+        self.signer_backend = backend;
+        self
+    }
+
+    /// The selected signing backend (issue #161), `None` for the local key store.
+    #[must_use]
+    pub fn signer_backend(
+        &self,
+    ) -> Option<&Arc<dyn ironauth_jose::external_signer::ExternalSigner>> {
+        self.signer_backend.as_ref()
     }
 
     /// Install the trust domain transaction tokens are minted for (issue #133, PROTOTYPE).

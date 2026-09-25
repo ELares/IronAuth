@@ -348,7 +348,7 @@ mod tokens;
 mod totp;
 mod trusted_device;
 mod upstream_token;
-mod vault_sign;
+pub mod vault_sign;
 mod userinfo;
 mod util;
 mod verification;
