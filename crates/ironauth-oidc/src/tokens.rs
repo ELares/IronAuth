@@ -62,9 +62,11 @@ use std::time::{Duration, SystemTime};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_jose::{
-    Confirmation, EmissionOptions, SigningKey, SigningPolicy, TokenTyp, compact_len,
-    protected_header, sign_jws_with_policy,
+    Confirmation, EmissionOptions, JwsAlgorithm, SigningKey, SigningPolicy, TokenTyp,
+    compact_len, protected_header, protected_header_with, sign_jws_with_policy,
+    signing_input,
 };
+use std::sync::Arc;
 use ironauth_store::{
     IssuedTokenId, RefreshTokenId, Scope, TokenFormat, opaque_access_token_digest,
     refresh_token_digest,
@@ -1292,7 +1294,7 @@ pub(crate) fn issued_acr(auth_methods: &str) -> String {
 /// Returns `Err(())` if `signer`'s algorithm is not permitted by `policy` or the
 /// signing backend fails; the caller maps that to a token-endpoint `server_error`,
 /// so a signing failure fails the issuance closed. The opaque path is infallible.
-pub fn mint_client_credentials_access_token(
+pub async fn mint_client_credentials_access_token(
     state: &OidcState,
     signer: &SigningKey,
     policy: &SigningPolicy,
@@ -1332,13 +1334,27 @@ pub fn mint_client_credentials_access_token(
                     confirmation.embed_in_claims(object);
                 }
             }
-            let token = sign_jws_with_policy(
-                policy,
-                signer,
-                &serde_json::to_vec(&claims).map_err(|_| ())?,
-                &EmissionOptions::new().with_token_typ(TokenTyp::AccessToken),
-            )
-            .map_err(|_| ())?;
+            let claims_bytes = serde_json::to_vec(&claims).map_err(|_| ())?;
+            let token = if let Some(backend) = state.signer_backend() {
+                sign_through_backend(
+                    state,
+                    backend,
+                    signer.kid().unwrap_or_default(),
+                    signer.algorithm(),
+                    &claims_bytes,
+                    TokenTyp::AccessToken,
+                )
+                .await
+                .map_err(|_| ())?
+            } else {
+                sign_jws_with_policy(
+                    policy,
+                    signer,
+                    &claims_bytes,
+                    &EmissionOptions::new().with_token_typ(TokenTyp::AccessToken),
+                )
+                .map_err(|_| ())?
+            };
             MintedAccessToken::Jwt { token, jti }
         }
         // Opaque tokens carry no claims, so this is the exact same reference token as
@@ -1683,6 +1699,56 @@ fn at_jwt_payload(
 /// opaque access token IronAuth issues is byte-shaped identically regardless of the
 /// grant that minted it.
 /// issuance-gate-allow: a format arm below `mint_access`, which has already checked.
+/// Sign `payload` through the selected backend (issue #161): the JWS input is the
+/// exact bytes the backend signs (the same [`signing_input`] the local mint uses),
+/// the size guard runs BEFORE dispatch (a backend whose raw-input ceiling the input
+/// exceeds is refused with the numbers named), and the compact form is assembled
+/// from the raw signature. The warning half of the guard increments
+/// `ironauth_signing_input_oversized_total`.
+async fn sign_through_backend(
+    state: &OidcState,
+    backend: &Arc<dyn ironauth_jose::external_signer::ExternalSigner>,
+    kid: &str,
+    alg: JwsAlgorithm,
+    payload: &[u8],
+    typ: TokenTyp,
+) -> Result<String, ()> {
+    describe_signing_metrics();
+    let header = protected_header_with(kid, alg, &EmissionOptions::new().with_token_typ(typ))
+        .map_err(|_| ())?;
+    let input = signing_input(&header, payload);
+    if ironauth_jose::external_signer::input_exceeds_warn_threshold(input.as_bytes()) {
+        tracing::warn!(
+            bytes = input.len(),
+            "signing input exceeds the 3 KB warning threshold (issue #161)"
+        );
+        metrics::counter!(
+            ironauth_jose::external_signer::SIGNING_INPUT_OVERSIZED_METRIC
+        )
+        .increment(1);
+    }
+    ironauth_jose::external_signer::guard_signing_input_size(
+        input.as_bytes(),
+        backend.max_raw_signing_input_bytes(),
+    )
+    .map_err(|_| ())?;
+    let signature = backend
+        .sign(kid, alg, input.as_bytes())
+        .await
+        .map_err(|_| ())?;
+    Ok(ironauth_jose::assemble(&input, &signature))
+}
+
+/// Describe the oversized-signing-input counter (issue #161): called by the first
+/// external-signer signing path that runs (the counter's HELP/TYPE only need to
+/// appear once for Prometheus).
+pub fn describe_signing_metrics() {
+    metrics::describe_counter!(
+        ironauth_jose::external_signer::SIGNING_INPUT_OVERSIZED_METRIC,
+        "Raw signing inputs above the 3 KB warning threshold (issue #161)"
+    );
+}
+
 fn mint_opaque_access(
     state: &OidcState,
     scope: &Scope,
