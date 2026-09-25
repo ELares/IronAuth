@@ -278,6 +278,12 @@ pub struct Config {
     /// outbox-stream replication shipper alerts at. OFF by default.
     pub replication: ReplicationConfig,
 
+    /// The signing backend (issue #161): where the environment's signing keys sign.
+    /// `local` (the default) uses the encrypted-at-rest key store; `vault` signs
+    /// through a Vault/OpenBao transit engine, so the private keys never leave the
+    /// Vault boundary. Misconfiguration fails fast at boot.
+    pub signing: SigningConfig,
+
     /// Mutual-TLS client authentication (issue #159): the PKI method's trust
     /// anchors. Empty by default, which leaves `tls_client_auth` unregistrable:
     /// a chain cannot validate against a bundle nothing configured.
@@ -767,6 +773,61 @@ pub struct SigningRotationConfig {
     /// Seconds between timer passes. A pass is idempotent, so an over-long interval
     /// only delays a scheduled rotation by the interval; it never skips one.
     pub interval_secs: u64,
+}
+
+/// The signing-backend selection (issue #161).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct SigningConfig {
+    /// The backend: `local` (the default) or `vault`.
+    pub backend: SigningBackend,
+
+    /// The Vault/OpenBao transit settings; validated only when `backend = vault`.
+    pub vault: VaultTransitConfig,
+}
+
+impl Default for SigningConfig {
+    fn default() -> Self {
+        Self {
+            backend: SigningBackend::Local,
+            vault: VaultTransitConfig::default(),
+        }
+    }
+}
+
+/// Which backend signs tokens (issue #161).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SigningBackend {
+    /// The encrypted-at-rest key store (the default).
+    Local,
+    /// A Vault/OpenBao transit engine: keys never leave the Vault boundary.
+    Vault,
+}
+
+/// The Vault/OpenBao transit configuration (issue #161).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct VaultTransitConfig {
+    /// The Vault address, for example `https://vault.internal:8200`.
+    pub addr: String,
+    /// The transit engine mount path, for example `transit`.
+    pub mount: String,
+    /// The Vault token, through the file/env secrets indirection (never inline).
+    pub token: Option<Secret>,
+    /// Seconds before a sign request is a retryable timeout.
+    pub timeout_secs: u64,
+}
+
+impl Default for VaultTransitConfig {
+    fn default() -> Self {
+        Self {
+            addr: String::new(),
+            mount: "transit".to_owned(),
+            token: None,
+            timeout_secs: 5,
+        }
+    }
 }
 
 /// The mutual-TLS trust-anchor configuration (issue #159): the CA bundle the
@@ -6692,6 +6753,7 @@ impl Config {
         validate_backup(&self.backup)?;
         validate_replication(&self.replication, self.database.url.expose())?;
         validate_signing_rotation(&self.signing_rotation)?;
+        validate_signing(&self.signing)?;
         validate_certificate_expiry(&self.certificate_expiry)?;
         check_oidc_lifetime(
             "oidc.authorization_code_ttl_secs",
@@ -6963,6 +7025,29 @@ fn validate_replication(
 /// the machine will not question them - a pre-publication window bigger than the cadence
 /// means the successor is published after its own rotation instant, and a zero cadence
 /// makes the machine's "idempotent" pass a real work unit.
+/// Validate the signing-backend section (issue #161): a `vault` selection without an
+/// address or a token is a misconfiguration that must fail at boot, not at the first
+/// issuance.
+fn validate_signing(signing: &SigningConfig) -> Result<(), ConfigError> {
+    if signing.backend == SigningBackend::Vault {
+        if signing.vault.addr.is_empty() {
+            return Err(ConfigError::Invalid {
+                message: "signing.backend = vault requires signing.vault.addr: the \
+                           transit engine's address"
+                    .to_string(),
+            });
+        }
+        if signing.vault.token.is_none() {
+            return Err(ConfigError::Invalid {
+                message: "signing.backend = vault requires signing.vault.token: the \
+                           Vault token, through the file/env indirection"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_signing_rotation(rotation: &SigningRotationConfig) -> Result<(), ConfigError> {
     if !rotation.enabled {
         return Ok(());
