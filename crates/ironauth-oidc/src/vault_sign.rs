@@ -234,6 +234,7 @@ mod tests {
                     let mut buf = [0_u8; 8192];
                     let _ = socket.read(&mut buf).await;
                     let text = String::from_utf8_lossy(&buf);
+<<<<<<< HEAD
                     let body = text
                         .split_once(
                             "
@@ -241,6 +242,11 @@ mod tests {
 ",
                         )
                         .map_or("", |(_, body)| body.trim());
+=======
+                    let body = text.split_once("
+
+").map_or("", |(_, body)| body.trim());
+>>>>>>> 8862ecc7 (signer: the shared conformance battery and the user-path mint routing (#161))
                     let value: serde_json::Value =
                         serde_json::from_str(body).unwrap_or_else(|_| serde_json::json!({}));
                     let input = STANDARD
@@ -293,13 +299,22 @@ mod tests {
         let signer =
             VaultTransitSigner::from_fetcher(addr, "transit", token, Duration::from_secs(5), http);
         let input = b"the full signing input, exactly as PureEdDSA demands";
-        let sig = signer
-            .sign("test-kid", JwsAlgorithm::EdDsa, input)
-            .await
-            .expect("the vault backend signs");
         let trusted = stub_key.verifying_key().expect("the trusted key");
-        // The stub signed with the SAME key the public half verifies against.
-        assert_eq!(sig.len(), 64, "an Ed25519 signature is 64 bytes");
-        let _ = trusted;
+        // THE SHARED BATTERY (issue #161, the Dex pattern): the SAME battery the
+        // local backend passes. The stub signed with the same key the public half
+        // verifies against.
+        let verify = |signature: &[u8]| {
+            ironauth_jose::verify_detached(&trusted, JwsAlgorithm::EdDsa, input, signature)
+                .is_ok()
+        };
+        let outcome = ironauth_jose::external_signer::run_conformance_battery(
+            &signer,
+            "test-kid",
+            JwsAlgorithm::EdDsa,
+            input,
+            verify,
+        )
+        .await;
+        assert!(outcome.is_ok(), "the vault backend passes: {outcome:?}");
     }
 }

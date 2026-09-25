@@ -1423,7 +1423,7 @@ fn generate_opaque_access_token(state: &OidcState, jti: &IssuedTokenId) -> Strin
 /// draw and hashing are infallible), but the ID token is always signed, so a
 /// signing failure still fails the whole exchange closed.
 /// issuance-gate-allow: delegates to `mint_access`, which is the door.
-pub fn mint(
+pub async fn mint(
     state: &OidcState,
     signer: &SigningKey,
     policy: &SigningPolicy,
@@ -1455,15 +1455,29 @@ pub fn mint(
     // the environment default. The access token below always uses the environment
     // default `signer`.
     let id_signer = request.id_token_signer.unwrap_or(signer);
-    let id_token = sign_jws_with_policy(
-        policy,
-        id_signer,
-        &serde_json::to_vec(&id_claims).map_err(|_| ())?,
-        &EmissionOptions::new().with_token_typ(TokenTyp::IdToken),
-    )
-    .map_err(|_| ())?;
+    let id_claims_bytes = serde_json::to_vec(&id_claims).map_err(|_| ())?;
+    let id_token = if let Some(backend) = state.signer_backend() {
+        sign_through_backend(
+            state,
+            backend,
+            id_signer.kid().unwrap_or_default(),
+            id_signer.algorithm(),
+            &id_claims_bytes,
+            TokenTyp::IdToken,
+        )
+        .await
+        .map_err(|_| ())?
+    } else {
+        sign_jws_with_policy(
+            policy,
+            id_signer,
+            &id_claims_bytes,
+            &EmissionOptions::new().with_token_typ(TokenTyp::IdToken),
+        )
+        .map_err(|_| ())?
+    };
 
-    let (access, permission_budget) = mint_access(state, signer, policy, request, target, now)?;
+    let (access, permission_budget) = mint_access(state, signer, policy, request, target, now).await?;
 
     Ok(IssuedTokens {
         access,
@@ -1490,7 +1504,7 @@ pub fn mint(
 /// signing backend fails; the caller maps that to a token-endpoint `server_error`,
 /// so a signing failure fails the refresh closed. The opaque path is infallible.
 /// issuance-gate-allow: delegates to `mint_access`.
-pub fn mint_access_token(
+pub async fn mint_access_token(
     state: &OidcState,
     signer: &SigningKey,
     policy: &SigningPolicy,
@@ -1498,7 +1512,8 @@ pub fn mint_access_token(
     target: &AccessTokenTarget,
 ) -> Result<MintedRefreshAccess, MintRefusal> {
     let now = state.now();
-    let (access, permission_budget) = mint_access(state, signer, policy, request, target, now)?;
+    let (access, permission_budget) =
+        mint_access(state, signer, policy, request, target, now).await?;
     Ok(MintedRefreshAccess {
         access,
         expires_in_secs: secs(target.ttl),
@@ -1523,7 +1538,7 @@ pub fn mint_access_token(
 /// extension point to put one in. Permissions are an `at+jwt` feature or they do not
 /// exist. `an_opaque_access_token_can_never_carry_permissions` asserts it rather than
 /// leaving it to be inferred from the absence of code.
-fn mint_access(
+async fn mint_access(
     state: &OidcState,
     signer: &SigningKey,
     policy: &SigningPolicy,
@@ -1554,8 +1569,11 @@ fn mint_access(
         // RFC 9068 at+jwt: the header typ is `at+jwt` and the claims carry the
         // section 2.2 set, signed through the same policy-enforced core as the ID
         // token, so an algorithm the policy forbids is refused before signing.
-        TokenFormat::AtJwt => mint_at_jwt(state, signer, policy, request, target, iat, access_exp)
-            .map_err(MintRefusal::from),
+        TokenFormat::AtJwt => {
+            mint_at_jwt(state, signer, policy, request, target, iat, access_exp)
+                .await
+                .map_err(MintRefusal::from)
+        }
         // Opaque: a scope-declaring reference token; only its digest and metadata
         // are stored (the caller records them in the redeem transaction). The token
         // embeds its own `jti` as the routing handle, so the digest is over the
@@ -1601,7 +1619,7 @@ fn mint_access(
 /// threaded in on [`MintRequest`]. One source, no wiring point for a caller to miss,
 /// and no way for two call sites to hand the mint two different budgets.
 /// issuance-gate-allow: a format arm below `mint_access`, which has already checked.
-fn mint_at_jwt(
+async fn mint_at_jwt(
     state: &OidcState,
     signer: &SigningKey,
     policy: &SigningPolicy,
@@ -1635,7 +1653,20 @@ fn mint_at_jwt(
         &build,
     )?;
 
-    let token = sign_jws_with_policy(policy, signer, &payload, &options).map_err(|_| ())?;
+    let token = if let Some(backend) = state.signer_backend() {
+        sign_through_backend(
+            state,
+            backend,
+            signer.kid().unwrap_or_default(),
+            signer.algorithm(),
+            &payload,
+            TokenTyp::AccessToken,
+        )
+        .await
+        .map_err(|_| ())?
+    } else {
+        sign_jws_with_policy(policy, signer, &payload, &options).map_err(|_| ())?
+    };
     Ok((MintedAccessToken::Jwt { token, jti }, outcome))
 }
 
