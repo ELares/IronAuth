@@ -2081,6 +2081,7 @@ async fn build_oidc_plane(
         None => OidcState::new(store, env, registry, oidc_config, issuer_base),
     }
     .with_mtls_anchors(mtls_anchors(&config.mtls))
+    .with_signer_backend(signer_backend(&config))
     .with_org_provisioning(org_provisioning)
     .with_global_token_revocation_enabled(surfaces.global_revocation)
     .with_ssf(&config.ssf)
@@ -6138,6 +6139,60 @@ fn select_control_dsn(config: &Config) -> Option<String> {
     );
     None
 }
+/// Resolve the configured signing backend (issue #161): a `vault` selection
+/// constructs the transit signer with the token resolved through the secrets
+/// indirection, REFUSING to start when the token cannot resolve (a bad
+/// configuration fails at startup, not at the first issuance); `local` selects
+/// nothing and the existing key store signs.
+fn signer_backend(
+    config: &Config,
+) -> Option<std::sync::Arc<dyn ironauth_jose::external_signer::ExternalSigner>> {
+    if config.signing.backend != ironauth_config::SigningBackend::Vault {
+        return None;
+    }
+    let Some(secret) = &config.signing.vault.token else {
+        tracing::error!(
+            "signing backend = vault but signing.vault.token is unset; the config \
+             validator should have refused this"
+        );
+        return None;
+    };
+    // The resolve is the FAIL-FAST check (a token that cannot resolve means a
+    // signer that cannot sign); the backend keeps the original Secret so every
+    // sign call re-resolves (a file/env token can rotate in place).
+    if let Err(error) = secret.resolve() {
+        tracing::error!(
+            %error,
+            "signing backend = vault but the token could not resolve; refusing to \
+             start with a signer that cannot sign"
+        );
+        std::process::exit(1);
+    }
+    let timeout = std::time::Duration::from_secs(config.signing.vault.timeout_secs);
+    match ironauth_oidc::vault_sign::VaultTransitSigner::new(
+        config.signing.vault.addr.clone(),
+        config.signing.vault.mount.clone(),
+        secret.clone(),
+        timeout,
+    ) {
+        Ok(backend) => {
+            tracing::info!(
+                addr = %config.signing.vault.addr,
+                "signing backend: vault transit"
+            );
+            Some(std::sync::Arc::new(backend))
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "signing backend = vault but the fetcher could not start; refusing to \
+                 start with a signer that cannot sign"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Parse the `[mtls]` trust-anchor bundle (issue #159). A bundle whose entries do
 /// not parse REFUSES the PKI method entirely, with the reason logged at boot (a
 /// typo'd PEM would otherwise arm a method whose every chain fails per request).
