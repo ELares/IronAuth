@@ -755,6 +755,23 @@ mod tests {
              suggest a request path can rotate signing keys, which none does.",
         ),
         (
+            "signing",
+            Reach::OnePlaneOrNoState,
+            "consumed once at boot to select the signing backend (issue #161): which \
+             backend signs tokens - the local key store or a Vault transit engine - and \
+             the Vault's address, mount, and token. No plane state holds it: the mint \
+             resolves the selected backend at boot, and handing the section to a plane \
+             would suggest a request path can pick its own signer, which none does.",
+        ),
+        (
+            "mtls",
+            Reach::OnePlaneOrNoState,
+            "consumed once at boot to arm the tls_client_auth PKI method's trust anchors \
+             (issue #159). No plane state holds it: the anchors live on the oidc state \
+             built at boot, and handing the section to a plane would suggest a request \
+             path can change the trust boundary, which none does.",
+        ),
+        (
             "dev_mode",
             Reach::OnePlaneOrNoState,
             "a scalar, not a section: it relaxes the literal-secret warning at load and \
