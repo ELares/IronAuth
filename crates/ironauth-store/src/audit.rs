@@ -672,6 +672,8 @@ pub enum Action {
     /// A per-environment signing key was provisioned (issue #19). Covers both a
     /// day-one key and a manually rotated-in successor.
     SigningKeyProvision,
+    /// The environment's FAPI 2.0 hardened-mode flag was set or cleared (issue #156).
+    EnvironmentFapiHardenedSet,
     /// A break-glass rotation was invoked with explicit confirmation (issue #160): the
     /// compromised key was withdrawn immediately and a fresh successor promoted.
     SigningKeyBreakGlass,
@@ -1879,6 +1881,7 @@ impl Action {
             Action::ConsentSkipped => "consent.skip",
             Action::SigningKeyProvision => "signing_key.provision",
             Action::SigningKeyBreakGlass => "signing_key.break_glass",
+            Action::EnvironmentFapiHardenedSet => "environment.fapi_hardened.set",
             Action::SigningKeyPromoted => "signing_key.promoted",
             Action::SigningKeyRetiring => "signing_key.retiring",
             Action::SigningKeyRetired => "signing_key.retired",

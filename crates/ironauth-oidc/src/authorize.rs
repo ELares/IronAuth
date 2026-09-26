@@ -949,7 +949,8 @@ async fn issue_code(
     //    the SAME validator at push time, so a pushed request and a plain request are
     //    checked by EXACTLY the same rules and cannot diverge. An error before a
     //    redirect target is validated is a page; after, it rides the negotiated mode.
-    let validated = validate_request(state, &client, &params)
+    let hardened = crate::fapi_hardened::is_hardened(state, scope).await.unwrap_or(false);
+    let validated = validate_request(state, &client, &params, hardened)
         .map_err(|error| error.into_authorize(state.issuer_for(&scope), params.state.as_deref()))?;
     let ValidatedRequest {
         redirect_uri,
@@ -1632,6 +1633,7 @@ pub(crate) fn validate_request<'a>(
     state: &OidcState,
     client: &ResolvedClient<'_>,
     params: &'a AuthorizeParams,
+    hardened: bool,
 ) -> Result<ValidatedRequest<'a>, AuthRequestError> {
     // 3. redirect_uri: present, a registrable RFC 8252 target, and an EXACT match
     //    against the client's registered set. A failure is a PAGE error (no redirect
@@ -1680,6 +1682,18 @@ pub(crate) fn validate_request<'a>(
         },
     )?;
 
+    // 4c. PAR MANDATORY (FAPI 2.0 §6.2): a hardened environment only accepts a
+    //    request that arrived through the PAR endpoint's `request_uri`, delivered
+    //    by the already-negotiated mode.
+    if hardened && params.request_uri.is_none() {
+        return Err(AuthRequestError::redirect(
+            redirect_uri,
+            mode,
+            AuthzErrorCode::InvalidRequestObject,
+            "a hardened (FAPI 2.0) environment requires a pushed authorization request",
+        ));
+    }
+
     // 4c. Enablement: `code` is always enabled; a legacy type not enabled in this
     //     environment is unsupported_response_type, by the negotiated mode.
     if !state.response_type_enabled(response_type) {
@@ -1718,6 +1732,7 @@ pub(crate) fn validate_request<'a>(
         response_type,
         mode,
         nonce,
+    hardened,
     )
 }
 
@@ -1733,6 +1748,7 @@ fn validate_request_tail<'a>(
     response_type: ResponseType,
     mode: ResponseMode,
     nonce: Option<&'a str>,
+    hardened: bool,
 ) -> Result<ValidatedRequest<'a>, AuthRequestError> {
     // Every step below delivers its error as an invalid_request redirect by the
     // already-negotiated mode; this closure captures that one shape (both captures are
@@ -1746,12 +1762,26 @@ fn validate_request_tail<'a>(
         )
     };
 
+    // 4b. The client-auth restriction (FAPI 2.0 §6.1): a hardened environment
+    //    refuses a request from a client whose registered method is not in the
+    //    permitted set - public clients cannot exist here.
+    if hardened && !crate::fapi_hardened::hardened_permits_client_auth_method(client.auth_method()) {
+        return Err(AuthRequestError::redirect(
+            redirect_uri,
+            mode,
+            AuthzErrorCode::InvalidRequest,
+            &crate::fapi_hardened::hardened_auth_method_refusal(client.auth_method()),
+        ));
+    }
+
     // 5. PKCE (S256-only, mandatory; see resolve_pkce). A PUBLIC client always
     //    requires PKCE (RFC 9700 2.1.1); a CONFIDENTIAL client follows the
     //    per-environment policy, required by default.
     let is_public = client.auth_method() == ClientAuthMethod::None.as_str();
-    let pkce_required =
-        response_type.issues_code() && (is_public || state.require_pkce_for_confidential());
+    // A hardened environment (FAPI 2.0 §6.5.2) requires PKCE on EVERY request,
+    // whatever the client's class; `resolve_pkce` is S256-only by construction.
+    let pkce_required = response_type.issues_code()
+        && (hardened || is_public || state.require_pkce_for_confidential());
     let code_challenge = resolve_pkce(params, pkce_required).map_err(invalid)?;
     let code_challenge_method = code_challenge.map(|_| PkceMethod::S256.as_str());
 

@@ -11872,6 +11872,28 @@ impl EnvironmentGuardrailRepo<'_> {
         Ok(GuardrailSet::for_kind(kind))
     }
 
+    /// Whether this environment is FAPI-hardened (issue #156): the per-environment
+    /// switch the request paths check before enforcing the FAPI 2.0 Security
+    /// Profile's constraints.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the environment is absent in this scope.
+    pub async fn hardened(&self) -> Result<bool, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT fapi_hardened FROM environment_guardrails \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        Ok(row.get::<bool, _>("fapi_hardened"))
+    }
+
     /// Resolve this environment's PER-ENVIRONMENT auto-link posture override (issue #78,
     /// FORK B), or [`None`] when the environment inherits the deployment default. Read
     /// through the SAME scope-forced `environment_guardrails` projection as the guardrail
@@ -58084,6 +58106,50 @@ impl ActingEnvironmentRepo<'_> {
     /// [`StoreError::NotFound`] if no live environment matched under this tenant;
     /// [`StoreError::Database`] on a persistence failure (a token outside the closed set
     /// is rejected by the column CHECK).
+    /// Set or clear the environment's FAPI 2.0 hardened-mode flag (issue #156).
+    /// Audited (`environment.fapi_hardened.set`) in the same transaction. The
+    /// enforcement lives in the request paths; this is the switch.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no live environment matched under this tenant;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_fapi_hardened(
+        &self,
+        env: &Env,
+        id: &EnvironmentId,
+        hardened: bool,
+    ) -> Result<(), StoreError> {
+        let scope = Scope::new(self.tenant, *id);
+        let tenant = self.tenant;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::EnvironmentFapiHardenedSet,
+                target: id,
+            },
+            async move |tx| {
+                let updated = sqlx::query(
+                    "UPDATE environments SET fapi_hardened = $1                      WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL",
+                )
+                .bind(hardened)
+                .bind(id.to_string())
+                .bind(tenant.to_string())
+                .execute(&mut **tx)
+                .await?;
+                if updated.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
     pub async fn set_auto_link_posture(
         &self,
         env: &Env,

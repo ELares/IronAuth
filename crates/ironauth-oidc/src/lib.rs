@@ -121,6 +121,7 @@ mod federation;
 mod federation_client_secret;
 mod federation_health;
 mod federation_jwks;
+mod fapi_hardened;
 mod federation_oauth2;
 mod federation_relay;
 pub mod flow;

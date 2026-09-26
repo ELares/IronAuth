@@ -532,6 +532,18 @@ async fn authorization_code_grant(
     //     for every browser code and for an unbound browserless one.
     enforce_code_dpop_binding(bindings.dpop_jkt.as_deref(), dpop_jkt)?;
 
+    // 5i. THE SENDER-CONSTRAINED REQUIREMENT (FAPI 2.0 §6.4): a hardened
+    //     environment refuses a plain bearer exchange. The constraint is proven by
+    //     a DPoP proof key OR the mTLS certificate that authenticated this request.
+    if crate::fapi_hardened::is_hardened(state, scope).await.unwrap_or(false)
+        && !crate::fapi_hardened::hardened_sender_constrained(
+            dpop_jkt,
+            authenticated_client.certificate_thumbprint.as_deref(),
+        )
+    {
+        return Err(TokenError::InvalidGrant);
+    }
+
     // 6. Mint (sign) the tokens BEFORE the consume, so a missing key or a signing
     //    failure fails closed without burning the code. The ID token stays lean by
     //    default (scope claims are served from UserInfo); the extra claims are the

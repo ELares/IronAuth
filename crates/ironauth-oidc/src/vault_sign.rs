@@ -300,19 +300,9 @@ mod tests {
                     let mut buf = [0_u8; 8192];
                     let _ = socket.read(&mut buf).await;
                     let text = String::from_utf8_lossy(&buf);
-<<<<<<< HEAD
                     let body = text
-                        .split_once(
-                            "
-
-",
-                        )
+                        .split_once("\r\n\r\n")
                         .map_or("", |(_, body)| body.trim());
-=======
-                    let body = text.split_once("
-
-").map_or("", |(_, body)| body.trim());
->>>>>>> 8862ecc7 (signer: the shared conformance battery and the user-path mint routing (#161))
                     let value: serde_json::Value =
                         serde_json::from_str(body).unwrap_or_else(|_| serde_json::json!({}));
                     let input = STANDARD
