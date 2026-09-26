@@ -71,6 +71,9 @@ use crate::response;
 pub enum AuthzErrorCode {
     /// The request is missing a parameter, or includes an invalid one.
     InvalidRequest,
+    /// The request object (a PAR `request_uri` or a JAR `request` object) is
+    /// absent, malformed, expired, or otherwise unusable (FAPI 2.0 §6.2).
+    InvalidRequestObject,
     /// The `response_type` is not one this server supports: it is token-bearing
     /// (structurally unrepresentable), otherwise unknown, or a legacy type not
     /// enabled in this environment (issue #17).
@@ -117,6 +120,8 @@ impl AuthzErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
             AuthzErrorCode::InvalidRequest => "invalid_request",
+            AuthzErrorCode::InvalidRequestObject => "invalid_request_object",
+
             AuthzErrorCode::UnsupportedResponseType => "unsupported_response_type",
             AuthzErrorCode::AccessDenied => "access_denied",
             AuthzErrorCode::LoginRequired => "login_required",

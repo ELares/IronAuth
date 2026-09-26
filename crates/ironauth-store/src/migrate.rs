@@ -2012,6 +2012,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0236_use_mtls_endpoint_aliases.sql"),
         },
+        // EXPAND (issue #156): the per-environment FAPI hardened-mode flag.
+        Migration {
+            version: 237,
+            name: "fapi_hardened",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0237_fapi_hardened.sql"),
+        },
     ]
 }
 
