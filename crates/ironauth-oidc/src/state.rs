@@ -232,6 +232,10 @@ pub struct OidcState {
     // response (M16) slots in as a new serializer without touching the endpoint.
     // Default: the RFC 7662 plain-JSON serializer.
     introspection_serializer: Arc<dyn IntrospectionSerializer>,
+    /// The RFC 9701 signed-introspection capability (issue #156): the response JWT's
+    /// validity window. `None` (the default) keeps the plain JSON form everywhere;
+    /// a hardened environment whose boot enabled this answers with the signed JWT.
+    signed_introspection_ttl_secs: Option<i64>,
     // Whether the experimental Global Token Revocation receiver (issue #36) is
     // mounted. Kept OUTSIDE `Inner` and set through the builder because it is NOT a
     // plain `OidcConfig` toggle an operator can flip directly (that would bypass the
@@ -1104,6 +1108,7 @@ impl OidcState {
             }),
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
+            signed_introspection_ttl_secs: None,
             global_token_revocation_enabled: false,
             // FROM THE CONFIG TYPE, not repeated literals. These were `false` and `20` written
             // again here, so a test asserting "off by default" pinned this copy and would have
@@ -2880,6 +2885,30 @@ impl OidcState {
     ) -> Self {
         self.introspection_serializer = serializer;
         self
+    }
+
+    /// Enable the RFC 9701 signed-introspection capability (issue #156): a hardened
+    /// environment's introspection then answers with the signed JWT form, whose
+    /// validity window is `ttl_secs`.
+    #[must_use]
+    pub fn with_signed_introspection(mut self, ttl_secs: i64) -> Self {
+        self.signed_introspection_ttl_secs = Some(ttl_secs);
+        self
+    }
+
+    /// Enable from the config's knob; `None` leaves the capability off.
+    #[must_use]
+    pub fn with_signed_introspection_opt(mut self, ttl_secs: Option<u64>) -> Self {
+        if let Some(ttl) = ttl_secs {
+            self.signed_introspection_ttl_secs = Some(i64::try_from(ttl).unwrap_or(0));
+        }
+        self
+    }
+
+    /// The signed-introspection validity window, when the capability is enabled.
+    #[must_use]
+    pub fn signed_introspection_ttl_secs(&self) -> Option<i64> {
+        self.signed_introspection_ttl_secs
     }
 
     /// The internal revocation-event sink every successful revocation is published on.
