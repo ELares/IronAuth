@@ -54,7 +54,7 @@ use axum::extract::{Form, State};
 use axum::http::HeaderMap;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use ironauth_jose::{Confirmation, VerifiedToken};
+use ironauth_jose::{Confirmation, SigningKey, VerifiedToken};
 use ironauth_store::{IssuedTokenId, RefreshTokenId, Scope};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -214,47 +214,170 @@ pub struct JsonIntrospectionSerializer;
 
 impl IntrospectionSerializer for JsonIntrospectionSerializer {
     fn serialize(&self, claims: &IntrospectionClaims) -> SerializedIntrospection {
-        let mut object = Map::new();
-        object.insert("active".to_owned(), Value::Bool(claims.active));
-        insert_str(&mut object, "scope", claims.scope.as_deref());
-        insert_str(&mut object, "client_id", claims.client_id.as_deref());
-        insert_str(&mut object, "sub", claims.sub.as_deref());
-        // Derived, never stored: an access token's type follows from its binding, so
-        // a bound token cannot be reported as `Bearer` (RFC 9449 section 6.2). A
-        // refresh token has no RFC 6749 section 5.1 type and reports none.
-        let token_type = claims
-            .is_access_token
-            .then(|| access_token_type(claims.confirmation.as_ref()))
-            .flatten();
-        insert_str(&mut object, "token_type", token_type);
-        insert_i64(&mut object, "exp", claims.exp);
-        insert_i64(&mut object, "iat", claims.iat);
-        insert_aud(&mut object, &claims.aud);
-        // RFC 8693 section 4.1: the delegation chain, reported whole (issue #125). A
-        // resource server honouring "A acting for B" has to see A, and across multi-hop
-        // delegation it has to see every hop, so the nested value is emitted as signed
-        // rather than flattened to the nearest actor.
-        if let Some(act) = &claims.act {
-            object.insert("act".to_owned(), act.clone());
-        }
-        // RFC 9396: what the resource owner approved. A resource server that enforces the
-        // approval rather than a scope name standing in for it reads this, and for an OPAQUE
-        // token this response is the only place it exists.
-        if let Some(details) = &claims.authorization_details {
-            object.insert("authorization_details".to_owned(), details.clone());
-        }
-        // RFC 9449 section 6.2: the binding travels as a TOP-LEVEL `cnf` member whose
-        // content is the same `{ member: thumbprint }` object a bound JWT carries, so
-        // a resource server reads an identical shape whichever it has in hand.
-        if let Some(confirmation) = &claims.confirmation {
-            object.insert(
-                "cnf".to_owned(),
-                Value::Object(confirmation.to_cnf_object()),
-            );
-        }
         SerializedIntrospection {
             content_type: "application/json",
-            body: Value::Object(object).to_string(),
+            body: introspect_claims_object(claims).to_string(),
+        }
+    }
+}
+
+/// Build the RFC 9701 signed introspection response for `scope` (issue #156): the
+/// RFC 7662 claims plus the envelope, signed with the ENVIRONMENT's own signing
+/// key (resolved from the issuer registry), so the response verifies against the
+/// same JWKS the tokens verify against.
+async fn signed_introspection_response(
+    state: &OidcState,
+    scope: Scope,
+    claims: &IntrospectionClaims,
+    ttl_secs: i64,
+) -> SerializedIntrospection {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(0))
+        .unwrap_or(0);
+    let mut payload = introspect_claims_object(claims)
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let issuer = state.issuer_for(&scope);
+    payload.insert("iss".to_owned(), Value::String(issuer.clone()));
+    let aud = claims
+        .aud
+        .first()
+        .cloned()
+        .unwrap_or_else(|| issuer.clone());
+    payload.insert("aud".to_owned(), Value::String(aud));
+    payload.insert("iat".to_owned(), Value::Number(now.into()));
+    payload.insert("exp".to_owned(), Value::Number((now + ttl_secs).into()));
+    payload.insert("jti".to_owned(), Value::String(format!("iti_{now:x}")));
+    let Some(entry) = state.issuer_entry(&scope).await else {
+        // No signer (an unprovisioned environment): fail to the plain JSON shape
+        // rather than answering with nothing.
+        return state.introspection_serializer().serialize(claims);
+    };
+    let Some(signer) = entry.signer(state.now()) else {
+        return state.introspection_serializer().serialize(claims);
+    };
+    let body = ironauth_jose::sign_jws(
+        signer,
+        &serde_json::to_vec(&Value::Object(payload)).unwrap_or_default(),
+        &ironauth_jose::EmissionOptions::new().with_typ(
+            "token-introspection+jwt", // invariant-allow: typ-via-declaration -- RFC 9701 dictates the media type; no IronAuth TokenTyp exists for it
+        ),
+    )
+    .unwrap_or_else(|_| state.introspection_serializer().serialize(claims).body);
+    SerializedIntrospection {
+        content_type: "application/token-introspection+jwt",
+        body,
+    }
+}
+
+/// The RFC 7662 claims object both serializers share: `active` always, every other
+/// field only when present, so a not-active response is exactly `{"active":false}`.
+fn introspect_claims_object(claims: &IntrospectionClaims) -> Value {
+    let mut object = Map::new();
+    object.insert("active".to_owned(), Value::Bool(claims.active));
+    insert_str(&mut object, "scope", claims.scope.as_deref());
+    insert_str(&mut object, "client_id", claims.client_id.as_deref());
+    insert_str(&mut object, "sub", claims.sub.as_deref());
+    // Derived, never stored: an access token's type follows from its binding, so
+    // a bound token cannot be reported as `Bearer` (RFC 9449 section 6.2). A
+    // refresh token has no RFC 6749 section 5.1 type and reports none.
+    let token_type = claims
+        .is_access_token
+        .then(|| access_token_type(claims.confirmation.as_ref()))
+        .flatten();
+    insert_str(&mut object, "token_type", token_type);
+    insert_i64(&mut object, "exp", claims.exp);
+    insert_i64(&mut object, "iat", claims.iat);
+    insert_aud(&mut object, &claims.aud);
+    // RFC 8693 section 4.1: the delegation chain, reported whole (issue #125). A
+    // resource server honouring "A acting for B" has to see A, and across multi-hop
+    // delegation it has to see every hop, so the nested value is emitted as signed
+    // rather than flattened to the nearest actor.
+    if let Some(act) = &claims.act {
+        object.insert("act".to_owned(), act.clone());
+    }
+    // RFC 9396: what the resource owner approved. A resource server that enforces the
+    // approval rather than a scope name standing in for it reads this, and for an OPAQUE
+    // token this response is the only place it exists.
+    if let Some(details) = &claims.authorization_details {
+        object.insert("authorization_details".to_owned(), details.clone());
+    }
+    // RFC 9449 section 6.2: the binding travels as a TOP-LEVEL `cnf` member whose
+    // content is the same `{ member: thumbprint }` object a bound JWT carries, so
+    // a resource server reads an identical shape whichever it has in hand.
+    if let Some(confirmation) = &claims.confirmation {
+        object.insert("cnf".to_owned(), Value::Object(confirmation.to_cnf_object()));
+    }
+    Value::Object(object)
+}
+
+/// THE RFC 9701 SIGNED-JWT SERIALIZER (issue #156): the introspection response is a
+/// signed JWT (`application/token-introspection+jwt`) carrying the RFC 7662 claims
+/// plus the RFC 9701 envelope (`iss`, `aud`, `iat`, `exp`, `jti`), so a resource
+/// server can verify the answer itself - the non-repudiation FAPI ecosystems demand.
+/// The response is signed with the environment's own signing key, so it verifies
+/// against the SAME JWKS the tokens verify against.
+pub struct SignedJwtIntrospectionSerializer {
+    signer: SigningKey,
+    issuer: String,
+    ttl_secs: i64,
+    now_unix_secs: fn() -> i64,
+}
+
+impl SignedJwtIntrospectionSerializer {
+    /// Build the signed serializer over `signer` (the environment's signing key) and
+    /// `issuer`, with a `ttl_secs` validity window for the response JWT.
+    #[must_use]
+    pub fn new(signer: SigningKey, issuer: impl Into<String>, ttl_secs: i64) -> Self {
+        Self {
+            signer,
+            issuer: issuer.into(),
+            ttl_secs,
+            now_unix_secs: || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| i64::try_from(d.as_secs()).unwrap_or(0))
+                    .unwrap_or(0)
+            },
+        }
+    }
+}
+
+impl IntrospectionSerializer for SignedJwtIntrospectionSerializer {
+    fn serialize(&self, claims: &IntrospectionClaims) -> SerializedIntrospection {
+        let mut payload = introspect_claims_object(claims)
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let now = (self.now_unix_secs)();
+        // RFC 9701 section 2.2: the envelope. The `aud` is the introspecting client
+        // (the response is for it); `iat`/`exp` bound the response's own lifetime.
+        payload.insert("iss".to_owned(), Value::String(self.issuer.clone()));
+        let aud = claims
+            .aud
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.issuer.clone());
+        payload.insert("aud".to_owned(), Value::String(aud));
+        payload.insert("iat".to_owned(), Value::Number(now.into()));
+        payload.insert("exp".to_owned(), Value::Number((now + self.ttl_secs).into()));
+        payload.insert("jti".to_owned(), Value::String(format!("iti_{now:x}")));
+        // The `typ` header is the RFC 9701 media type: not an IronAuth token profile,
+        // so it rides the foreign-media-type path (`with_typ` with the reason, the
+        // attestation media types' pattern). The JWS signs with the environment's key.
+        let token = ironauth_jose::sign_jws(
+            &self.signer,
+            &serde_json::to_vec(&Value::Object(payload)).unwrap_or_default(),
+            &ironauth_jose::EmissionOptions::new().with_typ(
+                "token-introspection+jwt", // invariant-allow: typ-via-declaration -- RFC 9701 dictates the media type; no IronAuth TokenTyp exists for it
+            ),
+        )
+        .unwrap_or_else(|_| "".to_owned());
+        SerializedIntrospection {
+            content_type: "application/token-introspection+jwt",
+            body: token,
         }
     }
 }
@@ -395,7 +518,19 @@ pub async fn introspect(
         .unwrap_or_else(IntrospectionClaims::inactive);
 
     // 4. Render through the pluggable serializer (RFC 9701 seam) and cache nothing.
-    let serialized = state.introspection_serializer().serialize(&claims);
+    //    A hardened environment answers with the signed-JWT form when the boot
+    //    installed it (issue #156); everything else keeps the plain JSON shape.
+    let serialized = if crate::fapi_hardened::is_hardened(&state, scope)
+        .await
+        .unwrap_or(false)
+    {
+        match state.signed_introspection_ttl_secs() {
+            Some(ttl) => signed_introspection_response(&state, scope, &claims, ttl).await,
+            None => state.introspection_serializer().serialize(&claims),
+        }
+    } else {
+        state.introspection_serializer().serialize(&claims)
+    };
     (
         StatusCode::OK,
         [

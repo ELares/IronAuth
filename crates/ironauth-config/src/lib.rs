@@ -3962,6 +3962,12 @@ pub struct OidcConfig {
     /// deployment default until per-environment overrides land.
     pub require_pushed_authorization_requests: bool,
 
+    /// The RFC 9701 signed-introspection capability (issue #156): when set, a
+    /// hardened environment's introspection answers with a signed JWT whose
+    /// validity window is this many seconds. `None` (the default) keeps the plain
+    /// JSON form everywhere.
+    pub introspection_signed_ttl_secs: Option<u64>,
+
     /// The pushed-authorization-request `request_uri` lifetime in seconds (RFC 9126
     /// section 2.2, issue #27). A pushed request is short-lived and single-use; the
     /// default (60) is one minute, following the RFC's guidance that a `request_uri`
@@ -4694,6 +4700,7 @@ impl Default for OidcConfig {
             offline_access_requires_consent: true,
             remembered_consent_ttl_secs: 2_592_000,
             require_pushed_authorization_requests: false,
+            introspection_signed_ttl_secs: None,
             par_ttl_secs: 60,
             registration_enabled: false,
             registration_mode: RegistrationMode::TokenGated,

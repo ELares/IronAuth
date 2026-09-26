@@ -3686,6 +3686,29 @@ impl Harness {
         Ok(id)
     }
 
+    /// Make the harness's environment FAPI-hardened (issue #156) and, when
+    /// `signed_introspection_ttl` is set, enable the RFC 9701 signed-introspection
+    /// capability with that validity window. The router is REBUILT so every request
+    /// sees the new state.
+    pub async fn harden_environment(&mut self, signed_introspection_ttl: Option<i64>) {
+        let (actor, corr) = self.seeding_actor();
+        let environment_id = self.scope.environment();
+        let operator = ironauth_store::OperatorId::generate(self.env());
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .environments(operator, self.scope.tenant())
+            .set_fapi_hardened(self.env(), &environment_id, true)
+            .await
+            .expect("the environment hardens");
+        let mut state = self.state.clone();
+        if let Some(ttl) = signed_introspection_ttl {
+            state = state.with_signed_introspection(ttl);
+        }
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Arm the PKI method's trust anchors on the state the router runs (issue #159).
     /// The router is REBUILT, matching `with_scim_warning_lead` next door: the router
     /// captures the state it was built from, so installing on the state afterwards
