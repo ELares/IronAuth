@@ -46,6 +46,12 @@ pub fn hardened_permits_algorithm(algorithm: JwsAlgorithm) -> bool {
     HARDENED_SIGNING_ALGS.contains(&algorithm)
 }
 
+/// The JOSE-name form of the same check (the discovery arrays carry names).
+#[must_use]
+pub fn hardened_permits_signing_alg_name(name: &str) -> bool {
+    JwsAlgorithm::from_jose_name(name).is_some_and(hardened_permits_algorithm)
+}
+
 /// Whether `method` (the wire string) is a hardened-permitted client-auth method.
 #[must_use]
 pub fn hardened_permits_client_auth_method(method: &str) -> bool {
