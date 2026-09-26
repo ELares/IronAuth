@@ -261,6 +261,7 @@ pub async fn register(
         &signable,
         default_alg,
         guardrails,
+        scope,
     )
     .await
     {
@@ -441,6 +442,7 @@ pub async fn update(
         &signable,
         default_alg,
         guardrails,
+        scope,
     )
     .await
     {
@@ -949,6 +951,7 @@ async fn validate_metadata(
     signable: &[JwsAlgorithm],
     default_alg: JwsAlgorithm,
     guardrails: GuardrailSet,
+    scope: ironauth_store::Scope,
 ) -> Result<ValidatedMetadata, RegistrationError> {
     let application_type = match metadata.get("application_type") {
         None => "web".to_owned(),
@@ -967,6 +970,21 @@ async fn validate_metadata(
     check_only(metadata, "grant_types", "authorization_code")?;
 
     let auth_method = validate_auth_method(metadata, state.mtls_anchors().is_some())?;
+
+    // THE HARDENED GATE (issue #156): a hardened environment refuses a registration
+    // (or update) whose client-auth method is not in the FAPI-permitted set, with
+    // the precise error. The signing-algorithm half runs after the algorithm is
+    // validated below.
+    let hardened = crate::fapi_hardened::is_hardened(state, scope)
+        .await
+        .unwrap_or(false);
+    if hardened
+        && !crate::fapi_hardened::hardened_permits_client_auth_method(auth_method.as_str())
+    {
+        return Err(RegistrationError::metadata_owned(
+            crate::fapi_hardened::hardened_auth_method_refusal(auth_method.as_str()),
+        ));
+    }
 
     let redirect_uris = validate_redirect_uris(metadata, &application_type, guardrails)?;
 
@@ -988,6 +1006,18 @@ async fn validate_metadata(
 
     let id_token_signed_response_alg = negotiate_id_token_alg(metadata, signable, default_alg)?;
     let token_endpoint_auth_signing_alg = validate_signing_alg(metadata)?;
+    if hardened {
+        if let Some(alg) = token_endpoint_auth_signing_alg.as_ref() {
+            let parsed = ironauth_jose::JwsAlgorithm::from_jose_name(alg);
+            if !parsed.is_some_and(crate::fapi_hardened::hardened_permits_algorithm) {
+                return Err(RegistrationError::metadata_owned(
+                    format!(
+                        "a hardened (FAPI 2.0) environment permits only PS256, ES256, or                          EdDSA as the token-endpoint signing algorithm, not {alg}"
+                    ),
+                ));
+            }
+        }
+    }
     let (jwks, jwks_uri) = validate_client_keys(state, metadata, auth_method).await?;
 
     let display_name = metadata
@@ -1533,10 +1563,10 @@ impl RegistrationError {
         RegistrationError::InvalidClientMetadata(message.to_owned())
     }
 
+    /// The owned-message form (the hardened refusals name the offending value).
     fn metadata_owned(message: String) -> Self {
         RegistrationError::InvalidClientMetadata(message)
     }
-
     fn redirect(message: &'static str) -> Self {
         RegistrationError::InvalidRedirectUri(message.to_owned())
     }
