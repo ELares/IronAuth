@@ -1723,6 +1723,11 @@ required-features = ["testing"]
 path = "tests/forward_auth_trace.rs"
 
 [[test]]
+name = "fapi_hardened"
+path = "tests/fapi_hardened.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "mtls"
 path = "tests/mtls.rs"
 required-features = ["testing"]
