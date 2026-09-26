@@ -320,6 +320,12 @@ pub struct DiscoveryCapabilities {
     /// publishes no aliases: the endpoints are served at `public_url` and mTLS
     /// clients authenticate there through the certificate header.
     mtls_endpoint_aliases_base: Option<String>,
+    /// Whether this environment is FAPI-hardened (issue #156): the discovery
+    /// document then reflects the restricted capability set - the hardened client-
+    /// auth methods, `require_pushed_authorization_requests: true`, the
+    /// PS256/ES256/EdDSA algorithm arrays, and `id_token_signing_alg_values_supported`
+    /// keeping RS256 per OIDC Discovery section 3 (the canonical exception).
+    hardened: bool,
     /// Whether the Dynamic Client Registration endpoint is enabled (issue #30). When
     /// `true`, the document advertises the per-environment `registration_endpoint`
     /// (`{issuer}/connect/register`); when `false` the field is absent, so discovery
@@ -411,6 +417,14 @@ impl DiscoveryCapabilities {
     /// Declare whether OIDC Session Management 1.0 is enabled (issue #39), so
     /// discovery advertises `check_session_iframe` only when the iframe is mounted.
     #[must_use]
+    /// Mark this environment hardened (issue #156); the generator reflects the
+    /// restricted set. Not hardened (the default) leaves the document unchanged.
+    #[must_use]
+    pub fn with_hardened(mut self, hardened: bool) -> Self {
+        self.hardened = hardened;
+        self
+    }
+
     pub fn with_session_management(mut self, enabled: bool) -> Self {
         self.session_management_enabled = enabled;
         self
@@ -659,14 +673,37 @@ pub fn discovery_document(
     );
     document.insert(
         "id_token_signing_alg_values_supported".to_owned(),
-        json!(id_token_signing_alg_values(policy)),
+        json!(if capabilities.hardened {
+            // THE CANONICAL EXCEPTION: RS256 stays per OIDC Discovery section 3,
+            // everything else outside the hardened set is absent.
+            let mut algs: Vec<String> = id_token_signing_alg_values(policy)
+                .into_iter()
+                .filter(|name| {
+                    crate::fapi_hardened::hardened_permits_signing_alg_name(name)
+                        || name == "RS256"
+                })
+                .collect();
+            if !algs.iter().any(|name| name == "RS256") {
+                algs.push("RS256".to_owned());
+            }
+            algs
+        } else {
+            id_token_signing_alg_values(policy)
+        }),
     );
+    let advertised_auth_methods: Vec<&str> = if capabilities.hardened {
+        crate::fapi_hardened::HARDENED_CLIENT_AUTH_METHODS.to_vec()
+    } else {
+        ClientAuthMethod::ALL
+            .iter()
+            .map(|value| value.as_str())
+            .collect()
+    };
     document.insert(
         "token_endpoint_auth_methods_supported".to_owned(),
-        json!(to_strings(
-            ClientAuthMethod::ALL.iter().map(|value| value.as_str())
-        )),
+        json!(to_strings(advertised_auth_methods.iter().copied())),
     );
+
     // OIDC Discovery 1.0 section 3 REQUIRES this field whenever `private_key_jwt`
     // (or `client_secret_jwt`) is advertised above. It is the asymmetric matrix the
     // token endpoint verifies a `private_key_jwt` assertion against (EdDSA + the
@@ -674,7 +711,14 @@ pub fn discovery_document(
     // from what verification accepts; `none` and ES512 are excluded by construction.
     document.insert(
         "token_endpoint_auth_signing_alg_values_supported".to_owned(),
-        json!(crate::client_auth::assertion_signing_alg_values()),
+        json!(if capabilities.hardened {
+            crate::client_auth::assertion_signing_alg_values()
+                .into_iter()
+                .filter(|name| crate::fapi_hardened::hardened_permits_signing_alg_name(name))
+                .collect::<Vec<_>>()
+        } else {
+            crate::client_auth::assertion_signing_alg_values()
+        }),
     );
     // The RFC 7009 revocation and RFC 7662 introspection endpoints authenticate the
     // client through the SAME token-endpoint client-auth suite (issue #22), sourced
@@ -779,7 +823,7 @@ pub fn discovery_document(
     // exactly what the authorization endpoint enforces).
     document.insert(
         "require_pushed_authorization_requests".to_owned(),
-        json!(capabilities.require_pushed_authorization_requests),
+        json!((capabilities.require_pushed_authorization_requests || capabilities.hardened)),
     );
 
     // OIDC Back-Channel Logout 1.0 (issue #32): every authorization-code ID token
@@ -995,10 +1039,26 @@ impl DiscoveryState {
         // emptiness here: an earlier revision had one, and a review showed both arms produced
         // the identical document because `discovery_document` already substitutes the fallback
         // for an empty set and nothing in production ever pre-populates the capability.
+        // The FAPI-hardened reflection (issue #156): the per-issuer document reads
+        // the environment's flag (the live store read, authoritative when it
+        // answers) and the generator restricts the advertised set. An unreadable
+        // flag (a store-less registry or an outage) leaves the document unchanged:
+        // a wrong claim about a restriction is cached, an un-restricted document
+        // is the safe direction.
+        let hardened = match self.registry.store() {
+            Some(store) => store
+                .scoped(scope.clone())
+                .environment_guardrails()
+                .hardened()
+                .await
+                .unwrap_or(false),
+            None => false,
+        };
         let capabilities = self
             .capabilities
             .clone()
-            .with_supported_ui_locales(ui_locales);
+            .with_supported_ui_locales(ui_locales)
+            .with_hardened(hardened);
         let document = discovery_document(
             &issuer,
             self.base(),

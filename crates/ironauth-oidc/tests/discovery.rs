@@ -851,6 +851,46 @@ async fn discovery_advertises_the_registered_authorization_details_types() {
     );
 }
 
+/// THE HARDENED REFLECTION (issue #156): a hardened environment's document
+/// advertises the restricted capability set - the hardened client-auth methods,
+/// `require_pushed_authorization_requests: true`, the PS256/ES256/EdDSA algorithm
+/// arrays, and the canonical exception: RS256 REMAINS in
+/// `id_token_signing_alg_values_supported` per OIDC Discovery section 3 while
+/// being absent from every other algorithm array.
+#[test]
+fn hardened_discovery_reflects_the_restricted_capability_set() {
+    let policy = SigningPolicy::new(vec![JwsAlgorithm::EdDsa, JwsAlgorithm::Rs256]).expect("policy");
+    let issuer = "https://issuer.test/t/tnt/e/env";
+    let jwks_uri = format!("{issuer}/jwks.json");
+    let caps = DiscoveryCapabilities::default().with_hardened(true);
+    let doc = discovery_document(issuer, ISSUER_BASE, &jwks_uri, &policy, &caps);
+
+    // The client-auth methods: private_key_jwt + the mTLS methods only.
+    let methods = string_array(&doc, "token_endpoint_auth_methods_supported");
+    assert_eq!(
+        methods,
+        vec![
+            "private_key_jwt".to_owned(),
+            "tls_client_auth".to_owned(),
+            "self_signed_tls_client_auth".to_owned(),
+        ]
+    );
+    // PAR mandatory.
+    assert_eq!(doc["require_pushed_authorization_requests"], json!(true));
+    // The canonical exception: RS256 stays in the id-token array, nothing else
+    // outside the hardened set does.
+    let id_algs = string_array(&doc, "id_token_signing_alg_values_supported");
+    assert!(id_algs.contains(&"RS256".to_owned()), "{id_algs:?}");
+    assert!(id_algs.contains(&"EdDSA".to_owned()), "{id_algs:?}");
+    // The assertion matrix excludes RS256 entirely.
+    let assertion_algs = string_array(&doc, "token_endpoint_auth_signing_alg_values_supported");
+    assert!(!assertion_algs.contains(&"RS256".to_owned()), "{assertion_algs:?}");
+    assert!(
+        !assertion_algs.contains(&"RS384".to_owned()) && !assertion_algs.contains(&"PS512".to_owned()),
+        "the assertion matrix is the hardened set: {assertion_algs:?}"
+    );
+}
+
 /// RFC 8705 section 5 (issue #159): the `mtls_endpoint_aliases` member appears
 /// ONLY when an operator configured the alias base, and names the token,
 /// revocation, and introspection endpoints under it. Without the base, the member
