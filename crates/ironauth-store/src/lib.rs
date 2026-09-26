@@ -77,6 +77,14 @@ pub mod identity_fact;
 pub mod impersonation;
 pub mod interchange;
 pub mod kek_backup;
+pub(crate) fn fapi_hardened_permits_auth_method(method: &str) -> bool {
+    matches!(method, "private_key_jwt" | "tls_client_auth" | "self_signed_tls_client_auth")
+}
+
+pub(crate) fn fapi_hardened_permits_signing_alg(alg: &str) -> bool {
+    matches!(alg, "PS256" | "ES256" | "EdDSA")
+}
+
 pub mod key_rotation;
 pub mod locale_bundle;
 pub mod log_stream;

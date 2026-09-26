@@ -11894,6 +11894,52 @@ impl EnvironmentGuardrailRepo<'_> {
         Ok(row.get::<bool, _>("fapi_hardened"))
     }
 
+    /// The FAPI-hardened compliance scan (issue #156): every registered client in
+    /// this scope whose configuration violates the hardened constraints, each
+    /// named. An empty list is a conformant environment. The scan covers the
+    /// client-auth method (must be private_key_jwt or an mTLS method) and the
+    /// registered signing algorithm (must be PS256/ES256/EdDSA).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the environment is absent in this scope.
+    pub async fn hardened_compliance_violations(&self) -> Result<Vec<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, display_name, token_endpoint_auth_method, \
+                    token_endpoint_auth_signing_alg \
+             FROM clients \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut violations = Vec::new();
+        for row in rows {
+            let id: String = row.get("id");
+            let display_name: String = row.get("display_name");
+            let auth_method: String = row.get("token_endpoint_auth_method");
+            let signing_alg: Option<String> = row.get("token_endpoint_auth_signing_alg");
+            if !crate::fapi_hardened_permits_auth_method(&auth_method) {
+                violations.push(format!(
+                    "client {display_name} ({id}) authenticates with {auth_method}, \
+                     which a hardened (FAPI 2.0) environment does not permit"
+                ));
+            }
+            if let Some(alg) = signing_alg {
+                if !crate::fapi_hardened_permits_signing_alg(&alg) {
+                    violations.push(format!(
+                        "client {display_name} ({id}) registers signing algorithm {alg}, \
+                         which a hardened (FAPI 2.0) environment does not permit"
+                    ));
+                }
+            }
+        }
+        Ok(violations)
+    }
+
     /// Resolve this environment's PER-ENVIRONMENT auto-link posture override (issue #78,
     /// FORK B), or [`None`] when the environment inherits the deployment default. Read
     /// through the SAME scope-forced `environment_guardrails` projection as the guardrail
@@ -58121,6 +58167,21 @@ impl ActingEnvironmentRepo<'_> {
         hardened: bool,
     ) -> Result<(), StoreError> {
         let scope = Scope::new(self.tenant, *id);
+        // ENABLING runs the compliance scan FIRST (issue #156): an environment with
+        // nonconforming registered clients cannot be hardened, and the refusal names
+        // every violation. The scan is a scoped read; a conformant environment
+        // proceeds to the write.
+        if hardened {
+            let violations = self
+                .store
+                .scoped(scope)
+                .environment_guardrails()
+                .hardened_compliance_violations()
+                .await?;
+            if !violations.is_empty() {
+                return Err(StoreError::HardenedViolations(violations));
+            }
+        }
         let tenant = self.tenant;
         write_audited(
             AuditedWrite {

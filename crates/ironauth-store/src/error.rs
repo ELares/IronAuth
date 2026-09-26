@@ -18,6 +18,10 @@ use crate::migrate::MigrationError;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum StoreError {
+    /// Enabling FAPI hardened mode was refused because the environment has
+    /// nonconforming registered clients (issue #156): each violation's diagnostic
+    /// rides the list, so the caller can name them all.
+    HardenedViolations(Vec<String>),
     /// The requested resource is not visible in the current scope. Returned
     /// identically whether the resource is absent, belongs to another tenant,
     /// belongs to another environment, or was presented with a malformed
@@ -402,6 +406,9 @@ impl StoreError {
     pub fn into_wire(self) -> StoreErrorWire {
         match self {
             StoreError::NotFound => StoreErrorWire::NotFound,
+            // The refusal's diagnostics ride as a conflict-class wire error; the
+            // caller (the management surface) re-renders the list.
+            StoreError::HardenedViolations(_) => StoreErrorWire::Conflict,
             // An invitation mint collision joins the genuine faults: 256 bits of
             // entropy collided, which the caller neither caused nor can act on, and
             // which no typed refusal could describe without asserting something false
@@ -460,6 +467,9 @@ impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StoreError::NotFound => f.write_str("resource not found"),
+            StoreError::HardenedViolations(violations) => {
+                write!(f, "the environment cannot be hardened: {}", violations.join("; "))
+            }
             StoreError::Invalid => f.write_str(
                 "a value was refused by a shape rule: an organization contact's address must \
                  be shaped like a deliverable address, its name must be present and within the \
@@ -552,6 +562,7 @@ impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             StoreError::NotFound
+            | StoreError::HardenedViolations(_)
             | StoreError::RetentionGap
             | StoreError::IdempotencyConflict
             | StoreError::SelfApproval

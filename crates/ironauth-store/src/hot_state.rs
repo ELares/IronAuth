@@ -203,6 +203,8 @@ impl PgHotState {
             // THE CALLER'S INPUT, which is what every CHECK on this table is about. No retry
             // fixes these and no fallback answers them.
             StoreError::Conflict | StoreError::Invalid => HotError::Malformed,
+            // The hardened-enable refusal: the caller's configuration, no retry.
+            StoreError::HardenedViolations(_) => HotError::Malformed,
 
             // THE CEILING, which is neither an outage nor bad input: the write was understood
             // and refused because this scope already holds as many entries for this use as
