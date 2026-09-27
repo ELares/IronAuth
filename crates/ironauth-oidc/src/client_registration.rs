@@ -290,6 +290,7 @@ pub async fn register(
         redirect_uris: &validated.redirect_uris,
         application_type: &validated.application_type,
         id_token_signed_response_alg: &validated.id_token_signed_response_alg,
+        userinfo_signed_response_alg: validated.userinfo_signed_response_alg.as_deref(),
         jwks: validated.jwks.as_deref(),
         jwks_uri: validated.jwks_uri.as_deref(),
         token_endpoint_auth_signing_alg: validated.token_endpoint_auth_signing_alg.as_deref(),
@@ -463,6 +464,7 @@ pub async fn update(
         redirect_uris: &validated.redirect_uris,
         application_type: &validated.application_type,
         id_token_signed_response_alg: &validated.id_token_signed_response_alg,
+        userinfo_signed_response_alg: validated.userinfo_signed_response_alg.as_deref(),
         jwks: validated.jwks.as_deref(),
         jwks_uri: validated.jwks_uri.as_deref(),
         token_endpoint_auth_signing_alg: validated.token_endpoint_auth_signing_alg.as_deref(),
@@ -934,6 +936,7 @@ struct ValidatedMetadata {
     jwks: Option<String>,
     jwks_uri: Option<String>,
     token_endpoint_auth_signing_alg: Option<String>,
+    userinfo_signed_response_alg: Option<String>,
 }
 
 /// Validate an RFC 7591 metadata document, applying per-spec defaults, ignoring
@@ -1006,6 +1009,7 @@ async fn validate_metadata(
 
     let id_token_signed_response_alg = negotiate_id_token_alg(metadata, signable, default_alg)?;
     let token_endpoint_auth_signing_alg = validate_signing_alg(metadata)?;
+    let userinfo_signed_response_alg = validate_userinfo_signing_alg(metadata)?;
     if hardened {
         if let Some(alg) = token_endpoint_auth_signing_alg.as_ref() {
             let parsed = ironauth_jose::JwsAlgorithm::from_jose_name(alg);
@@ -1037,7 +1041,8 @@ async fn validate_metadata(
         jwks,
         jwks_uri,
         token_endpoint_auth_signing_alg,
-    })
+        userinfo_signed_response_alg,
+})
 }
 
 /// Validate `token_endpoint_auth_method` against the ACTUALLY IMPLEMENTED suite
@@ -1305,6 +1310,25 @@ fn validate_signing_alg(
         )),
     }
 }
+/// Validate the `userinfo_signed_response_alg` (issue #158, OIDC Core 5.3.2):
+/// an unknown value is refused; absent means the plain JSON form.
+fn validate_userinfo_signing_alg(
+    metadata: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, RegistrationError> {
+    match metadata.get("userinfo_signed_response_alg") {
+        None => Ok(None),
+        Some(Value::String(value)) if JwsAlgorithm::from_jose_name(value).is_some() => {
+            Ok(Some(value.clone()))
+        }
+        Some(Value::String(value)) => Err(RegistrationError::metadata_owned(format!(
+            "userinfo_signed_response_alg {value:?} is not a supported JWS algorithm"
+        ))),
+        Some(_) => Err(RegistrationError::metadata(
+            "userinfo_signed_response_alg must be a string",
+        )),
+    }
+}
+
 
 /// Validate the `jwks` / `jwks_uri` pair. They are MUTUALLY EXCLUSIVE. A
 /// `private_key_jwt` client MUST supply exactly one usable source; other methods
