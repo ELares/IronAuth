@@ -68,7 +68,7 @@ use crate::util::{append_query, client_service_actor, epoch_micros};
 /// #27) can be stored verbatim by the PAR endpoint and replayed here when its
 /// `request_uri` is consumed: the pushed request is EXACTLY an `AuthorizeParams`, so
 /// the two paths validate one identical shape.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct AuthorizeParams {
     /// The PAR (RFC 9126, issue #27) `request_uri`: a reference to a request the
     /// client already pushed to the PAR endpoint. When present, the authorization
@@ -79,6 +79,11 @@ pub struct AuthorizeParams {
     /// never itself part of a pushed request (the PAR endpoint rejects it), so it is
     /// [`None`] on every replayed request.
     pub request_uri: Option<String>,
+    /// The JAR request object (RFC 9101, issue #158): a JWS whose claims carry the
+    /// authorization request parameters. When present, the parameters are taken
+    /// ONLY from the object (the documented deviation from OIDC Core section 6's
+    /// merge). Optional; absent means the query parameters govern.
+    pub request: Option<String>,
     /// The OAuth `response_type`: `code` always, plus the per-environment legacy
     /// types (`id_token`, `code id_token`, `none`) when enabled (issue #17). It is
     /// an ORDER-INSENSITIVE space-separated set; token-bearing values are
@@ -333,6 +338,11 @@ async fn handle(
         Ok(resolved) => resolved,
         Err(error) => return error.into_response(),
     };
+    // THE JAR RESOLUTION (RFC 9101, issue #158): when the request carries a
+    // request OBJECT, it is verified against the client's registered keys inside
+    // issue_code (where the client is resolved) and its claims REPLACE the query
+    // parameters - the 9101-only semantics, documented in the jar module.
+    let _ = params.request.is_some();
     match issue_code(state, headers, params, pushed.as_ref(), path_scope).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
@@ -897,6 +907,18 @@ async fn issue_code(
                 "the authorization request could not be processed",
             ));
         }
+    };
+
+    // THE JAR RESOLUTION (RFC 9101, issue #158): when the request carries a request
+    // OBJECT, it is verified against the resolved client's registered keys and its
+    // claims REPLACE the query parameters (the 9101-only semantics, documented in
+    // the jar module).
+    let params = if params.request.is_some() {
+        crate::jar::resolve_request_object(state, scope, &client, params)
+            .await
+            .map_err(|_| AuthorizeError::page("the request object could not be verified"))?
+    } else {
+        params
     };
 
     // The identifier as it will be STORED and audited. A CIMD client carries its `cimc_`
@@ -3140,6 +3162,10 @@ fn build_authorize_url(
         ui_locales: _,
         claims_locales: _,
         display: _,
+        // A JAR request object was already verified and consumed at the first hop;
+        // re-presenting it would re-verify an already-spent object (and the 9101
+        // semantics say the object governs the FIRST hop's parameters).
+        request: _,
         // A PAR request never resumes through THIS builder. `build_par_resume_url`
         // re-presents the `request_uri` and the pushed request is read back from
         // storage, so replaying either of these on a plain `/authorize` would be wrong.

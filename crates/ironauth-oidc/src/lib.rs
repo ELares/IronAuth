@@ -136,6 +136,7 @@ mod introspection;
 mod invitations;
 mod issuer;
 mod jwks;
+mod jar;
 mod jwt_bearer;
 mod login;
 mod logout;
