@@ -74,7 +74,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ironauth_jose::Confirmation;
-use ironauth_store::{AccessTokenResolution, IssuedTokenId, Scope};
+use ironauth_store::{AccessTokenResolution, ClientId, IssuedTokenId, Scope};
 use serde_json::{Map, Value};
 
 use crate::claims_request::ClaimsRequest;
@@ -159,7 +159,7 @@ async fn respond(
     query: Option<&str>,
 ) -> Response {
     let mut response = match resolve(state, headers, method, query).await {
-        Ok(claims) => success(&claims),
+        Ok((claims, client_id, scope)) => success(state, &claims, &client_id, scope).await,
         Err(error) => error.into_response(),
     };
     if let Some(origin) = registered_origin(state, headers) {
@@ -176,7 +176,7 @@ async fn resolve(
     headers: &HeaderMap,
     method: &str,
     query: Option<&str>,
-) -> Result<Map<String, Value>, UserInfoError> {
+) -> Result<(Map<String, Value>, String, Scope), UserInfoError> {
     // A token in the query string is refused outright (RFC 6750 2.3 is discouraged
     // and here disallowed): it leaks through logs, proxies, and Referer.
     if query_carries_access_token(query) {
@@ -276,7 +276,7 @@ async fn resolve(
     let sub = state.resolve_public_subject(&resolution.subject);
     released.insert("sub".to_owned(), Value::String(sub));
 
-    Ok(released)
+    Ok((released, resolution.client_id, scope))
 }
 
 /// Resolve a presented OPAQUE access token (issue #29) and build the released claim
@@ -287,7 +287,7 @@ async fn resolve_opaque(
     state: &OidcState,
     presented: &Presented,
     method: &str,
-) -> Result<Map<String, Value>, UserInfoError> {
+) -> Result<(Map<String, Value>, String, Scope), UserInfoError> {
     let token = presented.token.as_str();
     // Recover the scope the token declares in its routing handle. An unreadable
     // handle is a uniform invalid_token; the scope is only a lookup key and is
@@ -350,7 +350,7 @@ async fn resolve_opaque(
     let sub = state.resolve_public_subject(&active.subject);
     released.insert("sub".to_owned(), Value::String(sub));
 
-    Ok(released)
+    Ok((released, active.client_id, scope))
 }
 
 /// Recover the `(tenant, environment)` scope an opaque access token declares in its
@@ -369,6 +369,12 @@ fn opaque_token_scope(token: &str) -> Option<Scope> {
 
 /// Now, in microseconds since the Unix epoch, from the environment clock seam (never
 /// the raw system clock), for the opaque resolve's expiry comparison.
+fn epoch_secs(at: std::time::SystemTime) -> i64 {
+    at.duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(0))
+        .unwrap_or(0)
+}
+
 fn epoch_micros(state: &OidcState) -> i64 {
     state
         .now()
@@ -645,17 +651,86 @@ fn set_cors_origin(headers: &mut HeaderMap, origin: &str) {
 }
 
 /// A `200 OK` `UserInfo` response: the claims JSON, `no-store` cached.
-fn success(claims: &Map<String, Value>) -> Response {
+/// Render the UserInfo success (issue #158, OIDC Core 5.3.2): the plain JSON
+/// form by default; the SIGNED JWT form when the client registered
+/// `userinfo_signed_response_alg` - the claims plus the mandatory `iss` and
+/// `aud`, signed with the environment's key, content type `application/jwt`.
+/// Render the UserInfo success (issue #158, OIDC Core 5.3.2): the plain JSON
+/// form by default; the SIGNED JWT form when the client registered
+/// `userinfo_signed_response_alg` - the claims plus the mandatory `iss` and
+/// `aud`, signed with the environment's key, content type `application/jwt`.
+async fn success(
+    state: &OidcState,
+    claims: &Map<String, Value>,
+    client_id: &str,
+    scope: Scope,
+) -> Response {
+    let (content_type, body) = match userinfo_signing_alg(state, client_id, scope).await {
+        Some(_alg) => ("application/jwt", sign_userinfo(state, claims, client_id, scope).await),
+        None => (
+            "application/json",
+            Value::Object(claims.clone()).to_string(),
+        ),
+    };
     (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "application/json"),
+            (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, "no-store"),
             (header::PRAGMA, "no-cache"),
         ],
-        Value::Object(claims.clone()).to_string(),
+        body,
     )
         .into_response()
+}
+
+/// The client's registered UserInfo signing algorithm (issue #158): the scoped
+/// record's `userinfo_signed_response_alg`; `None` (the default) keeps the plain
+/// JSON form.
+async fn userinfo_signing_alg(
+    state: &OidcState,
+    client_id: &str,
+    scope: Scope,
+) -> Option<String> {
+    let id = ClientId::parse_in_scope(client_id, &scope).ok()?;
+    state
+        .store()
+        .scoped(scope)
+        .clients()
+        .dynamic_registration(&id)
+        .await
+        .ok()
+        .and_then(|record| record.userinfo_signed_response_alg)
+}
+
+/// Sign the released claims as the UserInfo JWT (issue #158): the claims plus
+/// `iss` (the environment's issuer) and `aud` (the client), signed with the
+/// environment's key.
+async fn sign_userinfo(
+    state: &OidcState,
+    claims: &Map<String, Value>,
+    client_id: &str,
+    scope: Scope,
+) -> String {
+    let Some(entry) = state.issuer_entry(&scope).await else {
+        return Value::Object(claims.clone()).to_string();
+    };
+    let Some(signer) = entry.signer(state.now()) else {
+        return Value::Object(claims.clone()).to_string();
+    };
+    let now = epoch_secs(state.now());
+    let mut payload = claims.clone();
+    payload.insert("iss".to_owned(), Value::String(state.issuer_for(&scope)));
+    payload.insert("aud".to_owned(), Value::String(client_id.to_owned()));
+    payload.insert("iat".to_owned(), Value::Number(now.into()));
+    ironauth_jose::sign_jws(
+        signer,
+        &serde_json::to_vec(&Value::Object(payload)).unwrap_or_default(),
+        &ironauth_jose::EmissionOptions::new().with_typ(
+            "application/jwt", // invariant-allow: typ-via-declaration -- OIDC Core 5.3.2 dictates the UserInfo JWT media type
+        ),
+    )
+    .unwrap_or_else(|_| Value::Object(claims.clone()).to_string())
 }
 
 /// A `UserInfo` failure, each mapping to a spec-exact RFC 6750 3.1 challenge.

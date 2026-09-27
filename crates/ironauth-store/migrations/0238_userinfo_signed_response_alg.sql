@@ -1,0 +1,12 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The signed-UserInfo response algorithm (issue #158, OIDC Core 5.3.2).
+--
+-- A client that registers `userinfo_signed_response_alg` receives its UserInfo
+-- response as a signed JWT (content type application/jwt) carrying the released
+-- claims plus the mandatory `iss` and `aud` claims. `NULL` (the default) keeps
+-- the plain JSON form, which stays the default for every client - signing is off
+-- by default, the node-oidc-provider model.
+--
+-- EXPAND: additive column; existing rows default to NULL (plain JSON).
+ALTER TABLE clients ADD COLUMN userinfo_signed_response_alg text;

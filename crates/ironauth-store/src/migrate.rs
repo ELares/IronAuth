@@ -2019,6 +2019,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0237_fapi_hardened.sql"),
         },
+        // EXPAND (issue #158): the signed-UserInfo response algorithm.
+        Migration {
+            version: 238,
+            name: "userinfo_signed_response_alg",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0238_userinfo_signed_response_alg.sql"),
+        },
     ]
 }
 

@@ -3281,6 +3281,10 @@ pub struct DynamicClientRecord {
     /// The negotiated `id_token_signed_response_alg`, or `None` for a pre-DCR
     /// client.
     pub id_token_signed_response_alg: Option<String>,
+    /// The registered `userinfo_signed_response_alg` (issue #158, OIDC Core
+    /// 5.3.2): when set, the UserInfo response is a signed JWT. `None` (the
+    /// default) keeps the plain JSON form.
+    pub userinfo_signed_response_alg: Option<String>,
     /// The client's inline `jwks` (a JWK Set JSON document), or `None`.
     pub jwks: Option<String>,
     /// The client's `jwks_uri`, or `None`.
@@ -3363,6 +3367,9 @@ pub struct NewDynamicClient<'a> {
     pub application_type: &'a str,
     /// The negotiated `id_token_signed_response_alg`.
     pub id_token_signed_response_alg: &'a str,
+    /// The registered `userinfo_signed_response_alg` (issue #158), or `None` to
+    /// keep the plain JSON form.
+    pub userinfo_signed_response_alg: Option<&'a str>,
     /// The inline `jwks`, or `None` (mutually exclusive with `jwks_uri`).
     pub jwks: Option<&'a str>,
     /// The `jwks_uri`, or `None`.
@@ -3423,6 +3430,9 @@ pub struct DynamicClientUpdate<'a> {
     pub application_type: &'a str,
     /// The re-negotiated `id_token_signed_response_alg`.
     pub id_token_signed_response_alg: &'a str,
+    /// The replacement `userinfo_signed_response_alg` (issue #158), or `None` to
+    /// keep the plain JSON form.
+    pub userinfo_signed_response_alg: Option<&'a str>,
     /// The replacement inline `jwks`, or `None`.
     pub jwks: Option<&'a str>,
     /// The replacement `jwks_uri`, or `None`.
@@ -3795,6 +3805,7 @@ impl ClientRepo<'_> {
             redirect_uris: row.get("redirect_uris"),
             application_type: row.get("application_type"),
             id_token_signed_response_alg: row.get("id_token_signed_response_alg"),
+            userinfo_signed_response_alg: row.get("userinfo_signed_response_alg"),
             jwks: row.get("jwks"),
             jwks_uri: row.get("jwks_uri"),
             token_endpoint_auth_signing_alg: row.get("token_endpoint_auth_signing_alg"),
@@ -6586,7 +6597,7 @@ impl ActingClientRepo<'_> {
                       registration_access_token_hash, quarantined, dcr_policy_chain, \
                       dcr_registered) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                             $15, $16, $17, $18, $19, true)",
+                             $15, $16, $17, $18, $19, $20, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -6597,6 +6608,7 @@ impl ActingClientRepo<'_> {
                 .bind(&redirect_uris)
                 .bind(params.application_type)
                 .bind(params.id_token_signed_response_alg)
+                .bind(params.userinfo_signed_response_alg)
                 .bind(params.jwks)
                 .bind(params.jwks_uri)
                 .bind(params.token_endpoint_auth_signing_alg)
@@ -6683,10 +6695,11 @@ impl ActingClientRepo<'_> {
                 let result = sqlx::query(
                     "UPDATE clients SET display_name = $1, token_endpoint_auth_method = $2, \
                      redirect_uris = $3, application_type = $4, \
-                     id_token_signed_response_alg = $5, jwks = $6, jwks_uri = $7, \
-                     token_endpoint_auth_signing_alg = $8, registration_access_token_hash = $9, \
-                     secret_hash = CASE WHEN $13 THEN secret_hash ELSE NULL END \
-                     WHERE id = $10 AND tenant_id = $11 AND environment_id = $12 \
+                     id_token_signed_response_alg = $5, userinfo_signed_response_alg = $6, \
+                     jwks = $7, jwks_uri = $8, \
+                     token_endpoint_auth_signing_alg = $9, registration_access_token_hash = $10, \
+                     secret_hash = CASE WHEN $14 THEN secret_hash ELSE NULL END \
+                     WHERE id = $11 AND tenant_id = $12 AND environment_id = $13 \
                      AND dcr_registered = true",
                 )
                 .bind(update.display_name)
@@ -6694,6 +6707,7 @@ impl ActingClientRepo<'_> {
                 .bind(&redirect_uris)
                 .bind(update.application_type)
                 .bind(update.id_token_signed_response_alg)
+                .bind(update.userinfo_signed_response_alg)
                 .bind(update.jwks)
                 .bind(update.jwks_uri)
                 .bind(update.token_endpoint_auth_signing_alg)

@@ -102,6 +102,70 @@ async fn issue_tokens_with_document(
     (subject, access, id)
 }
 
+/// THE SIGNED-USERINFO CRITERION (issue #158, OIDC Core 5.3.2): a client that
+/// registered `userinfo_signed_response_alg` receives its UserInfo as a signed
+/// JWT (application/jwt) carrying `iss` and `aud`; the default stays plain JSON.
+#[tokio::test]
+async fn a_client_registered_for_signed_userinfo_receives_a_signed_jwt() {
+    let harness = Harness::start().await;
+    let (subject, access, _) = issue_tokens(&harness).await;
+    // The default: plain JSON.
+    let (status, headers, body) = userinfo(&harness, "GET", Some(&access), None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "the default UserInfo is plain JSON"
+    );
+
+    // A client registered for the signed form.
+    let (actor, corr) = harness.seeding_actor();
+    harness
+        .store()
+        .scoped(harness.scope())
+        .acting(actor, corr)
+        .clients()
+        .update_dynamic(
+            harness.env(),
+            &harness.client_id(),
+            ironauth_store::DynamicClientUpdate {
+                display_name: "signed userinfo",
+                auth_method: "none",
+                redirect_uris: &[],
+                application_type: "web",
+                id_token_signed_response_alg: "EdDSA",
+                userinfo_signed_response_alg: Some("EdDSA"),
+                jwks: None,
+                jwks_uri: None,
+                token_endpoint_auth_signing_alg: None,
+                registration_access_token_hash: "rotated-hash",
+            },
+        )
+        .await
+        .expect("the metadata updates");
+    // Issue a fresh token for the harness client.
+    let (subject2, access2, _) = issue_tokens(&harness).await;
+    let _ = subject2;
+    let (status, headers, body) = userinfo(&harness, "GET", Some(&access2), None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/jwt"),
+        "a registered client receives the signed form"
+    );
+    let claims = payload_claims(&body);
+    assert_eq!(claims["iss"], serde_json::json!("https://issuer.test"), "{claims:?}");
+    assert!(
+        claims.get("aud").is_some(),
+        "the mandatory aud claim rides the signed response: {claims:?}"
+    );
+    assert!(claims.get("sub").is_some(), "{claims:?}");
+}
+
 /// A unique login handle drawn from the deterministic entropy stream.
 fn unique_identifier(harness: &Harness) -> String {
     use std::fmt::Write as _;
