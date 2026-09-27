@@ -699,6 +699,23 @@ pub fn discovery_document(
             .map(|value| value.as_str())
             .collect()
     };
+    // The JAR surface (RFC 9101, issue #158): the request parameter is supported,
+    // and the request-object signing algorithms are the asymmetric assertion
+    // matrix (the same values the token endpoint verifies a private_key_jwt
+    // against, so a request object signed with an algorithm the matrix does not
+    // accept would fail at the authorize validator).
+    document.insert("request_parameter_supported".to_owned(), json!(true));
+    document.insert(
+        "request_object_signing_alg_values_supported".to_owned(),
+        json!(if capabilities.hardened {
+            crate::client_auth::assertion_signing_alg_values()
+                .into_iter()
+                .filter(|name| crate::fapi_hardened::hardened_permits_signing_alg_name(name))
+                .collect::<Vec<_>>()
+        } else {
+            crate::client_auth::assertion_signing_alg_values()
+        }),
+    );
     document.insert(
         "token_endpoint_auth_methods_supported".to_owned(),
         json!(to_strings(advertised_auth_methods.iter().copied())),

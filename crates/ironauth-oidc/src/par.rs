@@ -142,6 +142,7 @@ impl ParParams {
     ) -> AuthorizeParams {
         AuthorizeParams {
             request_uri: None,
+            request: None,
             response_type: self.response_type,
             response_mode: self.response_mode,
             client_id: Some(authenticated_client_id),
