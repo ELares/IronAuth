@@ -9,10 +9,20 @@ range per docs/RELEASING.md.
 - Preserve the already published `signing_key.break_glass` v1 event name through
   an exact legacy-wire exception; newly registered event names still require past tense.
 
+- Restore the dynamic-client registration INSERT's missing policy-snapshot
+  placeholder after the response metadata expansion (issue #1437 prerequisite).
+  All existing inputs now align with their columns; registration no longer fails
+  with PostgreSQL 42601 before storing the client.
+
 - Give `RemoteKeyProvisioner::ensure_remote_key` a named opaque
   `RemoteKeyProvisionError` instead of `()` (issue #1437 compiler prerequisite).
   Implementors must update that result type; every failure still prevents key
   promotion through the same store error mapping.
+
+- Restore existing app/control dynamic-client metadata updates after migration
+  0238 by granting UPDATE on its new `userinfo_signed_response_alg` column only
+  (issue #1437 prerequisite). Other grants remain unchanged, including the
+  control-only quarantine column.
 
 - Repair upstream migration 0237's guardrail view column ordering. The runner
   admits only its exact known old checksum in addition to the corrected bytes;
