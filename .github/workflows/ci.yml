@@ -461,7 +461,7 @@ jobs:
           [ "$PG_ONLY_EXIT" -eq 0 ] && [ "$IRONBUS_EXIT" -eq 0 ] || exit 1
       - name: record the replication lag artifacts (#155)
         if: always()
-        uses: actions/upload-artifact@ff4a2771b20de53f2e9e83d73487a1e9ec0cb13b # v5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: replication-lag-under-netem
           path: |
@@ -476,7 +476,7 @@ jobs:
           IRONBUS_BACKBONE_LATENCY_JSON: ${{ github.workspace }}/outbox-backbone-latency.json
       - name: record the backbone latency artifact (#147 c3)
         if: always()
-        uses: actions/upload-artifact@ff4a2771b20de53f2e9e83d73487a1e9ec0cb13b # v5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: outbox-backbone-latency
           path: ${{ github.workspace }}/outbox-backbone-latency.json
@@ -555,6 +555,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "stable"
+      - name: Install the WASM target for the pinned toolchain
+        # The OIDC test targets below build the mandatory hook guest fixtures.
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Built from git rather than crates.io: IronCache publishes NO crate at all, client or
       # server. Pinned to an exact COMMIT and not a branch, for the reason the IronBus lane
@@ -1380,25 +1383,18 @@ jobs:
       # That is what makes it worth more than the readiness probe beside it, which opens a TCP
       # connection and speaks no protocol.
       - name: Discovery answers for the bootstrapped scope
-        run: |
-          echo "tenant=$TENANT environment=$ENVIRONMENT"
-          test -n "$TENANT" && test "$TENANT" != "null"
-          test -n "$ENVIRONMENT" && test "$ENVIRONMENT" != "null"
-          # `kubectl run --rm` appends `pod "discovery" deleted` to the captured output, on the
-          # same line as the response, so parsing it directly fails with "Invalid numeric
-          # literal" at whatever column the document happens to end. The JSON is one object,
-          # so take from the first brace to the last.
-          raw=$(kubectl run discovery --rm -i --restart=Never --image=curlimages/curl:8.10.1 -- \
-            -fsS --max-time 10 \
-            "http://ironauth:8443/t/$TENANT/e/$ENVIRONMENT/.well-known/openid-configuration")
-          doc=$(printf '%s' "$raw" | grep -o '{.*}')
-          echo "$doc" | jq .issuer
-          # The issuer it names must be the scope that was asked for, not merely a 200: a
-          # discovery document for the wrong environment is the shape that would let a client
-          # trust keys from somewhere else.
-          echo "$doc" | jq -e --arg t "$TENANT" --arg e "$ENVIRONMENT" \
-            '.issuer | contains("/t/" + $t + "/e/" + $e)'
-          echo "$doc" | jq -e '.jwks_uri and .authorization_endpoint and .token_endpoint'
+        id: discovery_probe
+        env:
+          EXPECTED_PUBLIC_URL: http://ironauth.default.svc.cluster.local:8443
+        run: timeout --signal=TERM --kill-after=20s 210s scripts/helm-discovery-probe.sh
+      - name: Preserve the discovery response and probe state
+        if: ${{ always() && steps.discovery_probe.outcome != '' && steps.discovery_probe.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: helm-discovery-response
+          path: target/helm-discovery/
+          if-no-files-found: error
+          retention-days: 7
       - name: Diagnostics on failure
         if: failure()
         run: |
