@@ -2040,7 +2040,28 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0240_id_token_encrypted_response.sql"),
         },
+        // EXPAND (issue #1436 prerequisite): retain the original view's prior column.
+        Migration {
+            version: 241,
+            name: "fapi_guardrails_view_repair",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0241_fapi_guardrails_view_repair.sql"),
+        },
     ]
+}
+
+// The one explicit historical repair (issue #1436 prerequisite). Upstream 0237
+// replaced column five, introduced by 0062, instead of appending its new column.
+// Fresh chains failed before a forward migration could run. Preserve old ledgers
+// verbatim, admit ONLY these exact old/corrected bytes, then 0241 validates and
+// repairs the old view shape without dropping it or changing grants/ownership.
+// Every other altered checksum, including another edit to 0237, is still refused.
+fn known_0237_view_repair(migration: &Migration, recorded: &str) -> bool {
+    migration.version == 237
+        && migration.name == "fapi_hardened"
+        && recorded == "02bd786d62041c24c5a6268b8c33bf53cdcdc6610701b42a509c514dbd6f2530"
+        && migration.checksum()
+            == "68cd229209d09ff7045ac02c3a16d60b9ec705b3c633617862f3b75d335dd81b"
 }
 
 /// The fixed key for the migration advisory lock. A session-level Postgres
@@ -2172,7 +2193,7 @@ impl<'a> MigrationRunner<'a> {
             let Some(migration) = self.migrations.iter().find(|m| m.version == version) else {
                 return Err(MigrationError::UnknownApplied { version });
             };
-            if &migration.checksum() != recorded {
+            if &migration.checksum() != recorded && !known_0237_view_repair(migration, recorded) {
                 return Err(MigrationError::ChecksumMismatch { version });
             }
         }

@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Exact historical-checksum compatibility for the broken upstream 0237 view.
+//! Every schema here belongs to the throwaway test cluster.
+
+use ironauth_env::Env;
+use ironauth_store::test_support::TestDatabase;
+use ironauth_store::{CorrelationId, MigrationError, MigrationRunner, chain};
+
+const OLD_HASH: &str = "02bd786d62041c24c5a6268b8c33bf53cdcdc6610701b42a509c514dbd6f2530";
+
+async fn old_ledger() -> TestDatabase {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .register(
+            &env,
+            "legacy-owner@example.test",
+            "fixture-password-hash",
+            None,
+        )
+        .await
+        .expect("preexisting account");
+    // Simulate the old recorded 0237 state without modifying a running database.
+    // A real ordinary fresh chain could not reach it; compatibility nevertheless
+    // preserves operators who previously worked around the broken view manually.
+    sqlx::raw_sql(
+        "DELETE FROM _schema_migrations WHERE version >= 241; \
+         DROP VIEW environment_guardrails; \
+         CREATE VIEW environment_guardrails AS \
+           SELECT tenant_id, id AS environment_id, kind, custom_domain, fapi_hardened \
+           FROM environments WHERE tenant_id = current_setting('ironauth.tenant_id', true) \
+           AND id = current_setting('ironauth.environment_id', true); \
+         GRANT SELECT ON environment_guardrails TO ironauth_app, ironauth_control;",
+    )
+    .execute(db.owner_pool())
+    .await
+    .expect("owned historical fixture");
+    sqlx::query("UPDATE _schema_migrations SET checksum = $1 WHERE version = 237")
+        .bind(OLD_HASH)
+        .execute(db.owner_pool())
+        .await
+        .expect("known old ledger");
+    db
+}
+
+async fn view_identity(db: &TestDatabase) -> (String, Option<String>, Option<Vec<String>>) {
+    sqlx::query_as("SELECT relowner::regrole::text, relacl::text, reloptions FROM pg_class WHERE oid = 'environment_guardrails'::regclass")
+        .fetch_one(db.owner_pool()).await.expect("view owner/grants/options")
+}
+
+async fn data(db: &TestDatabase) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT value FROM ( \
+         SELECT row_to_json(t)::text AS value FROM tenants t UNION ALL \
+         SELECT row_to_json(e)::text FROM environments e UNION ALL \
+         SELECT (to_jsonb(u) - 'recipient_email_bidx' - 'recipient_email_indexed')::text FROM users u \
+         ) preserved ORDER BY value",
+    ).fetch_all(db.owner_pool()).await.expect("retained account data")
+}
+
+#[tokio::test]
+async fn corrected_fresh_chain_keeps_both_guardrail_columns_and_is_idempotent() {
+    let db = TestDatabase::start().await;
+    let names: Vec<String> = sqlx::query_scalar("SELECT attname::text FROM pg_attribute WHERE attrelid = 'environment_guardrails'::regclass AND attnum > 0 ORDER BY attnum")
+        .fetch_all(db.owner_pool()).await.expect("columns");
+    assert_eq!(
+        names,
+        [
+            "tenant_id",
+            "environment_id",
+            "kind",
+            "custom_domain",
+            "auto_link_posture",
+            "fapi_hardened"
+        ]
+    );
+    let report = MigrationRunner::new(db.owner_pool())
+        .run()
+        .await
+        .expect("unchanged rerun");
+    assert!(report.newly_applied().is_empty());
+}
+
+#[tokio::test]
+async fn exact_old_checksum_upgrades_without_rewriting_ledger_data_view_grants_or_dependencies() {
+    let db = old_ledger().await;
+    // A dependent consumer remains valid because the repair appends a column; it
+    // never drops/reorders existing columns and never uses CASCADE.
+    sqlx::query(
+        "CREATE VIEW owned_guardrail_consumer AS SELECT fapi_hardened FROM environment_guardrails",
+    )
+    .execute(db.owner_pool())
+    .await
+    .expect("existing dependent view");
+    let before_view = view_identity(&db).await;
+    let before_data = data(&db).await;
+    let before_ledger: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(m)::text FROM _schema_migrations m ORDER BY version",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("old ledger");
+    let report = MigrationRunner::new(db.owner_pool())
+        .run()
+        .await
+        .expect("known old checksum repair");
+    assert_eq!(report.newly_applied(), [241]);
+    assert_eq!(before_view, view_identity(&db).await);
+    assert_eq!(before_data, data(&db).await);
+    let after_ledger: Vec<String> = sqlx::query_scalar("SELECT row_to_json(m)::text FROM _schema_migrations m WHERE version < 241 ORDER BY version")
+        .fetch_all(db.owner_pool()).await.expect("preserved ledger");
+    assert_eq!(
+        before_ledger, after_ledger,
+        "old checksums and timestamps are not rewritten"
+    );
+    sqlx::query("SELECT * FROM owned_guardrail_consumer")
+        .fetch_all(db.owner_pool())
+        .await
+        .expect("dependent view intact");
+    let report = MigrationRunner::new(db.owner_pool())
+        .run()
+        .await
+        .expect("old-hash rerun remains idempotent");
+    assert!(report.newly_applied().is_empty());
+}
+
+#[tokio::test]
+async fn unknown_237_hash_and_other_historical_hashes_still_refuse() {
+    for version in [237, 62] {
+        let db = old_ledger().await;
+        sqlx::query(
+            "UPDATE _schema_migrations SET checksum = 'unrecognized-checksum' WHERE version = $1",
+        )
+        .bind(version)
+        .execute(db.owner_pool())
+        .await
+        .expect("adversarial ledger");
+        assert!(
+            matches!(MigrationRunner::new(db.owner_pool()).run().await, Err(MigrationError::ChecksumMismatch {version: actual}) if actual == version)
+        );
+        let later: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM _schema_migrations WHERE version >= 241")
+                .fetch_one(db.owner_pool())
+                .await
+                .expect("no later migration");
+        assert_eq!(later, 0);
+    }
+}
+
+#[tokio::test]
+async fn known_old_ledger_does_not_admit_another_edit_to_237_or_an_unexpected_view_definition() {
+    let db = old_ledger().await;
+    let mut altered = chain();
+    let migration = altered
+        .iter_mut()
+        .find(|migration| migration.version == 237)
+        .expect("0237");
+    migration.sql = Box::leak(format!("{}\n-- another edit", migration.sql).into_boxed_str());
+    assert!(matches!(
+        MigrationRunner::from_migrations(db.owner_pool(), altered)
+            .run()
+            .await,
+        Err(MigrationError::ChecksumMismatch { version: 237 })
+    ));
+    sqlx::query("CREATE OR REPLACE VIEW environment_guardrails AS SELECT tenant_id, id AS environment_id, kind, custom_domain, fapi_hardened FROM environments WHERE false")
+        .execute(db.owner_pool()).await.expect("unexpected security definition");
+    let before = view_identity(&db).await;
+    assert!(matches!(
+        MigrationRunner::new(db.owner_pool()).run().await,
+        Err(MigrationError::Database(_))
+    ));
+    assert_eq!(before, view_identity(&db).await);
+    let applied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM _schema_migrations WHERE version >= 241")
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("no partial forward migration");
+    assert_eq!(applied, 0);
+}

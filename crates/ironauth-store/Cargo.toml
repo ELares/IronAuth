@@ -1169,3 +1169,9 @@ path = "tests/access_review_fixture.rs"
 name = "portal_sessions"
 path = "tests/portal_sessions.rs"
 required-features = ["testing"]
+
+# Exact historical view repair required by the recipient core's fresh installs.
+[[test]]
+name = "migration_0237_repair"
+path = "tests/migration_0237_repair.rs"
+required-features = ["testing"]
