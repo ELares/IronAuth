@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Restore the dynamic-client registration INSERT's missing policy-snapshot
+  placeholder after the response metadata expansion (issue #1437 prerequisite).
+  All existing inputs now align with their columns; registration no longer fails
+  with PostgreSQL 42601 before storing the client.
+
 - Restore the control role's column-scoped FAPI policy setter after migration
   0237 (issue #1437 prerequisite). Forward migration 0244 grants only UPDATE on
   `environments.fapi_hardened` to `ironauth_control`; application roles remain
