@@ -93,10 +93,11 @@ label on the wire with every test green.
 | `ironauth_password_screen_total` | counter | `outcome` | Password screening checks, by outcome |
 | `ironauth_proxy_forwarding_rejected_total` | counter | `reason` | Requests whose forwarding headers were rejected and failed closed |
 | `ironauth_quota_decisions_total` | counter | `decision`, `dimension` | Quota decisions, by dimension and admitted or denied |
-| `ironauth_replication_lag_messages` | gauge | `environment_id`, `tenant_id` | Replication lag in outbox-stream positions, per (tenant, environment) partition (issue #155) |
-| `ironauth_replication_shipped_total` | counter | `environment_id`, `tenant_id` | Home outbox-stream rows copied to the follower, per partition (issue #155) |
+| `ironauth_replication_lag_messages` | gauge | none | Maximum partition lag in outbox-stream positions from the last successful ship pass |
+| `ironauth_replication_shipped_total` | counter | none | Home outbox-stream rows copied to the follower across all partitions |
 | `ironauth_request_throttled_total` | counter | `layer` | Request-path refusals by the layered limiter, by refusing layer |
 | `ironauth_shared_rate_fallbacks_total` | counter | none | Admits enforced by the local bucket because the shared rate tier could not answer |
+| `ironauth_signing_input_oversized_total` | counter | none | Raw signing inputs above the 3 KB warning threshold (issue #161) |
 | `ironauth_sms_route_throttled_total` | counter | `route` | SMS sends refused by a per-route throttle |
 | `ironauth_sms_send_hash_rejected_total` | counter | none | SMS sends refused because the recipient hash was rejected |
 | `ironauth_sms_send_refused_total` | counter | `reason` | SMS sends refused, by reason |
@@ -105,7 +106,7 @@ label on the wire with every test green.
 | `ironauth_up` | gauge | none | 1 while the process is serving |
 | `ironauth_verification_send_suppressed_total` | counter | `purpose` | Verification sends suppressed, by purpose |
 
-50 metrics, 16 of them carrying no labels at all.
+51 metrics, 19 of them carrying no labels at all.
 
 ## Scope
 

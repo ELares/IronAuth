@@ -284,16 +284,22 @@ pub const CONTRACT: &[MetricSpec] = &[
         help: "Authentications refused for attempting a weaker factor than the policy allows",
     },
     MetricSpec {
+        name: "ironauth_signing_input_oversized_total",
+        kind: MetricKind::Counter,
+        labels: &[],
+        help: "Raw signing inputs above the 3 KB warning threshold (issue #161)",
+    },
+    MetricSpec {
         name: "ironauth_replication_lag_messages",
         kind: MetricKind::Gauge,
-        labels: &["tenant_id", "environment_id"],
-        help: "Replication lag in outbox-stream positions, per (tenant, environment) partition (issue #155)",
+        labels: &[],
+        help: "Maximum partition lag in outbox-stream positions from the last successful ship pass",
     },
     MetricSpec {
         name: "ironauth_replication_shipped_total",
         kind: MetricKind::Counter,
-        labels: &["tenant_id", "environment_id"],
-        help: "Home outbox-stream rows copied to the follower, per partition (issue #155)",
+        labels: &[],
+        help: "Home outbox-stream rows copied to the follower across all partitions",
     },
     MetricSpec {
         name: "ironauth_backup_success_total",

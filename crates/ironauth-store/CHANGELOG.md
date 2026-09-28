@@ -6,6 +6,17 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Bound replication metrics to two process-wide series (issue #1437 prerequisite).
+  Remove tenant/environment labels: shipped rows accumulate across partitions and
+  lag is their maximum from the last successful pass, zero for an empty stream.
+  Exact partition details remain in reports and threshold alerts. Dashboards must
+  stop selecting the removed labels.
+- Pin the recipient challenge reissue DELETE privilege to its actual audited
+  caller in the migration contract. Reissue replaces the prior subject challenge;
+  cross-environment deletion is RLS-filtered and verified by an unchanged row image.
+- Preserve the already published `signing_key.break_glass` v1 event name through
+  an exact legacy-wire exception; newly registered event names still require past tense.
+
 - Restore the dynamic-client registration INSERT's missing policy-snapshot
   placeholder after the response metadata expansion (issue #1437 prerequisite).
   All existing inputs now align with their columns; registration no longer fails

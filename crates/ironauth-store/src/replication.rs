@@ -39,12 +39,11 @@ use sqlx::{PgPool, Row};
 /// The batch bound: how many home rows one pass may copy per (tenant, environment).
 pub const BATCH_LIMIT: i64 = 1_000;
 
-/// The lag gauge: replication lag in stream positions, per partition (issue #155
-/// criterion: "replication lag is exported per tenant in the metric contract with
-/// alerting thresholds").
+/// The process-wide lag gauge: maximum partition lag from the last successful pass.
+/// Partition detail stays in reports and threshold alerts, not metric labels.
 pub const REPLICATION_LAG_MESSAGES: &str = "ironauth_replication_lag_messages";
 
-/// The shipped counter: home stream rows copied per partition.
+/// The process-wide shipped counter: committed rows copied across all partitions.
 pub const REPLICATION_SHIPPED_TOTAL: &str = "ironauth_replication_shipped_total";
 
 /// Whether `lag` breaches `threshold`. A threshold of zero disables alerting, matching
@@ -156,16 +155,16 @@ impl ReplicationShipper {
     ///
     /// # Errors
     ///
-    /// [`sqlx::Error`] on a persistence failure. A failed pass changes nothing: the
-    /// cursor advance is in the same transaction as the copy.
+    /// [`sqlx::Error`] on a persistence failure. Each partition's cursor and copy commit
+    /// together; previously completed partitions survive a later partition failure.
     pub async fn ship(&self, batch_limit: i64) -> Result<ShipReport, sqlx::Error> {
         metrics::describe_gauge!(
             REPLICATION_LAG_MESSAGES,
-            "Replication lag in outbox-stream positions, per (tenant, environment) partition (issue #155)"
+            "Maximum partition lag in outbox-stream positions from the last successful ship pass"
         );
         metrics::describe_counter!(
             REPLICATION_SHIPPED_TOTAL,
-            "Home outbox-stream rows copied to the follower, per partition (issue #155)"
+            "Home outbox-stream rows copied to the follower across all partitions"
         );
         let mut report = ShipReport {
             partitions: Vec::new(),
@@ -204,22 +203,9 @@ impl ReplicationShipper {
             let partition = self
                 .ship_partition(&tenant_id, &environment_id, cursor, batch_limit)
                 .await?;
-            // The gauge's unit is f64; the lag is an integer position. The cast loses
-            // nothing for any lag a deployment can reach (2^52 positions), which is
-            // stated because the lint flags the cast.
-            #[allow(clippy::cast_precision_loss)]
-            metrics::gauge!(
-                REPLICATION_LAG_MESSAGES,
-                "tenant_id" => partition.tenant_id.clone(),
-                "environment_id" => partition.environment_id.clone(),
-            )
-            .set(partition.lag_messages as f64);
-            metrics::counter!(
-                REPLICATION_SHIPPED_TOTAL,
-                "tenant_id" => partition.tenant_id.clone(),
-                "environment_id" => partition.environment_id.clone(),
-            )
-            .increment(u64::try_from(partition.copied).unwrap_or(0));
+            // Count committed copies even if a later partition in this pass fails.
+            metrics::counter!(REPLICATION_SHIPPED_TOTAL)
+                .increment(u64::try_from(partition.copied).unwrap_or(0));
             // THE ALERT: the operator chose the lag bound; the system reports the breach.
             if breaches_threshold(partition.lag_messages, self.alert_threshold_messages) {
                 tracing::warn!(
@@ -232,6 +218,17 @@ impl ReplicationShipper {
             }
             report.partitions.push(partition);
         }
+        let maximum_lag = report
+            .partitions
+            .iter()
+            .map(|partition| partition.lag_messages)
+            .max()
+            .unwrap_or(0);
+        // One bounded process-wide series, updated once per successful pass. Empty
+        // streams explicitly clear it; partition detail remains in reports/alerts.
+        // Integer positions are exact for all practical lags below 2^52.
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!(REPLICATION_LAG_MESSAGES).set(maximum_lag as f64);
         Ok(report)
     }
 
