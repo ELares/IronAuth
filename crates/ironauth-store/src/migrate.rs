@@ -2033,6 +2033,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0239_authorization_signed_response_alg.sql"),
         },
+        // EXPAND (issue #158): the encrypted ID-token response algorithms.
+        Migration {
+            version: 240,
+            name: "id_token_encrypted_response",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0240_id_token_encrypted_response.sql"),
+        },
     ]
 }
 

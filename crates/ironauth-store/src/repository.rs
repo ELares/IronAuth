@@ -3288,6 +3288,12 @@ pub struct DynamicClientRecord {
     /// The registered JARM response algorithm (issue #158): when set, the
     /// authorization responses are signed JWTs in the jwt modes.
     pub authorization_signed_response_alg: Option<String>,
+    /// The registered encrypted-ID-token response algorithms (issue #158):
+    /// `id_token_encrypted_response_alg` (+ the optional `enc`). When set, the
+    /// ID tokens are sign-then-encrypt nested JWTs.
+    pub id_token_encrypted_response_alg: Option<String>,
+    /// The registered `id_token_encrypted_response_enc`.
+    pub id_token_encrypted_response_enc: Option<String>,
     /// The client's inline `jwks` (a JWK Set JSON document), or `None`.
     pub jwks: Option<String>,
     /// The client's `jwks_uri`, or `None`.
@@ -3376,6 +3382,12 @@ pub struct NewDynamicClient<'a> {
     /// The registered JARM response algorithm (issue #158), or `None` for the
     /// plain response modes.
     pub authorization_signed_response_alg: Option<&'a str>,
+    /// The registered `id_token_encrypted_response_alg` (issue #158), or `None`
+    /// for the plain signed ID token.
+    pub id_token_encrypted_response_alg: Option<&'a str>,
+    /// The registered `id_token_encrypted_response_enc`, or `None` to default to
+    /// A256GCM.
+    pub id_token_encrypted_response_enc: Option<&'a str>,
     /// The inline `jwks`, or `None` (mutually exclusive with `jwks_uri`).
     pub jwks: Option<&'a str>,
     /// The `jwks_uri`, or `None`.
@@ -3783,7 +3795,8 @@ impl ClientRepo<'_> {
         let row = sqlx::query(
             "SELECT id, display_name, token_endpoint_auth_method, redirect_uris, \
              application_type, id_token_signed_response_alg, userinfo_signed_response_alg, \
-             authorization_signed_response_alg, jwks, jwks_uri, \
+             authorization_signed_response_alg, id_token_encrypted_response_alg, \
+             id_token_encrypted_response_enc, jwks, jwks_uri, \
              token_endpoint_auth_signing_alg, registration_client_uri, \
              registration_access_token_hash, dcr_registered, \
              quarantined, dcr_policy_chain, \
@@ -3814,6 +3827,8 @@ impl ClientRepo<'_> {
             id_token_signed_response_alg: row.get("id_token_signed_response_alg"),
             userinfo_signed_response_alg: row.get("userinfo_signed_response_alg"),
             authorization_signed_response_alg: row.get("authorization_signed_response_alg"),
+            id_token_encrypted_response_alg: row.get("id_token_encrypted_response_alg"),
+            id_token_encrypted_response_enc: row.get("id_token_encrypted_response_enc"),
             jwks: row.get("jwks"),
             jwks_uri: row.get("jwks_uri"),
             token_endpoint_auth_signing_alg: row.get("token_endpoint_auth_signing_alg"),
@@ -6600,6 +6615,7 @@ impl ActingClientRepo<'_> {
                       token_endpoint_auth_method, secret_hash, redirect_uris, \
                       application_type, id_token_signed_response_alg, \
                       userinfo_signed_response_alg, authorization_signed_response_alg, \
+                      id_token_encrypted_response_alg, id_token_encrypted_response_enc, \
                       jwks, jwks_uri, \
                       token_endpoint_auth_signing_alg, tls_client_auth_cert, \
                       tls_client_auth_subject_dn, use_mtls_endpoint_aliases, \
@@ -6620,6 +6636,8 @@ impl ActingClientRepo<'_> {
                 .bind(params.id_token_signed_response_alg)
                 .bind(params.userinfo_signed_response_alg)
                 .bind(params.authorization_signed_response_alg)
+                .bind(params.id_token_encrypted_response_alg)
+                .bind(params.id_token_encrypted_response_enc)
                 .bind(params.jwks)
                 .bind(params.jwks_uri)
                 .bind(params.token_endpoint_auth_signing_alg)

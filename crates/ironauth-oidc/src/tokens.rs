@@ -66,7 +66,7 @@ use ironauth_jose::{
     protected_header, protected_header_with, sign_jws_with_policy, signing_input,
 };
 use ironauth_store::{
-    IssuedTokenId, RefreshTokenId, Scope, TokenFormat, opaque_access_token_digest,
+    ClientId, IssuedTokenId, RefreshTokenId, Scope, TokenFormat, opaque_access_token_digest,
     refresh_token_digest,
 };
 use serde_json::json;
@@ -1775,6 +1775,65 @@ pub fn describe_signing_metrics() {
         ironauth_jose::external_signer::SIGNING_INPUT_OVERSIZED_METRIC,
         "Raw signing inputs above the 3 KB warning threshold (issue #161)"
     );
+}
+
+/// The sign-then-encrypt arm (issue #158): when the client registered
+/// `id_token_encrypted_response_alg`, the minted ID-token JWS is the plaintext of
+/// an ECDH-ES JWE to the client's registered P-256 public key (from its inline
+/// `jwks`). `None` keeps the plain signed token.
+pub(crate) async fn encrypt_id_token_for_client(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &str,
+    id_token: &str,
+) -> Option<String> {
+    let id = ClientId::parse_in_scope(client_id, &scope).ok()?;
+    let record = state
+        .store()
+        .scoped(scope)
+        .clients()
+        .dynamic_registration(&id)
+        .await
+        .ok()?;
+    if record.id_token_encrypted_response_alg.as_deref() != Some("ECDH-ES") {
+        return None;
+    }
+    let jwks_text = record.jwks.as_deref()?;
+    let jwks: serde_json::Value = serde_json::from_str(jwks_text).ok()?;
+    let Some(keys) = jwks.get("keys").and_then(|v| v.as_array()) else {
+        return None;
+    };
+    for key in keys.iter() {
+        let kty = key.get("kty").and_then(|v| v.as_str());
+        let crv = key.get("crv").and_then(|v| v.as_str());
+        let Some(x) = key.get("x").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(y) = key.get("y").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if kty == Some("EC") && crv == Some("P-256") {
+            use base64::Engine as _;
+            let x_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(x)
+                .ok()?;
+            let y_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(y)
+                .ok()?;
+            let mut sec1 = vec![0x04];
+            sec1.extend_from_slice(&x_bytes);
+            sec1.extend_from_slice(&y_bytes);
+            use ironauth_env::Entropy as _;
+            return ironauth_jose::jwe::encrypt_ecdh_es(
+                "ECDH-ES",
+                &sec1,
+                id_token.as_bytes(),
+                state.env().entropy(),
+            )
+            .ok();
+        }
+    }
+    None
 }
 
 fn mint_opaque_access(

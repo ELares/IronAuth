@@ -292,6 +292,8 @@ pub async fn register(
         id_token_signed_response_alg: &validated.id_token_signed_response_alg,
         userinfo_signed_response_alg: validated.userinfo_signed_response_alg.as_deref(),
         authorization_signed_response_alg: validated.authorization_signed_response_alg.as_deref(),
+        id_token_encrypted_response_alg: validated.id_token_encrypted_response_alg.as_deref(),
+        id_token_encrypted_response_enc: validated.id_token_encrypted_response_enc.as_deref(),
         jwks: validated.jwks.as_deref(),
         jwks_uri: validated.jwks_uri.as_deref(),
         token_endpoint_auth_signing_alg: validated.token_endpoint_auth_signing_alg.as_deref(),
@@ -939,6 +941,8 @@ struct ValidatedMetadata {
     token_endpoint_auth_signing_alg: Option<String>,
     userinfo_signed_response_alg: Option<String>,
     authorization_signed_response_alg: Option<String>,
+    id_token_encrypted_response_alg: Option<String>,
+    id_token_encrypted_response_enc: Option<String>,
 }
 
 /// Validate an RFC 7591 metadata document, applying per-spec defaults, ignoring
@@ -1013,6 +1017,8 @@ async fn validate_metadata(
     let token_endpoint_auth_signing_alg = validate_signing_alg(metadata)?;
     let userinfo_signed_response_alg = validate_userinfo_signing_alg(metadata)?;
     let authorization_signed_response_alg = validate_authorization_signing_alg(metadata)?;
+    let id_token_encrypted_response_alg = validate_id_token_encrypted_alg(metadata)?;
+    let id_token_encrypted_response_enc = validate_id_token_encrypted_enc(metadata)?;
     if hardened {
         if let Some(alg) = token_endpoint_auth_signing_alg.as_ref() {
             let parsed = ironauth_jose::JwsAlgorithm::from_jose_name(alg);
@@ -1046,6 +1052,8 @@ async fn validate_metadata(
         token_endpoint_auth_signing_alg,
         userinfo_signed_response_alg,
 authorization_signed_response_alg,
+id_token_encrypted_response_alg,
+id_token_encrypted_response_enc,
 })
 }
 
@@ -1351,6 +1359,45 @@ fn validate_authorization_signing_alg(
         )),
     }
 }
+/// Validate the `id_token_encrypted_response_alg` (issue #158): only the
+/// shipped ECDH-ES is accepted; the refused families (RSA1_5, PBKDF2) are
+/// rejected at registration. Absent means the plain signed ID token.
+fn validate_id_token_encrypted_alg(
+    metadata: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, RegistrationError> {
+    match metadata.get("id_token_encrypted_response_alg") {
+        None => Ok(None),
+        Some(Value::String(value)) if value == "ECDH-ES" => Ok(Some(value.clone())),
+        Some(Value::String(value)) if ironauth_jose::jwe::jwe_algorithm_is_refused(value) => {
+            Err(RegistrationError::metadata_owned(format!(
+                "id_token_encrypted_response_alg {value:?} is a refused JWE algorithm"
+            )))
+        }
+        Some(Value::String(value)) => Err(RegistrationError::metadata_owned(format!(
+            "id_token_encrypted_response_alg {value:?} is not a shipped JWE algorithm"
+        ))),
+        Some(_) => Err(RegistrationError::metadata(
+            "id_token_encrypted_response_alg must be a string",
+        )),
+    }
+}
+
+/// Validate the `id_token_encrypted_response_enc`: only A256GCM ships.
+fn validate_id_token_encrypted_enc(
+    metadata: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, RegistrationError> {
+    match metadata.get("id_token_encrypted_response_enc") {
+        None => Ok(None),
+        Some(Value::String(value)) if value == "A256GCM" => Ok(Some(value.clone())),
+        Some(Value::String(value)) => Err(RegistrationError::metadata_owned(format!(
+            "id_token_encrypted_response_enc {value:?} is not a shipped JWE content algorithm"
+        ))),
+        Some(_) => Err(RegistrationError::metadata(
+            "id_token_encrypted_response_enc must be a string",
+        )),
+    }
+}
+
 
 
 
