@@ -1477,6 +1477,15 @@ pub async fn mint(
         .map_err(|_| ())?
     };
 
+    // THE SIGN-THEN-ENCRYPT ARM (issue #158): a client registered for the
+    // encrypted ID-token response gets the JWS wrapped in an ECDH-ES JWE to its
+    // registered public key - the code-flow counterpart of the front-channel arm.
+    let id_token = match encrypt_id_token_for_client(state, request.scope, &request.client_id, &id_token).await
+    {
+        Some(encrypted) => encrypted,
+        None => id_token,
+    };
+
     let (access, permission_budget) = mint_access(state, signer, policy, request, target, now).await?;
 
     Ok(IssuedTokens {
