@@ -108,7 +108,7 @@ async fn issue_tokens_with_document(
 #[tokio::test]
 async fn a_client_registered_for_signed_userinfo_receives_a_signed_jwt() {
     let harness = Harness::start().await;
-    let (subject, access, _) = issue_tokens(&harness).await;
+    let (_subject, access, _) = issue_tokens(&harness, "openid profile email", None).await;
     // The default: plain JSON.
     let (status, headers, body) = userinfo(&harness, "GET", Some(&access), None, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -120,6 +120,14 @@ async fn a_client_registered_for_signed_userinfo_receives_a_signed_jwt() {
         "the default UserInfo is plain JSON"
     );
 
+    // This test changes DCR metadata; the ordinary harness client is static.
+    // Seed the appropriate origin in the owned fixture, then exercise the real
+    // app-role updater and its column grants below.
+    sqlx::query("UPDATE clients SET dcr_registered = true WHERE id = $1")
+        .bind(harness.client_id().to_string())
+        .execute(harness.db().owner_pool())
+        .await
+        .expect("DCR fixture origin");
     // A client registered for the signed form.
     let (actor, corr) = harness.seeding_actor();
     harness
@@ -133,7 +141,7 @@ async fn a_client_registered_for_signed_userinfo_receives_a_signed_jwt() {
             ironauth_store::DynamicClientUpdate {
                 display_name: "signed userinfo",
                 auth_method: "none",
-                redirect_uris: &[],
+                redirect_uris: &[REDIRECT_URI.to_owned()],
                 application_type: "web",
                 id_token_signed_response_alg: "EdDSA",
                 userinfo_signed_response_alg: Some("EdDSA"),
@@ -146,7 +154,7 @@ async fn a_client_registered_for_signed_userinfo_receives_a_signed_jwt() {
         .await
         .expect("the metadata updates");
     // Issue a fresh token for the harness client.
-    let (subject2, access2, _) = issue_tokens(&harness).await;
+    let (subject2, access2, _) = issue_tokens(&harness, "openid profile email", None).await;
     let _ = subject2;
     let (status, headers, body) = userinfo(&harness, "GET", Some(&access2), None, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -160,7 +168,7 @@ async fn a_client_registered_for_signed_userinfo_receives_a_signed_jwt() {
     let claims = payload_claims(&body);
     assert_eq!(
         claims["iss"],
-        serde_json::json!("https://issuer.test"),
+        serde_json::json!(harness.issuer()),
         "{claims:?}"
     );
     assert!(

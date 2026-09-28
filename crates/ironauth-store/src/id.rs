@@ -1528,6 +1528,14 @@ impl ScopedKind for EmailOtpCodeKind {
     const PREFIX: &'static str = "eot";
 }
 
+/// Marker for an authenticated recipient email challenge (`rcp_`, issue #1436).
+/// The handle is not a bearer credential; its secret is an independent code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecipientChallengeKind;
+impl ScopedKind for RecipientChallengeKind {
+    const PREFIX: &'static str = "rcp";
+}
+
 /// Marker for a scanner-safe magic-link token (`mlk_`), one row in the per-user
 /// magic-link set (issue #68): the SHA-256 digest of a high-entropy bearer token,
 /// single-active per (subject, purpose), single-use. A tenant-scoped resource: the id
@@ -2306,6 +2314,8 @@ pub type AbuseBanId = ScopedId<AbuseBanKind>;
 /// (issue #68). The value it points at is a one-way Argon2id hash, never a plaintext
 /// code.
 pub type EmailOtpCodeId = ScopedId<EmailOtpCodeKind>;
+/// An authenticated recipient verification challenge (`rcp_`, issue #1436).
+pub type RecipientChallengeId = ScopedId<RecipientChallengeKind>;
 /// A magic-link token identifier (`mlk_...`), one row in the per-user magic-link set
 /// and the scope-declaring routing handle embedded in the `ira_mlk_<id>~<secret>` wire
 /// token (issue #68). Its debug form redacts the payload (it is part of a bearer token).

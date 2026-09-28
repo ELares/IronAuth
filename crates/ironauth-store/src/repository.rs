@@ -80,6 +80,7 @@ use crate::error::StoreError;
 use crate::federation_state::{ConsumedFederationLoginState, NewFederationLoginState};
 use crate::flow::{FlowRecord, NewFlow};
 use crate::flow_version::{FlowVersionRecord, NewFlowVersion};
+use crate::id::RecipientChallengeId;
 use crate::id::{
     AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId,
     AgentPrincipalId, AgentVaultApprovalId, AgentVaultConnectionId, ApiKeyId, AssertionMappingId,
@@ -114,6 +115,10 @@ use crate::message_feedback::SuppressionReason;
 use crate::message_rate::RateBudget;
 use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
+use crate::recipient_verification::{
+    NewRecipientChallenge, RecipientAttempt, RecipientChallenge, VerifiedRecipient,
+    valid_recipient_email,
+};
 use crate::recovery::{
     NewRecoveryFlow, RecoveryCancelReason, RecoveryEntryPoint, RecoveryFlowRecord, RecoveryMethod,
     RecoveryState,
@@ -755,11 +760,16 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
-    /// The read-only flexible-identifier repository for this scope (issue #54):
-    /// identifier-first login resolution (canonicalize a submitted identifier and
-    /// return the applicable authentication methods), a user's identifier list, and
-    /// the mode-change collision validation pass. The mutating add lives on
-    /// [`ActingStore::user_identifiers`].
+    /// Current subject-bound recipient verification, separate from login claims.
+    #[must_use]
+    pub fn recipient_verification(&self) -> RecipientVerificationRepo<'a> {
+        RecipientVerificationRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// Read a user's typed identifiers.
     #[must_use]
     pub fn user_identifiers(&self) -> UserIdentifierRepo<'a> {
         UserIdentifierRepo {
@@ -2176,10 +2186,17 @@ impl<'a> ActingStore<'a> {
         }
     }
 
-    /// The mutating flexible-identifier repository for this scope and actor (issue
-    /// #54): add a typed login identifier to a user (canonicalized once at the seam,
-    /// blind-indexed for uniqueness and lookup, raw sealed for display), and
-    /// recompute the uniqueness discriminators on a mode change, each audited.
+    /// Audited recipient challenge and verification writes for this scope and actor.
+    #[must_use]
+    pub fn recipient_verification(&self) -> ActingRecipientVerificationRepo<'a> {
+        ActingRecipientVerificationRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// Mutate a user's typed identifiers with a same-transaction audit row.
     #[must_use]
     pub fn user_identifiers(&self) -> ActingUserIdentifierRepo<'a> {
         ActingUserIdentifierRepo {
@@ -17432,6 +17449,8 @@ async fn insert_admin_user_row(
     created_at_micros: i64,
     id_collision: StoreError,
 ) -> Result<(), StoreError> {
+    recipient_ownership_lock(tx, scope).await?;
+    let recipient_bidx = primary_recipient_index(master, scope, spec.identifier);
     let identifier_bidx = user_identifier_blind_index(master, scope, spec.identifier);
     let external_id_bidx = spec
         .external_id
@@ -17491,11 +17510,12 @@ async fn insert_admin_user_row(
           password_hash, claims_sealed, pii_dek_version, state, \
           external_id_bidx, external_id_sealed, external_id_dek_version, \
           created_at, updated_at, foreign_password_hash, foreign_password_algo, \
-          traits_sealed, traits_dek_version, traits_schema_version) \
+          traits_sealed, traits_dek_version, traits_schema_version, \
+          recipient_email_bidx, recipient_email_indexed) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
                  TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
                  TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
-                 $14, $15, $16, $17, $18)",
+                 $14, $15, $16, $17, $18, $19, true)",
     )
     .bind(id.to_string())
     .bind(scope.tenant().to_string())
@@ -17515,6 +17535,7 @@ async fn insert_admin_user_row(
     .bind(traits_sealed)
     .bind(traits_dek_version)
     .bind(spec.traits.and_then(|traits| traits.schema_version))
+    .bind(recipient_bidx)
     .execute(&mut **tx)
     .await;
     match result {
@@ -18612,6 +18633,8 @@ impl ActingUserRepo<'_> {
                 target: &id,
             },
             async move |tx| {
+                recipient_ownership_lock(tx, scope).await?;
+                let recipient_bidx = primary_recipient_index(master, scope, identifier);
                 let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
                 let identifier_sealed = dek.seal(
                     env.entropy(),
@@ -18641,8 +18664,9 @@ impl ActingUserRepo<'_> {
                      (id, tenant_id, environment_id, identifier_bidx, identifier_sealed, \
                       password_hash, claims_sealed, pii_dek_version, passwordless, \
                       webauthn_user_handle, state, quarantined, \
-                      traits_sealed, traits_dek_version, traits_schema_version) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                      traits_sealed, traits_dek_version, traits_schema_version, \
+                      recipient_email_bidx, recipient_email_indexed) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -18659,6 +18683,7 @@ impl ActingUserRepo<'_> {
                 .bind(traits_sealed)
                 .bind(traits_dek_version)
                 .bind(traits_schema_version)
+                .bind(recipient_bidx)
                 .execute(&mut **tx)
                 .await;
                 match result {
@@ -20361,6 +20386,453 @@ fn mode_group_key_sql(mode: UniquenessMode) -> Option<&'static str> {
     }
 }
 
+// Subject-bound recipient verification (issue #1436). This purpose has no
+// relationship to login OTP consumption or authentication strength.
+
+fn primary_recipient_index(master: &MasterKey, scope: Scope, raw: &str) -> Option<Vec<u8>> {
+    // Index every nonempty canonical email, even a legacy-shaped handle unsuitable
+    // for delivery. It must still reserve its canonical ownership when another
+    // account asks to verify a deliverable spelling of the same address.
+    let canonical = canonicalize_identifier(IdentifierType::Email, raw);
+    (!canonical.is_empty())
+        .then(|| flexible_identifier_blind_index(master, scope, &canonical).into_bytes())
+}
+
+async fn recipient_ownership_lock(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+) -> Result<(), StoreError> {
+    // The two primary-user insertion seams, typed-identifier add, and this new
+    // ceremony share one lock. Existing uniqueness modes remain unchanged, but a
+    // verification cannot race an insertion that would make ownership ambiguous.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "recipient-ownership:{}:{}",
+            scope.tenant(),
+            scope.environment()
+        ))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+struct RecipientOwner {
+    bidx: Vec<u8>,
+    email: String,
+    identifier: Option<String>,
+}
+
+async fn current_recipient_owner(
+    tx: &mut Transaction<'_, Postgres>,
+    master: &MasterKey,
+    scope: Scope,
+    subject: &UserId,
+) -> Result<RecipientOwner, StoreError> {
+    recipient_ownership_lock(tx, scope).await?;
+    // This row lock also serializes disable/quarantine/delete with verification.
+    let row = sqlx::query(
+        "SELECT recipient_email_bidx, identifier_sealed, pii_dek_version FROM users \
+         WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+         AND state = 'active' AND NOT quarantined AND deleted_at IS NULL \
+         AND recipient_email_indexed FOR UPDATE",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(subject.to_string())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(StoreError::NotFound)?;
+    let bidx: Vec<u8> = row
+        .get::<Option<Vec<u8>>, _>("recipient_email_bidx")
+        .ok_or(StoreError::NotFound)?;
+    let complete: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM users WHERE tenant_id = $1 \
+         AND environment_id = $2 AND NOT recipient_email_indexed) \
+         AND (SELECT count(*) FROM users WHERE tenant_id = $1 \
+         AND environment_id = $2 AND recipient_email_bidx = $3) = 1",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(&bidx)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !complete {
+        return Err(StoreError::NotFound);
+    }
+    let identifiers = sqlx::query(
+        "SELECT id, user_id FROM user_identifiers WHERE tenant_id = $1 \
+         AND environment_id = $2 AND identifier_type = 'email' \
+         AND canonical_bidx = $3 ORDER BY id LIMIT 2 FOR UPDATE",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(&bidx)
+    .fetch_all(&mut **tx)
+    .await?;
+    // Multiple rows are ambiguous even when policy normally permits non-unique
+    // identifiers. This narrow flow must not choose the first owner or row.
+    if identifiers.len() > 1
+        || identifiers
+            .first()
+            .is_some_and(|row| row.get::<String, _>("user_id") != subject.to_string())
+    {
+        return Err(StoreError::NotFound);
+    }
+    let version: i32 = row.get("pii_dek_version");
+    let dek = fetch_dek_by_version(tx, scope, master, version).await?;
+    let raw: Vec<u8> = row.get("identifier_sealed");
+    let email = String::from_utf8(dek.open(
+        &user_pii_seal_aad(scope, USER_IDENTIFIER_PURPOSE, version),
+        &Sealed::from_bytes(raw)?,
+    )?)
+    .map_err(|_| StoreError::Encryption)?;
+    // Delivery always uses the account's stored primary address, never a caller's
+    // alternative spelling, even when both spellings canonicalize identically.
+    if !valid_recipient_email(&email) {
+        return Err(StoreError::NotFound);
+    }
+    Ok(RecipientOwner {
+        bidx,
+        email,
+        identifier: identifiers.first().map(|r| r.get("id")),
+    })
+}
+
+/// Read current subject-bound verification state, never arbitrary stored claims.
+pub struct RecipientVerificationRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl RecipientVerificationRepo<'_> {
+    /// Require an access token issued on a direct interactive authorization-code
+    /// grant and a currently live, non-impersonated session. Exchange and machine
+    /// grants cannot be mistaken for an invited person's own sign-in.
+    ///
+    /// # Errors
+    /// Persistence failures; ineligible tokens return `false`.
+    pub async fn direct_token(
+        &self,
+        id: &IssuedTokenId,
+        subject: &UserId,
+        now_micros: i64,
+    ) -> Result<bool, StoreError> {
+        if id.scope() != self.scope || subject.scope() != self.scope {
+            return Ok(false);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let direct = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM issued_tokens t \
+             JOIN grants g ON g.id = t.grant_id AND g.tenant_id = t.tenant_id \
+             AND g.environment_id = t.environment_id \
+             JOIN sessions s ON s.id = g.session_ref AND s.tenant_id = g.tenant_id \
+             AND s.environment_id = g.environment_id AND s.subject = g.subject \
+             WHERE t.tenant_id = $1 AND t.environment_id = $2 AND t.id = $3 \
+             AND t.token_kind = 'access' AND g.subject = $4 AND g.revoked_at IS NULL \
+             AND s.revoked_at IS NULL AND s.impersonator IS NULL \
+             AND s.expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             AND EXISTS (SELECT 1 FROM authorization_codes c WHERE c.tenant_id = g.tenant_id \
+             AND c.environment_id = g.environment_id AND c.grant_id = g.id \
+             AND c.subject = g.subject AND c.consumed_at IS NOT NULL))",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(subject.to_string())
+        .bind(now_micros)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(direct)
+    }
+
+    /// Resolve a live challenge only for its authenticated subject.
+    ///
+    /// # Errors
+    /// Persistence failures; absent, expired, stale or exhausted challenges return `None`.
+    pub async fn challenge(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        id: &RecipientChallengeId,
+    ) -> Result<Option<RecipientChallenge>, StoreError> {
+        if subject.scope() != self.scope || id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let hash: Option<String> = sqlx::query_scalar(
+            "SELECT code_hash FROM recipient_verification_challenges \
+             WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 AND id = $4 \
+             AND consumed_at IS NULL AND attempt_count < 5 \
+             AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(id.to_string())
+        .bind(epoch_micros(env.clock().now_utc()))
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(hash.map(|code_hash| RecipientChallenge { id: *id, code_hash }))
+    }
+
+    /// Match an expected recipient to CURRENT verified ownership under the exact
+    /// authenticated subject. Identifier removal/replacement, duplicate ownership,
+    /// incomplete legacy indexing and inactive identities fail closed.
+    ///
+    /// # Errors
+    /// Persistence/encryption failures. Unverified or ineligible subjects return `None`.
+    pub async fn current(
+        &self,
+        subject: &UserId,
+        expected_email: &str,
+    ) -> Result<Option<VerifiedRecipient>, StoreError> {
+        if subject.scope() != self.scope || !valid_recipient_email(expected_email) {
+            return Ok(None);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let owner = match current_recipient_owner(&mut tx, master, self.scope, subject).await {
+            Ok(owner) => owner,
+            Err(StoreError::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if primary_recipient_index(master, self.scope, expected_email).as_ref() != Some(&owner.bidx)
+        {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT v.identifier_id, v.revision, \
+             (extract(epoch FROM v.verified_at) * 1000000)::bigint AS verified_us \
+             FROM recipient_email_verifications v JOIN user_identifiers i \
+             ON i.tenant_id = v.tenant_id AND i.environment_id = v.environment_id \
+             AND i.id = v.identifier_id AND i.user_id = v.subject \
+             AND i.identifier_type = 'email' AND i.canonical_bidx = v.recipient_bidx AND i.verified \
+             WHERE v.tenant_id = $1 AND v.environment_id = $2 AND v.subject = $3 \
+             AND v.recipient_bidx = $4 AND v.identifier_id = $5",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(subject.to_string())
+        .bind(&owner.bidx)
+        .bind(owner.identifier)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let result = row
+            .map(|row| -> Result<VerifiedRecipient, StoreError> {
+                Ok(VerifiedRecipient {
+                    identifier_id: UserIdentifierId::parse_in_scope(
+                        &row.get::<String, _>("identifier_id"),
+                        &self.scope,
+                    )?,
+                    revision: RecipientChallengeId::parse_in_scope(
+                        &row.get::<String, _>("revision"),
+                        &self.scope,
+                    )?,
+                    verified_at_unix_micros: row.get("verified_us"),
+                })
+            })
+            .transpose()?;
+        tx.commit().await?;
+        Ok(result)
+    }
+}
+
+/// Audited subject-bound challenge issuance and verification.
+pub struct ActingRecipientVerificationRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingRecipientVerificationRepo<'_> {
+    /// Issue a challenge for this subject's own primary mailbox. Return the stored
+    /// delivery address, not the request spelling. Reissue invalidates the old code.
+    /// A durable one-minute cooldown bounds sends even across provider instances.
+    ///
+    /// # Errors
+    /// Uniform `NotFound` for ineligible ownership, `QuotaExceeded` during cooldown,
+    /// `Invalid` for an invalid hash/expiry, or a persistence/encryption failure.
+    pub async fn start(
+        &self,
+        env: &Env,
+        spec: NewRecipientChallenge<'_>,
+    ) -> Result<String, StoreError> {
+        let scope = self.scope;
+        if spec.subject.scope() != scope
+            || spec.id.scope() != scope
+            || !valid_recipient_email(spec.email)
+        {
+            return Err(StoreError::NotFound);
+        }
+        let now = epoch_micros(env.clock().now_utc());
+        if spec.expires_at_unix_micros <= now
+            || spec.expires_at_unix_micros > now.saturating_add(600_000_000)
+            || !spec.code_hash.starts_with("$argon2id$")
+            || spec.code_hash.len() > 512
+        {
+            return Err(StoreError::Invalid);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        write_audited(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env,
+                action: Action::RecipientVerificationStart, target: spec.id },
+            async move |tx| {
+                let owner = current_recipient_owner(tx, master, scope, spec.subject).await?;
+                if primary_recipient_index(master, scope, spec.email).as_ref() != Some(&owner.bidx) {
+                    return Err(StoreError::NotFound);
+                }
+                let recent: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM recipient_verification_challenges \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+                     AND created_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
+                )
+                .bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+                .bind(spec.subject.to_string()).bind(now.saturating_sub(60_000_000))
+                .fetch_one(&mut **tx).await?;
+                if recent { return Err(StoreError::QuotaExceeded); }
+                // Keep at most one row per subject. Verification retains its separate
+                // revision so replacing a challenge never erases a verified epoch.
+                sqlx::query("DELETE FROM recipient_verification_challenges WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3")
+                    .bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+                    .bind(spec.subject.to_string()).execute(&mut **tx).await?;
+                sqlx::query(
+                    "INSERT INTO recipient_verification_challenges \
+                     (id, tenant_id, environment_id, subject, recipient_bidx, expected_identifier_id, \
+                      code_hash, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                      TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                      TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval)",
+                )
+                .bind(spec.id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+                .bind(spec.subject.to_string()).bind(owner.bidx).bind(owner.identifier)
+                .bind(spec.code_hash).bind(spec.expires_at_unix_micros).bind(now)
+                .execute(&mut **tx).await?;
+                Ok(owner.email)
+            }, false,
+        ).await
+    }
+
+    /// Commit one attempt after the caller checked the resolved Argon2 hash through
+    /// its bounded hashing pool. The exact challenge/hash, subject, current ownership,
+    /// expiry and attempt limit are rechecked under locks. No session changes.
+    ///
+    /// # Errors
+    /// Uniform `NotFound` for stale/ineligible attempts, or persistence failure.
+    pub async fn attempt(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        challenge: &RecipientChallenge,
+        matched: bool,
+    ) -> Result<RecipientAttempt, StoreError> {
+        self.attempt_inner(env, subject, challenge, matched, false)
+            .await
+    }
+
+    /// Test-only proof that challenge consumption, ownership and audit roll back together.
+    ///
+    /// # Errors
+    /// Always fails after staging the write and audit, if the attempt was eligible.
+    #[cfg(feature = "testing")]
+    pub async fn attempt_poisoned_for_test(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        challenge: &RecipientChallenge,
+    ) -> Result<RecipientAttempt, StoreError> {
+        self.attempt_inner(env, subject, challenge, true, true)
+            .await
+    }
+
+    async fn attempt_inner(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        challenge: &RecipientChallenge,
+        matched: bool,
+        poison: bool,
+    ) -> Result<RecipientAttempt, StoreError> {
+        let scope = self.scope;
+        if subject.scope() != scope || challenge.id.scope() != scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let now = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env,
+                action: if matched { Action::RecipientVerificationVerified } else { Action::RecipientVerificationAttempt }, target: &challenge.id },
+            async move |tx| {
+                let owner = current_recipient_owner(tx, master, scope, subject).await?;
+                let consumed = sqlx::query(
+                    "UPDATE recipient_verification_challenges SET attempt_count = attempt_count + 1, \
+                     consumed_at = CASE WHEN $8 OR attempt_count = 4 THEN \
+                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval ELSE NULL END \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 AND id = $4 \
+                     AND code_hash = $5 AND recipient_bidx = $6 AND consumed_at IS NULL \
+                     AND attempt_count < 5 AND expires_at > \
+                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval \
+                     AND expected_identifier_id IS NOT DISTINCT FROM $9",
+                )
+                .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(subject.to_string())
+                .bind(challenge.id.to_string()).bind(&challenge.code_hash).bind(&owner.bidx)
+                .bind(now).bind(matched).bind(&owner.identifier).execute(&mut **tx).await?;
+                if consumed.rows_affected() != 1 { return Err(StoreError::NotFound); }
+                if !matched { return Ok(RecipientAttempt::Refused); }
+                verify_recipient_owner(tx, master, scope, env, subject, owner, &challenge.id).await?;
+                Ok(RecipientAttempt::Verified)
+            }, poison,
+        ).await
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // One transaction and the exact verified ownership inputs.
+async fn verify_recipient_owner(
+    tx: &mut Transaction<'_, Postgres>,
+    master: &MasterKey,
+    scope: Scope,
+    env: &Env,
+    subject: &UserId,
+    owner: RecipientOwner,
+    revision: &RecipientChallengeId,
+) -> Result<(), StoreError> {
+    let identifier = if let Some(id) = owner.identifier {
+        sqlx::query("UPDATE user_identifiers SET verified = true WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 AND user_id = $4")
+            .bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+            .bind(&id).bind(subject.to_string()).execute(&mut **tx).await?;
+        id
+    } else {
+        let id = UserIdentifierId::generate(env, &scope).to_string();
+        let (version, dek) = fetch_active_dek(tx, scope, master).await?;
+        let sealed = dek.seal(
+            env.entropy(),
+            &flexible_identifier_seal_aad(scope, version),
+            owner.email.as_bytes(),
+        );
+        sqlx::query(
+            "INSERT INTO user_identifiers (id, tenant_id, environment_id, user_id, identifier_type, \
+             canonical_bidx, raw_sealed, pii_dek_version, verified, uniqueness_key) \
+             VALUES ($1, $2, $3, $4, 'email', $5, $6, $7, true, 'env')",
+        )
+        .bind(&id).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+        .bind(subject.to_string()).bind(&owner.bidx).bind(sealed.into_bytes()).bind(version)
+        .execute(&mut **tx).await?;
+        id
+    };
+    sqlx::query(
+        "INSERT INTO recipient_email_verifications \
+         (tenant_id, environment_id, subject, recipient_bidx, identifier_id, revision, verified_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+         ON CONFLICT (tenant_id, environment_id, subject) DO UPDATE SET \
+         recipient_bidx = EXCLUDED.recipient_bidx, identifier_id = EXCLUDED.identifier_id, \
+         revision = EXCLUDED.revision, verified_at = EXCLUDED.verified_at",
+    )
+    .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(subject.to_string())
+    .bind(owner.bidx).bind(identifier).bind(revision.to_string()).bind(epoch_micros(env.clock().now_utc()))
+    .execute(&mut **tx).await?;
+    Ok(())
+}
+
 /// The read-only flexible-identifier repository (issue #54).
 pub struct UserIdentifierRepo<'a> {
     store: &'a Store,
@@ -20651,6 +21123,7 @@ impl ActingUserIdentifierRepo<'_> {
                 target: id,
             },
             async move |tx| {
+                recipient_ownership_lock(tx, scope).await?;
                 // BIND the org-scoped discriminator to real membership (issue #249). Under
                 // `OrgScoped` the uniqueness key is `org:<id>`, and without this the id is
                 // whatever the caller passed: a caller who could influence it could pick a

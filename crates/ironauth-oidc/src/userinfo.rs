@@ -199,6 +199,53 @@ async fn resolve(
         return resolve_opaque(state, &presented, method).await;
     }
 
+    let (resolution, verified, scope) = resolve_jwt(
+        state,
+        &presented,
+        method,
+        &crate::dpop::normalized_htu_for_userinfo(state),
+    )
+    .await?;
+
+    // The granted scope drives which claim sets are released (Core 5.4). UserInfo
+    // requires the openid scope (Core 5.3.1); its absence is insufficient_scope.
+    let granted = parse_scope_set(verified.claims().get("scope").and_then(Value::as_str));
+    if !granted.contains(REQUIRED_SCOPE) {
+        return Err(UserInfoError::InsufficientScope);
+    }
+
+    // The claims request parameter's userinfo member (frozen onto the grant at
+    // authorization). A stored value is already canonical; tolerate any anomaly by
+    // treating it as no request rather than failing the response.
+    let claims_request = resolution
+        .claims_request
+        .as_deref()
+        .and_then(|raw| ClaimsRequest::parse(raw).ok())
+        .unwrap_or_default();
+
+    // The user's stored standard-claim document (empty when the user has none, or
+    // is absent). Released selectively by scope and the claims request.
+    let bag = user_claim_bag(state, &scope, &resolution.subject).await?;
+    let mut released = assemble_claims(&bag, &granted, claims_request.userinfo());
+
+    // sub is ALWAYS present and derived through the ONE shared subject function,
+    // exactly as the ID token derived it, so the two are byte-identical (including
+    // pairwise, once it lands). It can never be shadowed by stored claim data.
+    let sub = state.resolve_public_subject(&resolution.subject);
+    released.insert("sub".to_owned(), Value::String(sub));
+
+    Ok((released, resolution.client_id, scope))
+}
+
+/// The JWT validation shared by `UserInfo` and the purpose-specific recipient door.
+/// No stored standard claims are involved in authentication.
+async fn resolve_jwt(
+    state: &OidcState,
+    presented: &Presented,
+    method: &str,
+    htu: &str,
+) -> Result<(AccessTokenResolution, ironauth_jose::VerifiedToken, Scope), UserInfoError> {
+    let token = presented.token.as_str();
     // 1. Read the jti (an opaque handle) and recover its embedded scope. A token
     //    whose payload is unreadable, or whose jti is not a scoped token id, is a
     //    uniform invalid_token.
@@ -238,45 +285,69 @@ async fn resolve(
     let cnf =
         Confirmation::from_claims(verified.claims()).map_err(|_| UserInfoError::InvalidToken)?;
     let expected_jkt = confirmation_jkt(cnf.as_ref())?;
-    enforce_dpop(
-        state,
-        &scope,
-        expected_jkt,
-        &presented,
-        method,
-        &crate::dpop::normalized_htu_for_userinfo(state),
-        token,
-    )
-    .await?;
+    enforce_dpop(state, &scope, expected_jkt, presented, method, htu, token).await?;
 
-    // The granted scope drives which claim sets are released (Core 5.4). UserInfo
-    // requires the openid scope (Core 5.3.1); its absence is insufficient_scope.
-    let granted = parse_scope_set(verified.claims().get("scope").and_then(Value::as_str));
-    if !granted.contains(REQUIRED_SCOPE) {
+    Ok((resolution, verified, scope))
+}
+
+pub(crate) struct RecipientPrincipal {
+    pub scope: Scope,
+    pub subject: ironauth_store::UserId,
+    pub client_id: String,
+    pub expires_at_unix_micros: i64,
+}
+
+/// Authenticate an exact direct-user JWT without treating `UserInfo` email claims as proof.
+/// Opaque credentials have no actor provenance in their current resolved record;
+/// they are deliberately outside this gated core's supported credential profile.
+pub(crate) async fn recipient_principal(
+    state: &OidcState,
+    headers: &HeaderMap,
+    scope: Scope,
+    htu: &str,
+) -> Result<RecipientPrincipal, UserInfoError> {
+    let presented = presented_credential(headers)?;
+    if presented.token.starts_with(OPAQUE_ACCESS_TOKEN_PREFIX) {
+        return Err(UserInfoError::InvalidToken);
+    }
+    let (resolution, verified, actual_scope) = resolve_jwt(state, &presented, "POST", htu).await?;
+    if actual_scope != scope || verified.claims().get("act").is_some() {
+        return Err(UserInfoError::InvalidToken);
+    }
+    if !parse_scope_set(verified.claims().get("scope").and_then(Value::as_str))
+        .contains(REQUIRED_SCOPE)
+    {
         return Err(UserInfoError::InsufficientScope);
     }
-
-    // The claims request parameter's userinfo member (frozen onto the grant at
-    // authorization). A stored value is already canonical; tolerate any anomaly by
-    // treating it as no request rather than failing the response.
-    let claims_request = resolution
-        .claims_request
-        .as_deref()
-        .and_then(|raw| ClaimsRequest::parse(raw).ok())
-        .unwrap_or_default();
-
-    // The user's stored standard-claim document (empty when the user has none, or
-    // is absent). Released selectively by scope and the claims request.
-    let bag = user_claim_bag(state, &scope, &resolution.subject).await?;
-    let mut released = assemble_claims(&bag, &granted, claims_request.userinfo());
-
-    // sub is ALWAYS present and derived through the ONE shared subject function,
-    // exactly as the ID token derived it, so the two are byte-identical (including
-    // pairwise, once it lands). It can never be shadowed by stored claim data.
-    let sub = state.resolve_public_subject(&resolution.subject);
-    released.insert("sub".to_owned(), Value::String(sub));
-
-    Ok((released, resolution.client_id, scope))
+    let subject = ironauth_store::UserId::parse_in_scope(&resolution.subject, &scope)
+        .map_err(|_| UserInfoError::InvalidToken)?;
+    let jti = peek_jti(&presented.token)
+        .and_then(|id| IssuedTokenId::parse_in_scope(&id, &scope).ok())
+        .ok_or(UserInfoError::InvalidToken)?;
+    // Token-exchange impersonation can intentionally omit `act`. Demand a live,
+    // non-impersonated interactive session on an authorization-code grant as well.
+    if !state
+        .store()
+        .scoped(scope)
+        .recipient_verification()
+        .direct_token(&jti, &subject, epoch_micros(state))
+        .await
+        .map_err(|_| UserInfoError::ServerError)?
+    {
+        return Err(UserInfoError::InvalidToken);
+    }
+    let expires = verified
+        .claims()
+        .get("exp")
+        .and_then(Value::as_i64)
+        .and_then(|value| value.checked_mul(1_000_000))
+        .ok_or(UserInfoError::InvalidToken)?;
+    Ok(RecipientPrincipal {
+        scope,
+        subject,
+        client_id: resolution.client_id,
+        expires_at_unix_micros: expires,
+    })
 }
 
 /// Resolve a presented OPAQUE access token (issue #29) and build the released claim
@@ -371,8 +442,7 @@ fn opaque_token_scope(token: &str) -> Option<Scope> {
 /// the raw system clock), for the opaque resolve's expiry comparison.
 fn epoch_secs(at: std::time::SystemTime) -> i64 {
     at.duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(0))
-        .unwrap_or(0)
+        .map_or(0, |duration| i64::try_from(duration.as_secs()).unwrap_or(0))
 }
 
 fn epoch_micros(state: &OidcState) -> i64 {
@@ -666,7 +736,10 @@ async fn success(
     scope: Scope,
 ) -> Response {
     let (content_type, body) = match userinfo_signing_alg(state, client_id, scope).await {
-        Some(_alg) => ("application/jwt", sign_userinfo(state, claims, client_id, scope).await),
+        Some(_alg) => (
+            "application/jwt",
+            sign_userinfo(state, claims, client_id, scope).await,
+        ),
         None => (
             "application/json",
             Value::Object(claims.clone()).to_string(),
@@ -687,11 +760,7 @@ async fn success(
 /// The client's registered UserInfo signing algorithm (issue #158): the scoped
 /// record's `userinfo_signed_response_alg`; `None` (the default) keeps the plain
 /// JSON form.
-async fn userinfo_signing_alg(
-    state: &OidcState,
-    client_id: &str,
-    scope: Scope,
-) -> Option<String> {
+async fn userinfo_signing_alg(state: &OidcState, client_id: &str, scope: Scope) -> Option<String> {
     let id = ClientId::parse_in_scope(client_id, &scope).ok()?;
     state
         .store()

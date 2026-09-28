@@ -6,6 +6,15 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add a disabled recipient-verification/proof core (issue #1436). The cookie
+  ceremony requires the current subject, same origin and fresh authentication;
+  verification never creates or upgrades a session. The online proof binds the
+  current verified recipient to issuer, OAuth client, public subject and nonce.
+  Only direct interactive JWT credentials are accepted in this first cut.
+  Production routes return 503: real secret-safe delivery, hosted recovery UI
+  and controlled legacy indexing remain required before enablement. Existing
+  OTP, UserInfo and token-policy behavior is preserved.
+
 - Upgrade Argon2 to 0.6 with explicit raw salts from the environment entropy
   seam. Stored Argon2 PHC hashes, configured costs, salt length, and the absent-user
   verification work remain compatible; the hasher's automatic RNG is disabled.

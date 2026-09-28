@@ -467,3 +467,27 @@ parser over untrusted input, or a new privileged plane) must extend this
 document in the same PR. Reviewers block merges that add a surface without
 its STRIDE section. This rule is stated in CONTRIBUTING.md and enforced by
 the PR template checklist.
+
+## Surface: gated subject-bound recipient verification (issue #1436)
+
+Three bounded JSON POSTs live under the scoped account path: challenge start,
+challenge verify and online relying-party recipient proof. Production has no
+installer or enable flag; it returns 503 until delivery, hosted recovery and
+legacy-index readiness are qualified. The only installer is testing-only.
+See [the contract and remaining acceptance](design/RECIPIENT-VERIFICATION.md).
+
+| STRIDE | Threat | Control / residual |
+| --- | --- | --- |
+| Spoofing | An arbitrary email claim or another subject's code grants an invitation | Current exact authenticated subject; same-origin fresh direct session for ceremony; same canonicalizer and unambiguous primary/typed ownership; fresh proof reads current identifier and ceremony revision, never stored OIDC claims |
+| Tampering | Reissue, account disable, identifier replacement or competing owners race verification | Scope-bound IDs/RLS, shared ownership transaction lock, current user/identifier locks, exact challenge/hash/identifier comparison, and atomic consume plus verified ownership plus audit |
+| Repudiation | A verification changes ownership without a matching audit event | Challenge and attempt writes share the store's audited transaction; an injected post-audit failure rolls back consumption, identifier and proof epoch together |
+| Information disclosure | Codes/addresses leak through URLs, logs, ordinary outbox or response caches | Strict 2048-byte JSON, no query parameters, Argon2id at rest, sealed existing mailbox, no secret-bearing Debug/wire serialization, purpose-specific transient transport and no-store responses |
+| Denial of service | Flooded sends, concurrent guesses, unbounded slow transport or expensive hashing | Existing regulation/quota and bounded hash pool; durable one-minute send cooldown and five-attempt ceiling; one current challenge per subject; five-minute expiry and five-second transport deadline |
+| Elevation | Possession creates a stronger session, a token exchange hides impersonation, or a stale proof is reused | No session/token mint or strength change; direct live non-impersonated authorization-code provenance in addition to signed JWT/DPoP checks; issuer/client/public-subject/nonce/expected-recipient binding and at most 30-second online proof lifetime |
+
+Residuals are explicit: this core has no real delivery/hosted UI/legacy index
+backfill and must stay unavailable until those are qualified. Additional mailbox
+enrollment and opaque-token direct-actor provenance are not supported. A proof
+reports current provider-recorded ownership, not a new inbox-possession ceremony
+on every read. Relying-party acceptance must recheck its own current authority
+transactionally and bind the fresh response, as specified in the contract.

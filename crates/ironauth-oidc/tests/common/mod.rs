@@ -3693,9 +3693,10 @@ impl Harness {
     pub async fn harden_environment(&mut self, signed_introspection_ttl: Option<i64>) {
         let (actor, corr) = self.seeding_actor();
         let environment_id = self.scope.environment();
-        let operator = ironauth_store::OperatorId::generate(self.env());
-        self.store()
-            .scoped(self.scope)
+        let operator = self.db.owning_operator(&self.scope.tenant()).await;
+        self.db
+            .control_store()
+            .management()
             .acting(actor, corr)
             .environments(operator, self.scope.tenant())
             .set_fapi_hardened(self.env(), &environment_id, true)
