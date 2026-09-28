@@ -25,19 +25,17 @@
 //! The JWE Concat KDF (NIST SP 800-56A) derives the content key from the agreed
 //! key `Z`: SHA-256 over `Z || round(4 bytes) || Z-length(4 bytes) || Z ||
 //! AlgorithmID || PartyUInfo || PartyVInfo || SuppPubInfo || SuppPrivInfo`. For
-//! `ECDH-ES` the derived key IS the CEK; the `alg` in the AlgorithmID is the
+//! `ECDH-ES` the derived key IS the CEK; the `alg` in the `AlgorithmID` is the
 //! content-encryption algorithm (`A256GCM`), per RFC 7518 section 4.6.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use p256::ecdh::{EphemeralSecret, SharedSecret};
-use p256::EncodedPoint;
+use p256::ecdh::EphemeralSecret;
 use ring::aead::{AES_256_GCM, Aad as RingAad, LessSafeKey, Nonce, UnboundKey};
-use ring::rand::SystemRandom;
 
 use crate::crypto::sha256;
 
-/// The refused JWE algorithm families: RSA1_5 (Bleichenbacher class) and the
+/// The refused JWE algorithm families: `RSA1_5` (Bleichenbacher class) and the
 /// PBKDF2-based algorithms. Refused at the PARSE, never implemented.
 pub const REFUSED_JWE_ALGORITHMS: &[&str] = &[
     "RSA1_5",
@@ -58,7 +56,7 @@ const CONTENT_ENC: &str = "A256GCM";
 /// A JWE processing failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JweError {
-    /// The algorithm is refused or unsupported (RSA1_5, the PBKDF2 family, or
+    /// The algorithm is refused or unsupported (`RSA1_5`, the PBKDF2 family, or
     /// anything outside the curated suite).
     UnsupportedAlgorithm,
     /// The ciphertext does not decrypt (a wrong key, a tampered compact form, or
@@ -87,8 +85,8 @@ pub fn encrypt_ecdh_es(
     if alg != "ECDH-ES" {
         return Err(JweError::UnsupportedAlgorithm);
     }
-    let public = p256::PublicKey::from_sec1_bytes(recipient_public_key)
-        .map_err(|_| JweError::InvalidKey)?;
+    let public =
+        p256::PublicKey::from_sec1_bytes(recipient_public_key).map_err(|_| JweError::InvalidKey)?;
     let mut rng = ironauth_env::keygen_rng(entropy);
     let ephemeral = EphemeralSecret::random(&mut rng);
     let shared = ephemeral.diffie_hellman(&public);
@@ -104,7 +102,7 @@ pub fn encrypt_ecdh_es(
             "y": URL_SAFE_NO_PAD.encode(epk.y().ok_or(JweError::InvalidKey)?.as_slice()),
         },
     });
-    encrypt_with_cek(&header, &cek, &[], plaintext)
+    encrypt_with_cek(&header, &cek, &[], plaintext, entropy)
 }
 
 /// Decrypt a compact ECDH-ES JWE with the recipient's STATIC P-256 private key
@@ -130,16 +128,26 @@ pub fn decrypt_ecdh_es(
     )
     .map_err(|_| JweError::Decryption)?;
     let epk = header.get("epk").ok_or(JweError::Decryption)?;
-    let x = epk.get("x").and_then(|v| v.as_str()).ok_or(JweError::Decryption)?;
-    let y = epk.get("y").and_then(|v| v.as_str()).ok_or(JweError::Decryption)?;
-    let x_bytes = URL_SAFE_NO_PAD.decode(x).map_err(|_| JweError::Decryption)?;
-    let y_bytes = URL_SAFE_NO_PAD.decode(y).map_err(|_| JweError::Decryption)?;
+    let x = epk
+        .get("x")
+        .and_then(|v| v.as_str())
+        .ok_or(JweError::Decryption)?;
+    let y = epk
+        .get("y")
+        .and_then(|v| v.as_str())
+        .ok_or(JweError::Decryption)?;
+    let x_bytes = URL_SAFE_NO_PAD
+        .decode(x)
+        .map_err(|_| JweError::Decryption)?;
+    let y_bytes = URL_SAFE_NO_PAD
+        .decode(y)
+        .map_err(|_| JweError::Decryption)?;
     let mut encoded = vec![0x04];
     encoded.extend_from_slice(&x_bytes);
     encoded.extend_from_slice(&y_bytes);
     let peer = p256::PublicKey::from_sec1_bytes(&encoded).map_err(|_| JweError::Decryption)?;
-    let secret = p256::SecretKey::from_slice(recipient_private_key)
-        .map_err(|_| JweError::InvalidKey)?;
+    let secret =
+        p256::SecretKey::from_slice(recipient_private_key).map_err(|_| JweError::InvalidKey)?;
     let scalar = secret.to_nonzero_scalar();
     let shared = p256::ecdh::diffie_hellman(&scalar, peer.as_ref());
     let cek = concat_kdf(shared.raw_secret_bytes(), CONTENT_ENC, 32);
@@ -163,16 +171,20 @@ fn split_compact(compact: &str) -> Option<(&str, &str, &str, &str, &str)> {
 /// The JWE Concat KDF (NIST SP 800-56A, RFC 7518 section 4.6): derive `key_len`
 /// bytes from the agreed key `z` for the content-encryption `alg`.
 fn concat_kdf(z: &[u8], alg: &str, key_len: usize) -> Vec<u8> {
+    // Both callers use a 32-byte P-256 secret, A256GCM and a 32-byte key.
+    let secret_len = u32::try_from(z.len()).expect("the fixed P-256 secret length fits u32");
+    let algorithm_len = u32::try_from(alg.len()).expect("the fixed algorithm length fits u32");
+    let key_bits = u32::try_from(key_len * 8).expect("the fixed content key bit length fits u32");
     let mut hash_input = Vec::new();
     hash_input.extend_from_slice(&1_u32.to_be_bytes());
-    hash_input.extend_from_slice(&(z.len() as u32).to_be_bytes());
+    hash_input.extend_from_slice(&secret_len.to_be_bytes());
     hash_input.extend_from_slice(z);
-    hash_input.extend_from_slice(&(alg.len() as u32).to_be_bytes());
+    hash_input.extend_from_slice(&algorithm_len.to_be_bytes());
     hash_input.extend_from_slice(alg.as_bytes());
     // The empty PartyUInfo/PartyVInfo and the empty SuppPrivInfo are the default
     // (no apu/apv supplied); SuppPubInfo is the key-length bits.
     hash_input.extend_from_slice(&[0, 0, 0, 0]);
-    hash_input.extend_from_slice(&((key_len * 8) as u32).to_be_bytes());
+    hash_input.extend_from_slice(&key_bits.to_be_bytes());
     hash_input.extend_from_slice(&[0, 0, 0, 0]);
     sha256(&hash_input)[..key_len].to_vec()
 }
@@ -183,12 +195,12 @@ fn encrypt_with_cek(
     cek: &[u8],
     encrypted_key: &[u8],
     plaintext: &[u8],
+    entropy: &dyn ironauth_env::Entropy,
 ) -> Result<String, JweError> {
     let unbound = UnboundKey::new(&AES_256_GCM, cek).map_err(|_| JweError::InvalidKey)?;
     let key = LessSafeKey::new(unbound);
     let mut iv = [0_u8; 12];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut iv)
-        .map_err(|_| JweError::InvalidKey)?;
+    entropy.fill_bytes(&mut iv);
     let mut in_out = plaintext.to_vec();
     let tag = key
         .seal_in_place_separate_tag(
@@ -197,8 +209,8 @@ fn encrypt_with_cek(
             &mut in_out,
         )
         .map_err(|_| JweError::InvalidKey)?;
-    let header_b64 = URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(header).map_err(|_| JweError::InvalidKey)?);
+    let header_b64 =
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(header).map_err(|_| JweError::InvalidKey)?);
     Ok(format!(
         "{header_b64}.{}.{}.{}.{}",
         URL_SAFE_NO_PAD.encode(encrypted_key),
@@ -228,17 +240,22 @@ fn decrypt_with_cek(
     let key = LessSafeKey::new(unbound);
     let mut in_out = ciphertext;
     in_out.extend_from_slice(&tag);
-    key.open_in_place(
-        Nonce::try_assume_unique_for_key(&iv).map_err(|_| JweError::Decryption)?,
-        RingAad::empty(),
-        &mut in_out,
-    )
-    .map_err(|_| JweError::Decryption)?;
+    let plaintext_len = key
+        .open_in_place(
+            Nonce::try_assume_unique_for_key(&iv).map_err(|_| JweError::Decryption)?,
+            RingAad::empty(),
+            &mut in_out,
+        )
+        .map_err(|_| JweError::Decryption)?
+        .len();
+    in_out.truncate(plaintext_len);
     Ok(in_out)
 }
 
 #[cfg(test)]
 mod tests {
+    use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+
     use super::*;
 
     /// A fresh P-256 keypair: the static private scalar + the uncompressed public
@@ -266,35 +283,73 @@ mod tests {
     #[test]
     fn ecdh_es_p256_round_trips() {
         let env = fixed_entropy();
-        let (private, public) = p256_keypair(&env);
-        let compact = encrypt_ecdh_es("ECDH-ES", &public, b"the id token", &env).expect("encrypt");
+        let (private, public) = p256_keypair(env.entropy());
+        let compact =
+            encrypt_ecdh_es("ECDH-ES", &public, b"the id token", env.entropy()).expect("encrypt");
         let plain = decrypt_ecdh_es("ECDH-ES", &compact, &private).expect("decrypt");
         assert_eq!(plain, b"the id token");
     }
 
     #[test]
+    fn decryption_returns_exact_plaintext_without_the_authentication_tag() {
+        let env = fixed_entropy();
+        let (private, public) = p256_keypair(env.entropy());
+        for payload in [b"".as_slice(), &[0, 255, 128, 0, 1, 2, 3][..]] {
+            let compact =
+                encrypt_ecdh_es("ECDH-ES", &public, payload, env.entropy()).expect("encrypt");
+            let plaintext = decrypt_ecdh_es("ECDH-ES", &compact, &private).expect("decrypt");
+            assert_eq!(plaintext, payload);
+            assert_eq!(plaintext.len(), payload.len());
+        }
+    }
+
+    #[test]
+    fn encryption_iv_uses_the_callers_entropy_seam() {
+        let key_env = fixed_entropy();
+        let (_, public) = p256_keypair(key_env.entropy());
+        let first_env = fixed_entropy();
+        let replay_env = fixed_entropy();
+        let first = encrypt_ecdh_es("ECDH-ES", &public, b"owned fixture", first_env.entropy())
+            .expect("encrypt");
+        let replay = encrypt_ecdh_es("ECDH-ES", &public, b"owned fixture", replay_env.entropy())
+            .expect("replay");
+        assert_eq!(
+            first, replay,
+            "every random input comes from the supplied seam"
+        );
+        let second = encrypt_ecdh_es("ECDH-ES", &public, b"owned fixture", first_env.entropy())
+            .expect("next encrypt");
+        let (_, _, first_iv, _, _) = split_compact(&first).expect("first compact");
+        let (_, _, second_iv, _, _) = split_compact(&second).expect("next compact");
+        assert_ne!(first_iv, second_iv, "each encryption consumes a fresh IV");
+        assert_eq!(URL_SAFE_NO_PAD.decode(first_iv).expect("IV").len(), 12);
+    }
+
+    #[test]
     fn a_wrong_key_does_not_decrypt() {
         let env = fixed_entropy();
-        let (public, _) = p256_keypair(&env);
-        let (other_private, _) = p256_keypair(&env);
-        let compact = encrypt_ecdh_es("ECDH-ES", &public, b"secret", &env).expect("encrypt");
+        let (_, public) = p256_keypair(env.entropy());
+        let (other_private, _) = p256_keypair(env.entropy());
+        let compact =
+            encrypt_ecdh_es("ECDH-ES", &public, b"secret", env.entropy()).expect("encrypt");
         assert!(decrypt_ecdh_es("ECDH-ES", &compact, &other_private).is_err());
     }
 
     #[test]
     fn tampering_fails_the_tag() {
         let env = fixed_entropy();
-        let (private, public) = p256_keypair(&env);
-        let compact = encrypt_ecdh_es("ECDH-ES", &public, b"secret", &env).expect("encrypt");
-        let tampered = format!("{}x", compact);
+        let (private, public) = p256_keypair(env.entropy());
+        let compact =
+            encrypt_ecdh_es("ECDH-ES", &public, b"secret", env.entropy()).expect("encrypt");
+        let tampered = format!("{compact}x");
         assert!(decrypt_ecdh_es("ECDH-ES", &tampered, &private).is_err());
     }
 
     #[test]
     fn a_refused_algorithm_is_never_accepted() {
         let env = fixed_entropy();
-        let (_, public) = p256_keypair(&env);
-        assert!(encrypt_ecdh_es("RSA1_5", &public, b"x", &env).is_err());
-        assert!(encrypt_ecdh_es("PBES2-HS256+A128KW", &public, b"x", &env).is_err());
+        let (_, public) = p256_keypair(env.entropy());
+        assert!(encrypt_ecdh_es("RSA1_5", &public, b"x", env.entropy()).is_err());
+        assert!(encrypt_ecdh_es("PBES2-HS256+A128KW", &public, b"x", env.entropy()).is_err());
     }
 }

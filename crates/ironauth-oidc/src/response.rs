@@ -116,7 +116,12 @@ pub(crate) fn render(
     mode: ResponseMode,
     redirect_uri: &str,
     params: &[(&str, Option<&str>)],
-    jarm: Option<(&ironauth_jose::SigningKey, &str, &str)>,
+    jarm: Option<(
+        &ironauth_jose::SigningKey,
+        &str,
+        &str,
+        std::time::SystemTime,
+    )>,
 ) -> Response {
     // THE JARM ARM (issue #158): the response parameters become the `response`
     // claim of a signed JWT (plus `iss`, the JARM envelope), and the JWT rides
@@ -127,7 +132,7 @@ pub(crate) fn render(
         ResponseMode::Fragment => redirect_response(&append_fragment(redirect_uri, params)),
         ResponseMode::FormPost => pages::form_post_response(redirect_uri, params),
         ResponseMode::Jwt | ResponseMode::FragmentJwt | ResponseMode::FormPostJwt => {
-            let Some((signer, _alg, issuer)) = jarm else {
+            let Some((signer, _alg, issuer, at)) = jarm else {
                 // A JARM mode without a signer is a server-side misconfiguration,
                 // not a silent downgrade to the plain mode.
                 return redirect_response(&append_query(redirect_uri, params));
@@ -141,10 +146,13 @@ pub(crate) fn render(
                     );
                 }
             }
-            let now = std::time::SystemTime::now()
+            let now = at
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| serde_json::Value::Number((d.as_secs() as i64).into()))
-                .unwrap_or(serde_json::Value::Null);
+                .ok()
+                .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+                .map_or(serde_json::Value::Null, |seconds| {
+                    serde_json::Value::Number(seconds.into())
+                });
             let payload = serde_json::json!({
                 "response": serde_json::Value::Object(response_object),
                 "iss": issuer,
@@ -153,9 +161,7 @@ pub(crate) fn render(
             let jwt = ironauth_jose::sign_jws(
                 signer,
                 &serde_json::to_vec(&payload).unwrap_or_default(),
-                &ironauth_jose::EmissionOptions::new().with_typ(
-                    "JWT", // invariant-allow: typ-via-declaration -- JARM dictates the response JWT media type
-                ),
+                &ironauth_jose::EmissionOptions::new().with_typ("JWT"), // invariant-allow: typ-via-declaration -- JARM uses the standard generic JWT type; it cannot declare a unique profile distinct from ID-token JWT
             )
             .unwrap_or_default();
             if jwt.is_empty() {
@@ -184,6 +190,45 @@ mod tests {
         params
             .iter()
             .any(|(name, value)| *name == "iss" && value.is_some_and(|v| !v.is_empty()))
+    }
+
+    #[test]
+    fn jarm_issuance_time_comes_from_the_supplied_environment_clock() {
+        use base64::Engine as _;
+        use std::time::{Duration, SystemTime};
+
+        let (env, clock) =
+            ironauth_env::Env::deterministic(SystemTime::UNIX_EPOCH + Duration::from_secs(1200), 7);
+        let key =
+            ironauth_jose::SigningKey::ed25519_from_seed(Some("test-key".to_owned()), &[7; 32])
+                .expect("key");
+        for expected in [1200, 1205] {
+            let response = render(
+                ResponseMode::Jwt,
+                "https://client.test/cb",
+                &[("code", Some("test-code"))],
+                Some((&key, "EdDSA", "https://issuer.test", env.clock().now_utc())),
+            );
+            let location = response.headers()[header::LOCATION]
+                .to_str()
+                .expect("location");
+            let query = location.split_once('?').expect("redirect query").1;
+            let values: Vec<(String, String)> =
+                serde_urlencoded::from_str(query).expect("query fields");
+            let jwt = values
+                .into_iter()
+                .find(|(name, _)| name == "response")
+                .expect("signed response")
+                .1;
+            let claims: serde_json::Value = serde_json::from_slice(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(jwt.split('.').nth(1).expect("payload"))
+                    .expect("payload encoding"),
+            )
+            .expect("claims");
+            assert_eq!(claims["iat"], expected);
+            clock.advance(Duration::from_secs(5));
+        }
     }
 
     #[test]
@@ -254,7 +299,12 @@ mod tests {
 
         // form_post mode: each parameter becomes a hidden field; the same list, so
         // iss is among them.
-        let response = render(ResponseMode::FormPost, "https://client.test/cb", &params);
+        let response = render(
+            ResponseMode::FormPost,
+            "https://client.test/cb",
+            &params,
+            None,
+        );
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         assert!(has_iss(&params));
     }
@@ -284,7 +334,7 @@ mod tests {
         // query and fragment are 303 See Other redirects carrying a Location, and
         // the code-carrying seam sets no-store AND no-referrer (RFC 9700).
         for mode in [ResponseMode::Query, ResponseMode::Fragment] {
-            let response = render(mode, "https://client.test/cb", &params);
+            let response = render(mode, "https://client.test/cb", &params, None);
             assert_eq!(response.status(), REDIRECT_STATUS);
             assert!(
                 response.headers().get(header::LOCATION).is_some(),
@@ -301,7 +351,12 @@ mod tests {
         }
 
         // form_post is a 200 with NO Location: the code is only in the POST body.
-        let response = render(ResponseMode::FormPost, "https://client.test/cb", &params);
+        let response = render(
+            ResponseMode::FormPost,
+            "https://client.test/cb",
+            &params,
+            None,
+        );
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         assert!(
             response.headers().get(header::LOCATION).is_none(),

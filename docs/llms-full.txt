@@ -10994,6 +10994,17 @@ document in the same PR. Reviewers block merges that add a surface without
 its STRIDE section. This rule is stated in CONTRIBUTING.md and enforced by
 the PR template checklist.
 
+## Existing JWE plaintext boundary repair (issue #1437 prerequisite)
+
+The repaired JOSE tests exposed a preexisting decryption-output defect:
+`decrypt_with_cek` authenticated the input but returned the entire mutable
+buffer, including the trailing authentication tag. It now returns exactly the
+plaintext span reported by the crypto backend. This is an output-correctness
+repair, with text, empty and binary round-trip coverage; wrong keys and modified
+ciphertext still fail. It adds no algorithms or verification bypass and does
+not broaden the recipient-proof profile.
+
+
 ---
 
 # Per-operation unit costs

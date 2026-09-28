@@ -9,6 +9,11 @@ range per docs/RELEASING.md.
 - Preserve the already published `signing_key.break_glass` v1 event name through
   an exact legacy-wire exception; newly registered event names still require past tense.
 
+- Give `RemoteKeyProvisioner::ensure_remote_key` a named opaque
+  `RemoteKeyProvisionError` instead of `()` (issue #1437 compiler prerequisite).
+  Implementors must update that result type; every failure still prevents key
+  promotion through the same store error mapping.
+
 
 - Add `Store::probe_readiness` (issue #149): the query `/readyz` asks, on the pool requests
   are served from rather than a fresh connection. Reports whether the schema is one this

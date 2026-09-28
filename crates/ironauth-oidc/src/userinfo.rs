@@ -724,9 +724,7 @@ async fn sign_userinfo(
     ironauth_jose::sign_jws(
         signer,
         &serde_json::to_vec(&Value::Object(payload)).unwrap_or_default(),
-        &ironauth_jose::EmissionOptions::new().with_typ(
-            "application/jwt", // invariant-allow: typ-via-declaration -- OIDC Core 5.3.2 dictates the UserInfo JWT media type
-        ),
+        &ironauth_jose::EmissionOptions::new().with_typ("application/jwt"), // invariant-allow: typ-via-declaration -- OIDC Core 5.3.2 prescribes this generic JWT response type, equivalent to the existing ID-token JWT type
     )
     .unwrap_or_else(|_| Value::Object(claims.clone()).to_string())
 }

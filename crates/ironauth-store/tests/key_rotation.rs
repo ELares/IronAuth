@@ -347,10 +347,25 @@ async fn the_database_wide_pass_advances_every_environment_and_converges_on_repl
 /// the previous current key stays ACTIVE, exactly one key in the set.
 #[tokio::test]
 async fn a_backend_outage_during_seeding_leaves_the_previous_current_key_active() {
+    struct RecoveredProvisioner;
+    impl ironauth_store::key_rotation::RemoteKeyProvisioner for RecoveredProvisioner {
+        fn ensure_remote_key(
+            &self,
+            _kid: &str,
+            _algorithm: &str,
+        ) -> Result<(), ironauth_store::key_rotation::RemoteKeyProvisionError> {
+            Ok(())
+        }
+    }
+
     struct OutagedProvisioner;
     impl ironauth_store::key_rotation::RemoteKeyProvisioner for OutagedProvisioner {
-        fn ensure_remote_key(&self, _kid: &str, _algorithm: &str) -> Result<(), ()> {
-            Err(())
+        fn ensure_remote_key(
+            &self,
+            _kid: &str,
+            _algorithm: &str,
+        ) -> Result<(), ironauth_store::key_rotation::RemoteKeyProvisionError> {
+            Err(ironauth_store::key_rotation::RemoteKeyProvisionError)
         }
     }
 
@@ -362,8 +377,9 @@ async fn a_backend_outage_during_seeding_leaves_the_previous_current_key_active(
     let actor = db.test_actor(&env);
     let policy = test_policy();
     let provisioner = OutagedProvisioner;
-    let machine = RotationStateMachine::new(db.store(), scope, actor, CorrelationId::generate(&env))
-        .with_remote_seeding(&provisioner);
+    let machine =
+        RotationStateMachine::new(db.store(), scope, actor, CorrelationId::generate(&env))
+            .with_remote_seeding(&provisioner);
 
     // The pre-publication point: the seed is due, the backend is OUT. The advance
     // fails, and the key set is unchanged - the previous current key is active.
@@ -378,12 +394,6 @@ async fn a_backend_outage_during_seeding_leaves_the_previous_current_key_active(
     );
 
     // The backend recovers: the same advance now seeds normally.
-    struct RecoveredProvisioner;
-    impl ironauth_store::key_rotation::RemoteKeyProvisioner for RecoveredProvisioner {
-        fn ensure_remote_key(&self, _kid: &str, _algorithm: &str) -> Result<(), ()> {
-            Ok(())
-        }
-    }
     let recovered = RecoveredProvisioner;
     let machine = RotationStateMachine::new(
         db.store(),
@@ -405,7 +415,8 @@ async fn a_backend_outage_during_seeding_leaves_the_previous_current_key_active(
         .await
         .expect("list the keys");
     assert!(
-        keys.iter().any(|key| key.material_kind.as_str() == "remote_reference"),
+        keys.iter()
+            .any(|key| key.material_kind.as_str() == "remote_reference"),
         "the remote deployment's successor is a REMOTE reference"
     );
 }
