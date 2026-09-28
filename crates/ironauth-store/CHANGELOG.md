@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Restore the control role's column-scoped FAPI policy setter after migration
+  0237 (issue #1437 prerequisite). Forward migration 0244 grants only UPDATE on
+  `environments.fapi_hardened` to `ironauth_control`; application roles remain
+  unable to change environment policy and admission checks are unchanged.
+
 - Give `RemoteKeyProvisioner::ensure_remote_key` a named opaque
   `RemoteKeyProvisionError` instead of `()` (issue #1437 compiler prerequisite).
   Implementors must update that result type; every failure still prevents key
