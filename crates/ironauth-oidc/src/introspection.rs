@@ -308,7 +308,10 @@ fn introspect_claims_object(claims: &IntrospectionClaims) -> Value {
     // content is the same `{ member: thumbprint }` object a bound JWT carries, so
     // a resource server reads an identical shape whichever it has in hand.
     if let Some(confirmation) = &claims.confirmation {
-        object.insert("cnf".to_owned(), Value::Object(confirmation.to_cnf_object()));
+        object.insert(
+            "cnf".to_owned(),
+            Value::Object(confirmation.to_cnf_object()),
+        );
     }
     Value::Object(object)
 }
@@ -362,7 +365,10 @@ impl IntrospectionSerializer for SignedJwtIntrospectionSerializer {
             .unwrap_or_else(|| self.issuer.clone());
         payload.insert("aud".to_owned(), Value::String(aud));
         payload.insert("iat".to_owned(), Value::Number(now.into()));
-        payload.insert("exp".to_owned(), Value::Number((now + self.ttl_secs).into()));
+        payload.insert(
+            "exp".to_owned(),
+            Value::Number((now + self.ttl_secs).into()),
+        );
         payload.insert("jti".to_owned(), Value::String(format!("iti_{now:x}")));
         // The `typ` header is the RFC 9701 media type: not an IronAuth token profile,
         // so it rides the foreign-media-type path (`with_typ` with the reason, the

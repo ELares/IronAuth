@@ -859,7 +859,8 @@ async fn discovery_advertises_the_registered_authorization_details_types() {
 /// being absent from every other algorithm array.
 #[test]
 fn hardened_discovery_reflects_the_restricted_capability_set() {
-    let policy = SigningPolicy::new(vec![JwsAlgorithm::EdDsa, JwsAlgorithm::Rs256]).expect("policy");
+    let policy =
+        SigningPolicy::new(vec![JwsAlgorithm::EdDsa, JwsAlgorithm::Rs256]).expect("policy");
     let issuer = "https://issuer.test/t/tnt/e/env";
     let jwks_uri = format!("{issuer}/jwks.json");
     let caps = DiscoveryCapabilities::default().with_hardened(true);
@@ -884,9 +885,13 @@ fn hardened_discovery_reflects_the_restricted_capability_set() {
     assert!(id_algs.contains(&"EdDSA".to_owned()), "{id_algs:?}");
     // The assertion matrix excludes RS256 entirely.
     let assertion_algs = string_array(&doc, "token_endpoint_auth_signing_alg_values_supported");
-    assert!(!assertion_algs.contains(&"RS256".to_owned()), "{assertion_algs:?}");
     assert!(
-        !assertion_algs.contains(&"RS384".to_owned()) && !assertion_algs.contains(&"PS512".to_owned()),
+        !assertion_algs.contains(&"RS256".to_owned()),
+        "{assertion_algs:?}"
+    );
+    assert!(
+        !assertion_algs.contains(&"RS384".to_owned())
+            && !assertion_algs.contains(&"PS512".to_owned()),
         "the assertion matrix is the hardened set: {assertion_algs:?}"
     );
 }

@@ -234,7 +234,8 @@ mod tests {
         let verify = |signature: &[u8]| {
             crate::verify_detached(&trusted, JwsAlgorithm::EdDsa, input, signature).is_ok()
         };
-        let outcome = run_conformance_battery(&signer, "kid_test", JwsAlgorithm::EdDsa, input, verify);
+        let outcome =
+            run_conformance_battery(&signer, "kid_test", JwsAlgorithm::EdDsa, input, verify);
         assert!(outcome.is_ok(), "the local backend passes: {outcome:?}");
     }
 

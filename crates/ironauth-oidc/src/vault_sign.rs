@@ -61,7 +61,12 @@ impl VaultKeyProvisioner {
     /// Build the provisioner; the token resolution failures map to a backend
     /// error at the call.
     #[must_use]
-    pub fn new(addr: impl Into<String>, mount: impl Into<String>, token: Secret, timeout: Duration) -> Self {
+    pub fn new(
+        addr: impl Into<String>,
+        mount: impl Into<String>,
+        token: Secret,
+        timeout: Duration,
+    ) -> Self {
         Self {
             addr: addr.into(),
             mount: mount.into(),
@@ -89,11 +94,8 @@ impl ironauth_store::key_rotation::RemoteKeyProvisioner for VaultKeyProvisioner 
             )
             .header(
                 axum::http::header::AUTHORIZATION,
-                axum::http::HeaderValue::from_str(&format!(
-                    "Bearer {}",
-                    resolved.expose()
-                ))
-                .map_err(|_| ())?,
+                axum::http::HeaderValue::from_str(&format!("Bearer {}", resolved.expose()))
+                    .map_err(|_| ())?,
             )
             .timeout(timeout)
             .allow_plaintext_http();
@@ -360,8 +362,7 @@ mod tests {
         // local backend passes. The stub signed with the same key the public half
         // verifies against.
         let verify = |signature: &[u8]| {
-            ironauth_jose::verify_detached(&trusted, JwsAlgorithm::EdDsa, input, signature)
-                .is_ok()
+            ironauth_jose::verify_detached(&trusted, JwsAlgorithm::EdDsa, input, signature).is_ok()
         };
         let outcome = ironauth_jose::external_signer::run_conformance_battery(
             &signer,

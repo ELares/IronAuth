@@ -28,8 +28,11 @@ use ironauth_jose::JwsAlgorithm;
 use ironauth_store::Scope;
 
 /// The signing algorithms a hardened environment permits (FAPI 2.0 §6.7).
-pub const HARDENED_SIGNING_ALGS: &[JwsAlgorithm] =
-    &[JwsAlgorithm::Ps256, JwsAlgorithm::Es256, JwsAlgorithm::EdDsa];
+pub const HARDENED_SIGNING_ALGS: &[JwsAlgorithm] = &[
+    JwsAlgorithm::Ps256,
+    JwsAlgorithm::Es256,
+    JwsAlgorithm::EdDsa,
+];
 
 /// The client-authentication methods a hardened environment permits (FAPI 2.0
 /// §6.1): `private_key_jwt` or the two RFC 8705 mTLS methods. A public client
@@ -123,7 +126,9 @@ mod tests {
     fn the_client_auth_set_permits_private_key_jwt_and_mtls_only() {
         assert!(hardened_permits_client_auth_method("private_key_jwt"));
         assert!(hardened_permits_client_auth_method("tls_client_auth"));
-        assert!(hardened_permits_client_auth_method("self_signed_tls_client_auth"));
+        assert!(hardened_permits_client_auth_method(
+            "self_signed_tls_client_auth"
+        ));
         assert!(!hardened_permits_client_auth_method("client_secret_basic"));
         assert!(!hardened_permits_client_auth_method("client_secret_post"));
         assert!(!hardened_permits_client_auth_method("none"));
