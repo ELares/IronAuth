@@ -147,3 +147,15 @@ branch. Migration 0242 supplies the missing column-scoped UPDATE grant for
 written by the existing dynamic-client metadata updater. Only `ironauth_app`
 and `ironauth_control` receive that one-column grant. Migration 0243 adds the
 recipient-verification core.
+
+Forward migration 0244 restores only the control role's UPDATE privilege on
+`environments.fapi_hardened`, missing after 0237 added the column. Real
+conformant admission failed with 42501 before this repair. The application role
+still cannot update environment policy, and control has no table-wide UPDATE.
+
+Required protocol checks also exposed two existing request-path defects: the
+dynamic-registration INSERT had no placeholder for its final bound policy
+snapshot, and hardened authorization consulted a replayed `request_uri` that
+PAR intentionally clears. The fixes add the missing placeholder and pass only
+the verified stored-request context to the private validator. They preserve
+role, client, PKCE and sender constraints; no query resume marker proves PAR.

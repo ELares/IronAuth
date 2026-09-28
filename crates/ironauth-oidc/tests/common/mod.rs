@@ -9,6 +9,8 @@
 //! binary, so dead code is allowed here.
 #![allow(dead_code)]
 
+pub mod fapi;
+
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -3684,6 +3686,13 @@ impl Harness {
             .await?;
         self.register_default_redirect(&id).await;
         Ok(id)
+    }
+
+    /// Install the signed-introspection setting without changing environment policy.
+    pub fn enable_signed_introspection(&mut self, ttl: i64) {
+        let state = self.state.clone().with_signed_introspection(ttl);
+        self.router = oidc_router(state.clone());
+        self.state = state;
     }
 
     /// Make the harness's environment FAPI-hardened (issue #156) and, when
