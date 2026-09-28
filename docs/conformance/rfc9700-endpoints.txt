@@ -35,6 +35,8 @@
 /t/{tenant_id}/e/{environment_id}/account/consents/revoke
 /t/{tenant_id}/e/{environment_id}/account/credentials
 /t/{tenant_id}/e/{environment_id}/account/credentials/remove
+/t/{tenant_id}/e/{environment_id}/account/email-verification/start
+/t/{tenant_id}/e/{environment_id}/account/email-verification/verify
 /t/{tenant_id}/e/{environment_id}/account/linked-identities
 /t/{tenant_id}/e/{environment_id}/account/linked-identities/remove
 /t/{tenant_id}/e/{environment_id}/account/linked-identities/start
@@ -47,6 +49,7 @@
 /t/{tenant_id}/e/{environment_id}/account/mfa/totp/verify-enrollment
 /t/{tenant_id}/e/{environment_id}/account/password
 /t/{tenant_id}/e/{environment_id}/account/password/remove
+/t/{tenant_id}/e/{environment_id}/account/recipient-proof
 /t/{tenant_id}/e/{environment_id}/account/sessions
 /t/{tenant_id}/e/{environment_id}/account/sessions/revoke
 /t/{tenant_id}/e/{environment_id}/account/sessions/revoke-others

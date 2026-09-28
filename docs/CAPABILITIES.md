@@ -107,6 +107,16 @@ validates a previously issued JWT can keep accepting it until `exp`. The default
 access-token lifetime is 300 seconds. See [token formats](design/TOKEN-FORMATS.md)
 and [agent revocation](agents.md#revocation-stated-plainly).
 
+### Recipient proof for relying-party invitations
+
+A gated core exists for authenticated primary-mailbox verification and an online
+recipient match. It has **no production enable switch**. All three routes return
+`503 recipient_verification_unavailable` unless an owned test transport is
+installed by the test harness. Existing OTP/logging senders cannot enable it.
+Real delivery, hosted recovery UI and a controlled canonical-index backfill for
+existing scopes remain acceptance work in [issue #1436](https://github.com/ELares/IronAuth/issues/1436).
+See [the exact contract and readiness limits](design/RECIPIENT-VERIFICATION.md).
+
 ### Authentication methods and account self-service
 
 | Capability | User experience and controls |

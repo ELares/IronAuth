@@ -543,6 +543,10 @@ pub struct OidcState {
     // Default: the no-op NullVerificationSender (no transport wired yet), so the
     // closed-registration acknowledgment is identical whether or not a send goes out.
     verification_sender: Arc<dyn crate::verification::VerificationSender>,
+    // No production installer in the gated core. Logging/null OTP senders cannot
+    // accidentally enable recipient verification (issue #1436).
+    recipient_verification_transport:
+        Option<Arc<dyn crate::recipient_verification::RecipientVerificationTransport>>,
     // The SMS delivery seam (issue #70). Kept OUTSIDE `Inner` so the real provider
     // adapter (M11 messaging) installs its sender here later without a wire change.
     // Default: the no-op NullSmsSender (no transport wired yet), so the guarded
@@ -1170,6 +1174,7 @@ impl OidcState {
             ip_reputation_provider: Arc::new(crate::risk::NullIpReputationProvider),
             challenge_provider: Arc::new(crate::pow::BuiltinPowProvider),
             verification_sender: Arc::new(crate::verification::NullVerificationSender),
+            recipient_verification_transport: None,
             sms_sender: Arc::new(crate::verification::NullSmsSender),
             risk_evaluator: Arc::new(crate::recovery::NullRiskEvaluator),
             password_policy: ironauth_screening::PasswordPolicy::default(),
@@ -2331,6 +2336,25 @@ impl OidcState {
     ) -> Self {
         self.verification_sender = sender;
         self
+    }
+
+    /// Install an owned LOCAL fixture transport for the disabled recipient core.
+    /// Production enablement requires the remaining delivery/UI/index-readiness
+    /// work in issue #1436; there is deliberately no production builder or flag.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn with_recipient_verification_test_transport(
+        mut self,
+        transport: Arc<dyn crate::recipient_verification::RecipientVerificationTransport>,
+    ) -> Self {
+        self.recipient_verification_transport = Some(transport);
+        self
+    }
+
+    pub(crate) fn recipient_verification_transport(
+        &self,
+    ) -> Option<&Arc<dyn crate::recipient_verification::RecipientVerificationTransport>> {
+        self.recipient_verification_transport.as_ref()
     }
 
     /// Install the SMS sender (issue #70), replacing the default no-op

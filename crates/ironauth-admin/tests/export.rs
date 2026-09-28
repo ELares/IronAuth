@@ -217,6 +217,33 @@ async fn full_export_reimports_into_a_fresh_instance_with_logins_working() {
     );
     assert!(!login_ok(&bob, "nope"), "a wrong password is rejected");
 
+    // Import rebuilds recipient lookup state, never mailbox possession. Alice's
+    // portable claims even carry email_verified=true, which is not current proof.
+    let indexed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM users WHERE tenant_id = $1 AND environment_id = $2 \
+         AND recipient_email_indexed AND recipient_email_bidx IS NOT NULL",
+    )
+    .bind(target.tenant().to_string())
+    .bind(target.environment().to_string())
+    .fetch_one(harness.db().owner_pool())
+    .await
+    .expect("destination indexes");
+    assert_eq!(
+        indexed, 3,
+        "each imported mailbox has its destination lookup index"
+    );
+    assert!(
+        harness
+            .db()
+            .store()
+            .scoped(target)
+            .recipient_verification()
+            .current(&alice.id, "alice@exit.test")
+            .await
+            .expect("current possession read")
+            .is_none()
+    );
+
     // Bob's traits round-tripped verbatim, with their source schema version.
     let (schema_version, traits) = store
         .scoped(target)
@@ -389,6 +416,8 @@ async fn every_identity_column_is_exported_or_a_documented_non_exported_field() 
                 "tenant_id",               // the target scope
                 "environment_id",          // the target scope
                 "identifier_bidx",         // re-derived from the plaintext under the target key
+                "recipient_email_bidx",    // canonical index re-derived under the target key
+                "recipient_email_indexed", // destination index readiness, never mailbox proof
                 "external_id_bidx",        // re-derived from the plaintext under the target key
                 "pii_dek_version",         // re-sealed under the target active DEK
                 "external_id_dek_version", // re-sealed under the target active DEK

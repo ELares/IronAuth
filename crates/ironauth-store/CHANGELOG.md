@@ -6,6 +6,9 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Pin the recipient challenge reissue DELETE privilege to its actual audited
+  caller in the migration contract. Reissue replaces the prior subject challenge;
+  cross-environment deletion is RLS-filtered and verified by an unchanged row image.
 - Preserve the already published `signing_key.break_glass` v1 event name through
   an exact legacy-wire exception; newly registered event names still require past tense.
 
@@ -24,6 +27,12 @@ range per docs/RELEASING.md.
   (issue #1437 prerequisite). Other grants remain unchanged, including the
   control-only quarantine column.
 
+- Add the gated recipient-verification store core (issue #1436): exact-subject,
+  canonical ownership checks, bounded one-time challenges, same-transaction
+  verification and audit, and fresh ownership reads independent of stored claims.
+  New users receive a non-unique canonical email index without changing login
+  lookup. Existing scopes require a controlled index backfill before enablement;
+  no existing mailbox is inferred to be verified.
 - Repair upstream migration 0237's guardrail view column ordering. The runner
   admits only its exact known old checksum in addition to the corrected bytes;
   migration 0241 validates and repairs that old view shape while retaining data,

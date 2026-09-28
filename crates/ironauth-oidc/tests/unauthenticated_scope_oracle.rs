@@ -168,6 +168,33 @@ struct Case {
 #[allow(clippy::too_many_lines)]
 fn cases() -> Vec<Case> {
     vec![
+        // Recipient verification has no production transport. These valid requests pin
+        // the uniform readiness refusal. The enabled anonymous boundary is exercised
+        // with an owned transport in recipient_verification.rs as well.
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/account/email-verification/start",
+            query: "",
+            method: "POST",
+            content_type: "application/json",
+            body: r#"{"email":"owner@example.test"}"#,
+            live_status: StatusCode::SERVICE_UNAVAILABLE,
+        },
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/account/email-verification/verify",
+            query: "",
+            method: "POST",
+            content_type: "application/json",
+            body: r#"{"challenge_id":"rcp_00000000000000000000000000","code":"12345678"}"#,
+            live_status: StatusCode::SERVICE_UNAVAILABLE,
+        },
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/account/recipient-proof",
+            query: "",
+            method: "POST",
+            content_type: "application/json",
+            body: r#"{"email":"owner@example.test","nonce":"owned_invitation_nonce_00000000000000001"}"#,
+            live_status: StatusCode::SERVICE_UNAVAILABLE,
+        },
         // THE FORWARD-AUTH CHECK (issue #154), driven with the surface OFF, which is the
         // default and the only state this harness builds.
         //

@@ -110,7 +110,7 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      hot state, hot state invalidation cursors, hot state column scoped updates, per-tenant quota limits, \
      readiness can read the ledger, tenant quota limits scope key, replication cursors, \
      signing key rotation lifecycle grant, \
-     client tls client auth, cnf x5t s256, use mtls endpoint aliases, fapi hardened, userinfo signed response alg, authorization signed response alg, id token encrypted response, fapi guardrails view repair, userinfo metadata update grant";
+     client tls client auth, cnf x5t s256, use mtls endpoint aliases, fapi hardened, userinfo signed response alg, authorization signed response alg, id token encrypted response, fapi guardrails view repair, userinfo metadata update grant, recipient verification";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -741,7 +741,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        242,
+        243,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -785,7 +785,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193,
             194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210,
             211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227,
-            228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242
+            228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243
         ]
     );
     let phase_of = |version: i64| async move {
@@ -8493,6 +8493,10 @@ async fn the_data_plane_can_delete_only_where_a_caller_deletes() {
         "magic_link_tokens",
         "policy_decision_traces",
         "pow_challenges",
+        // ActingRecipientVerificationRepo::start replaces this scoped subject's
+        // previous challenge inside the audited transaction. DELETE bounds it to
+        // one row and makes every previous code unusable on reissue (issue #1436).
+        "recipient_verification_challenges",
         "recovery_codes",
         "scope_step_up_policies",
         "sms_country_allowlist",
