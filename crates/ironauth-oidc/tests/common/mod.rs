@@ -9,6 +9,8 @@
 //! binary, so dead code is allowed here.
 #![allow(dead_code)]
 
+pub mod fapi;
+
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -3686,6 +3688,13 @@ impl Harness {
         Ok(id)
     }
 
+    /// Install the signed-introspection setting without changing environment policy.
+    pub fn enable_signed_introspection(&mut self, ttl: i64) {
+        let state = self.state.clone().with_signed_introspection(ttl);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Make the harness's environment FAPI-hardened (issue #156) and, when
     /// `signed_introspection_ttl` is set, enable the RFC 9701 signed-introspection
     /// capability with that validity window. The router is REBUILT so every request
@@ -3693,9 +3702,10 @@ impl Harness {
     pub async fn harden_environment(&mut self, signed_introspection_ttl: Option<i64>) {
         let (actor, corr) = self.seeding_actor();
         let environment_id = self.scope.environment();
-        let operator = ironauth_store::OperatorId::generate(self.env());
-        self.store()
-            .scoped(self.scope)
+        let operator = self.db.owning_operator(&self.scope.tenant()).await;
+        self.db
+            .control_store()
+            .management()
             .acting(actor, corr)
             .environments(operator, self.scope.tenant())
             .set_fapi_hardened(self.env(), &environment_id, true)

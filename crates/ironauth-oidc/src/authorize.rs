@@ -971,8 +971,10 @@ async fn issue_code(
     //    the SAME validator at push time, so a pushed request and a plain request are
     //    checked by EXACTLY the same rules and cannot diverge. An error before a
     //    redirect target is validated is a page; after, it rides the negotiated mode.
-    let hardened = crate::fapi_hardened::is_hardened(state, scope).await.unwrap_or(false);
-    let validated = validate_request(state, &client, &params, hardened)
+    let hardened = crate::fapi_hardened::is_hardened(state, scope)
+        .await
+        .unwrap_or(false);
+    let validated = validate_request(state, &client, &params, hardened, pushed.is_some())
         .map_err(|error| error.into_authorize(state.issuer_for(&scope), params.state.as_deref()))?;
     let ValidatedRequest {
         redirect_uri,
@@ -1676,6 +1678,7 @@ pub(crate) fn validate_request<'a>(
     client: &ResolvedClient<'_>,
     params: &'a AuthorizeParams,
     hardened: bool,
+    verified_pushed_request: bool,
 ) -> Result<ValidatedRequest<'a>, AuthRequestError> {
     // 3. redirect_uri: present, a registrable RFC 8252 target, and an EXACT match
     //    against the client's registered set. A failure is a PAGE error (no redirect
@@ -1725,9 +1728,9 @@ pub(crate) fn validate_request<'a>(
     )?;
 
     // 4c. PAR MANDATORY (FAPI 2.0 §6.2): a hardened environment only accepts a
-    //    request that arrived through the PAR endpoint's `request_uri`, delivered
-    //    by the already-negotiated mode.
-    if hardened && params.request_uri.is_none() {
+    //    request that arrived through a validated PAR context. Replayed parameters
+    //    intentionally have no request_uri; no client-supplied marker is trusted.
+    if hardened && !crate::fapi_hardened::hardened_par_conformant(verified_pushed_request) {
         return Err(AuthRequestError::redirect(
             redirect_uri,
             mode,

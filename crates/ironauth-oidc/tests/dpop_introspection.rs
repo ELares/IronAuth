@@ -118,28 +118,38 @@ async fn introspect(harness: &Harness, token: &str, client_id: &str, secret: &st
     json(&body)
 }
 
-/// THE RFC 9701 SIGNED INTROSPECTION (issue #156): a hardened environment with
-/// the signed capability answers introspection with a JWT whose payload carries
-/// the RFC 7662 claims + the envelope, and the JWT verifies against the
-/// environment's signing key.
+/// The RFC 9701 capability on a conformant hardened environment uses its clock.
 #[tokio::test]
 async fn a_hardened_environment_answers_introspection_with_a_signed_jwt() {
-    let mut harness = Harness::start().await;
-    harness.harden_environment(Some(60)).await;
-    let (client_id, secret) = harness
-        .create_confidential_client(ClientAuthMethod::Basic)
+    let mut fixture = common::fapi::Fixture::start(true).await;
+    fixture.harness.enable_signed_introspection(60);
+    let query = fixture.pushed_query(true, "signed-introspection-par").await;
+    let headers = fixture.authorize(&query).await;
+    let code = location_param(&headers, "code").expect("authorization code");
+    let (status, body) = fixture
+        .exchange(&code, "signed-introspection-token", true)
         .await;
-    let client = client_id.to_string();
-    let tokens = issue(&harness, &client, &secret, None).await;
-    let access = tokens["access_token"].as_str().expect("access_token");
-
-    let request = axum::http::Request::builder()
+    assert_eq!(status, StatusCode::OK, "token exchange: {body}");
+    let tokens = json(&body);
+    let access = tokens["access_token"].as_str().expect("access token");
+    let harness = &fixture.harness;
+    let request = Request::builder()
         .method("POST")
         .uri("/introspect")
-        .header(axum::http::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .header(axum::http::header::AUTHORIZATION, basic(&client, &secret))
-        .body(axum::body::Body::from(common::form(&[("token", access)])))
-        .expect("request builds");
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(form(&[
+            ("token", access),
+            ("client_id", &fixture.client),
+            (
+                "client_assertion_type",
+                ironauth_oidc::JWT_BEARER_ASSERTION_TYPE,
+            ),
+            (
+                "client_assertion",
+                &fixture.assertion("signed-introspection-read"),
+            ),
+        ])))
+        .expect("introspection request");
     let (status, headers, body) = harness.send(request).await;
     assert_eq!(status, StatusCode::OK, "introspect: {body}");
     assert_eq!(
@@ -147,7 +157,7 @@ async fn a_hardened_environment_answers_introspection_with_a_signed_jwt() {
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
         Some("application/token-introspection+jwt"),
-        "the hardened response is a signed JWT"
+        "the enabled response is a signed JWT"
     );
     // The JWT's payload carries the claims + the envelope.
     let payload = body.split('.').nth(1).expect("the payload segment");
@@ -158,9 +168,20 @@ async fn a_hardened_environment_answers_introspection_with_a_signed_jwt() {
     )
     .expect("the payload is json");
     assert_eq!(claims["active"], true, "{claims}");
-    assert!(claims.get("iss").is_some(), "the envelope rides the payload: {claims}");
-    assert!(claims.get("exp").is_some(), "the envelope rides the payload: {claims}");
-    assert!(claims.get("jti").is_some(), "the envelope rides the payload: {claims}");
+    assert_eq!(claims["iat"], now_secs(harness));
+    assert_eq!(claims["exp"], now_secs(harness) + 60);
+    assert!(
+        claims.get("iss").is_some(),
+        "the envelope rides the payload: {claims}"
+    );
+    assert!(
+        claims.get("exp").is_some(),
+        "the envelope rides the payload: {claims}"
+    );
+    assert!(
+        claims.get("jti").is_some(),
+        "the envelope rides the payload: {claims}"
+    );
 }
 
 /// A bound `at+jwt` introspects with its `cnf.jkt` and a `DPoP` `token_type`.

@@ -11,7 +11,7 @@
 //!   PAR `request_uri` is rejected with `invalid_request_object`.
 //! - **PKCE S256 only** (§6.5.2): a plain (or absent) `code_challenge_method` is
 //!   rejected.
-//! - **Sender-constrained tokens** (§6.4): an exchange that proves neither a DPoP
+//! - **Sender-constrained tokens** (§6.4): an exchange that proves neither a `DPoP`
 //!   proof key nor an mTLS certificate binding is rejected before issuance.
 //! - **Client authentication restricted** (§6.1): a client whose registered
 //!   method is neither `private_key_jwt` nor an mTLS method cannot exist in a
@@ -28,8 +28,11 @@ use ironauth_jose::JwsAlgorithm;
 use ironauth_store::Scope;
 
 /// The signing algorithms a hardened environment permits (FAPI 2.0 §6.7).
-pub const HARDENED_SIGNING_ALGS: &[JwsAlgorithm] =
-    &[JwsAlgorithm::Ps256, JwsAlgorithm::Es256, JwsAlgorithm::EdDsa];
+pub const HARDENED_SIGNING_ALGS: &[JwsAlgorithm] = &[
+    JwsAlgorithm::Ps256,
+    JwsAlgorithm::Es256,
+    JwsAlgorithm::EdDsa,
+];
 
 /// The client-authentication methods a hardened environment permits (FAPI 2.0
 /// §6.1): `private_key_jwt` or the two RFC 8705 mTLS methods. A public client
@@ -72,7 +75,7 @@ pub fn hardened_par_conformant(has_par_request_uri: bool) -> bool {
     has_par_request_uri
 }
 
-/// Whether an exchange proves sender constraint (FAPI 2.0 §6.4): a DPoP proof
+/// Whether an exchange proves sender constraint (FAPI 2.0 §6.4): a `DPoP` proof
 /// key (a `jkt` binding) or an mTLS certificate binding must be present.
 #[must_use]
 pub fn hardened_sender_constrained(dpop_jkt: Option<&str>, mtls_thumbprint: Option<&str>) -> bool {
@@ -123,7 +126,9 @@ mod tests {
     fn the_client_auth_set_permits_private_key_jwt_and_mtls_only() {
         assert!(hardened_permits_client_auth_method("private_key_jwt"));
         assert!(hardened_permits_client_auth_method("tls_client_auth"));
-        assert!(hardened_permits_client_auth_method("self_signed_tls_client_auth"));
+        assert!(hardened_permits_client_auth_method(
+            "self_signed_tls_client_auth"
+        ));
         assert!(!hardened_permits_client_auth_method("client_secret_basic"));
         assert!(!hardened_permits_client_auth_method("client_secret_post"));
         assert!(!hardened_permits_client_auth_method("none"));

@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Restore hardened authorization of actual pushed requests (issue #1437
+  prerequisite). The PAR requirement now uses the verified stored-request context,
+  since replayed parameters intentionally omit `request_uri`. Plain requests and
+  forged resume markers remain refused; PKCE and client admission are unchanged.
+
 - Use the existing environment clock for JARM and signed-introspection issuance
   timestamps, with checked integer conversion (issue #1437 prerequisite).
   The private JARM render context now receives `state.now()` from authorize;
