@@ -5,7 +5,7 @@
 //! Signs through a Vault transit engine, so the private keys never leave the Vault
 //! boundary: the backend sends the raw signing input and receives the signature.
 //! Verification continues against the published JWKS (only signing is delegated),
-//! and the key material — including the Vault token — never appears in logs (the
+//! and the key material - including the Vault token - never appears in logs (the
 //! token rides the config `Secret` and the request header is built inside the
 //! fetch seam's redacted envelope).
 //!

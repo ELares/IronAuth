@@ -229,8 +229,8 @@ mod tests {
     }
 
     /// THE BATTERY (issue #161): the local backend passes the shared conformance
-    /// battery — sign/verify round-trip against its public half, kid handling, and
-    /// the ceiling behavior — the same battery every remote backend must pass.
+    /// battery - sign/verify round-trip against its public half, kid handling, and
+    /// the ceiling behavior - the same battery every remote backend must pass.
     #[test]
     fn the_local_backend_passes_the_shared_conformance_battery() {
         let signer = local_signer();

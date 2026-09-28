@@ -155,7 +155,12 @@ scan entropy-via-env 'getrandom::|(^|[^A-Za-z0-9_])rand::|rand_core::' 1
 # upstream ID token above carry the marker. ONE of the three (`tests/identity_chaining.rs`) also
 # mints deliberately WRONG types, to prove the media type is what separates an identity
 # assertion from an ordinary one; the two in `tests/jwt_bearer.rs` always mint the ID-JAG type.
-scan typ-via-declaration '(\.|::)\s*with_typ\s*\(' 16
+# 16 -> 19 (issue #1437 prerequisite): three existing production signed responses
+# carry protocol-prescribed types: JARM generic JWT, UserInfo application/jwt and
+# RFC 9701 token-introspection+jwt. Their existing local reasons were attached to
+# the next line, so they did not exempt the actual calls. No token verifier or
+# credential type is changed; generic JWT cannot be a second unique TokenTyp.
+scan typ-via-declaration '(\.|::)\s*with_typ\s*\(' 19
 
 # Rule fetcher-in-integration-tests: no integration test constructs a REAL `Fetcher`.
 #

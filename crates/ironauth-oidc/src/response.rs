@@ -161,9 +161,7 @@ pub(crate) fn render(
             let jwt = ironauth_jose::sign_jws(
                 signer,
                 &serde_json::to_vec(&payload).unwrap_or_default(),
-                &ironauth_jose::EmissionOptions::new().with_typ(
-                    "JWT", // invariant-allow: typ-via-declaration -- JARM dictates the response JWT media type
-                ),
+                &ironauth_jose::EmissionOptions::new().with_typ("JWT"), // invariant-allow: typ-via-declaration -- JARM uses the standard generic JWT type; it cannot declare a unique profile distinct from ID-token JWT
             )
             .unwrap_or_default();
             if jwt.is_empty() {

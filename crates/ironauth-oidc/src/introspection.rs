@@ -261,9 +261,7 @@ async fn signed_introspection_response(
     let body = ironauth_jose::sign_jws(
         signer,
         &serde_json::to_vec(&Value::Object(payload)).unwrap_or_default(),
-        &ironauth_jose::EmissionOptions::new().with_typ(
-            "token-introspection+jwt", // invariant-allow: typ-via-declaration -- RFC 9701 dictates the media type; no IronAuth TokenTyp exists for it
-        ),
+        &ironauth_jose::EmissionOptions::new().with_typ("token-introspection+jwt"), // invariant-allow: typ-via-declaration -- RFC 9701 prescribes this signed-response media type; this response is not an access credential
     )
     .unwrap_or_else(|_| state.introspection_serializer().serialize(claims).body);
     SerializedIntrospection {

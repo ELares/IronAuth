@@ -13220,11 +13220,12 @@ impl ClientAuthDiagnosticReason {
     /// nothing outside the `match` can observe a variant the array omits, so no runtime
     /// assertion written against the array can notice the omission. Only a witness
     /// derived from the enum's own declaration can, which is what the test above is.
-    pub const ALL: [ClientAuthDiagnosticReason; 22] = [
+    pub const ALL: [ClientAuthDiagnosticReason; 23] = [
         ClientAuthDiagnosticReason::Unparsable,
         ClientAuthDiagnosticReason::UnknownClient,
         ClientAuthDiagnosticReason::MethodMismatch,
         ClientAuthDiagnosticReason::BadSecret,
+        ClientAuthDiagnosticReason::BadCertificate,
         ClientAuthDiagnosticReason::AssertionInvalid,
         ClientAuthDiagnosticReason::AssertionBadSignature,
         ClientAuthDiagnosticReason::AssertionExpired,
@@ -58655,19 +58656,6 @@ impl ActingEnvironmentRepo<'_> {
         .await
     }
 
-    /// Set (or clear) an environment's PER-ENVIRONMENT auto-link posture override
-    /// (issue #78, FORK B): the control-plane write behind the deployment default.
-    /// `posture` is the wire token (`off` / `verified_to_verified`) the column CHECK
-    /// pins, or [`None`] to CLEAR the override so the environment inherits the
-    /// deployment default. Audited `environment.auto_link_posture.set` in the same
-    /// transaction. The write is scoped to `(tenant, environment)` and touches ONLY the
-    /// `auto_link_posture` column (the control role holds a column-scoped UPDATE grant).
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::NotFound`] if no live environment matched under this tenant;
-    /// [`StoreError::Database`] on a persistence failure (a token outside the closed set
-    /// is rejected by the column CHECK).
     /// Set or clear the environment's FAPI 2.0 hardened-mode flag (issue #156).
     /// Audited (`environment.fapi_hardened.set`) in the same transaction. The
     /// enforcement lives in the request paths; this is the switch.
@@ -58727,12 +58715,19 @@ impl ActingEnvironmentRepo<'_> {
         .await
     }
 
-    /// Set or clear the environment's account auto-link posture in an audited write.
+    /// Set (or clear) an environment's PER-ENVIRONMENT auto-link posture override
+    /// (issue #78, FORK B): the control-plane write behind the deployment default.
+    /// `posture` is the wire token (`off` / `verified_to_verified`) the column CHECK
+    /// pins, or [`None`] to CLEAR the override so the environment inherits the
+    /// deployment default. Audited `environment.auto_link_posture.set` in the same
+    /// transaction. The write is scoped to `(tenant, environment)` and touches ONLY the
+    /// `auto_link_posture` column (the control role holds a column-scoped UPDATE grant).
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if no live environment matched under this tenant;
-    /// a store error if the database operation or audit write fails.
+    /// [`StoreError::Database`] on a persistence failure (a token outside the closed set
+    /// is rejected by the column CHECK).
     pub async fn set_auto_link_posture(
         &self,
         env: &Env,
