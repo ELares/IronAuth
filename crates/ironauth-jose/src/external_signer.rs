@@ -213,6 +213,8 @@ pub async fn run_conformance_battery(
 
 #[cfg(test)]
 mod tests {
+    use futures_util::FutureExt as _;
+
     use super::*;
 
     fn local_signer() -> LocalSigner {
@@ -234,8 +236,12 @@ mod tests {
         let verify = |signature: &[u8]| {
             crate::verify_detached(&trusted, JwsAlgorithm::EdDsa, input, signature).is_ok()
         };
+        // LocalSigner performs no asynchronous I/O. Poll the complete battery;
+        // a pending future must fail this test, never be dropped as a success.
         let outcome =
-            run_conformance_battery(&signer, "kid_test", JwsAlgorithm::EdDsa, input, verify);
+            run_conformance_battery(&signer, "kid_test", JwsAlgorithm::EdDsa, input, verify)
+                .now_or_never()
+                .expect("the local conformance battery completes on its first poll");
         assert!(outcome.is_ok(), "the local backend passes: {outcome:?}");
     }
 
