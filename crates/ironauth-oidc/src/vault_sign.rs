@@ -279,74 +279,52 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    /// A stub transit endpoint the size of the shared battery: signs the input
-    /// with a local key (`EdDSA`) and returns Vault's envelope. A RAW listener (the
-    /// `client_assertion` pattern): the fetcher's test dialer forwards to it, and the
-    /// SSRF posture is bypassed by the resolver seam, so the stub never needs the
-    /// axum server machinery.
-    async fn stub_transit() -> (String, Arc<ironauth_jose::SigningKey>) {
+    /// An owned local endpoint that reads the complete JSON request before signing.
+    /// The dialer redirects only this test's synthetic public URL to its socket.
+    async fn stub_transit() -> (
+        std::net::SocketAddr,
+        Arc<ironauth_jose::SigningKey>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let key = ironauth_jose::SigningKey::ed25519_from_seed(None, &[9_u8; 32])
             .expect("the stub key loads");
         let signing_key = Arc::new(key);
         let router_key = Arc::clone(&signing_key);
+        let router = axum::Router::new().route(
+            "/v1/transit/sign/test-kid",
+            axum::routing::post(move |axum::Json(value): axum::Json<serde_json::Value>| {
+                let key = Arc::clone(&router_key);
+                async move {
+                    let input = STANDARD
+                        .decode(value["input"].as_str().expect("input string"))
+                        .expect("base64 input");
+                    let signature = ironauth_jose::sign_detached(&key, &input).expect("stub signs");
+                    axum::Json(serde_json::json!({"data": {
+                        "signature": format!("vault:v1:{}", STANDARD.encode(signature))
+                    }}))
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("binds");
-        let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    break;
-                };
-                let router_key = Arc::clone(&router_key);
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-                    let mut buf = [0_u8; 8192];
-                    let _ = socket.read(&mut buf).await;
-                    let text = String::from_utf8_lossy(&buf);
-                    let body = text
-                        .split_once("\r\n\r\n")
-                        .map_or("", |(_, body)| body.trim());
-                    let value: serde_json::Value =
-                        serde_json::from_str(body).unwrap_or_else(|_| serde_json::json!({}));
-                    let input = STANDARD
-                        .decode(value["input"].as_str().unwrap_or(""))
-                        .unwrap_or_default();
-                    let sig =
-                        ironauth_jose::sign_detached(&router_key, &input).expect("the stub signs");
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        serde_json::json!({
-                            "data": {
-                                "signature": format!("vault:v1:{}", STANDARD.encode(&sig))
-                            }
-                        })
-                        .to_string()
-                        .len(),
-                        serde_json::json!({
-                            "data": {
-                                "signature": format!("vault:v1:{}", STANDARD.encode(&sig))
-                            }
-                        }),
-                    );
-                    let _ = socket.write_all(response.as_bytes()).await;
-                    let _ = socket.flush().await;
-                });
-            }
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("owned stub serves");
         });
-        (format!("http://{addr}"), signing_key)
+        (address, signing_key, server)
     }
 
     /// The shared battery: sign through the backend, verify through the public half.
     #[tokio::test]
     async fn vault_transit_signs_and_the_public_half_verifies() {
-        let (addr, stub_key) = stub_transit().await;
+        let (addr, stub_key, server) = stub_transit().await;
         let token = Secret::Literal(ironauth_config::SecretString::new("test-token"));
         // The SSRF posture blocks loopback; the client_assertion pattern: a resolver
         // that returns a public sentinel + a dialer that forwards to the stub.
-        let dialer = Arc::new(ironauth_fetch::RecordingDialer::new(
-            addr.parse::<std::net::SocketAddr>().expect("addr"),
-        ));
+        let dialer = Arc::new(ironauth_fetch::RecordingDialer::new(addr));
         let resolver = Arc::new(ironauth_fetch::StaticResolver::new(vec![
             std::net::IpAddr::from([8, 8, 8, 8]),
         ]));
@@ -355,8 +333,13 @@ mod tests {
             resolver,
             dialer,
         );
-        let signer =
-            VaultTransitSigner::from_fetcher(addr, "transit", token, Duration::from_secs(5), http);
+        let signer = VaultTransitSigner::from_fetcher(
+            "http://vault.test",
+            "transit",
+            token,
+            Duration::from_secs(5),
+            http,
+        );
         let input = b"the full signing input, exactly as PureEdDSA demands";
         let trusted = stub_key.verifying_key().expect("the trusted key");
         // THE SHARED BATTERY (issue #161, the Dex pattern): the SAME battery the
@@ -373,6 +356,7 @@ mod tests {
             verify,
         )
         .await;
+        server.abort();
         assert!(outcome.is_ok(), "the vault backend passes: {outcome:?}");
     }
 }
