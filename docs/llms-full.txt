@@ -10353,6 +10353,8 @@ protocol risk from the integrator, first.**
 
 The generated clients are produced by the pipeline in the [SDK contract](SDK-CONTRACT.md);
 CI fails if the management API changes without regenerating them.
+See the [management client guide](../sdks/README.md) for caller-supplied
+idempotency keys and retry behavior.
 
 The TypeScript development packages currently have private manifests and are
 built or packed from the repository; these rows do not imply npm publication.
