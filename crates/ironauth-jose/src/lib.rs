@@ -218,3 +218,4 @@ pub use webauthn::{
     WebauthnKey, WebauthnSignatureError, verify_jws_signature, verify_webauthn_signature,
 };
 pub mod mtls;
+pub mod jwe;

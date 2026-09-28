@@ -229,6 +229,7 @@ ring = "0.17"
 # floor). Default features are trimmed to keygen + DER: no signing, no PEM.
 p256 = { version = "0.13", default-features = false, features = [
     "arithmetic",
+    "ecdh",
     "pkcs8",
     "std",
 ] }
