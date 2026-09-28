@@ -1,0 +1,11 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- The JARM response algorithm (issue #158, JWT-Secured Authorization Response).
+--
+-- A client that registers `authorization_signed_response_alg` receives its
+-- authorization responses (success AND error) as signed JWTs in the jwt
+-- response modes. `NULL` (the default) keeps the plain response modes. The
+-- JARM modes are enabled per CLIENT by this registration, not per environment.
+--
+-- EXPAND: additive column; existing rows default to NULL (plain modes).
+ALTER TABLE clients ADD COLUMN authorization_signed_response_alg text;

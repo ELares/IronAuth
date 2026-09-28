@@ -1230,6 +1230,37 @@ async fn issue_code(
     //      the token endpoint's exact claim + signing path, carrying `nonce`, and
     //      (hybrid only) `c_hash` of the issued code, never an access token;
     //    - `none`: issue nothing.
+/// Resolve the JARM signing context (issue #158): the client's registered
+/// `authorization_signed_response_alg` + the environment's signing key + the
+/// issuer. `None` when the client registered no JARM alg (the plain modes) or
+/// the signer is unavailable.
+async fn jarm_context<'a>(
+    state: &OidcState,
+    scope: Scope,
+    stored: &str,
+    iss: &'a str,
+) -> Option<(&'static str, &'a str)> {
+    // The client's registered JARM response algorithm: the record's
+    // authorization_signed_response_alg. A client without one keeps the plain
+    // modes (the JARM spec's per-client enablement).
+    let id = ClientId::parse_in_scope(stored, &scope).ok()?;
+    let record = state
+        .store()
+        .scoped(scope)
+        .clients()
+        .dynamic_registration(&id)
+        .await
+        .ok()?;
+    let alg = record.authorization_signed_response_alg.as_deref()?;
+    if !crate::fapi_hardened::hardened_permits_signing_alg_name(alg) {
+        return None;
+    }
+    // The alg is a STATIC name when the record's value is a recognized algorithm
+    // (the registration validated it); the hardened check above proves it parses.
+    let static_alg = ironauth_jose::JwsAlgorithm::from_jose_name(alg)?.as_jose_name();
+    Some((static_alg, iss))
+}
+
     let code = if response_type.issues_code() {
         Some(persist_code(state, scope, stored, redirect_uri, &iss, mode, &resolved).await?)
     } else {
@@ -1287,7 +1318,20 @@ async fn issue_code(
         &iss,
         session_state_value.as_deref(),
     );
-    Ok(response::render(mode, redirect_uri, &params))
+    // THE JARM SIGNING (issue #158): a client registered for a JARM response
+    // algorithm signs the response; the env's key + the registered alg + the issuer
+    // ride the render. An unavailable signer is refused (never a silent downgrade).
+    let jarm_ctx = jarm_context(state, scope, &stored.to_string(), &iss).await;
+    let entry = state.issuer_entry(&scope).await;
+    let jarm = match (jarm_ctx, entry.as_ref()) {
+        (Some((alg, _iss)), Some(entry)) => {
+            entry
+                .signer(state.now())
+                .map(|key| (key, alg, iss.as_str()))
+        }
+        _ => None,
+    };
+    Ok(response::render(mode, redirect_uri, &params, jarm))
 }
 
 /// Resolve the response mode for a request (issue #17). Absent means the response

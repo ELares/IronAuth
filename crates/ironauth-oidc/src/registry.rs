@@ -342,6 +342,13 @@ pub enum ResponseMode {
     /// `form_post`: the response parameters are posted to the redirect URI by an
     /// auto-submitting HTML form, so they never appear in a URL.
     FormPost,
+    /// JARM (JWT-Secured Authorization Response, issue #158): the response
+    /// parameters are signed as a JWT and carried in the QUERY string.
+    Jwt,
+    /// JARM: the signed response JWT is carried in the URL FRAGMENT.
+    FragmentJwt,
+    /// JARM: the signed response JWT is posted by an auto-submitting HTML form.
+    FormPostJwt,
 }
 
 impl ResponseMode {
@@ -350,6 +357,9 @@ impl ResponseMode {
         ResponseMode::Query,
         ResponseMode::Fragment,
         ResponseMode::FormPost,
+        // The JARM modes (issue #158) are NOT in `ALL`: they ride the
+        // `authorization_signed_response_alg` client registration, so a deployment
+        // enables them per client rather than globally (the JARM spec's model).
     ];
 
     /// The response modes available in EVERY environment without configuration:
@@ -364,6 +374,9 @@ impl ResponseMode {
             ResponseMode::Query => "query",
             ResponseMode::Fragment => "fragment",
             ResponseMode::FormPost => "form_post",
+            ResponseMode::Jwt => "jwt",
+            ResponseMode::FragmentJwt => "fragment.jwt",
+            ResponseMode::FormPostJwt => "form_post.jwt",
         }
     }
 
@@ -374,6 +387,9 @@ impl ResponseMode {
             "query" => Some(ResponseMode::Query),
             "fragment" => Some(ResponseMode::Fragment),
             "form_post" => Some(ResponseMode::FormPost),
+            "jwt" => Some(ResponseMode::Jwt),
+            "fragment.jwt" => Some(ResponseMode::FragmentJwt),
+            "form_post.jwt" => Some(ResponseMode::FormPostJwt),
             _ => None,
         }
     }

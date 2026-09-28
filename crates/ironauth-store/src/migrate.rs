@@ -2026,6 +2026,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0238_userinfo_signed_response_alg.sql"),
         },
+        // EXPAND (issue #158): the JARM response algorithm.
+        Migration {
+            version: 239,
+            name: "authorization_signed_response_alg",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0239_authorization_signed_response_alg.sql"),
+        },
     ]
 }
 
