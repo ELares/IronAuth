@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Fix the existing ECDH-ES decryption result including the authentication tag
+  after the plaintext (issue #1437 prerequisite). Preserve the authenticated
+  plaintext length returned by the crypto backend and truncate the output to
+  exactly that length. Text, empty and binary round trips now return exactly
+  their original bytes; wrong-key and tampering failures remain errors.
+
 - **A fourth token profile: `iaj+jws`, the signed journey interchange archive** (issue #347).
   Added to the `token_profiles!` declaration, so the variant, its media type, and
   `TokenTyp::ALL` all move together and `no_two_profiles_share_a_media_type` compares it to the

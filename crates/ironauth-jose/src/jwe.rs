@@ -236,12 +236,15 @@ fn decrypt_with_cek(
     let key = LessSafeKey::new(unbound);
     let mut in_out = ciphertext;
     in_out.extend_from_slice(&tag);
-    key.open_in_place(
-        Nonce::try_assume_unique_for_key(&iv).map_err(|_| JweError::Decryption)?,
-        RingAad::empty(),
-        &mut in_out,
-    )
-    .map_err(|_| JweError::Decryption)?;
+    let plaintext_len = key
+        .open_in_place(
+            Nonce::try_assume_unique_for_key(&iv).map_err(|_| JweError::Decryption)?,
+            RingAad::empty(),
+            &mut in_out,
+        )
+        .map_err(|_| JweError::Decryption)?
+        .len();
+    in_out.truncate(plaintext_len);
     Ok(in_out)
 }
 
@@ -281,6 +284,19 @@ mod tests {
             encrypt_ecdh_es("ECDH-ES", &public, b"the id token", env.entropy()).expect("encrypt");
         let plain = decrypt_ecdh_es("ECDH-ES", &compact, &private).expect("decrypt");
         assert_eq!(plain, b"the id token");
+    }
+
+    #[test]
+    fn decryption_returns_exact_plaintext_without_the_authentication_tag() {
+        let env = fixed_entropy();
+        let (private, public) = p256_keypair(env.entropy());
+        for payload in [b"".as_slice(), &[0, 255, 128, 0, 1, 2, 3][..]] {
+            let compact =
+                encrypt_ecdh_es("ECDH-ES", &public, payload, env.entropy()).expect("encrypt");
+            let plaintext = decrypt_ecdh_es("ECDH-ES", &compact, &private).expect("decrypt");
+            assert_eq!(plaintext, payload);
+            assert_eq!(plaintext.len(), payload.len());
+        }
     }
 
     #[test]
