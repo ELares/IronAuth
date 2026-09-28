@@ -116,11 +116,61 @@ pub(crate) fn render(
     mode: ResponseMode,
     redirect_uri: &str,
     params: &[(&str, Option<&str>)],
+    jarm: Option<(&ironauth_jose::SigningKey, &str, &str)>,
 ) -> Response {
+    // THE JARM ARM (issue #158): the response parameters become the `response`
+    // claim of a signed JWT (plus `iss`, the JARM envelope), and the JWT rides
+    // the underlying mode's container. The signer + the algorithm + the issuer
+    // come from the caller; `None` for a non-JARM mode.
     match mode {
         ResponseMode::Query => redirect_response(&append_query(redirect_uri, params)),
         ResponseMode::Fragment => redirect_response(&append_fragment(redirect_uri, params)),
         ResponseMode::FormPost => pages::form_post_response(redirect_uri, params),
+        ResponseMode::Jwt | ResponseMode::FragmentJwt | ResponseMode::FormPostJwt => {
+            let Some((signer, _alg, issuer)) = jarm else {
+                // A JARM mode without a signer is a server-side misconfiguration,
+                // not a silent downgrade to the plain mode.
+                return redirect_response(&append_query(redirect_uri, params));
+            };
+            let mut response_object = serde_json::Map::new();
+            for (name, value) in params {
+                if let Some(value) = value {
+                    response_object.insert(
+                        (*name).to_owned(),
+                        serde_json::Value::String((*value).to_owned()),
+                    );
+                }
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| serde_json::Value::Number((d.as_secs() as i64).into()))
+                .unwrap_or(serde_json::Value::Null);
+            let payload = serde_json::json!({
+                "response": serde_json::Value::Object(response_object),
+                "iss": issuer,
+                "iat": now,
+            });
+            let jwt = ironauth_jose::sign_jws(
+                signer,
+                &serde_json::to_vec(&payload).unwrap_or_default(),
+                &ironauth_jose::EmissionOptions::new().with_typ(
+                    "JWT", // invariant-allow: typ-via-declaration -- JARM dictates the response JWT media type
+                ),
+            )
+            .unwrap_or_default();
+            if jwt.is_empty() {
+                return redirect_response(&append_query(redirect_uri, params));
+            }
+            let single = [("response", Some(jwt.as_str()))];
+            match mode {
+                ResponseMode::Jwt => redirect_response(&append_query(redirect_uri, &single)),
+                ResponseMode::FragmentJwt => {
+                    redirect_response(&append_fragment(redirect_uri, &single))
+                }
+                ResponseMode::FormPostJwt => pages::form_post_response(redirect_uri, &single),
+                _ => unreachable!(),
+            }
+        }
     }
 }
 

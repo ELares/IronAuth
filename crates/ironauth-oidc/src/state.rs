@@ -4375,6 +4375,10 @@ impl OidcState {
                     || self.inner.enable_response_type_code_id_token
             }
             ResponseMode::FormPost => self.inner.enable_response_mode_form_post,
+            // The JARM modes (issue #158) are enabled per CLIENT (the registered
+            // authorization_signed_response_alg), not per environment: the delegate
+            // answers true so the mode negotiation reaches the client-metadata gate.
+            ResponseMode::Jwt | ResponseMode::FragmentJwt | ResponseMode::FormPostJwt => true,
         }
     }
 

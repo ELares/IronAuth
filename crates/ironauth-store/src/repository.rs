@@ -3285,6 +3285,9 @@ pub struct DynamicClientRecord {
     /// 5.3.2): when set, the UserInfo response is a signed JWT. `None` (the
     /// default) keeps the plain JSON form.
     pub userinfo_signed_response_alg: Option<String>,
+    /// The registered JARM response algorithm (issue #158): when set, the
+    /// authorization responses are signed JWTs in the jwt modes.
+    pub authorization_signed_response_alg: Option<String>,
     /// The client's inline `jwks` (a JWK Set JSON document), or `None`.
     pub jwks: Option<String>,
     /// The client's `jwks_uri`, or `None`.
@@ -3370,6 +3373,9 @@ pub struct NewDynamicClient<'a> {
     /// The registered `userinfo_signed_response_alg` (issue #158), or `None` to
     /// keep the plain JSON form.
     pub userinfo_signed_response_alg: Option<&'a str>,
+    /// The registered JARM response algorithm (issue #158), or `None` for the
+    /// plain response modes.
+    pub authorization_signed_response_alg: Option<&'a str>,
     /// The inline `jwks`, or `None` (mutually exclusive with `jwks_uri`).
     pub jwks: Option<&'a str>,
     /// The `jwks_uri`, or `None`.
@@ -3776,7 +3782,8 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT id, display_name, token_endpoint_auth_method, redirect_uris, \
-             application_type, id_token_signed_response_alg, jwks, jwks_uri, \
+             application_type, id_token_signed_response_alg, userinfo_signed_response_alg, \
+             authorization_signed_response_alg, jwks, jwks_uri, \
              token_endpoint_auth_signing_alg, registration_client_uri, \
              registration_access_token_hash, dcr_registered, \
              quarantined, dcr_policy_chain, \
@@ -3806,6 +3813,7 @@ impl ClientRepo<'_> {
             application_type: row.get("application_type"),
             id_token_signed_response_alg: row.get("id_token_signed_response_alg"),
             userinfo_signed_response_alg: row.get("userinfo_signed_response_alg"),
+            authorization_signed_response_alg: row.get("authorization_signed_response_alg"),
             jwks: row.get("jwks"),
             jwks_uri: row.get("jwks_uri"),
             token_endpoint_auth_signing_alg: row.get("token_endpoint_auth_signing_alg"),
@@ -6590,14 +6598,16 @@ impl ActingClientRepo<'_> {
                     "INSERT INTO clients \
                      (id, tenant_id, environment_id, display_name, \
                       token_endpoint_auth_method, secret_hash, redirect_uris, \
-                      application_type, id_token_signed_response_alg, jwks, jwks_uri, \
+                      application_type, id_token_signed_response_alg, \
+                      userinfo_signed_response_alg, authorization_signed_response_alg, \
+                      jwks, jwks_uri, \
                       token_endpoint_auth_signing_alg, tls_client_auth_cert, \
                       tls_client_auth_subject_dn, use_mtls_endpoint_aliases, \
                       registration_client_uri, \
                       registration_access_token_hash, quarantined, dcr_policy_chain, \
                       dcr_registered) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                             $15, $16, $17, $18, $19, $20, true)",
+                             $15, $16, $17, $18, $19, $20, $21, $22, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -6609,6 +6619,7 @@ impl ActingClientRepo<'_> {
                 .bind(params.application_type)
                 .bind(params.id_token_signed_response_alg)
                 .bind(params.userinfo_signed_response_alg)
+                .bind(params.authorization_signed_response_alg)
                 .bind(params.jwks)
                 .bind(params.jwks_uri)
                 .bind(params.token_endpoint_auth_signing_alg)
