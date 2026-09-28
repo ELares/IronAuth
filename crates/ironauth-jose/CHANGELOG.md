@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Draw the JWE IV from the caller's existing environment entropy seam, like its
+  ephemeral key (issue #1437 prerequisite). The public API and algorithms are
+  unchanged; deterministic coverage now checks the full compact output and fresh IVs.
+
 - Fix the existing ECDH-ES decryption result including the authentication tag
   after the plaintext (issue #1437 prerequisite). Preserve the authenticated
   plaintext length returned by the crypto backend and truncate the output to

@@ -102,7 +102,7 @@ pub fn encrypt_ecdh_es(
             "y": URL_SAFE_NO_PAD.encode(epk.y().ok_or(JweError::InvalidKey)?.as_slice()),
         },
     });
-    encrypt_with_cek(&header, &cek, &[], plaintext)
+    encrypt_with_cek(&header, &cek, &[], plaintext, entropy)
 }
 
 /// Decrypt a compact ECDH-ES JWE with the recipient's STATIC P-256 private key
@@ -195,12 +195,12 @@ fn encrypt_with_cek(
     cek: &[u8],
     encrypted_key: &[u8],
     plaintext: &[u8],
+    entropy: &dyn ironauth_env::Entropy,
 ) -> Result<String, JweError> {
     let unbound = UnboundKey::new(&AES_256_GCM, cek).map_err(|_| JweError::InvalidKey)?;
     let key = LessSafeKey::new(unbound);
     let mut iv = [0_u8; 12];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut iv)
-        .map_err(|_| JweError::InvalidKey)?;
+    entropy.fill_bytes(&mut iv);
     let mut in_out = plaintext.to_vec();
     let tag = key
         .seal_in_place_separate_tag(
@@ -301,6 +301,28 @@ mod tests {
             assert_eq!(plaintext, payload);
             assert_eq!(plaintext.len(), payload.len());
         }
+    }
+
+    #[test]
+    fn encryption_iv_uses_the_callers_entropy_seam() {
+        let key_env = fixed_entropy();
+        let (_, public) = p256_keypair(key_env.entropy());
+        let first_env = fixed_entropy();
+        let replay_env = fixed_entropy();
+        let first = encrypt_ecdh_es("ECDH-ES", &public, b"owned fixture", first_env.entropy())
+            .expect("encrypt");
+        let replay = encrypt_ecdh_es("ECDH-ES", &public, b"owned fixture", replay_env.entropy())
+            .expect("replay");
+        assert_eq!(
+            first, replay,
+            "every random input comes from the supplied seam"
+        );
+        let second = encrypt_ecdh_es("ECDH-ES", &public, b"owned fixture", first_env.entropy())
+            .expect("next encrypt");
+        let (_, _, first_iv, _, _) = split_compact(&first).expect("first compact");
+        let (_, _, second_iv, _, _) = split_compact(&second).expect("next compact");
+        assert_ne!(first_iv, second_iv, "each encryption consumes a fresh IV");
+        assert_eq!(URL_SAFE_NO_PAD.decode(first_iv).expect("IV").len(), 12);
     }
 
     #[test]
