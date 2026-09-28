@@ -1532,7 +1532,15 @@ async fn mint_front_channel_id_token(
         // silently discarded by the one caller that happens not to need half of it.
         access_extra_claims: &access_extra_claims,
     };
-    tokens::mint_id_token(state, signer, entry.policy(), &request).map(|(id_token, _jti)| id_token)
+    let id_token = tokens::mint_id_token(state, signer, entry.policy(), &request)
+        .map(|(id_token, _jti)| id_token)?;
+    // THE SIGN-THEN-ENCRYPT ARM (issue #158): a client registered for the
+    // encrypted ID-token response gets the JWS wrapped in an ECDH-ES JWE to its
+    // registered public key.
+    match tokens::encrypt_id_token_for_client(state, scope, &client_id_str, &id_token).await {
+        Some(encrypted) => Ok(encrypted),
+        None => Ok(id_token),
+    }
 }
 
 /// The claims to embed in a PURE front-channel ID token (`response_type=id_token`),
