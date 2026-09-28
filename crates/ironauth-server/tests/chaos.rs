@@ -58,8 +58,12 @@ async fn postgres_dies_the_probe_marks_hard_down_and_recovers() {
     let app = server.management_app();
 
     // SERVING: the schema is migrated and the query-backed probe answers ready.
-    let (status, _, body) =
-        eventually(|| get(app.clone(), "/readyz"), Duration::from_secs(30)).await;
+    let (status, _, body) = eventually(
+        || get(app.clone(), "/readyz"),
+        StatusCode::OK,
+        Duration::from_secs(30),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "serving: {body}");
     assert_eq!(body, "ready\n");
 
@@ -68,8 +72,12 @@ async fn postgres_dies_the_probe_marks_hard_down_and_recovers() {
 
     // HARD DOWN, AND ONLY READY IS DOWN: the documented 503 body, while liveness and the
     // scrape surface keep serving.
-    let (status, _, body) =
-        eventually(|| get(app.clone(), "/readyz"), Duration::from_secs(30)).await;
+    let (status, _, body) = eventually(
+        || get(app.clone(), "/readyz"),
+        StatusCode::SERVICE_UNAVAILABLE,
+        Duration::from_secs(30),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::SERVICE_UNAVAILABLE,
@@ -95,8 +103,12 @@ async fn postgres_dies_the_probe_marks_hard_down_and_recovers() {
     // RECOVERY: start the postmaster again; the same pool reconnects and the probe returns
     // to ready.
     cluster.resume();
-    let (status, _, body) =
-        eventually(|| get(app.clone(), "/readyz"), Duration::from_secs(60)).await;
+    let (status, _, body) = eventually(
+        || get(app.clone(), "/readyz"),
+        StatusCode::OK,
+        Duration::from_secs(60),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "recovered: {body}");
     assert_eq!(body, "ready\n");
 }
@@ -112,37 +124,80 @@ async fn eventually_body(
     expected: &str,
     timeout: Duration,
 ) -> (StatusCode, String) {
-    let deadline = Instant::now() + timeout; // invariant-allow: time-via-env
-    let mut last = get(app.clone(), "/readyz").await;
-    let now = Instant::now(); // invariant-allow: time-via-env
-    while now < deadline && last.2 != expected {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        last = get(app.clone(), "/readyz").await;
-    }
-    (last.0, last.2)
+    let (status, _, body) = eventually_matching(
+        || get(app.clone(), "/readyz"),
+        |answer| answer.2 == expected,
+        timeout,
+    )
+    .await;
+    (status, body)
 }
 
-/// Poll `f` until it answers or `timeout` elapses, returning the LAST answer either way.
-///
-/// The pool's view of a dead server is not instant: a connection is acquired and the query
-/// fails, then the pool ages the connection out. Polling rather than asserting once is what
-/// makes this test measure the outcome instead of the timing.
+/// Poll for the requested status, with one deadline covering requests and sleeps.
 async fn eventually<F, Fut>(
-    mut f: F,
+    f: F,
+    expected: StatusCode,
     timeout: Duration,
 ) -> (StatusCode, axum::http::HeaderMap, String)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = (StatusCode, axum::http::HeaderMap, String)>,
 {
-    let deadline = Instant::now() + timeout; // invariant-allow: time-via-env
-    let mut last = f().await; // invariant-allow: time-via-env
-    let now = Instant::now(); // invariant-allow: time-via-env
-    while now < deadline && last.0 != StatusCode::OK {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        last = f().await;
-    }
-    last
+    eventually_matching(f, |answer| answer.0 == expected, timeout).await
+}
+
+async fn eventually_matching<F, Fut, P>(
+    mut f: F,
+    matches: P,
+    timeout: Duration,
+) -> (StatusCode, axum::http::HeaderMap, String)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = (StatusCode, axum::http::HeaderMap, String)>,
+    P: Fn(&(StatusCode, axum::http::HeaderMap, String)) -> bool,
+{
+    let mut last = None;
+    let _deadline = tokio::time::timeout(timeout, async {
+        loop {
+            let answer = f().await;
+            let complete = matches(&answer);
+            last = Some(answer);
+            if complete {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    last.expect("readiness did not return even one response before its deadline")
+}
+
+#[tokio::test]
+async fn polling_returns_the_last_nonmatching_status_at_its_deadline() {
+    let mut calls = 0;
+    let answer = eventually(
+        || {
+            calls += 1;
+            std::future::ready((
+                StatusCode::OK,
+                axum::http::HeaderMap::new(),
+                "still serving".to_owned(),
+            ))
+        },
+        StatusCode::SERVICE_UNAVAILABLE,
+        Duration::from_millis(10),
+    )
+    .await;
+    assert_eq!(calls, 1, "the deadline expires during the polling sleep");
+    assert_eq!(answer.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn body_polling_returns_the_last_nonmatching_body_at_its_deadline() {
+    let app = axum::Router::new().route("/readyz", axum::routing::get(|| async { "ready\n" }));
+    let (status, body) = eventually_body(app, "not ready\n", Duration::from_millis(10)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "ready\n");
 }
 
 /// The binary's readiness probe, reproduced here: a query through the serving pool.
@@ -397,8 +452,12 @@ async fn ironcache_dies_the_probe_marks_degraded_and_recovers() {
     let app = server.management_app();
 
     // CACHE UP: the declared accelerator answers, so the instance is fully ready.
-    let (status, _, body) =
-        eventually(|| get(app.clone(), "/readyz"), Duration::from_secs(30)).await;
+    let (status, _, body) = eventually(
+        || get(app.clone(), "/readyz"),
+        StatusCode::OK,
+        Duration::from_secs(30),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "cache up: {body}");
     assert_eq!(body, "ready\n");
 
@@ -407,8 +466,12 @@ async fn ironcache_dies_the_probe_marks_degraded_and_recovers() {
 
     // DEGRADED, NOT DOWN: 200 with the documented token, because every flow still
     // completes and only the accelerator is missing.
-    let (status, _, body) =
-        eventually(|| get(app.clone(), "/readyz"), Duration::from_secs(30)).await;
+    let (status, _, body) = eventually(
+        || get(app.clone(), "/readyz"),
+        StatusCode::OK,
+        Duration::from_secs(30),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "degraded stays a 200: {body}");
     assert_eq!(
         body, "degraded: accelerator_absent\n",
@@ -418,8 +481,12 @@ async fn ironcache_dies_the_probe_marks_degraded_and_recovers() {
     // RECOVERY: the cache comes back on the SAME port, and the probe returns to ready.
     cache.restart();
     wait_for_port(port, Duration::from_secs(30));
-    let (status, _, body) =
-        eventually(|| get(app.clone(), "/readyz"), Duration::from_secs(60)).await;
+    let (status, _, body) = eventually(
+        || get(app.clone(), "/readyz"),
+        StatusCode::OK,
+        Duration::from_secs(60),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "recovered: {body}");
     assert_eq!(body, "ready\n");
 }
@@ -551,8 +618,12 @@ async fn ironbus_dies_the_probe_marks_degraded_and_recovers() {
     let app = server.management_app();
 
     // BROKER UP: the declared backbone answers, so the instance is fully ready.
-    let (status, _, body) =
-        eventually(|| get(app.clone(), "/readyz"), Duration::from_secs(30)).await;
+    let (status, _, body) = eventually(
+        || get(app.clone(), "/readyz"),
+        StatusCode::OK,
+        Duration::from_secs(30),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "broker up: {body}");
     assert_eq!(body, "ready\n");
 

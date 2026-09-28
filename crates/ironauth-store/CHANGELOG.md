@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Preserve the already published `signing_key.break_glass` v1 event name through
+  an exact legacy-wire exception; newly registered event names still require past tense.
+
+
 - Add `Store::probe_readiness` (issue #149): the query `/readyz` asks, on the pool requests
   are served from rather than a fresh connection. Reports whether the schema is one this
   build can serve, treating a pending `Phase::Contract` migration as healthy because

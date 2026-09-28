@@ -88,6 +88,7 @@ fn operation_ids_are_the_stable_set() {
             "activateTraitSchemaVersion",
             "addOrgGroupMember",
             "addUserIdentifier",
+            "advanceSigningKeyRotation",
             "allowSmsCountry",
             "applyConfigPromotion",
             "applyIdentifierUniqueness",
@@ -99,6 +100,7 @@ fn operation_ids_are_the_stable_set() {
             "authorizeUserImpersonation",
             "authzenEvaluation",
             "authzenEvaluations",
+            "breakGlassSigningKeyRotation",
             "bulkRevokeSessions",
             "clearOrgDefaultRole",
             "clearQuotaLimit",
@@ -284,6 +286,7 @@ fn operation_ids_are_the_stable_set() {
             "listServiceAccountApiKeys",
             "listSessionTokenTemplates",
             "listSessions",
+            "listSigningKeyRotation",
             "listSignupQuarantines",
             "listSmsAllowlist",
             "listStepUpPolicies",
@@ -717,6 +720,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/allowlist",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/config",
@@ -816,6 +820,8 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}/rotate",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/revoke",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}/revoke",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation/advance",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation/break-glass",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/approve",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/extend",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine/{user_id}/reject",
@@ -966,7 +972,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        308,
+        311,
         "the documented route count is pinned"
     );
 

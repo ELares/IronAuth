@@ -1053,12 +1053,7 @@ async fn mint_and_persist(
     // revocable and introspectable by construction (the SAME grant chain). The
     // client id was a valid scoped identifier when it authenticated, so it parses
     // here; a parse failure is defensive fail-closed server error.
-    let client_id = state
-        .store()
-        .scoped(scope)
-        .clients()
-        .parse_id(client_id_str)
-        .map_err(|_| TokenError::ServerError)?;
+    let client_id = parsed_client_id(state, scope, client_id_str)?;
     let grant_id = GrantId::generate(state.env(), &scope);
     let access = match &minted {
         MintedAccessToken::Jwt { jti, .. } => ClientCredentialsAccess::Jwt { jti },
@@ -1115,6 +1110,19 @@ async fn mint_and_persist(
         crate::token::record_agent_issuance(state, scope, agent, requested_scope).await;
     }
     Ok(jwt_bearer_response(&minted, expires_in, requested_scope))
+}
+
+fn parsed_client_id(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &str,
+) -> Result<ironauth_store::ClientId, TokenError> {
+    state
+        .store()
+        .scoped(scope)
+        .clients()
+        .parse_id(client_id)
+        .map_err(|_| TokenError::ServerError)
 }
 
 /// Record a jwt-bearer grant failure diagnostic out of band, best effort, in the

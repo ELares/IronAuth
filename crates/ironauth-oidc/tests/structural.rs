@@ -189,7 +189,7 @@ fn response_type_registry_is_the_four_token_free_members_only() {
 }
 
 #[test]
-fn response_mode_registry_has_no_token_leaking_mode_and_parses_its_three() {
+fn response_mode_registry_keeps_client_gated_jarm_out_of_global_defaults() {
     // The three modes: query, fragment, form_post. Each round-trips; the always-on
     // base is query only (fragment and form_post are per-environment, issue #17).
     assert_eq!(
@@ -204,8 +204,17 @@ fn response_mode_registry_has_no_token_leaking_mode_and_parses_its_three() {
     for mode in ResponseMode::ALL {
         assert_eq!(ResponseMode::parse(mode.as_str()), Some(*mode));
     }
-    // The JARM `jwt` response mode is M16, not representable here.
-    assert!(ResponseMode::parse("jwt").is_none());
+    // JARM is representable, but requires registered client metadata rather
+    // than becoming a default or globally enabled response mode.
+    for mode in [
+        ResponseMode::Jwt,
+        ResponseMode::FragmentJwt,
+        ResponseMode::FormPostJwt,
+    ] {
+        assert_eq!(ResponseMode::parse(mode.as_str()), Some(mode));
+        assert!(!ResponseMode::ALL.contains(&mode));
+        assert!(!ResponseMode::DEFAULT.contains(&mode));
+    }
     assert!(ResponseMode::parse("").is_none());
 }
 

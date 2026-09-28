@@ -987,8 +987,7 @@ async fn validate_metadata(
     let hardened = crate::fapi_hardened::is_hardened(state, scope)
         .await
         .unwrap_or(false);
-    if hardened
-        && !crate::fapi_hardened::hardened_permits_client_auth_method(auth_method.as_str())
+    if hardened && !crate::fapi_hardened::hardened_permits_client_auth_method(auth_method.as_str())
     {
         return Err(RegistrationError::metadata_owned(
             crate::fapi_hardened::hardened_auth_method_refusal(auth_method.as_str()),
@@ -1023,11 +1022,9 @@ async fn validate_metadata(
         if let Some(alg) = token_endpoint_auth_signing_alg.as_ref() {
             let parsed = ironauth_jose::JwsAlgorithm::from_jose_name(alg);
             if !parsed.is_some_and(crate::fapi_hardened::hardened_permits_algorithm) {
-                return Err(RegistrationError::metadata_owned(
-                    format!(
-                        "a hardened (FAPI 2.0) environment permits only PS256, ES256, or                          EdDSA as the token-endpoint signing algorithm, not {alg}"
-                    ),
-                ));
+                return Err(RegistrationError::metadata_owned(format!(
+                    "a hardened (FAPI 2.0) environment permits only PS256, ES256, or                          EdDSA as the token-endpoint signing algorithm, not {alg}"
+                )));
             }
         }
     }
@@ -1051,10 +1048,10 @@ async fn validate_metadata(
         jwks_uri,
         token_endpoint_auth_signing_alg,
         userinfo_signed_response_alg,
-authorization_signed_response_alg,
-id_token_encrypted_response_alg,
-id_token_encrypted_response_enc,
-})
+        authorization_signed_response_alg,
+        id_token_encrypted_response_alg,
+        id_token_encrypted_response_enc,
+    })
 }
 
 /// Validate `token_endpoint_auth_method` against the ACTUALLY IMPLEMENTED suite
@@ -1360,7 +1357,7 @@ fn validate_authorization_signing_alg(
     }
 }
 /// Validate the `id_token_encrypted_response_alg` (issue #158): only the
-/// shipped ECDH-ES is accepted; the refused families (RSA1_5, PBKDF2) are
+/// shipped ECDH-ES is accepted; the refused families (`RSA1_5`, PBKDF2) are
 /// rejected at registration. Absent means the plain signed ID token.
 fn validate_id_token_encrypted_alg(
     metadata: &serde_json::Map<String, Value>,
@@ -1397,9 +1394,6 @@ fn validate_id_token_encrypted_enc(
         )),
     }
 }
-
-
-
 
 /// Validate the `jwks` / `jwks_uri` pair. They are MUTUALLY EXCLUSIVE. A
 /// `private_key_jwt` client MUST supply exactly one usable source; other methods

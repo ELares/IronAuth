@@ -351,7 +351,9 @@ run_required "TypeScript hook test fixture built from source" ./scripts/build-ts
 # Note the scope precisely: the marker guards the LOWERED threshold, which is what that
 # variable added. A sweep at the six-hour default is behaviour that predates it and still
 # runs, so a cluster you share with a run older than six hours is not protected by this.
-run "test" scripts/with-test-db.sh cargo test --workspace --all-features
+# Keep running the other test binaries when one fails, just as this gate keeps
+# running its other lanes. Cargo still returns nonzero if any target fails.
+run "test" scripts/with-test-db.sh cargo test --workspace --all-features --no-fail-fast
 
 run "invariant lints" scripts/invariant-lints.sh
 

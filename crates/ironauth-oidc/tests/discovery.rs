@@ -223,9 +223,9 @@ async fn default_policy_environment_publishes_the_explicit_traps_and_rs256_floor
 }
 
 #[test]
-fn es256_only_policy_bans_eddsa_everywhere_but_keeps_the_rs256_floor() {
-    // Acceptance criterion 4: an ES256-only environment advertises NO EdDSA in any
-    // *_supported array, while RS256 remains as the id-token floor. Driven at the
+fn es256_issuance_policy_preserves_the_independent_client_verification_matrix() {
+    // An ES256-only environment signs its own tokens under that policy, while
+    // client-signed assertions use the separate verification matrix. Driven at the
     // generator with an explicit policy (the live mount uses the default policy
     // until per-environment policy sources load in issue #194).
     let policy = SigningPolicy::new(vec![JwsAlgorithm::Es256]).expect("policy");
@@ -241,15 +241,25 @@ fn es256_only_policy_bans_eddsa_everywhere_but_keeps_the_rs256_floor() {
     let algs = string_array(&doc, "id_token_signing_alg_values_supported");
     assert_eq!(algs, vec!["ES256".to_owned(), "RS256".to_owned()]);
 
+    // OIDC Discovery section 3 and RFC 9101 section 6.2 describe algorithms for
+    // verifying the CLIENT's Request Object, not selecting the OP's token key.
+    // Pin the complete matrix rather than merely exempting this field below.
+    assert_eq!(
+        string_array(&doc, "request_object_signing_alg_values_supported"),
+        ironauth_oidc::assertion_signing_alg_values(),
+    );
+
     // No *_supported array anywhere mentions EdDSA under an ES256-only policy,
-    // EXCEPT the `*_endpoint_auth_signing_alg_values_supported` fields: those are the
+    // EXCEPT the Request Object and endpoint-auth fields: those are the
     // fixed `private_key_jwt` assertion-VERIFY matrix (issue #25) the token, revocation,
     // and introspection endpoints (issue #22) share, which is independent of the
     // environment's id-token signing policy, so they advertise the whole asymmetric
     // family (EdDSA included) even here.
     let object = doc.as_object().expect("object");
     for (key, value) in object {
-        if key.ends_with("_endpoint_auth_signing_alg_values_supported") {
+        if key.ends_with("_endpoint_auth_signing_alg_values_supported")
+            || key == "request_object_signing_alg_values_supported"
+        {
             continue;
         }
         if key.ends_with("_supported") {
@@ -859,7 +869,8 @@ async fn discovery_advertises_the_registered_authorization_details_types() {
 /// being absent from every other algorithm array.
 #[test]
 fn hardened_discovery_reflects_the_restricted_capability_set() {
-    let policy = SigningPolicy::new(vec![JwsAlgorithm::EdDsa, JwsAlgorithm::Rs256]).expect("policy");
+    let policy =
+        SigningPolicy::new(vec![JwsAlgorithm::EdDsa, JwsAlgorithm::Rs256]).expect("policy");
     let issuer = "https://issuer.test/t/tnt/e/env";
     let jwks_uri = format!("{issuer}/jwks.json");
     let caps = DiscoveryCapabilities::default().with_hardened(true);
@@ -884,9 +895,13 @@ fn hardened_discovery_reflects_the_restricted_capability_set() {
     assert!(id_algs.contains(&"EdDSA".to_owned()), "{id_algs:?}");
     // The assertion matrix excludes RS256 entirely.
     let assertion_algs = string_array(&doc, "token_endpoint_auth_signing_alg_values_supported");
-    assert!(!assertion_algs.contains(&"RS256".to_owned()), "{assertion_algs:?}");
     assert!(
-        !assertion_algs.contains(&"RS384".to_owned()) && !assertion_algs.contains(&"PS512".to_owned()),
+        !assertion_algs.contains(&"RS256".to_owned()),
+        "{assertion_algs:?}"
+    );
+    assert!(
+        !assertion_algs.contains(&"RS384".to_owned())
+            && !assertion_algs.contains(&"PS512".to_owned()),
         "the assertion matrix is the hardened set: {assertion_algs:?}"
     );
 }
