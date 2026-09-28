@@ -1343,8 +1343,7 @@ pub async fn mint_client_credentials_access_token(
                     &claims_bytes,
                     TokenTyp::AccessToken,
                 )
-                .await
-                .map_err(|_| ())?
+                .await?
             } else {
                 sign_jws_with_policy(
                     policy,
@@ -1465,8 +1464,7 @@ pub async fn mint(
             &id_claims_bytes,
             TokenTyp::IdToken,
         )
-        .await
-        .map_err(|_| ())?
+        .await?
     } else {
         sign_jws_with_policy(
             policy,
@@ -1661,8 +1659,7 @@ async fn mint_at_jwt(
             &payload,
             TokenTyp::AccessToken,
         )
-        .await
-        .map_err(|_| ())?
+        .await?
     } else {
         sign_jws_with_policy(policy, signer, &payload, &options).map_err(|_| ())?
     };
@@ -1735,7 +1732,7 @@ fn at_jwt_payload(
 /// from the raw signature. The warning half of the guard increments
 /// `ironauth_signing_input_oversized_total`.
 async fn sign_through_backend(
-    state: &OidcState,
+    _state: &OidcState,
     backend: &Arc<dyn ironauth_jose::external_signer::ExternalSigner>,
     kid: &str,
     alg: JwsAlgorithm,
@@ -1799,10 +1796,8 @@ pub(crate) async fn encrypt_id_token_for_client(
     }
     let jwks_text = record.jwks.as_deref()?;
     let jwks: serde_json::Value = serde_json::from_str(jwks_text).ok()?;
-    let Some(keys) = jwks.get("keys").and_then(|v| v.as_array()) else {
-        return None;
-    };
-    for key in keys.iter() {
+    let keys = jwks.get("keys").and_then(|v| v.as_array())?;
+    for key in keys {
         let kty = key.get("kty").and_then(|v| v.as_str());
         let crv = key.get("crv").and_then(|v| v.as_str());
         let Some(x) = key.get("x").and_then(|v| v.as_str()) else {
@@ -1822,7 +1817,7 @@ pub(crate) async fn encrypt_id_token_for_client(
             let mut sec1 = vec![0x04];
             sec1.extend_from_slice(&x_bytes);
             sec1.extend_from_slice(&y_bytes);
-            use ironauth_env::Entropy as _;
+
             return ironauth_jose::jwe::encrypt_ecdh_es(
                 "ECDH-ES",
                 &sec1,

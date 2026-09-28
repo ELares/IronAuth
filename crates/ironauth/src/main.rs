@@ -2081,7 +2081,7 @@ async fn build_oidc_plane(
         None => OidcState::new(store, env, registry, oidc_config, issuer_base),
     }
     .with_mtls_anchors(mtls_anchors(&config.mtls))
-    .with_signer_backend(signer_backend(&config))
+    .with_signer_backend(signer_backend(config))
     .with_signed_introspection_opt(oidc_config.introspection_signed_ttl_secs)
     .with_org_provisioning(org_provisioning)
     .with_global_token_revocation_enabled(surfaces.global_revocation)

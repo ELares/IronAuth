@@ -721,11 +721,11 @@ fn set_cors_origin(headers: &mut HeaderMap, origin: &str) {
 }
 
 /// A `200 OK` `UserInfo` response: the claims JSON, `no-store` cached.
-/// Render the UserInfo success (issue #158, OIDC Core 5.3.2): the plain JSON
+/// Render the `UserInfo` success (issue #158, OIDC Core 5.3.2): the plain JSON
 /// form by default; the SIGNED JWT form when the client registered
 /// `userinfo_signed_response_alg` - the claims plus the mandatory `iss` and
 /// `aud`, signed with the environment's key, content type `application/jwt`.
-/// Render the UserInfo success (issue #158, OIDC Core 5.3.2): the plain JSON
+/// Render the `UserInfo` success (issue #158, OIDC Core 5.3.2): the plain JSON
 /// form by default; the SIGNED JWT form when the client registered
 /// `userinfo_signed_response_alg` - the claims plus the mandatory `iss` and
 /// `aud`, signed with the environment's key, content type `application/jwt`.
@@ -757,7 +757,7 @@ async fn success(
         .into_response()
 }
 
-/// The client's registered UserInfo signing algorithm (issue #158): the scoped
+/// The client's registered `UserInfo` signing algorithm (issue #158): the scoped
 /// record's `userinfo_signed_response_alg`; `None` (the default) keeps the plain
 /// JSON form.
 async fn userinfo_signing_alg(state: &OidcState, client_id: &str, scope: Scope) -> Option<String> {
@@ -772,7 +772,7 @@ async fn userinfo_signing_alg(state: &OidcState, client_id: &str, scope: Scope) 
         .and_then(|record| record.userinfo_signed_response_alg)
 }
 
-/// Sign the released claims as the UserInfo JWT (issue #158): the claims plus
+/// Sign the released claims as the `UserInfo` JWT (issue #158): the claims plus
 /// `iss` (the environment's issuer) and `aud` (the client), signed with the
 /// environment's key.
 async fn sign_userinfo(

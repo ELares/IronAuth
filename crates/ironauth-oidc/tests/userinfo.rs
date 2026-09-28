@@ -103,7 +103,7 @@ async fn issue_tokens_with_document(
 }
 
 /// THE SIGNED-USERINFO CRITERION (issue #158, OIDC Core 5.3.2): a client that
-/// registered `userinfo_signed_response_alg` receives its UserInfo as a signed
+/// registered `userinfo_signed_response_alg` receives its `UserInfo` as a signed
 /// JWT (application/jwt) carrying `iss` and `aud`; the default stays plain JSON.
 #[tokio::test]
 async fn a_client_registered_for_signed_userinfo_receives_a_signed_jwt() {
@@ -137,7 +137,7 @@ async fn a_client_registered_for_signed_userinfo_receives_a_signed_jwt() {
         .clients()
         .update_dynamic(
             harness.env(),
-            &harness.client_id(),
+            harness.client_id(),
             ironauth_store::DynamicClientUpdate {
                 display_name: "signed userinfo",
                 auth_method: "none",

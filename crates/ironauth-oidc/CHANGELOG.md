@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Use the existing environment clock for JARM and signed-introspection issuance
+  timestamps, with checked integer conversion (issue #1437 prerequisite).
+  The private JARM render context now receives `state.now()` from authorize;
+  public exports and response capability settings are unchanged. Remove only
+  the unexported, unused duplicate signed-introspection serializer.
+
 - Add a disabled recipient-verification/proof core (issue #1436). The cookie
   ceremony requires the current subject, same origin and fresh authentication;
   verification never creates or upgrades a session. The online proof binds the

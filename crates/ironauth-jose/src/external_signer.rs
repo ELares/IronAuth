@@ -168,6 +168,11 @@ impl ExternalSigner for LocalSigner {
 /// (the signature must verify against the key the kid names), and the size
 /// ceiling's refusal (a backend whose declared ceiling the input exceeds must
 /// refuse BEFORE dispatch).
+///
+/// # Errors
+///
+/// Returns a description if a valid input is refused, its signature does not
+/// verify, or the backend fails to refuse an oversized input with its exact limit.
 pub async fn run_conformance_battery(
     backend: &(dyn ExternalSigner + '_),
     kid: &str,
@@ -245,11 +250,6 @@ mod tests {
         assert!(outcome.is_ok(), "the local backend passes: {outcome:?}");
     }
 
-    fn base64_url(bytes: &[u8]) -> String {
-        use base64::Engine as _;
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-    }
-
     /// THE SIZE CEILING (issue #161): the guard warns over 3 KB and hard-fails
     /// over the backend's declared ceiling before any dispatch.
     #[test]
@@ -273,16 +273,5 @@ mod tests {
                 size: 5000
             }
         );
-    }
-
-    trait NowOrNever {
-        fn now_or_never_ok(self) -> Option<Result<Vec<u8>, ExternalSignerError>>;
-    }
-    impl NowOrNever
-        for Pin<Box<dyn Future<Output = Result<Vec<u8>, ExternalSignerError>> + Send + '_>>
-    {
-        fn now_or_never_ok(self) -> Option<Result<Vec<u8>, ExternalSignerError>> {
-            futures_util::FutureExt::now_or_never(self)
-        }
     }
 }

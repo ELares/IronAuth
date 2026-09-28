@@ -1232,36 +1232,6 @@ async fn issue_code(
     //      the token endpoint's exact claim + signing path, carrying `nonce`, and
     //      (hybrid only) `c_hash` of the issued code, never an access token;
     //    - `none`: issue nothing.
-    /// Resolve the JARM signing context (issue #158): the client's registered
-    /// `authorization_signed_response_alg` + the environment's signing key + the
-    /// issuer. `None` when the client registered no JARM alg (the plain modes) or
-    /// the signer is unavailable.
-    async fn jarm_context<'a>(
-        state: &OidcState,
-        scope: Scope,
-        stored: &str,
-        iss: &'a str,
-    ) -> Option<(&'static str, &'a str)> {
-        // The client's registered JARM response algorithm: the record's
-        // authorization_signed_response_alg. A client without one keeps the plain
-        // modes (the JARM spec's per-client enablement).
-        let id = ClientId::parse_in_scope(stored, &scope).ok()?;
-        let record = state
-            .store()
-            .scoped(scope)
-            .clients()
-            .dynamic_registration(&id)
-            .await
-            .ok()?;
-        let alg = record.authorization_signed_response_alg.as_deref()?;
-        if !crate::fapi_hardened::hardened_permits_signing_alg_name(alg) {
-            return None;
-        }
-        // The alg is a STATIC name when the record's value is a recognized algorithm
-        // (the registration validated it); the hardened check above proves it parses.
-        let static_alg = ironauth_jose::JwsAlgorithm::from_jose_name(alg)?.as_jose_name();
-        Some((static_alg, iss))
-    }
 
     let code = if response_type.issues_code() {
         Some(persist_code(state, scope, stored, redirect_uri, &iss, mode, &resolved).await?)
@@ -1328,7 +1298,7 @@ async fn issue_code(
     let jarm = match (jarm_ctx, entry.as_ref()) {
         (Some((alg, _iss)), Some(entry)) => entry
             .signer(state.now())
-            .map(|key| (key, alg, iss.as_str())),
+            .map(|key| (key, alg, iss.as_str(), state.now())),
         _ => None,
     };
     Ok(response::render(mode, redirect_uri, &params, jarm))
@@ -1759,7 +1729,7 @@ pub(crate) fn validate_request<'a>(
     // 4c. PAR MANDATORY (FAPI 2.0 §6.2): a hardened environment only accepts a
     //    request that arrived through the PAR endpoint's `request_uri`, delivered
     //    by the already-negotiated mode.
-    if hardened && params.request_uri.is_none() {
+    if hardened && !crate::fapi_hardened::hardened_par_conformant(params.request_uri.is_some()) {
         return Err(AuthRequestError::redirect(
             redirect_uri,
             mode,
@@ -1802,12 +1772,42 @@ pub(crate) fn validate_request<'a>(
         state,
         client,
         params,
-        redirect_uri,
+        (redirect_uri, mode),
         response_type,
-        mode,
         nonce,
         hardened,
     )
+}
+
+/// Resolve the JARM signing context (issue #158): the client's registered
+/// `authorization_signed_response_alg` + the environment's signing key + the
+/// issuer. `None` when the client registered no JARM alg (the plain modes) or
+/// the signer is unavailable.
+async fn jarm_context<'a>(
+    state: &OidcState,
+    scope: Scope,
+    stored: &str,
+    iss: &'a str,
+) -> Option<(&'static str, &'a str)> {
+    // The client's registered JARM response algorithm: the record's
+    // authorization_signed_response_alg. A client without one keeps the plain
+    // modes (the JARM spec's per-client enablement).
+    let id = ClientId::parse_in_scope(stored, &scope).ok()?;
+    let record = state
+        .store()
+        .scoped(scope)
+        .clients()
+        .dynamic_registration(&id)
+        .await
+        .ok()?;
+    let alg = record.authorization_signed_response_alg.as_deref()?;
+    if !crate::fapi_hardened::hardened_permits_signing_alg_name(alg) {
+        return None;
+    }
+    // The alg is a STATIC name when the record's value is a recognized algorithm
+    // (the registration validated it); the hardened check above proves it parses.
+    let static_alg = ironauth_jose::JwsAlgorithm::from_jose_name(alg)?.as_jose_name();
+    Some((static_alg, iss))
 }
 
 /// The tail of the shared validator (steps 5-5d): PKCE, the `claims` request
@@ -1818,12 +1818,12 @@ fn validate_request_tail<'a>(
     state: &OidcState,
     client: &ResolvedClient<'_>,
     params: &'a AuthorizeParams,
-    redirect_uri: &'a str,
+    redirect: (&'a str, ResponseMode),
     response_type: ResponseType,
-    mode: ResponseMode,
     nonce: Option<&'a str>,
     hardened: bool,
 ) -> Result<ValidatedRequest<'a>, AuthRequestError> {
+    let (redirect_uri, mode) = redirect;
     // Every step below delivers its error as an invalid_request redirect by the
     // already-negotiated mode; this closure captures that one shape (both captures are
     // Copy, so it is reusable across the steps).
@@ -1845,7 +1845,7 @@ fn validate_request_tail<'a>(
             redirect_uri,
             mode,
             AuthzErrorCode::InvalidRequest,
-            &crate::fapi_hardened::hardened_auth_method_refusal(client.auth_method()),
+            crate::fapi_hardened::hardened_auth_method_refusal(client.auth_method()),
         ));
     }
 
@@ -2026,7 +2026,7 @@ fn resolve_pkce(
         Some(challenge) if !challenge.is_empty() => {
             // A challenge requires an EXPLICIT S256 method (a defaulted `plain` is
             // forbidden).
-            if named_method != Some(PkceMethod::S256.as_str()) {
+            if !crate::fapi_hardened::hardened_pkce_conformant(named_method) {
                 return Err("code_challenge_method must be S256");
             }
             // An S256 challenge is BASE64URL(SHA256(v)): exactly 43 unpadded

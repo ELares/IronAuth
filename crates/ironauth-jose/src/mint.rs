@@ -303,6 +303,7 @@ fn build_header(
 /// PUBLIC because the external-signer path (issue #161) builds the input here -
 /// exactly the bytes a remote backend must sign - and then assembles the compact
 /// form itself, without ever holding the private key.
+#[must_use]
 pub fn signing_input(header: &[u8], payload: &[u8]) -> String {
     format!(
         "{}.{}",
@@ -315,6 +316,7 @@ pub fn signing_input(header: &[u8], payload: &[u8]) -> String {
 ///
 /// PUBLIC for the same reason as [`signing_input`]: the external-signer path
 /// (issue #161) assembles a token from the backend's raw signature.
+#[must_use]
 pub fn assemble(signing_input: &str, signature: &[u8]) -> String {
     format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
 }

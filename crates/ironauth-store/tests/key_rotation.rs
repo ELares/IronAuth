@@ -347,10 +347,25 @@ async fn the_database_wide_pass_advances_every_environment_and_converges_on_repl
 /// the previous current key stays ACTIVE, exactly one key in the set.
 #[tokio::test]
 async fn a_backend_outage_during_seeding_leaves_the_previous_current_key_active() {
+    struct RecoveredProvisioner;
+    impl ironauth_store::key_rotation::RemoteKeyProvisioner for RecoveredProvisioner {
+        fn ensure_remote_key(
+            &self,
+            _kid: &str,
+            _algorithm: &str,
+        ) -> Result<(), ironauth_store::key_rotation::RemoteKeyProvisionError> {
+            Ok(())
+        }
+    }
+
     struct OutagedProvisioner;
     impl ironauth_store::key_rotation::RemoteKeyProvisioner for OutagedProvisioner {
-        fn ensure_remote_key(&self, _kid: &str, _algorithm: &str) -> Result<(), ()> {
-            Err(())
+        fn ensure_remote_key(
+            &self,
+            _kid: &str,
+            _algorithm: &str,
+        ) -> Result<(), ironauth_store::key_rotation::RemoteKeyProvisionError> {
+            Err(ironauth_store::key_rotation::RemoteKeyProvisionError)
         }
     }
 
@@ -379,12 +394,6 @@ async fn a_backend_outage_during_seeding_leaves_the_previous_current_key_active(
     );
 
     // The backend recovers: the same advance now seeds normally.
-    struct RecoveredProvisioner;
-    impl ironauth_store::key_rotation::RemoteKeyProvisioner for RecoveredProvisioner {
-        fn ensure_remote_key(&self, _kid: &str, _algorithm: &str) -> Result<(), ()> {
-            Ok(())
-        }
-    }
     let recovered = RecoveredProvisioner;
     let machine = RotationStateMachine::new(
         db.store(),

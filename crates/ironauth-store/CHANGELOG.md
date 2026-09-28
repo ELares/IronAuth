@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Give `RemoteKeyProvisioner::ensure_remote_key` a named opaque
+  `RemoteKeyProvisionError` instead of `()` (issue #1437 compiler prerequisite).
+  Implementors must update that result type; every failure still prevents key
+  promotion through the same store error mapping.
+
 - Restore existing app/control dynamic-client metadata updates after migration
   0238 by granting UPDATE on its new `userinfo_signed_response_alg` column only
   (issue #1437 prerequisite). Other grants remain unchanged, including the

@@ -77,39 +77,45 @@ impl VaultKeyProvisioner {
 }
 
 impl ironauth_store::key_rotation::RemoteKeyProvisioner for VaultKeyProvisioner {
-    fn ensure_remote_key(&self, kid: &str, _algorithm: &str) -> Result<(), ()> {
+    fn ensure_remote_key(
+        &self,
+        kid: &str,
+        _algorithm: &str,
+    ) -> Result<(), ironauth_store::key_rotation::RemoteKeyProvisionError> {
         let url = format!("{}/v1/{}/keys/{kid}", self.addr, self.mount);
         let token = Arc::clone(&self.token);
         let timeout = self.timeout;
         // The check is a HEAD-style read; the vault transit API answers 404 for a
         // missing key, and any non-success (including the timeout) is an outage.
         // The tokio runtime is present at every call site (the machine's pass).
-        tokio::runtime::Handle::current().block_on(async move {
-            let Ok(resolved) = token.resolve() else {
-                return Err(());
-            };
-            let request = ironauth_fetch::FetchRequest::get(
-                ironauth_fetch::FetchPurpose::ExternalSigner,
-                url,
-            )
-            .header(
-                axum::http::header::AUTHORIZATION,
-                axum::http::HeaderValue::from_str(&format!("Bearer {}", resolved.expose()))
-                    .map_err(|_| ())?,
-            )
-            .timeout(timeout)
-            .allow_plaintext_http();
-            let response = ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default())
-                .map_err(|_| ())?
-                .fetch(request)
-                .await
-                .map_err(|_| ())?;
-            if response.status().is_success() {
-                Ok(())
-            } else {
-                Err(())
-            }
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async move {
+                let Ok(resolved) = token.resolve() else {
+                    return Err(());
+                };
+                let request = ironauth_fetch::FetchRequest::get(
+                    ironauth_fetch::FetchPurpose::ExternalSigner,
+                    url,
+                )
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    axum::http::HeaderValue::from_str(&format!("Bearer {}", resolved.expose()))
+                        .map_err(|_| ())?,
+                )
+                .timeout(timeout)
+                .allow_plaintext_http();
+                let response = ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default())
+                    .map_err(|_| ())?
+                    .fetch(request)
+                    .await
+                    .map_err(|_| ())?;
+                if response.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            })
+            .map_err(|()| ironauth_store::key_rotation::RemoteKeyProvisionError)
     }
 }
 
@@ -223,7 +229,7 @@ impl ExternalSigner for VaultTransitSigner {
             if let Err(ref error) = response {
                 eprintln!("vault stub fetch error: {error:?}");
             }
-            let response = response.map_err(map_fetch_error)?;
+            let response = response.map_err(|error| map_fetch_error(&error))?;
             let payload: serde_json::Value = serde_json::from_slice(response.body())
                 .map_err(|_| ExternalSignerError::Backend)?;
             let signature = payload
@@ -247,15 +253,11 @@ impl ExternalSigner for VaultTransitSigner {
 /// The Vault algorithm + optional hash for a JOSE algorithm (issue #161).
 fn vault_algorithm(alg: JwsAlgorithm) -> (&'static str, Option<&'static str>) {
     match alg {
-        JwsAlgorithm::EdDsa => ("ed25519", None),
         JwsAlgorithm::Es256 => ("ecdsa-p256", None),
         JwsAlgorithm::Es384 => ("ecdsa-p384", None),
-        JwsAlgorithm::Rs256 => ("rsa-2048", Some("sha2-256")),
-        JwsAlgorithm::Rs384 => ("rsa-2048", Some("sha2-384")),
-        JwsAlgorithm::Rs512 => ("rsa-2048", Some("sha2-512")),
-        JwsAlgorithm::Ps256 => ("rsa-2048", Some("sha2-256")),
-        JwsAlgorithm::Ps384 => ("rsa-2048", Some("sha2-384")),
-        JwsAlgorithm::Ps512 => ("rsa-2048", Some("sha2-512")),
+        JwsAlgorithm::Rs256 | JwsAlgorithm::Ps256 => ("rsa-2048", Some("sha2-256")),
+        JwsAlgorithm::Rs384 | JwsAlgorithm::Ps384 => ("rsa-2048", Some("sha2-384")),
+        JwsAlgorithm::Rs512 | JwsAlgorithm::Ps512 => ("rsa-2048", Some("sha2-512")),
         // The  algorithm never reaches a signer (the mint refuses it before
         // selection); mapping it here keeps the match exhaustive without inventing
         // a Vault algorithm for a JWS that must not be signed.
@@ -265,7 +267,7 @@ fn vault_algorithm(alg: JwsAlgorithm) -> (&'static str, Option<&'static str>) {
 
 /// Map a fetch failure to the signer's boundary (issue #161): timeouts and
 /// throttles are retryable and distinct; everything else is opaque.
-fn map_fetch_error(error: FetchError) -> ExternalSignerError {
+fn map_fetch_error(error: &FetchError) -> ExternalSignerError {
     if matches!(error, FetchError::Timeout) {
         return ExternalSignerError::Timeout;
     }
@@ -278,8 +280,8 @@ mod tests {
     use std::sync::Arc;
 
     /// A stub transit endpoint the size of the shared battery: signs the input
-    /// with a local key (EdDSA) and returns Vault's envelope. A RAW listener (the
-    /// client_assertion pattern): the fetcher's test dialer forwards to it, and the
+    /// with a local key (`EdDSA`) and returns Vault's envelope. A RAW listener (the
+    /// `client_assertion` pattern): the fetcher's test dialer forwards to it, and the
     /// SSRF posture is bypassed by the resolver seam, so the stub never needs the
     /// axum server machinery.
     async fn stub_transit() -> (String, Arc<ironauth_jose::SigningKey>) {
@@ -325,8 +327,7 @@ mod tests {
                             "data": {
                                 "signature": format!("vault:v1:{}", STANDARD.encode(&sig))
                             }
-                        })
-                        .to_string(),
+                        }),
                     );
                     let _ = socket.write_all(response.as_bytes()).await;
                     let _ = socket.flush().await;

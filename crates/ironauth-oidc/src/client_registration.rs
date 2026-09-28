@@ -1357,7 +1357,7 @@ fn validate_authorization_signing_alg(
     }
 }
 /// Validate the `id_token_encrypted_response_alg` (issue #158): only the
-/// shipped ECDH-ES is accepted; the refused families (RSA1_5, PBKDF2) are
+/// shipped ECDH-ES is accepted; the refused families (`RSA1_5`, PBKDF2) are
 /// rejected at registration. Absent means the plain signed ID token.
 fn validate_id_token_encrypted_alg(
     metadata: &serde_json::Map<String, Value>,

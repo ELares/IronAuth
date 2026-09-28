@@ -3299,7 +3299,7 @@ pub struct DynamicClientRecord {
     /// client.
     pub id_token_signed_response_alg: Option<String>,
     /// The registered `userinfo_signed_response_alg` (issue #158, OIDC Core
-    /// 5.3.2): when set, the UserInfo response is a signed JWT. `None` (the
+    /// 5.3.2): when set, the `UserInfo` response is a signed JWT. `None` (the
     /// default) keeps the plain JSON form.
     pub userinfo_signed_response_alg: Option<String>,
     /// The registered JARM response algorithm (issue #158): when set, the
@@ -3367,7 +3367,7 @@ impl fmt::Debug for DynamicClientRecord {
             .field("quarantined", &self.quarantined)
             .field("verified_at_unix_micros", &self.verified_at_unix_micros)
             .field("has_dcr_policy_chain", &self.dcr_policy_chain.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -11957,7 +11957,7 @@ impl EnvironmentGuardrailRepo<'_> {
     /// The FAPI-hardened compliance scan (issue #156): every registered client in
     /// this scope whose configuration violates the hardened constraints, each
     /// named. An empty list is a conformant environment. The scan covers the
-    /// client-auth method (must be private_key_jwt or an mTLS method) and the
+    /// client-auth method (must be `private_key_jwt` or an mTLS method) and the
     /// registered signing algorithm (must be PS256/ES256/EdDSA).
     ///
     /// # Errors
@@ -58727,6 +58727,12 @@ impl ActingEnvironmentRepo<'_> {
         .await
     }
 
+    /// Set or clear the environment's account auto-link posture in an audited write.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no live environment matched under this tenant;
+    /// a store error if the database operation or audit write fails.
     pub async fn set_auto_link_posture(
         &self,
         env: &Env,

@@ -25,7 +25,7 @@
 //! The JWE Concat KDF (NIST SP 800-56A) derives the content key from the agreed
 //! key `Z`: SHA-256 over `Z || round(4 bytes) || Z-length(4 bytes) || Z ||
 //! AlgorithmID || PartyUInfo || PartyVInfo || SuppPubInfo || SuppPrivInfo`. For
-//! `ECDH-ES` the derived key IS the CEK; the `alg` in the AlgorithmID is the
+//! `ECDH-ES` the derived key IS the CEK; the `alg` in the `AlgorithmID` is the
 //! content-encryption algorithm (`A256GCM`), per RFC 7518 section 4.6.
 
 use base64::Engine as _;
@@ -35,7 +35,7 @@ use ring::aead::{AES_256_GCM, Aad as RingAad, LessSafeKey, Nonce, UnboundKey};
 
 use crate::crypto::sha256;
 
-/// The refused JWE algorithm families: RSA1_5 (Bleichenbacher class) and the
+/// The refused JWE algorithm families: `RSA1_5` (Bleichenbacher class) and the
 /// PBKDF2-based algorithms. Refused at the PARSE, never implemented.
 pub const REFUSED_JWE_ALGORITHMS: &[&str] = &[
     "RSA1_5",
@@ -56,7 +56,7 @@ const CONTENT_ENC: &str = "A256GCM";
 /// A JWE processing failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JweError {
-    /// The algorithm is refused or unsupported (RSA1_5, the PBKDF2 family, or
+    /// The algorithm is refused or unsupported (`RSA1_5`, the PBKDF2 family, or
     /// anything outside the curated suite).
     UnsupportedAlgorithm,
     /// The ciphertext does not decrypt (a wrong key, a tampered compact form, or
@@ -171,16 +171,20 @@ fn split_compact(compact: &str) -> Option<(&str, &str, &str, &str, &str)> {
 /// The JWE Concat KDF (NIST SP 800-56A, RFC 7518 section 4.6): derive `key_len`
 /// bytes from the agreed key `z` for the content-encryption `alg`.
 fn concat_kdf(z: &[u8], alg: &str, key_len: usize) -> Vec<u8> {
+    // Both callers use a 32-byte P-256 secret, A256GCM and a 32-byte key.
+    let secret_len = u32::try_from(z.len()).expect("the fixed P-256 secret length fits u32");
+    let algorithm_len = u32::try_from(alg.len()).expect("the fixed algorithm length fits u32");
+    let key_bits = u32::try_from(key_len * 8).expect("the fixed content key bit length fits u32");
     let mut hash_input = Vec::new();
     hash_input.extend_from_slice(&1_u32.to_be_bytes());
-    hash_input.extend_from_slice(&(z.len() as u32).to_be_bytes());
+    hash_input.extend_from_slice(&secret_len.to_be_bytes());
     hash_input.extend_from_slice(z);
-    hash_input.extend_from_slice(&(alg.len() as u32).to_be_bytes());
+    hash_input.extend_from_slice(&algorithm_len.to_be_bytes());
     hash_input.extend_from_slice(alg.as_bytes());
     // The empty PartyUInfo/PartyVInfo and the empty SuppPrivInfo are the default
     // (no apu/apv supplied); SuppPubInfo is the key-length bits.
     hash_input.extend_from_slice(&[0, 0, 0, 0]);
-    hash_input.extend_from_slice(&((key_len * 8) as u32).to_be_bytes());
+    hash_input.extend_from_slice(&key_bits.to_be_bytes());
     hash_input.extend_from_slice(&[0, 0, 0, 0]);
     sha256(&hash_input)[..key_len].to_vec()
 }
@@ -315,7 +319,7 @@ mod tests {
         let (private, public) = p256_keypair(env.entropy());
         let compact =
             encrypt_ecdh_es("ECDH-ES", &public, b"secret", env.entropy()).expect("encrypt");
-        let tampered = format!("{}x", compact);
+        let tampered = format!("{compact}x");
         assert!(decrypt_ecdh_es("ECDH-ES", &tampered, &private).is_err());
     }
 
