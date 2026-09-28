@@ -533,6 +533,21 @@ jobs:
     name: hot state (ironcache mode)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # The full OIDC testing suite also needs isolated real databases. The cache
+    # accelerates hot state; it does not replace PostgreSQL or its isolation tests.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --shm-size=1g
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     # ISSUE #146 CRITERION 6: "the full test suite passes in both modes (Postgres-only and
     # IronCache-attached)". The Postgres-only half is every other job in this file, which runs
     # with no accelerator and no IRONCACHE_ADDR.
@@ -549,6 +564,9 @@ jobs:
     # and binding only here. That is the whole reason this job exists: without it the IronCache
     # implementation would be code that compiles and that nothing ever runs.
     env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # This job owns the disposable service container and all its test databases.
+      IRONAUTH_TEST_DB_DISPOSABLE: "1"
       IRONCACHE_ADDR: 127.0.0.1:17379
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
