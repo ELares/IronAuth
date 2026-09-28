@@ -786,6 +786,16 @@ validates a previously issued JWT can keep accepting it until `exp`. The default
 access-token lifetime is 300 seconds. See [token formats](design/TOKEN-FORMATS.md)
 and [agent revocation](agents.md#revocation-stated-plainly).
 
+### Recipient proof for relying-party invitations
+
+A gated core exists for authenticated primary-mailbox verification and an online
+recipient match. It has **no production enable switch**. All three routes return
+`503 recipient_verification_unavailable` unless an owned test transport is
+installed by the test harness. Existing OTP/logging senders cannot enable it.
+Real delivery, hosted recovery UI and a controlled canonical-index backfill for
+existing scopes remain acceptance work in [issue #1436](https://github.com/ELares/IronAuth/issues/1436).
+See [the exact contract and readiness limits](design/RECIPIENT-VERIFICATION.md).
+
 ### Authentication methods and account self-service
 
 | Capability | User experience and controls |
@@ -1179,6 +1189,8 @@ at the top of the file, or map it in `.taplo.toml`).
 | `messaging` | table | see fields | Outbound message delivery (issue #111). |
 | `messaging.delivery_enabled` | boolean | `false` | Whether THIS process drains the `message.delivery` queue. OFF by default, like every other outbound consumer: no deployment gains mandatory background infrastructure by upgrading, and a deployment that wants messages says so. |
 | `messaging.providers` | array | empty | The providers to try, in failover order. Empty is valid while delivery is off. |
+| `mtls` | table | see fields | Mutual-TLS client authentication (issue #159): the PKI method's trust anchors. Empty by default, which leaves `tls_client_auth` unregistrable: a chain cannot validate against a bundle nothing configured. |
+| `mtls.trust_anchor_certs` | array | empty | The trusted root (or intermediate) CA certificates, PEM-encoded, one entry per element. A presented certificate chain is accepted when every link's signature verifies and the topmost presented cert is signed by one of these. |
 | `oidc` | table | see fields | OIDC provider settings (issue #12). |
 | `oidc.access_token_ttl_secs` | integer | `300` | Access-token lifetime in seconds. The default (300) is a conservative five minutes; refresh handling (rotation, families) lands in M3. Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`. A registered resource server (issue #29) may override this per audience. |
 | `oidc.acr_order` | array | `["urn:ironauth:acr:pwd", "urn:ironauth:acr:mfa_remembered", "urn:ironauth:acr:mfa", "phr", "phrh", "urn:ironauth:acr:attested_passkey"]` | The DEPLOYMENT-level `acr` order for step-up comparison (RFC 9470, issue #72), weakest first. A step-up requirement's `acr` floor is satisfied when the achieved `acr` is the same value or ranks at least as strong under this order. The default is the canonical credential-ladder order the provider advertises ([`OIDC_DEFAULT_ACR_ORDER`]: `pwd`, `mfa_remembered`, `mfa`, `phr`, `phrh`, `attested_passkey`); a deployment that trusts its factors differently (for example ranking a verified TOTP above a synced passkey) reorders them here. An empty list falls back to the default ladder. A non-empty override must be a PERMUTATION of the known rungs (no unknown value, no duplicate, nothing left unranked) and must keep `mfa_remembered` STRICTLY below `mfa` (a remembered device must never satisfy a genuine `mfa` floor); any violation is a boot-time [`ConfigError::Invalid`]. This is resolved ONCE from configuration and applied across the deployment; per-(tenant, environment) resolution is a future enhancement, consistent with how the other per-environment config is handled. |
@@ -1242,6 +1254,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `oidc.frontchannel_logout_enabled` | boolean | `false` | Enable OIDC Front-Channel Logout 1.0 for this environment (issue #39). The SAFE default (`false`) leaves it OFF: discovery omits `frontchannel_logout_supported` and `frontchannel_logout_session_supported`, and RP-initiated logout renders no front-channel iframes. When `true`, the `end_session` flow renders a page embedding a hidden iframe per participating RP that registered a `frontchannel_logout_uri`, passing `iss` and the RP's OWN per-(client, session) `sid` when it registered `frontchannel_logout_session_required`. Front-channel delivery is best-effort by construction: it never blocks, replaces, or reorders the authoritative back-channel logout path. Like Session Management, this iframe mechanism is degraded under third-party-cookie partitioning and ships ONLY for certification completeness. Enabling it requires BOTH this environment flag AND per-client opt-in (a registered `frontchannel_logout_uri`), so it can never turn on globally by accident. This is a promotable per-environment setting in spirit; the process value is the deployment default until per-environment overrides ride the M5 promotion pipeline. |
 | `oidc.global_token_revocation_hard_kill` | boolean | `false` | Whether the Global Token Revocation receiver (issue #36) HARD-KILLS the subject's `offline_access` refresh families too, not only the session-bound ones. This has effect ONLY when the experimental `global-token-revocation` feature is enabled (the endpoint is otherwise unmounted). The SAFE default (`false`) matches the platform-wide revoke-everything semantic: offline (consented long-lived) grants survive a revoke unless a hard kill is asked for (issue #21/#32), so a routine global revoke does not silently strip a user's standing offline authorizations. Set it to `true` for an account-takeover posture, where a global revoke must terminate absolutely everything the subject holds, offline grants included, so every already-issued token dies at once. |
 | `oidc.id_token_ttl_secs` | integer | `300` | ID-token lifetime in seconds. Must be at least 1 and at most `OIDC_MAX_LIFETIME_SECS`. |
+| `oidc.introspection_signed_ttl_secs` | integer or unset | unset | The RFC 9701 signed-introspection capability (issue #156): when set, a hardened environment's introspection answers with a signed JWT whose validity window is this many seconds. `None` (the default) keeps the plain JSON form everywhere. |
 | `oidc.issue_refresh_tokens` | boolean | `true` | Whether the authorization-code grant issues a refresh token (issue #21). Default `true`: a successful code exchange returns a rotating refresh token alongside the access token. A refresh token issued WITHOUT the `offline_access` scope is session-bound (it is revoked when the end user's RP session is logged out); one issued WITH `offline_access` survives RP logout and gets the separate offline lifecycle. Set it to `false` for an environment that mints access tokens only. |
 | `oidc.jwks_cache_max_age_secs` | integer | `600` | The `Cache-Control: max-age` (in seconds) advertised on every JWKS response (issue #19). A relying party may cache the published keys for this long, so it bounds how quickly a rotated-in key propagates and feeds the pre-publish lead. Operational discipline requires it to stay between `OIDC_JWKS_CACHE_MIN_SECS` (300) and `OIDC_JWKS_CACHE_MAX_SECS` (900); the default (600) is the midpoint. This is a promotable per-environment setting in spirit; the process value is the deployment default until per-environment overrides ride the M5 promotion pipeline. |
 | `oidc.lazy_migration` | table | see fields | The INBOUND lazy-migration hook (issue #56): verify a first login against a legacy credential store over the SSRF-hardened outbound fetcher and, on success, create the user locally with a native Argon2id hash so subsequent logins never call the hook. Disabled by default. |
@@ -1409,6 +1422,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `password_policy.screening_failure_policy` | string | `"fail_open"` | What to do when the screening provider cannot answer: `fail_open` (allow the password and emit an audit event) or `fail_closed` (refuse the set until screening succeeds). The default (`fail_open`) is AVAILABILITY-BIASED: a HIBP outage lets a known-breached password through (audited and detectable via the `fail_open` metric/log), so a provider outage never locks every user out of setting a password. For HARD enforcement that never accepts an unscreened password, set `fail_closed`, or use the `offline` provider (an operator-supplied corpus is immune to an outbound-provider outage). |
 | `password_policy.screening_provider` | string | `"hibp"` | Which screening provider to use (issue #63): `hibp` (the online k-anonymity range API, the default) or `offline` (an operator-supplied corpus, fully offline). |
 | `proxy` | table | see fields | Trusted-proxy policy. Controls whether forwarding headers are honored; the safe default trusts nothing. |
+| `proxy.client_certificate_header` | string | `""` | The reverse proxy's client-certificate header (issue #159): the header a TLS-terminating proxy fills with the client certificate PEM it accepted. Read ONLY when the request arrived through the trusted-proxy chain (the same gate as the forwarding headers) and re-stamped onto [`CLIENT_CERT_HEADER`], so a client that reaches the endpoint directly cannot present one. The default names nginx's `$ssl_client_escaped_cert`. An EMPTY value disables client-certificate delivery entirely. |
 | `proxy.trust_forwarded` | boolean | `false` | Whether to honor forwarding headers at all. False (the default) ignores every forwarding header regardless of `trusted_hops`. Both this and a non-zero `trusted_hops` are required before any header is consulted. |
 | `proxy.trusted_hops` | integer | `0` | Exact number of trusted reverse-proxy hops in front of the server. Zero (the default) means the server is exposed directly and no forwarding header is ever honored. Forwarding is honored only when the request presents exactly this many forwarding entries; any other count fails closed to the transport peer. |
 | `quota` | table | see fields | Per-tenant and per-environment quota fairness settings (issue #50). The operator-plane noisy-neighbor guard: nested token buckets that keep one tenant or environment from starving another. Safe defaults, fully tunable (the tunability principle); a burst of 0 for a dimension means unlimited (the single-tenant self-hoster posture). |
@@ -1467,8 +1481,23 @@ at the top of the file, or map it in `.taplo.toml`).
 | `server` | table | see fields | HTTP server settings. |
 | `server.bind` | string | `"127.0.0.1:8443"` | Socket address the public data plane listens on. This plane serves the protocol and hosted-page surfaces; health, readiness, and metrics are never exposed here. |
 | `server.management_bind` | string | `"127.0.0.1:9443"` | Socket address the management plane listens on. Liveness, readiness, and the Prometheus metrics endpoint live here so the data plane is never probed publicly; bind it to a private interface. |
+| `server.mtls_public_url` | string or unset | unset | The mTLS-terminating base URL for the RFC 8705 `mtls_endpoint_aliases` (issue #159): the host where a TLS-terminating proxy requires client certificates and forwards the SAME paths this server serves. Unset (the default) publishes no aliases: the endpoints are served at `public_url` and mTLS clients authenticate there through the certificate header. Must be an https URL when set. |
 | `server.public_url` | string or unset | unset | Externally visible base URL (scheme and host) used to mint issuer and endpoint URLs. Unset means single-host development behind the bind address. The scheme, host, and issuer always derive from this value, never from request headers (see the `[proxy]` policy). |
 | `server.shutdown_grace_secs` | integer | `25` | Maximum seconds to drain in-flight requests after a shutdown signal before the process exits regardless. Zero exits without draining. |
+| `signing` | table | see fields | The signing backend (issue #161): where the environment's signing keys sign. `local` (the default) uses the encrypted-at-rest key store; `vault` signs through a Vault/OpenBao transit engine, so the private keys never leave the Vault boundary. Misconfiguration fails fast at boot. |
+| `signing.backend` | string | `"local"` | The backend: `local` (the default) or `vault`. |
+| `signing.vault` | table | see fields | The Vault/OpenBao transit settings; validated only when `backend = vault`. |
+| `signing.vault.addr` | string | `""` | The Vault address, for example `https://vault.internal:8200`. |
+| `signing.vault.mount` | string | `"transit"` | The transit engine mount path, for example `transit`. |
+| `signing.vault.timeout_secs` | integer | `5` | Seconds before a sign request is a retryable timeout. |
+| `signing.vault.token` | string or table or unset | unset | The Vault token, through the file/env secrets indirection (never inline). |
+| `signing_rotation` | table | see fields | Automated signing-key rotation (issue #160): whether THIS process runs the rotation state machine's timer, and the per-environment policy it uses. OFF by default: the machine's keys rotate on the cadence only when an operator wires the timer, exactly like the replication shipper. |
+| `signing_rotation.cadence_secs` | integer | `7776000` | Seconds between a key's activation and its successor's activation. The safe default is about 90 days; a shorter cadence only widens the compromise blast radius nothing else in this product accepts, and the pre-publication window must stay comfortably below it. |
+| `signing_rotation.enabled` | boolean | `false` | Whether the rotation timer is wired at boot. OFF by default. |
+| `signing_rotation.interval_secs` | integer | `3600` | Seconds between timer passes. A pass is idempotent, so an over-long interval only delays a scheduled rotation by the interval; it never skips one. |
+| `signing_rotation.max_token_lifetime_secs` | integer | `3600` | The assumed access-token lifetime the machine uses to size a retiring key's expiry, in seconds. The OIDC side's configured value is the real one; this is the seam where it enters the machine. |
+| `signing_rotation.pre_publication_secs` | integer | `86400` | Seconds before the rotation instant the successor appears in the published JWKS: cache TTL + max token lifetime + buffer. An RP caching at the max TTL must never see a miss, which is what this window exists for. |
+| `signing_rotation.retirement_buffer_secs` | integer | `86400` | Seconds past the last signed token's expiry a retiring key stays published. |
 | `ssf` | table | see fields | The Shared Signals transmitter (issue #143). OFF by default, so the default boot mounts no stream-management surface and serves no SSF discovery document. |
 | `ssf.enabled` | boolean | `false` | Whether to serve the Shared Signals stream-management surface and its discovery document on the public plane. Off by default. |
 | `ssf.max_owed_sets_per_stream` | integer | `1000` | The most UNACKNOWLEDGED SETs one poll stream may hold. |
@@ -1880,7 +1909,7 @@ Source: docs/EVENTS.md
 Generated by `scripts/event-catalog.sh` from the registry in
 `crates/ironauth-store/src/event_catalog.rs`; do not edit by hand.
 
-171 event type(s) across 63 domain(s), every one of them emitted by a real producer and carrying a payload contract.
+175 event type(s) across 66 domain(s), every one of them emitted by a real producer and carrying a payload contract.
 
 This is the EVENT vocabulary, which is not the audit vocabulary: an audit action
 records what an actor DID (`user.create`), an event records what BECAME TRUE
@@ -2453,6 +2482,30 @@ as a sentinel, so an absent one means absent.
   "request_id": "request_id_example",
   "approved": true
 }
+```
+
+## `backup` (1)
+
+| Type | Payload version |
+|---|---|
+| `backup.requested` | 1 |
+
+### `backup.requested` v1
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {},
+  "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{}
 ```
 
 ## `ban` (2)
@@ -6153,6 +6206,49 @@ as a sentinel, so an absent one means absent.
 }
 ```
 
+## `quota` (1)
+
+| Type | Payload version |
+|---|---|
+| `quota.limit_changed` | 1 |
+
+### `quota.limit_changed` v1
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "burst": {
+      "type": "number"
+    },
+    "cleared": {
+      "type": "boolean"
+    },
+    "dimension": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "refill_per_sec": {
+      "type": "number"
+    }
+  },
+  "required": [
+    "dimension"
+  ],
+  "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "dimension": "dimension_example"
+}
+```
+
 ## `recovery_approval` (1)
 
 | Type | Payload version |
@@ -6833,6 +6929,88 @@ as a sentinel, so an absent one means absent.
   "audience": "audience_example",
   "ttl_seconds": 1
 }
+```
+
+## `signing_key` (2)
+
+| Type | Payload version |
+|---|---|
+| `signing_key.break_glass` | 1 |
+| `signing_key.rotation_advanced` | 1 |
+
+### `signing_key.break_glass` v1
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "withdrawn": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "withdrawn"
+  ],
+  "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{
+  "withdrawn": [
+    "withdrawn_1"
+  ]
+}
+```
+
+### `signing_key.rotation_advanced` v1
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "promoted": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "provisioned": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "retired": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "retiring": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "type": "object"
+}
+```
+
+A minimal payload, derived from the schema above: every required
+field and nothing else. Optional fields are OMITTED rather than sent
+as a sentinel, so an absent one means absent.
+
+```json
+{}
 ```
 
 ## `signup_form` (2)
@@ -10095,7 +10273,7 @@ is not making a cross-site request in the first place.
 
 ## Error codes
 
-The authorization endpoint's machine-readable codes. 10 of them, taken
+The authorization endpoint's machine-readable codes. 11 of them, taken
 from the exhaustive match that renders them, so this list cannot fall behind the
 code without the freshness gate failing.
 
@@ -10106,6 +10284,7 @@ code without the freshness gate failing.
 | `consent_required` | `AuthzErrorCode::ConsentRequired` |
 | `interaction_required` | `AuthzErrorCode::InteractionRequired` |
 | `invalid_request` | `AuthzErrorCode::InvalidRequest` |
+| `invalid_request_object` | `AuthzErrorCode::InvalidRequestObject` |
 | `invalid_target` | `AuthzErrorCode::InvalidTarget` |
 | `login_required` | `AuthzErrorCode::LoginRequired` |
 | `server_error` | `AuthzErrorCode::ServerError` |
@@ -10824,6 +11003,40 @@ parser over untrusted input, or a new privileged plane) must extend this
 document in the same PR. Reviewers block merges that add a surface without
 its STRIDE section. This rule is stated in CONTRIBUTING.md and enforced by
 the PR template checklist.
+
+## Existing JWE plaintext boundary repair (issue #1437 prerequisite)
+
+The repaired JOSE tests exposed a preexisting decryption-output defect:
+`decrypt_with_cek` authenticated the input but returned the entire mutable
+buffer, including the trailing authentication tag. It now returns exactly the
+plaintext span reported by the crypto backend. This is an output-correctness
+repair, with text, empty and binary round-trip coverage; wrong keys and modified
+ciphertext still fail. It adds no algorithms or verification bypass and does
+not broaden the recipient-proof profile.
+
+## Surface: gated subject-bound recipient verification (issue #1436)
+
+Three bounded JSON POSTs live under the scoped account path: challenge start,
+challenge verify and online relying-party recipient proof. Production has no
+installer or enable flag; it returns 503 until delivery, hosted recovery and
+legacy-index readiness are qualified. The only installer is testing-only.
+See [the contract and remaining acceptance](design/RECIPIENT-VERIFICATION.md).
+
+| STRIDE | Threat | Control / residual |
+| --- | --- | --- |
+| Spoofing | An arbitrary email claim or another subject's code grants an invitation | Current exact authenticated subject; same-origin fresh direct session for ceremony; same canonicalizer and unambiguous primary/typed ownership; fresh proof reads current identifier and ceremony revision, never stored OIDC claims |
+| Tampering | Reissue, account disable, identifier replacement or competing owners race verification | Scope-bound IDs/RLS, shared ownership transaction lock, current user/identifier locks, exact challenge/hash/identifier comparison, and atomic consume plus verified ownership plus audit |
+| Repudiation | A verification changes ownership without a matching audit event | Challenge and attempt writes share the store's audited transaction; an injected post-audit failure rolls back consumption, identifier and proof epoch together |
+| Information disclosure | Codes/addresses leak through URLs, logs, ordinary outbox or response caches | Strict 2048-byte JSON, no query parameters, Argon2id at rest, sealed existing mailbox, no secret-bearing Debug/wire serialization, purpose-specific transient transport and no-store responses |
+| Denial of service | Flooded sends, concurrent guesses, unbounded slow transport or expensive hashing | Existing regulation/quota and bounded hash pool; durable one-minute send cooldown and five-attempt ceiling; one current challenge per subject; five-minute expiry and five-second transport deadline |
+| Elevation | Possession creates a stronger session, a token exchange hides impersonation, or a stale proof is reused | No session/token mint or strength change; direct live non-impersonated authorization-code provenance in addition to signed JWT/DPoP checks; issuer/client/public-subject/nonce/expected-recipient binding and at most 30-second online proof lifetime |
+
+Residuals are explicit: this core has no real delivery/hosted UI/legacy index
+backfill and must stay unavailable until those are qualified. Additional mailbox
+enrollment and opaque-token direct-actor provenance are not supported. A proof
+reports current provider-recorded ownership, not a new inbox-possession ceremony
+on every read. Relying-party acceptance must recheck its own current authority
+transactionally and bind the fresh response, as specified in the contract.
 
 ---
 
@@ -11959,6 +12172,13 @@ The export omits fields that are re-created at the destination rather than carri
   the login handle (unique per environment), so a re-import stays idempotent.
 - Timestamps, blind-index lookup columns, and the encryption key versions that seal
   PII at rest are re-derived and re-sealed against the destination instance.
+- The recipient lookup fields `users.recipient_email_bidx` and
+  `users.recipient_email_indexed` are DERIVED destination state. Import rebuilds
+  the canonical mailbox index under the destination key and records its local
+  readiness; it never carries the source blind index or marks a mailbox verified.
+  Stored `claims.email_verified` is portable claim data, not evidence for the
+  current recipient-proof API. Challenges and subject-bound verification records
+  remain instance-local ceremony state; verification must occur on the destination.
 - Soft-deleted (offboarded) users are excluded: a tombstone is not exported.
 - The account's enrolled MFA / login credential REGISTRY (passkey, TOTP, and
   recovery-code enrollments) IS exported today, in the `credentials` array above: the
