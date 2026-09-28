@@ -794,8 +794,16 @@ jobs:
           python-version: "3.12"
       - name: provision the gate's python deps (hash pinned)
         run: python3 -m pip install --require-hashes -r deploy/conformance/requirements.txt
+      - name: Check the bounded diagnostic observer
+        run: timeout --signal=TERM --kill-after=5s 55s python3 -B scripts/test-hook-bench-diagnostics.py
+      - name: Capture runner metadata before measurement
+        run: timeout --signal=TERM --kill-after=5s 55s python3 -B scripts/hook-bench-diagnostics.py snapshot before
       - name: Measure and gate
+        id: authoritative_measurement
         run: ./scripts/hook-bench-gate.sh
+      - name: Capture runner metadata after measurement
+        if: (success() || failure()) && steps.authoritative_measurement.outcome != 'skipped'
+        run: timeout --signal=TERM --kill-after=5s 55s python3 -B scripts/hook-bench-diagnostics.py snapshot after
       # Criterion 4: "numbers are published per release". The release workflow attaches the
       # committed baseline; this keeps the run's OWN measurement, which is what a bisect needs
       # and what the baseline is not (the baseline changes only when somebody commits one).
@@ -819,6 +827,21 @@ jobs:
         with:
           name: hook-latency-measurement
           path: target/hook-bench-measurement.json
+          if-no-files-found: error
+      # This can explain a failure; it cannot replace the gate or qualify performance.
+      # No retries, privilege changes, runner tuning or baseline changes are permitted.
+      - name: Collect one diagnostic profile after a failed measurement
+        if: failure() && steps.authoritative_measurement.outcome == 'failure'
+        env:
+          HOOK_BENCH_AUTHORITATIVE_OUTCOME: ${{ steps.authoritative_measurement.outcome }}
+        run: timeout --signal=TERM --kill-after=5s 175s python3 -B scripts/hook-bench-diagnostics.py profile
+      - name: Publish bounded runner diagnostics
+        if: success() || failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hook-latency-diagnostics
+          path: target/hook-bench-diagnostics
+          retention-days: 7
           if-no-files-found: error
 
   ts-hook-freshness:
