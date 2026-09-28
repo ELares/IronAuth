@@ -8493,6 +8493,10 @@ async fn the_data_plane_can_delete_only_where_a_caller_deletes() {
         "magic_link_tokens",
         "policy_decision_traces",
         "pow_challenges",
+        // ActingRecipientVerificationRepo::start replaces this scoped subject's
+        // previous challenge inside the audited transaction. DELETE bounds it to
+        // one row and makes every previous code unusable on reissue (issue #1436).
+        "recipient_verification_challenges",
         "recovery_codes",
         "scope_step_up_policies",
         "sms_country_allowlist",

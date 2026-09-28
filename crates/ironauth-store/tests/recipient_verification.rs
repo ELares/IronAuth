@@ -562,6 +562,43 @@ async fn new_relations_force_rls_and_application_grants_do_not_rewrite_authority
         );
     }
     tx.rollback().await.expect("end scope");
+    // Reissue needs a scoped DELETE, but the application cannot erase another
+    // environment's challenge even when it knows the exact row ID.
+    let before: String = sqlx::query_scalar(
+        "SELECT row_to_json(c)::text FROM recipient_verification_challenges c WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("owned preimage");
+    let mut tx = db
+        .app_pool()
+        .begin()
+        .await
+        .expect("foreign app transaction");
+    sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true), set_config('ironauth.environment_id', $2, true)")
+        .bind(foreign.tenant().to_string()).bind(foreign.environment().to_string()).execute(&mut *tx).await.expect("foreign scope");
+    let denied = sqlx::query("DELETE FROM recipient_verification_challenges WHERE id = $1")
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("RLS filters delete");
+    assert_eq!(denied.rows_affected(), 0);
+    tx.commit()
+        .await
+        .expect("foreign attempt committed with no effect");
+    let after: String = sqlx::query_scalar(
+        "SELECT row_to_json(c)::text FROM recipient_verification_challenges c WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("owned postimage");
+    assert_eq!(before, after);
+    assert!(
+        verified(&db, &owner, EMAIL).await,
+        "foreign delete preserves current proof"
+    );
     for query in [
         "UPDATE recipient_verification_challenges SET subject = subject",
         "UPDATE recipient_verification_challenges SET code_hash = code_hash",
@@ -573,4 +610,39 @@ async fn new_relations_force_rls_and_application_grants_do_not_rewrite_authority
             "forbidden authority update: {query}"
         );
     }
+}
+
+#[tokio::test]
+async fn reissue_replaces_an_active_challenge_and_keeps_one_row_per_subject() {
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH + Duration::from_secs(1000), 1438);
+    let scope = db.seed_scope(&env).await;
+    let owner = signup(&db, &env, scope, EMAIL).await;
+    let first = issue(&db, &env, &owner, EMAIL).await.expect("first start");
+    let old_code = challenge(&db, &env, &owner, &first).await;
+    clock.advance(Duration::from_secs(61));
+    let second = issue(&db, &env, &owner, EMAIL)
+        .await
+        .expect("active reissue");
+    assert_ne!(first, second);
+    let rows: Vec<String> = sqlx::query_scalar("SELECT id FROM recipient_verification_challenges WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3")
+        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(owner.to_string())
+        .fetch_all(db.owner_pool()).await.expect("bounded challenge rows");
+    assert_eq!(rows, vec![second.to_string()]);
+    assert!(matches!(
+        attempt(&db, &env, &owner, &old_code, true).await,
+        Err(StoreError::NotFound)
+    ));
+    let current = challenge(&db, &env, &owner, &second).await;
+    assert_eq!(
+        attempt(&db, &env, &owner, &current, true)
+            .await
+            .expect("current code verifies"),
+        RecipientAttempt::Verified
+    );
+    assert_eq!(
+        audit_count(&db).await,
+        3,
+        "two starts and exactly one committed verification"
+    );
 }

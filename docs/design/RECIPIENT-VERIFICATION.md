@@ -61,6 +61,14 @@ five attempts, and is replaced by reissue. A database-enforced one-minute
 cooldown bounds cross-node sends. The ordinary regulation and request-quota
 checks also apply.
 
+Reissue uses the application role's DELETE grant on the challenge table: the
+current subject's previous row is deleted and the replacement inserted inside
+the same ownership-locked, audited transaction. This keeps one row per subject
+and immediately invalidates every old code. It does not delete the separate
+verification revision. Forced RLS prevents deletion across environments; the
+migration grant corpus names this exact caller and real app-role tests preserve
+the foreign row image while proving own-subject replacement.
+
 `delivery:"accepted"` means transport acceptance, not inbox delivery. A refusal
 or uncertain result is HTTP 503 with `delivery:"refused"` or `"uncertain"` and the
 challenge handle. Timeout is uncertain. The challenge is not falsely marked

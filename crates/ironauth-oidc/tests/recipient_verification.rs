@@ -630,3 +630,66 @@ async fn signed_access_without_direct_session_provenance_cannot_prove_a_recipien
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn enabled_anonymous_routes_refuse_live_and_absent_scopes_without_effects() {
+    let h = Harness::start().await;
+    let transport = Arc::new(OwnedTransport::default());
+    let router = enabled_router(&h, Arc::clone(&transport));
+    let absent = ironauth_store::Scope::new(
+        ironauth_store::TenantId::generate(h.env()),
+        ironauth_store::EnvironmentId::generate(h.env()),
+    );
+    let before = recipient_rows(&h).await;
+    for (operation, body) in [
+        (
+            "email-verification/start",
+            json!({"email": "owner@example.test"}),
+        ),
+        (
+            "email-verification/verify",
+            json!({"challenge_id": ironauth_store::RecipientChallengeId::generate(h.env(), &h.scope()).to_string(), "code": "12345678"}),
+        ),
+        (
+            "recipient-proof",
+            json!({"email": "owner@example.test", "nonce": NONCE}),
+        ),
+    ] {
+        let live = post(
+            &router,
+            &route(&h, operation),
+            None,
+            None,
+            Some(ISSUER_BASE),
+            &body,
+        )
+        .await;
+        let ghost = post(
+            &router,
+            &format!(
+                "/t/{}/e/{}/account/{operation}",
+                absent.tenant(),
+                absent.environment()
+            ),
+            None,
+            None,
+            Some(ISSUER_BASE),
+            &body,
+        )
+        .await;
+        assert_eq!(live.0, StatusCode::UNAUTHORIZED, "{operation}: {}", live.2);
+        assert_eq!(
+            live, ghost,
+            "{operation} cannot distinguish scope existence"
+        );
+        assert!(!live.1.contains_key(header::SET_COOKIE));
+    }
+    assert_eq!(before, recipient_rows(&h).await);
+    assert!(
+        transport
+            .messages
+            .lock()
+            .expect("fixture mailbox")
+            .is_empty()
+    );
+}
