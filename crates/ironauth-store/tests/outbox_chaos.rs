@@ -118,6 +118,56 @@ async fn wait_handled(consumer: &Arc<ScriptedConsumer>, count: usize, timeout: D
     }
 }
 
+/// Observe degradation within the existing budget, including when it never appears.
+async fn wait_for_degradation(mut is_degraded: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout; // invariant-allow: time-via-env
+    loop {
+        if is_degraded() {
+            return true;
+        }
+        let now = Instant::now(); // invariant-allow: time-via-env
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50).min(deadline - now)).await;
+    }
+}
+
+#[tokio::test]
+async fn degradation_wait_already_degraded_completes_without_delay() {
+    assert!(wait_for_degradation(|| true, Duration::ZERO).await);
+}
+
+#[tokio::test]
+async fn degradation_wait_observes_later_transition() {
+    let mut observations = 0;
+    let degraded = tokio::time::timeout(
+        Duration::from_secs(2),
+        wait_for_degradation(
+            || {
+                observations += 1;
+                observations == 3
+            },
+            Duration::from_secs(1),
+        ),
+    )
+    .await
+    .expect("the degradation wait must remain bounded");
+    assert!(degraded);
+    assert_eq!(observations, 3);
+}
+
+#[tokio::test]
+async fn degradation_wait_missing_transition_terminates() {
+    let degraded = tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_for_degradation(|| false, Duration::from_millis(20)),
+    )
+    .await
+    .expect("the inner deadline must expire even when degradation never appears");
+    assert!(!degraded, "a deadline is not evidence of degradation");
+}
+
 /// A real `ironbus` broker on a test-chosen port, killed and restarted on demand.
 struct BusGuard {
     bin: PathBuf,
@@ -281,14 +331,12 @@ async fn ironbus_dies_the_outbox_drains_on_the_poll_with_no_loss() {
     // the queue holds the work and the Postgres poll delivers it.
     enqueue(&db, &env, scope, "down-1").await;
     wait_handled(&consumer, 2, Duration::from_secs(10)).await;
-    // The reader notices the death (asynchronously); when it does, wait is PollOnly.
-    // NOT LOAD-BEARING - the drain is - but it is the mechanism the design names.
-
-    let deadline = Instant::now() + Duration::from_secs(10); // invariant-allow: time-via-env
-    let now = Instant::now(); // invariant-allow: time-via-env
-    while !concrete.is_degraded() && now < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    // The drain above proves delivery. Also observe the promised degraded state before
+    // restarting, and fail within the existing budget if the reader never reports it.
+    assert!(
+        wait_for_degradation(|| concrete.is_degraded(), Duration::from_secs(10)).await,
+        "the backbone did not report degradation within ten seconds"
+    );
 
     // RECOVERY: the broker comes back on the same port, and the same backbone delivers
     // again - a reconnect, not a restart of the process.
