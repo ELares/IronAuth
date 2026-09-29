@@ -41,6 +41,7 @@
 //! FORCE-RLS backstop not enforced (a startup warning says so). See
 //! `ironauth_store::Store::management` and `docs/adr/0005-management-api.md`.
 
+mod advisory_feed;
 mod api_keys;
 mod auth;
 mod authzen;
