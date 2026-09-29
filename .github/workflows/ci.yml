@@ -370,6 +370,9 @@ jobs:
     name: outbox (ironbus mode)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     services:
       postgres:
         image: postgres:16
@@ -396,8 +399,16 @@ jobs:
       # the day this job's test list grows is not the day to rediscover that.
       IRONAUTH_TEST_DB_DISPOSABLE: "1"
       IRONBUS_ADDR: 127.0.0.1:17654
+      IRONAUTH_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: bind the actual job deadline and check the observer
+        timeout-minutes: 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/test-outbox-chaos-watchdog.py
+          python3 scripts/outbox-chaos-watchdog.py clock --clock "$RUNNER_TEMP/outbox-job-clock.json"
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "stable"
@@ -487,7 +498,23 @@ jobs:
       # no loss, then recovers when the broker returns. It needs the broker BINARIES this
       # job installs; everywhere else it skips loudly.
       - name: "Chaos: IronBus down, the outbox drains on the poll (issue #149)"
-        run: cargo test -p ironauth-store --features testing,ironbus --test outbox_chaos -- --test-threads=1
+        id: outbox_chaos
+        timeout-minutes: 11
+        # One original cargo invocation, capped at ten minutes and ending at least
+        # two minutes before the actual job deadline for cleanup and evidence.
+        run: >-
+          python3 scripts/outbox-chaos-watchdog.py run
+          --clock "$RUNNER_TEMP/outbox-job-clock.json"
+          --output "$RUNNER_TEMP/outbox-chaos-diagnostics"
+      - name: preserve failed outbox stage and owned cleanup evidence
+        if: failure() && steps.outbox_chaos.outcome == 'failure'
+        timeout-minutes: 1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: outbox-chaos-diagnostics
+          path: ${{ runner.temp }}/outbox-chaos-diagnostics
+          if-no-files-found: error
+          retention-days: 14
       # Issue #149 criterion 1: the BACKBONE-ABSENT readiness tier, induced for real. The
       # test starts a REAL broker, boots a server declaring it in [outbox] ironbus_addr,
       # KILLS the broker, and asserts the documented 200 degraded: backbone_absent
@@ -548,21 +575,9 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-    # ISSUE #146 CRITERION 6: "the full test suite passes in both modes (Postgres-only and
-    # IronCache-attached)". The Postgres-only half is every other job in this file, which runs
-    # with no accelerator and no IRONCACHE_ADDR.
-    #
-    # THIS JOB IS NOT YET THE WHOLE OTHER HALF, and saying it is would be the easier sentence.
-    # It runs ONE CRATE with an accelerator attached, because `ironauth-hot` is the only crate
-    # that has an IronCache code path: nothing else in the workspace takes a `HotState`, so
-    # running the workspace here would execute the same Postgres-only code a second time and
-    # prove nothing. The lane grows to match the criterion when the registry's uses acquire
-    # call sites.
-    #
-    # WHAT IT CAN AND CANNOT SHOW. `crates/ironauth-hot/tests/ironcache.rs` SKIPS every case
-    # when IRONCACHE_ADDR is unset, printing why, so those tests are inert in every other lane
-    # and binding only here. That is the whole reason this job exists: without it the IronCache
-    # implementation would be code that compiles and that nothing ever runs.
+    # The foundation job retains the real cache seam, chaos and rate assertions.
+    # Four checked jobs below execute the full eligible OIDC target roster; their
+    # aggregate must also pass before dual-mode coverage is considered complete.
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # This job owns the disposable service container and all its test databases.
@@ -644,13 +659,89 @@ jobs:
         run: |
           cargo test -p ironauth-oidc --features testing,ironcache --test rate_l2 -- --test-threads=1
           cargo check -p ironauth --features ironcache
-      # #146 CRITERION 6, MADE REAL FOR THE WHOLE REQUEST PATH: the FULL oidc suite runs
-      # with the cache attached. The seam suites and rate_l2 cover the seam; this is the
-      # "the full test suite passes in both modes" evidence - a divergence in dual mode
-      # shows up as a failing job here rather than in a deployment. The binaries are
-      # already built by the steps above; the cost is the run.
-      - name: the full oidc suite in dual mode (issue #146)
-        run: cargo test -p ironauth-oidc --features testing,ironcache
+      # Preserve every example/default test build from the original full command.
+      # The four checked jobs execute its entire eligible corpus with the cache.
+      - name: compile the complete dual-mode target and example roster
+        run: cargo test -p ironauth-oidc --features testing,ironcache --no-run
+
+  ironcache-oidc:
+    name: OIDC dual mode (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    # The full OIDC testing suite also needs isolated real databases. The cache
+    # accelerates hot state; it does not replace PostgreSQL or its isolation tests.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --shm-size=1g
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # This job owns the disposable service container and all its test databases.
+      IRONAUTH_TEST_DB_DISPOSABLE: "1"
+      IRONCACHE_ADDR: 127.0.0.1:17379
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
+      - name: Install the WASM target for the pinned toolchain
+        # The OIDC test targets below build the mandatory hook guest fixtures.
+        run: rustup target add wasm32-wasip2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Built from git rather than crates.io: IronCache publishes NO crate at all, client or
+      # server. Pinned to an exact COMMIT and not a branch, for the reason the IronBus lane
+      # below gives: a branch lets another repository silently change what this lane tests.
+      # This SHA is the revision the implementation was actually developed and verified
+      # against, locally, before this job existed.
+      - name: install the IronCache server
+        run: >-
+          cargo install --locked --git https://github.com/ELares/IronCache
+          --rev 4d97ddd927890b0590a5aeed2f9f80c388826378 ironcache
+      - name: start the cache
+        run: |
+          ironcache server --port 17379 --metrics-addr off &
+          # Wait for the listener rather than sleeping a guess: a fixed sleep is either flaky
+          # on a slow runner or wasted time on a fast one.
+          for _ in $(seq 1 60); do
+            if nc -z 127.0.0.1 17379; then echo "cache up"; exit 0; fi
+            sleep 1
+          done
+          echo "cache did not come up" >&2
+          exit 1
+      - name: verify and execute the exact OIDC partition
+        env:
+          OIDC_DUAL_SHARD: ${{ matrix.shard }}
+        run: |
+          python3 scripts/test-oidc-dual-tests.py
+          python3 scripts/oidc-dual-tests.py --shard "$OIDC_DUAL_SHARD"
+
+  ironcache-complete:
+    name: complete IronCache dual-mode coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [ironcache-matrix, ironcache-oidc]
+    if: always()
+    steps:
+      - name: require the foundation and all four partitions
+        env:
+          FOUNDATION_RESULT: ${{ needs.ironcache-matrix.result }}
+          OIDC_RESULT: ${{ needs.ironcache-oidc.result }}
+        run: |
+          test "$FOUNDATION_RESULT" = success
+          test "$OIDC_RESULT" = success
 
   msrv:
     name: msrv (1.85)

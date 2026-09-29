@@ -19,10 +19,11 @@
 
 #![cfg(feature = "ironbus")]
 
+use std::io::Write as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ironauth_env::Env;
@@ -35,6 +36,88 @@ use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     EnvironmentId, NewOutboxMessage, OutboxMessage, RetryPolicy, Scope, TenantId,
 };
+
+/// Optional, flushed test-only stage ledger. It records static labels, never
+/// connection strings, environment values, message content or credentials.
+struct StageLog {
+    file: Mutex<std::fs::File>,
+    start: Instant,
+}
+
+impl StageLog {
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            file: Mutex::new(file),
+            start: Instant::now(), // invariant-allow: time-via-env - test-only monotonic diagnostic duration
+        }
+    }
+
+    fn record(&self, label: &'static str) -> std::io::Result<()> {
+        let mut file = self.file.lock().expect("stage ledger lock");
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"stage": label, "elapsed_ms": self.start.elapsed().as_millis()})
+        )?;
+        file.flush()
+    }
+}
+
+fn stage(label: &'static str) {
+    static LOG: OnceLock<Option<StageLog>> = OnceLock::new();
+    if let Some(log) = LOG.get_or_init(|| {
+        std::env::var_os("IRONAUTH_CHAOS_STAGE_FILE").map(|path| {
+            StageLog::new(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .expect("open the existing test-only stage ledger"),
+            )
+        })
+    }) {
+        log.record(label).expect("flush test-only stage ledger");
+    }
+}
+
+#[test]
+fn stage_ledger_flushes_static_labels_in_order() {
+    struct OwnedLedger(PathBuf);
+    impl Drop for OwnedLedger {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let path = std::env::temp_dir().join(format!(
+        "ironauth-stage-ledger-{}.jsonl",
+        std::process::id()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .expect("create unique test-owned ledger without replacing any file");
+    let owned = OwnedLedger(path);
+    let log = StageLog::new(file);
+    log.record("notify.begin").expect("first stage");
+    let first = std::fs::read_to_string(&owned.0).expect("read without closing writer");
+    assert_eq!(first.lines().count(), 1);
+    log.record("notify.end").expect("second stage");
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(&owned.0)
+        .expect("flushed stages")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("stage JSON"))
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["stage"], "notify.begin");
+    assert_eq!(rows[1]["stage"], "notify.end");
+    assert!(rows[1]["elapsed_ms"].as_u64() >= rows[0]["elapsed_ms"].as_u64());
+    assert!(rows
+        .iter()
+        .all(|row| row.as_object().expect("stage").len() == 2));
+}
 
 /// The consumer name this suite drains.
 const CONSUMER: &str = "chaos";
@@ -197,7 +280,9 @@ impl BusGuard {
             .process_group(0)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        stage("broker.spawn.begin");
         let child = command.spawn().expect("ironbus dev spawns");
+        stage("broker.spawn.end");
         self.child = Some(child);
     }
 
@@ -206,11 +291,23 @@ impl BusGuard {
         if let Some(child) = self.child.take() {
             // `kill -9 -<pid>` signals every member of the group: the `dev` parent and
             // the `serve` child that owns the listener.
-            let _ = Command::new("kill")
+            stage("broker.kill.command.begin");
+            let result = Command::new("kill")
                 .args(["-9", &format!("-{}", child.id())])
                 .status();
+            stage(match result {
+                Ok(status) if status.success() => "broker.kill.command.success",
+                Ok(_) => "broker.kill.command.nonzero",
+                Err(_) => "broker.kill.command.error",
+            });
             let mut child = child;
-            let _ = child.wait();
+            stage("broker.reap.begin");
+            let result = child.wait();
+            stage(if result.is_ok() {
+                "broker.reap.end"
+            } else {
+                "broker.reap.error"
+            });
         }
     }
 
@@ -222,7 +319,9 @@ impl BusGuard {
 
 impl Drop for BusGuard {
     fn drop(&mut self) {
+        stage("broker.drop.begin");
         self.kill();
+        stage("broker.drop.end");
     }
 }
 
@@ -267,6 +366,7 @@ fn any_scope() -> Scope {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ironbus_dies_the_outbox_drains_on_the_poll_with_no_loss() {
+    stage("test.begin");
     let Some(bin) = ironbus_bin() else {
         eprintln!(
             "SKIPPED: no `ironbus` broker binary on this host, so the bus-down chaos tier \
@@ -275,14 +375,21 @@ async fn ironbus_dies_the_outbox_drains_on_the_poll_with_no_loss() {
         );
         return;
     };
+    stage("broker.binary.found");
     let port = free_port();
     let mut broker = BusGuard::start(&bin, port);
+    stage("broker.listen.begin");
     wait_for_port(port, Duration::from_secs(30));
+    stage("broker.listen.end");
     let addr = format!("127.0.0.1:{port}");
 
+    stage("database.start.begin");
     let db = TestDatabase::start().await;
+    stage("database.start.end");
     let env = Env::system();
+    stage("database.seed.begin");
     let scope = db.seed_scope(&env).await;
+    stage("database.seed.end");
     let consumer = ScriptedConsumer::new(CONSUMER);
     // A 200ms poll: short enough that the down-phase drain is observable in test time, and
     // the contract that bounds it (the deadline is never removed) is what is under test.
@@ -293,7 +400,9 @@ async fn ironbus_dies_the_outbox_drains_on_the_poll_with_no_loss() {
         batch: 16,
         retry: RetryPolicy::default(),
     };
+    stage("backbone.connect.begin");
     let concrete = Arc::new(IronBusBackbone::connect(&addr).expect("connect to the broker"));
+    stage("backbone.connect.end");
     let backbone: Arc<dyn OutboxBackbone> = concrete.clone();
     // Give the reader its subscription before any wake, or the wake races the subscribe.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -314,9 +423,15 @@ async fn ironbus_dies_the_outbox_drains_on_the_poll_with_no_loss() {
     // BUS UP: the wake path crosses the broker. Enqueue, then wake the drain; the message
     // arrives. (The poll would deliver it anyway; the wake is the path that only exists
     // with a live bus, and this is the control that the down-phase below loses it.)
+    stage("enqueue.up.begin");
     enqueue(&db, &env, scope, "up-1").await;
+    stage("enqueue.up.end");
+    stage("notify.up.begin");
     backbone.notify(CONSUMER, any_scope());
+    stage("notify.up.end");
+    stage("delivery.up.begin");
     wait_handled(&consumer, 1, Duration::from_secs(10)).await;
+    stage("delivery.up.end");
     assert!(
         !concrete.is_degraded(),
         "the reader is alive with the bus up"
@@ -329,29 +444,48 @@ async fn ironbus_dies_the_outbox_drains_on_the_poll_with_no_loss() {
     // backbone degrades to PollOnly and the poll deadline is never removed - within a
     // few poll intervals. This is criterion 4's "accumulate and drain with no loss":
     // the queue holds the work and the Postgres poll delivers it.
+    stage("enqueue.down.begin");
     enqueue(&db, &env, scope, "down-1").await;
+    stage("enqueue.down.end");
+    stage("delivery.down.begin");
     wait_handled(&consumer, 2, Duration::from_secs(10)).await;
+    stage("delivery.down.end");
     // The drain above proves delivery. Also observe the promised degraded state before
     // restarting, and fail within the existing budget if the reader never reports it.
+    stage("degradation.begin");
     assert!(
         wait_for_degradation(|| concrete.is_degraded(), Duration::from_secs(10)).await,
         "the backbone did not report degradation within ten seconds"
     );
+    stage("degradation.end");
 
     // RECOVERY: the broker comes back on the same port, and the same backbone delivers
     // again - a reconnect, not a restart of the process.
+    stage("broker.restart.begin");
     broker.restart();
+    stage("broker.restart.end");
+    stage("broker.listen.begin");
     wait_for_port(port, Duration::from_secs(30));
+    stage("broker.listen.end");
+    stage("enqueue.back.begin");
     enqueue(&db, &env, scope, "back-1").await;
+    stage("enqueue.back.end");
+    stage("notify.back.begin");
     backbone.notify(CONSUMER, any_scope());
+    stage("notify.back.end");
+    stage("delivery.back.begin");
     wait_handled(&consumer, 3, Duration::from_secs(10)).await;
+    stage("delivery.back.end");
 
+    stage("pool.shutdown.begin");
     pool.shutdown().await;
+    stage("pool.shutdown.end");
     assert_eq!(
         consumer.handled(),
         vec!["up-1".to_owned(), "down-1".to_owned(), "back-1".to_owned()],
         "every message delivered exactly once, whatever the bus state"
     );
+    stage("test.assertions.end");
 }
 
 /// A port nothing is listening on, chosen by binding and releasing.

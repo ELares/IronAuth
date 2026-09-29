@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add optional static, flushed stage diagnostics to the real outbox chaos test
+  (issue #1453). CI retains one original test invocation and all assertions; an
+  owned-process watchdog reserves cleanup time inside the existing job deadline.
+  A timed-out invocation fails and does not claim its test databases were cleaned.
+
 - Bound replication metrics to two process-wide series (issue #1437 prerequisite).
   Remove tenant/environment labels: shipped rows accumulate across partitions and
   lag is their maximum from the last successful pass, zero for an empty stream.
