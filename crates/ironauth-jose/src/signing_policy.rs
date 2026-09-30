@@ -65,6 +65,25 @@ impl SigningPolicy {
         }
     }
 
+    /// The FIPS tenant profile (issue #162): `ES256` (the default), `RS256`
+    /// (available), and `EdDSA` UNAVAILABLE.
+    ///
+    /// The profile exists because of a genuine subtlety: even with a FIPS
+    /// 140-3-validated module server-side (aws-lc-rs, which notably includes
+    /// EdDSA), client-side validated-module coverage for EdDSA verification is
+    /// thin and CNSA 2.0 excludes EdDSA entirely. So a FIPS-constrained
+    /// environment should default to ES256 today; RS256 stays available for
+    /// clients that need it, and EdDSA is refused so no token can carry an
+    /// algorithm the tenant's assurance posture excludes. The first entry is
+    /// the environment's preferred signer (`SigningPolicy::preferred`), which
+    /// is how ES256 becomes the default rather than merely permitted.
+    #[must_use]
+    pub fn fips() -> Self {
+        Self {
+            allowed: vec![JwsAlgorithm::Es256, JwsAlgorithm::Rs256],
+        }
+    }
+
     /// The permitted algorithms, in preference order.
     #[must_use]
     pub fn allowed(&self) -> &[JwsAlgorithm] {
