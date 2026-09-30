@@ -169,6 +169,29 @@ pub fn assemble_claims(
 ) -> Map<String, Value> {
     let mut released = Map::new();
 
+    // 0. The verified_claims envelope (issue #164, IDA schema readiness): when
+    //    the claim bag carries verification metadata and the request names it,
+    //    the envelope is released through the subset semantics (the additive
+    //    verified_claims surface needs nothing more when it lands). Released
+    //    BEFORE the scope loop so a scope that names it can never widen it
+    //    beyond the request's subset.
+    if let Some(envelope) = bag.get(crate::verified_claims::VERIFIED_CLAIMS_CLAIM) {
+        if let Some(spec) = requested.get(crate::verified_claims::VERIFIED_CLAIMS_CLAIM) {
+            if let Some(released_envelope) =
+                crate::verified_claims::release_subset(envelope, spec)
+            {
+                released.insert(
+                    crate::verified_claims::VERIFIED_CLAIMS_CLAIM.to_owned(),
+                    released_envelope,
+                );
+            } else if spec.has_value_filter() {
+                // Present but failing the request's subset: omit it, the same
+                // omission rule the per-claim path applies.
+                released.remove(crate::verified_claims::VERIFIED_CLAIMS_CLAIM);
+            }
+        }
+    }
+
     // 1. Scope-derived claims: release each present member (no value filter).
     for name in scope_claim_names(granted_scopes) {
         // Refused rather than released: see PROTECTED_CLAIMS. A scope that named one of
@@ -218,6 +241,14 @@ mod tests {
             "name": "Ada Lovelace",
             "given_name": "Ada",
             "email": "ada@example.test",
+            "verified_claims": {
+                "verification": {
+                    "trust_framework": "de_aml",
+                    "assurance": "high",
+                    "evidence": [{"type": "document", "method": "pipp"}]
+                },
+                "claims": {"email": "ada@example.test"}
+            },
             "email_verified": true,
             "phone_number": "+15550100",
             "sub": "attacker-controlled",
@@ -233,6 +264,54 @@ mod tests {
 
     fn no_request() -> std::collections::BTreeMap<String, ClaimSpec> {
         std::collections::BTreeMap::new()
+    }
+
+    #[test]
+    fn verified_claims_rides_the_pipeline_end_to_end() {
+        // STORED: the claim document carries the envelope (the bag above).
+        let requested = {
+            let mut map = std::collections::BTreeMap::new();
+            map.insert(
+                crate::verified_claims::VERIFIED_CLAIMS_CLAIM.to_owned(),
+                ClaimSpec::voluntary().with_value(json!({"verification": {}})),
+            );
+            map
+        };
+        // REQUESTED + EMITTED: the one shared assembler releases the envelope
+        // when the request names it, verbatim for an unpinned request.
+        let released = assemble_claims(&bag(), &scopes(&["openid"]), &requested);
+        let envelope = released
+            .get(crate::verified_claims::VERIFIED_CLAIMS_CLAIM)
+            .expect("the envelope is released when requested");
+        assert_eq!(
+            envelope["verification"]["trust_framework"], "de_aml",
+            "the verification metadata (trust framework) survives stored -> emitted"
+        );
+        assert_eq!(
+            envelope["claims"]["email"], "ada@example.test",
+            "the claims half rides with the verification context"
+        );
+
+        // The subset semantics: a request pinning a DIFFERENT framework omits
+        // the envelope entirely (never partially released).
+        let eidas_request = {
+            let mut map = std::collections::BTreeMap::new();
+            map.insert(
+                crate::verified_claims::VERIFIED_CLAIMS_CLAIM.to_owned(),
+                ClaimSpec::voluntary()
+                    .with_value(json!({"verification": {"trust_framework": ["eidas"]}})),
+            );
+            map
+        };
+        let released = assemble_claims(&bag(), &scopes(&["openid"]), &eidas_request);
+        assert!(
+            !released.contains_key(crate::verified_claims::VERIFIED_CLAIMS_CLAIM),
+            "an envelope outside the pinned framework is omitted"
+        );
+
+        // Unrequested: never released (a scope cannot leak it either).
+        let released = assemble_claims(&bag(), &scopes(&["openid"]), &no_request());
+        assert!(!released.contains_key(crate::verified_claims::VERIFIED_CLAIMS_CLAIM));
     }
 
     #[test]
