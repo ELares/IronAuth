@@ -1510,6 +1510,7 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+
     /// The out of band policy decision trace sink for this scope (issue #91, M9 flow
     /// inspector). Records WHY a traced policy decision (step up, risk, or claim
     /// mapping) came out the way it did, off the request path; it is a diagnostic log,
@@ -13422,6 +13423,85 @@ pub struct ClientAuthDiagnosticQuery<'a> {
 /// opaque `invalid_client` with no oracle. Append-only and deliberately off the
 /// audited-write path (a diagnostic is a log entry, not a business mutation),
 /// mirroring `idempotency_keys`.
+/// The security-advisory repository (issue #163): the deployment-global banner
+/// surface's projection. Every row was verified before insertion (the feed
+/// module's single path); this repo is the store half.
+pub struct SecurityAdvisoryRepo<'a> {
+    pub(crate) store: &'a Store,
+}
+
+impl SecurityAdvisoryRepo<'_> {
+    /// Replace the accepted advisories with `advisories` (the feed poll/import
+    /// applies the whole verified set; a removed advisory stops being a banner).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn replace_all(
+        &self,
+        advisories: &[crate::advisory::AdvisoryRecord],
+        source: &str,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.store.pool().begin().await?;
+        sqlx::query("DELETE FROM security_advisories")
+            .execute(&mut *tx)
+            .await?;
+        for advisory in advisories {
+            sqlx::query(
+                "INSERT INTO security_advisories \
+                 (id, title, severity, affected_versions, summary, published_at, source) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(&advisory.id)
+            .bind(&advisory.title)
+            .bind(advisory.severity.as_str())
+            .bind(
+                &serde_json::to_string(&advisory.affected_versions)
+                    .map_err(|_| StoreError::Encryption)?,
+            )
+            .bind(&advisory.summary)
+            .bind(advisory.published_at)
+            .bind(source)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The accepted advisories, newest first (the banner surface's order).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(&self) -> Result<Vec<crate::advisory::AdvisoryRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, title, severity, affected_versions, summary, published_at \
+             FROM security_advisories ORDER BY published_at DESC",
+        )
+        .fetch_all(self.store.pool())
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(crate::advisory::AdvisoryRecord {
+                id: row.get("id"),
+                title: row.get("title"),
+                severity: crate::advisory::AdvisorySeverity::parse(
+                    &row.get::<String, _>("severity"),
+                )
+                .unwrap_or(crate::advisory::AdvisorySeverity::Low),
+                affected_versions: serde_json::from_str(
+                    &row.get::<String, _>("affected_versions"),
+                )
+                .unwrap_or_default(),
+                summary: row.get("summary"),
+                published_at: row.get("published_at"),
+            });
+        }
+        Ok(out)
+    }
+}
+
 pub struct ClientAuthDiagnosticsRepo<'a> {
     store: &'a Store,
     scope: Scope,

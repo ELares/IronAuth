@@ -49,6 +49,7 @@
 
 pub mod abuse;
 pub mod access_request;
+pub mod advisory;
 pub mod access_review;
 pub mod api_key;
 pub mod audit;
@@ -429,6 +430,8 @@ pub use risk::{
     NewRiskSignal, RiskDecisionView, RiskSignalView,
 };
 pub use scope::Scope;
+
+
 pub use signup_form::{
     NewSignupForm, SignupFormConfig, SignupFormError, SignupFormField, SignupFormRecord,
     SignupStep, validate_against_schema as validate_signup_form,
