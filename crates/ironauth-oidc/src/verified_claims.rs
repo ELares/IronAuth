@@ -94,7 +94,7 @@ pub fn release_subset(envelope: &Value, spec: &ClaimSpec) -> Option<Value> {
             .and_then(|values| values.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
             .or_else(|| pinned.as_str().map(|s| vec![s]))?;
         let matches = accepted.iter().any(|candidate| {
-            candidate == framework
+            *candidate == framework
                 || (known_framework(candidate) && known_framework(framework) && false)
         });
         if !matches {
@@ -109,7 +109,7 @@ pub fn release_subset(envelope: &Value, spec: &ClaimSpec) -> Option<Value> {
             .and_then(|values| values.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
             .or_else(|| pinned.as_str().map(|s| vec![s]))?;
         let assurance = verification.get("assurance").and_then(Value::as_str)?;
-        if !accepted.iter().any(|candidate| candidate == assurance) {
+        if !accepted.iter().any(|candidate| *candidate == assurance) {
             return None;
         }
     }

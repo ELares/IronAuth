@@ -3557,3 +3557,68 @@ export async function setResourceServerPermissionClaims(
   }
   return data;
 }
+
+// ---------------------------------------------------------------------------
+// The security-advisory surface (issue #163): the banner projection and the
+// offline bundle import. Every advisory the console renders was VERIFIED by the
+// server before it was stored (the feed's single verification path), so this
+// surface never renders an unverified advisory.
+
+// One accepted advisory, as the banner surface renders it.
+export interface AdvisoryView {
+  id: string;
+  title: string;
+  severity: string;
+  affected_versions: string[];
+  summary: string;
+  published_at: number;
+}
+
+// The accepted advisories, newest first.
+export interface AdvisoryListView {
+  advisories: AdvisoryView[];
+}
+
+// Fetch the accepted security advisories for the active {tenant, environment}.
+// When no scope is selected the caller must not call this (zero calls).
+export async function fetchSecurityAdvisories(
+  tenantId: string,
+  environmentId: string,
+): Promise<AdvisoryListView> {
+  const client = createManagementClient();
+  const { data, error, response } = await client.GET(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories",
+    {
+      params: {
+        path: { tenant_id: tenantId, environment_id: environmentId },
+      },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+  return { advisories: data?.advisories ?? [] };
+}
+
+// Import the signed advisory bundle (the offline path; the online poll uses the
+// SAME verification on the server). The bundle is the signed feed document: the
+// `feed` member plus the `signature` member.
+export async function importSecurityAdvisories(
+  tenantId: string,
+  environmentId: string,
+  feed: string,
+): Promise<void> {
+  const client = createManagementClient();
+  const { error, response } = await client.POST(
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories/import",
+    {
+      params: {
+        path: { tenant_id: tenantId, environment_id: environmentId },
+      },
+      body: { feed },
+    },
+  );
+  if (error !== undefined || !response.ok) {
+    throw new ManagementError(toErrorBody(error), response.status);
+  }
+}
