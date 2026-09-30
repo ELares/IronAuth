@@ -2040,6 +2040,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0240_id_token_encrypted_response.sql"),
         },
+        // EXPAND (issue #163): the security-advisory store.
+        Migration {
+            version: 241,
+            name: "security_advisories",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0241_security_advisories.sql"),
+        },
     ]
 }
 

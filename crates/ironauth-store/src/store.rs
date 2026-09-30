@@ -117,6 +117,14 @@ pub const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 3;
 pub const BOOT_CONNECT_TOLERANCE_SECS: u64 = 30;
 
 impl Store {
+    /// The deployment-global security-advisory repository (issue #163): the
+    /// banner surface's projection.
+    #[must_use]
+    pub fn security_advisories(&self) -> crate::repository::SecurityAdvisoryRepo<'_> {
+        crate::repository::SecurityAdvisoryRepo {
+            store: self,
+        }
+    }
     /// Run the pre-upgrade data preflight against this store's database (issue #148).
     ///
     /// Read-only: it probes live rows against the constraints every pending migration

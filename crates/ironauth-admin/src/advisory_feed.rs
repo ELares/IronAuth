@@ -102,6 +102,20 @@ pub fn verify_feed(
     Ok(VerifiedFeed { advisories })
 }
 
+/// Load the deployment's configured verification key (the base64url Ed25519
+/// public key from `[security] advisory_verification_key`), or `None` when the
+/// feed is disabled.
+pub fn configured_verification_key(
+    config: &ironauth_config::Config,
+) -> Option<ironauth_jose::TrustedKey> {
+    let key_b64 = config.advisory_verification_key.as_deref()?;
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(key_b64)
+        .ok()?;
+    ironauth_jose::TrustedKey::ed25519(Some("advisory-feed".to_owned()), &bytes).ok()
+}
+
 /// Sign a feed (the authoring side: tests and the release tooling).
 pub fn sign_feed(feed_member: &Value, signing_key: &ironauth_jose::SigningKey) -> String {
     let canonical = serde_json::to_vec(feed_member).expect("the feed serializes");
