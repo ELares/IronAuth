@@ -9325,12 +9325,14 @@ async fn rotation_timer_inputs(
                     );
                     return None;
                 };
-                Some(Box::new(ironauth_oidc::vault_sign::VaultKeyProvisioner::new(
-                    config.signing.vault.addr.clone(),
-                    config.signing.vault.mount.clone(),
-                    secret.clone(),
-                    std::time::Duration::from_secs(config.signing.vault.timeout_secs),
-                )))
+                Some(Box::new(
+                    ironauth_oidc::vault_sign::VaultKeyProvisioner::new(
+                        config.signing.vault.addr.clone(),
+                        config.signing.vault.mount.clone(),
+                        secret.clone(),
+                        std::time::Duration::from_secs(config.signing.vault.timeout_secs),
+                    ),
+                ))
             }
             ironauth_config::SigningBackend::Local => None,
         },

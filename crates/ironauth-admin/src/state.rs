@@ -869,7 +869,11 @@ impl AdminState {
     /// key + the poll interval. `None` disables the feed. A BUILDER, not an
     /// `AdminConfig` field, because the setting lives in `[security]`.
     #[must_use]
-    pub fn with_advisory_feed(mut self, key: Option<ironauth_jose::TrustedKey>, poll_secs: u64) -> Self {
+    pub fn with_advisory_feed(
+        mut self,
+        key: Option<ironauth_jose::TrustedKey>,
+        poll_secs: u64,
+    ) -> Self {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             inner.advisory_verification_key = key;
             inner.advisory_poll_interval_secs = poll_secs;

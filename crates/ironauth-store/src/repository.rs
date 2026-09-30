@@ -1510,7 +1510,6 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
-
     /// The out of band policy decision trace sink for this scope (issue #91, M9 flow
     /// inspector). Records WHY a traced policy decision (step up, risk, or claim
     /// mapping) came out the way it did, off the request path; it is a diagnostic log,
@@ -13512,10 +13511,8 @@ impl SecurityAdvisoryRepo<'_> {
                     &row.get::<String, _>("severity"),
                 )
                 .unwrap_or(crate::advisory::AdvisorySeverity::Low),
-                affected_versions: serde_json::from_str(
-                    &row.get::<String, _>("affected_versions"),
-                )
-                .unwrap_or_default(),
+                affected_versions: serde_json::from_str(&row.get::<String, _>("affected_versions"))
+                    .unwrap_or_default(),
                 summary: row.get("summary"),
                 published_at: row.get("published_at"),
             });

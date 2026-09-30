@@ -85,8 +85,8 @@ pub fn encrypt_ecdh_es(
     if alg != "ECDH-ES" {
         return Err(JweError::UnsupportedAlgorithm);
     }
-    let public = p256::PublicKey::from_sec1_bytes(recipient_public_key)
-        .map_err(|_| JweError::InvalidKey)?;
+    let public =
+        p256::PublicKey::from_sec1_bytes(recipient_public_key).map_err(|_| JweError::InvalidKey)?;
     let mut rng = ironauth_env::keygen_rng(entropy);
     let ephemeral = EphemeralSecret::random(&mut rng);
     let shared = ephemeral.diffie_hellman(&public);
@@ -128,16 +128,26 @@ pub fn decrypt_ecdh_es(
     )
     .map_err(|_| JweError::Decryption)?;
     let epk = header.get("epk").ok_or(JweError::Decryption)?;
-    let x = epk.get("x").and_then(|v| v.as_str()).ok_or(JweError::Decryption)?;
-    let y = epk.get("y").and_then(|v| v.as_str()).ok_or(JweError::Decryption)?;
-    let x_bytes = URL_SAFE_NO_PAD.decode(x).map_err(|_| JweError::Decryption)?;
-    let y_bytes = URL_SAFE_NO_PAD.decode(y).map_err(|_| JweError::Decryption)?;
+    let x = epk
+        .get("x")
+        .and_then(|v| v.as_str())
+        .ok_or(JweError::Decryption)?;
+    let y = epk
+        .get("y")
+        .and_then(|v| v.as_str())
+        .ok_or(JweError::Decryption)?;
+    let x_bytes = URL_SAFE_NO_PAD
+        .decode(x)
+        .map_err(|_| JweError::Decryption)?;
+    let y_bytes = URL_SAFE_NO_PAD
+        .decode(y)
+        .map_err(|_| JweError::Decryption)?;
     let mut encoded = vec![0x04];
     encoded.extend_from_slice(&x_bytes);
     encoded.extend_from_slice(&y_bytes);
     let peer = p256::PublicKey::from_sec1_bytes(&encoded).map_err(|_| JweError::Decryption)?;
-    let secret = p256::SecretKey::from_slice(recipient_private_key)
-        .map_err(|_| JweError::InvalidKey)?;
+    let secret =
+        p256::SecretKey::from_slice(recipient_private_key).map_err(|_| JweError::InvalidKey)?;
     let scalar = secret.to_nonzero_scalar();
     let shared = p256::ecdh::diffie_hellman(&scalar, peer.as_ref());
     let cek = concat_kdf(shared.raw_secret_bytes(), CONTENT_ENC, 32);
@@ -195,8 +205,8 @@ fn encrypt_with_cek(
             &mut in_out,
         )
         .map_err(|_| JweError::InvalidKey)?;
-    let header_b64 = URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(header).map_err(|_| JweError::InvalidKey)?);
+    let header_b64 =
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(header).map_err(|_| JweError::InvalidKey)?);
     Ok(format!(
         "{header_b64}.{}.{}.{}.{}",
         URL_SAFE_NO_PAD.encode(encrypted_key),

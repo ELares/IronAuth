@@ -1480,13 +1480,20 @@ pub async fn mint(
     // THE SIGN-THEN-ENCRYPT ARM (issue #158): a client registered for the
     // encrypted ID-token response gets the JWS wrapped in an ECDH-ES JWE to its
     // registered public key - the code-flow counterpart of the front-channel arm.
-    let id_token = match encrypt_id_token_for_client(state, request.scope, &request.client_id, &id_token).await
+    let id_token = match encrypt_id_token_for_client(
+        state,
+        request.scope,
+        &request.client_id,
+        &id_token,
+    )
+    .await
     {
         Some(encrypted) => encrypted,
         None => id_token,
     };
 
-    let (access, permission_budget) = mint_access(state, signer, policy, request, target, now).await?;
+    let (access, permission_budget) =
+        mint_access(state, signer, policy, request, target, now).await?;
 
     Ok(IssuedTokens {
         access,
@@ -1578,11 +1585,9 @@ async fn mint_access(
         // RFC 9068 at+jwt: the header typ is `at+jwt` and the claims carry the
         // section 2.2 set, signed through the same policy-enforced core as the ID
         // token, so an algorithm the policy forbids is refused before signing.
-        TokenFormat::AtJwt => {
-            mint_at_jwt(state, signer, policy, request, target, iat, access_exp)
-                .await
-                .map_err(MintRefusal::from)
-        }
+        TokenFormat::AtJwt => mint_at_jwt(state, signer, policy, request, target, iat, access_exp)
+            .await
+            .map_err(MintRefusal::from),
         // Opaque: a scope-declaring reference token; only its digest and metadata
         // are stored (the caller records them in the redeem transaction). The token
         // embeds its own `jti` as the routing handle, so the digest is over the

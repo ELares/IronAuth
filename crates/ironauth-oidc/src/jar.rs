@@ -23,10 +23,10 @@
 
 use std::sync::Arc;
 
-use base64::Engine as _;
+use crate::OidcState;
 use crate::authorize::AuthorizeParams;
 use crate::client_auth::resolve_client_keys;
-use crate::OidcState;
+use base64::Engine as _;
 use ironauth_jose::{ExpectedTyp, TokenTyp, TrustedKey, VerificationPolicy, verify};
 use ironauth_store::{ClientId, Scope};
 use serde_json::Value;
@@ -94,7 +94,10 @@ pub async fn resolve_request_object(
         .store()
         .scoped(scope)
         .clients()
-        .auth_record(&ClientId::parse_in_scope(&client_id, &scope).map_err(|_| JarError::InvalidRequestObject)?)
+        .auth_record(
+            &ClientId::parse_in_scope(&client_id, &scope)
+                .map_err(|_| JarError::InvalidRequestObject)?,
+        )
         .await
         .map_err(|_| JarError::InvalidRequestObject)?;
     let keys = resolve_client_keys(state, &auth_record).await;

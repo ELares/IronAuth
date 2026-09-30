@@ -142,23 +142,26 @@ pub async fn import_security_advisories(
                 .to_owned(),
         ));
     };
-    let verified = crate::advisory_feed::verify_feed(&request.feed, &verification_key).map_err(
-        |error| match error {
-            crate::advisory_feed::FeedError::BadSignature => {
-                // A rejected feed is a SECURITY EVENT: an operator imported a bundle
-                // whose signature did not verify. The endpoint answers 400; the log
-                // carries the attempt.
-                tracing::error!(
-                    actor = %actor,
-                    "security-advisory feed REJECTED: the signature did not verify"
-                );
-                ApiError::BadRequest("the advisory bundle failed signature verification".to_owned())
+    let verified =
+        crate::advisory_feed::verify_feed(&request.feed, &verification_key).map_err(|error| {
+            match error {
+                crate::advisory_feed::FeedError::BadSignature => {
+                    // A rejected feed is a SECURITY EVENT: an operator imported a bundle
+                    // whose signature did not verify. The endpoint answers 400; the log
+                    // carries the attempt.
+                    tracing::error!(
+                        actor = %actor,
+                        "security-advisory feed REJECTED: the signature did not verify"
+                    );
+                    ApiError::BadRequest(
+                        "the advisory bundle failed signature verification".to_owned(),
+                    )
+                }
+                crate::advisory_feed::FeedError::Malformed => {
+                    ApiError::BadRequest("the advisory bundle does not parse".to_owned())
+                }
             }
-            crate::advisory_feed::FeedError::Malformed => ApiError::BadRequest(
-                "the advisory bundle does not parse".to_owned(),
-            ),
-        },
-    )?;
+        })?;
     let records: Vec<ironauth_store::advisory::AdvisoryRecord> = verified
         .advisories
         .iter()

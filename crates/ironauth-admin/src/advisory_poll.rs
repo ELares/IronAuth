@@ -58,10 +58,7 @@ async fn poll_once(
     verification_key: &ironauth_jose::TrustedKey,
 ) -> Result<(), PollError> {
     let request = FetchRequest::get(FetchPurpose::AdvisoryPoll, feed_url);
-    let response = fetcher
-        .fetch(request)
-        .await
-        .map_err(|_| PollError::Fetch)?;
+    let response = fetcher.fetch(request).await.map_err(|_| PollError::Fetch)?;
     if !response.status().is_success() {
         return Err(PollError::Fetch);
     }
@@ -156,7 +153,9 @@ impl std::fmt::Display for PollError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PollError::Fetch => formatter.write_str("the feed could not be fetched"),
-            PollError::Tampered => formatter.write_str("the feed failed signature verification (rejected entirely)"),
+            PollError::Tampered => {
+                formatter.write_str("the feed failed signature verification (rejected entirely)")
+            }
             PollError::Store => formatter.write_str("the verified feed could not be persisted"),
         }
     }

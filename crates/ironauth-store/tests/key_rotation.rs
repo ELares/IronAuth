@@ -362,8 +362,9 @@ async fn a_backend_outage_during_seeding_leaves_the_previous_current_key_active(
     let actor = db.test_actor(&env);
     let policy = test_policy();
     let provisioner = OutagedProvisioner;
-    let machine = RotationStateMachine::new(db.store(), scope, actor, CorrelationId::generate(&env))
-        .with_remote_seeding(&provisioner);
+    let machine =
+        RotationStateMachine::new(db.store(), scope, actor, CorrelationId::generate(&env))
+            .with_remote_seeding(&provisioner);
 
     // The pre-publication point: the seed is due, the backend is OUT. The advance
     // fails, and the key set is unchanged - the previous current key is active.
@@ -405,7 +406,8 @@ async fn a_backend_outage_during_seeding_leaves_the_previous_current_key_active(
         .await
         .expect("list the keys");
     assert!(
-        keys.iter().any(|key| key.material_kind.as_str() == "remote_reference"),
+        keys.iter()
+            .any(|key| key.material_kind.as_str() == "remote_reference"),
         "the remote deployment's successor is a REMOTE reference"
     );
 }

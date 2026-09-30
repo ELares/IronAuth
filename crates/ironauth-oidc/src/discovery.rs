@@ -679,8 +679,7 @@ pub fn discovery_document(
             let mut algs: Vec<String> = id_token_signing_alg_values(policy)
                 .into_iter()
                 .filter(|name| {
-                    crate::fapi_hardened::hardened_permits_signing_alg_name(name)
-                        || name == "RS256"
+                    crate::fapi_hardened::hardened_permits_signing_alg_name(name) || name == "RS256"
                 })
                 .collect();
             if !algs.iter().any(|name| name == "RS256") {

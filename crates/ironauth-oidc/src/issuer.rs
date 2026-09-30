@@ -1139,7 +1139,12 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> LoadOutcome {
     // order), because a transient read must never change the signing policy --
     // the opposite direction (fail closed) would swap the environment's signer
     // on a database hiccup, which is worse than serving the default set.
-    let fips = match store.scoped(*scope).environment_guardrails().fips_profile().await {
+    let fips = match store
+        .scoped(*scope)
+        .environment_guardrails()
+        .fips_profile()
+        .await
+    {
         Ok(fips) => fips,
         Err(_) => false,
     };
