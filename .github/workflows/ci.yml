@@ -901,6 +901,16 @@ jobs:
         run: |
           PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
           EXPECT_CODE=334158 ./scripts/dev-otp-login.sh
+      # Issue #163 criterion: the core-flow battery (discovery, JWKS fetch,
+      # code+PKCE login, token issuance, admin API call) passes in the SAME
+      # no-egress window the inspection above observes. The script boots its own
+      # emulator on a fresh port; everything is loopback (the RP-style listener
+      # on port 80 catches the authorization code), so no DNS or egress is
+      # involved anywhere in the flows an air-gapped operator actually runs.
+      - name: Assert the core-flow battery passes (code+PKCE, token issuance, admin API)
+        run: |
+          PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
+          EXPECT_CODE=334158 ./scripts/dev-core-flows.sh
       # Issue #120 criterion 1: the HEADLESS login path, driven with no browser anywhere.
       # The device grant's whole premise is a device that cannot open one, so a test that
       # approves through a browser proves nothing about the case the flow exists for. This
