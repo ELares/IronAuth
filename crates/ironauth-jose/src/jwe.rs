@@ -252,6 +252,7 @@ mod tests {
     /// A fresh P-256 keypair: the static private scalar + the uncompressed public
     /// point, drawn off the determinism-seam bridge (the same rng the keygen uses).
     fn p256_keypair(entropy: &dyn ironauth_env::Entropy) -> ([u8; 32], Vec<u8>) {
+        use p256::elliptic_curve::sec1::ToEncodedPoint as _;
         let mut rng = ironauth_env::keygen_rng(entropy);
         let private = p256::SecretKey::random(&mut rng);
         let public_point = private.public_key().to_encoded_point(false);
@@ -274,8 +275,8 @@ mod tests {
     #[test]
     fn ecdh_es_p256_round_trips() {
         let env = fixed_entropy();
-        let (private, public) = p256_keypair(&env);
-        let compact = encrypt_ecdh_es("ECDH-ES", &public, b"the id token", &env).expect("encrypt");
+        let (private, public) = p256_keypair(env.entropy());
+        let compact = encrypt_ecdh_es("ECDH-ES", &public, b"the id token", env.entropy()).expect("encrypt");
         let plain = decrypt_ecdh_es("ECDH-ES", &compact, &private).expect("decrypt");
         assert_eq!(plain, b"the id token");
     }
@@ -283,17 +284,17 @@ mod tests {
     #[test]
     fn a_wrong_key_does_not_decrypt() {
         let env = fixed_entropy();
-        let (public, _) = p256_keypair(&env);
-        let (other_private, _) = p256_keypair(&env);
-        let compact = encrypt_ecdh_es("ECDH-ES", &public, b"secret", &env).expect("encrypt");
+        let (public, _) = p256_keypair(env.entropy());
+        let (other_private, _) = p256_keypair(env.entropy());
+        let compact = encrypt_ecdh_es("ECDH-ES", &public, b"secret", env.entropy()).expect("encrypt");
         assert!(decrypt_ecdh_es("ECDH-ES", &compact, &other_private).is_err());
     }
 
     #[test]
     fn tampering_fails_the_tag() {
         let env = fixed_entropy();
-        let (private, public) = p256_keypair(&env);
-        let compact = encrypt_ecdh_es("ECDH-ES", &public, b"secret", &env).expect("encrypt");
+        let (private, public) = p256_keypair(env.entropy());
+        let compact = encrypt_ecdh_es("ECDH-ES", &public, b"secret", env.entropy()).expect("encrypt");
         let tampered = format!("{}x", compact);
         assert!(decrypt_ecdh_es("ECDH-ES", &tampered, &private).is_err());
     }
@@ -301,8 +302,8 @@ mod tests {
     #[test]
     fn a_refused_algorithm_is_never_accepted() {
         let env = fixed_entropy();
-        let (_, public) = p256_keypair(&env);
-        assert!(encrypt_ecdh_es("RSA1_5", &public, b"x", &env).is_err());
-        assert!(encrypt_ecdh_es("PBES2-HS256+A128KW", &public, b"x", &env).is_err());
+        let (_, public) = p256_keypair(env.entropy());
+        assert!(encrypt_ecdh_es("RSA1_5", &public, b"x", env.entropy()).is_err());
+        assert!(encrypt_ecdh_es("PBES2-HS256+A128KW", &public, b"x", env.entropy()).is_err());
     }
 }
