@@ -2047,6 +2047,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0241_security_advisories.sql"),
         },
+        // EXPAND (issue #162): the per-environment FIPS tenant profile flag.
+        Migration {
+            version: 242,
+            name: "fips_profile",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0242_fips_profile.sql"),
+        },
     ]
 }
 

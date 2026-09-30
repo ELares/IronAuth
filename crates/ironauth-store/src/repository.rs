@@ -11938,6 +11938,28 @@ impl EnvironmentGuardrailRepo<'_> {
         Ok(row.get::<bool, _>("fapi_hardened"))
     }
 
+    /// Whether this environment runs the FIPS tenant profile (issue #162): the
+    /// algorithm policy presets to the validated-module-compatible set (ES256
+    /// default, RS256 available, EdDSA unavailable).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the environment is absent in this scope.
+    pub async fn fips_profile(&self) -> Result<bool, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT fips_profile FROM environment_guardrails \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        Ok(row.get::<bool, _>("fips_profile"))
+    }
+
     /// The FAPI-hardened compliance scan (issue #156): every registered client in
     /// this scope whose configuration violates the hardened constraints, each
     /// named. An empty list is a conformant environment. The scan covers the
