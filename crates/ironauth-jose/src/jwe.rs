@@ -25,20 +25,18 @@
 //! The JWE Concat KDF (NIST SP 800-56A) derives the content key from the agreed
 //! key `Z`: SHA-256 over `Z || round(4 bytes) || Z-length(4 bytes) || Z ||
 //! AlgorithmID || PartyUInfo || PartyVInfo || SuppPubInfo || SuppPrivInfo`. For
-//! `ECDH-ES` the derived key IS the CEK; the `alg` in the AlgorithmID is the
+//! `ECDH-ES` the derived key IS the CEK; the `alg` in the `AlgorithmID` is the
 //! content-encryption algorithm (`A256GCM`), per RFC 7518 section 4.6.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use p256::ecdh::{EphemeralSecret, SharedSecret};
-use p256::EncodedPoint;
+use p256::ecdh::EphemeralSecret;
 use ring::aead::{AES_256_GCM, Aad as RingAad, LessSafeKey, Nonce, UnboundKey};
-use ring::rand::SystemRandom;
 
 use crate::crypto::sha256;
 
-/// The refused JWE algorithm families: RSA1_5 (Bleichenbacher class) and the
-/// PBKDF2-based algorithms. Refused at the PARSE, never implemented.
+/// The refused JWE algorithm families: `RSA1_5` (Bleichenbacher class) and the
+/// `PBKDF2`-based algorithms. Refused at the PARSE, never implemented.
 pub const REFUSED_JWE_ALGORITHMS: &[&str] = &[
     "RSA1_5",
     "PBES2-HS256+A128KW",
@@ -58,7 +56,7 @@ const CONTENT_ENC: &str = "A256GCM";
 /// A JWE processing failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JweError {
-    /// The algorithm is refused or unsupported (RSA1_5, the PBKDF2 family, or
+    /// The algorithm is refused or unsupported (`RSA1_5`, the `PBKDF2` family, or
     /// anything outside the curated suite).
     UnsupportedAlgorithm,
     /// The ciphertext does not decrypt (a wrong key, a tampered compact form, or

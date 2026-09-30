@@ -168,6 +168,11 @@ impl ExternalSigner for LocalSigner {
 /// (the signature must verify against the key the kid names), and the size
 /// ceiling's refusal (a backend whose declared ceiling the input exceeds must
 /// refuse BEFORE dispatch).
+/// # Errors
+///
+/// Returns an error string naming the failed assertion: a signature that does
+/// not verify, a mismatched `kid`, or a backend that signed despite an input
+/// exceeding its declared ceiling.
 pub async fn run_conformance_battery(
     backend: &(dyn ExternalSigner + '_),
     kid: &str,
