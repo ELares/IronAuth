@@ -121,9 +121,7 @@ impl Store {
     /// banner surface's projection.
     #[must_use]
     pub fn security_advisories(&self) -> crate::repository::SecurityAdvisoryRepo<'_> {
-        crate::repository::SecurityAdvisoryRepo {
-            store: self,
-        }
+        crate::repository::SecurityAdvisoryRepo { store: self }
     }
     /// Run the pre-upgrade data preflight against this store's database (issue #148).
     ///

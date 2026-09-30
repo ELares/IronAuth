@@ -177,8 +177,7 @@ pub fn assemble_claims(
     //    beyond the request's subset.
     if let Some(envelope) = bag.get(crate::verified_claims::VERIFIED_CLAIMS_CLAIM) {
         if let Some(spec) = requested.get(crate::verified_claims::VERIFIED_CLAIMS_CLAIM) {
-            if let Some(released_envelope) =
-                crate::verified_claims::release_subset(envelope, spec)
+            if let Some(released_envelope) = crate::verified_claims::release_subset(envelope, spec)
             {
                 released.insert(
                     crate::verified_claims::VERIFIED_CLAIMS_CLAIM.to_owned(),

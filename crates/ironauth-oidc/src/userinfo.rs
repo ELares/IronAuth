@@ -666,7 +666,10 @@ async fn success(
     scope: Scope,
 ) -> Response {
     let (content_type, body) = match userinfo_signing_alg(state, client_id, scope).await {
-        Some(_alg) => ("application/jwt", sign_userinfo(state, claims, client_id, scope).await),
+        Some(_alg) => (
+            "application/jwt",
+            sign_userinfo(state, claims, client_id, scope).await,
+        ),
         None => (
             "application/json",
             Value::Object(claims.clone()).to_string(),
@@ -687,11 +690,7 @@ async fn success(
 /// The client's registered UserInfo signing algorithm (issue #158): the scoped
 /// record's `userinfo_signed_response_alg`; `None` (the default) keeps the plain
 /// JSON form.
-async fn userinfo_signing_alg(
-    state: &OidcState,
-    client_id: &str,
-    scope: Scope,
-) -> Option<String> {
+async fn userinfo_signing_alg(state: &OidcState, client_id: &str, scope: Scope) -> Option<String> {
     let id = ClientId::parse_in_scope(client_id, &scope).ok()?;
     state
         .store()

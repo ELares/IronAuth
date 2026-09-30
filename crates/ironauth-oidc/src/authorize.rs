@@ -971,7 +971,9 @@ async fn issue_code(
     //    the SAME validator at push time, so a pushed request and a plain request are
     //    checked by EXACTLY the same rules and cannot diverge. An error before a
     //    redirect target is validated is a page; after, it rides the negotiated mode.
-    let hardened = crate::fapi_hardened::is_hardened(state, scope).await.unwrap_or(false);
+    let hardened = crate::fapi_hardened::is_hardened(state, scope)
+        .await
+        .unwrap_or(false);
     let validated = validate_request(state, &client, &params, hardened)
         .map_err(|error| error.into_authorize(state.issuer_for(&scope), params.state.as_deref()))?;
     let ValidatedRequest {
@@ -1230,36 +1232,36 @@ async fn issue_code(
     //      the token endpoint's exact claim + signing path, carrying `nonce`, and
     //      (hybrid only) `c_hash` of the issued code, never an access token;
     //    - `none`: issue nothing.
-/// Resolve the JARM signing context (issue #158): the client's registered
-/// `authorization_signed_response_alg` + the environment's signing key + the
-/// issuer. `None` when the client registered no JARM alg (the plain modes) or
-/// the signer is unavailable.
-async fn jarm_context<'a>(
-    state: &OidcState,
-    scope: Scope,
-    stored: &str,
-    iss: &'a str,
-) -> Option<(&'static str, &'a str)> {
-    // The client's registered JARM response algorithm: the record's
-    // authorization_signed_response_alg. A client without one keeps the plain
-    // modes (the JARM spec's per-client enablement).
-    let id = ClientId::parse_in_scope(stored, &scope).ok()?;
-    let record = state
-        .store()
-        .scoped(scope)
-        .clients()
-        .dynamic_registration(&id)
-        .await
-        .ok()?;
-    let alg = record.authorization_signed_response_alg.as_deref()?;
-    if !crate::fapi_hardened::hardened_permits_signing_alg_name(alg) {
-        return None;
+    /// Resolve the JARM signing context (issue #158): the client's registered
+    /// `authorization_signed_response_alg` + the environment's signing key + the
+    /// issuer. `None` when the client registered no JARM alg (the plain modes) or
+    /// the signer is unavailable.
+    async fn jarm_context<'a>(
+        state: &OidcState,
+        scope: Scope,
+        stored: &str,
+        iss: &'a str,
+    ) -> Option<(&'static str, &'a str)> {
+        // The client's registered JARM response algorithm: the record's
+        // authorization_signed_response_alg. A client without one keeps the plain
+        // modes (the JARM spec's per-client enablement).
+        let id = ClientId::parse_in_scope(stored, &scope).ok()?;
+        let record = state
+            .store()
+            .scoped(scope)
+            .clients()
+            .dynamic_registration(&id)
+            .await
+            .ok()?;
+        let alg = record.authorization_signed_response_alg.as_deref()?;
+        if !crate::fapi_hardened::hardened_permits_signing_alg_name(alg) {
+            return None;
+        }
+        // The alg is a STATIC name when the record's value is a recognized algorithm
+        // (the registration validated it); the hardened check above proves it parses.
+        let static_alg = ironauth_jose::JwsAlgorithm::from_jose_name(alg)?.as_jose_name();
+        Some((static_alg, iss))
     }
-    // The alg is a STATIC name when the record's value is a recognized algorithm
-    // (the registration validated it); the hardened check above proves it parses.
-    let static_alg = ironauth_jose::JwsAlgorithm::from_jose_name(alg)?.as_jose_name();
-    Some((static_alg, iss))
-}
 
     let code = if response_type.issues_code() {
         Some(persist_code(state, scope, stored, redirect_uri, &iss, mode, &resolved).await?)
@@ -1324,11 +1326,9 @@ async fn jarm_context<'a>(
     let jarm_ctx = jarm_context(state, scope, &stored.to_string(), &iss).await;
     let entry = state.issuer_entry(&scope).await;
     let jarm = match (jarm_ctx, entry.as_ref()) {
-        (Some((alg, _iss)), Some(entry)) => {
-            entry
-                .signer(state.now())
-                .map(|key| (key, alg, iss.as_str()))
-        }
+        (Some((alg, _iss)), Some(entry)) => entry
+            .signer(state.now())
+            .map(|key| (key, alg, iss.as_str())),
         _ => None,
     };
     Ok(response::render(mode, redirect_uri, &params, jarm))
@@ -1806,7 +1806,7 @@ pub(crate) fn validate_request<'a>(
         response_type,
         mode,
         nonce,
-    hardened,
+        hardened,
     )
 }
 
@@ -1839,7 +1839,8 @@ fn validate_request_tail<'a>(
     // 4b. The client-auth restriction (FAPI 2.0 §6.1): a hardened environment
     //    refuses a request from a client whose registered method is not in the
     //    permitted set - public clients cannot exist here.
-    if hardened && !crate::fapi_hardened::hardened_permits_client_auth_method(client.auth_method()) {
+    if hardened && !crate::fapi_hardened::hardened_permits_client_auth_method(client.auth_method())
+    {
         return Err(AuthRequestError::redirect(
             redirect_uri,
             mode,

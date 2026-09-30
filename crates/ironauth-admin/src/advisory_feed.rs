@@ -26,10 +26,10 @@
 //! The banner tiering (critical/high/medium/low) drives the admin SPA's rendering
 //! and the dismiss-per-admin audit; the tiers are part of the advisory model.
 
+use base64::Engine as _;
 use ironauth_jose::TrustedKey;
 use serde::Deserialize;
 use serde_json::Value;
-use base64::Engine as _;
 
 /// The advisory severity tiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -76,8 +76,7 @@ pub fn verify_feed(
     feed_json: &str,
     verification_key: &TrustedKey,
 ) -> Result<VerifiedFeed, FeedError> {
-    let value: Value =
-        serde_json::from_str(feed_json).map_err(|_| FeedError::Malformed)?;
+    let value: Value = serde_json::from_str(feed_json).map_err(|_| FeedError::Malformed)?;
     let signature = value
         .get("signature")
         .and_then(|v| v.as_str())

@@ -80,7 +80,9 @@ fn known_framework(framework: &str) -> bool {
 pub fn release_subset(envelope: &Value, spec: &ClaimSpec) -> Option<Value> {
     let object = envelope.as_object()?;
     let verification = object.get("verification")?.as_object()?;
-    let framework = verification.get("trust_framework").and_then(Value::as_str)?;
+    let framework = verification
+        .get("trust_framework")
+        .and_then(Value::as_str)?;
 
     // The request's pins live under `verification` inside the request's own
     // envelope-shaped spec: `{"verified_claims": {"verification": {...}}}`.
@@ -139,8 +141,11 @@ mod tests {
 
     #[test]
     fn an_unpinned_request_releases_the_envelope_verbatim() {
-        let released = release_subset(&envelope("de_aml", "high"), &spec(json!({"verification": {}})))
-            .expect("released");
+        let released = release_subset(
+            &envelope("de_aml", "high"),
+            &spec(json!({"verification": {}})),
+        )
+        .expect("released");
         assert_eq!(released, envelope("de_aml", "high"));
     }
 
@@ -171,7 +176,10 @@ mod tests {
     #[test]
     fn an_envelope_without_verification_is_never_released() {
         assert_eq!(
-            release_subset(&json!({"claims": {"email": "a@b.test"}}), &spec(json!({"verification": {}}))),
+            release_subset(
+                &json!({"claims": {"email": "a@b.test"}}),
+                &spec(json!({"verification": {}}))
+            ),
             None,
             "claims without the verification context must not present as verified"
         );

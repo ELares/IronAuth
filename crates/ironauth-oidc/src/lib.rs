@@ -93,7 +93,6 @@ mod ciba;
 mod ciba_grant;
 pub mod cimd;
 pub mod claims_mapping;
-pub mod verified_claims;
 pub mod claims_mapping_at_issuance;
 mod claims_request;
 mod client_auth;
@@ -117,12 +116,12 @@ pub mod factor_downgrade;
 /// suite can drive the SAME provider the emulator ships instead of a second hand-rolled mock
 /// that could conform where the shipped one does not.
 pub mod fake_idp;
+mod fapi_hardened;
 mod fedcm;
 mod federation;
 mod federation_client_secret;
 mod federation_health;
 mod federation_jwks;
-mod fapi_hardened;
 mod federation_oauth2;
 mod federation_relay;
 pub mod flow;
@@ -136,8 +135,8 @@ mod interaction;
 mod introspection;
 mod invitations;
 mod issuer;
-mod jwks;
 mod jar;
+mod jwks;
 mod jwt_bearer;
 mod login;
 mod logout;
@@ -229,6 +228,7 @@ pub mod token_hook;
 /// mint directly; the exchange refuses the requested type unless the draft is acknowledged AND a
 /// trust domain is configured.
 pub mod transaction_tokens;
+pub mod verified_claims;
 
 /// The hook dispatch's SHAPE, with the feature off.
 ///

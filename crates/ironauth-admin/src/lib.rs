@@ -42,8 +42,8 @@
 //! `ironauth_store::Store::management` and `docs/adr/0005-management-api.md`.
 
 mod advisories;
-mod advisory_poll;
 mod advisory_feed;
+mod advisory_poll;
 mod api_keys;
 mod auth;
 mod authzen;

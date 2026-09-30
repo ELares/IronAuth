@@ -1414,7 +1414,10 @@ fn allowed_assertion_algs(record: &ClientAuthRecord) -> Vec<JwsAlgorithm> {
 /// registered, otherwise its `jwks_uri` fetched (and cached) through the hardened
 /// fetcher. Returns an empty set (fail closed) when neither is available or the
 /// resolution yields no usable key.
-pub(crate) async fn resolve_client_keys(state: &OidcState, record: &ClientAuthRecord) -> Vec<TrustedKey> {
+pub(crate) async fn resolve_client_keys(
+    state: &OidcState,
+    record: &ClientAuthRecord,
+) -> Vec<TrustedKey> {
     if let Some(inline) = &record.jwks {
         return ironauth_jose::trusted_keys_from_jwks(inline.as_bytes());
     }
