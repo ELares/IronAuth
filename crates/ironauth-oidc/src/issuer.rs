@@ -1129,7 +1129,31 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> LoadOutcome {
     // algorithms actually present, so EdDSA stays the deterministic default whenever
     // it is provisioned. Any present algorithm outside the canonical list (a future
     // key kind) is appended in its loaded order so it is never silently dropped.
-    let Ok(policy) = SigningPolicy::new(canonical_algorithm_order(&algorithms)) else {
+    //
+    // A FIPS-profile environment (issue #162) overrides the canonical order: the
+    // FIPS order makes ES256 the default, keeps RS256, and EXCLUDES EdDSA even
+    // though the environment's keys still include it (the POLICY refuses it; the
+    // key material's presence never leaks an algorithm the tenant's assurance
+    // posture excludes). The guardrail read is best-effort: an unreadable
+    // guardrail is treated as NOT a FIPS profile (fail open to the default
+    // order), because a transient read must never change the signing policy --
+    // the opposite direction (fail closed) would swap the environment's signer
+    // on a database hiccup, which is worse than serving the default set.
+    let fips = match store
+        .scoped(*scope)
+        .environment_guardrails()
+        .fips_profile()
+        .await
+    {
+        Ok(fips) => fips,
+        Err(_) => false,
+    };
+    let order = if fips {
+        fips_algorithm_order(&algorithms)
+    } else {
+        canonical_algorithm_order(&algorithms)
+    };
+    let Ok(policy) = SigningPolicy::new(order) else {
         // Defensive and unreachable: a non-empty keyset guarantees a non-empty
         // algorithm list. Treat it as a confirmed absence (not a transient error),
         // so it 404s deterministically rather than looping a retry.
@@ -1207,6 +1231,19 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> LoadOutcome {
 /// named in the canonical list is appended afterwards in its incoming order, so a
 /// future key kind is never silently dropped from the policy. The input is already
 /// de-duplicated by the caller; the output preserves that.
+/// The FIPS-profile order (issue #162): ES256 (the default), then RS256, and
+/// EdDSA EXCLUDED even when provisioned. A FIPS-profile environment's keys
+/// still include EdDSA (every environment provisions all three on day one);
+/// the POLICY is what refuses it, so the key material's presence never leaks an
+/// algorithm the tenant's assurance posture excludes.
+fn fips_algorithm_order(present: &[JwsAlgorithm]) -> Vec<JwsAlgorithm> {
+    const FIPS_ORDER: [JwsAlgorithm; 2] = [JwsAlgorithm::Es256, JwsAlgorithm::Rs256];
+    FIPS_ORDER
+        .into_iter()
+        .filter(|alg| present.contains(alg))
+        .collect()
+}
+
 fn canonical_algorithm_order(present: &[JwsAlgorithm]) -> Vec<JwsAlgorithm> {
     // The canonical default-preference order. EdDSA is IronAuth's default and must
     // stay the default signer whenever it is provisioned.
