@@ -11186,6 +11186,7 @@ an environment they cannot legitimately reach.
 |---|---|---|
 | Spoofing | Phishing lookalikes of auth pages | Per-environment custom domains with automated TLS (M5); passkey origin binding defeats credential replay (M7) |
 | Tampering | XSS on the auth origin | Strict nonce-based CSP, frame-ancestors none, no customer HTML or script on the auth origin ever, sanitized branding tokens only (#20 baseline, M9 full) |
+| Tampering | An untrusted resume URL widens hosted form navigation | Only an exactly registered HTTP(S) redirect grants its origin to form-action. Resolve the client in its encoded scope; hosted flows also require their persisted scope. Duplicate authorization fields, unresolved PAR/JAR requests, unsupported schemes and failed lookups retain the original policy. Script nonces, default-src and framing controls are preserved (#1379). |
 | Repudiation | Disputed logins | Authentication event stream with device and geo context (M8, M11) |
 | Information disclosure | Reflected parameters, account enumeration | HTML-escape every reflected parameter including error_description (M9); uniform responses and timing across login, registration, and recovery (M7) |
 | Denial of service | Bot-driven form floods | Proof-of-work challenges with pluggable adapters, never a hard third-party dependency (M8) |

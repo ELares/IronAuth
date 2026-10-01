@@ -39,6 +39,8 @@ range per docs/RELEASING.md.
   and controlled legacy indexing remain required before enablement. Existing
   OTP, UserInfo and token-policy behavior is preserved.
 
+- Permit hosted form navigation to an exactly registered HTTP(S) callback origin after scoped client and redirect validation, including login error pages and hosted flows (#1379).
+
 - Upgrade Argon2 to 0.6 with explicit raw salts from the environment entropy
   seam. Stored Argon2 PHC hashes, configured costs, salt length, and the absent-user
   verification work remain compatible; the hasher's automatic RNG is disabled.

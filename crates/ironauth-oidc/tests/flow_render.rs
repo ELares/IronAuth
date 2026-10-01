@@ -164,3 +164,79 @@ fn urlencoding_lite(raw: &str) -> String {
     }
     out
 }
+
+/// Persisted browser flows retain the callback origin without weakening style
+/// or framing policy. An unregistered path on that origin grants nothing.
+#[tokio::test]
+async fn hosted_flow_csp_admits_only_the_registered_resume_callback() {
+    for webauthn_enabled in [false, true] {
+        let mut harness = Harness::start_store_backed_with(ironauth_config::OidcConfig {
+            webauthn_enabled,
+            ..Default::default()
+        })
+        .await;
+        harness.enable_flows();
+        for (redirect, allowed) in [
+            (common::REDIRECT_URI, true),
+            ("https://client.test/unregistered", false),
+            ("https://attacker.test/cb", false),
+        ] {
+            let resume = format!(
+                "/authorize?response_type=code&client_id={}&redirect_uri={}",
+                harness.client_id(),
+                common::enc(redirect),
+            );
+            let path = format!(
+                "{}?return_to={}",
+                browser_login_path(&harness),
+                common::enc(&resume)
+            );
+            let (status, headers, body) = harness.get_with_cookie(&path, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+            assert!(csp.contains("default-src 'none'"));
+            assert!(csp.contains("style-src 'self'"));
+            assert!(csp.contains("frame-ancestors 'none'"));
+            assert!(!csp.contains("unsafe-inline"));
+            assert_eq!(
+                csp.contains("form-action 'self' https://client.test;"),
+                allowed
+            );
+            if !allowed {
+                assert!(csp.contains("form-action 'self';"));
+            }
+            assert!(!csp.contains("attacker.test"));
+            assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+            assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY");
+            // This initial flow has no passkey node group. Enabling WebAuthn
+            // alone must not add an executable script or nonce to that page.
+            assert!(!csp.contains("'nonce-"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn hosted_flow_refuses_a_resume_from_another_scope() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_flows();
+    let other_scope = ironauth_store::Scope::new(
+        ironauth_store::TenantId::generate(harness.env()),
+        ironauth_store::EnvironmentId::generate(harness.env()),
+    );
+    assert_ne!(harness.scope(), other_scope);
+    let other_client = ironauth_store::ClientId::generate(harness.env(), &other_scope);
+    let resume = format!(
+        "/authorize?client_id={}&redirect_uri={}",
+        other_client,
+        common::enc(common::REDIRECT_URI)
+    );
+    let path = format!(
+        "{}?return_to={}",
+        browser_login_path(&harness),
+        common::enc(&resume)
+    );
+    let (status, headers, _) = harness.get_with_cookie(&path, None).await;
+    assert!(!status.is_success());
+    let policy = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+    assert!(!policy.contains("https://client.test"));
+}

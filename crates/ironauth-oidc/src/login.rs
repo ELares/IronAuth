@@ -66,6 +66,15 @@ pub async fn login_get(
     State(state): State<OidcState>,
     Query(query): Query<ResumeQuery>,
 ) -> Response {
+    let resume = query.return_to.clone();
+    let response = login_get_inner(State(state.clone()), Query(query)).await;
+    interaction::with_registered_form_navigation(&state, resume.as_deref(), None, response).await
+}
+
+async fn login_get_inner(
+    State(state): State<OidcState>,
+    Query(query): Query<ResumeQuery>,
+) -> Response {
     match parse_resume(query.return_to.as_deref()) {
         Some(resume) => {
             // The environment-kind chrome (issue #42): a non-production environment
@@ -156,6 +165,16 @@ pub async fn mfa_challenge_get(
     headers: HeaderMap,
     Query(query): Query<MfaChallengeQuery>,
 ) -> Response {
+    let resume = query.return_to.clone();
+    let response = mfa_challenge_get_inner(State(state.clone()), headers, Query(query)).await;
+    interaction::with_registered_form_navigation(&state, resume.as_deref(), None, response).await
+}
+
+async fn mfa_challenge_get_inner(
+    State(state): State<OidcState>,
+    headers: HeaderMap,
+    Query(query): Query<MfaChallengeQuery>,
+) -> Response {
     let Some(resume) = parse_resume(query.return_to.as_deref()) else {
         return interaction::invalid_link_page();
     };
@@ -217,6 +236,17 @@ fn remember_device_offered(state: &OidcState) -> bool {
 /// issues tokens reflecting what ACTUALLY happened, never a stale or asserted value.
 #[allow(clippy::too_many_lines)]
 pub async fn mfa_challenge_post(
+    State(state): State<OidcState>,
+    headers: HeaderMap,
+    Form(form): Form<MfaChallengeForm>,
+) -> Response {
+    let resume = form.return_to.clone();
+    let response = mfa_challenge_post_inner(State(state.clone()), headers, Form(form)).await;
+    interaction::with_registered_form_navigation(&state, resume.as_deref(), None, response).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn mfa_challenge_post_inner(
     State(state): State<OidcState>,
     headers: HeaderMap,
     Form(form): Form<MfaChallengeForm>,
@@ -671,6 +701,17 @@ async fn annotated_login_fields(state: &OidcState, scope: ironauth_store::Scope)
 // invariant across helpers, so the length lint is allowed here (issue #64).
 #[allow(clippy::too_many_lines)]
 pub async fn login_post(
+    State(state): State<OidcState>,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let resume = form.return_to.clone();
+    let response = login_post_inner(State(state.clone()), headers, Form(form)).await;
+    interaction::with_registered_form_navigation(&state, resume.as_deref(), None, response).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn login_post_inner(
     State(state): State<OidcState>,
     headers: HeaderMap,
     Form(form): Form<LoginForm>,

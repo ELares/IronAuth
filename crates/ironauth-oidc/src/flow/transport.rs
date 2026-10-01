@@ -763,8 +763,15 @@ async fn render_browser_flow(
         &scope_path,
         passkey.as_ref(),
     );
-    match rendered.passkey_nonce {
+    let response = match rendered.passkey_nonce {
         Some(nonce) => pages::flow_login_html(StatusCode::OK, rendered.body, &nonce),
         None => pages::flow_html(StatusCode::OK, rendered.body),
-    }
+    };
+    crate::interaction::with_registered_form_navigation(
+        state,
+        flow.request_url.as_deref(),
+        Some(scope),
+        response,
+    )
+    .await
 }

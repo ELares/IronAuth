@@ -91,6 +91,88 @@ pub fn parse_resume(raw: Option<&str>) -> Option<ResumeTarget> {
     })
 }
 
+/// Keep the hosted form's navigation chain usable for an exactly registered
+/// callback, including cross-origin redirects after its credential POST. The
+/// ordinary authorization validator remains the authority for redirect matching.
+/// Invalid, ambiguous, unavailable or cross-scope resumes keep the original CSP.
+pub(crate) async fn with_registered_form_navigation(
+    state: &OidcState,
+    raw_resume: Option<&str>,
+    expected_scope: Option<Scope>,
+    mut response: Response,
+) -> Response {
+    let Some(policy) = response
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return response;
+    };
+    if !policy
+        .split(';')
+        .any(|directive| directive.trim() == "form-action 'self'")
+    {
+        return response;
+    }
+    let Some(origin) = registered_form_origin(state, raw_resume, expected_scope).await else {
+        return response;
+    };
+    let policy = response.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .expect("previously validated policy");
+    let updated = policy.replacen(
+        "form-action 'self'",
+        &format!("form-action 'self' {origin}"),
+        1,
+    );
+    if let Ok(value) = updated.parse() {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, value);
+    }
+    response
+}
+
+async fn registered_form_origin(
+    state: &OidcState,
+    raw_resume: Option<&str>,
+    expected_scope: Option<Scope>,
+) -> Option<String> {
+    let resume = parse_resume(raw_resume)?;
+    if expected_scope.is_some_and(|scope| scope != resume.scope) {
+        return None;
+    }
+    let query = resume.return_to.strip_prefix(RESUME_PREFIX)?;
+    // Deserializing the authorization type rejects duplicate known parameters.
+    // Indirect PAR/JAR requests cannot supply an origin through outer parameters.
+    let params: crate::authorize::AuthorizeParams = serde_urlencoded::from_str(query).ok()?;
+    if params.request_uri.is_some() || params.request.is_some() {
+        return None;
+    }
+    let record = state
+        .store()
+        .scoped(resume.scope)
+        .clients()
+        .get(&resume.client_id)
+        .await
+        .ok()?;
+    let client = crate::authorize::ResolvedClient::Registered(&record);
+    let redirect = crate::authorize::validate_registered_redirect(&client, &params).ok()?;
+    let uri: axum::http::Uri = redirect.parse().ok()?;
+    let scheme = uri.scheme_str()?;
+    if !matches!(scheme, "http" | "https") {
+        return None;
+    }
+    let authority = uri.authority()?.as_str();
+    if authority.contains('@') {
+        return None;
+    }
+    let authority = authority.to_ascii_lowercase();
+    let default_port = if scheme == "https" { ":443" } else { ":80" };
+    let authority = authority.strip_suffix(default_port).unwrap_or(&authority);
+    Some(format!("{scheme}://{authority}"))
+}
+
 /// The `Cookie` header value, if present and valid UTF-8.
 #[must_use]
 pub fn cookie_header(headers: &HeaderMap) -> Option<&str> {
