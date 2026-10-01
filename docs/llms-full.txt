@@ -196,7 +196,7 @@ cargo build --locked -p ironauth --bin ironauth
 scripts/gate.sh > gate.log 2>&1
 ```
 
-The default server and most crates support Rust 1.85. The optional WASM hook
+The default server and most crates support Rust 1.88. The optional WASM hook
 engine requires Rust 1.95. A whole-workspace build includes that engine even
 when the server's `wasm-hooks` feature is disabled. The pinned development
 toolchain satisfies both; see the generated
@@ -1155,33 +1155,33 @@ table is the authoritative list of artifacts and their versions at HEAD.
 
 | Artifact | Version | Kind | MSRV |
 |----------|---------|------|------|
-| ironauth | 0.1.0 | binary | 1.85 |
-| ironauth-admin | 0.1.0 | library | 1.85 |
-| ironauth-admin-ui | 0.1.0 | library | 1.85 |
-| ironauth-apply | 0.1.0 | library | 1.85 |
-| ironauth-cel | 0.1.0 | library | 1.85 |
-| ironauth-config | 0.1.0 | library | 1.85 |
-| ironauth-connector | 0.1.0 | library | 1.85 |
-| ironauth-der | 0.1.0 | library | 1.85 |
-| ironauth-env | 0.1.0 | library | 1.85 |
-| ironauth-fastly-verify | 0.1.0 | library | 1.85 |
-| ironauth-fetch | 0.1.0 | library | 1.85 |
-| ironauth-hash-scheme | 0.2.0 | library | 1.85 |
+| ironauth | 0.1.0 | binary | 1.88 |
+| ironauth-admin | 0.1.0 | library | 1.88 |
+| ironauth-admin-ui | 0.1.0 | library | 1.88 |
+| ironauth-apply | 0.1.0 | library | 1.88 |
+| ironauth-cel | 0.1.0 | library | 1.88 |
+| ironauth-config | 0.1.0 | library | 1.88 |
+| ironauth-connector | 0.1.0 | library | 1.88 |
+| ironauth-der | 0.1.0 | library | 1.88 |
+| ironauth-env | 0.1.0 | library | 1.88 |
+| ironauth-fastly-verify | 0.1.0 | library | 1.88 |
+| ironauth-fetch | 0.1.0 | library | 1.88 |
+| ironauth-hash-scheme | 0.2.0 | library | 1.88 |
 | ironauth-hooks | 0.1.0 | library | 1.95 |
-| ironauth-hot | 0.1.0 | library | 1.85 |
-| ironauth-import | 0.1.0 | library | 1.85 |
-| ironauth-importers | 0.1.0 | library | 1.85 |
-| ironauth-jose | 0.1.0 | library | 1.85 |
-| ironauth-journey | 0.1.0 | library | 1.85 |
-| ironauth-kms | 0.1.0 | library | 1.85 |
-| ironauth-oidc | 0.1.0 | library | 1.85 |
-| ironauth-quota | 0.1.0 | library | 1.85 |
-| ironauth-saml | 0.1.0 | library | 1.85 |
-| ironauth-scim | 0.1.0 | library | 1.85 |
-| ironauth-screening | 0.1.0 | library | 1.85 |
-| ironauth-server | 0.1.0 | library | 1.85 |
-| ironauth-store | 0.1.0 | library | 1.85 |
-| ironauth-webauthn | 0.1.0 | library | 1.85 |
+| ironauth-hot | 0.1.0 | library | 1.88 |
+| ironauth-import | 0.1.0 | library | 1.88 |
+| ironauth-importers | 0.1.0 | library | 1.88 |
+| ironauth-jose | 0.1.0 | library | 1.88 |
+| ironauth-journey | 0.1.0 | library | 1.88 |
+| ironauth-kms | 0.1.0 | library | 1.88 |
+| ironauth-oidc | 0.1.0 | library | 1.88 |
+| ironauth-quota | 0.1.0 | library | 1.88 |
+| ironauth-saml | 0.1.0 | library | 1.88 |
+| ironauth-scim | 0.1.0 | library | 1.88 |
+| ironauth-screening | 0.1.0 | library | 1.88 |
+| ironauth-server | 0.1.0 | library | 1.88 |
+| ironauth-store | 0.1.0 | library | 1.88 |
+| ironauth-webauthn | 0.1.0 | library | 1.88 |
 
 ---
 
