@@ -180,7 +180,49 @@ fn touches_the_event_feed_other_than_appending(text: &str) -> bool {
 /// `an_event_enqueue_blocks_on_the_per_scope_append_lock` (the lock is taken),
 /// `serialising_appenders_on_a_scope_lock_makes_sequence_order_equal_commit_order` (it
 /// orders), and this count (the round trip is gone).
-const REDEMPTION_STATEMENTS: usize = 71;
+/// 71 -> 76 (#1437 prerequisite): the existing FAPI sender-constraint policy read
+/// contributes five captured statements: SET TRANSACTION, two scope `set_config`
+/// calls, SELECT `fapi_hardened`, and COMMIT. The driver does not log BEGIN here.
+/// The regression below pins that exact contiguous block as well as the total;
+/// neither metering work nor the recipient ceremony is added to token issuance.
+const REDEMPTION_STATEMENTS: usize = 76;
+
+fn assert_redemption_budget(redemption: &str) {
+    let statements = statement_count(redemption);
+    let query_lines: Vec<_> = redemption
+        .lines()
+        .filter(|line| line.contains("sqlx::query"))
+        .collect();
+    let policy_reads = query_lines
+        .windows(5)
+        .filter(|window| {
+            window[0].contains("set transaction isolation level read committed")
+                && window[1].contains("set_config('ironauth.tenant_id'")
+                && window[2].contains("set_config('ironauth.environment_id'")
+                && window[3].contains("select fapi_hardened from environment_guardrails")
+                && window[4].contains("commit")
+        })
+        .count();
+    assert_eq!(
+        policy_reads, 1,
+        "the measured five-statement current policy read must execute once"
+    );
+    if statements != REDEMPTION_STATEMENTS {
+        for line in &query_lines {
+            if let Some((_, sql)) = line.split_once("sqlx::query:") {
+                eprintln!("captured SQL (no bindings): {sql}");
+            }
+        }
+    }
+    assert_eq!(
+        statements, REDEMPTION_STATEMENTS,
+        "the redemption executed {statements} statements rather than {REDEMPTION_STATEMENTS}. \
+         If this is legitimate drift, move the constant and say why in the commit; if it is \
+         metering folded into the issuance path, that is the regression criterion 5 exists to \
+         catch. A count is the only assertion here that sees metering added against a table \
+         this file has never heard of."
+    );
+}
 
 /// Redeeming an authorization code touches the event feed ONLY to append to it.
 ///
@@ -322,15 +364,7 @@ async fn redeeming_a_code_runs_no_query_that_reads_the_event_feed() {
     // So it is a RATCHET, the same shape as `MINIMUM_ENTRIES` and the migration chain's
     // `already_applied` count: a number you must move deliberately, with the reason in the
     // commit. That is the cost of an assertion that actually catches one added statement.
-    let statements = statement_count(&redemption);
-    assert_eq!(
-        statements, REDEMPTION_STATEMENTS,
-        "the redemption executed {statements} statements rather than {REDEMPTION_STATEMENTS}. \
-         If this is legitimate drift, move the constant and say why in the commit; if it is \
-         metering folded into the issuance path, that is the regression criterion 5 exists to \
-         catch. A count is the only assertion here that sees metering added against a table \
-         this file has never heard of."
-    );
+    assert_redemption_budget(&redemption);
 
     // Second half: the feed itself. Issuance may APPEND to it (that is the event being emitted);
     // anything else that touches it is folding usage inline.

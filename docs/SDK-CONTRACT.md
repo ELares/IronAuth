@@ -51,7 +51,7 @@ is not making a cross-site request in the first place.
 
 ## Error codes
 
-The authorization endpoint's machine-readable codes. 10 of them, taken
+The authorization endpoint's machine-readable codes. 11 of them, taken
 from the exhaustive match that renders them, so this list cannot fall behind the
 code without the freshness gate failing.
 
@@ -62,6 +62,7 @@ code without the freshness gate failing.
 | `consent_required` | `AuthzErrorCode::ConsentRequired` |
 | `interaction_required` | `AuthzErrorCode::InteractionRequired` |
 | `invalid_request` | `AuthzErrorCode::InvalidRequest` |
+| `invalid_request_object` | `AuthzErrorCode::InvalidRequestObject` |
 | `invalid_target` | `AuthzErrorCode::InvalidTarget` |
 | `login_required` | `AuthzErrorCode::LoginRequired` |
 | `server_error` | `AuthzErrorCode::ServerError` |

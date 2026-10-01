@@ -63,6 +63,10 @@ class Client:
         """Add a login identifier to a user. POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/users/{urllib.parse.quote(user_id)}/identifiers", query, body)
 
+    def advance_signing_key_rotation(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Run the machine's tick now: the manual trigger. POST /v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation/advance."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/signing/rotation/advance", query, None)
+
     def allow_sms_country(self, tenant_id: str, environment_id: str, country_code: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Allow SMS to a country calling code. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/allowlist/{country_code}."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/sms-otp/allowlist/{urllib.parse.quote(country_code)}", query, None)
@@ -107,6 +111,10 @@ class Client:
         """authzenEvaluations. POST /v1/tenants/{tenant_id}/environments/{environment_id}/access/v1/evaluations."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/access/v1/evaluations", query, body)
 
+    def break_glass_signing_key_rotation(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """The rotate-now-and-revoke path: a fresh successor immediately, the compromised key withdrawn NOW. The confirmation flag is mandatory. POST /v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation/break-glass."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/signing/rotation/break-glass", query, body)
+
     def bulk_revoke_sessions(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Revoke a BATCH of sessions in one audited transaction. A foreign-scope id in the batch is a uniform no-op (never a cross-tenant revocation). POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/revoke."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/sessions/revoke", query, body)
@@ -114,6 +122,10 @@ class Client:
     def clear_org_default_role(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """CLEAR the organization's DEFAULT role designation. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/default-role", query, None)
+
+    def clear_quota_limit(self, tenant_id: str, environment_id: str, dimension: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Clear one dimension's override, returning the scope to its configured tier. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits/{dimension}."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/quota/limits/{urllib.parse.quote(dimension)}", query, None)
 
     def create_ban(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Place a durable credential-abuse ban. POST /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans."""
@@ -791,6 +803,10 @@ class Client:
         """Report queue depth for every consumer in the environment. GET /v1/tenants/{tenant_id}/environments/{environment_id}/queues."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/queues", query, None)
 
+    def list_quota_limits(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List every stored quota override for this scope. GET /v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/quota/limits", query, None)
+
     def list_recovery_approvals(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List the OPEN admin-approved recovery approvals under an environment (cursor paginated). GET /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/recovery-approvals", query, None)
@@ -838,6 +854,10 @@ class Client:
     def list_sessions(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List the sessions in an environment (cursor paginated), searchable by user and by client. GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/sessions", query, None)
+
+    def list_signing_key_rotation(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List every key's rotation state and the next scheduled rotation. GET /v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/signing/rotation", query, None)
 
     def list_signup_quarantines(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List the OPEN signup-quarantine cases under an environment (cursor paginated). GET /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine."""
@@ -1151,6 +1171,10 @@ class Client:
         """Enable, or rotate, one environment's outbound-verification token. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/migration/outbound-verification."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/migration/outbound-verification", query, body)
 
+    def set_quota_limit(self, tenant_id: str, environment_id: str, dimension: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Set one dimension's override for this scope, replacing any existing one. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits/{dimension}."""
+        return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/quota/limits/{urllib.parse.quote(dimension)}", query, body)
+
     def set_scim_push_connection_active(self, tenant_id: str, environment_id: str, organization_id: str, connection_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """`PUT .../scim-push-connections/{connection_id}/active`. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/active."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-push-connections/{urllib.parse.quote(connection_id)}/active", query, body)
@@ -1206,6 +1230,10 @@ class Client:
     def test_token_hook(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Run a client's token hook against a recorded event, without deploying anything. POST /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/test."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook/test", query, body)
+
+    def trigger_backup(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Trigger an on-demand encrypted backup. POST /v1/tenants/{tenant_id}/environments/{environment_id}/backups."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/backups", query, None)
 
     def unassign_org_group_role(self, tenant_id: str, environment_id: str, organization_id: str, group_id: str, role_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Withdraw a role from a group. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles/{role_id}."""

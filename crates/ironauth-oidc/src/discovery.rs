@@ -414,9 +414,6 @@ impl DiscoveryCapabilities {
         self
     }
 
-    /// Declare whether OIDC Session Management 1.0 is enabled (issue #39), so
-    /// discovery advertises `check_session_iframe` only when the iframe is mounted.
-    #[must_use]
     /// Mark this environment hardened (issue #156); the generator reflects the
     /// restricted set. Not hardened (the default) leaves the document unchanged.
     #[must_use]
@@ -425,6 +422,9 @@ impl DiscoveryCapabilities {
         self
     }
 
+    /// Declare whether OIDC Session Management 1.0 is enabled (issue #39), so
+    /// discovery advertises `check_session_iframe` only when the iframe is mounted.
+    #[must_use]
     pub fn with_session_management(mut self, enabled: bool) -> Self {
         self.session_management_enabled = enabled;
         self
@@ -1063,7 +1063,7 @@ impl DiscoveryState {
         // is the safe direction.
         let hardened = match self.registry.store() {
             Some(store) => store
-                .scoped(scope.clone())
+                .scoped(*scope)
                 .environment_guardrails()
                 .hardened()
                 .await
