@@ -30,6 +30,15 @@ INSERT INTO environments (id, tenant_id, display_name)
 VALUES ('cert', 'cert', 'Conformance Environment')
 ON CONFLICT (id) DO NOTHING;
 
+-- The FAPI2SP environment (issue #157): hardened from the first seed, so the
+-- FAPI 2.0 Security Profile plans run against the constraints they certify
+-- (PKCE S256 only, PAR mandatory, restricted client auth, sender-constrained
+-- tokens) rather than against a soft environment. Separate from 'cert' because
+-- the OP basic/dynamic plans must NOT run hardened.
+INSERT INTO environments (id, tenant_id, display_name, fapi_hardened)
+VALUES ('cert-fapi', 'cert', 'FAPI2SP Conformance Environment', true)
+ON CONFLICT (id) DO NOTHING;
+
 -- The deterministic end-user the suite logs in as. identifier is the login
 -- handle; password_hash is an Argon2id PHC verifier (seed.sh renders it from the
 -- committed cert password documented in that script). One account per handle per

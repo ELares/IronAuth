@@ -136,7 +136,10 @@ async fn a_hardened_environment_answers_introspection_with_a_signed_jwt() {
     let request = axum::http::Request::builder()
         .method("POST")
         .uri("/introspect")
-        .header(axum::http::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
         .header(axum::http::header::AUTHORIZATION, basic(&client, &secret))
         .body(axum::body::Body::from(common::form(&[("token", access)])))
         .expect("request builds");
@@ -158,9 +161,18 @@ async fn a_hardened_environment_answers_introspection_with_a_signed_jwt() {
     )
     .expect("the payload is json");
     assert_eq!(claims["active"], true, "{claims}");
-    assert!(claims.get("iss").is_some(), "the envelope rides the payload: {claims}");
-    assert!(claims.get("exp").is_some(), "the envelope rides the payload: {claims}");
-    assert!(claims.get("jti").is_some(), "the envelope rides the payload: {claims}");
+    assert!(
+        claims.get("iss").is_some(),
+        "the envelope rides the payload: {claims}"
+    );
+    assert!(
+        claims.get("exp").is_some(),
+        "the envelope rides the payload: {claims}"
+    );
+    assert!(
+        claims.get("jti").is_some(),
+        "the envelope rides the payload: {claims}"
+    );
 }
 
 /// A bound `at+jwt` introspects with its `cnf.jkt` and a `DPoP` `token_type`.
