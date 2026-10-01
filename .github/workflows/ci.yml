@@ -632,17 +632,17 @@ jobs:
         run: cargo test -p ironauth-oidc --features testing,ironcache
 
   msrv:
-    name: msrv (1.85)
+    name: msrv (1.88)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       # rust-toolchain.toml pins 1.97.0 and outranks `rustup default`, which
       # would silently turn this lane into a no-op. RUSTUP_TOOLCHAIN outranks
-      # the toolchain file, so the check genuinely runs under 1.85.
-      RUSTUP_TOOLCHAIN: "1.85"
+      # the toolchain file, so the check genuinely runs under 1.88.
+      RUSTUP_TOOLCHAIN: "1.88"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@077fee5b0788f1a772d4c6ce2814159cd1d6632b # 1.85
+      - uses: dtolnay/rust-toolchain@688313b0823df1393bcebb1b4add0438a6d36884 # 1.88
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # ONE crate is excluded, under this rule: a workspace member whose DEPENDENCY declares
       # an MSRV above the workspace promise, and which nothing in the shipped binary's graph
@@ -650,7 +650,7 @@ jobs:
       #
       #   ironauth-hooks -- wasmtime/cranelift 48 declare rust-version 1.95
       #
-      # It is not reachable from `ironauth`, so the SHIPPED binary's MSRV is still 1.85 and the
+      # It is not reachable from `ironauth`, so the SHIPPED binary's MSRV is 1.88 and the
       # promise in docs/COMPATIBILITY.md is intact. This is not a way to make the number look
       # good: the moment that crate is wired into the binary, the product MSRV becomes its
       # dependency's, and raising a published compatibility promise is an owner decision rather
