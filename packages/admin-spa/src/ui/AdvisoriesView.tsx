@@ -76,8 +76,9 @@ function ImportForm() {
   const scope = activeScope.value;
 
   const mutation = useMutation();
+  const canImport = scope !== null && scope.environmentId !== undefined;
 
-  if (scope === undefined || scope.environment === undefined) {
+  if (!canImport) {
     return null;
   }
 
@@ -101,7 +102,10 @@ function ImportForm() {
         onClick={() =>
           void mutation.run(
             async () => {
-              await importSecurityAdvisories(scope.tenant, scope.environment, feed);
+              if (scope === null || scope.environmentId === undefined) {
+                return;
+              }
+              await importSecurityAdvisories(scope.tenantId, scope.environmentId, feed);
             },
             "The verified advisories replaced the accepted set",
           )
@@ -119,28 +123,33 @@ export function AdvisoriesView() {
   const scope = activeScope.value;
   const advisories = useAsyncResource(
     async () => {
-      if (scope === undefined || scope.environment === undefined) {
+      if (scope === null || scope.environmentId === undefined) {
         return { advisories: [] };
       }
-      return fetchSecurityAdvisories(scope.tenant, scope.environment);
+      return fetchSecurityAdvisories(scope.tenantId, scope.environmentId);
     },
-    [scope?.tenant, scope?.environment],
+    [scope?.tenantId, scope?.environmentId],
   );
 
-  if (scope === undefined || scope.environment === undefined) {
+  if (scope === null || scope.environmentId === undefined) {
     return (
-      <ResourceHeading title="Security advisories">
-        <p>Select a tenant and environment to read its security advisories.</p>
-      </ResourceHeading>
+      <ResourceHeading
+        id="advisories"
+        title="Security advisories"
+        description="Select a tenant and environment to read its security advisories."
+      />
     );
   }
 
   return (
-    <ResourceHeading
-      title="Security advisories"
-
-    >
-      <AsyncBoundary result={advisories}>
+    <>
+      <ResourceHeading
+        id="advisories"
+        title="Security advisories"
+        description="The accepted security advisories for this environment, plus the offline bundle import."
+      />
+      <div>
+        <AsyncBoundary state={advisories.state}>
         {(list) =>
           list.advisories.length === 0 ? (
             <p>
@@ -155,8 +164,9 @@ export function AdvisoriesView() {
             </div>
           )
         }
-      </AsyncBoundary>
-      <ImportForm />
-    </ResourceHeading>
+        </AsyncBoundary>
+        <ImportForm />
+      </div>
+    </>
   );
 }
