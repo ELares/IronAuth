@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Update `time` to 0.3.47 to bound RFC 2822 parser recursion. The default
+  workspace minimum Rust version is now 1.88; the optional WASM engine still
+  requires 1.95. The pinned development toolchain remains unchanged.
+
 - Patch vulnerable Cargo, console tooling, hook builder, conformance Python,
   and Terraform-provider dependencies. Pin workflow actions to verified commit
   hashes, use locked npm installs, and add CodeQL and dependency review workflows.
