@@ -468,7 +468,11 @@ impl fmt::Display for StoreError {
         match self {
             StoreError::NotFound => f.write_str("resource not found"),
             StoreError::HardenedViolations(violations) => {
-                write!(f, "the environment cannot be hardened: {}", violations.join("; "))
+                write!(
+                    f,
+                    "the environment cannot be hardened: {}",
+                    violations.join("; ")
+                )
             }
             StoreError::Invalid => f.write_str(
                 "a value was refused by a shape rule: an organization contact's address must \

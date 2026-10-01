@@ -3285,6 +3285,15 @@ pub struct DynamicClientRecord {
     /// 5.3.2): when set, the UserInfo response is a signed JWT. `None` (the
     /// default) keeps the plain JSON form.
     pub userinfo_signed_response_alg: Option<String>,
+    /// The registered JARM response algorithm (issue #158): when set, the
+    /// authorization responses are signed JWTs in the jwt modes.
+    pub authorization_signed_response_alg: Option<String>,
+    /// The registered encrypted-ID-token response algorithms (issue #158):
+    /// `id_token_encrypted_response_alg` (+ the optional `enc`). When set, the
+    /// ID tokens are sign-then-encrypt nested JWTs.
+    pub id_token_encrypted_response_alg: Option<String>,
+    /// The registered `id_token_encrypted_response_enc`.
+    pub id_token_encrypted_response_enc: Option<String>,
     /// The client's inline `jwks` (a JWK Set JSON document), or `None`.
     pub jwks: Option<String>,
     /// The client's `jwks_uri`, or `None`.
@@ -3370,6 +3379,15 @@ pub struct NewDynamicClient<'a> {
     /// The registered `userinfo_signed_response_alg` (issue #158), or `None` to
     /// keep the plain JSON form.
     pub userinfo_signed_response_alg: Option<&'a str>,
+    /// The registered JARM response algorithm (issue #158), or `None` for the
+    /// plain response modes.
+    pub authorization_signed_response_alg: Option<&'a str>,
+    /// The registered `id_token_encrypted_response_alg` (issue #158), or `None`
+    /// for the plain signed ID token.
+    pub id_token_encrypted_response_alg: Option<&'a str>,
+    /// The registered `id_token_encrypted_response_enc`, or `None` to default to
+    /// A256GCM.
+    pub id_token_encrypted_response_enc: Option<&'a str>,
     /// The inline `jwks`, or `None` (mutually exclusive with `jwks_uri`).
     pub jwks: Option<&'a str>,
     /// The `jwks_uri`, or `None`.
@@ -3776,7 +3794,9 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT id, display_name, token_endpoint_auth_method, redirect_uris, \
-             application_type, id_token_signed_response_alg, jwks, jwks_uri, \
+             application_type, id_token_signed_response_alg, userinfo_signed_response_alg, \
+             authorization_signed_response_alg, id_token_encrypted_response_alg, \
+             id_token_encrypted_response_enc, jwks, jwks_uri, \
              token_endpoint_auth_signing_alg, registration_client_uri, \
              registration_access_token_hash, dcr_registered, \
              quarantined, dcr_policy_chain, \
@@ -3806,6 +3826,9 @@ impl ClientRepo<'_> {
             application_type: row.get("application_type"),
             id_token_signed_response_alg: row.get("id_token_signed_response_alg"),
             userinfo_signed_response_alg: row.get("userinfo_signed_response_alg"),
+            authorization_signed_response_alg: row.get("authorization_signed_response_alg"),
+            id_token_encrypted_response_alg: row.get("id_token_encrypted_response_alg"),
+            id_token_encrypted_response_enc: row.get("id_token_encrypted_response_enc"),
             jwks: row.get("jwks"),
             jwks_uri: row.get("jwks_uri"),
             token_endpoint_auth_signing_alg: row.get("token_endpoint_auth_signing_alg"),
@@ -6590,14 +6613,17 @@ impl ActingClientRepo<'_> {
                     "INSERT INTO clients \
                      (id, tenant_id, environment_id, display_name, \
                       token_endpoint_auth_method, secret_hash, redirect_uris, \
-                      application_type, id_token_signed_response_alg, jwks, jwks_uri, \
+                      application_type, id_token_signed_response_alg, \
+                      userinfo_signed_response_alg, authorization_signed_response_alg, \
+                      id_token_encrypted_response_alg, id_token_encrypted_response_enc, \
+                      jwks, jwks_uri, \
                       token_endpoint_auth_signing_alg, tls_client_auth_cert, \
                       tls_client_auth_subject_dn, use_mtls_endpoint_aliases, \
                       registration_client_uri, \
                       registration_access_token_hash, quarantined, dcr_policy_chain, \
                       dcr_registered) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                             $15, $16, $17, $18, $19, $20, true)",
+                             $15, $16, $17, $18, $19, $20, $21, $22, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -6609,6 +6635,9 @@ impl ActingClientRepo<'_> {
                 .bind(params.application_type)
                 .bind(params.id_token_signed_response_alg)
                 .bind(params.userinfo_signed_response_alg)
+                .bind(params.authorization_signed_response_alg)
+                .bind(params.id_token_encrypted_response_alg)
+                .bind(params.id_token_encrypted_response_enc)
                 .bind(params.jwks)
                 .bind(params.jwks_uri)
                 .bind(params.token_endpoint_auth_signing_alg)
@@ -11908,6 +11937,28 @@ impl EnvironmentGuardrailRepo<'_> {
         Ok(row.get::<bool, _>("fapi_hardened"))
     }
 
+    /// Whether this environment runs the FIPS tenant profile (issue #162): the
+    /// algorithm policy presets to the validated-module-compatible set (ES256
+    /// default, RS256 available, EdDSA unavailable).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the environment is absent in this scope.
+    pub async fn fips_profile(&self) -> Result<bool, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT fips_profile FROM environment_guardrails \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        Ok(row.get::<bool, _>("fips_profile"))
+    }
+
     /// The FAPI-hardened compliance scan (issue #156): every registered client in
     /// this scope whose configuration violates the hardened constraints, each
     /// named. An empty list is a conformant environment. The scan covers the
@@ -13393,6 +13444,83 @@ pub struct ClientAuthDiagnosticQuery<'a> {
 /// opaque `invalid_client` with no oracle. Append-only and deliberately off the
 /// audited-write path (a diagnostic is a log entry, not a business mutation),
 /// mirroring `idempotency_keys`.
+/// The security-advisory repository (issue #163): the deployment-global banner
+/// surface's projection. Every row was verified before insertion (the feed
+/// module's single path); this repo is the store half.
+pub struct SecurityAdvisoryRepo<'a> {
+    pub(crate) store: &'a Store,
+}
+
+impl SecurityAdvisoryRepo<'_> {
+    /// Replace the accepted advisories with `advisories` (the feed poll/import
+    /// applies the whole verified set; a removed advisory stops being a banner).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn replace_all(
+        &self,
+        advisories: &[crate::advisory::AdvisoryRecord],
+        source: &str,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.store.pool().begin().await?;
+        sqlx::query("DELETE FROM security_advisories")
+            .execute(&mut *tx)
+            .await?;
+        for advisory in advisories {
+            sqlx::query(
+                "INSERT INTO security_advisories \
+                 (id, title, severity, affected_versions, summary, published_at, source) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(&advisory.id)
+            .bind(&advisory.title)
+            .bind(advisory.severity.as_str())
+            .bind(
+                &serde_json::to_string(&advisory.affected_versions)
+                    .map_err(|_| StoreError::Encryption)?,
+            )
+            .bind(&advisory.summary)
+            .bind(advisory.published_at)
+            .bind(source)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The accepted advisories, newest first (the banner surface's order).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(&self) -> Result<Vec<crate::advisory::AdvisoryRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, title, severity, affected_versions, summary, published_at \
+             FROM security_advisories ORDER BY published_at DESC",
+        )
+        .fetch_all(self.store.pool())
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(crate::advisory::AdvisoryRecord {
+                id: row.get("id"),
+                title: row.get("title"),
+                severity: crate::advisory::AdvisorySeverity::parse(
+                    &row.get::<String, _>("severity"),
+                )
+                .unwrap_or(crate::advisory::AdvisorySeverity::Low),
+                affected_versions: serde_json::from_str(&row.get::<String, _>("affected_versions"))
+                    .unwrap_or_default(),
+                summary: row.get("summary"),
+                published_at: row.get("published_at"),
+            });
+        }
+        Ok(out)
+    }
+}
+
 pub struct ClientAuthDiagnosticsRepo<'a> {
     store: &'a Store,
     scope: Scope,

@@ -168,6 +168,11 @@ impl ExternalSigner for LocalSigner {
 /// (the signature must verify against the key the kid names), and the size
 /// ceiling's refusal (a backend whose declared ceiling the input exceeds must
 /// refuse BEFORE dispatch).
+/// # Errors
+///
+/// Returns an error string naming the failed assertion: a signature that does
+/// not verify, a mismatched `kid`, or a backend that signed despite an input
+/// exceeding its declared ceiling.
 pub async fn run_conformance_battery(
     backend: &(dyn ExternalSigner + '_),
     kid: &str,
@@ -234,7 +239,13 @@ mod tests {
         let verify = |signature: &[u8]| {
             crate::verify_detached(&trusted, JwsAlgorithm::EdDsa, input, signature).is_ok()
         };
-        let outcome = run_conformance_battery(&signer, "kid_test", JwsAlgorithm::EdDsa, input, verify);
+        let outcome = futures_util::block_on(run_conformance_battery(
+            &signer,
+            "kid_test",
+            JwsAlgorithm::EdDsa,
+            input,
+            verify,
+        ));
         assert!(outcome.is_ok(), "the local backend passes: {outcome:?}");
     }
 

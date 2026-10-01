@@ -214,7 +214,7 @@ impl IntoResponse for AuthorizeError {
                     state.as_deref(),
                     &iss,
                 );
-                response::render(mode, &redirect_uri, &params)
+                response::render(mode, &redirect_uri, &params, None)
             }
         }
     }

@@ -291,6 +291,9 @@ pub async fn register(
         application_type: &validated.application_type,
         id_token_signed_response_alg: &validated.id_token_signed_response_alg,
         userinfo_signed_response_alg: validated.userinfo_signed_response_alg.as_deref(),
+        authorization_signed_response_alg: validated.authorization_signed_response_alg.as_deref(),
+        id_token_encrypted_response_alg: validated.id_token_encrypted_response_alg.as_deref(),
+        id_token_encrypted_response_enc: validated.id_token_encrypted_response_enc.as_deref(),
         jwks: validated.jwks.as_deref(),
         jwks_uri: validated.jwks_uri.as_deref(),
         token_endpoint_auth_signing_alg: validated.token_endpoint_auth_signing_alg.as_deref(),
@@ -937,6 +940,9 @@ struct ValidatedMetadata {
     jwks_uri: Option<String>,
     token_endpoint_auth_signing_alg: Option<String>,
     userinfo_signed_response_alg: Option<String>,
+    authorization_signed_response_alg: Option<String>,
+    id_token_encrypted_response_alg: Option<String>,
+    id_token_encrypted_response_enc: Option<String>,
 }
 
 /// Validate an RFC 7591 metadata document, applying per-spec defaults, ignoring
@@ -981,8 +987,7 @@ async fn validate_metadata(
     let hardened = crate::fapi_hardened::is_hardened(state, scope)
         .await
         .unwrap_or(false);
-    if hardened
-        && !crate::fapi_hardened::hardened_permits_client_auth_method(auth_method.as_str())
+    if hardened && !crate::fapi_hardened::hardened_permits_client_auth_method(auth_method.as_str())
     {
         return Err(RegistrationError::metadata_owned(
             crate::fapi_hardened::hardened_auth_method_refusal(auth_method.as_str()),
@@ -1010,15 +1015,16 @@ async fn validate_metadata(
     let id_token_signed_response_alg = negotiate_id_token_alg(metadata, signable, default_alg)?;
     let token_endpoint_auth_signing_alg = validate_signing_alg(metadata)?;
     let userinfo_signed_response_alg = validate_userinfo_signing_alg(metadata)?;
+    let authorization_signed_response_alg = validate_authorization_signing_alg(metadata)?;
+    let id_token_encrypted_response_alg = validate_id_token_encrypted_alg(metadata)?;
+    let id_token_encrypted_response_enc = validate_id_token_encrypted_enc(metadata)?;
     if hardened {
         if let Some(alg) = token_endpoint_auth_signing_alg.as_ref() {
             let parsed = ironauth_jose::JwsAlgorithm::from_jose_name(alg);
             if !parsed.is_some_and(crate::fapi_hardened::hardened_permits_algorithm) {
-                return Err(RegistrationError::metadata_owned(
-                    format!(
-                        "a hardened (FAPI 2.0) environment permits only PS256, ES256, or                          EdDSA as the token-endpoint signing algorithm, not {alg}"
-                    ),
-                ));
+                return Err(RegistrationError::metadata_owned(format!(
+                    "a hardened (FAPI 2.0) environment permits only PS256, ES256, or                          EdDSA as the token-endpoint signing algorithm, not {alg}"
+                )));
             }
         }
     }
@@ -1042,7 +1048,10 @@ async fn validate_metadata(
         jwks_uri,
         token_endpoint_auth_signing_alg,
         userinfo_signed_response_alg,
-})
+        authorization_signed_response_alg,
+        id_token_encrypted_response_alg,
+        id_token_encrypted_response_enc,
+    })
 }
 
 /// Validate `token_endpoint_auth_method` against the ACTUALLY IMPLEMENTED suite
@@ -1328,7 +1337,63 @@ fn validate_userinfo_signing_alg(
         )),
     }
 }
+/// Validate the `authorization_signed_response_alg` (JARM, issue #158): the
+/// response modes' signing algorithm. An unknown value is refused; absent means
+/// the plain response modes.
+fn validate_authorization_signing_alg(
+    metadata: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, RegistrationError> {
+    match metadata.get("authorization_signed_response_alg") {
+        None => Ok(None),
+        Some(Value::String(value)) if JwsAlgorithm::from_jose_name(value).is_some() => {
+            Ok(Some(value.clone()))
+        }
+        Some(Value::String(value)) => Err(RegistrationError::metadata_owned(format!(
+            "authorization_signed_response_alg {value:?} is not a supported JWS algorithm"
+        ))),
+        Some(_) => Err(RegistrationError::metadata(
+            "authorization_signed_response_alg must be a string",
+        )),
+    }
+}
+/// Validate the `id_token_encrypted_response_alg` (issue #158): only the
+/// shipped ECDH-ES is accepted; the refused families (RSA1_5, PBKDF2) are
+/// rejected at registration. Absent means the plain signed ID token.
+fn validate_id_token_encrypted_alg(
+    metadata: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, RegistrationError> {
+    match metadata.get("id_token_encrypted_response_alg") {
+        None => Ok(None),
+        Some(Value::String(value)) if value == "ECDH-ES" => Ok(Some(value.clone())),
+        Some(Value::String(value)) if ironauth_jose::jwe::jwe_algorithm_is_refused(value) => {
+            Err(RegistrationError::metadata_owned(format!(
+                "id_token_encrypted_response_alg {value:?} is a refused JWE algorithm"
+            )))
+        }
+        Some(Value::String(value)) => Err(RegistrationError::metadata_owned(format!(
+            "id_token_encrypted_response_alg {value:?} is not a shipped JWE algorithm"
+        ))),
+        Some(_) => Err(RegistrationError::metadata(
+            "id_token_encrypted_response_alg must be a string",
+        )),
+    }
+}
 
+/// Validate the `id_token_encrypted_response_enc`: only A256GCM ships.
+fn validate_id_token_encrypted_enc(
+    metadata: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, RegistrationError> {
+    match metadata.get("id_token_encrypted_response_enc") {
+        None => Ok(None),
+        Some(Value::String(value)) if value == "A256GCM" => Ok(Some(value.clone())),
+        Some(Value::String(value)) => Err(RegistrationError::metadata_owned(format!(
+            "id_token_encrypted_response_enc {value:?} is not a shipped JWE content algorithm"
+        ))),
+        Some(_) => Err(RegistrationError::metadata(
+            "id_token_encrypted_response_enc must be a string",
+        )),
+    }
+}
 
 /// Validate the `jwks` / `jwks_uri` pair. They are MUTUALLY EXCLUSIVE. A
 /// `private_key_jwt` client MUST supply exactly one usable source; other methods

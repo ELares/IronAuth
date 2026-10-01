@@ -300,7 +300,7 @@ fn build_header(
 
 /// The JWS signing input: `base64url(header) || '.' || base64url(payload)`.
 ///
-/// PUBLIC because the external-signer path (issue #161) builds the input here -
+/// `PUBLIC` because the external-signer path (issue #161) builds the input here -
 /// exactly the bytes a remote backend must sign - and then assembles the compact
 /// form itself, without ever holding the private key.
 pub fn signing_input(header: &[u8], payload: &[u8]) -> String {
@@ -313,7 +313,7 @@ pub fn signing_input(header: &[u8], payload: &[u8]) -> String {
 
 /// Assemble the compact serialization from the signing input and signature.
 ///
-/// PUBLIC for the same reason as [`signing_input`]: the external-signer path
+/// `PUBLIC` for the same reason as [`signing_input`]: the external-signer path
 /// (issue #161) assembles a token from the backend's raw signature.
 pub fn assemble(signing_input: &str, signature: &[u8]) -> String {
     format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))

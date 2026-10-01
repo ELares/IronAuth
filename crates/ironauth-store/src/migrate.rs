@@ -2026,6 +2026,34 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0238_userinfo_signed_response_alg.sql"),
         },
+        // EXPAND (issue #158): the JARM response algorithm.
+        Migration {
+            version: 239,
+            name: "authorization_signed_response_alg",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0239_authorization_signed_response_alg.sql"),
+        },
+        // EXPAND (issue #158): the encrypted ID-token response algorithms.
+        Migration {
+            version: 240,
+            name: "id_token_encrypted_response",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0240_id_token_encrypted_response.sql"),
+        },
+        // EXPAND (issue #163): the security-advisory store.
+        Migration {
+            version: 241,
+            name: "security_advisories",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0241_security_advisories.sql"),
+        },
+        // EXPAND (issue #162): the per-environment FIPS tenant profile flag.
+        Migration {
+            version: 242,
+            name: "fips_profile",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0242_fips_profile.sql"),
+        },
     ]
 }
 

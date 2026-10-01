@@ -535,7 +535,9 @@ async fn authorization_code_grant(
     // 5i. THE SENDER-CONSTRAINED REQUIREMENT (FAPI 2.0 §6.4): a hardened
     //     environment refuses a plain bearer exchange. The constraint is proven by
     //     a DPoP proof key OR the mTLS certificate that authenticated this request.
-    if crate::fapi_hardened::is_hardened(state, scope).await.unwrap_or(false)
+    if crate::fapi_hardened::is_hardened(state, scope)
+        .await
+        .unwrap_or(false)
         && !crate::fapi_hardened::hardened_sender_constrained(
             dpop_jkt,
             authenticated_client.certificate_thumbprint.as_deref(),
@@ -1988,7 +1990,8 @@ async fn mint_tokens(
             access_extra_claims,
         },
         target,
-    ).await
+    )
+    .await
     .map_err(|refusal| match refusal {
         tokens::MintRefusal::Policy { .. } => TokenError::AccessDenied,
         tokens::MintRefusal::Signing => TokenError::ServerError,
@@ -3159,7 +3162,8 @@ async fn mint_refresh_access(
             access_extra_claims: &access_extra_claims,
         },
         target,
-    ).await
+    )
+    .await
     .map_err(|refusal| match refusal {
         tokens::MintRefusal::Policy { .. } => TokenError::AccessDenied,
         tokens::MintRefusal::Signing => TokenError::ServerError,
