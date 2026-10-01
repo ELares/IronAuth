@@ -172,6 +172,8 @@ mod probe;
 mod quota;
 #[cfg(feature = "ironcache")]
 pub mod rate_store;
+/// Gated subject-bound recipient verification and secret-safe transport contract.
+pub mod recipient_verification;
 mod recover;
 pub mod recovery;
 /// The STRUCTURAL recover-factor honesty rule (issue #295): the opaque
@@ -1121,6 +1123,20 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/invitations/accept",
             post(invitations::accept_invitation),
+        )
+        // Disabled recipient-proof core. Its only installer is testing-only;
+        // these routes return 503 until real delivery and the hosted journey ship.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/email-verification/start",
+            post(recipient_verification::start).layer(axum::extract::DefaultBodyLimit::max(2048)),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/email-verification/verify",
+            post(recipient_verification::verify).layer(axum::extract::DefaultBodyLimit::max(2048)),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/recipient-proof",
+            post(recipient_verification::proof).layer(axum::extract::DefaultBodyLimit::max(2048)),
         )
         // Email OTP + scanner-safe magic links (issue #68), scope-routed under the
         // per-environment path so the send/verify/consume run under the right

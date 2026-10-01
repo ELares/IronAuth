@@ -2068,6 +2068,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0244_userinfo_metadata_update_grant.sql"),
         },
+        // EXPAND (issue #1436): subject-bound recipient verification, disabled at the door.
+        Migration {
+            version: 245,
+            name: "recipient_verification",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0245_recipient_verification.sql"),
+        },
     ]
 }
 

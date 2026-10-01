@@ -1170,6 +1170,12 @@ name = "portal_sessions"
 path = "tests/portal_sessions.rs"
 required-features = ["testing"]
 
+# Authenticated recipient verification and fresh ownership, issue #1436.
+[[test]]
+name = "recipient_verification"
+path = "tests/recipient_verification.rs"
+required-features = ["testing"]
+
 # Exact historical view repair required by the recipient core's fresh installs.
 [[test]]
 name = "migration_0237_repair"

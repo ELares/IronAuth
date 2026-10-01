@@ -1561,6 +1561,12 @@ pub enum Action {
     /// `eot_` code; the `detail` records the purpose (never the plaintext code, which
     /// is hashed on the row). A send suppressed for anti-enumeration writes no row.
     EmailOtpSend,
+    /// An authenticated recipient challenge was issued, without a session change.
+    RecipientVerificationStart,
+    /// A bounded recipient verification attempt and its ownership result.
+    RecipientVerificationAttempt,
+    /// A recipient challenge and verified ownership committed together.
+    RecipientVerificationVerified,
     /// An email-OTP code was VERIFIED (issue #68): a user presented the correct code
     /// and it was consumed single-use. The row targets the `eot_` code; the `detail`
     /// records the purpose.
@@ -2064,6 +2070,9 @@ impl Action {
             Action::AaguidRuleSet => "aaguid.rule.set",
             Action::AaguidRuleRemove => "aaguid.rule.remove",
             Action::EmailOtpSend => "email_otp.send",
+            Action::RecipientVerificationStart => "recipient_verification.start",
+            Action::RecipientVerificationAttempt => "recipient_verification.attempt",
+            Action::RecipientVerificationVerified => "recipient_verification.verified",
             Action::EmailOtpVerify => "email_otp.verify",
             Action::SmsOtpSend => "sms_otp.send",
             Action::SmsOtpVerify => "sms_otp.verify",

@@ -29,7 +29,9 @@ async fn old_ledger() -> TestDatabase {
     // A real ordinary fresh chain could not reach it; compatibility nevertheless
     // preserves operators who previously worked around the broken view manually.
     sqlx::raw_sql(
-        "DELETE FROM _schema_migrations WHERE version >= 243; \
+        "DROP TABLE recipient_email_verifications; DROP TABLE recipient_verification_challenges; \
+         ALTER TABLE users DROP COLUMN recipient_email_bidx, DROP COLUMN recipient_email_indexed; \
+         DELETE FROM _schema_migrations WHERE version >= 243; \
          DROP VIEW environment_guardrails; \
          CREATE VIEW environment_guardrails AS \
            SELECT tenant_id, id AS environment_id, kind, custom_domain, fapi_hardened, fips_profile \
@@ -115,7 +117,7 @@ async fn exact_old_checksum_upgrades_without_rewriting_ledger_data_view_grants_o
         .run()
         .await
         .expect("known old checksum repair");
-    assert_eq!(report.newly_applied(), [243, 244]);
+    assert_eq!(report.newly_applied(), [243, 244, 245]);
     assert_eq!(before_view, view_identity(&db).await);
     assert_eq!(before_data, data(&db).await);
     let after_ledger: Vec<String> = sqlx::query_scalar("SELECT row_to_json(m)::text FROM _schema_migrations m WHERE version < 243 ORDER BY version")
@@ -124,6 +126,11 @@ async fn exact_old_checksum_upgrades_without_rewriting_ledger_data_view_grants_o
         before_ledger, after_ledger,
         "old checksums and timestamps are not rewritten"
     );
+    let indexed: bool = sqlx::query_scalar("SELECT recipient_email_indexed FROM users")
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("legacy readiness");
+    assert!(!indexed, "no inferred canonical-index or verified backfill");
     sqlx::query("SELECT * FROM owned_guardrail_consumer")
         .fetch_all(db.owner_pool())
         .await
@@ -240,7 +247,7 @@ async fn historical_237_without_fips_upgrades_through_corrected_242() {
         .run()
         .await
         .expect("FIPS upgrade");
-    assert_eq!(report.newly_applied(), [242, 243, 244]);
+    assert_eq!(report.newly_applied(), [242, 243, 244, 245]);
     assert_eq!(identity, view_identity(&db).await);
     let names: Vec<String> = sqlx::query_scalar("SELECT attname::text FROM pg_attribute WHERE attrelid = 'environment_guardrails'::regclass AND attnum > 0 ORDER BY attnum")
         .fetch_all(db.owner_pool()).await.expect("retained view order");

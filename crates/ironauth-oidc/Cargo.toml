@@ -1741,3 +1741,9 @@ path = "tests/request_path_limiter.rs"
 name = "access_rules_three_consumers"
 required-features = ["testing"]
 path = "tests/access_rules_three_consumers.rs"
+
+# Gated authenticated recipient verification and online RP proof, issue #1436.
+[[test]]
+name = "recipient_verification"
+path = "tests/recipient_verification.rs"
+required-features = ["testing"]

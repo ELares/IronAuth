@@ -786,6 +786,16 @@ validates a previously issued JWT can keep accepting it until `exp`. The default
 access-token lifetime is 300 seconds. See [token formats](design/TOKEN-FORMATS.md)
 and [agent revocation](agents.md#revocation-stated-plainly).
 
+### Recipient proof for relying-party invitations
+
+A gated core exists for authenticated primary-mailbox verification and an online
+recipient match. It has **no production enable switch**. All three routes return
+`503 recipient_verification_unavailable` unless an owned test transport is
+installed by the test harness. Existing OTP/logging senders cannot enable it.
+Real delivery, hosted recovery UI and a controlled canonical-index backfill for
+existing scopes remain acceptance work in [issue #1436](https://github.com/ELares/IronAuth/issues/1436).
+See [the exact contract and readiness limits](design/RECIPIENT-VERIFICATION.md).
+
 ### Authentication methods and account self-service
 
 | Capability | User experience and controls |
@@ -11004,6 +11014,29 @@ repair, with text, empty and binary round-trip coverage; wrong keys and modified
 ciphertext still fail. It adds no algorithms or verification bypass and does
 not broaden the recipient-proof profile.
 
+## Surface: gated subject-bound recipient verification (issue #1436)
+
+Three bounded JSON POSTs live under the scoped account path: challenge start,
+challenge verify and online relying-party recipient proof. Production has no
+installer or enable flag; it returns 503 until delivery, hosted recovery and
+legacy-index readiness are qualified. The only installer is testing-only.
+See [the contract and remaining acceptance](design/RECIPIENT-VERIFICATION.md).
+
+| STRIDE | Threat | Control / residual |
+| --- | --- | --- |
+| Spoofing | An arbitrary email claim or another subject's code grants an invitation | Current exact authenticated subject; same-origin fresh direct session for ceremony; same canonicalizer and unambiguous primary/typed ownership; fresh proof reads current identifier and ceremony revision, never stored OIDC claims |
+| Tampering | Reissue, account disable, identifier replacement or competing owners race verification | Scope-bound IDs/RLS, shared ownership transaction lock, current user/identifier locks, exact challenge/hash/identifier comparison, and atomic consume plus verified ownership plus audit |
+| Repudiation | A verification changes ownership without a matching audit event | Challenge and attempt writes share the store's audited transaction; an injected post-audit failure rolls back consumption, identifier and proof epoch together |
+| Information disclosure | Codes/addresses leak through URLs, logs, ordinary outbox or response caches | Strict 2048-byte JSON, no query parameters, Argon2id at rest, sealed existing mailbox, no secret-bearing Debug/wire serialization, purpose-specific transient transport and no-store responses |
+| Denial of service | Flooded sends, concurrent guesses, unbounded slow transport or expensive hashing | Existing regulation/quota and bounded hash pool; durable one-minute send cooldown and five-attempt ceiling; one current challenge per subject; five-minute expiry and five-second transport deadline |
+| Elevation | Possession creates a stronger session, a token exchange hides impersonation, or a stale proof is reused | No session/token mint or strength change; direct live non-impersonated authorization-code provenance in addition to signed JWT/DPoP checks; issuer/client/public-subject/nonce/expected-recipient binding and at most 30-second online proof lifetime |
+
+Residuals are explicit: this core has no real delivery/hosted UI/legacy index
+backfill and must stay unavailable until those are qualified. Additional mailbox
+enrollment and opaque-token direct-actor provenance are not supported. A proof
+reports current provider-recorded ownership, not a new inbox-possession ceremony
+on every read. Relying-party acceptance must recheck its own current authority
+transactionally and bind the fresh response, as specified in the contract.
 
 ---
 
@@ -12139,6 +12172,13 @@ The export omits fields that are re-created at the destination rather than carri
   the login handle (unique per environment), so a re-import stays idempotent.
 - Timestamps, blind-index lookup columns, and the encryption key versions that seal
   PII at rest are re-derived and re-sealed against the destination instance.
+- The recipient lookup fields `users.recipient_email_bidx` and
+  `users.recipient_email_indexed` are DERIVED destination state. Import rebuilds
+  the canonical mailbox index under the destination key and records its local
+  readiness; it never carries the source blind index or marks a mailbox verified.
+  Stored `claims.email_verified` is portable claim data, not evidence for the
+  current recipient-proof API. Challenges and subject-bound verification records
+  remain instance-local ceremony state; verification must occur on the destination.
 - Soft-deleted (offboarded) users are excluded: a tombstone is not exported.
 - The account's enrolled MFA / login credential REGISTRY (passkey, TOTP, and
   recovery-code enrollments) IS exported today, in the `credentials` array above: the
