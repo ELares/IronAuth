@@ -54,6 +54,14 @@ bumps `MULTI_REGION_REPLICATION_VERSION` and invalidates existing acks.
 
 ## What the acceptance criteria will verify (when built)
 
+The current exploratory shipper exports two bounded process-wide metric series:
+maximum partition lag from the last successful pass (zero for an empty stream),
+and total committed rows shipped. It carries tenant/environment details only in
+partition reports and threshold alerts. Metric labels must not contain principal
+identifiers. The original per-tenant metric criterion below therefore remains a
+future design requirement to reconcile at graduation; it is not satisfied by
+these aggregate series.
+
 - **RPO as a first-class metric**: replication lag exported per tenant in the metric
   contract, with configurable alerting thresholds.
 - **The failover demo**: a scripted, repeatable promotion that preserves logins - an

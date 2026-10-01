@@ -210,3 +210,138 @@ async fn a_bounded_pass_is_resumable_and_converges() {
     assert_eq!(stream.len(), 7);
     assert_eq!(stream[6].2, "evt-resume-6");
 }
+
+#[derive(Default)]
+struct ReplicationMetrics {
+    shipped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    lag: std::sync::Arc<RecordedLag>,
+}
+
+#[derive(Default)]
+struct RecordedLag(std::sync::Mutex<Vec<f64>>);
+
+impl metrics::GaugeFn for RecordedLag {
+    fn increment(&self, _: f64) {
+        panic!("replication publishes an absolute lag");
+    }
+    fn decrement(&self, _: f64) {
+        panic!("replication publishes an absolute lag");
+    }
+    fn set(&self, value: f64) {
+        self.0.lock().expect("lag capture").push(value);
+    }
+}
+
+impl metrics::Recorder for ReplicationMetrics {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        if key.name() == ironauth_store::replication::REPLICATION_SHIPPED_TOTAL {
+            assert_eq!(key.labels().count(), 0, "no per-principal metric labels");
+            metrics::Counter::from_arc(std::sync::Arc::clone(&self.shipped))
+        } else {
+            metrics::Counter::noop()
+        }
+    }
+    fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        if key.name() == ironauth_store::replication::REPLICATION_LAG_MESSAGES {
+            assert_eq!(key.labels().count(), 0, "no per-principal metric labels");
+            metrics::Gauge::from_arc(std::sync::Arc::clone(&self.lag))
+        } else {
+            metrics::Gauge::noop()
+        }
+    }
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// Unequal real partition backlogs publish their maximum once per successful pass,
+/// not a last-writer-wins partition value. Retries count no rows twice.
+#[tokio::test]
+async fn replication_metrics_are_bounded_and_aggregate_actual_partition_work() {
+    let home = TestDatabase::start().await;
+    let follower = TestDatabase::start().await;
+    let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0C0A_0055);
+    let (follower_env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x0C0A_0055);
+    let first = home.seed_scope(&env).await;
+    follower.seed_scope(&follower_env).await;
+    let second = home.seed_scope(&env).await;
+    follower.seed_scope(&follower_env).await;
+    let shipper = ReplicationShipper::new(home.owner_pool().clone(), follower.owner_pool().clone());
+    let capture = ReplicationMetrics::default();
+    // This current-thread test keeps the recorder installed throughout future polling.
+    let _guard = metrics::set_default_local_recorder(&capture);
+    let empty = shipper.ship(1).await.expect("empty stream");
+    assert!(empty.partitions.is_empty());
+    assert_eq!(*capture.lag.0.lock().expect("capture"), vec![0.0]);
+    for index in 0..5 {
+        append_event(&home, &env, first, &format!("metric-first-{index}")).await;
+    }
+    for index in 0..2 {
+        append_event(&home, &env, second, &format!("metric-second-{index}")).await;
+    }
+    let partial = shipper.ship(1).await.expect("partial pass");
+    assert_eq!(partial.partitions.len(), 2);
+    let mut lags: Vec<_> = partial
+        .partitions
+        .iter()
+        .map(|part| part.lag_messages)
+        .collect();
+    lags.sort_unstable();
+    assert_eq!(
+        lags,
+        vec![1, 4],
+        "both unequal partition facts remain available"
+    );
+    assert_eq!(*capture.lag.0.lock().expect("capture"), vec![0.0, 4.0]);
+    assert_eq!(
+        capture.shipped.load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    let complete = shipper.ship(100).await.expect("catch-up pass");
+    assert!(
+        complete
+            .partitions
+            .iter()
+            .all(|part| part.lag_messages == 0)
+    );
+    assert_eq!(*capture.lag.0.lock().expect("capture"), vec![0.0, 4.0, 0.0]);
+    assert_eq!(
+        capture.shipped.load(std::sync::atomic::Ordering::Relaxed),
+        7
+    );
+    let replay = shipper.ship(100).await.expect("empty replay");
+    assert!(replay.partitions.iter().all(|part| part.copied == 0));
+    assert_eq!(
+        *capture.lag.0.lock().expect("capture"),
+        vec![0.0, 4.0, 0.0, 0.0]
+    );
+    assert_eq!(
+        capture.shipped.load(std::sync::atomic::Ordering::Relaxed),
+        7
+    );
+}
