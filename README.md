@@ -82,7 +82,7 @@ cargo build --locked -p ironauth --bin ironauth
 scripts/gate.sh > gate.log 2>&1
 ```
 
-The default server and most crates support Rust 1.85. The optional WASM hook
+The default server and most crates support Rust 1.88. The optional WASM hook
 engine requires Rust 1.95. A whole-workspace build includes that engine even
 when the server's `wasm-hooks` feature is disabled. The pinned development
 toolchain satisfies both; see the generated

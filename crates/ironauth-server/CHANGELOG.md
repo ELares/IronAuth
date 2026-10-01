@@ -6,6 +6,9 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Wait for the exact readiness body during cache failure and recovery tests;
+  both ready and degraded states return HTTP 200.
+
 - Publish the bounded signing-input warning counter in the metric contract and
   update replication metrics to their label-free aggregate semantics (issue #1437
   prerequisite). Readiness chaos fixtures now wait for the requested status/body

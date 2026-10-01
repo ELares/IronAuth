@@ -546,12 +546,13 @@ run "openapi changelog self-test" python3 scripts/openapi-changelog.py --self-te
 run "sdk contract freshness" python3 scripts/sdk-contract.py --check
 # The generated management SDKs must still match the published contract (issue #122).
 run "generated management SDKs freshness" python3 scripts/gen-management-sdks.py --check
-# And they must still COMPILE, which a freshness check cannot show.
-run "Go SDK builds" bash -c 'cd sdks/go && go build ./...'
+# Compilation and captured requests prove more than generated-file freshness.
+run "Go SDK request tests" bash -c 'cd sdks/go && go test ./...'
 # `-B`, so importing does not write a `.pyc` and dirty the tree. Without it this lane was
 # the gate's own first tripwire: it rewrote a tracked cache file on every clean-tree run,
 # so a green gate reported "this run CHANGED the working tree" every time.
 run "Python SDK imports" python3 -B -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('c','sdks/python/ironauth_management/client_gen.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)"
+run "Python SDK request tests" python3 -B -m unittest discover -s sdks/python/tests
 # The events-vs-webhooks guidance must still match the code it quotes (issue #107).
 run "events-vs-webhooks guidance" python3 scripts/events-vs-webhooks.py --check
 # Metering must stay off the login and token-issuance paths (issue #107).

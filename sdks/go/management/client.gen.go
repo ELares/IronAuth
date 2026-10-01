@@ -25,11 +25,22 @@ type Client struct {
 	BaseURL string
 	Token   string
 	HTTP    *http.Client
+
+	idempotencyKey string
 }
 
 // New returns a client for baseURL authenticating with a management token.
 func New(baseURL, token string) *Client {
 	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: http.DefaultClient}
+}
+
+// WithIdempotencyKey returns a copy that sends key with each request.
+// Reuse this copy and the same request for retries of one logical operation.
+// The original client is unchanged; an empty key omits the header.
+func (c *Client) WithIdempotencyKey(key string) *Client {
+	cloned := *c
+	cloned.idempotencyKey = key
+	return &cloned
 }
 
 // do issues one request. Exported methods below differ only in method, path, and
@@ -54,6 +65,9 @@ func (c *Client) do(method, path string, query url.Values, body any) (*http.Resp
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
+	if c.idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", c.idempotencyKey)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -1121,6 +1135,13 @@ func (c *Client) GrantTokenHookSecret(tenant_id string, environment_id string, c
 	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook/secrets", query, nil)
 }
 
+// ImportSecurityAdvisories performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories/import.
+//
+// Import the signed advisory bundle (the offline path; the online poll uses the SAME verification).
+func (c *Client) ImportSecurityAdvisories(tenant_id string, environment_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/security/advisories/import", query, body)
+}
+
 // LiftBan performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans/lift.
 //
 // Lift a credential-abuse ban.
@@ -1455,6 +1476,13 @@ func (c *Client) ListScimPushResources(tenant_id string, environment_id string, 
 // List the secrets of an environment (metadata only, cursor paginated).
 func (c *Client) ListSecrets(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/secrets", query, nil)
+}
+
+// ListSecurityAdvisories performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories.
+//
+// List the accepted advisories (the admin SPA's banner surface).
+func (c *Client) ListSecurityAdvisories(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/security/advisories", query, nil)
 }
 
 // ListServiceAccountApiKeys performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys.

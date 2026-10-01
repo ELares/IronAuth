@@ -443,6 +443,15 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // config moves into the server (only when its switch is on). Runs before serving.
         let signing_backfill_inputs = signing_backfill_inputs(&config, &env);
 
+        let advisory_verification_key =
+            ironauth_admin::advisory_feed::configured_verification_key(&config);
+        let advisory_poll_interval_secs = config.advisory_poll_interval_secs;
+        let advisory_poll = config.advisory_feed_url.clone().and_then(|url| {
+            advisory_verification_key
+                .clone()
+                .map(|key| (url, advisory_poll_interval_secs, key))
+        });
+
         let mut server = match Server::new(config, env) {
             Ok(server) => server,
             Err(error) => {
@@ -512,7 +521,11 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             .map(|state| state.log_shipper().running_handle());
         let management = planes.management.map(|state| {
             tracing::info!("management API mounted on the management plane");
-            ironauth_admin::management_router(state.with_backup_trigger(backup_trigger.clone()))
+            ironauth_admin::management_router(
+                state
+                    .with_backup_trigger(backup_trigger.clone())
+                    .with_advisory_feed(advisory_verification_key, advisory_poll_interval_secs),
+            )
         });
         // Keep a clone of the management router (if any) for the admin console's
         // same-origin proxy (issue #90, PR 2): the browser reaches the management
@@ -604,6 +617,23 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => spawn_webhook_delivery_pools(inputs).await,
             None => Vec::new(),
         };
+        // The security-advisory poll (issue #163): the online path, NEVER
+        // load-bearing (a failure only logs; the offline import keeps working).
+        // Disabled unless both the feed URL and the verification key are set.
+        if let Some((url, interval_secs, trusted)) = advisory_poll {
+            if let Some(store) = planes.readiness_store.clone() {
+                ironauth_admin::advisory_poll::spawn_advisory_poll(
+                    store,
+                    url.clone(),
+                    interval_secs,
+                    trusted,
+                );
+                tracing::info!(
+                    %url,
+                    "security-advisory feed poll enabled (never load-bearing)"
+                );
+            }
+        }
         // The async flow-target delivery worker (issue #112 criterion 2), behind its OWN
         // switch for the same reason webhook delivery is: a deployment that registers flow
         // targets and no webhook endpoints must not have to enable webhook delivery to get

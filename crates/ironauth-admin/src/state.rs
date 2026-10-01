@@ -222,6 +222,16 @@ struct Inner {
     // one setting two operator-visible names that could disagree.
     scim_token_expiry_warning_secs: u64,
 
+    // The security-advisory feed (issue #163): the parsed verification key and
+    // the poll interval, installed by the boot path from the `[security]` keys.
+    // `None` when the feed is disabled (the default); the offline bundle import
+    // then REFUSES, and the poll is not spawned. A BUILDER rather than an
+    // `AdminConfig` field for the reason `max_group_depth` gives: the setting
+    // lives in `[security]`, and duplicating it under `[admin]` would give one
+    // setting two operator-visible names that could disagree.
+    advisory_verification_key: Option<ironauth_jose::TrustedKey>,
+    advisory_poll_interval_secs: u64,
+
     // The audit-retention policy this deployment enforces (issue #145 criterion 3), reported
     // by the management API so a customer can answer "how long do you keep our audit trail"
     // without asking their vendor. A BUILDER for the reason above: the setting already lives
@@ -427,6 +437,10 @@ impl AdminState {
                 // same horizon a default deployment does rather than never warning.
                 scim_token_expiry_warning_secs: ironauth_config::ScimConfig::default()
                     .token_expiry_warning_secs,
+                // The feed is DISABLED by default (the offline import refuses and
+                // no poll is spawned until the boot path installs the key).
+                advisory_verification_key: None,
+                advisory_poll_interval_secs: 86_400,
                 // The shipped default, so a state built directly reports the policy a
                 // default deployment enforces rather than an invented one.
                 audit_retention: crate::audit_retention::AuditRetentionPolicy::default(),
@@ -851,6 +865,35 @@ impl AdminState {
     /// lives in `[scim]`, and a second name for it under `[admin]` would be two knobs that can
     /// disagree about one thing.
     ///
+    /// Install the security-advisory feed (issue #163): the parsed verification
+    /// key + the poll interval. `None` disables the feed. A BUILDER, not an
+    /// `AdminConfig` field, because the setting lives in `[security]`.
+    #[must_use]
+    pub fn with_advisory_feed(
+        mut self,
+        key: Option<ironauth_jose::TrustedKey>,
+        poll_secs: u64,
+    ) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.advisory_verification_key = key;
+            inner.advisory_poll_interval_secs = poll_secs;
+        }
+        self
+    }
+
+    /// The configured advisory-feed verification key; `None` when the feed is
+    /// disabled (the default).
+    #[must_use]
+    pub fn advisory_verification_key(&self) -> Option<ironauth_jose::TrustedKey> {
+        self.inner.advisory_verification_key.clone()
+    }
+
+    /// The advisory poll interval (seconds).
+    #[must_use]
+    pub fn advisory_poll_interval_secs(&self) -> u64 {
+        self.inner.advisory_poll_interval_secs
+    }
+
     /// ZERO DISABLES THE WARNING, which config load permits deliberately: a deployment whose
     /// tokens never expire has nothing to warn about, and a flag that is always false is better
     /// than one that is always true.

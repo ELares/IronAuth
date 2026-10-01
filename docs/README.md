@@ -12,6 +12,8 @@ IronAuth is pre-1.0, and optional or experimental features have explicit limits.
 | Run a seeded local identity provider | [Local emulator](EMULATOR.md) |
 | Configure, deploy, upgrade, and monitor | [Operations](OPERATIONS.md), [configuration reference](CONFIG.md), and [Helm chart](../charts/ironauth/README.md) |
 | Use the dashboard and resource pages | [Admin console](ADMIN-CONSOLE.md) |
+| Deploy where the network is not reachable | [Air-gap parity guarantee](AIR-GAP.md) |
+| Answer crypto/post-quantum questionnaires | [FIPS posture](FIPS-POSTURE.md) |
 | Integrate an app or API | [Integration guide](INTEGRATIONS.md) |
 | Choose a supported SDK | [SDK policy](SDK-POLICY.md) and [artifact compatibility](COMPATIBILITY.md) |
 

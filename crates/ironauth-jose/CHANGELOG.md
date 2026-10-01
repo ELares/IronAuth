@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Correct ECDH-ES Concat KDF to RFC 7518 and authenticate the compact protected
+  header as AES-GCM additional data. Validate the declared algorithm, curve,
+  empty encrypted-key segment and exact IV/tag sizes; reject unsupported critical
+  and compression headers. Decode optional agreement party information into the
+  KDF. RFC and independent Python cryptography fixtures cover interoperability.
+  Previously emitted nonstandard encrypted tokens must be reissued; there is no
+  fallback to unauthenticated headers or the old KDF.
+
 - Draw the JWE IV from the caller's existing environment entropy seam, like its
   ephemeral key (issue #1437 prerequisite). The public API and algorithms are
   unchanged; deterministic coverage now checks the full compact output and fresh IVs.

@@ -4025,6 +4025,22 @@ impl Harness {
             .quarantined
     }
 
+    /// Configure encryption metadata through this fixture's provisioning role.
+    pub async fn set_id_token_encryption(&self, jwks: &str) {
+        sqlx::query(
+            "UPDATE clients SET id_token_encrypted_response_alg = 'ECDH-ES', \
+             id_token_encrypted_response_enc = 'A256GCM', jwks = $1 \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+        )
+        .bind(jwks)
+        .bind(self.client_id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .execute(self.db.owner_pool())
+        .await
+        .expect("configure encrypted ID tokens");
+    }
+
     /// Force a client INTO (or out of) the unverified-client quarantine (issue #31),
     /// for tests that must exercise the quarantine gate on the seeded (non-DCR) client.
     /// Runs through the owner pool (the migration/provisioning connection), so it can

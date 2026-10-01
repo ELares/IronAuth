@@ -132,6 +132,10 @@ pub enum FetchPurpose {
     SectorIdentifier,
     /// Fetching a client-metadata document (CIMD).
     ClientMetadata,
+    /// Polling the signed security-advisory feed (issue #163). NEVER load-bearing:
+    /// a failure only logs, and the feed rides the same SSRF-hardened fetch path
+    /// as every other outbound fetch.
+    AdvisoryPoll,
     /// An outbound request made by an operator's WASM token hook (issue #114 criterion 2).
     ///
     /// Its own purpose rather than borrowing `ClaimsEnrichment`, and the difference is who chose
@@ -284,6 +288,7 @@ impl FetchPurpose {
             FetchPurpose::MessageDelivery => "message_delivery",
             FetchPurpose::ExternalSigner => "external_signer",
             FetchPurpose::LogStreamDelivery => "log_stream_delivery",
+            FetchPurpose::AdvisoryPoll => "advisory_poll",
             FetchPurpose::FlowTarget => "flow_target",
             FetchPurpose::Logo => "logo",
             FetchPurpose::AcmeDirectory => "acme_directory",

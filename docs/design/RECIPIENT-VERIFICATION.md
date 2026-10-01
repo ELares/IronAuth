@@ -143,20 +143,20 @@ Existing ledger entries are never rewritten. Every other altered checksum,
 including another edit to 0237, remains an error. The migration immutability
 gate admits only the same exact path and old/new digest pair; its temporary
 Git-fixture tests reject other edits, paths, missing files and symlinks.
-Forward migration 0241
+Forward migration 0243
 validates the precise old/corrected view projection and parsed definition. It
 appends the missing old column for an operator who previously worked around
 0237, while preserving existing column positions, view owner, grants, options
 and compatible dependent objects. No table data is rewritten and there is no
 DROP/CASCADE of the serving view. An unexpected view definition or shape is
 refused for explicit operator review. Fresh corrected chains take the no-op
-branch. Migration 0242 supplies the missing column-scoped UPDATE grant for
+branch. Migration 0244 supplies the missing column-scoped UPDATE grant for
 `clients.userinfo_signed_response_alg`, added by upstream 0238 and always
 written by the existing dynamic-client metadata updater. Only `ironauth_app`
-and `ironauth_control` receive that one-column grant. Migration 0243 adds the
+and `ironauth_control` receive that one-column grant. Migration 0245 adds the
 recipient-verification core.
 
-Forward migration 0244 restores only the control role's UPDATE privilege on
+Forward migration 0246 restores only the control role's UPDATE privilege on
 `environments.fapi_hardened`, missing after 0237 added the column. Real
 conformant admission failed with 42501 before this repair. The application role
 still cannot update environment policy, and control has no table-wide UPDATE.
@@ -167,3 +167,12 @@ snapshot, and hardened authorization consulted a replayed `request_uri` that
 PAR intentionally clears. The fixes add the missing placeholder and pass only
 the verified stored-request context to the private validator. They preserve
 role, client, PKCE and sender constraints; no query resume marker proves PAR.
+
+The current published chain also includes the security-advisory migration 0241
+and FIPS profile migration 0242. Their version identities are retained. The
+original FIPS view definition repeats the column-position collision after the
+0237 correction. Only its exact published checksum and the corrected append-only
+SQL checksum are accepted as a compatibility pair, without rewriting existing
+ledger rows. Forward repair 0243 validates the full guardrail view and retains
+its FIPS column, grants, owner and existing column positions. Every other changed
+checksum or unexpected view definition still refuses startup.

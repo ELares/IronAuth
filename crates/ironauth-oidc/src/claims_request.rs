@@ -100,6 +100,14 @@ impl ClaimSpec {
         self.value.is_some() || self.values.is_some()
     }
 
+    /// The pinned value, when the request carries a single `value` pin. Used by
+    /// the `verified_claims` subset release (issue #164): the envelope-shaped
+    /// request pins live inside the `value`.
+    #[must_use]
+    pub fn pinned_value(&self) -> Option<&Value> {
+        self.value.as_ref()
+    }
+
     /// Whether `candidate` satisfies this request's value filter. With no filter,
     /// any value matches; with a single `value`, the candidate must equal it; with
     /// `values`, the candidate must be one of them. When both are present (unusual),

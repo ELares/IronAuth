@@ -53,7 +53,7 @@ pub use secret::{REDACTED, Secret, SecretError, SecretString};
 /// Every section rejects unknown keys and every field has a serde default,
 /// so an empty file is a valid (dev-oriented) configuration and a typo is a
 /// startup failure, never a silently ignored setting.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Development mode. Relaxes operational nagging (currently: the
@@ -284,6 +284,20 @@ pub struct Config {
     /// Vault boundary. Misconfiguration fails fast at boot.
     pub signing: SigningConfig,
 
+    /// The security-advisory feed's verification key (issue #163): the base64url
+    /// Ed25519 public key the signed feed's signature is checked against. Unset
+    /// (the default) disables the feed: no advisory is accepted from any source.
+    pub advisory_verification_key: Option<String>,
+
+    /// The security-advisory feed's poll URL (issue #163). Unset (the default)
+    /// disables the online poll; the offline bundle import keeps working. The
+    /// poll is NEVER load-bearing: a fetch or verification failure only logs.
+    pub advisory_feed_url: Option<String>,
+
+    /// The advisory poll interval (seconds). Defaults to 24 hours.
+    #[serde(default = "default_advisory_poll_interval")]
+    pub advisory_poll_interval_secs: u64,
+
     /// Mutual-TLS client authentication (issue #159): the PKI method's trust
     /// anchors. Empty by default, which leaves `tls_client_auth` unregistrable:
     /// a chain cannot validate against a bundle nothing configured.
@@ -321,6 +335,56 @@ pub struct Config {
     /// feature's exact current version; see the feature reference in the
     /// generated docs/CONFIG.md.
     pub features: BTreeMap<String, FeatureToggle>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            dev_mode: false,
+            server: ServerConfig::default(),
+            proxy: ProxyConfig::default(),
+            telemetry: TelemetryConfig::default(),
+            database: DatabaseConfig::default(),
+            admin: AdminConfig::default(),
+            oidc: OidcConfig::default(),
+            flows: FlowsConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
+            hosted_pages: HostedPagesConfig::default(),
+            admin_spa: AdminSpaConfig::default(),
+            identifiers: IdentifiersConfig::default(),
+            scim: ScimConfig::default(),
+            ssf: SsfConfig::default(),
+            risc_receiver: RiscReceiverConfig::default(),
+            scim_push: ScimPushConfig::default(),
+            quota: QuotaConfig::default(),
+            password_hashing: PasswordHashingConfig::default(),
+            password_policy: PasswordPolicyConfig::default(),
+            byok: ByokConfig::default(),
+            organizations: OrganizationsConfig::default(),
+            token_claims: TokenClaimsConfig::default(),
+            outbox: OutboxConfig::default(),
+            hot_state: HotStateConfig::default(),
+            forward_auth: ForwardAuthConfig::default(),
+            users: UsersConfig::default(),
+            traits: TraitsConfig::default(),
+            webhooks: WebhooksConfig::default(),
+            flow_targets: FlowTargetsConfig::default(),
+            messaging: MessagingConfig::default(),
+            audit_retention: AuditRetentionConfig::default(),
+            backup: BackupConfig::default(),
+            replication: ReplicationConfig::default(),
+            signing: SigningConfig::default(),
+            advisory_verification_key: None,
+            advisory_feed_url: None,
+            advisory_poll_interval_secs: default_advisory_poll_interval(),
+            mtls: MtlsConfig::default(),
+            signing_rotation: SigningRotationConfig::default(),
+            log_streams: LogStreamsConfig::default(),
+            certificate_expiry: CertificateExpiryConfig::default(),
+            ldap_sync: LdapSyncConfig::default(),
+            features: BTreeMap::default(),
+        }
+    }
 }
 
 /// Transactional outbox and job queue settings (issue #104).
@@ -3307,6 +3371,10 @@ pub struct AdminConfig {
 }
 
 /// The default admin sudo re-authentication freshness window: ten minutes (issue #73).
+fn default_advisory_poll_interval() -> u64 {
+    86_400
+}
+
 fn default_sudo_mode_window_secs() -> u64 {
     600
 }

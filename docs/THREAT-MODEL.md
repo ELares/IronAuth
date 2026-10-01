@@ -501,3 +501,19 @@ enrollment and opaque-token direct-actor provenance are not supported. A proof
 reports current provider-recorded ownership, not a new inbox-possession ceremony
 on every read. Relying-party acceptance must recheck its own current authority
 transactionally and bind the fresh response, as specified in the contract.
+
+### JWE protected-header and derivation review repair
+
+The merge review found that compact JWE used empty AEAD additional data and a
+nonstandard Concat KDF. Authenticate the original encoded protected header,
+validate the curated ECDH-ES/P-256/A256GCM profile, and derive with the exact RFC
+7518 ordering, including optional agreement-party information. Header mutation,
+nonempty encrypted keys and incorrect IV/tag lengths fail closed. Unsupported
+critical extensions and compression are rejected. RFC 7518 Appendix C and
+independently generated Python cryptography vectors prevent a self-consistent
+round trip from concealing wire incompatibility. Old nonstandard ciphertexts
+are intentionally not accepted by a compatibility fallback.
+
+The verified-claims generic release loop must not override the specialized
+verification-envelope validator. Matching subsets survive; malformed envelopes
+cannot be reintroduced through a generic voluntary or exact-value request.

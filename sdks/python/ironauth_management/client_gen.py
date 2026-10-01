@@ -10,6 +10,7 @@ handing the caller the body.
 
 from __future__ import annotations
 
+from copy import copy
 import json
 import urllib.parse
 import urllib.request
@@ -22,6 +23,16 @@ class Client:
     def __init__(self, base_url: str, token: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
+        self._idempotency_key = ""
+
+    def with_idempotency_key(self, key: str) -> Client:
+        """Return a copy sending key; reuse it for one operation's retries.
+
+        The original client is unchanged; an empty key omits the header.
+        """
+        cloned = copy(self)
+        cloned._idempotency_key = key
+        return cloned
 
     def _do(
         self,
@@ -37,6 +48,8 @@ class Client:
         data = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(target, data=data, method=method)
         request.add_header("Authorization", f"Bearer {self.token}")
+        if self._idempotency_key:
+            request.add_header("Idempotency-Key", self._idempotency_key)
         if data is not None:
             request.add_header("Content-Type", "application/json")
         try:
@@ -651,6 +664,10 @@ class Client:
         """Grant a hook permission to read an environment secret. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook/secrets", query, None)
 
+    def import_security_advisories(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Import the signed advisory bundle (the offline path; the online poll uses the SAME verification). POST /v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories/import."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/security/advisories/import", query, body)
+
     def lift_ban(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Lift a credential-abuse ban. POST /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans/lift."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/abuse/bans/lift", query, body)
@@ -842,6 +859,10 @@ class Client:
     def list_secrets(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List the secrets of an environment (metadata only, cursor paginated). GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/secrets", query, None)
+
+    def list_security_advisories(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List the accepted advisories (the admin SPA's banner surface). GET /v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/security/advisories", query, None)
 
     def list_service_account_api_keys(self, tenant_id: str, environment_id: str, service_account_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """listServiceAccountApiKeys. GET /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys."""
