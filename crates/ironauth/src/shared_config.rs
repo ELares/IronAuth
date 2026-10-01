@@ -623,6 +623,21 @@ mod tests {
     /// must state rather than one they can omit.
     const PLANE_LOCAL_KEYS: &[(&str, Reach, &str)] = &[
         (
+            "advisory_feed_url",
+            Reach::OnePlaneOrNoState,
+            "Consumed at boot by the optional signed-feed polling worker; neither request plane receives the URL.",
+        ),
+        (
+            "advisory_poll_interval_secs",
+            Reach::OnePlaneOrNoState,
+            "Consumed at boot by the optional signed-feed polling worker to set its cadence.",
+        ),
+        (
+            "advisory_verification_key",
+            Reach::OnePlaneOrNoState,
+            "Shared by the background feed verifier and management-plane offline import; the public OIDC plane does not receive it.",
+        ),
+        (
             "risc_receiver",
             Reach::OnePlaneOrNoState,
             "read at boot in ONE place, and it is not the management plane (issue #144). The \
