@@ -34,7 +34,7 @@
 //! a trust framework label is believable is the identity-proofing question the
 //! framework itself answers.
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::claims_request::ClaimSpec;
 

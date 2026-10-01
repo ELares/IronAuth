@@ -6,6 +6,9 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Keep the programmatic root configuration default consistent with the documented
+  24-hour advisory poll interval; preserve the defaults of every other field.
+
 - Corrected the generated console setup descriptions and database credential
   reference. The console is implemented and opt-in; serving connections use
   `database.url` directly and do not merge the reserved `database.password`

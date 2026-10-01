@@ -3718,6 +3718,29 @@
       },
       "description": "Admin console SPA settings (issue #90): the in-process serving of the\nPreact admin console on the public plane under `/admin`. The working\nconsole is embedded in the binary and uses Authorization Code + PKCE\nagainst the configured admin issuer. Opt in with `enabled`; while off,\nevery `/admin` path is a uniform 404. The same-origin `/admin/api` proxy\nis available only when the OIDC bridge is configured and the management\nplane is mounted. See `docs/ADMIN-CONSOLE.md` for setup and capabilities."
     },
+    "advisory_feed_url": {
+      "default": null,
+      "description": "The security-advisory feed's poll URL (issue #163). Unset (the default)\ndisables the online poll; the offline bundle import keeps working. The\npoll is NEVER load-bearing: a fetch or verification failure only logs.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "advisory_poll_interval_secs": {
+      "default": 86400,
+      "description": "The advisory poll interval (seconds). Defaults to 24 hours.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "advisory_verification_key": {
+      "default": null,
+      "description": "The security-advisory feed's verification key (issue #163): the base64url\nEd25519 public key the signed feed's signature is checked against. Unset\n(the default) disables the feed: no advisory is accepted from any source.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "audit_retention": {
       "$ref": "#/$defs/AuditRetentionConfig",
       "default": {

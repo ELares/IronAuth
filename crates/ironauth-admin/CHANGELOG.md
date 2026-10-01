@@ -6,6 +6,9 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Repair the signed-feed rejection tests so the wrong-key case uses a distinct
+  synthetic key and signature rejection assertions compile.
+
 ### A nested group create now announces its parent (issue #145 criterion 2)
 
 `POST .../organizations/{id}/groups` with a `parent_id` emits an

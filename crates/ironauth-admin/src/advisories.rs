@@ -80,7 +80,7 @@ pub async fn list_security_advisories(
     principal: Principal,
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    let (_scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     principal.require_permission(ManagementPermission::Read)?;
     let rows = state
         .store()
@@ -132,7 +132,7 @@ pub async fn import_security_advisories(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    let (_scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     principal.require_permission(ManagementPermission::WriteConfig)?;
     let request: AdvisoryImportRequest = parse_json(&body)?;
 

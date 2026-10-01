@@ -11956,7 +11956,7 @@ impl EnvironmentGuardrailRepo<'_> {
 
     /// Whether this environment runs the FIPS tenant profile (issue #162): the
     /// algorithm policy presets to the validated-module-compatible set (ES256
-    /// default, RS256 available, EdDSA unavailable).
+    /// default, RS256 available, `EdDSA` unavailable).
     ///
     /// # Errors
     ///
@@ -13539,6 +13539,7 @@ impl SecurityAdvisoryRepo<'_> {
     }
 }
 
+/// Scoped client-authentication diagnostic records.
 pub struct ClientAuthDiagnosticsRepo<'a> {
     store: &'a Store,
     scope: Scope,

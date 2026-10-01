@@ -6,6 +6,9 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Capture advisory verification and poll settings before moving configuration
+  into the server, restoring compilation of the management and worker wiring.
+
 - Patch vulnerable Cargo, console tooling, hook builder, conformance Python,
   and Terraform-provider dependencies. Pin workflow actions to verified commit
   hashes, use locked npm installs, and add CodeQL and dependency review workflows.

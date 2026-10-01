@@ -452,12 +452,7 @@ async fn ironcache_dies_the_probe_marks_degraded_and_recovers() {
     let app = server.management_app();
 
     // CACHE UP: the declared accelerator answers, so the instance is fully ready.
-    let (status, _, body) = eventually(
-        || get(app.clone(), "/readyz"),
-        StatusCode::OK,
-        Duration::from_secs(30),
-    )
-    .await;
+    let (status, body) = eventually_body(app.clone(), "ready\n", Duration::from_secs(30)).await;
     assert_eq!(status, StatusCode::OK, "cache up: {body}");
     assert_eq!(body, "ready\n");
 
@@ -466,9 +461,9 @@ async fn ironcache_dies_the_probe_marks_degraded_and_recovers() {
 
     // DEGRADED, NOT DOWN: 200 with the documented token, because every flow still
     // completes and only the accelerator is missing.
-    let (status, _, body) = eventually(
-        || get(app.clone(), "/readyz"),
-        StatusCode::OK,
+    let (status, body) = eventually_body(
+        app.clone(),
+        "degraded: accelerator_absent\n",
         Duration::from_secs(30),
     )
     .await;
@@ -481,12 +476,7 @@ async fn ironcache_dies_the_probe_marks_degraded_and_recovers() {
     // RECOVERY: the cache comes back on the SAME port, and the probe returns to ready.
     cache.restart();
     wait_for_port(port, Duration::from_secs(30));
-    let (status, _, body) = eventually(
-        || get(app.clone(), "/readyz"),
-        StatusCode::OK,
-        Duration::from_secs(60),
-    )
-    .await;
+    let (status, body) = eventually_body(app.clone(), "ready\n", Duration::from_secs(60)).await;
     assert_eq!(status, StatusCode::OK, "recovered: {body}");
     assert_eq!(body, "ready\n");
 }
