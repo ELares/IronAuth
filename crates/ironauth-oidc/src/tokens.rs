@@ -1733,13 +1733,6 @@ fn at_jwt_payload(
     })
 }
 
-/// Mint an OPAQUE access token for `target` (issue #29): the scope-declaring
-/// `ira_at_` reference token plus its digest and metadata for `opaque_access_tokens`.
-/// An opaque token carries no claims, so this is shared verbatim by the code
-/// exchange, the refresh grant, and the client-credentials grant (issue #23): every
-/// opaque access token IronAuth issues is byte-shaped identically regardless of the
-/// grant that minted it.
-/// issuance-gate-allow: a format arm below `mint_access`, which has already checked.
 /// Sign `payload` through the selected backend (issue #161): the JWS input is the
 /// exact bytes the backend signs (the same [`signing_input`] the local mint uses),
 /// the size guard runs BEFORE dispatch (a backend whose raw-input ceiling the input
@@ -1845,6 +1838,14 @@ pub(crate) async fn encrypt_id_token_for_client(
     None
 }
 
+/// Mint an OPAQUE access token for `target` (issue #29): the scope-declaring
+/// `ira_at_` reference token plus its digest and metadata for `opaque_access_tokens`.
+/// An opaque token carries no claims, so this is shared verbatim by the code
+/// exchange, the refresh grant, and the client-credentials grant (issue #23): every
+/// opaque access token IronAuth issues is byte-shaped identically regardless of the
+/// grant that minted it.
+/// issuance-gate-allow: a format arm called only after `mint_access` or
+/// `mint_client_credentials_access_token` has enforced `issuance_refusal`.
 fn mint_opaque_access(
     state: &OidcState,
     scope: &Scope,
