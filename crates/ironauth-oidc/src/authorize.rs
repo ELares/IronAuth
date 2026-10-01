@@ -971,7 +971,9 @@ async fn issue_code(
     //    the SAME validator at push time, so a pushed request and a plain request are
     //    checked by EXACTLY the same rules and cannot diverge. An error before a
     //    redirect target is validated is a page; after, it rides the negotiated mode.
-    let hardened = crate::fapi_hardened::is_hardened(state, scope).await.unwrap_or(false);
+    let hardened = crate::fapi_hardened::is_hardened(state, scope)
+        .await
+        .unwrap_or(false);
     let validated = validate_request(state, &client, &params, hardened)
         .map_err(|error| error.into_authorize(state.issuer_for(&scope), params.state.as_deref()))?;
     let ValidatedRequest {
