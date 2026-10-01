@@ -1173,9 +1173,14 @@ async fn hosted_form_csp_uses_only_exact_registered_callbacks() {
     let harness = Harness::start_store_backed().await;
     let client = harness.client_id().to_string();
     let resume = format!("/authorize?{}", authorize_query(&client, None));
-    for route in ["/login", "/register"] {
+    let subject = harness.seed_unique_user().await;
+    let cookie = harness.session_cookie(&subject).await;
+    for route in ["/login", "/register", "/consent", "/login/mfa"] {
         let (status, headers, _) = harness
-            .get_with_cookie(&format!("{route}?return_to={}", enc(&resume)), None)
+            .get_with_cookie(
+                &format!("{route}?return_to={}", enc(&resume)),
+                Some(&cookie),
+            )
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_hardened(&headers);
@@ -1188,7 +1193,10 @@ async fn hosted_form_csp_uses_only_exact_registered_callbacks() {
             format!("{resume}&request_uri=urn:unresolved"),
         ] {
             let (_, headers, _) = harness
-                .get_with_cookie(&format!("{route}?return_to={}", enc(&invalid)), None)
+                .get_with_cookie(
+                    &format!("{route}?return_to={}", enc(&invalid)),
+                    Some(&cookie),
+                )
                 .await;
             assert!(csp(&headers).contains("form-action 'self';"));
             assert!(!csp(&headers).contains("https://client.test"));
@@ -1206,6 +1214,27 @@ async fn hosted_form_csp_uses_only_exact_registered_callbacks() {
             None,
         )
         .await;
+    assert_hardened(&headers);
+    assert!(csp(&headers).contains("form-action 'self' https://client.test;"));
+}
+
+/// Validation failures must retain the callback policy on the next form POST.
+#[tokio::test]
+async fn registration_error_retains_registered_callback_navigation() {
+    let harness = Harness::start_store_backed().await;
+    let resume = format!(
+        "/authorize?{}",
+        authorize_query(&harness.client_id().to_string(), None)
+    );
+    let (status, headers, body) = harness
+        .post_form(
+            "/register",
+            &form(&[("identifier", ""), ("password", ""), ("return_to", &resume)]),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("An identifier is required."));
     assert_hardened(&headers);
     assert!(csp(&headers).contains("form-action 'self' https://client.test;"));
 }

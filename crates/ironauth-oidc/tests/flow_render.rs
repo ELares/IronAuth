@@ -164,3 +164,42 @@ fn urlencoding_lite(raw: &str) -> String {
     }
     out
 }
+
+/// Persisted browser flows retain the callback origin without weakening style
+/// or framing policy. An unregistered path on that origin grants nothing.
+#[tokio::test]
+async fn hosted_flow_csp_admits_only_the_registered_resume_callback() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_flows();
+    for (redirect, allowed) in [
+        (common::REDIRECT_URI, true),
+        ("https://client.test/unregistered", false),
+        ("https://attacker.test/cb", false),
+    ] {
+        let resume = format!(
+            "/authorize?response_type=code&client_id={}&redirect_uri={}",
+            harness.client_id(),
+            common::enc(redirect),
+        );
+        let path = format!(
+            "{}?return_to={}",
+            browser_login_path(&harness),
+            common::enc(&resume)
+        );
+        let (status, headers, body) = harness.get_with_cookie(&path, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(csp.contains("default-src 'none'"));
+        assert!(csp.contains("style-src 'self'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(!csp.contains("unsafe-inline"));
+        assert_eq!(
+            csp.contains("form-action 'self' https://client.test;"),
+            allowed
+        );
+        if !allowed {
+            assert!(csp.contains("form-action 'self';"));
+        }
+        assert!(!csp.contains("attacker.test"));
+    }
+}
