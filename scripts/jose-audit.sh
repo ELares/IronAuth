@@ -16,6 +16,11 @@
 # evade the net; ring enters the tree only transitively (via rustls), never as a
 # direct dependency outside ironauth-jose.
 #
+# The FIPS build seam (issue #162): `aws-lc-rs` is named in the SAME net, so the
+# second backend is governed by the same rule the day the variant lands - it is
+# a dependency of ironauth-jose ALONE, selected there by feature, and no other
+# crate may construct a second crypto path over it.
+#
 # Secondary net (best-effort, documented): no crate other than ironauth-jose may
 # name a JOSE verification primitive in its source (ring's signature/HMAC API, or
 # a JOSE/JWT crate namespace). This is grep-based and catches an accidental use
@@ -33,7 +38,7 @@ JOSE_CRATE='ironauth-jose'
 # JOSE/JWT crates and the crypto backend. A direct dependency on any of these,
 # outside ironauth-jose, is a second verifier. The names are anchored at the
 # start of a manifest key so prose in comments does not match.
-JOSE_DEPS='jsonwebtoken|josekit|jose|jwt|jwt-simple|jwt_compact|jwtk|jwts|frank_jwt|biscuit|biscuit-auth|ring'
+JOSE_DEPS='jsonwebtoken|josekit|jose|jwt|jwt-simple|jwt_compact|jwtk|jwts|frank_jwt|biscuit|biscuit-auth|ring|aws-lc-rs'
 
 # JOSE verification / signature primitives in source. ring's signature and HMAC
 # entry points are named so a hand-rolled verifier is caught; ironauth-jose's own

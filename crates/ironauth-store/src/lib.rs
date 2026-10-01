@@ -50,6 +50,7 @@
 pub mod abuse;
 pub mod access_request;
 pub mod access_review;
+pub mod advisory;
 pub mod api_key;
 pub mod audit;
 pub mod audit_retention;
@@ -78,7 +79,10 @@ pub mod impersonation;
 pub mod interchange;
 pub mod kek_backup;
 pub(crate) fn fapi_hardened_permits_auth_method(method: &str) -> bool {
-    matches!(method, "private_key_jwt" | "tls_client_auth" | "self_signed_tls_client_auth")
+    matches!(
+        method,
+        "private_key_jwt" | "tls_client_auth" | "self_signed_tls_client_auth"
+    )
 }
 
 pub(crate) fn fapi_hardened_permits_signing_alg(alg: &str) -> bool {
@@ -429,6 +433,7 @@ pub use risk::{
     NewRiskSignal, RiskDecisionView, RiskSignalView,
 };
 pub use scope::Scope;
+
 pub use signup_form::{
     NewSignupForm, SignupFormConfig, SignupFormError, SignupFormField, SignupFormRecord,
     SignupStep, validate_against_schema as validate_signup_form,

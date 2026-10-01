@@ -29,10 +29,10 @@ async fn old_ledger() -> TestDatabase {
     // A real ordinary fresh chain could not reach it; compatibility nevertheless
     // preserves operators who previously worked around the broken view manually.
     sqlx::raw_sql(
-        "DELETE FROM _schema_migrations WHERE version >= 241; \
+        "DELETE FROM _schema_migrations WHERE version >= 243; \
          DROP VIEW environment_guardrails; \
          CREATE VIEW environment_guardrails AS \
-           SELECT tenant_id, id AS environment_id, kind, custom_domain, fapi_hardened \
+           SELECT tenant_id, id AS environment_id, kind, custom_domain, fapi_hardened, fips_profile \
            FROM environments WHERE tenant_id = current_setting('ironauth.tenant_id', true) \
            AND id = current_setting('ironauth.environment_id', true); \
          GRANT SELECT ON environment_guardrails TO ironauth_app, ironauth_control;",
@@ -45,6 +45,11 @@ async fn old_ledger() -> TestDatabase {
         .execute(db.owner_pool())
         .await
         .expect("known old ledger");
+    sqlx::query("UPDATE _schema_migrations SET checksum = $1 WHERE version = 242")
+        .bind("59fa9390262ccdf8fa57542aa75f93d752a50be7e56bb816f558c371f5ef2121")
+        .execute(db.owner_pool())
+        .await
+        .expect("published 0242 ledger");
     db
 }
 
@@ -76,7 +81,8 @@ async fn corrected_fresh_chain_keeps_both_guardrail_columns_and_is_idempotent() 
             "kind",
             "custom_domain",
             "auto_link_posture",
-            "fapi_hardened"
+            "fapi_hardened",
+            "fips_profile"
         ]
     );
     let report = MigrationRunner::new(db.owner_pool())
@@ -109,10 +115,10 @@ async fn exact_old_checksum_upgrades_without_rewriting_ledger_data_view_grants_o
         .run()
         .await
         .expect("known old checksum repair");
-    assert_eq!(report.newly_applied(), [241, 242]);
+    assert_eq!(report.newly_applied(), [243, 244]);
     assert_eq!(before_view, view_identity(&db).await);
     assert_eq!(before_data, data(&db).await);
-    let after_ledger: Vec<String> = sqlx::query_scalar("SELECT row_to_json(m)::text FROM _schema_migrations m WHERE version < 241 ORDER BY version")
+    let after_ledger: Vec<String> = sqlx::query_scalar("SELECT row_to_json(m)::text FROM _schema_migrations m WHERE version < 243 ORDER BY version")
         .fetch_all(db.owner_pool()).await.expect("preserved ledger");
     assert_eq!(
         before_ledger, after_ledger,
@@ -131,7 +137,7 @@ async fn exact_old_checksum_upgrades_without_rewriting_ledger_data_view_grants_o
 
 #[tokio::test]
 async fn unknown_237_hash_and_other_historical_hashes_still_refuse() {
-    for version in [237, 62] {
+    for version in [237, 242, 62] {
         let db = old_ledger().await;
         sqlx::query(
             "UPDATE _schema_migrations SET checksum = 'unrecognized-checksum' WHERE version = $1",
@@ -144,7 +150,7 @@ async fn unknown_237_hash_and_other_historical_hashes_still_refuse() {
             matches!(MigrationRunner::new(db.owner_pool()).run().await, Err(MigrationError::ChecksumMismatch {version: actual}) if actual == version)
         );
         let later: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM _schema_migrations WHERE version >= 241")
+            sqlx::query_scalar("SELECT count(*) FROM _schema_migrations WHERE version >= 243")
                 .fetch_one(db.owner_pool())
                 .await
                 .expect("no later migration");
@@ -167,7 +173,7 @@ async fn known_old_ledger_does_not_admit_another_edit_to_237_or_an_unexpected_vi
             .await,
         Err(MigrationError::ChecksumMismatch { version: 237 })
     ));
-    sqlx::query("CREATE OR REPLACE VIEW environment_guardrails AS SELECT tenant_id, id AS environment_id, kind, custom_domain, fapi_hardened FROM environments WHERE false")
+    sqlx::query("CREATE OR REPLACE VIEW environment_guardrails AS SELECT tenant_id, id AS environment_id, kind, custom_domain, fapi_hardened, fips_profile FROM environments WHERE false")
         .execute(db.owner_pool()).await.expect("unexpected security definition");
     let before = view_identity(&db).await;
     assert!(matches!(
@@ -176,7 +182,7 @@ async fn known_old_ledger_does_not_admit_another_edit_to_237_or_an_unexpected_vi
     ));
     assert_eq!(before, view_identity(&db).await);
     let applied: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM _schema_migrations WHERE version >= 241")
+        sqlx::query_scalar("SELECT count(*) FROM _schema_migrations WHERE version >= 243")
             .fetch_one(db.owner_pool())
             .await
             .expect("no partial forward migration");
@@ -221,4 +227,58 @@ async fn userinfo_metadata_grant_is_exactly_the_app_control_column() {
         .rollback()
         .await
         .expect("end limited role transaction");
+}
+
+#[tokio::test]
+async fn historical_237_without_fips_upgrades_through_corrected_242() {
+    let db = old_ledger().await;
+    sqlx::raw_sql(
+        "DELETE FROM _schema_migrations WHERE version = 242;          DROP VIEW environment_guardrails;          ALTER TABLE environments DROP COLUMN fips_profile;          CREATE VIEW environment_guardrails AS            SELECT tenant_id, id AS environment_id, kind, custom_domain, fapi_hardened            FROM environments WHERE tenant_id = current_setting('ironauth.tenant_id', true)            AND id = current_setting('ironauth.environment_id', true);          GRANT SELECT ON environment_guardrails TO ironauth_app, ironauth_control;",
+    ).execute(db.owner_pool()).await.expect("owned pre-FIPS fixture");
+    let identity = view_identity(&db).await;
+    let report = MigrationRunner::new(db.owner_pool())
+        .run()
+        .await
+        .expect("FIPS upgrade");
+    assert_eq!(report.newly_applied(), [242, 243, 244]);
+    assert_eq!(identity, view_identity(&db).await);
+    let names: Vec<String> = sqlx::query_scalar("SELECT attname::text FROM pg_attribute WHERE attrelid = 'environment_guardrails'::regclass AND attnum > 0 ORDER BY attnum")
+        .fetch_all(db.owner_pool()).await.expect("retained view order");
+    assert_eq!(
+        names,
+        [
+            "tenant_id",
+            "environment_id",
+            "kind",
+            "custom_domain",
+            "fapi_hardened",
+            "fips_profile",
+            "auto_link_posture"
+        ]
+    );
+    assert!(
+        MigrationRunner::new(db.owner_pool())
+            .run()
+            .await
+            .expect("replay")
+            .newly_applied()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn published_242_checksum_does_not_admit_another_edit() {
+    let db = old_ledger().await;
+    let mut altered = chain();
+    let migration = altered
+        .iter_mut()
+        .find(|migration| migration.version == 242)
+        .expect("0242");
+    migration.sql = Box::leak(format!("{}\n-- another edit", migration.sql).into_boxed_str());
+    assert!(matches!(
+        MigrationRunner::from_migrations(db.owner_pool(), altered)
+            .run()
+            .await,
+        Err(MigrationError::ChecksumMismatch { version: 242 })
+    ));
 }
