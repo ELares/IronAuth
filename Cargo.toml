@@ -48,7 +48,10 @@ members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+# time 0.3.47 fixes unbounded RFC 2822 recursion and requires Rust 1.88.
+# Older dependency ceilings below remain conservative; this update does not
+# independently qualify newer trybuild, rcgen, sqlx, or crypto releases.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ELares/IronAuth"
 
