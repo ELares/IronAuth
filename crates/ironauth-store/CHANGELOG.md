@@ -6,6 +6,58 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Reconcile the recipient stack with published migrations 0241 and 0242 by assigning its new migrations 0243 through 0246. Repair the exact historical FIPS view collision without rewriting accepted ledger rows; retain the FIPS projection, existing view columns, ownership and grants on forward repair.
+
+- Add optional static, flushed stage diagnostics to the real outbox chaos test
+  (issue #1453). CI retains one original test invocation and all assertions; an
+  owned-process watchdog reserves cleanup time inside the existing job deadline.
+  A timed-out invocation fails and does not claim its test databases were cleaned.
+
+- Bound replication metrics to two process-wide series (issue #1437 prerequisite).
+  Remove tenant/environment labels: shipped rows accumulate across partitions and
+  lag is their maximum from the last successful pass, zero for an empty stream.
+  Exact partition details remain in reports and threshold alerts. Dashboards must
+  stop selecting the removed labels.
+- Pin the recipient challenge reissue DELETE privilege to its actual audited
+  caller in the migration contract. Reissue replaces the prior subject challenge;
+  cross-environment deletion is RLS-filtered and verified by an unchanged row image.
+- Preserve the already published `signing_key.break_glass` v1 event name through
+  an exact legacy-wire exception; newly registered event names still require past tense.
+
+- Restore the dynamic-client registration INSERT's missing policy-snapshot
+  placeholder after the response metadata expansion (issue #1437 prerequisite).
+  All existing inputs now align with their columns; registration no longer fails
+  with PostgreSQL 42601 before storing the client.
+
+- Restore the control role's column-scoped FAPI policy setter after migration
+  0237 (issue #1437 prerequisite). Forward migration 0244 grants only UPDATE on
+  `environments.fapi_hardened` to `ironauth_control`; application roles remain
+  unable to change environment policy and admission checks are unchanged.
+
+- Give `RemoteKeyProvisioner::ensure_remote_key` a named opaque
+  `RemoteKeyProvisionError` instead of `()` (issue #1437 compiler prerequisite).
+  Implementors must update that result type; every failure still prevents key
+  promotion through the same store error mapping.
+
+- Restore existing app/control dynamic-client metadata updates after migration
+  0238 by granting UPDATE on its new `userinfo_signed_response_alg` column only
+  (issue #1437 prerequisite). Other grants remain unchanged, including the
+  control-only quarantine column.
+
+- Add the gated recipient-verification store core (issue #1436): exact-subject,
+  canonical ownership checks, bounded one-time challenges, same-transaction
+  verification and audit, and fresh ownership reads independent of stored claims.
+  New users receive a non-unique canonical email index without changing login
+  lookup. Existing scopes require a controlled index backfill before enablement;
+  no existing mailbox is inferred to be verified.
+- Repair upstream migration 0237's guardrail view column ordering. The runner
+  admits only its exact known old checksum in addition to the corrected bytes;
+  migration 0241 validates and repairs that old view shape while retaining data,
+  ledger entries, grants, ownership and compatible dependents. Every other
+  checksum change remains refused. The migration byte guard admits the same
+  exact path/digest pair and has adversarial disposable-Git regression cases.
+  See the recipient-verification design note.
+
 - Add `Store::probe_readiness` (issue #149): the query `/readyz` asks, on the pool requests
   are served from rather than a fresh connection. Reports whether the schema is one this
   build can serve, treating a pending `Phase::Contract` migration as healthy because

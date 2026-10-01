@@ -1586,6 +1586,16 @@
           "minimum": 0,
           "type": "integer"
         },
+        "introspection_signed_ttl_secs": {
+          "default": null,
+          "description": "The RFC 9701 signed-introspection capability (issue #156): when set, a\nhardened environment's introspection answers with a signed JWT whose\nvalidity window is this many seconds. `None` (the default) keeps the plain\nJSON form everywhere.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "issue_refresh_tokens": {
           "default": true,
           "description": "Whether the authorization-code grant issues a refresh token (issue #21).\nDefault `true`: a successful code exchange returns a rotating refresh token\nalongside the access token. A refresh token issued WITHOUT the\n`offline_access` scope is session-bound (it is revoked when the end user's\nRP session is logged out); one issued WITH `offline_access` survives RP\nlogout and gets the separate offline lifecycle. Set it to `false` for an\nenvironment that mints access tokens only.",
@@ -3339,6 +3349,43 @@
       },
       "type": "object"
     },
+    "SigningBackend": {
+      "description": "Which backend signs tokens (issue #161).",
+      "oneOf": [
+        {
+          "const": "local",
+          "description": "The encrypted-at-rest key store (the default).",
+          "type": "string"
+        },
+        {
+          "const": "vault",
+          "description": "A Vault/OpenBao transit engine: keys never leave the Vault boundary.",
+          "type": "string"
+        }
+      ]
+    },
+    "SigningConfig": {
+      "additionalProperties": false,
+      "description": "The signing-backend selection (issue #161).",
+      "properties": {
+        "backend": {
+          "$ref": "#/$defs/SigningBackend",
+          "default": "local",
+          "description": "The backend: `local` (the default) or `vault`."
+        },
+        "vault": {
+          "$ref": "#/$defs/VaultTransitConfig",
+          "default": {
+            "addr": "",
+            "mount": "transit",
+            "timeout_secs": 5,
+            "token": null
+          },
+          "description": "The Vault/OpenBao transit settings; validated only when `backend = vault`."
+        }
+      },
+      "type": "object"
+    },
     "SigningRotationConfig": {
       "additionalProperties": false,
       "description": "Automated signing-key rotation (issue #160).\n\nOFF by default. The timer's pass is IDEMPOTENT (re-running at the same instant does\nnothing new), which is also the HA story: two nodes advancing the same environment\nat the same instant converge, so \"single execution\" needs no leader lease.",
@@ -3560,6 +3607,42 @@
           "default": true,
           "description": "Whether THIS process drains the `users.offboarding` queue and executes scheduled\noffboardings that have come due (issue #52).\n\nON by default, which is deliberately unlike every other worker here, and the reason\nis the difference between a feature and a PROMISE. Webhook delivery is an\nintegration a deployment may simply not use; a scheduled offboarding is something\nthe management API already accepts and answers 200 to, on every deployment. Shipping\nthe executor off by default would mean the default deployment keeps taking those\nrequests and silently never honouring them, which is the exact defect this exists to\nremove.\n\nTurning it off is still available, for a deployment that runs its workers on\ndedicated nodes. Nothing is lost when it is off: the wake-up is a durable queue row,\nso it is executed whenever a process that runs the worker next drains it.",
           "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "VaultTransitConfig": {
+      "additionalProperties": false,
+      "description": "The Vault/OpenBao transit configuration (issue #161).",
+      "properties": {
+        "addr": {
+          "default": "",
+          "description": "The Vault address, for example `https://vault.internal:8200`.",
+          "type": "string"
+        },
+        "mount": {
+          "default": "transit",
+          "description": "The transit engine mount path, for example `transit`.",
+          "type": "string"
+        },
+        "timeout_secs": {
+          "default": 5,
+          "description": "Seconds before a sign request is a retryable timeout.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "token": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Secret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The Vault token, through the file/env secrets indirection (never inline)."
         }
       },
       "type": "object"
@@ -3881,6 +3964,7 @@
         "frontchannel_logout_enabled": false,
         "global_token_revocation_hard_kill": false,
         "id_token_ttl_secs": 300,
+        "introspection_signed_ttl_secs": null,
         "issue_refresh_tokens": true,
         "jwks_cache_max_age_secs": 600,
         "lazy_migration": {
@@ -4188,6 +4272,19 @@
         "shutdown_grace_secs": 25
       },
       "description": "HTTP server settings."
+    },
+    "signing": {
+      "$ref": "#/$defs/SigningConfig",
+      "default": {
+        "backend": "local",
+        "vault": {
+          "addr": "",
+          "mount": "transit",
+          "timeout_secs": 5,
+          "token": null
+        }
+      },
+      "description": "The signing backend (issue #161): where the environment's signing keys sign.\n`local` (the default) uses the encrypted-at-rest key store; `vault` signs\nthrough a Vault/OpenBao transit engine, so the private keys never leave the\nVault boundary. Misconfiguration fails fast at boot."
     },
     "signing_rotation": {
       "$ref": "#/$defs/SigningRotationConfig",

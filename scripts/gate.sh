@@ -351,7 +351,9 @@ run_required "TypeScript hook test fixture built from source" ./scripts/build-ts
 # Note the scope precisely: the marker guards the LOWERED threshold, which is what that
 # variable added. A sweep at the six-hour default is behaviour that predates it and still
 # runs, so a cluster you share with a run older than six hours is not protected by this.
-run "test" scripts/with-test-db.sh cargo test --workspace --all-features
+# Keep running the other test binaries when one fails, just as this gate keeps
+# running its other lanes. Cargo still returns nonzero if any target fails.
+run "test" scripts/with-test-db.sh cargo test --workspace --all-features --no-fail-fast
 
 run "invariant lints" scripts/invariant-lints.sh
 
@@ -359,6 +361,7 @@ run "query audit (no scoped-table SQL outside the repository module)" scripts/qu
 run "scoped table registration (every forced-RLS table in the migrations is in the query audit list)" scripts/scoped-table-registration.sh
 run "audit foreign key claims (no comment asserts an audit_log foreign key that does not exist)" scripts/audit-fk-claim-scan.sh
 run "migration immutability (a landed migration's bytes never change)" scripts/migration-immutability.sh
+run "migration immutability regression cases" python3 scripts/test-migration-immutability.py
 run "test registration (every tests/*.rs file has a [[test]] entry; autotests are off)" scripts/test-registration.sh
 
 run "independently publishable crates" scripts/publishable-crates.sh
@@ -543,12 +546,13 @@ run "openapi changelog self-test" python3 scripts/openapi-changelog.py --self-te
 run "sdk contract freshness" python3 scripts/sdk-contract.py --check
 # The generated management SDKs must still match the published contract (issue #122).
 run "generated management SDKs freshness" python3 scripts/gen-management-sdks.py --check
-# And they must still COMPILE, which a freshness check cannot show.
-run "Go SDK builds" bash -c 'cd sdks/go && go build ./...'
+# Compilation and captured requests prove more than generated-file freshness.
+run "Go SDK request tests" bash -c 'cd sdks/go && go test ./...'
 # `-B`, so importing does not write a `.pyc` and dirty the tree. Without it this lane was
 # the gate's own first tripwire: it rewrote a tracked cache file on every clean-tree run,
 # so a green gate reported "this run CHANGED the working tree" every time.
 run "Python SDK imports" python3 -B -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('c','sdks/python/ironauth_management/client_gen.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)"
+run "Python SDK request tests" python3 -B -m unittest discover -s sdks/python/tests
 # The events-vs-webhooks guidance must still match the code it quotes (issue #107).
 run "events-vs-webhooks guidance" python3 scripts/events-vs-webhooks.py --check
 # Metering must stay off the login and token-issuance paths (issue #107).

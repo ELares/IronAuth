@@ -136,6 +136,13 @@ The export omits fields that are re-created at the destination rather than carri
   the login handle (unique per environment), so a re-import stays idempotent.
 - Timestamps, blind-index lookup columns, and the encryption key versions that seal
   PII at rest are re-derived and re-sealed against the destination instance.
+- The recipient lookup fields `users.recipient_email_bidx` and
+  `users.recipient_email_indexed` are DERIVED destination state. Import rebuilds
+  the canonical mailbox index under the destination key and records its local
+  readiness; it never carries the source blind index or marks a mailbox verified.
+  Stored `claims.email_verified` is portable claim data, not evidence for the
+  current recipient-proof API. Challenges and subject-bound verification records
+  remain instance-local ceremony state; verification must occur on the destination.
 - Soft-deleted (offboarded) users are excluded: a tombstone is not exported.
 - The account's enrolled MFA / login credential REGISTRY (passkey, TOTP, and
   recovery-code enrollments) IS exported today, in the `credentials` array above: the

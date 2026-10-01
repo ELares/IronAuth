@@ -6,6 +6,26 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Restore hardened authorization of actual pushed requests (issue #1437
+  prerequisite). The PAR requirement now uses the verified stored-request context,
+  since replayed parameters intentionally omit `request_uri`. Plain requests and
+  forged resume markers remain refused; PKCE and client admission are unchanged.
+
+- Use the existing environment clock for JARM and signed-introspection issuance
+  timestamps, with checked integer conversion (issue #1437 prerequisite).
+  The private JARM render context now receives `state.now()` from authorize;
+  public exports and response capability settings are unchanged. Remove only
+  the unexported, unused duplicate signed-introspection serializer.
+
+- Add a disabled recipient-verification/proof core (issue #1436). The cookie
+  ceremony requires the current subject, same origin and fresh authentication;
+  verification never creates or upgrades a session. The online proof binds the
+  current verified recipient to issuer, OAuth client, public subject and nonce.
+  Only direct interactive JWT credentials are accepted in this first cut.
+  Production routes return 503: real secret-safe delivery, hosted recovery UI
+  and controlled legacy indexing remain required before enablement. Existing
+  OTP, UserInfo and token-policy behavior is preserved.
+
 - Upgrade Argon2 to 0.6 with explicit raw salts from the environment entropy
   seam. Stored Argon2 PHC hashes, configured costs, salt length, and the absent-user
   verification work remain compatible; the hasher's automatic RNG is disabled.

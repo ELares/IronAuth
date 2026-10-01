@@ -110,6 +110,33 @@ async fn authenticate(
     Ok(account)
 }
 
+/// Fresh, direct, same-origin authentication for subject-bound mailbox verification.
+/// No subject or session authority comes from the submitted JSON body.
+pub(crate) async fn recipient_subject(
+    state: &OidcState,
+    tenant: &str,
+    environment: &str,
+    headers: &HeaderMap,
+) -> Result<(Scope, UserId), Response> {
+    if !headers.contains_key(axum::http::header::ORIGIN)
+        || !interaction::same_origin_ok(headers, state.self_origin().as_deref())
+    {
+        return Err(json_response(
+            StatusCode::FORBIDDEN,
+            json!({"error": "origin_required"}),
+        ));
+    }
+    let account = authenticate(state, tenant, environment, headers).await?;
+    let age = epoch_micros(state.now()).saturating_sub(account.auth_time_unix_micros);
+    if !(0..=300_000_000).contains(&age) {
+        return Err(json_response(
+            StatusCode::FORBIDDEN,
+            json!({"error": "reauthentication_required"}),
+        ));
+    }
+    Ok((account.scope, account.subject))
+}
+
 /// The refusal an impersonated caller gets on a constrained operation.
 ///
 /// Names the constraint rather than returning a bare 403: an operator who is impersonating

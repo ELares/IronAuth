@@ -168,11 +168,11 @@ impl ExternalSigner for LocalSigner {
 /// (the signature must verify against the key the kid names), and the size
 /// ceiling's refusal (a backend whose declared ceiling the input exceeds must
 /// refuse BEFORE dispatch).
+///
 /// # Errors
 ///
-/// Returns an error string naming the failed assertion: a signature that does
-/// not verify, a mismatched `kid`, or a backend that signed despite an input
-/// exceeding its declared ceiling.
+/// Returns a description if a valid input is refused, its signature does not
+/// verify, or the backend fails to refuse an oversized input with its exact limit.
 pub async fn run_conformance_battery(
     backend: &(dyn ExternalSigner + '_),
     kid: &str,
@@ -218,6 +218,8 @@ pub async fn run_conformance_battery(
 
 #[cfg(test)]
 mod tests {
+    use futures_util::FutureExt as _;
+
     use super::*;
 
     fn local_signer() -> LocalSigner {
@@ -227,8 +229,8 @@ mod tests {
     }
 
     /// THE BATTERY (issue #161): the local backend passes the shared conformance
-    /// battery — sign/verify round-trip against its public half, kid handling, and
-    /// the ceiling behavior — the same battery every remote backend must pass.
+    /// battery - sign/verify round-trip against its public half, kid handling, and
+    /// the ceiling behavior - the same battery every remote backend must pass.
     #[test]
     fn the_local_backend_passes_the_shared_conformance_battery() {
         let signer = local_signer();
@@ -239,19 +241,13 @@ mod tests {
         let verify = |signature: &[u8]| {
             crate::verify_detached(&trusted, JwsAlgorithm::EdDsa, input, signature).is_ok()
         };
-        let outcome = futures_util::block_on(run_conformance_battery(
-            &signer,
-            "kid_test",
-            JwsAlgorithm::EdDsa,
-            input,
-            verify,
-        ));
+        // LocalSigner performs no asynchronous I/O. Poll the complete battery;
+        // a pending future must fail this test, never be dropped as a success.
+        let outcome =
+            run_conformance_battery(&signer, "kid_test", JwsAlgorithm::EdDsa, input, verify)
+                .now_or_never()
+                .expect("the local conformance battery completes on its first poll");
         assert!(outcome.is_ok(), "the local backend passes: {outcome:?}");
-    }
-
-    fn base64_url(bytes: &[u8]) -> String {
-        use base64::Engine as _;
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 
     /// THE SIZE CEILING (issue #161): the guard warns over 3 KB and hard-fails
@@ -277,16 +273,5 @@ mod tests {
                 size: 5000
             }
         );
-    }
-
-    trait NowOrNever {
-        fn now_or_never_ok(self) -> Option<Result<Vec<u8>, ExternalSignerError>>;
-    }
-    impl NowOrNever
-        for Pin<Box<dyn Future<Output = Result<Vec<u8>, ExternalSignerError>> + Send + '_>>
-    {
-        fn now_or_never_ok(self) -> Option<Result<Vec<u8>, ExternalSignerError>> {
-            futures_util::FutureExt::now_or_never(self)
-        }
     }
 }

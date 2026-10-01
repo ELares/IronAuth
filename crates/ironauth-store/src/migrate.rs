@@ -2054,7 +2054,60 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0242_fips_profile.sql"),
         },
+        // EXPAND (issue #1436 prerequisite): retain the original view's prior column.
+        Migration {
+            version: 243,
+            name: "fapi_guardrails_view_repair",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0243_fapi_guardrails_view_repair.sql"),
+        },
+        // EXPAND (issue #1437 prerequisite): retain app/control metadata updates after 0238.
+        Migration {
+            version: 244,
+            name: "userinfo_metadata_update_grant",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0244_userinfo_metadata_update_grant.sql"),
+        },
+        // EXPAND (issue #1436): subject-bound recipient verification, disabled at the door.
+        Migration {
+            version: 245,
+            name: "recipient_verification",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0245_recipient_verification.sql"),
+        },
+        // EXPAND (issue #1437 prerequisite): the control-plane FAPI setter's column.
+        Migration {
+            version: 246,
+            name: "fapi_hardened_control_grant",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0246_fapi_hardened_control_grant.sql"),
+        },
     ]
+}
+
+// The one explicit historical repair (issue #1436 prerequisite). Upstream 0237
+// replaced column five, introduced by 0062, instead of appending its new column.
+// Fresh chains failed before a forward migration could run. Preserve old ledgers
+// verbatim, admit ONLY these exact old/corrected bytes, then 0243 validates and
+// repairs the old view shape without dropping it or changing grants/ownership.
+// Every other altered checksum, including another edit to 0237, is still refused.
+fn known_0237_view_repair(migration: &Migration, recorded: &str) -> bool {
+    migration.version == 237
+        && migration.name == "fapi_hardened"
+        && recorded == "02bd786d62041c24c5a6268b8c33bf53cdcdc6610701b42a509c514dbd6f2530"
+        && migration.checksum()
+            == "68cd229209d09ff7045ac02c3a16d60b9ec705b3c633617862f3b75d335dd81b"
+}
+
+// 0242 repeated the same column-position error after a corrected 0237.
+// Admit only the original published checksum with this exact append-only repair.
+// Historical ledger rows remain untouched; 0243 validates their final view.
+fn known_0242_view_repair(migration: &Migration, recorded: &str) -> bool {
+    migration.version == 242
+        && migration.name == "fips_profile"
+        && recorded == "59fa9390262ccdf8fa57542aa75f93d752a50be7e56bb816f558c371f5ef2121"
+        && migration.checksum()
+            == "f095fd161ff668c0a2e10cfb027507d13580b0b19f0e2553f4db1fd684067aff"
 }
 
 /// The fixed key for the migration advisory lock. A session-level Postgres
@@ -2186,7 +2239,10 @@ impl<'a> MigrationRunner<'a> {
             let Some(migration) = self.migrations.iter().find(|m| m.version == version) else {
                 return Err(MigrationError::UnknownApplied { version });
             };
-            if &migration.checksum() != recorded {
+            if &migration.checksum() != recorded
+                && !known_0237_view_repair(migration, recorded)
+                && !known_0242_view_repair(migration, recorded)
+            {
                 return Err(MigrationError::ChecksumMismatch { version });
             }
         }

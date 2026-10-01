@@ -804,8 +804,18 @@ mod tests {
         for mode in ResponseMode::ALL {
             assert_eq!(ResponseMode::parse(mode.as_str()), Some(*mode));
         }
-        // Unknown modes (including the JARM `jwt`, deferred to M16) do not resolve.
-        for unknown in ["", "jwt", "web_message", "Query"] {
+        // JARM parses independently of the environment-wide registry: its
+        // enablement still requires the client's signed-response registration.
+        for mode in [
+            ResponseMode::Jwt,
+            ResponseMode::FragmentJwt,
+            ResponseMode::FormPostJwt,
+        ] {
+            assert_eq!(ResponseMode::parse(mode.as_str()), Some(mode));
+            assert!(!ResponseMode::ALL.contains(&mode));
+            assert!(!ResponseMode::DEFAULT.contains(&mode));
+        }
+        for unknown in ["", "web_message", "Query", "JWT"] {
             assert!(ResponseMode::parse(unknown).is_none(), "{unknown:?}");
         }
     }

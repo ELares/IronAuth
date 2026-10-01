@@ -1343,8 +1343,7 @@ pub async fn mint_client_credentials_access_token(
                     &claims_bytes,
                     TokenTyp::AccessToken,
                 )
-                .await
-                .map_err(|_| ())?
+                .await?
             } else {
                 sign_jws_with_policy(
                     policy,
@@ -1465,8 +1464,7 @@ pub async fn mint(
             &id_claims_bytes,
             TokenTyp::IdToken,
         )
-        .await
-        .map_err(|_| ())?
+        .await?
     } else {
         sign_jws_with_policy(
             policy,
@@ -1475,21 +1473,6 @@ pub async fn mint(
             &EmissionOptions::new().with_token_typ(TokenTyp::IdToken),
         )
         .map_err(|_| ())?
-    };
-
-    // THE SIGN-THEN-ENCRYPT ARM (issue #158): a client registered for the
-    // encrypted ID-token response gets the JWS wrapped in an ECDH-ES JWE to its
-    // registered public key - the code-flow counterpart of the front-channel arm.
-    let id_token = match encrypt_id_token_for_client(
-        state,
-        request.scope,
-        &request.client_id,
-        &id_token,
-    )
-    .await
-    {
-        Some(encrypted) => encrypted,
-        None => id_token,
     };
 
     let (access, permission_budget) =
@@ -1676,8 +1659,7 @@ async fn mint_at_jwt(
             &payload,
             TokenTyp::AccessToken,
         )
-        .await
-        .map_err(|_| ())?
+        .await?
     } else {
         sign_jws_with_policy(policy, signer, &payload, &options).map_err(|_| ())?
     };
@@ -1736,13 +1718,6 @@ fn at_jwt_payload(
     })
 }
 
-/// Mint an OPAQUE access token for `target` (issue #29): the scope-declaring
-/// `ira_at_` reference token plus its digest and metadata for `opaque_access_tokens`.
-/// An opaque token carries no claims, so this is shared verbatim by the code
-/// exchange, the refresh grant, and the client-credentials grant (issue #23): every
-/// opaque access token IronAuth issues is byte-shaped identically regardless of the
-/// grant that minted it.
-/// issuance-gate-allow: a format arm below `mint_access`, which has already checked.
 /// Sign `payload` through the selected backend (issue #161): the JWS input is the
 /// exact bytes the backend signs (the same [`signing_input`] the local mint uses),
 /// the size guard runs BEFORE dispatch (a backend whose raw-input ceiling the input
@@ -1750,7 +1725,7 @@ fn at_jwt_payload(
 /// from the raw signature. The warning half of the guard increments
 /// `ironauth_signing_input_oversized_total`.
 async fn sign_through_backend(
-    state: &OidcState,
+    _state: &OidcState,
     backend: &Arc<dyn ironauth_jose::external_signer::ExternalSigner>,
     kid: &str,
     alg: JwsAlgorithm,
@@ -1814,10 +1789,8 @@ pub(crate) async fn encrypt_id_token_for_client(
     }
     let jwks_text = record.jwks.as_deref()?;
     let jwks: serde_json::Value = serde_json::from_str(jwks_text).ok()?;
-    let Some(keys) = jwks.get("keys").and_then(|v| v.as_array()) else {
-        return None;
-    };
-    for key in keys.iter() {
+    let keys = jwks.get("keys").and_then(|v| v.as_array())?;
+    for key in keys {
         let kty = key.get("kty").and_then(|v| v.as_str());
         let crv = key.get("crv").and_then(|v| v.as_str());
         let Some(x) = key.get("x").and_then(|v| v.as_str()) else {
@@ -1837,7 +1810,7 @@ pub(crate) async fn encrypt_id_token_for_client(
             let mut sec1 = vec![0x04];
             sec1.extend_from_slice(&x_bytes);
             sec1.extend_from_slice(&y_bytes);
-            use ironauth_env::Entropy as _;
+
             return ironauth_jose::jwe::encrypt_ecdh_es(
                 "ECDH-ES",
                 &sec1,
@@ -1850,6 +1823,14 @@ pub(crate) async fn encrypt_id_token_for_client(
     None
 }
 
+/// Mint an OPAQUE access token for `target` (issue #29): the scope-declaring
+/// `ira_at_` reference token plus its digest and metadata for `opaque_access_tokens`.
+/// An opaque token carries no claims, so this is shared verbatim by the code
+/// exchange, the refresh grant, and the client-credentials grant (issue #23): every
+/// opaque access token IronAuth issues is byte-shaped identically regardless of the
+/// grant that minted it.
+/// issuance-gate-allow: a format arm called only after `mint_access` or
+/// `mint_client_credentials_access_token` has enforced `issuance_refusal`.
 fn mint_opaque_access(
     state: &OidcState,
     scope: &Scope,

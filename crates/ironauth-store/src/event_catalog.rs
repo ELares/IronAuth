@@ -3980,6 +3980,11 @@ mod tests {
         "user.signed_in",
     ];
 
+    // Already published as v1 and emitted by break-glass key rotation. Renaming it
+    // would split historic and new consumers. This exact compatibility exception
+    // is not an irregular past form and does not admit other imperative events.
+    const LEGACY_V1_WIRE_NAMES: &[&str] = &["signing_key.break_glass"];
+
     /// Every registered type is a dotted, `snake_case` token in the PAST TENSE.
     ///
     /// The past tense is the vocabulary rule that keeps this list from drifting back into
@@ -3990,6 +3995,16 @@ mod tests {
     /// [`IRREGULAR_PAST_FORMS`], which is where the reasoning for each lives.
     #[test]
     fn every_registered_type_is_a_dotted_past_tense_token() {
+        for wire in LEGACY_V1_WIRE_NAMES {
+            let entry = registry()
+                .into_iter()
+                .find(|entry| entry.wire == *wire)
+                .expect("published legacy event");
+            assert_eq!(
+                entry.payload_version, 1,
+                "only the published v1 wire is grandfathered"
+            );
+        }
         for wire in event_types() {
             let (domain, rest) = wire
                 .split_once('.')
@@ -4004,7 +4019,9 @@ mod tests {
                 "`{wire}` is not a snake_case dotted token"
             );
             assert!(
-                rest.ends_with("ed") || IRREGULAR_PAST_FORMS.contains(&wire.as_str()),
+                rest.ends_with("ed")
+                    || IRREGULAR_PAST_FORMS.contains(&wire.as_str())
+                    || LEGACY_V1_WIRE_NAMES.contains(&wire.as_str()),
                 "`{wire}` is not past tense. An event records what BECAME TRUE; the \
                  imperative form is the AUDIT vocabulary, and conflating the two is the \
                  defect this rule exists to prevent. If this IS a past form that simply \

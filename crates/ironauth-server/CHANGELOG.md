@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Publish the bounded signing-input warning counter in the metric contract and
+  update replication metrics to their label-free aggregate semantics (issue #1437
+  prerequisite). Readiness chaos fixtures now wait for the requested status/body
+  under one deadline that also bounds a stalled request.
+
 - `/readyz` now SPEAKS THE DATABASE PROTOCOL rather than opening a socket (issue #149).
   `ReadinessProbe::with_database_probe` takes a `DatabaseProbe` and readiness asks it for a
   real query; without one the socket check remains and the body reports `probe=socket-only`

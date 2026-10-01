@@ -267,6 +267,7 @@ async fn push(
         &crate::authorize::ResolvedClient::Registered(&client),
         &authorize_params,
         false,
+        true,
     )
     .map_err(PushedAuthError::from_validation)?;
 

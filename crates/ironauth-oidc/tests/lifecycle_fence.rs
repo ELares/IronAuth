@@ -1367,16 +1367,15 @@ async fn a_missing_signing_key_still_answers_a_server_error() {
     // The environment here is NOT fenced: `environment_states` says nothing about it,
     // which reads as serving. Only its keys are gone.
     let harness = Harness::start_store_backed().await;
-    let code = outstanding_code(&harness).await;
-
-    // The authorization leg does not resolve an issuer entry, so the registry is still
-    // cold here and the exchange below performs a real load rather than serving a
-    // cached entry. That is measured, not assumed: with the keys present the same
-    // sequence mints (the other tests in this file), and with them gone it must not.
+    // Remove the key before either leg resolves the issuer. JARM preparation in
+    // /authorize now warms the registry even for a plain code response; deleting
+    // the row afterwards would exercise a still-fresh cached key, not a missing
+    // signing key. This fixture deliberately measures the cold-load fault.
     harness
         .db()
         .execute_owner_sql("DELETE FROM signing_keys")
         .await;
+    let code = outstanding_code(&harness).await;
 
     let (status, headers, body) = exchange_full(&harness, &code).await;
     assert_eq!(

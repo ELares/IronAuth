@@ -78,6 +78,7 @@ pub mod identity_fact;
 pub mod impersonation;
 pub mod interchange;
 pub mod kek_backup;
+pub mod recipient_verification;
 pub(crate) fn fapi_hardened_permits_auth_method(method: &str) -> bool {
     matches!(
         method,
@@ -219,28 +220,28 @@ pub use id::{
     OrganizationId, OrganizationKind, OutboxMessageId, OutboxMessageKind, PermissionId,
     PermissionKind, PortalLinkId, PortalLinkKind, PortalSessionId, PortalSessionKind,
     PowChallengeId, PowChallengeKind, ProjectGrantId, ProjectGrantKind, ProjectGrantRoleId,
-    ProjectGrantRoleKind, PushedRequestId, PushedRequestKind, RecoveryApprovalId,
-    RecoveryApprovalKind, RecoveryCodeId, RecoveryCodeKind, RecoveryContactConfirmationId,
-    RecoveryContactConfirmationKind, RecoveryFlowId, RecoveryFlowKind, RecoveryIdvSessionId,
-    RecoveryIdvSessionKind, RecoveryTrustedContactId, RecoveryTrustedContactKind, RefreshFamilyId,
-    RefreshFamilyKind, RefreshTokenId, RefreshTokenKind, ResourceServerId, ResourceServerKind,
-    RiskDecisionId, RiskDecisionKind, RiskDisavowalId, RiskDisavowalKind, RiskLoginGeoId,
-    RiskLoginGeoKind, RiskSignalId, RiskSignalKind, RoutingRuleId, RoutingRuleKind,
-    SamlCertificateId, SamlCertificateKind, SamlConnectionId, SamlConnectionKind, SamlSpKeyId,
-    SamlSpKeyKind, ScimConnectionId, ScimConnectionKind, ScimEnterpriseId, ScimEnterpriseKind,
-    ScimExternalIdId, ScimExternalIdKind, ScimPushConnectionId, ScimPushConnectionKind,
-    ScimPushLinkId, ScimPushLinkKind, ScopeStepUpPolicyId, ScopeStepUpPolicyKind, ScopedId,
-    ScopedKind, ServiceAccountId, ServiceAccountKind, ServiceId, ServiceKind, SessionEventId,
-    SessionEventKind, SessionId, SessionKind, SessionTokenKeyId, SessionTokenKeyKind, SigningKeyId,
-    SigningKeyKind, SignupFormId, SignupFormKind, SignupQuarantineId, SignupQuarantineKind,
-    SmsOtpCodeId, SmsOtpCodeKind, SmsRouteStatId, SmsRouteStatKind, SsfStreamId, SsfStreamKind,
-    StoredClientId, TenantId, TenantKind, TotpCredentialId, TotpCredentialKind,
-    TraitMigrationJobId, TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind, TrustedDeviceId,
-    TrustedDeviceKind, UpstreamTokenGrantId, UpstreamTokenGrantKind, UpstreamTokenId,
-    UpstreamTokenKind, UserId, UserIdentifierId, UserIdentifierKind, UserKind, VariableId,
-    VariableKind, WebauthnChallengeId, WebauthnChallengeKind, WebauthnCredentialId,
-    WebauthnCredentialKind, WebhookDeliveryAttemptId, WebhookDeliveryAttemptKind,
-    WebhookEndpointId,
+    ProjectGrantRoleKind, PushedRequestId, PushedRequestKind, RecipientChallengeId,
+    RecipientChallengeKind, RecoveryApprovalId, RecoveryApprovalKind, RecoveryCodeId,
+    RecoveryCodeKind, RecoveryContactConfirmationId, RecoveryContactConfirmationKind,
+    RecoveryFlowId, RecoveryFlowKind, RecoveryIdvSessionId, RecoveryIdvSessionKind,
+    RecoveryTrustedContactId, RecoveryTrustedContactKind, RefreshFamilyId, RefreshFamilyKind,
+    RefreshTokenId, RefreshTokenKind, ResourceServerId, ResourceServerKind, RiskDecisionId,
+    RiskDecisionKind, RiskDisavowalId, RiskDisavowalKind, RiskLoginGeoId, RiskLoginGeoKind,
+    RiskSignalId, RiskSignalKind, RoutingRuleId, RoutingRuleKind, SamlCertificateId,
+    SamlCertificateKind, SamlConnectionId, SamlConnectionKind, SamlSpKeyId, SamlSpKeyKind,
+    ScimConnectionId, ScimConnectionKind, ScimEnterpriseId, ScimEnterpriseKind, ScimExternalIdId,
+    ScimExternalIdKind, ScimPushConnectionId, ScimPushConnectionKind, ScimPushLinkId,
+    ScimPushLinkKind, ScopeStepUpPolicyId, ScopeStepUpPolicyKind, ScopedId, ScopedKind,
+    ServiceAccountId, ServiceAccountKind, ServiceId, ServiceKind, SessionEventId, SessionEventKind,
+    SessionId, SessionKind, SessionTokenKeyId, SessionTokenKeyKind, SigningKeyId, SigningKeyKind,
+    SignupFormId, SignupFormKind, SignupQuarantineId, SignupQuarantineKind, SmsOtpCodeId,
+    SmsOtpCodeKind, SmsRouteStatId, SmsRouteStatKind, SsfStreamId, SsfStreamKind, StoredClientId,
+    TenantId, TenantKind, TotpCredentialId, TotpCredentialKind, TraitMigrationJobId,
+    TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind, TrustedDeviceId, TrustedDeviceKind,
+    UpstreamTokenGrantId, UpstreamTokenGrantKind, UpstreamTokenId, UpstreamTokenKind, UserId,
+    UserIdentifierId, UserIdentifierKind, UserKind, VariableId, VariableKind, WebauthnChallengeId,
+    WebauthnChallengeKind, WebauthnCredentialId, WebauthnCredentialKind, WebhookDeliveryAttemptId,
+    WebhookDeliveryAttemptKind, WebhookEndpointId,
 };
 pub use identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -268,6 +269,9 @@ pub use promotion::{
     ChangeKind, ConfigDiff, PROMOTED_RESOURCE_TYPES, Plan, PlanError, PromotedResourceType,
     PromotionApplyError, PromotionOutcome, ResourceChange, collect_references,
     diff as diff_snapshots, evaluate_plan, plan_promotion, revision as promotion_revision,
+};
+pub use recipient_verification::{
+    NewRecipientChallenge, RecipientAttempt, RecipientChallenge, VerifiedRecipient,
 };
 pub use recovery::{
     NewRecoveryFlow, RecoveryCancelReason, RecoveryEntryPoint, RecoveryFlowRecord, RecoveryMethod,
@@ -403,6 +407,7 @@ pub use repository::{
     membership_delta_payload, mint_invitation_token, mint_invitation_token_for,
     opaque_access_token_digest, refresh_token_digest, scim_token_digest, user_code_hash,
 };
+pub use repository::{ActingRecipientVerificationRepo, RecipientVerificationRepo};
 pub use repository::{
     ActingWebhookEndpointRepo, AsyncFlowDeliveries, DeliveryAttemptRecord, DeliveryTargetLookup,
     DomainEvent, Enqueued, LOG_STREAM_REPLAY_CONSUMER, MESSAGE_DELIVERY_CONSUMER, MessageRecord,

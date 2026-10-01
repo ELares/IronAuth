@@ -54,7 +54,7 @@ use axum::extract::{Form, State};
 use axum::http::HeaderMap;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use ironauth_jose::{Confirmation, SigningKey, VerifiedToken};
+use ironauth_jose::{Confirmation, VerifiedToken};
 use ironauth_store::{IssuedTokenId, RefreshTokenId, Scope};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -231,10 +231,10 @@ async fn signed_introspection_response(
     claims: &IntrospectionClaims,
     ttl_secs: i64,
 ) -> SerializedIntrospection {
-    let now = std::time::SystemTime::now()
+    let now = state
+        .now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(0))
-        .unwrap_or(0);
+        .map_or(0, |duration| i64::try_from(duration.as_secs()).unwrap_or(0));
     let mut payload = introspect_claims_object(claims)
         .as_object()
         .cloned()
@@ -261,9 +261,7 @@ async fn signed_introspection_response(
     let body = ironauth_jose::sign_jws(
         signer,
         &serde_json::to_vec(&Value::Object(payload)).unwrap_or_default(),
-        &ironauth_jose::EmissionOptions::new().with_typ(
-            "token-introspection+jwt", // invariant-allow: typ-via-declaration -- RFC 9701 dictates the media type; no IronAuth TokenTyp exists for it
-        ),
+        &ironauth_jose::EmissionOptions::new().with_typ("token-introspection+jwt"), // invariant-allow: typ-via-declaration -- RFC 9701 prescribes this signed-response media type; this response is not an access credential
     )
     .unwrap_or_else(|_| state.introspection_serializer().serialize(claims).body);
     SerializedIntrospection {
@@ -314,78 +312,6 @@ fn introspect_claims_object(claims: &IntrospectionClaims) -> Value {
         );
     }
     Value::Object(object)
-}
-
-/// THE RFC 9701 SIGNED-JWT SERIALIZER (issue #156): the introspection response is a
-/// signed JWT (`application/token-introspection+jwt`) carrying the RFC 7662 claims
-/// plus the RFC 9701 envelope (`iss`, `aud`, `iat`, `exp`, `jti`), so a resource
-/// server can verify the answer itself - the non-repudiation FAPI ecosystems demand.
-/// The response is signed with the environment's own signing key, so it verifies
-/// against the SAME JWKS the tokens verify against.
-pub struct SignedJwtIntrospectionSerializer {
-    signer: SigningKey,
-    issuer: String,
-    ttl_secs: i64,
-    now_unix_secs: fn() -> i64,
-}
-
-impl SignedJwtIntrospectionSerializer {
-    /// Build the signed serializer over `signer` (the environment's signing key) and
-    /// `issuer`, with a `ttl_secs` validity window for the response JWT.
-    #[must_use]
-    pub fn new(signer: SigningKey, issuer: impl Into<String>, ttl_secs: i64) -> Self {
-        Self {
-            signer,
-            issuer: issuer.into(),
-            ttl_secs,
-            now_unix_secs: || {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| i64::try_from(d.as_secs()).unwrap_or(0))
-                    .unwrap_or(0)
-            },
-        }
-    }
-}
-
-impl IntrospectionSerializer for SignedJwtIntrospectionSerializer {
-    fn serialize(&self, claims: &IntrospectionClaims) -> SerializedIntrospection {
-        let mut payload = introspect_claims_object(claims)
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
-        let now = (self.now_unix_secs)();
-        // RFC 9701 section 2.2: the envelope. The `aud` is the introspecting client
-        // (the response is for it); `iat`/`exp` bound the response's own lifetime.
-        payload.insert("iss".to_owned(), Value::String(self.issuer.clone()));
-        let aud = claims
-            .aud
-            .first()
-            .cloned()
-            .unwrap_or_else(|| self.issuer.clone());
-        payload.insert("aud".to_owned(), Value::String(aud));
-        payload.insert("iat".to_owned(), Value::Number(now.into()));
-        payload.insert(
-            "exp".to_owned(),
-            Value::Number((now + self.ttl_secs).into()),
-        );
-        payload.insert("jti".to_owned(), Value::String(format!("iti_{now:x}")));
-        // The `typ` header is the RFC 9701 media type: not an IronAuth token profile,
-        // so it rides the foreign-media-type path (`with_typ` with the reason, the
-        // attestation media types' pattern). The JWS signs with the environment's key.
-        let token = ironauth_jose::sign_jws(
-            &self.signer,
-            &serde_json::to_vec(&Value::Object(payload)).unwrap_or_default(),
-            &ironauth_jose::EmissionOptions::new().with_typ(
-                "token-introspection+jwt", // invariant-allow: typ-via-declaration -- RFC 9701 dictates the media type; no IronAuth TokenTyp exists for it
-            ),
-        )
-        .unwrap_or_else(|_| "".to_owned());
-        SerializedIntrospection {
-            content_type: "application/token-introspection+jwt",
-            body: token,
-        }
-    }
 }
 
 /// Insert a string field only when present (RFC 7662: omit an absent claim, never

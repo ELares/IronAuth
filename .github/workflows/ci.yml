@@ -370,6 +370,9 @@ jobs:
     name: outbox (ironbus mode)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     services:
       postgres:
         image: postgres:16
@@ -396,8 +399,16 @@ jobs:
       # the day this job's test list grows is not the day to rediscover that.
       IRONAUTH_TEST_DB_DISPOSABLE: "1"
       IRONBUS_ADDR: 127.0.0.1:17654
+      IRONAUTH_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: bind the actual job deadline and check the observer
+        timeout-minutes: 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/test-outbox-chaos-watchdog.py
+          python3 scripts/outbox-chaos-watchdog.py clock --clock "$RUNNER_TEMP/outbox-job-clock.json"
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "stable"
@@ -461,7 +472,7 @@ jobs:
           [ "$PG_ONLY_EXIT" -eq 0 ] && [ "$IRONBUS_EXIT" -eq 0 ] || exit 1
       - name: record the replication lag artifacts (#155)
         if: always()
-        uses: actions/upload-artifact@ff4a2771b20de53f2e9e83d73487a1e9ec0cb13b # v5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: replication-lag-under-netem
           path: |
@@ -476,7 +487,7 @@ jobs:
           IRONBUS_BACKBONE_LATENCY_JSON: ${{ github.workspace }}/outbox-backbone-latency.json
       - name: record the backbone latency artifact (#147 c3)
         if: always()
-        uses: actions/upload-artifact@ff4a2771b20de53f2e9e83d73487a1e9ec0cb13b # v5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: outbox-backbone-latency
           path: ${{ github.workspace }}/outbox-backbone-latency.json
@@ -487,7 +498,23 @@ jobs:
       # no loss, then recovers when the broker returns. It needs the broker BINARIES this
       # job installs; everywhere else it skips loudly.
       - name: "Chaos: IronBus down, the outbox drains on the poll (issue #149)"
-        run: cargo test -p ironauth-store --features testing,ironbus --test outbox_chaos -- --test-threads=1
+        id: outbox_chaos
+        timeout-minutes: 11
+        # One original cargo invocation, capped at ten minutes and ending at least
+        # two minutes before the actual job deadline for cleanup and evidence.
+        run: >-
+          python3 scripts/outbox-chaos-watchdog.py run
+          --clock "$RUNNER_TEMP/outbox-job-clock.json"
+          --output "$RUNNER_TEMP/outbox-chaos-diagnostics"
+      - name: preserve failed outbox stage and owned cleanup evidence
+        if: failure() && steps.outbox_chaos.outcome == 'failure'
+        timeout-minutes: 1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: outbox-chaos-diagnostics
+          path: ${{ runner.temp }}/outbox-chaos-diagnostics
+          if-no-files-found: error
+          retention-days: 14
       # Issue #149 criterion 1: the BACKBONE-ABSENT readiness tier, induced for real. The
       # test starts a REAL broker, boots a server declaring it in [outbox] ironbus_addr,
       # KILLS the broker, and asserts the documented 200 degraded: backbone_absent
@@ -533,28 +560,37 @@ jobs:
     name: hot state (ironcache mode)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # ISSUE #146 CRITERION 6: "the full test suite passes in both modes (Postgres-only and
-    # IronCache-attached)". The Postgres-only half is every other job in this file, which runs
-    # with no accelerator and no IRONCACHE_ADDR.
-    #
-    # THIS JOB IS NOT YET THE WHOLE OTHER HALF, and saying it is would be the easier sentence.
-    # It runs ONE CRATE with an accelerator attached, because `ironauth-hot` is the only crate
-    # that has an IronCache code path: nothing else in the workspace takes a `HotState`, so
-    # running the workspace here would execute the same Postgres-only code a second time and
-    # prove nothing. The lane grows to match the criterion when the registry's uses acquire
-    # call sites.
-    #
-    # WHAT IT CAN AND CANNOT SHOW. `crates/ironauth-hot/tests/ironcache.rs` SKIPS every case
-    # when IRONCACHE_ADDR is unset, printing why, so those tests are inert in every other lane
-    # and binding only here. That is the whole reason this job exists: without it the IronCache
-    # implementation would be code that compiles and that nothing ever runs.
+    # The full OIDC testing suite also needs isolated real databases. The cache
+    # accelerates hot state; it does not replace PostgreSQL or its isolation tests.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --shm-size=1g
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    # The foundation job retains the real cache seam, chaos and rate assertions.
+    # Four checked jobs below execute the full eligible OIDC target roster; their
+    # aggregate must also pass before dual-mode coverage is considered complete.
     env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # This job owns the disposable service container and all its test databases.
+      IRONAUTH_TEST_DB_DISPOSABLE: "1"
       IRONCACHE_ADDR: 127.0.0.1:17379
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "stable"
+      - name: Install the WASM target for the pinned toolchain
+        # The OIDC test targets below build the mandatory hook guest fixtures.
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Built from git rather than crates.io: IronCache publishes NO crate at all, client or
       # server. Pinned to an exact COMMIT and not a branch, for the reason the IronBus lane
@@ -623,13 +659,89 @@ jobs:
         run: |
           cargo test -p ironauth-oidc --features testing,ironcache --test rate_l2 -- --test-threads=1
           cargo check -p ironauth --features ironcache
-      # #146 CRITERION 6, MADE REAL FOR THE WHOLE REQUEST PATH: the FULL oidc suite runs
-      # with the cache attached. The seam suites and rate_l2 cover the seam; this is the
-      # "the full test suite passes in both modes" evidence - a divergence in dual mode
-      # shows up as a failing job here rather than in a deployment. The binaries are
-      # already built by the steps above; the cost is the run.
-      - name: the full oidc suite in dual mode (issue #146)
-        run: cargo test -p ironauth-oidc --features testing,ironcache
+      # Preserve every example/default test build from the original full command.
+      # The four checked jobs execute its entire eligible corpus with the cache.
+      - name: compile the complete dual-mode target and example roster
+        run: cargo test -p ironauth-oidc --features testing,ironcache --no-run
+
+  ironcache-oidc:
+    name: OIDC dual mode (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    # The full OIDC testing suite also needs isolated real databases. The cache
+    # accelerates hot state; it does not replace PostgreSQL or its isolation tests.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --shm-size=1g
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # This job owns the disposable service container and all its test databases.
+      IRONAUTH_TEST_DB_DISPOSABLE: "1"
+      IRONCACHE_ADDR: 127.0.0.1:17379
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "stable"
+      - name: Install the WASM target for the pinned toolchain
+        # The OIDC test targets below build the mandatory hook guest fixtures.
+        run: rustup target add wasm32-wasip2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Built from git rather than crates.io: IronCache publishes NO crate at all, client or
+      # server. Pinned to an exact COMMIT and not a branch, for the reason the IronBus lane
+      # below gives: a branch lets another repository silently change what this lane tests.
+      # This SHA is the revision the implementation was actually developed and verified
+      # against, locally, before this job existed.
+      - name: install the IronCache server
+        run: >-
+          cargo install --locked --git https://github.com/ELares/IronCache
+          --rev 4d97ddd927890b0590a5aeed2f9f80c388826378 ironcache
+      - name: start the cache
+        run: |
+          ironcache server --port 17379 --metrics-addr off &
+          # Wait for the listener rather than sleeping a guess: a fixed sleep is either flaky
+          # on a slow runner or wasted time on a fast one.
+          for _ in $(seq 1 60); do
+            if nc -z 127.0.0.1 17379; then echo "cache up"; exit 0; fi
+            sleep 1
+          done
+          echo "cache did not come up" >&2
+          exit 1
+      - name: verify and execute the exact OIDC partition
+        env:
+          OIDC_DUAL_SHARD: ${{ matrix.shard }}
+        run: |
+          python3 scripts/test-oidc-dual-tests.py
+          python3 scripts/oidc-dual-tests.py --shard "$OIDC_DUAL_SHARD"
+
+  ironcache-complete:
+    name: complete IronCache dual-mode coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [ironcache-matrix, ironcache-oidc]
+    if: always()
+    steps:
+      - name: require the foundation and all four partitions
+        env:
+          FOUNDATION_RESULT: ${{ needs.ironcache-matrix.result }}
+          OIDC_RESULT: ${{ needs.ironcache-oidc.result }}
+        run: |
+          test "$FOUNDATION_RESULT" = success
+          test "$OIDC_RESULT" = success
 
   msrv:
     name: msrv (1.85)
@@ -773,8 +885,16 @@ jobs:
           python-version: "3.12"
       - name: provision the gate's python deps (hash pinned)
         run: python3 -m pip install --require-hashes -r deploy/conformance/requirements.txt
+      - name: Check the bounded diagnostic observer
+        run: timeout --signal=TERM --kill-after=5s 55s python3 -B scripts/test-hook-bench-diagnostics.py
+      - name: Capture runner metadata before measurement
+        run: timeout --signal=TERM --kill-after=5s 55s python3 -B scripts/hook-bench-diagnostics.py snapshot before
       - name: Measure and gate
+        id: authoritative_measurement
         run: ./scripts/hook-bench-gate.sh
+      - name: Capture runner metadata after measurement
+        if: (success() || failure()) && steps.authoritative_measurement.outcome != 'skipped'
+        run: timeout --signal=TERM --kill-after=5s 55s python3 -B scripts/hook-bench-diagnostics.py snapshot after
       # Criterion 4: "numbers are published per release". The release workflow attaches the
       # committed baseline; this keeps the run's OWN measurement, which is what a bisect needs
       # and what the baseline is not (the baseline changes only when somebody commits one).
@@ -798,6 +918,21 @@ jobs:
         with:
           name: hook-latency-measurement
           path: target/hook-bench-measurement.json
+          if-no-files-found: error
+      # This can explain a failure; it cannot replace the gate or qualify performance.
+      # No retries, privilege changes, runner tuning or baseline changes are permitted.
+      - name: Collect one diagnostic profile after a failed measurement
+        if: failure() && steps.authoritative_measurement.outcome == 'failure'
+        env:
+          HOOK_BENCH_AUTHORITATIVE_OUTCOME: ${{ steps.authoritative_measurement.outcome }}
+        run: timeout --signal=TERM --kill-after=5s 175s python3 -B scripts/hook-bench-diagnostics.py profile
+      - name: Publish bounded runner diagnostics
+        if: success() || failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hook-latency-diagnostics
+          path: target/hook-bench-diagnostics
+          retention-days: 7
           if-no-files-found: error
 
   ts-hook-freshness:
@@ -1390,25 +1525,18 @@ jobs:
       # That is what makes it worth more than the readiness probe beside it, which opens a TCP
       # connection and speaks no protocol.
       - name: Discovery answers for the bootstrapped scope
-        run: |
-          echo "tenant=$TENANT environment=$ENVIRONMENT"
-          test -n "$TENANT" && test "$TENANT" != "null"
-          test -n "$ENVIRONMENT" && test "$ENVIRONMENT" != "null"
-          # `kubectl run --rm` appends `pod "discovery" deleted` to the captured output, on the
-          # same line as the response, so parsing it directly fails with "Invalid numeric
-          # literal" at whatever column the document happens to end. The JSON is one object,
-          # so take from the first brace to the last.
-          raw=$(kubectl run discovery --rm -i --restart=Never --image=curlimages/curl:8.10.1 -- \
-            -fsS --max-time 10 \
-            "http://ironauth:8443/t/$TENANT/e/$ENVIRONMENT/.well-known/openid-configuration")
-          doc=$(printf '%s' "$raw" | grep -o '{.*}')
-          echo "$doc" | jq .issuer
-          # The issuer it names must be the scope that was asked for, not merely a 200: a
-          # discovery document for the wrong environment is the shape that would let a client
-          # trust keys from somewhere else.
-          echo "$doc" | jq -e --arg t "$TENANT" --arg e "$ENVIRONMENT" \
-            '.issuer | contains("/t/" + $t + "/e/" + $e)'
-          echo "$doc" | jq -e '.jwks_uri and .authorization_endpoint and .token_endpoint'
+        id: discovery_probe
+        env:
+          EXPECTED_PUBLIC_URL: http://ironauth.default.svc.cluster.local:8443
+        run: timeout --signal=TERM --kill-after=20s 210s scripts/helm-discovery-probe.sh
+      - name: Preserve the discovery response and probe state
+        if: ${{ always() && steps.discovery_probe.outcome != '' && steps.discovery_probe.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: helm-discovery-response
+          path: target/helm-discovery/
+          if-no-files-found: error
+          retention-days: 7
       - name: Diagnostics on failure
         if: failure()
         run: |
@@ -1631,6 +1759,8 @@ jobs:
       # ref cannot be resolved, since "could not run" is not "nothing changed".
       - name: migration immutability (a landed migration's bytes never change)
         run: scripts/migration-immutability.sh "origin/${{ github.base_ref || 'main' }}"
+      - name: migration immutability regression cases
+        run: python3 scripts/test-migration-immutability.py
       # An EXPAND or MIGRATE migration runs while the PREVIOUS binary is still serving, so it may
       # add and may not take away. This rejects the statement kinds that break that binary: a
       # dropped column or table, a column made mandatory or made nullable, a retyped column in
@@ -1875,10 +2005,12 @@ jobs:
         run: python3 scripts/sdk-contract.py --check
       - name: Generated management SDKs are fresh (issue #122)
         run: python3 scripts/gen-management-sdks.py --check
-      - name: Generated Go SDK builds (issue #122 criterion 4)
-        run: cd sdks/go && go build ./...
+      - name: Generated Go SDK request tests (issue #122 criterion 4)
+        run: cd sdks/go && go test ./...
       - name: Generated Python SDK imports (issue #122 criterion 4)
         run: python3 -c "import importlib.util; s=importlib.util.spec_from_file_location('c','sdks/python/ironauth_management/client_gen.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)"
+      - name: Generated Python SDK request tests
+        run: python3 -B -m unittest discover -s sdks/python/tests
       - name: Events-vs-webhooks guidance freshness (issue #107)
         run: python3 scripts/events-vs-webhooks.py --check
       - name: Metering stays off the hot path (issue #107)

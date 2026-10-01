@@ -25,11 +25,22 @@ type Client struct {
 	BaseURL string
 	Token   string
 	HTTP    *http.Client
+
+	idempotencyKey string
 }
 
 // New returns a client for baseURL authenticating with a management token.
 func New(baseURL, token string) *Client {
 	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: http.DefaultClient}
+}
+
+// WithIdempotencyKey returns a copy that sends key with each request.
+// Reuse this copy and the same request for retries of one logical operation.
+// The original client is unchanged; an empty key omits the header.
+func (c *Client) WithIdempotencyKey(key string) *Client {
+	cloned := *c
+	cloned.idempotencyKey = key
+	return &cloned
 }
 
 // do issues one request. Exported methods below differ only in method, path, and
@@ -54,6 +65,9 @@ func (c *Client) do(method, path string, query url.Values, body any) (*http.Resp
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
+	if c.idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", c.idempotencyKey)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -90,6 +104,13 @@ func (c *Client) AddOrgGroupMember(tenant_id string, environment_id string, orga
 // Add a login identifier to a user.
 func (c *Client) AddUserIdentifier(tenant_id string, environment_id string, user_id string, query url.Values, body any) (*http.Response, error) {
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/users/" + escape(user_id) + "/identifiers", query, body)
+}
+
+// AdvanceSigningKeyRotation performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation/advance.
+//
+// Run the machine's tick now: the manual trigger.
+func (c *Client) AdvanceSigningKeyRotation(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/signing/rotation/advance", query, nil)
 }
 
 // AllowSmsCountry performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/allowlist/{country_code}.
@@ -169,6 +190,13 @@ func (c *Client) AuthzenEvaluations(tenant_id string, environment_id string, que
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/access/v1/evaluations", query, body)
 }
 
+// BreakGlassSigningKeyRotation performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation/break-glass.
+//
+// The rotate-now-and-revoke path: a fresh successor immediately, the compromised key withdrawn NOW. The confirmation flag is mandatory.
+func (c *Client) BreakGlassSigningKeyRotation(tenant_id string, environment_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/signing/rotation/break-glass", query, body)
+}
+
 // BulkRevokeSessions performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/revoke.
 //
 // Revoke a BATCH of sessions in one audited transaction. A foreign-scope id in the batch is a uniform no-op (never a cross-tenant revocation).
@@ -181,6 +209,13 @@ func (c *Client) BulkRevokeSessions(tenant_id string, environment_id string, que
 // CLEAR the organization's DEFAULT role designation.
 func (c *Client) ClearOrgDefaultRole(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/default-role", query, nil)
+}
+
+// ClearQuotaLimit performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits/{dimension}.
+//
+// Clear one dimension's override, returning the scope to its configured tier.
+func (c *Client) ClearQuotaLimit(tenant_id string, environment_id string, dimension string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/quota/limits/" + escape(dimension), query, nil)
 }
 
 // CreateBan performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans.
@@ -1366,6 +1401,13 @@ func (c *Client) ListQueueDepths(tenant_id string, environment_id string, query 
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/queues", query, nil)
 }
 
+// ListQuotaLimits performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits.
+//
+// List every stored quota override for this scope.
+func (c *Client) ListQuotaLimits(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/quota/limits", query, nil)
+}
+
 // ListRecoveryApprovals performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals.
 //
 // List the OPEN admin-approved recovery approvals under an environment (cursor paginated).
@@ -1448,6 +1490,13 @@ func (c *Client) ListSessionTokenTemplates(tenant_id string, environment_id stri
 // List the sessions in an environment (cursor paginated), searchable by user and by client.
 func (c *Client) ListSessions(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/sessions", query, nil)
+}
+
+// ListSigningKeyRotation performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/signing/rotation.
+//
+// List every key's rotation state and the next scheduled rotation.
+func (c *Client) ListSigningKeyRotation(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/signing/rotation", query, nil)
 }
 
 // ListSignupQuarantines performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/signup-quarantine.
@@ -1996,6 +2045,13 @@ func (c *Client) SetOutboundVerification(tenant_id string, environment_id string
 	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/migration/outbound-verification", query, body)
 }
 
+// SetQuotaLimit performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits/{dimension}.
+//
+// Set one dimension's override for this scope, replacing any existing one.
+func (c *Client) SetQuotaLimit(tenant_id string, environment_id string, dimension string, query url.Values, body any) (*http.Response, error) {
+	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/quota/limits/" + escape(dimension), query, body)
+}
+
 // SetScimPushConnectionActive performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/active.
 //
 // `PUT .../scim-push-connections/{connection_id}/active`.
@@ -2092,6 +2148,13 @@ func (c *Client) SuspendTenant(tenant_id string, query url.Values) (*http.Respon
 // Run a client's token hook against a recorded event, without deploying anything.
 func (c *Client) TestTokenHook(tenant_id string, environment_id string, client_id string, query url.Values, body any) (*http.Response, error) {
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook/test", query, body)
+}
+
+// TriggerBackup performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/backups.
+//
+// Trigger an on-demand encrypted backup.
+func (c *Client) TriggerBackup(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/backups", query, nil)
 }
 
 // UnassignOrgGroupRole performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles/{role_id}.
