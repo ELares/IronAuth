@@ -1176,7 +1176,7 @@ async fn hosted_form_csp_uses_only_exact_registered_callbacks() {
     let subject = harness.seed_unique_user().await;
     let cookie = harness.session_cookie(&subject).await;
     for route in ["/login", "/register", "/consent", "/login/mfa"] {
-        let (status, headers, _) = harness
+        let (status, headers, body) = harness
             .get_with_cookie(
                 &format!("{route}?return_to={}", enc(&resume)),
                 Some(&cookie),
@@ -1184,6 +1184,18 @@ async fn hosted_form_csp_uses_only_exact_registered_callbacks() {
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_hardened(&headers);
+        if route == "/login" {
+            let policy = csp(&headers);
+            let nonce = policy
+                .split("'nonce-")
+                .nth(1)
+                .unwrap()
+                .split('\'')
+                .next()
+                .unwrap();
+            assert!(body.contains(&format!("nonce=\"{nonce}\"")));
+        }
+
         assert!(csp(&headers).contains("form-action 'self' https://client.test;"));
         for invalid in [
             resume.replace(&enc(REDIRECT_URI), &enc("https://client.test/unregistered")),
