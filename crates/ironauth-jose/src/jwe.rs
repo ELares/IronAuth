@@ -276,7 +276,8 @@ mod tests {
     fn ecdh_es_p256_round_trips() {
         let env = fixed_entropy();
         let (private, public) = p256_keypair(env.entropy());
-        let compact = encrypt_ecdh_es("ECDH-ES", &public, b"the id token", env.entropy()).expect("encrypt");
+        let compact =
+            encrypt_ecdh_es("ECDH-ES", &public, b"the id token", env.entropy()).expect("encrypt");
         let plain = decrypt_ecdh_es("ECDH-ES", &compact, &private).expect("decrypt");
         assert_eq!(plain, b"the id token");
     }
@@ -286,7 +287,8 @@ mod tests {
         let env = fixed_entropy();
         let (public, _) = p256_keypair(env.entropy());
         let (other_private, _) = p256_keypair(env.entropy());
-        let compact = encrypt_ecdh_es("ECDH-ES", &public, b"secret", env.entropy()).expect("encrypt");
+        let compact =
+            encrypt_ecdh_es("ECDH-ES", &public, b"secret", env.entropy()).expect("encrypt");
         assert!(decrypt_ecdh_es("ECDH-ES", &compact, &other_private).is_err());
     }
 
@@ -294,7 +296,8 @@ mod tests {
     fn tampering_fails_the_tag() {
         let env = fixed_entropy();
         let (private, public) = p256_keypair(env.entropy());
-        let compact = encrypt_ecdh_es("ECDH-ES", &public, b"secret", env.entropy()).expect("encrypt");
+        let compact =
+            encrypt_ecdh_es("ECDH-ES", &public, b"secret", env.entropy()).expect("encrypt");
         let tampered = format!("{}x", compact);
         assert!(decrypt_ecdh_es("ECDH-ES", &tampered, &private).is_err());
     }
