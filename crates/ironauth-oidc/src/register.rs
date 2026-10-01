@@ -60,6 +60,15 @@ pub async fn register_get(
     State(state): State<OidcState>,
     Query(query): Query<ResumeQuery>,
 ) -> Response {
+    let resume = query.return_to.clone();
+    let response = register_get_inner(State(state.clone()), Query(query)).await;
+    interaction::with_registered_form_navigation(&state, resume.as_deref(), None, response).await
+}
+
+async fn register_get_inner(
+    State(state): State<OidcState>,
+    Query(query): Query<ResumeQuery>,
+) -> Response {
     match parse_resume(query.return_to.as_deref()) {
         Some(resume) => {
             // The environment-kind chrome (issue #42): non-production marks the page
@@ -86,6 +95,17 @@ pub async fn register_get(
 // invariant, so the length lint is allowed here (issue #64).
 #[allow(clippy::too_many_lines)]
 pub async fn register_post(
+    State(state): State<OidcState>,
+    headers: HeaderMap,
+    Form(form): Form<RegisterForm>,
+) -> Response {
+    let resume = form.return_to.clone();
+    let response = register_post_inner(State(state.clone()), headers, Form(form)).await;
+    interaction::with_registered_form_navigation(&state, resume.as_deref(), None, response).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn register_post_inner(
     State(state): State<OidcState>,
     headers: HeaderMap,
     Form(form): Form<RegisterForm>,

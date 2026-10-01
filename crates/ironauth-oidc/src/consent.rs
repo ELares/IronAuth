@@ -65,6 +65,16 @@ pub async fn consent_get(
     headers: HeaderMap,
     Query(query): Query<ResumeQuery>,
 ) -> Response {
+    let resume = query.return_to.clone();
+    let response = consent_get_inner(State(state.clone()), headers, Query(query)).await;
+    interaction::with_registered_form_navigation(&state, resume.as_deref(), None, response).await
+}
+
+async fn consent_get_inner(
+    State(state): State<OidcState>,
+    headers: HeaderMap,
+    Query(query): Query<ResumeQuery>,
+) -> Response {
     let Some(resume) = parse_resume(query.return_to.as_deref()) else {
         return interaction::invalid_link_page();
     };
@@ -112,6 +122,17 @@ pub async fn consent_get(
 /// `POST /consent`: record the decision. Allow records consent and resumes; Deny
 /// renders a notice and issues no code.
 pub async fn consent_post(
+    State(state): State<OidcState>,
+    headers: HeaderMap,
+    Form(form): Form<ConsentForm>,
+) -> Response {
+    let resume = form.return_to.clone();
+    let response = consent_post_inner(State(state.clone()), headers, Form(form)).await;
+    interaction::with_registered_form_navigation(&state, resume.as_deref(), None, response).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn consent_post_inner(
     State(state): State<OidcState>,
     headers: HeaderMap,
     Form(form): Form<ConsentForm>,

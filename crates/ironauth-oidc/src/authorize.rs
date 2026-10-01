@@ -1961,7 +1961,7 @@ fn is_jwk_thumbprint(value: &str) -> bool {
 /// [`redirect_uri_matches`]). Every failure returns a short, non-secret description
 /// the caller renders as an error PAGE, never a redirect, so an unvalidated or
 /// unregistered URI can never be turned into an open redirector.
-fn validate_registered_redirect<'a>(
+pub(crate) fn validate_registered_redirect<'a>(
     client: &ResolvedClient<'_>,
     params: &'a AuthorizeParams,
 ) -> Result<&'a str, &'static str> {

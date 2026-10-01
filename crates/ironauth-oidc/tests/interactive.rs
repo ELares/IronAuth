@@ -1165,3 +1165,47 @@ async fn an_opaque_origin_is_rejected_without_own_site_fetch_metadata() {
         }
     }
 }
+
+/// The originating form's CSP must admit the registered callback after a 303
+/// chain, while an unregistered path on that SAME origin cannot grant authority.
+#[tokio::test]
+async fn hosted_form_csp_uses_only_exact_registered_callbacks() {
+    let harness = Harness::start_store_backed().await;
+    let client = harness.client_id().to_string();
+    let resume = format!("/authorize?{}", authorize_query(&client, None));
+    for route in ["/login", "/register"] {
+        let (status, headers, _) = harness
+            .get_with_cookie(&format!("{route}?return_to={}", enc(&resume)), None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_hardened(&headers);
+        assert!(csp(&headers).contains("form-action 'self' https://client.test;"));
+        for invalid in [
+            resume.replace(&enc(REDIRECT_URI), &enc("https://client.test/unregistered")),
+            resume.replace(&enc(REDIRECT_URI), &enc("https://attacker.test/cb")),
+            format!("{resume}&redirect_uri={}", enc(REDIRECT_URI)),
+            format!("{resume}&client_id={client}"),
+            format!("{resume}&request_uri=urn:unresolved"),
+        ] {
+            let (_, headers, _) = harness
+                .get_with_cookie(&format!("{route}?return_to={}", enc(&invalid)), None)
+                .await;
+            assert!(csp(&headers).contains("form-action 'self';"));
+            assert!(!csp(&headers).contains("https://client.test"));
+            assert!(!csp(&headers).contains("https://attacker.test"));
+        }
+    }
+    let (_, headers, _) = harness
+        .post_form(
+            "/login",
+            &form(&[
+                ("identifier", "absent@example.test"),
+                ("password", "incorrect"),
+                ("return_to", &resume),
+            ]),
+            None,
+        )
+        .await;
+    assert_hardened(&headers);
+    assert!(csp(&headers).contains("form-action 'self' https://client.test;"));
+}
