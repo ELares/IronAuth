@@ -42,6 +42,7 @@ the build if any workflow passes it.
 | `ironauth.toml` | Certification-representative config. Turns on the cert-only downgrades; the shipped default stays hardened. |
 | `nginx-tls.conf` | TLS terminator that fronts the OP as the `op` issuer host. |
 | `gen-certs.sh` | Generates the self-signed CA + OP cert (SAN `op`). Output is gitignored. |
+| `profile-matrix.yaml` | The FAPI2SP variant matrix (issue #157) is declared but not yet enabled: the four variants (private_key_jwt/mTLS client auth crossed with DPoP/mTLS certificate binding) target the hardened `cert-fapi` environment and the `mtls-op` proxy listener; each is blocked on the publicly reachable staging deployment. A disabled profile is reported as not-yet-enabled, never as passed. |
 | `seed.sql` / `seed.sh` | Deterministic operator/tenant/environment + login user. A seed script, not a migration. |
 | `cert-user-password.phc` | The COMMITTED Argon2id hash of the throwaway cert password, so seeding pulls no image and touches no network. |
 | `profile-matrix.yaml` | The reviewed profile matrix (which plans run on which trigger). |

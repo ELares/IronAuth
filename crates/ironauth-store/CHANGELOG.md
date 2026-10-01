@@ -19,6 +19,12 @@ range per docs/RELEASING.md.
 - Pin the recipient challenge reissue DELETE privilege to its actual audited
   caller in the migration contract. Reissue replaces the prior subject challenge;
   cross-environment deletion is RLS-filtered and verified by an unchanged row image.
+
+- Preserve published migrations 0241 and 0242 while assigning the new guardrail
+  view repair to 0243. Recognize only the exact published and corrected 0242
+  checksums; append view columns without replacing their existing order, grants
+  or dependencies. Historical ledgers remain unchanged.
+
 - Preserve the already published `signing_key.break_glass` v1 event name through
   an exact legacy-wire exception; newly registered event names still require past tense.
 
@@ -28,7 +34,7 @@ range per docs/RELEASING.md.
   with PostgreSQL 42601 before storing the client.
 
 - Restore the control role's column-scoped FAPI policy setter after migration
-  0237 (issue #1437 prerequisite). Forward migration 0244 grants only UPDATE on
+  0237 (issue #1437 prerequisite). Forward migration 0246 grants only UPDATE on
   `environments.fapi_hardened` to `ironauth_control`; application roles remain
   unable to change environment policy and admission checks are unchanged.
 
@@ -50,7 +56,7 @@ range per docs/RELEASING.md.
   no existing mailbox is inferred to be verified.
 - Repair upstream migration 0237's guardrail view column ordering. The runner
   admits only its exact known old checksum in addition to the corrected bytes;
-  migration 0241 validates and repairs that old view shape while retaining data,
+  migration 0243 validates and repairs that old view shape while retaining data,
   ledger entries, grants, ownership and compatible dependents. Every other
   checksum change remains refused. The migration byte guard admits the same
   exact path/digest pair and has adversarial disposable-Git regression cases.

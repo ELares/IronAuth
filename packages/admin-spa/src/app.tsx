@@ -25,6 +25,7 @@ import { OrganizationDetail, OrganizationsList } from "./ui/OrganizationsView";
 import { InvitationsList } from "./ui/InvitationsView";
 import { PermissionsList } from "./ui/PermissionsView";
 import { DiagnosticsView } from "./ui/DiagnosticsView";
+import { AdvisoriesView } from "./ui/AdvisoriesView";
 
 const signedIn = signal(isSignedIn());
 const authError = signal("");
@@ -271,6 +272,7 @@ export function Routes() {
       <Route path={consoleHref("/permissions")} component={PermissionsList} />
       <Route path={consoleHref("/invitations")} component={InvitationsList} />
       <Route path={consoleHref("/diagnostics")} component={DiagnosticsView} />
+      <Route path={consoleHref("/advisories")} component={AdvisoriesView} />
       <Route default component={NotFound} />
     </Router>
   );
