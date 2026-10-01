@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Validate encryption recipient key purpose, public material, curve and point
+  consistently at registration and issuance. Signing-only keys cannot be selected
+  for encrypted ID-token responses.
+
 - Correct ECDH-ES Concat KDF to RFC 7518 and authenticate the compact protected
   header as AES-GCM additional data. Validate the declared algorithm, curve,
   empty encrypted-key segment and exact IV/tag sizes; reject unsupported critical

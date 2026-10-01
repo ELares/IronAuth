@@ -70,6 +70,11 @@ fn documented_operations() -> BTreeSet<String> {
 /// credential granted ordinary configuration rights. That is why `WriteCredentials` is a
 /// separate permission rather than part of `WriteConfig`.
 const CLASSIFIED: &[(&str, ManagementPermission)] = &[
+    ("listSecurityAdvisories", ManagementPermission::Read),
+    (
+        "importSecurityAdvisories",
+        ManagementPermission::WriteConfig,
+    ),
     (
         "createManagementKey",
         ManagementPermission::WriteCredentials,

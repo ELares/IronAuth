@@ -11249,6 +11249,13 @@ The verified-claims generic release loop must not override the specialized
 verification-envelope validator. Matching subsets survive; malformed envelopes
 cannot be reintroduced through a generic voluntary or exact-value request.
 
+Registered ID-token encryption uses an inline public P-256 recipient key regardless
+of the client's authentication method. Signing-only keys, private key material,
+and incompatible key operations cannot select the encryption recipient. The
+current implementation does not fetch encryption keys from `jwks_uri`; such
+registrations are rejected. If configured encryption cannot be performed at
+issuance, the request fails instead of returning a plaintext signed ID token.
+
 ---
 
 # Per-operation unit costs

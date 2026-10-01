@@ -810,3 +810,27 @@ async fn start_jwks_server(body: String) -> SocketAddr {
     });
     addr
 }
+
+#[tokio::test]
+async fn encrypted_id_tokens_require_usable_inline_recipient_keys() {
+    let harness = Harness::start_with(dcr_config()).await;
+    for key_metadata in [
+        serde_json::json!({}),
+        serde_json::json!({"jwks": {"keys": []}}),
+        serde_json::json!({"jwks": serde_json::from_str::<Value>(&published_jwks(17)).unwrap()}),
+        serde_json::json!({"jwks_uri": "https://client.example/keys"}),
+    ] {
+        let mut metadata = serde_json::json!({
+            "redirect_uris": [REDIRECT_URI],
+            "token_endpoint_auth_method": "none",
+            "id_token_encrypted_response_alg": "ECDH-ES"
+        });
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .extend(key_metadata.as_object().unwrap().clone());
+        let (status, body) = post_json(&harness, &register_path(&harness), metadata).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_client_metadata");
+    }
+}

@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Retain and validate inline encryption keys for registered public clients,
+  separately from client-authentication keys. Reject missing or unsupported
+  encryption key sources at registration and refuse token issuance if configured
+  encryption cannot be completed; never fall back to a plaintext ID token.
+
 - Preserve registered ID-token encryption at the token endpoint when combining
   the signing repairs with current main. A full authorization-code exchange test
   decrypts the result and verifies the inner signed token and nonce.
