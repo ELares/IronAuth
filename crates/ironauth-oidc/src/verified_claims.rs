@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The verified_claims envelope (issue #164, IDA schema readiness).
+//! The `verified_claims` envelope (issue #164, IDA schema readiness).
 //!
 //! This module is the schema-readiness seam: the claims pipeline carries
 //! per-claim verification metadata (trust framework, evidence, assurance) so
@@ -38,28 +38,8 @@ use serde_json::Value;
 
 use crate::claims_request::ClaimSpec;
 
-/// The claim name of the verified_claims envelope (the OIDC/IDA standard name).
+/// The claim name of the `verified_claims` envelope (the OIDC/IDA standard name).
 pub const VERIFIED_CLAIMS_CLAIM: &str = "verified_claims";
-
-/// The accepted trust-framework values when a request pins them. A request may
-/// name any subset; unknown frameworks are carried through verbatim (an IDA
-/// profile newer than this module must not be silently dropped).
-const TRUST_FRAMEWORKS: [&str; 8] = [
-    "de_aml",
-    "eidas",
-    "de_ga",
-    "jp_ga",
-    "icao",
-    "iaca",
-    "credential_trust_framework",
-    "eudi",
-];
-
-/// Whether `framework` is a framework this module understands well enough to
-/// compare. Unknown values compare by string equality (never refused).
-fn known_framework(framework: &str) -> bool {
-    TRUST_FRAMEWORKS.contains(&framework)
-}
 
 /// Release the envelope the request's spec allows, or `None` when the envelope
 /// does not satisfy the request's pinned subset.
@@ -95,10 +75,8 @@ pub fn release_subset(envelope: &Value, spec: &ClaimSpec) -> Option<Value> {
             .as_array()
             .and_then(|values| values.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
             .or_else(|| pinned.as_str().map(|s| vec![s]))?;
-        let matches = accepted.iter().any(|candidate| {
-            *candidate == framework
-                || (known_framework(candidate) && known_framework(framework) && false)
-        });
+        // Unknown framework names obey the same exact comparison as known ones.
+        let matches = accepted.contains(&framework);
         if !matches {
             return None;
         }
@@ -111,7 +89,7 @@ pub fn release_subset(envelope: &Value, spec: &ClaimSpec) -> Option<Value> {
             .and_then(|values| values.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
             .or_else(|| pinned.as_str().map(|s| vec![s]))?;
         let assurance = verification.get("assurance").and_then(Value::as_str)?;
-        if !accepted.iter().any(|candidate| *candidate == assurance) {
+        if !accepted.contains(&assurance) {
             return None;
         }
     }

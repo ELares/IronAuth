@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Preserve registered ID-token encryption at the token endpoint when combining
+  the signing repairs with current main. A full authorization-code exchange test
+  decrypts the result and verifies the inner signed token and nonce.
+
 - Keep verified-claims envelope release under its dedicated subset validator.
   The generic claim loop no longer removes matching subsets or reintroduces
   malformed envelopes that the specialized validator refused.

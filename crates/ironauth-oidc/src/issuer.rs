@@ -1139,15 +1139,12 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> LoadOutcome {
     // order), because a transient read must never change the signing policy --
     // the opposite direction (fail closed) would swap the environment's signer
     // on a database hiccup, which is worse than serving the default set.
-    let fips = match store
+    let fips = store
         .scoped(*scope)
         .environment_guardrails()
         .fips_profile()
         .await
-    {
-        Ok(fips) => fips,
-        Err(_) => false,
-    };
+        .unwrap_or_default();
     let order = if fips {
         fips_algorithm_order(&algorithms)
     } else {
@@ -1232,8 +1229,8 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> LoadOutcome {
 /// future key kind is never silently dropped from the policy. The input is already
 /// de-duplicated by the caller; the output preserves that.
 /// The FIPS-profile order (issue #162): ES256 (the default), then RS256, and
-/// EdDSA EXCLUDED even when provisioned. A FIPS-profile environment's keys
-/// still include EdDSA (every environment provisions all three on day one);
+/// `EdDSA` EXCLUDED even when provisioned. A FIPS-profile environment's keys
+/// still include `EdDSA` (every environment provisions all three on day one);
 /// the POLICY is what refuses it, so the key material's presence never leaks an
 /// algorithm the tenant's assurance posture excludes.
 fn fips_algorithm_order(present: &[JwsAlgorithm]) -> Vec<JwsAlgorithm> {

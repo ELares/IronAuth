@@ -101,7 +101,7 @@ impl ClaimSpec {
     }
 
     /// The pinned value, when the request carries a single `value` pin. Used by
-    /// the verified_claims subset release (issue #164): the envelope-shaped
+    /// the `verified_claims` subset release (issue #164): the envelope-shaped
     /// request pins live inside the `value`.
     #[must_use]
     pub fn pinned_value(&self) -> Option<&Value> {

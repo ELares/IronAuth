@@ -1475,6 +1475,20 @@ pub async fn mint(
         .map_err(|_| ())?
     };
 
+    // Apply the registered encryption exactly once after signing for every
+    // back-channel ID-token grant, matching the front-channel emission path.
+    let id_token = match encrypt_id_token_for_client(
+        state,
+        request.scope,
+        &request.client_id,
+        &id_token,
+    )
+    .await
+    {
+        Some(encrypted) => encrypted,
+        None => id_token,
+    };
+
     let (access, permission_budget) =
         mint_access(state, signer, policy, request, target, now).await?;
 

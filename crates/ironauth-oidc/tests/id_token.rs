@@ -202,3 +202,57 @@ async fn requesting_acr_values_yields_the_achieved_acr_never_the_requested_value
         "the requested acr is never copied through"
     );
 }
+
+/// The RFC 7518 Appendix C recipient is public synthetic test material.
+#[tokio::test]
+async fn code_exchange_encrypts_exactly_one_signed_id_token_for_registered_client() {
+    use base64::Engine as _;
+    let harness = Harness::start().await;
+    let client_id = harness.client_id().to_string();
+    harness
+        .set_id_token_encryption(
+            &serde_json::json!({"keys": [{
+                "kty": "EC", "crv": "P-256", "use": "enc",
+                "x": "weNJy2HscCSM6AEDTDg04biOvhFhyyWvOHQfeF_PxMQ",
+                "y": "e8lnCO-AlStT-NJVX-crhB7QRYhiix03illJOVAOyck"
+            }]})
+            .to_string(),
+        )
+        .await;
+    let cookie = consenting_cookie(&harness, &client_id).await;
+    let (status, headers, body) = harness
+        .authorize_with_cookie(
+            &authorize_query(&client_id, &["nonce=encrypted-code-flow"]),
+            &cookie,
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    let code = location_param(&headers, "code").expect("authorization code");
+    let (status, _, body) = harness.token(&token_form(&code, &client_id)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response = json(&body);
+    let encrypted = response["id_token"].as_str().expect("ID token");
+    assert_eq!(
+        encrypted.split('.').count(),
+        5,
+        "registered encryption is mandatory"
+    );
+    let private = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode("VEmDZpDXXK8p8N0Cndsxs924q6nS1RXFASRl6BfUqdw")
+        .expect("fixture scalar");
+    let plain = ironauth_jose::jwe::decrypt_ecdh_es("ECDH-ES", encrypted, &private)
+        .expect("recipient decrypts the JWE");
+    let signed = std::str::from_utf8(&plain).expect("inner token UTF-8");
+    assert_eq!(
+        signed.split('.').count(),
+        3,
+        "one encryption layer around the JWS"
+    );
+    let verified = verify(
+        signed,
+        &harness.id_token_policy(&client_id),
+        &common::verify_clock(),
+    )
+    .expect("inner ID token verifies with the issuer key");
+    assert_eq!(verified.claims().raw()["nonce"], "encrypted-code-flow");
+}
