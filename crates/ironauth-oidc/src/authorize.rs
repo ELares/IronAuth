@@ -1507,7 +1507,7 @@ async fn mint_front_channel_id_token(
     // THE SIGN-THEN-ENCRYPT ARM (issue #158): a client registered for the
     // encrypted ID-token response gets the JWS wrapped in an ECDH-ES JWE to its
     // registered public key.
-    match tokens::encrypt_id_token_for_client(state, scope, &client_id_str, &id_token).await {
+    match tokens::encrypt_id_token_for_client(state, scope, &client_id_str, &id_token).await? {
         Some(encrypted) => Ok(encrypted),
         None => Ok(id_token),
     }

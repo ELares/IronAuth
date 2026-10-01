@@ -252,34 +252,8 @@ async fn code_exchange_encrypts_exactly_one_signed_id_token_for_registered_clien
     })
     .await;
     let client_id = register_encrypted_client(&harness).await;
-    let cookie = consenting_cookie(&harness, &client_id).await;
-    let (status, headers, body) = harness
-        .authorize_with_cookie(
-            &authorize_query(&client_id, &["nonce=encrypted-code-flow"]),
-            &cookie,
-        )
-        .await;
-    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
-    let code = location_param(&headers, "code").expect("authorization code");
-    let proof_key =
-        ironauth_jose::SigningKey::ed25519_from_seed(None, &[7; 32]).expect("synthetic proof key");
-    let request = axum::http::Request::builder()
-        .method("POST")
-        .uri("/token")
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header(
-            "DPoP",
-            ironauth_jose::dpop_test_util::sign_proof(
-                &proof_key,
-                "POST",
-                &format!("{}/token", common::ISSUER_BASE),
-                0,
-                "encrypted-code-exchange",
-            ),
-        )
-        .body(axum::body::Body::from(token_form(&code, &client_id)))
-        .expect("token request");
-    let (status, _, body) = harness.send(request).await;
+    let (status, _, body) =
+        encrypted_exchange(&harness, &client_id, "encrypted-code-exchange").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let response = json(&body);
     let encrypted = response["id_token"].as_str().expect("ID token");
@@ -306,4 +280,64 @@ async fn code_exchange_encrypts_exactly_one_signed_id_token_for_registered_clien
     )
     .expect("inner ID token verifies with the issuer key");
     assert_eq!(verified.claims().raw()["nonce"], "encrypted-code-flow");
+}
+
+async fn encrypted_exchange(
+    harness: &Harness,
+    client_id: &str,
+    jti: &str,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let cookie = consenting_cookie(harness, client_id).await;
+    let (status, headers, body) = harness
+        .authorize_with_cookie(
+            &authorize_query(client_id, &["nonce=encrypted-code-flow"]),
+            &cookie,
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    let code = location_param(&headers, "code").expect("authorization code");
+    let proof_key =
+        ironauth_jose::SigningKey::ed25519_from_seed(None, &[7; 32]).expect("synthetic proof key");
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/token")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "DPoP",
+            ironauth_jose::dpop_test_util::sign_proof(
+                &proof_key,
+                "POST",
+                &format!("{}/token", common::ISSUER_BASE),
+                0,
+                jti,
+            ),
+        )
+        .body(axum::body::Body::from(token_form(&code, client_id)))
+        .expect("token request");
+    harness.send(request).await
+}
+
+#[tokio::test]
+async fn configured_encryption_never_falls_back_when_recipient_keys_disappear() {
+    let harness = Harness::start_with(ironauth_config::OidcConfig {
+        registration_enabled: true,
+        registration_mode: ironauth_config::RegistrationMode::Open,
+        ..ironauth_config::OidcConfig::default()
+    })
+    .await;
+    let client_id = register_encrypted_client(&harness).await;
+    let changed = sqlx::query(
+        "UPDATE clients SET jwks = NULL WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(&client_id)
+    .bind(harness.scope().tenant().to_string())
+    .bind(harness.scope().environment().to_string())
+    .execute(harness.db().owner_pool())
+    .await
+    .expect("remove owned fixture keys");
+    assert_eq!(changed.rows_affected(), 1);
+    let (status, _, body) = encrypted_exchange(&harness, &client_id, "missing-recipient-key").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(json(&body)["error"], "server_error");
+    assert!(json(&body).get("id_token").is_none());
 }

@@ -1028,7 +1028,14 @@ async fn validate_metadata(
             }
         }
     }
-    let (jwks, jwks_uri) = validate_client_keys(state, metadata, auth_method).await?;
+    let (jwks, jwks_uri) = validate_client_keys(
+        state,
+        metadata,
+        auth_method,
+        id_token_encrypted_response_alg.is_some()
+            || existing.is_some_and(|client| client.id_token_encrypted_response_alg.is_some()),
+    )
+    .await?;
 
     let display_name = metadata
         .get("client_name")
@@ -1397,7 +1404,7 @@ fn validate_id_token_encrypted_enc(
 
 /// Validate the `jwks` / `jwks_uri` pair. They are MUTUALLY EXCLUSIVE. A
 /// `private_key_jwt` client MUST supply exactly one usable source; other methods
-/// ignore any key material (it has no effect on their authentication). An inline
+/// retain inline public keys when ID-token encryption is requested. An inline
 /// `jwks` must name at least one representable key; a `jwks_uri` is fetched THROUGH
 /// the SSRF-hardened fetcher and must yield at least one key, so a private-address
 /// destination is rejected structurally (issue #25 path reuse).
@@ -1405,6 +1412,7 @@ async fn validate_client_keys(
     state: &OidcState,
     metadata: &serde_json::Map<String, Value>,
     auth_method: ClientAuthMethod,
+    encrypted_id_token: bool,
 ) -> Result<(Option<String>, Option<String>), RegistrationError> {
     let jwks_value = metadata.get("jwks").filter(|value| !value.is_null());
     let jwks_uri = metadata
@@ -1418,9 +1426,8 @@ async fn validate_client_keys(
         ));
     }
 
-    // Only private_key_jwt consumes registered keys; for any other method they are
-    // an unrecognized-for-this-method property, so they are ignored (RFC 7591).
-    if auth_method != ClientAuthMethod::PrivateKeyJwt {
+    // Client authentication and response encryption consume different key uses.
+    if auth_method != ClientAuthMethod::PrivateKeyJwt && !encrypted_id_token {
         return Ok((None, None));
     }
 
@@ -1429,10 +1436,31 @@ async fn validate_client_keys(
             return Err(RegistrationError::metadata("jwks must be a JWK Set object"));
         };
         let serialized = Value::Object(object.clone()).to_string();
-        if ironauth_jose::trusted_keys_from_jwks(serialized.as_bytes()).is_empty() {
+        if auth_method == ClientAuthMethod::PrivateKeyJwt
+            && ironauth_jose::trusted_keys_from_jwks(serialized.as_bytes()).is_empty()
+        {
             return Err(RegistrationError::metadata("jwks names no usable key"));
         }
+        if encrypted_id_token
+            && !object
+                .get("keys")
+                .and_then(Value::as_array)
+                .is_some_and(|keys| {
+                    keys.iter()
+                        .any(|key| ironauth_jose::jwe::encryption_recipient_key(key).is_some())
+                })
+        {
+            return Err(RegistrationError::metadata(
+                "encrypted ID tokens require a usable public P-256 encryption key in inline jwks",
+            ));
+        }
         return Ok((Some(serialized), None));
+    }
+
+    if encrypted_id_token {
+        return Err(RegistrationError::metadata(
+            "encrypted ID tokens require inline jwks; jwks_uri encryption is not supported",
+        ));
     }
 
     if let Some(jwks_uri) = jwks_uri {

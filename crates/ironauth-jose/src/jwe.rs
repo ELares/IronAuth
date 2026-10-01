@@ -66,10 +66,46 @@ pub enum JweError {
     InvalidKey,
 }
 
+/// Read a usable public P-256 recipient key for the shipped ECDH-ES suite.
+/// Signing-only keys, private material and incompatible key operations are refused.
+#[must_use]
+pub fn encryption_recipient_key(jwk: &serde_json::Value) -> Option<Vec<u8>> {
+    if jwk.get("kty")?.as_str()? != "EC"
+        || jwk.get("crv")?.as_str()? != "P-256"
+        || jwk.get("d").is_some()
+        || jwk.get("use").is_some_and(|v| v.as_str() != Some("enc"))
+        || jwk
+            .get("alg")
+            .is_some_and(|v| v.as_str() != Some("ECDH-ES"))
+    {
+        return None;
+    }
+    if let Some(operations) = jwk.get("key_ops") {
+        let operations = operations.as_array()?;
+        if operations.is_empty()
+            || !operations
+                .iter()
+                .all(|v| matches!(v.as_str(), Some("deriveKey" | "deriveBits")))
+        {
+            return None;
+        }
+    }
+    let x = URL_SAFE_NO_PAD.decode(jwk.get("x")?.as_str()?).ok()?;
+    let y = URL_SAFE_NO_PAD.decode(jwk.get("y")?.as_str()?).ok()?;
+    if x.len() != 32 || y.len() != 32 {
+        return None;
+    }
+    let mut point = vec![4];
+    point.extend_from_slice(&x);
+    point.extend_from_slice(&y);
+    p256::PublicKey::from_sec1_bytes(&point).ok()?;
+    Some(point)
+}
+
 /// The P-256 ECDH-ES encrypt (issue #158): an ephemeral P-256 key agrees with
 /// the recipient's static public key (uncompressed 65-byte point), the agreed
 /// secret derives the A256GCM content key, and the compact serialization is
-/// `header.epk.iv.ciphertext.tag` (the encrypted-key segment is empty for direct
+/// `header.encrypted_key.iv.ciphertext.tag` (the encrypted-key segment is empty for direct
 /// agreement).
 ///
 /// # Errors
@@ -315,6 +351,31 @@ mod tests {
     /// A fixed entropy source for the deterministic tests.
     fn fixed_entropy() -> ironauth_env::Env {
         ironauth_env::Env::deterministic(std::time::SystemTime::UNIX_EPOCH, 7).0
+    }
+
+    #[test]
+    fn encryption_keys_reject_signing_use_private_material_and_invalid_points() {
+        let key = serde_json::json!({
+            "kty": "EC", "crv": "P-256", "use": "enc",
+            "x": "weNJy2HscCSM6AEDTDg04biOvhFhyyWvOHQfeF_PxMQ",
+            "y": "e8lnCO-AlStT-NJVX-crhB7QRYhiix03illJOVAOyck"
+        });
+        assert!(super::encryption_recipient_key(&key).is_some());
+        for (field, value) in [
+            ("use", serde_json::json!("sig")),
+            ("d", serde_json::json!("private")),
+            ("alg", serde_json::json!("ES256")),
+            ("crv", serde_json::json!("P-384")),
+            ("x", serde_json::json!("AA")),
+            ("key_ops", serde_json::json!(["verify"])),
+        ] {
+            let mut invalid = key.clone();
+            invalid[field] = value;
+            assert!(
+                super::encryption_recipient_key(&invalid).is_none(),
+                "{field}"
+            );
+        }
     }
 
     #[test]
