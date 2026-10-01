@@ -6,7 +6,7 @@ description = "In-process WASM component hooks for IronAuth: a deny-by-default c
 edition.workspace = true
 # NOT the workspace MSRV, and this is the one place in the tree that departs from it.
 #
-# wasmtime 48 and cranelift both declare rust-version = "1.95.0". The workspace promises 1.85
+# wasmtime 48 and cranelift both declare rust-version = "1.95.0". The workspace promises 1.88
 # (docs/COMPATIBILITY.md, and the CI msrv lane checks it), so this crate cannot honour that
 # promise and there is no version of the runtime that would let it: the MSRV is a property of
 # the dependency, not of how it is used.
