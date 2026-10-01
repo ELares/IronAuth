@@ -664,6 +664,10 @@ class Client:
         """Grant a hook permission to read an environment secret. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook/secrets", query, None)
 
+    def import_security_advisories(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Import the signed advisory bundle (the offline path; the online poll uses the SAME verification). POST /v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories/import."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/security/advisories/import", query, body)
+
     def lift_ban(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Lift a credential-abuse ban. POST /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans/lift."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/abuse/bans/lift", query, body)
@@ -855,6 +859,10 @@ class Client:
     def list_secrets(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List the secrets of an environment (metadata only, cursor paginated). GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/secrets", query, None)
+
+    def list_security_advisories(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List the accepted advisories (the admin SPA's banner surface). GET /v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/security/advisories", query, None)
 
     def list_service_account_api_keys(self, tenant_id: str, environment_id: str, service_account_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """listServiceAccountApiKeys. GET /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys."""

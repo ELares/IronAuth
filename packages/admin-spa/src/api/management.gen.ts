@@ -3165,6 +3165,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the accepted advisories (the admin SPA's banner surface). */
+        get: operations["listSecurityAdvisories"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import the signed advisory bundle (the offline path; the online poll uses the
+         *     SAME verification).
+         */
+        post: operations["importSecurityAdvisories"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys": {
         parameters: {
             query?: never;
@@ -4418,6 +4455,37 @@ export interface components {
              * @example omb_...
              */
             membership_id: string;
+        };
+        /**
+         * @description The offline bundle import request: the SAME signed feed the online poll
+         *     consumes.
+         */
+        AdvisoryImportRequest: {
+            /** @description The signed feed document (the `feed` + `signature` members). */
+            feed: string;
+        };
+        /** @description The accepted advisories. */
+        AdvisoryListView: {
+            /** @description The accepted advisories, newest first. */
+            advisories: components["schemas"]["AdvisoryView"][];
+        };
+        /** @description One advisory, as the banner surface renders it. */
+        AdvisoryView: {
+            /** @description The affected version ranges. */
+            affected_versions: string[];
+            /** @description The stable advisory identifier. */
+            id: string;
+            /**
+             * Format: int64
+             * @description The advisory's published date (unix seconds).
+             */
+            published_at: number;
+            /** @description The severity tier. */
+            severity: string;
+            /** @description The banner summary. */
+            summary: string;
+            /** @description The human-facing title. */
+            title: string;
         };
         /** @description A page of agents. */
         AgentList: {
@@ -25986,6 +26054,121 @@ export interface operations {
             };
             /** @description Still referenced by a variable or another secret */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listSecurityAdvisories: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The accepted security advisories */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdvisoryListView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or not in this scope */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    importSecurityAdvisories: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdvisoryImportRequest"];
+            };
+        };
+        responses: {
+            /** @description The verified advisories replaced the accepted set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The bundle failed verification or does not parse */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment is absent or not in this scope */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

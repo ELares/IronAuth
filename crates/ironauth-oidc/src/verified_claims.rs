@@ -136,7 +136,7 @@ mod tests {
     }
 
     fn spec(value: Value) -> ClaimSpec {
-        ClaimSpec::voluntary().with_value(value)
+        ClaimSpec::with_value(value)
     }
 
     #[test]

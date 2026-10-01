@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Keep verified-claims envelope release under its dedicated subset validator.
+  The generic claim loop no longer removes matching subsets or reintroduces
+  malformed envelopes that the specialized validator refused.
+
 - Restore hardened authorization of actual pushed requests (issue #1437
   prerequisite). The PAR requirement now uses the verified stored-request context,
   since replayed parameters intentionally omit `request_uri`. Plain requests and
