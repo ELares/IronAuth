@@ -21,7 +21,7 @@ use utoipa::ToSchema;
 use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::input::parse_json;
-use crate::org_context::resolve_scope;
+use crate::org_context::{require_live_environment, resolve_scope};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
 
@@ -132,8 +132,9 @@ pub async fn import_security_advisories(
     Path((tenant_id, environment_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (_scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     principal.require_permission(ManagementPermission::WriteConfig)?;
+    require_live_environment(&state, &scope).await?;
     let request: AdvisoryImportRequest = parse_json(&body)?;
 
     let Some(verification_key) = state.advisory_verification_key() else {

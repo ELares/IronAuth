@@ -6,6 +6,9 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Refuse offline advisory imports into soft-deleted environments before parsing
+  their body, matching the management write boundary and preserving read access.
+
 - Repair the signed-feed rejection tests so the wrong-key case uses a distinct
   synthetic key and signature rejection assertions compile.
 
