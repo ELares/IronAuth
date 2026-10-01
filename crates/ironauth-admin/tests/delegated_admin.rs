@@ -7468,3 +7468,45 @@ async fn a_request_for_somebody_who_is_not_a_member_is_refused() {
         "the refused request was stored anyway: {subjects:?}"
     );
 }
+
+#[tokio::test]
+async fn advisory_routes_require_their_specific_read_and_config_permissions() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("advisory-permissions", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "k-mint").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/security/advisories");
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, body) = h.get_as(&base, &secret).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, body) = h
+        .post_as(
+            &format!("{base}/import"),
+            &secret,
+            "advisory-read-refused",
+            r#"{"feed":"{}"}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("management.write_config"), "{body}");
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&base, &secret).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("management.read"), "{body}");
+    let (status, _, body) = h
+        .post_as(
+            &format!("{base}/import"),
+            &secret,
+            "advisory-config-admitted",
+            r#"{"feed":"{}"}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("advisory feed is disabled"), "{body}");
+}

@@ -844,6 +844,9 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
 /// the false coverage claim this list exists to prevent. Hand-maintained, and only for
 /// operations somebody actually checked.
 const PERMISSION_PROVEN: &[&str] = &[
+    // delegated_admin::advisory_routes_require_their_specific_read_and_config_permissions
+    "listSecurityAdvisories",
+    "importSecurityAdvisories",
     // The agent principal surface (issue #130), proven by
     // `the_agent_surface_splits_registering_and_revoking_from_listing`: registering and
     // revoking are write_organizations, listing is read, and each is driven in BOTH
@@ -1175,12 +1178,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        250,
+        252,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        106,
+        108,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
