@@ -1560,6 +1560,19 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
     });
 
     vec![
+        Case::empty(
+            "advisories.listSecurityAdvisories",
+            "GET",
+            format!("{base}/security/advisories"),
+        ),
+        Case::json(
+            "advisories.importSecurityAdvisories",
+            "POST",
+            format!("{base}/security/advisories/import"),
+            // This sweep uses the default disabled feed and exercises its 400;
+            // missing/deleted environment checks must refuse before that policy.
+            &serde_json::json!({"feed": "{}"}),
+        ),
         // ---- the operator plane, which hangs off no environment ----
         Case::empty(
             "signing_interop.getSigningRecommendations",
