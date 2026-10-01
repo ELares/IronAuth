@@ -284,6 +284,20 @@ pub struct Config {
     /// Vault boundary. Misconfiguration fails fast at boot.
     pub signing: SigningConfig,
 
+    /// The security-advisory feed's verification key (issue #163): the base64url
+    /// Ed25519 public key the signed feed's signature is checked against. Unset
+    /// (the default) disables the feed: no advisory is accepted from any source.
+    pub advisory_verification_key: Option<String>,
+
+    /// The security-advisory feed's poll URL (issue #163). Unset (the default)
+    /// disables the online poll; the offline bundle import keeps working. The
+    /// poll is NEVER load-bearing: a fetch or verification failure only logs.
+    pub advisory_feed_url: Option<String>,
+
+    /// The advisory poll interval (seconds). Defaults to 24 hours.
+    #[serde(default = "default_advisory_poll_interval")]
+    pub advisory_poll_interval_secs: u64,
+
     /// Mutual-TLS client authentication (issue #159): the PKI method's trust
     /// anchors. Empty by default, which leaves `tls_client_auth` unregistrable:
     /// a chain cannot validate against a bundle nothing configured.
@@ -3307,6 +3321,10 @@ pub struct AdminConfig {
 }
 
 /// The default admin sudo re-authentication freshness window: ten minutes (issue #73).
+fn default_advisory_poll_interval() -> u64 {
+    86_400
+}
+
 fn default_sudo_mode_window_secs() -> u64 {
     600
 }

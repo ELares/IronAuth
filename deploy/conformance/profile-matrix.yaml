@@ -27,6 +27,12 @@
 
 op:
   issuer: "https://op/t/cert/e/cert"
+  # The FAPI2SP issuer (issue #157): a SEPARATE hardened environment. The FAPI
+  # 2.0 Security Profile's constraints (PKCE S256 only, PAR mandatory, mTLS
+  # client auth, sender-constrained tokens) are per-environment flags that the
+  # OP basic/dynamic plans must NOT run under, so the FAPI2SP variants target
+  # their own environment instead of flipping the shared one.
+  fapi_issuer: "https://op/t/cert/e/cert-fapi"
   # The two well-known forms the suite may probe; both must return the identical
   # document with the issuer above (see scripts/discovery-scan.sh and #194).
   well_known:
@@ -79,6 +85,61 @@ profiles:
     triggers: [nightly]
     enabled: true
     variant: { server_metadata: discovery, client_registration: dynamic_client, response_type: "code id_token" }
+
+  # --- FAPI2SP variants (issue #157): the certification matrix --------------
+  # The four FAPI 2.0 Security Profile variants: client authentication
+  # (private_key_jwt, mTLS) crossed with sender constraining (DPoP, mTLS
+  # certificate binding). `enabled: false` because the live runs need the
+  # PUBLICLY REACHABLE staging deployment + the mTLS endpoint-alias proxy
+  # topology (issue #159's documented topology; the aliases are configured in
+  # ironauth.toml below). The runner reports them as not-yet-enabled, never as
+  # passed; flip each to `enabled: true` in the SAME PR that provisions its
+  # staging + proxy, so the gate starts holding it exactly when it becomes
+  # real. Each fix from a conformance failure lands with a regression test in
+  # the normal suite.
+  - id: fapi2sp-op-test-plan
+    name: "FAPI2SP private_key_jwt x DPoP"
+    triggers: [nightly]
+    enabled: false
+    blocked_by: "#157 (staging deployment + mTLS proxy topology)"
+    variant:
+      server_metadata: discovery
+      client_registration: dynamic_client
+      client_auth: private_key_jwt
+      sender_constrain: dpop
+
+  - id: fapi2sp-op-test-plan
+    name: "FAPI2SP private_key_jwt x mTLS certificate binding"
+    triggers: [nightly]
+    enabled: false
+    blocked_by: "#157 (staging deployment + mTLS proxy topology)"
+    variant:
+      server_metadata: discovery
+      client_registration: dynamic_client
+      client_auth: private_key_jwt
+      sender_constrain: mtls
+
+  - id: fapi2sp-op-test-plan
+    name: "FAPI2SP mTLS x DPoP"
+    triggers: [nightly]
+    enabled: false
+    blocked_by: "#157 (staging deployment + mTLS proxy topology)"
+    variant:
+      server_metadata: discovery
+      client_registration: dynamic_client
+      client_auth: mtls
+      sender_constrain: dpop
+
+  - id: fapi2sp-op-test-plan
+    name: "FAPI2SP mTLS x mTLS certificate binding"
+    triggers: [nightly]
+    enabled: false
+    blocked_by: "#157 (staging deployment + mTLS proxy topology)"
+    variant:
+      server_metadata: discovery
+      client_registration: dynamic_client
+      client_auth: mtls
+      sender_constrain: mtls
 
   # --- Logout profiles: DEFERRED, add incrementally as the deps land -----------
   # Not yet enabled: the sessions/logout surfaces they certify are not merged.

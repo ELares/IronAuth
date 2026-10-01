@@ -230,6 +230,7 @@ pub mod token_hook;
 /// mint directly; the exchange refuses the requested type unless the draft is acknowledged AND a
 /// trust domain is configured.
 pub mod transaction_tokens;
+pub mod verified_claims;
 
 /// The hook dispatch's SHAPE, with the feature off.
 ///

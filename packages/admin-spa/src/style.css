@@ -2091,3 +2091,45 @@ a.stat-card:hover {
     scroll-behavior: auto !important;
   }
 }
+
+/* The security-advisory banners (issue #163): the tiered, non-blocking banner
+   surface. The tier colors follow the severity; every advisory here was
+   VERIFIED by the server before storage, so the console never renders an
+   unverified advisory. */
+.advisory-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 16px 0;
+}
+.advisory-banner {
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 6px;
+  padding: 12px 14px;
+}
+.advisory-banner--critical { border-left-color: #c62828; }
+.advisory-banner--high { border-left-color: #e65100; }
+.advisory-banner--medium { border-left-color: #f9a825; }
+.advisory-banner--low { border-left-color: #2e7d32; }
+.advisory-banner__head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  opacity: 0.8;
+  margin-bottom: 4px;
+}
+.advisory-banner__title { font-weight: 600; margin-bottom: 4px; }
+.advisory-banner__summary { font-size: 14px; }
+.advisory-banner__versions { font-size: 12px; opacity: 0.8; margin-top: 6px; }
+.advisory-import {
+  margin-top: 24px;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+.advisory-import textarea {
+  width: 100%;
+  font-family: monospace;
+  font-size: 13px;
+  margin: 8px 0;
+}
