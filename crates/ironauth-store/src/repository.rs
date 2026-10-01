@@ -11954,6 +11954,28 @@ impl EnvironmentGuardrailRepo<'_> {
         Ok(row.get::<bool, _>("fapi_hardened"))
     }
 
+    /// Whether this environment runs the FIPS tenant profile (issue #162): the
+    /// algorithm policy presets to the validated-module-compatible set (ES256
+    /// default, RS256 available, EdDSA unavailable).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the environment is absent in this scope.
+    pub async fn fips_profile(&self) -> Result<bool, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT fips_profile FROM environment_guardrails \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        Ok(row.get::<bool, _>("fips_profile"))
+    }
+
     /// The FAPI-hardened compliance scan (issue #156): every registered client in
     /// this scope whose configuration violates the hardened constraints, each
     /// named. An empty list is a conformant environment. The scan covers the
@@ -13440,6 +13462,83 @@ pub struct ClientAuthDiagnosticQuery<'a> {
 /// opaque `invalid_client` with no oracle. Append-only and deliberately off the
 /// audited-write path (a diagnostic is a log entry, not a business mutation),
 /// mirroring `idempotency_keys`.
+/// The security-advisory repository (issue #163): the deployment-global banner
+/// surface's projection. Every row was verified before insertion (the feed
+/// module's single path); this repo is the store half.
+pub struct SecurityAdvisoryRepo<'a> {
+    pub(crate) store: &'a Store,
+}
+
+impl SecurityAdvisoryRepo<'_> {
+    /// Replace the accepted advisories with `advisories` (the feed poll/import
+    /// applies the whole verified set; a removed advisory stops being a banner).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn replace_all(
+        &self,
+        advisories: &[crate::advisory::AdvisoryRecord],
+        source: &str,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.store.pool().begin().await?;
+        sqlx::query("DELETE FROM security_advisories")
+            .execute(&mut *tx)
+            .await?;
+        for advisory in advisories {
+            sqlx::query(
+                "INSERT INTO security_advisories \
+                 (id, title, severity, affected_versions, summary, published_at, source) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(&advisory.id)
+            .bind(&advisory.title)
+            .bind(advisory.severity.as_str())
+            .bind(
+                &serde_json::to_string(&advisory.affected_versions)
+                    .map_err(|_| StoreError::Encryption)?,
+            )
+            .bind(&advisory.summary)
+            .bind(advisory.published_at)
+            .bind(source)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The accepted advisories, newest first (the banner surface's order).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list(&self) -> Result<Vec<crate::advisory::AdvisoryRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, title, severity, affected_versions, summary, published_at \
+             FROM security_advisories ORDER BY published_at DESC",
+        )
+        .fetch_all(self.store.pool())
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(crate::advisory::AdvisoryRecord {
+                id: row.get("id"),
+                title: row.get("title"),
+                severity: crate::advisory::AdvisorySeverity::parse(
+                    &row.get::<String, _>("severity"),
+                )
+                .unwrap_or(crate::advisory::AdvisorySeverity::Low),
+                affected_versions: serde_json::from_str(&row.get::<String, _>("affected_versions"))
+                    .unwrap_or_default(),
+                summary: row.get("summary"),
+                published_at: row.get("published_at"),
+            });
+        }
+        Ok(out)
+    }
+}
+
 pub struct ClientAuthDiagnosticsRepo<'a> {
     store: &'a Store,
     scope: Scope,
