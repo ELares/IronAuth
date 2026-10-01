@@ -105,6 +105,18 @@ struct KeyLifecycle {
     expire_at_micros: Option<i64>,
 }
 
+/// An opaque remote-key verification failure; no successor may be promoted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteKeyProvisionError;
+
+impl std::fmt::Display for RemoteKeyProvisionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("remote key verification failed")
+    }
+}
+
+impl std::error::Error for RemoteKeyProvisionError {}
+
 /// The remote-key verification seam (issue #161): before a REMOTE-REFERENCE
 /// successor is stored, the machine asks the backend to ensure the key exists
 /// (a pre-provisioned vault key named by the kid). An outage (the backend down)
@@ -117,7 +129,7 @@ pub trait RemoteKeyProvisioner: Send + Sync {
     ///
     /// On any backend failure (a timeout, a missing key, an auth refusal); the
     /// machine treats every error the same: no successor, no promotion.
-    fn ensure_remote_key(&self, kid: &str, algorithm: &str) -> Result<(), ()>;
+    fn ensure_remote_key(&self, kid: &str, algorithm: &str) -> Result<(), RemoteKeyProvisionError>;
 }
 
 /// How the machine seeds successors (issue #161).
@@ -317,7 +329,7 @@ impl<'a> RotationStateMachine<'a> {
                 };
                 provisioner
                     .ensure_remote_key(&id.to_string(), algorithm)
-                    .map_err(|()| StoreError::Invalid)?;
+                    .map_err(|_| StoreError::Invalid)?;
                 (
                     SigningKeyMaterialKind::RemoteReference,
                     id.to_string().into_bytes(),

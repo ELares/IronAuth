@@ -6,6 +6,13 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Use the existing environment clock for JARM and signed-introspection issuance
+  timestamps, with checked integer conversion (issue #1437 prerequisite).
+  The private JARM render context now receives `state.now()` from authorize;
+  public exports and response capability settings are unchanged. Remove only
+  the unexported, unused duplicate signed-introspection serializer.
+
+
 - Upgrade Argon2 to 0.6 with explicit raw salts from the environment entropy
   seam. Stored Argon2 PHC hashes, configured costs, salt length, and the absent-user
   verification work remain compatible; the hasher's automatic RNG is disabled.

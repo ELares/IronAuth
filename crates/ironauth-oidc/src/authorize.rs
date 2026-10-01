@@ -1298,7 +1298,7 @@ async fn issue_code(
     let jarm = match (jarm_ctx, entry.as_ref()) {
         (Some((alg, _iss)), Some(entry)) => entry
             .signer(state.now())
-            .map(|key| (key, alg, iss.as_str())),
+            .map(|key| (key, alg, iss.as_str(), state.now())),
         _ => None,
     };
     Ok(response::render(mode, redirect_uri, &params, jarm))
