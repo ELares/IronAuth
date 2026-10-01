@@ -41,6 +41,9 @@
 //! FORCE-RLS backstop not enforced (a startup warning says so). See
 //! `ironauth_store::Store::management` and `docs/adr/0005-management-api.md`.
 
+mod advisories;
+pub mod advisory_feed;
+pub mod advisory_poll;
 mod api_keys;
 mod auth;
 mod authzen;
@@ -231,6 +234,16 @@ pub use state::{
 #[allow(clippy::too_many_lines)]
 pub fn management_router(state: AdminState) -> Router {
     Router::new()
+        // The security-advisory surface (issue #163): the banner projection and
+        // the offline bundle import (the same signed feed the online poll consumes).
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories",
+            get(advisories::list_security_advisories),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories/import",
+            post(advisories::import_security_advisories),
+        )
         // On-demand backups (issue #153): record an audited request and wake the runner.
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/backups",
