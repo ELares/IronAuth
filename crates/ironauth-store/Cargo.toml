@@ -1175,3 +1175,9 @@ required-features = ["testing"]
 name = "migration_0237_repair"
 path = "tests/migration_0237_repair.rs"
 required-features = ["testing"]
+
+# The observed dynamic-registration bind-count prerequisite, issue #1437.
+[[test]]
+name = "dynamic_registration"
+path = "tests/dynamic_registration.rs"
+required-features = ["testing"]

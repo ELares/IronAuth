@@ -115,7 +115,7 @@ async fn exact_old_checksum_upgrades_without_rewriting_ledger_data_view_grants_o
         .run()
         .await
         .expect("known old checksum repair");
-    assert_eq!(report.newly_applied(), [243]);
+    assert_eq!(report.newly_applied(), [243, 244]);
     assert_eq!(before_view, view_identity(&db).await);
     assert_eq!(before_data, data(&db).await);
     let after_ledger: Vec<String> = sqlx::query_scalar("SELECT row_to_json(m)::text FROM _schema_migrations m WHERE version < 243 ORDER BY version")
@@ -190,6 +190,46 @@ async fn known_old_ledger_does_not_admit_another_edit_to_237_or_an_unexpected_vi
 }
 
 #[tokio::test]
+async fn userinfo_metadata_grant_is_exactly_the_app_control_column() {
+    let db = TestDatabase::start().await;
+    for role in ["ironauth_app", "ironauth_control"] {
+        let granted: bool = sqlx::query_scalar(
+            "SELECT has_column_privilege($1, 'clients', 'userinfo_signed_response_alg', 'UPDATE')",
+        )
+        .bind(role)
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("metadata column grant");
+        assert!(granted, "{role} retains metadata update");
+    }
+    let mut app = db.app_pool().begin().await.expect("application connection");
+    sqlx::query("UPDATE clients SET userinfo_signed_response_alg = NULL WHERE false")
+        .execute(&mut *app)
+        .await
+        .expect("actual app-role column update admitted");
+    let denied = sqlx::query("UPDATE clients SET quarantined = quarantined WHERE false")
+        .execute(&mut *app)
+        .await;
+    assert!(denied.is_err(), "quarantine remains control-plane only");
+    app.rollback().await.expect("end app transaction");
+    let mut limited = db.owner_pool().begin().await.expect("owned role fixture");
+    sqlx::query("SET LOCAL ROLE ironauth_audit_retention")
+        .execute(&mut *limited)
+        .await
+        .expect("limited role");
+    assert!(
+        sqlx::query("UPDATE clients SET userinfo_signed_response_alg = NULL WHERE false")
+            .execute(&mut *limited)
+            .await
+            .is_err()
+    );
+    limited
+        .rollback()
+        .await
+        .expect("end limited role transaction");
+}
+
+#[tokio::test]
 async fn historical_237_without_fips_upgrades_through_corrected_242() {
     let db = old_ledger().await;
     sqlx::raw_sql(
@@ -200,7 +240,7 @@ async fn historical_237_without_fips_upgrades_through_corrected_242() {
         .run()
         .await
         .expect("FIPS upgrade");
-    assert_eq!(report.newly_applied(), [242, 243]);
+    assert_eq!(report.newly_applied(), [242, 243, 244]);
     assert_eq!(identity, view_identity(&db).await);
     let names: Vec<String> = sqlx::query_scalar("SELECT attname::text FROM pg_attribute WHERE attrelid = 'environment_guardrails'::regclass AND attnum > 0 ORDER BY attnum")
         .fetch_all(db.owner_pool()).await.expect("retained view order");

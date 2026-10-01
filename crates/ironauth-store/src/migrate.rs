@@ -2061,6 +2061,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0243_fapi_guardrails_view_repair.sql"),
         },
+        // EXPAND (issue #1437 prerequisite): retain app/control metadata updates after 0238.
+        Migration {
+            version: 244,
+            name: "userinfo_metadata_update_grant",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0244_userinfo_metadata_update_grant.sql"),
+        },
     ]
 }
 
