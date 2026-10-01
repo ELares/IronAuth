@@ -11,7 +11,7 @@
 //!   PAR `request_uri` is rejected with `invalid_request_object`.
 //! - **PKCE S256 only** (§6.5.2): a plain (or absent) `code_challenge_method` is
 //!   rejected.
-//! - **Sender-constrained tokens** (§6.4): an exchange that proves neither a DPoP
+//! - **Sender-constrained tokens** (§6.4): an exchange that proves neither a `DPoP`
 //!   proof key nor an mTLS certificate binding is rejected before issuance.
 //! - **Client authentication restricted** (§6.1): a client whose registered
 //!   method is neither `private_key_jwt` nor an mTLS method cannot exist in a
@@ -75,7 +75,7 @@ pub fn hardened_par_conformant(has_par_request_uri: bool) -> bool {
     has_par_request_uri
 }
 
-/// Whether an exchange proves sender constraint (FAPI 2.0 §6.4): a DPoP proof
+/// Whether an exchange proves sender constraint (FAPI 2.0 §6.4): a `DPoP` proof
 /// key (a `jkt` binding) or an mTLS certificate binding must be present.
 #[must_use]
 pub fn hardened_sender_constrained(dpop_jkt: Option<&str>, mtls_thumbprint: Option<&str>) -> bool {

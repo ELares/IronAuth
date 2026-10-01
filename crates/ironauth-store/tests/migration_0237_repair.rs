@@ -117,7 +117,7 @@ async fn exact_old_checksum_upgrades_without_rewriting_ledger_data_view_grants_o
         .run()
         .await
         .expect("known old checksum repair");
-    assert_eq!(report.newly_applied(), [243, 244, 245]);
+    assert_eq!(report.newly_applied(), [243, 244, 245, 246]);
     assert_eq!(before_view, view_identity(&db).await);
     assert_eq!(before_data, data(&db).await);
     let after_ledger: Vec<String> = sqlx::query_scalar("SELECT row_to_json(m)::text FROM _schema_migrations m WHERE version < 243 ORDER BY version")
@@ -237,6 +237,49 @@ async fn userinfo_metadata_grant_is_exactly_the_app_control_column() {
 }
 
 #[tokio::test]
+async fn fapi_setter_grant_preserves_control_policy_and_data_plane_denial() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let operator = db.owning_operator(&scope.tenant()).await;
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .environments(operator, scope.tenant())
+        .set_fapi_hardened(&env, &scope.environment(), true)
+        .await
+        .expect("conformant environment hardens through actual control role");
+    assert!(
+        db.store()
+            .scoped(scope)
+            .environment_guardrails()
+            .hardened()
+            .await
+            .expect("app projection")
+    );
+    let mut app = db.app_pool().begin().await.expect("app role");
+    let error = sqlx::query("UPDATE environments SET fapi_hardened = false WHERE false")
+        .execute(&mut *app)
+        .await
+        .expect_err("app cannot change environment policy");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("42501")
+    );
+    app.rollback().await.expect("app rollback");
+    let table_grant: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege('ironauth_control', 'environments', 'UPDATE')",
+    )
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("control table privilege");
+    assert!(!table_grant, "control authority remains column-scoped");
+}
+
+#[tokio::test]
 async fn historical_237_without_fips_upgrades_through_corrected_242() {
     let db = old_ledger().await;
     sqlx::raw_sql(
@@ -247,7 +290,7 @@ async fn historical_237_without_fips_upgrades_through_corrected_242() {
         .run()
         .await
         .expect("FIPS upgrade");
-    assert_eq!(report.newly_applied(), [242, 243, 244, 245]);
+    assert_eq!(report.newly_applied(), [242, 243, 244, 245, 246]);
     assert_eq!(identity, view_identity(&db).await);
     let names: Vec<String> = sqlx::query_scalar("SELECT attname::text FROM pg_attribute WHERE attrelid = 'environment_guardrails'::regclass AND attnum > 0 ORDER BY attnum")
         .fetch_all(db.owner_pool()).await.expect("retained view order");

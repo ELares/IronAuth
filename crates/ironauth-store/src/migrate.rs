@@ -2075,6 +2075,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0245_recipient_verification.sql"),
         },
+        // EXPAND (issue #1437 prerequisite): the control-plane FAPI setter's column.
+        Migration {
+            version: 246,
+            name: "fapi_hardened_control_grant",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0246_fapi_hardened_control_grant.sql"),
+        },
     ]
 }
 
