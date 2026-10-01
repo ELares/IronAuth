@@ -202,3 +202,142 @@ async fn requesting_acr_values_yields_the_achieved_acr_never_the_requested_value
         "the requested acr is never copied through"
     );
 }
+
+/// Register through the actual DCR surface and clear its default quarantine.
+async fn register_encrypted_client(harness: &Harness) -> String {
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/t/{}/e/{}/connect/register",
+            harness.scope().tenant(),
+            harness.scope().environment(),
+        ))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "client_name": "Encrypted token regression",
+                "redirect_uris": [REDIRECT_URI],
+                "token_endpoint_auth_method": "none",
+                "id_token_encrypted_response_alg": "ECDH-ES",
+                "id_token_encrypted_response_enc": "A256GCM",
+                "jwks": {"keys": [{
+                    "kty": "EC", "crv": "P-256", "use": "enc",
+                    "x": "weNJy2HscCSM6AEDTDg04biOvhFhyyWvOHQfeF_PxMQ",
+                    "y": "e8lnCO-AlStT-NJVX-crhB7QRYhiix03illJOVAOyck"
+                }]}
+            })
+            .to_string(),
+        ))
+        .expect("registration request");
+    let (status, _, body) = harness.send(request).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let client_id = json(&body)["client_id"]
+        .as_str()
+        .expect("client id")
+        .to_owned();
+    let client = ironauth_store::ClientId::parse_in_scope(&client_id, &harness.scope())
+        .expect("scoped registered client");
+    harness.verify_client(&client).await;
+    client_id
+}
+
+/// The RFC 7518 Appendix C recipient is public synthetic test material.
+#[tokio::test]
+async fn code_exchange_encrypts_exactly_one_signed_id_token_for_registered_client() {
+    use base64::Engine as _;
+    let harness = Harness::start_with(ironauth_config::OidcConfig {
+        registration_enabled: true,
+        registration_mode: ironauth_config::RegistrationMode::Open,
+        ..ironauth_config::OidcConfig::default()
+    })
+    .await;
+    let client_id = register_encrypted_client(&harness).await;
+    let (status, _, body) =
+        encrypted_exchange(&harness, &client_id, "encrypted-code-exchange").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response = json(&body);
+    let encrypted = response["id_token"].as_str().expect("ID token");
+    assert_eq!(
+        encrypted.split('.').count(),
+        5,
+        "registered encryption is mandatory"
+    );
+    let private = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode("VEmDZpDXXK8p8N0Cndsxs924q6nS1RXFASRl6BfUqdw")
+        .expect("fixture scalar");
+    let plain = ironauth_jose::jwe::decrypt_ecdh_es("ECDH-ES", encrypted, &private)
+        .expect("recipient decrypts the JWE");
+    let signed = std::str::from_utf8(&plain).expect("inner token UTF-8");
+    assert_eq!(
+        signed.split('.').count(),
+        3,
+        "one encryption layer around the JWS"
+    );
+    let verified = verify(
+        signed,
+        &harness.id_token_policy(&client_id),
+        &common::verify_clock(),
+    )
+    .expect("inner ID token verifies with the issuer key");
+    assert_eq!(verified.claims().raw()["nonce"], "encrypted-code-flow");
+}
+
+async fn encrypted_exchange(
+    harness: &Harness,
+    client_id: &str,
+    jti: &str,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let cookie = consenting_cookie(harness, client_id).await;
+    let (status, headers, body) = harness
+        .authorize_with_cookie(
+            &authorize_query(client_id, &["nonce=encrypted-code-flow"]),
+            &cookie,
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    let code = location_param(&headers, "code").expect("authorization code");
+    let proof_key =
+        ironauth_jose::SigningKey::ed25519_from_seed(None, &[7; 32]).expect("synthetic proof key");
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/token")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "DPoP",
+            ironauth_jose::dpop_test_util::sign_proof(
+                &proof_key,
+                "POST",
+                &format!("{}/token", common::ISSUER_BASE),
+                0,
+                jti,
+            ),
+        )
+        .body(axum::body::Body::from(token_form(&code, client_id)))
+        .expect("token request");
+    harness.send(request).await
+}
+
+#[tokio::test]
+async fn configured_encryption_never_falls_back_when_recipient_keys_disappear() {
+    let harness = Harness::start_with(ironauth_config::OidcConfig {
+        registration_enabled: true,
+        registration_mode: ironauth_config::RegistrationMode::Open,
+        ..ironauth_config::OidcConfig::default()
+    })
+    .await;
+    let client_id = register_encrypted_client(&harness).await;
+    let changed = sqlx::query(
+        "UPDATE clients SET jwks = NULL WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+    )
+    .bind(&client_id)
+    .bind(harness.scope().tenant().to_string())
+    .bind(harness.scope().environment().to_string())
+    .execute(harness.db().owner_pool())
+    .await
+    .expect("remove owned fixture keys");
+    assert_eq!(changed.rows_affected(), 1);
+    let (status, _, body) = encrypted_exchange(&harness, &client_id, "missing-recipient-key").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(json(&body)["error"], "server_error");
+    assert!(json(&body).get("id_token").is_none());
+}

@@ -235,6 +235,7 @@ fn operation_ids_are_the_stable_set() {
             "getVariable",
             "grantChallengeComponentSecret",
             "grantTokenHookSecret",
+            "importSecurityAdvisories",
             "liftBan",
             "linkUserExternalId",
             "listAccessRequests",
@@ -283,6 +284,7 @@ fn operation_ids_are_the_stable_set() {
             "listScimPushConnections",
             "listScimPushResources",
             "listSecrets",
+            "listSecurityAdvisories",
             "listServiceAccountApiKeys",
             "listSessionTokenTemplates",
             "listSessions",
@@ -715,6 +717,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates",
@@ -816,6 +819,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/reject",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules/{rule_id}/verify-domain",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories/import",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}/rotate",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/revoke",
@@ -972,7 +976,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        311,
+        313,
         "the documented route count is pinned"
     );
 

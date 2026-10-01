@@ -1475,20 +1475,15 @@ pub async fn mint(
         .map_err(|_| ())?
     };
 
-    // THE SIGN-THEN-ENCRYPT ARM (issue #158): a client registered for the
-    // encrypted ID-token response gets the JWS wrapped in an ECDH-ES JWE to its
-    // registered public key - the code-flow counterpart of the front-channel arm.
-    let id_token = match encrypt_id_token_for_client(
-        state,
-        request.scope,
-        &request.client_id,
-        &id_token,
-    )
-    .await
-    {
-        Some(encrypted) => encrypted,
-        None => id_token,
-    };
+    // Apply the registered encryption exactly once after signing for every
+    // back-channel ID-token grant, matching the front-channel emission path.
+    let id_token =
+        match encrypt_id_token_for_client(state, request.scope, &request.client_id, &id_token)
+            .await?
+        {
+            Some(encrypted) => encrypted,
+            None => id_token,
+        };
 
     let (access, permission_budget) =
         mint_access(state, signer, policy, request, target, now).await?;
@@ -1784,58 +1779,52 @@ pub fn describe_signing_metrics() {
 /// The sign-then-encrypt arm (issue #158): when the client registered
 /// `id_token_encrypted_response_alg`, the minted ID-token JWS is the plaintext of
 /// an ECDH-ES JWE to the client's registered P-256 public key (from its inline
-/// `jwks`). `None` keeps the plain signed token.
+/// `jwks`). Only absent encryption configuration keeps the plain signed token;
+/// configured encryption failures refuse issuance.
 pub(crate) async fn encrypt_id_token_for_client(
     state: &OidcState,
     scope: Scope,
     client_id: &str,
     id_token: &str,
-) -> Option<String> {
-    let id = ClientId::parse_in_scope(client_id, &scope).ok()?;
-    let record = state
+) -> Result<Option<String>, ()> {
+    let Ok(id) = ClientId::parse_in_scope(client_id, &scope) else {
+        return Ok(None);
+    };
+    let record = match state
         .store()
         .scoped(scope)
         .clients()
         .dynamic_registration(&id)
         .await
-        .ok()?;
-    if record.id_token_encrypted_response_alg.as_deref() != Some("ECDH-ES") {
-        return None;
+    {
+        Ok(record) => record,
+        Err(ironauth_store::StoreError::NotFound) => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let Some(alg) = record.id_token_encrypted_response_alg.as_deref() else {
+        return Ok(None);
+    };
+    if alg != "ECDH-ES"
+        || record
+            .id_token_encrypted_response_enc
+            .as_deref()
+            .is_some_and(|enc| enc != "A256GCM")
+    {
+        return Err(());
     }
-    let jwks_text = record.jwks.as_deref()?;
-    let jwks: serde_json::Value = serde_json::from_str(jwks_text).ok()?;
-    let keys = jwks.get("keys").and_then(|v| v.as_array())?;
-    for key in keys {
-        let kty = key.get("kty").and_then(|v| v.as_str());
-        let crv = key.get("crv").and_then(|v| v.as_str());
-        let Some(x) = key.get("x").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(y) = key.get("y").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if kty == Some("EC") && crv == Some("P-256") {
-            use base64::Engine as _;
-            let x_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(x)
-                .ok()?;
-            let y_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(y)
-                .ok()?;
-            let mut sec1 = vec![0x04];
-            sec1.extend_from_slice(&x_bytes);
-            sec1.extend_from_slice(&y_bytes);
-
-            return ironauth_jose::jwe::encrypt_ecdh_es(
-                "ECDH-ES",
-                &sec1,
-                id_token.as_bytes(),
-                state.env().entropy(),
-            )
-            .ok();
-        }
-    }
-    None
+    let jwks: serde_json::Value =
+        serde_json::from_str(record.jwks.as_deref().ok_or(())?).map_err(|_| ())?;
+    let keys = jwks
+        .get("keys")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(())?;
+    let public = keys
+        .iter()
+        .find_map(ironauth_jose::jwe::encryption_recipient_key)
+        .ok_or(())?;
+    ironauth_jose::jwe::encrypt_ecdh_es(alg, &public, id_token.as_bytes(), state.env().entropy())
+        .map(Some)
+        .map_err(|_| ())
 }
 
 /// Mint an OPAQUE access token for `target` (issue #29): the scope-declaring

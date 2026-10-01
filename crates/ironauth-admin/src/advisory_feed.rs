@@ -35,9 +35,13 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AdvisorySeverity {
+    /// Immediate action required.
     Critical,
+    /// High severity.
     High,
+    /// Medium severity.
     Medium,
+    /// Low severity.
     Low,
 }
 
@@ -139,19 +143,16 @@ pub enum FeedError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironauth_env::Env;
     use ironauth_jose::SigningKey;
-    use std::time::SystemTime;
 
-    fn signing_key(env: &Env) -> SigningKey {
-        SigningKey::ed25519_from_seed(Some("advisory-key".to_owned()), &[3_u8; 32])
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::ed25519_from_seed(Some("advisory-key".to_owned()), &[seed; 32])
             .expect("the key loads")
     }
 
     #[test]
     fn a_signed_feed_verifies_and_parses() {
-        let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 1);
-        let key = signing_key(&env);
+        let key = signing_key(1);
         let feed = serde_json::json!([{
             "id": "ADV-2026-001",
             "title": "a seeded advisory",
@@ -169,15 +170,14 @@ mod tests {
 
     #[test]
     fn a_tampered_feed_is_rejected_entirely() {
-        let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 2);
-        let key = signing_key(&env);
+        let key = signing_key(2);
         let feed = serde_json::json!([{ "id": "ADV-2026-002", "title": "t", "severity": "low", "affected_versions": [], "summary": "s", "published_at": 1 }]);
         let signed = sign_feed(&feed, &key);
         // Tamper: change one advisory byte after signing.
         let tampered = signed.replace("\"ADV-2026-002\"", "\"ADV-2026-003\"");
         let trusted = key.verifying_key().expect("the trusted key");
         assert_eq!(
-            verify_feed(&tampered, &trusted),
+            verify_feed(&tampered, &trusted).map(|_| ()),
             Err(FeedError::BadSignature),
             "a tampered feed is rejected, never partially applied"
         );
@@ -185,12 +185,10 @@ mod tests {
 
     #[test]
     fn a_wrong_key_rejects_the_feed() {
-        let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 3);
-        let key = signing_key(&env);
+        let key = signing_key(3);
         let feed = serde_json::json!([{ "id": "ADV-2026-004", "title": "t", "severity": "low", "affected_versions": [], "summary": "s", "published_at": 1 }]);
         let signed = sign_feed(&feed, &key);
-        let (other_env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 4);
-        let other = signing_key(&other_env);
+        let other = signing_key(4);
         let trusted = other.verifying_key().expect("the trusted key");
         assert!(verify_feed(&signed, &trusted).is_err());
     }

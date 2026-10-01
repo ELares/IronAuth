@@ -6,6 +6,9 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Capture advisory verification and poll settings before moving configuration
+  into the server, restoring compilation of the management and worker wiring.
+
 - Update `time` to 0.3.47 to bound RFC 2822 parser recursion. The default
   workspace minimum Rust version is now 1.88; the optional WASM engine still
   requires 1.95. The pinned development toolchain remains unchanged.

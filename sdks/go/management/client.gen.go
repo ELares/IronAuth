@@ -1135,6 +1135,13 @@ func (c *Client) GrantTokenHookSecret(tenant_id string, environment_id string, c
 	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook/secrets", query, nil)
 }
 
+// ImportSecurityAdvisories performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories/import.
+//
+// Import the signed advisory bundle (the offline path; the online poll uses the SAME verification).
+func (c *Client) ImportSecurityAdvisories(tenant_id string, environment_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/security/advisories/import", query, body)
+}
+
 // LiftBan performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans/lift.
 //
 // Lift a credential-abuse ban.
@@ -1469,6 +1476,13 @@ func (c *Client) ListScimPushResources(tenant_id string, environment_id string, 
 // List the secrets of an environment (metadata only, cursor paginated).
 func (c *Client) ListSecrets(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/secrets", query, nil)
+}
+
+// ListSecurityAdvisories performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories.
+//
+// List the accepted advisories (the admin SPA's banner surface).
+func (c *Client) ListSecurityAdvisories(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/security/advisories", query, nil)
 }
 
 // ListServiceAccountApiKeys performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys.

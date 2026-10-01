@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Reconcile the recipient stack with published migrations 0241 and 0242 by assigning its new migrations 0243 through 0246. Repair the exact historical FIPS view collision without rewriting accepted ledger rows; retain the FIPS projection, existing view columns, ownership and grants on forward repair.
+
 - Add optional static, flushed stage diagnostics to the real outbox chaos test
   (issue #1453). CI retains one original test invocation and all assertions; an
   owned-process watchdog reserves cleanup time inside the existing job deadline.
@@ -19,12 +21,6 @@ range per docs/RELEASING.md.
 - Pin the recipient challenge reissue DELETE privilege to its actual audited
   caller in the migration contract. Reissue replaces the prior subject challenge;
   cross-environment deletion is RLS-filtered and verified by an unchanged row image.
-
-- Preserve published migrations 0241 and 0242 while assigning the new guardrail
-  view repair to 0243. Recognize only the exact published and corrected 0242
-  checksums; append view columns without replacing their existing order, grants
-  or dependencies. Historical ledgers remain unchanged.
-
 - Preserve the already published `signing_key.break_glass` v1 event name through
   an exact legacy-wire exception; newly registered event names still require past tense.
 

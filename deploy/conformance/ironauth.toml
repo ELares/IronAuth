@@ -35,6 +35,15 @@ management_bind = "127.0.0.1:9443"
 public_url = "https://op"
 shutdown_grace_secs = 25
 
+# The FAPI2SP mTLS variants (issue #157): the RFC 8705 alias surface. The
+# TLS-terminating proxy's client-certificate listener (the topology issue #159
+# documents) lives at this base; the server itself keeps serving the SAME paths
+# at public_url. Published only when the proxy actually terminates client
+# certificates - the aliases advertise the mTLS capability, so advertising them
+# before the proxy exists would send FAPI2SP clients to a dead listener.
+mtls_public_url = "https://mtls-op"
+
+
 # The cert stack has exactly one proxy hop (the TLS terminator), but the issuer
 # and all endpoint URLs derive from public_url, not headers, so trusting the
 # forwarding chain is not required for issuer correctness. Keep the hardened
@@ -44,13 +53,6 @@ shutdown_grace_secs = 25
 trusted_hops = 0
 trust_forwarded = false
 
-# The FAPI2SP mTLS variants (issue #157): the RFC 8705 alias surface. The
-# TLS-terminating proxy's client-certificate listener (the topology issue #159
-# documents) lives at this base; the server itself keeps serving the SAME paths
-# at public_url. Published only when the proxy actually terminates client
-# certificates - the aliases advertise the mTLS capability, so advertising them
-# before the proxy exists would send FAPI2SP clients to a dead listener.
-mtls_public_url = "https://mtls-op"
 
 [telemetry]
 log_format = "json"

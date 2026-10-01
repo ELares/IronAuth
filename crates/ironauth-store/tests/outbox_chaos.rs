@@ -114,9 +114,10 @@ fn stage_ledger_flushes_static_labels_in_order() {
     assert_eq!(rows[0]["stage"], "notify.begin");
     assert_eq!(rows[1]["stage"], "notify.end");
     assert!(rows[1]["elapsed_ms"].as_u64() >= rows[0]["elapsed_ms"].as_u64());
-    assert!(rows
-        .iter()
-        .all(|row| row.as_object().expect("stage").len() == 2));
+    assert!(
+        rows.iter()
+            .all(|row| row.as_object().expect("stage").len() == 2)
+    );
 }
 
 /// The consumer name this suite drains.

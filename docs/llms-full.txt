@@ -196,7 +196,7 @@ cargo build --locked -p ironauth --bin ironauth
 scripts/gate.sh > gate.log 2>&1
 ```
 
-The default server and most crates support Rust 1.85. The optional WASM hook
+The default server and most crates support Rust 1.88. The optional WASM hook
 engine requires Rust 1.95. A whole-workspace build includes that engine even
 when the server's `wasm-hooks` feature is disabled. The pinned development
 toolchain satisfies both; see the generated
@@ -673,6 +673,109 @@ not an accessibility certification.
 
 ---
 
+# The air-gap parity guarantee (issue #163)
+
+Source: docs/AIR-GAP.md
+
+# The air-gap parity guarantee (issue #163)
+
+This page is the written guarantee. It is a **maintained guarantee, not an
+accident**: the no-egress CI lane ([`scripts/dev-no-egress.sh`](../scripts/dev-no-egress.sh)
+plus [`scripts/dev-core-flows.sh`](../scripts/dev-core-flows.sh)) boots the
+server with egress blocked and drives the core-flow battery — discovery, JWKS
+fetch, email-OTP login, the code+PKCE authorization, token issuance, and an
+admin API call — on every run. A feature that needs a reachable third party to
+function breaks that lane, and the lane fails.
+
+## The property, stated precisely
+
+Every IronAuth feature works in a deployment with **no outbound network access
+at all**: no phone-home, no license callbacks, and no telemetry required for
+functionality. The single binary plus PostgreSQL is a complete deployment.
+IronCache and IronBus remain strictly optional and are documented for offline
+use where deployed.
+
+The guarantee explicitly covers the environments the public-sector procurement
+vocabulary calls **DDIL** — denied, disrupted, intermittent, and limited
+communications environments. A deployment that can reach nothing still issues,
+validates, and manages credentials.
+
+What the guarantee does **not** cover: integrations whose entire purpose is a
+reachable third party — social IdP federation, external email/SMS providers,
+online breach databases (the offline HIBP corpus covers that path), and
+remote-signing backends you choose to reach over a network. Those are
+documented where they are configured.
+
+## Why it is maintained, not accidental
+
+Three covenants make this structural rather than a posture claim:
+
+1. **No mandatory first-party infrastructure.** Nothing in the product
+   requires an ELares-operated service to function.
+2. **No unexportable data.** Every write is to the deployment's own database.
+3. **The no-egress CI lane.** The enforcement mechanism above: the battery runs
+   against a booted server inside a window in which the process's connections
+   are inspected (lsof) and asserted to be loopback-only.
+
+## The offline security-advisory feed
+
+Disconnected deployments are exactly the ones that miss security advisories.
+The signed advisory feed ([`[security]` config](./CONFIG.md)) works in both
+worlds with one verification path:
+
+- **Online**: the server polls the feed (opt-out, never load-bearing — a fetch
+  or verification failure only logs).
+- **Air-gapped**: the same signed bundle is imported through the management API
+  (`POST .../security/advisories/import`).
+
+A feed that fails signature verification is rejected **entirely** in both paths
+— a tampered bundle cannot inject one advisory while the rest fails — and the
+rejection is logged as a security event. The banner surface
+(`GET .../security/advisories`) renders only accepted advisories.
+
+## The air-gapped install, end to end
+
+The procedure below is the one the no-egress lane exercises (loopback instead
+of a transfer into an enclave; the flows are identical).
+
+1. **The artifact.** The single `ironauth` binary (cosign-signed images and
+   the CycloneDX SBOM ship with the release pipeline). Transfer it into the
+   enclave by whatever media your air gap uses; no checksum download at
+   runtime is ever needed.
+2. **The registry.** If you deploy from containers, mirror the image into your
+   offline registry (`docker pull` outside the enclave, then `docker save` /
+   transfer / `docker load` inside, or a registry-mirror pattern). The image
+   contains nothing that fetches at first start.
+3. **Postgres.** Provision PostgreSQL inside the enclave. The binary migrates
+   its own schema at boot (a real migration chain, applied in order, each
+   reversible). No external DNS is consulted; the database is reached by
+   whatever address your enclave resolves locally.
+4. **Configuration.** `ironauth.toml` is written without any external
+   reference: database URL, listeners, signing keys (local or the Vault
+   transit backend if your enclave runs one), and the optional
+   `[security] advisory_verification_key` for the offline bundle import.
+5. **Battery.** Run the core-flow battery against the new deployment before
+   service: discovery answers, a code+PKCE login completes, a token issues,
+   JWKS serves, the admin API answers. In CI this is the no-egress lane; in an
+   enclave it is your acceptance run.
+6. **Advisories.** Import the signed advisory bundle through the management
+   API (`POST .../security/advisories/import`); banners render in the admin
+   console, and certificate/expiry warnings come from the deployment's own
+   state.
+
+## Offline capabilities at a glance
+
+| Capability | Offline status |
+| --- | --- |
+| Discovery, JWKS, authorization code + PKCE, device code, client credentials | Full |
+| Token issuance, refresh, revocation | Full |
+| OTP login (codes captured in the sink, not a mail server) | Full |
+| Security-advisory feed | Imported bundle (same verification as online) |
+| Breached-password screening | Configured offline corpus |
+| Social IdP federation, external email/SMS | Requires the third party (documented) |
+
+---
+
 # IronAuth capabilities
 
 Source: docs/CAPABILITIES.md
@@ -1052,33 +1155,33 @@ table is the authoritative list of artifacts and their versions at HEAD.
 
 | Artifact | Version | Kind | MSRV |
 |----------|---------|------|------|
-| ironauth | 0.1.0 | binary | 1.85 |
-| ironauth-admin | 0.1.0 | library | 1.85 |
-| ironauth-admin-ui | 0.1.0 | library | 1.85 |
-| ironauth-apply | 0.1.0 | library | 1.85 |
-| ironauth-cel | 0.1.0 | library | 1.85 |
-| ironauth-config | 0.1.0 | library | 1.85 |
-| ironauth-connector | 0.1.0 | library | 1.85 |
-| ironauth-der | 0.1.0 | library | 1.85 |
-| ironauth-env | 0.1.0 | library | 1.85 |
-| ironauth-fastly-verify | 0.1.0 | library | 1.85 |
-| ironauth-fetch | 0.1.0 | library | 1.85 |
-| ironauth-hash-scheme | 0.2.0 | library | 1.85 |
+| ironauth | 0.1.0 | binary | 1.88 |
+| ironauth-admin | 0.1.0 | library | 1.88 |
+| ironauth-admin-ui | 0.1.0 | library | 1.88 |
+| ironauth-apply | 0.1.0 | library | 1.88 |
+| ironauth-cel | 0.1.0 | library | 1.88 |
+| ironauth-config | 0.1.0 | library | 1.88 |
+| ironauth-connector | 0.1.0 | library | 1.88 |
+| ironauth-der | 0.1.0 | library | 1.88 |
+| ironauth-env | 0.1.0 | library | 1.88 |
+| ironauth-fastly-verify | 0.1.0 | library | 1.88 |
+| ironauth-fetch | 0.1.0 | library | 1.88 |
+| ironauth-hash-scheme | 0.2.0 | library | 1.88 |
 | ironauth-hooks | 0.1.0 | library | 1.95 |
-| ironauth-hot | 0.1.0 | library | 1.85 |
-| ironauth-import | 0.1.0 | library | 1.85 |
-| ironauth-importers | 0.1.0 | library | 1.85 |
-| ironauth-jose | 0.1.0 | library | 1.85 |
-| ironauth-journey | 0.1.0 | library | 1.85 |
-| ironauth-kms | 0.1.0 | library | 1.85 |
-| ironauth-oidc | 0.1.0 | library | 1.85 |
-| ironauth-quota | 0.1.0 | library | 1.85 |
-| ironauth-saml | 0.1.0 | library | 1.85 |
-| ironauth-scim | 0.1.0 | library | 1.85 |
-| ironauth-screening | 0.1.0 | library | 1.85 |
-| ironauth-server | 0.1.0 | library | 1.85 |
-| ironauth-store | 0.1.0 | library | 1.85 |
-| ironauth-webauthn | 0.1.0 | library | 1.85 |
+| ironauth-hot | 0.1.0 | library | 1.88 |
+| ironauth-import | 0.1.0 | library | 1.88 |
+| ironauth-importers | 0.1.0 | library | 1.88 |
+| ironauth-jose | 0.1.0 | library | 1.88 |
+| ironauth-journey | 0.1.0 | library | 1.88 |
+| ironauth-kms | 0.1.0 | library | 1.88 |
+| ironauth-oidc | 0.1.0 | library | 1.88 |
+| ironauth-quota | 0.1.0 | library | 1.88 |
+| ironauth-saml | 0.1.0 | library | 1.88 |
+| ironauth-scim | 0.1.0 | library | 1.88 |
+| ironauth-screening | 0.1.0 | library | 1.88 |
+| ironauth-server | 0.1.0 | library | 1.88 |
+| ironauth-store | 0.1.0 | library | 1.88 |
+| ironauth-webauthn | 0.1.0 | library | 1.88 |
 
 ---
 
@@ -1117,6 +1220,9 @@ at the top of the file, or map it in `.taplo.toml`).
 | `admin_spa.enabled` | boolean | `false` | Whether to serve the in-process admin console. Off by default so the default boot mounts nothing under `/admin` and every such path is a uniform 404. When on, the embedded console is served on the public plane. |
 | `admin_spa.management_audience` | string or unset | unset | The management API AUDIENCE the console's `at+jwt` must be bound to (issue #90, PR 2): an RFC 8707 resource-server audience registered under the admin issuer. The console requests `resource=<this>` at `/token`, and the management API requires the presented token's `aud` to EQUAL this value exactly. That exact match is the cross-RP replay defense: a token minted for any other client or resource, even by the same issuer, is rejected. Unset leaves the bridge disarmed (fail closed). A bounded URL datum, no secret. |
 | `admin_spa.operator_subjects` | array | empty | The OPERATOR-SUBJECT ALLOWLIST (issue #90, PR 2): the OIDC `sub` values, in the admin issuer, that map to the management operator plane. A verified `at+jwt` whose `sub` is a member is resolved to `Principal::Operator`; ANY other subject is REJECTED (fail closed). This is the entire human-to-authz mapping in PR 2: operator or nothing, no scoped binding, no migration, no auto-provisioning. Empty (the default) authorizes nobody, so arming the bridge without listing a subject grants no one console access. |
+| `advisory_feed_url` | string or unset | unset | The security-advisory feed's poll URL (issue #163). Unset (the default) disables the online poll; the offline bundle import keeps working. The poll is NEVER load-bearing: a fetch or verification failure only logs. |
+| `advisory_poll_interval_secs` | integer | `86400` | The advisory poll interval (seconds). Defaults to 24 hours. |
+| `advisory_verification_key` | string or unset | unset | The security-advisory feed's verification key (issue #163): the base64url Ed25519 public key the signed feed's signature is checked against. Unset (the default) disables the feed: no advisory is accepted from any source. |
 | `audit_retention` | table | see fields | Audit retention (issue #109): the per-stream windows, and whether THIS process sweeps to them. |
 | `audit_retention.admin_action_retention_secs` | integer | `0` | How long an ADMIN-ACTION row is kept, in seconds. `0` means keep forever. |
 | `audit_retention.authentication_retention_secs` | integer | `0` | How long an AUTHENTICATION row is kept, in seconds. `0` means keep forever. |
@@ -8771,6 +8877,82 @@ checks in the generator and the test file are what keep the page honest while it
 
 ---
 
+# The FIPS posture and build seam (issue #162)
+
+Source: docs/FIPS-POSTURE.md
+
+# The FIPS posture and build seam (issue #162)
+
+This page is the published posture document for security questionnaires and
+procurement. It states precisely: which builds use which crypto module and its
+validation status, the EdDSA-under-FIPS nuance, the recommended FIPS tenant
+configuration, and the current post-quantum position.
+
+## Which builds use which module
+
+- **The default build** signs, verifies, and keys with **ring** (the
+  RustCrypto-free, pure-assembly backend; not FIPS 140-3 validated). This is
+  the build everyone runs by default.
+- **The FIPS build variant** (the build seam, in progress) signs, verifies,
+  and keys through **aws-lc-rs**, the AWS libcrypto fork that holds a
+  **FIPS 140-3 validated** module — and notably includes **EdDSA**, which is
+  why the seam is viable for this product rather than a downgrade.
+
+IronAuth itself does not pursue its own CMVP certificate: the validated module
+is aws-lc-rs, and IronAuth documents module usage. The seam's contract: all
+signing, verification, key generation, and JWE operations go through a single
+abstraction with the backend selected at build time, both backends pass
+identical test vectors for every supported algorithm on every merge, and a
+backend-specific capability gap is a **startup-checked configuration error**,
+never a silent difference.
+
+## The EdDSA-under-FIPS nuance (why the FIPS profile defaults to ES256)
+
+A genuine subtlety the posture must carry:
+
+- Server-side, a validated module (aws-lc-rs) **includes** EdDSA, so the
+  server can sign Ed25519 under a validated module.
+- Client-side, validated-module coverage for **EdDSA verification is thin** —
+  most validated client modules do not include it.
+- **CNSA 2.0 excludes EdDSA entirely.**
+
+So a FIPS-constrained tenant should run **ES256** (or RS256) defaults today.
+The per-tenant algorithm policy makes this a **configuration stance rather
+than a code fork**: a tenant whose environments carry the FIPS profile signs
+ES256 by default, keeps RS256 available, and makes EdDSA unavailable — the
+policy refuses it even though the environment's keys include it, so the key
+material's presence never leaks an algorithm the tenant's assurance posture
+excludes.
+
+## The recommended FIPS tenant configuration
+
+1. Set the FIPS profile on the tenant's environments (the per-environment
+   `fips_profile` guardrail).
+2. The environment's issuer then signs ES256 (the default signer), keeps
+   RS256 available, and refuses EdDSA.
+3. Constant-time RSA comes with aws-lc-rs (the hand-rolled cautionary tale is
+   the Rauthy Marvin-attack response); the FIPS build never reaches a
+   non-constant-time path.
+4. A deployment that additionally runs the external-signer backend on an HSM
+   composes with this seam: the HSM performs the operation, and the seam
+   still governs what the HSM is asked to do.
+
+## The post-quantum position
+
+The current position, for questionnaires: **no post-quantum signer ships
+yet.** The algorithm set is conventional (EdDSA/ES256/RS256 + ECDH-ES), and
+the post-quantum readiness bet is owned by the exploratory work; this page
+publishes the posture and will be updated when that work lands.
+
+## What changes operationally in a FIPS build
+
+- The build is selected at build/deploy time (feature flag + CI job).
+- Nothing else changes: no feature loss beyond the algorithm policy.
+- Startup verifies backend availability; a mis-selected backend is a
+  configuration error, not a runtime surprise.
+
+---
+
 # The headless flow contract (issue #84)
 
 Source: docs/FLOWS.md
@@ -9927,6 +10109,8 @@ IronAuth is pre-1.0, and optional or experimental features have explicit limits.
 | Run a seeded local identity provider | [Local emulator](EMULATOR.md) |
 | Configure, deploy, upgrade, and monitor | [Operations](OPERATIONS.md), [configuration reference](CONFIG.md), and [Helm chart](../charts/ironauth/README.md) |
 | Use the dashboard and resource pages | [Admin console](ADMIN-CONSOLE.md) |
+| Deploy where the network is not reachable | [Air-gap parity guarantee](AIR-GAP.md) |
+| Answer crypto/post-quantum questionnaires | [FIPS posture](FIPS-POSTURE.md) |
 | Integrate an app or API | [Integration guide](INTEGRATIONS.md) |
 | Choose a supported SDK | [SDK policy](SDK-POLICY.md) and [artifact compatibility](COMPATIBILITY.md) |
 
@@ -11048,6 +11232,29 @@ enrollment and opaque-token direct-actor provenance are not supported. A proof
 reports current provider-recorded ownership, not a new inbox-possession ceremony
 on every read. Relying-party acceptance must recheck its own current authority
 transactionally and bind the fresh response, as specified in the contract.
+
+### JWE protected-header and derivation review repair
+
+The merge review found that compact JWE used empty AEAD additional data and a
+nonstandard Concat KDF. Authenticate the original encoded protected header,
+validate the curated ECDH-ES/P-256/A256GCM profile, and derive with the exact RFC
+7518 ordering, including optional agreement-party information. Header mutation,
+nonempty encrypted keys and incorrect IV/tag lengths fail closed. Unsupported
+critical extensions and compression are rejected. RFC 7518 Appendix C and
+independently generated Python cryptography vectors prevent a self-consistent
+round trip from concealing wire incompatibility. Old nonstandard ciphertexts
+are intentionally not accepted by a compatibility fallback.
+
+The verified-claims generic release loop must not override the specialized
+verification-envelope validator. Matching subsets survive; malformed envelopes
+cannot be reintroduced through a generic voluntary or exact-value request.
+
+Registered ID-token encryption uses an inline public P-256 recipient key regardless
+of the client's authentication method. Signing-only keys, private key material,
+and incompatible key operations cannot select the encryption recipient. The
+current implementation does not fetch encryption keys from `jwks_uri`; such
+registrations are rejected. If configured encryption cannot be performed at
+issuance, the request fails instead of returning a plaintext signed ID token.
 
 ---
 
@@ -12751,6 +12958,57 @@ authorization surface rather than adding a dark one.
 
 ---
 
+# DBSC session binding (DESIGN NOTE)
+
+Source: docs/experimental/dbsc-session-binding.md
+
+# DBSC session binding (DESIGN NOTE)
+
+**Status:** design note only. No prototype ships.
+**Pinned revision:** the Device-Bound Session Credentials (DBSC) spec as shipped in Chrome 146 GA (April 2026).
+**Feature flag:** none (no prototype).
+**Trigger condition:** DBSC support spreads beyond Chromium-on-Windows (the second browser + a non-Windows OS), OR a concrete enterprise engagement names it.
+**Graduation criteria:** a Chromium-only prototype binding the hosted-pages OP session cookie to a device-bound credential, with the documented graceful fallback (a standard session cookie) everywhere else, behind the experimental ack gate.
+
+## The bet
+
+- No OSS IdP ships DBSC-bound OP session cookies; a first-mover here is a real differentiator for the hosted-pages tier.
+- The session layer (the opaque server-side session row + hardened cookie from issue #20) is the seam: the cookie already carries only an identifier; a DBSC arm adds the device-bound assertion at the session's establishment and refresh.
+- The fallback is structural: a browser without DBSC gets the current cookie semantics, so the prototype can never brick a session.
+- Google Workspace defaulting DBSC on (May 2026) is the demand-side signal.
+
+## What must NOT happen
+
+- Binding anything but the session cookie: DBSC on the API/token surfaces would be a different product change with its own attack surface.
+
+---
+
+# IDA schema readiness (DESIGN NOTE + SHIPPED SEAM)
+
+Source: docs/experimental/ida-schema-readiness.md
+
+# IDA schema readiness (DESIGN NOTE + SHIPPED SEAM)
+
+**Status:** the schema seam ships (verified_claims carrier + subset semantics); the full IDA surface does not.
+**Pinned revision:** the IDA verified_claims shape as it stands (trust framework, evidence, assurance).
+**Feature flag:** none (the carrier is inert until a claim document stores an envelope and a request names it).
+**Trigger condition for the full surface:** a regulated customer demanding IDA verified_claims request syntax and response assembly (4-8 weeks as an additive feature, by design).
+**Graduation criteria for the seam:** the acceptance criterion's end-to-end demonstration — a claim carrying verification metadata stored, requested, and emitted — in the test suite (landed).
+
+## The shipped seam
+
+The claims pipeline now carries per-claim verification metadata end to end:
+
+- **Stored:** the user's claim document (migration 0009, verbatim JSON) carries the `verified_claims` envelope.
+- **Requested:** the `claims` parameter names `verified_claims`, optionally pinning the verification subset (trust frameworks, assurance levels).
+- **Emitted:** the ONE shared assembler (`scope_claims::assemble_claims`) releases the filtered envelope; an envelope outside the pinned subset is omitted entirely — never partially released, because the claims half without the assurance context would present unverifiable identity data as verified.
+
+## The additive surface
+
+When the trigger fires: verified_claims request syntax and response assembly land ON TOP of the seam — the envelope model, the subset release, and the assembler wiring are already there. The seam deliberately does not verify anything about the metadata's truth; trust-framework believability is the framework's own question.
+
+---
+
 # Identity chaining and ID-JAG, the receiving side (PROTOTYPE)
 
 Source: docs/experimental/identity-chaining.md
@@ -12968,6 +13226,105 @@ The secret's lifetime is clamped at the mint rather than exposed, for the reason
 - **Device binding**, so an exfiltrated secret does not work from another machine.
 - **Rotation on redemption**, which bounds the damage of a leaked secret to one exchange rather than to the session's lifetime.
 - **An operator surface.** The SSO set is severable, but nothing lists it: an operator cannot see which secrets are live for a person without reading the table.
+
+---
+
+# OID4VC (DESIGN NOTE)
+
+Source: docs/experimental/oid4vc.md
+
+# OID4VC (DESIGN NOTE)
+
+**Status:** design note only. No prototype ships.
+**Pinned revision:** OID4VCI / OID4VP as published, with HAIP conformance targeted (HAIP 1.1 planned for December 2026 — the profile-version-sensitive code is isolated because of it).
+**Feature flag:** none (no prototype).
+**Trigger condition:** a regulated-sector demand signal — the eIDAS 2.0 December 2026 member-state deadline passing with a concrete wallet-integration request, or an EUDI-login-style engagement (Keycloak's EUDI-login request is its second most-reacted open issue).
+**Graduation criteria:** an OID4VCI issuer (SD-JWT VC, pre-authorized code and authorization code flows, issuer metadata) followed by an OID4VP verifier ("log in with EUDI wallet" via DCQL and direct_post), both targeting HAIP conformance.
+
+## The bet
+
+- The wallet ecosystem consolidated on OID4VP + the browser Digital Credentials API (SIOPv2 refused).
+- HAIP centers on ES256 — already in the algorithm matrix — so the crypto surface is a config stance, not a new stack.
+- SD-JWT VC is the credential format the EUDI ecosystem actually uses; the jose crate's JWT assembly is the seam it slots into.
+
+## What must NOT happen
+
+- OID4VP before OID4VCI (a verifier with no issuer ecosystem is a demo).
+- Base-spec-only conformance: HAIP conformance is the acceptance bar.
+
+---
+
+# OpenID Federation 1.1 (DESIGN NOTE)
+
+Source: docs/experimental/openid-federation.md
+
+# OpenID Federation 1.1 (DESIGN NOTE)
+
+**Status:** design note only. No prototype ships.
+**Pinned revision:** OpenID Federation 1.1 Final (May 2026) — the corrected final text, not the 2024 drafts.
+**Feature flag:** none (no prototype).
+**Trigger condition:** a concrete ecosystem engagement — a federation operator (the Italy SPID/CIE class, or a comparable national-scale program) naming IronAuth as a participant or relying party. 3-6 engineer-months budget, milestone-class.
+**Graduation criteria:** leaf entity + automatic client registration shipping behind the experimental ack gate: entity statements at `/.well-known/openid-federation`, trust-chain resolution, metadata policy merge — all pinned to the 1.1 Final text, with the conformance suite's federation tests green.
+
+## The bet
+
+- 1.1 Final runs at national scale (10,000+ RPs in the Italian context); no OSS Rust participant.
+- The cheapest hedge regardless of the trigger: keep entity metadata and trust config modular in the existing discovery/client-registration surfaces so the federation layer is an addition, not a rework.
+- The registration story is the actual product: a federation participant registers through the trust chain, so the entity statement + metadata policy merge IS the DCR flow's federation arm.
+
+## What must NOT happen
+
+- Trust-anchor and intermediate tooling before a leaf entity exists.
+- Budget before a concrete engagement (the trigger discipline is the issue's whole point).
+
+---
+
+# Post-quantum readiness (DESIGN NOTE)
+
+Source: docs/experimental/post-quantum-readiness.md
+
+# Post-quantum readiness (DESIGN NOTE)
+
+**Status:** design note only. No prototype ships.
+**Pinned revision:** RFC 9964 (ML-DSA for JOSE and COSE, May 2026); FIPS 204 (final).
+**Feature flag:** none (no prototype).
+**Trigger condition:** ecosystem verifier support for ML-DSA JOSE broadens to the point where a tenant can actually consume an ML-DSA-issued token — OR the JOSE hybrid composite (`draft-ietf-jose-pq-composite-sigs`) reaches a stable revision and a KMS partner carries it.
+**Graduation criteria:** an ML-DSA-44 signer behind the experimental ack gate, signed under a pinned RFC 9964 revision, passing the workspace's JOSE test-vector battery; then ecosystem evidence (two independent verifiers consuming the tokens) before anything leaves experimental.
+
+## The bet
+
+- **Priority ordering:** JWE key agreement and long-lived trust material over access-token signing. Access tokens are short-lived and rotating; trust anchors are what outlive a Shor-capable adversary.
+- **The seam:** the key store stays fully polymorphic over alg/kid/key-type so RFC 9964's AKP kty (seed-only private keys) slots in as just another signer. The external-signer seam (issue #161) already keeps the backend abstract; the AKP kty is a key-shape, not a backend, and the jose crate's key material enum is the single widening point.
+- **The hedge:** JOSE hybrid composites (ML-DSA plus Ed25519) tracked as the likely transition shape; nothing ships until both halves of the hybrid are verifiable in the ecosystem.
+- **Cost today:** roughly 5 KB tokens break cookie limits — the constraint that makes signing readiness, not shipping, the right stance.
+
+## What must NOT happen
+
+- ML-DSA as a default posture: token size + verifier thinness make it a regression for everyone until the ecosystem moves.
+
+---
+
+# Token status list (DESIGN NOTE)
+
+Source: docs/experimental/token-status-list.md
+
+# Token status list (DESIGN NOTE)
+
+**Status:** design note only (a watch item, not one of the five bets).
+**Pinned revision:** `draft-ietf-oauth-status-list` (tracked; Janssen's Cedarling already consumes it).
+**Feature flag:** none (no prototype).
+**Trigger condition:** the draft reaches RFC, OR two independent ecosystem consumers are live.
+**Graduation criteria:** status-list publication over the token store with NO schema change (the design constraint), behind the experimental ack gate.
+
+## The bet
+
+- A status list is a compact signed artifact encoding token statuses (revoked, suspended, etc.) for offline-ish validation — the revocation surface's scalable arm.
+- The design constraint that makes it cheap: the token store already records revocation state per token; a status-list publication reads that state and composes the signed list. The store's revocation rows are the single source; publication is a projection.
+- The jose crate's JWT assembly + the signing policy govern the list's signature exactly as they govern a token's.
+
+## What must NOT happen
+
+- A schema change to enable it (the constraint IS the bet: the store already holds the state).
 
 ---
 

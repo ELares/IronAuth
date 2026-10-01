@@ -22862,6 +22862,171 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories": {
+      "get": {
+        "tags": [
+          "security"
+        ],
+        "summary": "List the accepted advisories (the admin SPA's banner surface).",
+        "operationId": "listSecurityAdvisories",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The accepted security advisories",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdvisoryListView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or not in this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/security/advisories/import": {
+      "post": {
+        "tags": [
+          "security"
+        ],
+        "summary": "Import the signed advisory bundle (the offline path; the online poll uses the\nSAME verification).",
+        "operationId": "importSecurityAdvisories",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdvisoryImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The verified advisories replaced the accepted set"
+          },
+          "400": {
+            "description": "The bundle failed verification or does not parse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment is absent or not in this scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys": {
       "get": {
         "tags": [
@@ -30827,6 +30992,77 @@
             "type": "string",
             "description": "The organization membership to bind (`omb_...`), NOT a user id. It must be a\nLIVE membership of THIS organization; anything else (absent, removed,\nanother scope's, another organization's) is the uniform not-found.",
             "example": "omb_..."
+          }
+        }
+      },
+      "AdvisoryImportRequest": {
+        "type": "object",
+        "description": "The offline bundle import request: the SAME signed feed the online poll\nconsumes.",
+        "required": [
+          "feed"
+        ],
+        "properties": {
+          "feed": {
+            "type": "string",
+            "description": "The signed feed document (the `feed` + `signature` members)."
+          }
+        }
+      },
+      "AdvisoryListView": {
+        "type": "object",
+        "description": "The accepted advisories.",
+        "required": [
+          "advisories"
+        ],
+        "properties": {
+          "advisories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdvisoryView"
+            },
+            "description": "The accepted advisories, newest first."
+          }
+        }
+      },
+      "AdvisoryView": {
+        "type": "object",
+        "description": "One advisory, as the banner surface renders it.",
+        "required": [
+          "id",
+          "title",
+          "severity",
+          "affected_versions",
+          "summary",
+          "published_at"
+        ],
+        "properties": {
+          "affected_versions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The affected version ranges."
+          },
+          "id": {
+            "type": "string",
+            "description": "The stable advisory identifier."
+          },
+          "published_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The advisory's published date (unix seconds)."
+          },
+          "severity": {
+            "type": "string",
+            "description": "The severity tier."
+          },
+          "summary": {
+            "type": "string",
+            "description": "The banner summary."
+          },
+          "title": {
+            "type": "string",
+            "description": "The human-facing title."
           }
         }
       },

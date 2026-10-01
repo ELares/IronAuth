@@ -1,0 +1,14 @@
+{
+  "generator": "Python cryptography 41.0.7 ConcatKDFHash(SHA256) and AESGCM; fixed synthetic scalars 1 and 2",
+  "recipient_private": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE",
+  "vectors": [
+    {
+      "compact": "eyJhbGciOiJFQ0RILUVTIiwiZW5jIjoiQTI1NkdDTSIsImVwayI6eyJrdHkiOiJFQyIsImNydiI6IlAtMjU2IiwieCI6ImZQSjdHSTBEVDM2S1VqZ0RCTFVhdzhDSmFlSjM4aHMxcGd0SV9FZG1tWGciLCJ5IjoiQjNkVkVOdU8wRUFwUFpyR24zUXcyN3A5cmVZODZZSXBuZ1MzblNKNGM5RSJ9fQ..AAECAwQFBgcICQoL.9VEM1S5oytlhIUg4UVjpt3MYxWul3DIGUQ.LErdTYgE1f-_qN7DctWdgg",
+      "plaintext": "SW5kZXBlbmRlbnQgSldFIGZpeHR1cmUA_w"
+    },
+    {
+      "compact": "eyJhbGciOiJFQ0RILUVTIiwiZW5jIjoiQTI1NkdDTSIsImVwayI6eyJrdHkiOiJFQyIsImNydiI6IlAtMjU2IiwieCI6ImZQSjdHSTBEVDM2S1VqZ0RCTFVhdzhDSmFlSjM4aHMxcGd0SV9FZG1tWGciLCJ5IjoiQjNkVkVOdU8wRUFwUFpyR24zUXcyN3A5cmVZODZZSXBuZ1MzblNKNGM5RSJ9LCJhcHUiOiJRV3hwWTJVIiwiYXB2IjoiUW05aSJ9..AAECAwQFBgcICQoL.ylQZ7lG59hMxjD7nr9GZHyE-EmETv9QR1g.Gd1pHEuk9RygJB6zLLeDBw",
+      "plaintext": "SW5kZXBlbmRlbnQgSldFIGZpeHR1cmUA_w"
+    }
+  ]
+}

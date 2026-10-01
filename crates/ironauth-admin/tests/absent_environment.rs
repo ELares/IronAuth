@@ -844,6 +844,13 @@ fn environment_child_cases(base: &str, ids: &Ids) -> Vec<Case> {
         ..
     } = ids;
     vec![
+        Case {
+            label: "advisories.importSecurityAdvisories",
+            method: "POST",
+            path: format!("{base}/security/advisories/import"),
+            // Scope refusal must precede feed verification and any global write.
+            body: Some(body_of(&serde_json::json!({"feed": "{}"}))),
+        },
         // The streaming bulk-import job (issue #55). Its body is newline-delimited
         // records rather than a JSON object, which changes nothing here: at an absent
         // environment neither route reads a byte of it.

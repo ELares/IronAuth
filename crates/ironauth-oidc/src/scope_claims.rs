@@ -207,6 +207,12 @@ pub fn assemble_claims(
     //    any pinned value/values filter. This can add a claim no scope selected,
     //    or narrow one a scope already released.
     for (name, spec) in requested {
+        // This envelope was already filtered by its verification subset above.
+        // Generic value equality would remove a valid subset or re-release an
+        // invalid envelope that the specialized path refused.
+        if name == crate::verified_claims::VERIFIED_CLAIMS_CLAIM {
+            continue;
+        }
         // The same refusal on the explicit-request path. This is the one an attacker
         // actually reaches: a claims request is caller-supplied, so without this a client
         // could ask for `aud` and have it released from the bag.
@@ -266,13 +272,30 @@ mod tests {
     }
 
     #[test]
+    fn generic_claim_release_cannot_bypass_verified_envelope_validation() {
+        let invalid = json!({"claims": {"email": "ada@example.test"}});
+        let bag = json!({"verified_claims": invalid})
+            .as_object()
+            .unwrap()
+            .clone();
+        for spec in [ClaimSpec::voluntary(), ClaimSpec::with_value(invalid)] {
+            let requested =
+                std::collections::BTreeMap::from([("verified_claims".to_owned(), spec)]);
+            assert!(
+                !assemble_claims(&bag, &scopes(&["openid"]), &requested)
+                    .contains_key("verified_claims")
+            );
+        }
+    }
+
+    #[test]
     fn verified_claims_rides_the_pipeline_end_to_end() {
         // STORED: the claim document carries the envelope (the bag above).
         let requested = {
             let mut map = std::collections::BTreeMap::new();
             map.insert(
                 crate::verified_claims::VERIFIED_CLAIMS_CLAIM.to_owned(),
-                ClaimSpec::voluntary().with_value(json!({"verification": {}})),
+                ClaimSpec::with_value(json!({"verification": {}})),
             );
             map
         };
@@ -297,8 +320,7 @@ mod tests {
             let mut map = std::collections::BTreeMap::new();
             map.insert(
                 crate::verified_claims::VERIFIED_CLAIMS_CLAIM.to_owned(),
-                ClaimSpec::voluntary()
-                    .with_value(json!({"verification": {"trust_framework": ["eidas"]}})),
+                ClaimSpec::with_value(json!({"verification": {"trust_framework": ["eidas"]}})),
             );
             map
         };

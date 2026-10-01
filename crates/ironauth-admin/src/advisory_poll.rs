@@ -120,9 +120,7 @@ impl From<crate::advisory_feed::FeedError> for PollError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironauth_env::Env;
     use ironauth_jose::SigningKey;
-    use std::time::SystemTime;
 
     #[test]
     fn a_failed_verification_is_the_tampered_case() {
@@ -140,7 +138,6 @@ mod tests {
 
     #[test]
     fn the_signing_helpers_round_trip() {
-        let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 9);
         let key = SigningKey::ed25519_from_seed(Some("advisory".to_owned()), &[9; 32])
             .expect("the key loads");
         let feed = serde_json::json!([{ "id": "ADV-2026-009", "title": "t", "severity": "low", "affected_versions": [], "summary": "s", "published_at": 1 }]);
