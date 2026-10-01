@@ -10,6 +10,7 @@ handing the caller the body.
 
 from __future__ import annotations
 
+from copy import copy
 import json
 import urllib.parse
 import urllib.request
@@ -22,6 +23,16 @@ class Client:
     def __init__(self, base_url: str, token: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
+        self._idempotency_key = ""
+
+    def with_idempotency_key(self, key: str) -> Client:
+        """Return a copy sending key; reuse it for one operation's retries.
+
+        The original client is unchanged; an empty key omits the header.
+        """
+        cloned = copy(self)
+        cloned._idempotency_key = key
+        return cloned
 
     def _do(
         self,
@@ -37,6 +48,8 @@ class Client:
         data = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(target, data=data, method=method)
         request.add_header("Authorization", f"Bearer {self.token}")
+        if self._idempotency_key:
+            request.add_header("Idempotency-Key", self._idempotency_key)
         if data is not None:
             request.add_header("Content-Type", "application/json")
         try:

@@ -25,11 +25,22 @@ type Client struct {
 	BaseURL string
 	Token   string
 	HTTP    *http.Client
+
+	idempotencyKey string
 }
 
 // New returns a client for baseURL authenticating with a management token.
 func New(baseURL, token string) *Client {
 	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: http.DefaultClient}
+}
+
+// WithIdempotencyKey returns a copy that sends key with each request.
+// Reuse this copy and the same request for retries of one logical operation.
+// The original client is unchanged; an empty key omits the header.
+func (c *Client) WithIdempotencyKey(key string) *Client {
+	cloned := *c
+	cloned.idempotencyKey = key
+	return &cloned
 }
 
 // do issues one request. Exported methods below differ only in method, path, and
@@ -54,6 +65,9 @@ func (c *Client) do(method, path string, query url.Values, body any) (*http.Resp
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
+	if c.idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", c.idempotencyKey)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

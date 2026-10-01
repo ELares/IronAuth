@@ -1877,10 +1877,12 @@ jobs:
         run: python3 scripts/sdk-contract.py --check
       - name: Generated management SDKs are fresh (issue #122)
         run: python3 scripts/gen-management-sdks.py --check
-      - name: Generated Go SDK builds (issue #122 criterion 4)
-        run: cd sdks/go && go build ./...
+      - name: Generated Go SDK request tests (issue #122 criterion 4)
+        run: cd sdks/go && go test ./...
       - name: Generated Python SDK imports (issue #122 criterion 4)
         run: python3 -c "import importlib.util; s=importlib.util.spec_from_file_location('c','sdks/python/ironauth_management/client_gen.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)"
+      - name: Generated Python SDK request tests
+        run: python3 -B -m unittest discover -s sdks/python/tests
       - name: Events-vs-webhooks guidance freshness (issue #107)
         run: python3 scripts/events-vs-webhooks.py --check
       - name: Metering stays off the hot path (issue #107)
