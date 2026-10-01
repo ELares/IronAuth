@@ -36,7 +36,7 @@ use ring::aead::{AES_256_GCM, Aad as RingAad, LessSafeKey, Nonce, UnboundKey};
 use crate::crypto::sha256;
 
 /// The refused JWE algorithm families: `RSA1_5` (Bleichenbacher class) and the
-/// PBKDF2-based algorithms. Refused at the PARSE, never implemented.
+/// `PBKDF2`-based algorithms. Refused at the PARSE, never implemented.
 pub const REFUSED_JWE_ALGORITHMS: &[&str] = &[
     "RSA1_5",
     "PBES2-HS256+A128KW",
@@ -56,7 +56,7 @@ const CONTENT_ENC: &str = "A256GCM";
 /// A JWE processing failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JweError {
-    /// The algorithm is refused or unsupported (`RSA1_5`, the PBKDF2 family, or
+    /// The algorithm is refused or unsupported (`RSA1_5`, the `PBKDF2` family, or
     /// anything outside the curated suite).
     UnsupportedAlgorithm,
     /// The ciphertext does not decrypt (a wrong key, a tampered compact form, or
@@ -261,6 +261,7 @@ mod tests {
     /// A fresh P-256 keypair: the static private scalar + the uncompressed public
     /// point, drawn off the determinism-seam bridge (the same rng the keygen uses).
     fn p256_keypair(entropy: &dyn ironauth_env::Entropy) -> ([u8; 32], Vec<u8>) {
+        use p256::elliptic_curve::sec1::ToEncodedPoint as _;
         let mut rng = ironauth_env::keygen_rng(entropy);
         let private = p256::SecretKey::random(&mut rng);
         let public_point = private.public_key().to_encoded_point(false);

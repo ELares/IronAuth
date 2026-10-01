@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Preserve published migrations 0241 and 0242 while assigning the new guardrail
+  view repair to 0243. Recognize only the exact published and corrected 0242
+  checksums; append view columns without replacing their existing order, grants
+  or dependencies. Historical ledgers remain unchanged.
+
 - Preserve the already published `signing_key.break_glass` v1 event name through
   an exact legacy-wire exception; newly registered event names still require past tense.
 

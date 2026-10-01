@@ -364,6 +364,8 @@ use crate::views::{
         crate::dcr::verify_dcr_client,
         crate::signing_algorithm::get_signing_recommendations,
         crate::signing_algorithm::set_client_signing_algorithm,
+        crate::advisories::list_security_advisories,
+        crate::advisories::import_security_advisories,
         crate::connectors::create_connector,
         crate::connectors::list_connectors,
         crate::connectors::get_connector,

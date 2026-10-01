@@ -158,7 +158,11 @@ async fn a_client_registered_for_signed_userinfo_receives_a_signed_jwt() {
         "a registered client receives the signed form"
     );
     let claims = payload_claims(&body);
-    assert_eq!(claims["iss"], serde_json::json!("https://issuer.test"), "{claims:?}");
+    assert_eq!(
+        claims["iss"],
+        serde_json::json!("https://issuer.test"),
+        "{claims:?}"
+    );
     assert!(
         claims.get("aud").is_some(),
         "the mandatory aud claim rides the signed response: {claims:?}"

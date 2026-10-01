@@ -17,11 +17,7 @@ use ironauth_oidc::ClientAuthMethod;
 
 /// Drive the authorize request with the given query + cookie, returning the
 /// redirect's error parameter (or `None` when the request succeeds).
-async fn authorize_error(
-    h: &Harness,
-    query: &str,
-    cookie: &str,
-) -> Option<String> {
+async fn authorize_error(h: &Harness, query: &str, cookie: &str) -> Option<String> {
     let (status, headers, _) = h.authorize_with_cookie(query, cookie).await;
     assert_eq!(status, StatusCode::SEE_OTHER, "authorize redirects");
     common::location_param(&headers, "error")
@@ -142,9 +138,16 @@ async fn a_bearer_code_exchange_is_refused_only_under_hardened_mode() {
         ("redirect_uri", REDIRECT_URI),
     ]);
     let (status, _, body) = plain
-        .token_with_auth(&exchange, Some(&basic(&plain_id.to_string(), &plain_secret)))
+        .token_with_auth(
+            &exchange,
+            Some(&basic(&plain_id.to_string(), &plain_secret)),
+        )
         .await;
-    assert_eq!(status, StatusCode::OK, "the plain env issues a bearer token: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the plain env issues a bearer token: {body}"
+    );
 
     // The hardened side: refused.
     let mut hardened = Harness::start().await;
