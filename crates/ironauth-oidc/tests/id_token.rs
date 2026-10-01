@@ -207,18 +207,45 @@ async fn requesting_acr_values_yields_the_achieved_acr_never_the_requested_value
 #[tokio::test]
 async fn code_exchange_encrypts_exactly_one_signed_id_token_for_registered_client() {
     use base64::Engine as _;
-    let harness = Harness::start().await;
-    let client_id = harness.client_id().to_string();
-    harness
-        .set_id_token_encryption(
-            &serde_json::json!({"keys": [{
-                "kty": "EC", "crv": "P-256", "use": "enc",
-                "x": "weNJy2HscCSM6AEDTDg04biOvhFhyyWvOHQfeF_PxMQ",
-                "y": "e8lnCO-AlStT-NJVX-crhB7QRYhiix03illJOVAOyck"
-            }]})
+    let harness = Harness::start_with(ironauth_config::OidcConfig {
+        registration_enabled: true,
+        registration_mode: ironauth_config::RegistrationMode::Open,
+        ..ironauth_config::OidcConfig::default()
+    })
+    .await;
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/t/{}/e/{}/connect/register",
+            harness.scope().tenant(),
+            harness.scope().environment(),
+        ))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "client_name": "Encrypted token regression",
+                "redirect_uris": [REDIRECT_URI],
+                "token_endpoint_auth_method": "none",
+                "id_token_encrypted_response_alg": "ECDH-ES",
+                "id_token_encrypted_response_enc": "A256GCM",
+                "jwks": {"keys": [{
+                    "kty": "EC", "crv": "P-256", "use": "enc",
+                    "x": "weNJy2HscCSM6AEDTDg04biOvhFhyyWvOHQfeF_PxMQ",
+                    "y": "e8lnCO-AlStT-NJVX-crhB7QRYhiix03illJOVAOyck"
+                }]}
+            })
             .to_string(),
-        )
-        .await;
+        ))
+        .expect("registration request");
+    let (status, _, body) = harness.send(request).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let client_id = json(&body)["client_id"]
+        .as_str()
+        .expect("client id")
+        .to_owned();
+    let client = ironauth_store::ClientId::parse_in_scope(&client_id, &harness.scope())
+        .expect("scoped registered client");
+    harness.verify_client(&client).await;
     let cookie = consenting_cookie(&harness, &client_id).await;
     let (status, headers, body) = harness
         .authorize_with_cookie(
