@@ -516,7 +516,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 state
                     .with_backup_trigger(backup_trigger.clone())
                     .with_advisory_feed(
-                        ironauth_admin::advisory_feed::configured_verification_key(config),
+                        ironauth_admin::advisory_feed::configured_verification_key(&config),
                         config.advisory_poll_interval_secs,
                     ),
             )
@@ -616,15 +616,24 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // Disabled unless both the feed URL and the verification key are set.
         if let Some(url) = &config.advisory_feed_url {
             if let Some(trusted) =
-                ironauth_admin::advisory_feed::configured_verification_key(config)
+                ironauth_admin::advisory_feed::configured_verification_key(&config)
             {
-                ironauth_admin::advisory_poll::spawn_advisory_poll(
-                    control_store.clone(),
-                    url.clone(),
-                    config.advisory_poll_interval_secs,
-                    trusted,
-                );
-                tracing::info!(%url, "security-advisory feed poll enabled (never load-bearing)");
+                // The readiness store IS the control-plane store: every plane's
+                // pool opens from the same DSN, and the poll is a control-plane
+                // reader. None (no plane opened a pool) leaves the poll off,
+                // which is the same never-load-bearing stance.
+                if let Some(store) = planes.readiness_store.clone() {
+                    ironauth_admin::advisory_poll::spawn_advisory_poll(
+                        store,
+                        url.clone(),
+                        config.advisory_poll_interval_secs,
+                        trusted,
+                    );
+                    tracing::info!(
+                        %url,
+                        "security-advisory feed poll enabled (never load-bearing)"
+                    );
+                }
             }
         }
         // The async flow-target delivery worker (issue #112 criterion 2), behind its OWN
