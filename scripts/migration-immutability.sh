@@ -18,6 +18,9 @@
 # The correction for a wrong comment in a shipped migration goes on the Rust type or in the
 # crate CHANGELOG, never in the file. See migration 0073's correction on
 # `PolicyDecisionInputs` and migration 0099's in `ironauth-store/CHANGELOG.md`.
+# The sole exact exception below repairs the fresh-chain failure in 0237; it
+# matches migrate.rs's narrowly pinned compatibility and forward repair 0243.
+# See docs/design/RECIPIENT-VERIFICATION.md and issue #1437.
 #
 # Usage: scripts/migration-immutability.sh [base-ref]   (default origin/main)
 set -euo pipefail
@@ -94,6 +97,7 @@ if [ ! -s "$list_file" ]; then
 fi
 
 violations=0
+repairs=0
 # NUL delimited, and read from a FILE rather than a pipe: a pipe would run the loop in a
 # subshell and `violations` would be discarded when it exited.
 while IFS= read -r -d '' file; do
@@ -142,6 +146,29 @@ while IFS= read -r -d '' file; do
   # heading saying the file changed.
   [ "$before" = "$after" ] && continue
 
+  # 0237 attempted to rename an existing view column, which PostgreSQL rejects
+  # before any appended migration can run. Admit only these reviewed bytes at
+  # this exact path, not another edit to 0237 or a same-content different file.
+  # migrate.rs accepts this same old/new pair without rewriting old ledgers;
+  # 0243 validates and repairs the prior view shape without dropping it.
+  if [ "$file" = "crates/ironauth-store/migrations/0237_fapi_hardened.sql" ] &&
+     [ "$before" = "02bd786d62041c24c5a6268b8c33bf53cdcdc6610701b42a509c514dbd6f2530" ] &&
+     [ "$after" = "68cd229209d09ff7045ac02c3a16d60b9ec705b3c633617862f3b75d335dd81b" ]; then
+    echo "migration-immutability: admitted exact 0237 compatibility repair (issue #1437)."
+    repairs=$((repairs + 1))
+    continue
+  fi
+
+  # The published 0242 repeats the view-column collision after corrected 0237.
+  # Keep its exact original ledger accepted; reject every other digest pair.
+  if [ "$file" = "crates/ironauth-store/migrations/0242_fips_profile.sql" ] &&
+     [ "$before" = "59fa9390262ccdf8fa57542aa75f93d752a50be7e56bb816f558c371f5ef2121" ] &&
+     [ "$after" = "f095fd161ff668c0a2e10cfb027507d13580b0b19f0e2553f4db1fd684067aff" ]; then
+    echo "migration-immutability: admitted exact 0242 compatibility repair."
+    repairs=$((repairs + 1))
+    continue
+  fi
+
   echo "migration-immutability: FROZEN MIGRATION CHANGED: $file"
   echo "    checksum in $BASE : $before"
   echo "    checksum here     : $after"
@@ -169,4 +196,4 @@ MSG
   exit 1
 fi
 
-echo "migration-immutability: clean (no landed migration modified against $BASE)."
+echo "migration-immutability: clean (no unrecognized landed migration change against $BASE; $repairs exact repairs)."

@@ -1631,6 +1631,8 @@ jobs:
       # ref cannot be resolved, since "could not run" is not "nothing changed".
       - name: migration immutability (a landed migration's bytes never change)
         run: scripts/migration-immutability.sh "origin/${{ github.base_ref || 'main' }}"
+      - name: migration immutability regression cases
+        run: python3 scripts/test-migration-immutability.py
       # An EXPAND or MIGRATE migration runs while the PREVIOUS binary is still serving, so it may
       # add and may not take away. This rejects the statement kinds that break that binary: a
       # dropped column or table, a column made mandatory or made nullable, a retyped column in

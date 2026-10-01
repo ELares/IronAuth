@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Preserve published migrations 0241 and 0242 while assigning the new guardrail
+  view repair to 0243. Recognize only the exact published and corrected 0242
+  checksums; append view columns without replacing their existing order, grants
+  or dependencies. Historical ledgers remain unchanged.
+
 - Preserve the already published `signing_key.break_glass` v1 event name through
   an exact legacy-wire exception; newly registered event names still require past tense.
 
@@ -14,6 +19,13 @@ range per docs/RELEASING.md.
   Implementors must update that result type; every failure still prevents key
   promotion through the same store error mapping.
 
+- Repair upstream migration 0237's guardrail view column ordering. The runner
+  admits only its exact known old checksum in addition to the corrected bytes;
+  migration 0241 validates and repairs that old view shape while retaining data,
+  ledger entries, grants, ownership and compatible dependents. Every other
+  checksum change remains refused. The migration byte guard admits the same
+  exact path/digest pair and has adversarial disposable-Git regression cases.
+  See the recipient-verification design note.
 
 - Add `Store::probe_readiness` (issue #149): the query `/readyz` asks, on the pool requests
   are served from rather than a fresh connection. Reports whether the schema is one this

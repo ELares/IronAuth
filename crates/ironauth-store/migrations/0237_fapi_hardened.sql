@@ -19,7 +19,7 @@
 ALTER TABLE environments ADD COLUMN fapi_hardened boolean NOT NULL DEFAULT false;
 
 CREATE OR REPLACE VIEW environment_guardrails AS
-    SELECT tenant_id, id AS environment_id, kind, custom_domain, fapi_hardened
+    SELECT tenant_id, id AS environment_id, kind, custom_domain, auto_link_posture, fapi_hardened
     FROM environments
     WHERE tenant_id = current_setting('ironauth.tenant_id', true)
       AND id = current_setting('ironauth.environment_id', true);
