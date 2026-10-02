@@ -301,3 +301,44 @@ async fn starttls_never_falls_back_to_plaintext() {
         .unwrap()
         .unwrap();
 }
+
+#[test]
+fn operator_configuration_resolves_secrets_only_when_enabled_and_redacts_failures() {
+    use ironauth_config::{
+        RecipientSmtpSecurity, RecipientSmtpSettings, RecipientVerificationConfig, Secret,
+        SecretString,
+    };
+    let settings = RecipientSmtpSettings {
+        host: "localhost".into(),
+        port: 465,
+        security: RecipientSmtpSecurity::Implicit,
+        sender: "verify@example.test".into(),
+        message_id_domain: "auth.example.test".into(),
+        username: Some(Secret::Literal(SecretString::new("fixture-user"))),
+        password: Some(Secret::File(
+            "/nonexistent/ironauth-recipient-1475/password".into(),
+        )),
+        max_in_flight: 2,
+    };
+    let mut config = RecipientVerificationConfig {
+        enabled: false,
+        smtp: Some(settings),
+    };
+    assert!(
+        RecipientSmtpTransport::configured(&config, env())
+            .unwrap()
+            .is_none()
+    );
+    config.enabled = true;
+    let error = RecipientSmtpTransport::configured(&config, env()).unwrap_err();
+    assert_eq!(error.to_string(), "invalid recipient SMTP configuration");
+    config.smtp.as_mut().unwrap().password =
+        Some(Secret::Literal(SecretString::new("fixture-password")));
+    assert!(
+        RecipientSmtpTransport::configured(&config, env())
+            .unwrap()
+            .is_some()
+    );
+    config.smtp = None;
+    assert!(RecipientSmtpTransport::configured(&config, env()).is_err());
+}

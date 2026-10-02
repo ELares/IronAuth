@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add the authenticated mailbox verification page with registered in-scope authorization continuation, current ownership on reload, honest send recovery and scoped cancellation (#1475).
+
 - Add a bounded TLS SMTP adapter for subject-bound recipient verification (#1475),
   with challenge-bound message identity, redacted errors, concurrency limits and
   accepted/refused/uncertain outcomes. The hosted ceremony remains disabled pending

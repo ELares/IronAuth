@@ -89,6 +89,52 @@ fn mailbox(value: &str) -> Result<Address, RecipientSmtpConfigError> {
 }
 
 impl RecipientSmtpTransport {
+    /// Resolve the operator's secret references and construct the configured
+    /// transport. Disabled settings never read secrets or create a client.
+    ///
+    /// # Errors
+    /// A value-free error for missing, unreadable or invalid relay configuration.
+    pub fn configured(
+        config: &ironauth_config::RecipientVerificationConfig,
+        env: Env,
+    ) -> Result<Option<Self>, RecipientSmtpConfigError> {
+        if !config.enabled {
+            return Ok(None);
+        }
+        let smtp = config.smtp.as_ref().ok_or(RecipientSmtpConfigError)?;
+        let credentials = match (&smtp.username, &smtp.password) {
+            (Some(user), Some(password)) => Some((
+                user.resolve()
+                    .map_err(|_| RecipientSmtpConfigError)?
+                    .expose()
+                    .to_owned(),
+                password
+                    .resolve()
+                    .map_err(|_| RecipientSmtpConfigError)?
+                    .expose()
+                    .to_owned(),
+            )),
+            (None, None) => None,
+            _ => return Err(RecipientSmtpConfigError),
+        };
+        Self::new(
+            RecipientSmtpConfig {
+                host: smtp.host.clone(),
+                port: smtp.port,
+                tls: match smtp.security {
+                    ironauth_config::RecipientSmtpSecurity::Implicit => RecipientSmtpTls::Implicit,
+                    ironauth_config::RecipientSmtpSecurity::StartTls => RecipientSmtpTls::StartTls,
+                },
+                sender: smtp.sender.clone(),
+                message_id_domain: smtp.message_id_domain.clone(),
+                credentials,
+                max_in_flight: smtp.max_in_flight,
+            },
+            env,
+        )
+        .map(Some)
+    }
+
     /// Construct a relay with verified TLS and bounded command deadlines.
     ///
     /// # Errors

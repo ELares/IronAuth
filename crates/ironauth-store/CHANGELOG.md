@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add audited, repeatable cancellation of the authenticated subject's pending recipient challenge without changing existing verified ownership (#1475).
+
 - Reconcile the recipient stack with published migrations 0241 and 0242 by assigning its new migrations 0243 through 0246. Repair the exact historical FIPS view collision without rewriting accepted ledger rows; retain the FIPS projection, existing view columns, ownership and grants on forward repair.
 
 - Add optional static, flushed stage diagnostics to the real outbox chaos test

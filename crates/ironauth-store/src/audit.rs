@@ -1563,6 +1563,8 @@ pub enum Action {
     EmailOtpSend,
     /// An authenticated recipient challenge was issued, without a session change.
     RecipientVerificationStart,
+    /// The authenticated subject cancelled its pending mailbox challenge.
+    RecipientVerificationCancel,
     /// A bounded recipient verification attempt and its ownership result.
     RecipientVerificationAttempt,
     /// A recipient challenge and verified ownership committed together.
@@ -2071,6 +2073,7 @@ impl Action {
             Action::AaguidRuleRemove => "aaguid.rule.remove",
             Action::EmailOtpSend => "email_otp.send",
             Action::RecipientVerificationStart => "recipient_verification.start",
+            Action::RecipientVerificationCancel => "recipient_verification.cancel",
             Action::RecipientVerificationAttempt => "recipient_verification.attempt",
             Action::RecipientVerificationVerified => "recipient_verification.verified",
             Action::EmailOtpVerify => "email_otp.verify",

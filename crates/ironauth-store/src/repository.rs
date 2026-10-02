@@ -20748,6 +20748,48 @@ pub struct ActingRecipientVerificationRepo<'a> {
 }
 
 impl ActingRecipientVerificationRepo<'_> {
+    /// Cancel this authenticated subject's current challenge, including one whose
+    /// send response was lost. Serializes with issue/verify and never clears an
+    /// already established ownership proof. Repeating cancellation is harmless.
+    ///
+    /// # Errors
+    /// Scope mismatch or a persistence/audit failure. No writes commit on failure.
+    pub async fn cancel(&self, env: &Env, subject: &UserId) -> Result<(), StoreError> {
+        let scope = self.scope;
+        if subject.scope() != scope {
+            return Err(StoreError::NotFound);
+        }
+        let now = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RecipientVerificationCancel,
+                target: subject,
+            },
+            async move |tx| {
+                recipient_ownership_lock(tx, scope).await?;
+                sqlx::query(
+                    "UPDATE recipient_verification_challenges SET consumed_at = \
+                     TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+                     AND consumed_at IS NULL",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(subject.to_string())
+                .bind(now)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
     /// Issue a challenge for this subject's own primary mailbox. Return the stored
     /// delivery address, not the request spelling. Reissue invalidates the old code.
     /// A durable one-minute cooldown bounds sends even across provider instances.

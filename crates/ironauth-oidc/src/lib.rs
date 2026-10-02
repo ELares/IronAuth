@@ -172,6 +172,7 @@ mod probe;
 mod quota;
 #[cfg(feature = "ironcache")]
 pub mod rate_store;
+mod recipient_page;
 /// Bounded SMTP delivery for subject-bound verification; activation remains gated.
 pub mod recipient_smtp;
 /// Gated subject-bound recipient verification and secret-safe transport contract.
@@ -1126,8 +1127,16 @@ pub fn oidc_router(state: OidcState) -> Router {
             "/t/{tenant_id}/e/{environment_id}/invitations/accept",
             post(invitations::accept_invitation),
         )
-        // Disabled recipient-proof core. Its only installer is testing-only;
-        // these routes return 503 until real delivery and the hosted journey ship.
+        // Default-off recipient verification. Only the concrete configured SMTP
+        // adapter (or a testing-only fixture) enables these scoped routes.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/email-verification",
+            get(recipient_page::page),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/email-verification/cancel",
+            post(recipient_verification::cancel).layer(axum::extract::DefaultBodyLimit::max(2048)),
+        )
         .route(
             "/t/{tenant_id}/e/{environment_id}/account/email-verification/start",
             post(recipient_verification::start).layer(axum::extract::DefaultBodyLimit::max(2048)),

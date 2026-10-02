@@ -133,7 +133,7 @@ pub(crate) async fn with_registered_form_navigation(
     response
 }
 
-async fn registered_form_origin(
+pub(crate) async fn registered_form_origin(
     state: &OidcState,
     raw_resume: Option<&str>,
     expected_scope: Option<Scope>,

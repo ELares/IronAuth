@@ -2338,9 +2338,22 @@ impl OidcState {
         self
     }
 
-    /// Install an owned LOCAL fixture transport for the disabled recipient core.
-    /// Production enablement requires the remaining delivery/UI/index-readiness
-    /// work in issue #1436; there is deliberately no production builder or flag.
+    /// Install the concrete TLS SMTP adapter for the hosted recipient ceremony.
+    /// Logging/no-op senders cannot use this production entry point. The caller
+    /// must resolve validated operator configuration; scoped ownership readiness
+    /// remains enforced by the store on every challenge and current proof.
+    #[must_use]
+    pub fn with_recipient_verification_smtp(
+        mut self,
+        transport: crate::recipient_smtp::RecipientSmtpTransport,
+    ) -> Self {
+        self.recipient_verification_transport = Some(Arc::new(transport));
+        self
+    }
+
+    /// Install an owned LOCAL fixture transport for recipient-core qualification.
+    /// Arbitrary adapters remain testing-only; production uses the concrete TLS
+    /// SMTP installer and validated operator configuration.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn with_recipient_verification_test_transport(

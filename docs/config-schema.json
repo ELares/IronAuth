@@ -1706,6 +1706,14 @@
           },
           "description": "The signup-quarantine sensitive-scope policy (issue #82, PR 2): which scopes a\nquarantined account may never receive, so the shared authorize path strips them from\nits grant. Consulted only when the `signup-quarantine` experimental feature is\nenabled AND acknowledged; the conservative default already strips offline access and\nadmin/management scopes. See [`QuarantineConfig`]."
         },
+        "recipient_verification": {
+          "$ref": "#/$defs/RecipientVerificationConfig",
+          "default": {
+            "enabled": false,
+            "smtp": null
+          },
+          "description": "Subject-bound mailbox verification for relying-party invitations."
+        },
         "recovery_cooldown_secs": {
           "default": 300,
           "description": "The cooldown between two account-recovery initiations for the SAME account, in\nseconds (issue #81): a repeated recovery request inside this window is refused, so\nrecovery-request spam against one account is rate-limited on the recovery path\nindependently of the login path. Must be at least 1. The default (300) is five\nminutes.",
@@ -2705,6 +2713,113 @@
           ],
           "default": null,
           "description": "Bounds one subject (issue #150 criterion 1).\n\nBinds wherever the surface resolves a VERIFIED subject before limiting: the token\nendpoint's grants resolve the subject from the code's binding or the refresh\nfamily before minting, so the bucket key is the real user, never attacker-chosen\nbytes. A surface that resolves no subject before its limiter runs reports the\nlayer in the outcome's `unenforced` census when configured, never in silence."
+        }
+      },
+      "type": "object"
+    },
+    "RecipientSmtpSecurity": {
+      "description": "Mandatory certificate-verified encryption for the configured SMTP relay.",
+      "oneOf": [
+        {
+          "const": "implicit",
+          "description": "TLS from connection establishment, commonly port 465.",
+          "type": "string"
+        },
+        {
+          "const": "start_tls",
+          "description": "Mandatory STARTTLS, commonly port 587. No plaintext fallback.",
+          "type": "string"
+        }
+      ]
+    },
+    "RecipientSmtpSettings": {
+      "additionalProperties": false,
+      "description": "SMTP relay configuration. Required fields have no guessed operational defaults.",
+      "properties": {
+        "host": {
+          "description": "Relay DNS hostname or IPv4 address; no URL, path or embedded credentials.",
+          "type": "string"
+        },
+        "max_in_flight": {
+          "default": 4,
+          "description": "Maximum simultaneous delivery attempts, from 1 through 32; no waiting queue.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "message_id_domain": {
+          "description": "DNS domain used in the challenge-bound Message-ID.",
+          "type": "string"
+        },
+        "password": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Secret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional authentication password, through the existing file/env secret seam."
+        },
+        "port": {
+          "description": "Explicit nonzero TCP port.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "security": {
+          "$ref": "#/$defs/RecipientSmtpSecurity",
+          "description": "Required TLS policy; there is no plaintext mode."
+        },
+        "sender": {
+          "description": "Bare ASCII sender mailbox, without a display name or header syntax.",
+          "type": "string"
+        },
+        "username": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Secret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional authentication username. Configure together with password."
+        }
+      },
+      "required": [
+        "host",
+        "port",
+        "security",
+        "sender",
+        "message_id_domain"
+      ],
+      "type": "object"
+    },
+    "RecipientVerificationConfig": {
+      "additionalProperties": false,
+      "description": "Subject-bound mailbox verification. Default off; separate from login OTP.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Enable the authenticated hosted mailbox ceremony and current recipient proof.\nRequires OIDC, an HTTPS public URL and a configured TLS SMTP relay.\nExisting accounts still require controlled recipient-index backfill.",
+          "type": "boolean"
+        },
+        "smtp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecipientSmtpSettings"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Deployment-owned SMTP settings. The browser cannot choose a relay or sender."
         }
       },
       "type": "object"
@@ -4019,6 +4134,10 @@
             "admin",
             "management"
           ]
+        },
+        "recipient_verification": {
+          "enabled": false,
+          "smtp": null
         },
         "recovery_cooldown_secs": 300,
         "recovery_delay_secs": 259200,

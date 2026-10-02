@@ -1807,6 +1807,19 @@ async fn build_oidc_plane(
     forward_auth: Option<std::sync::Arc<ironauth_oidc::forward_auth_rules::ForwardAuthRuntime>>,
     access_rules: std::sync::Arc<ironauth_oidc::rules::RuleSet>,
 ) -> Option<OidcPlane> {
+    let recipient_transport =
+        match ironauth_oidc::recipient_smtp::RecipientSmtpTransport::configured(
+            &config.oidc.recipient_verification,
+            env.clone(),
+        ) {
+            Ok(transport) => transport,
+            Err(_) => {
+                tracing::error!(
+                    "recipient verification SMTP configuration is unavailable; refusing startup"
+                );
+                std::process::exit(1);
+            }
+        };
     let oidc_config = &config.oidc;
     let policy_config = &config.password_policy;
     let hashing_config = &config.password_hashing;
@@ -2211,6 +2224,11 @@ async fn build_oidc_plane(
     ));
     // Installed after the chain because it is CONDITIONAL: a disabled hook, or one whose
     // allowlist is empty, resolves to `None` and issuance is byte-for-byte unchanged.
+    let state = if let Some(transport) = recipient_transport {
+        state.with_recipient_verification_smtp(transport)
+    } else {
+        state
+    };
     let state = match &claims_enrichment_hook {
         Some(hook) => state.with_claims_enrichment_hook(std::sync::Arc::clone(hook)),
         None => state,
