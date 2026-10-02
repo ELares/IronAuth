@@ -525,3 +525,22 @@ and incompatible key operations cannot select the encryption recipient. The
 current implementation does not fetch encryption keys from `jwks_uri`; such
 registrations are rejected. If configured encryption cannot be performed at
 issuance, the request fails instead of returning a plaintext signed ID token.
+
+
+## Surface: recipient verification SMTP adapter (issue #1475, activation gated)
+
+The adapter sends the authenticated core's stored mailbox address and transient
+challenge code to one operator-configured relay. It does not enable a production
+ceremony or accept relay configuration from the browser.
+
+| STRIDE | Threat | Control |
+| --- | --- | --- |
+| Spoofing | Relay impersonation or plaintext downgrade | Certificate and hostname verification; implicit TLS or mandatory STARTTLS only |
+| Tampering | Header injection, scope confusion or arbitrary message bodies | Bare bounded ASCII mailbox parsing; typed challenge scope check; eight numeric digits; fixed subject and text/HTML bodies |
+| Repudiation | Lost final reply reported as accepted or automatically resent | Explicit SMTP negative responses are refused; disconnect and timeout are uncertain; one attempt and no retry/failover; challenge-bound Message-ID is correlation, not a relay deduplication guarantee |
+| Information disclosure | Codes, credentials, addresses or server replies leak through diagnostics | No message/config serialization or Debug; redacted transport Debug and value-free errors; no logging; no plaintext outbox or file transport |
+| Denial of service | Slow relay or send burst retains unlimited secrets | Four-second whole-attempt deadline, three-second command timeout, bounded simultaneous attempts and no waiting queue; existing subject challenge cooldown and attempt budget stay authoritative |
+| Elevation | Adapter enables an incomplete account-ownership flow | Existing production gate remains closed; configuration, hosted continuation and controlled ownership indexing are required before activation |
+
+Local TLS SMTP fixtures establish protocol behavior, not external inbox delivery.
+Real permitted-mailbox and hosted-flow evidence remains required by #1475.

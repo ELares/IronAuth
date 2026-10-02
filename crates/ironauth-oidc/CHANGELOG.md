@@ -6,6 +6,11 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add a bounded TLS SMTP adapter for subject-bound recipient verification (#1475),
+  with challenge-bound message identity, redacted errors, concurrency limits and
+  accepted/refused/uncertain outcomes. The hosted ceremony remains disabled pending
+  configuration, ownership indexing, continuation and delivery qualification.
+
 - Retain and validate inline encryption keys for registered public clients,
   separately from client-authentication keys. Reject missing or unsupported
   encryption key sources at registration and refuse token issuance if configured

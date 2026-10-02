@@ -27,6 +27,8 @@ use crate::util::epoch_micros;
 /// A transient secret handed only to an explicit transport. No `Debug`, no
 /// serialization and no plaintext persistence in the provider's ordinary outbox.
 pub struct RecipientVerificationMessage<'a> {
+    /// Persisted challenge identity; also identifies this one delivery attempt.
+    pub challenge_id: &'a RecipientChallengeId,
     /// Exact isolated provider scope.
     pub scope: Scope,
     /// The account's stored primary delivery address, never the submitted alias.
@@ -45,8 +47,8 @@ pub enum RecipientDeliveryFailure {
 }
 
 /// Purpose-specific secret transport. It must acknowledge actual acceptance,
-/// never a no-op, and must not persist or log the plaintext code. No implementation
-/// or production installer ships with the gated core.
+/// never a no-op, and must not persist or log the plaintext code. The SMTP adapter
+/// is implemented separately; no production installer ships with the gated core.
 #[async_trait::async_trait]
 pub trait RecipientVerificationTransport: Send + Sync {
     /// Deliver through a bounded, secret-safe transport. The provider also imposes
@@ -211,6 +213,7 @@ pub(crate) async fn start(
     let delivery = tokio::time::timeout(
         Duration::from_secs(5),
         transport.deliver(RecipientVerificationMessage {
+            challenge_id: &id,
             scope,
             recipient: &email,
             code: &code,

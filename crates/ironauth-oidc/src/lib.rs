@@ -172,6 +172,8 @@ mod probe;
 mod quota;
 #[cfg(feature = "ironcache")]
 pub mod rate_store;
+/// Bounded SMTP delivery for subject-bound verification; activation remains gated.
+pub mod recipient_smtp;
 /// Gated subject-bound recipient verification and secret-safe transport contract.
 pub mod recipient_verification;
 mod recover;
