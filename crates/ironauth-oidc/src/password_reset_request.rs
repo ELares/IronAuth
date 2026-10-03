@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Hosted lost-password request and browser-bound challenge issuance. These routes
-//! remain unmounted until completion notices and the full journey are qualified.
+//! are mounted by the provider; disabled delivery returns explicit unavailability.
 
 use axum::extract::{DefaultBodyLimit, Form, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -19,8 +19,8 @@ use crate::recover::RecoverForm;
 use crate::recovery::PreparedPasswordResetCase;
 use crate::state::OidcState;
 
-/// Request and completion routes for qualification. Not merged into the main
-/// provider router yet. GET never issues proof, sets a cookie or sends email.
+/// Bounded request and completion routes mounted by the provider.
+/// GET never issues proof, sets a cookie or sends email.
 pub fn routes() -> axum::Router<OidcState> {
     axum::Router::new()
         .route(

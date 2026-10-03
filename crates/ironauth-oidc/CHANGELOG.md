@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Mount browser-bound password recovery in the provider router (#1479), replacing the logging-only request acknowledgement. Configured recovery issues real/decoy code forms; disabled delivery explicitly reports unavailable. Main-router HTTP/TLS tests cover reset and cancellation without implicit sign-in.
+
 - Deliver code-free cancelled-reset owner warnings through the durable recovery worker (#1479). Cancellation pages no longer claim mail was delivered and return a retryable unavailable response when the cancellation transaction fails.
 
 - Add a durable password-reset completion-notice consumer with verified-channel selection, bounded SMTP and no automatic resend after a claimed attempt (#1479). The server starts its worker with recovery enabled; isolated HTTP/TLS/outbox qualification covers acceptance, refusal and uncertain acknowledgement. Main-router activation remains pending.

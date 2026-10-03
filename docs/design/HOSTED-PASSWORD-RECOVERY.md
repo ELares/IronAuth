@@ -1,7 +1,8 @@
 # Hosted password recovery
 
-Status: implementation in progress for #1479. This document does not describe a shipped
-password-reset capability. Civio onboarding issue encryptixio/civio#455 depends
+Status: implementation in progress for #1479. The branch mounts request, reset and
+cancellation handlers in the provider router, with local HTTP/TLS qualification.
+This document does not describe a shipped password-reset capability. Civio onboarding issue encryptixio/civio#455 depends
 on the complete browser journey, not merely the recovery acknowledgement.
 
 ## Observed gap
@@ -542,3 +543,24 @@ returns retryable 503 and preserves the link, successful POST plus repeat queue 
 code-free TLS warning, and the original password remains valid. The full 38-test
 reset store suite and two existing legacy cancellation tests pass. This does not
 claim Internet mail, browser qualification, or full process restart evidence.
+
+
+The provider router now merges the bounded request/reset routes. The legacy
+logging-only request handlers are removed, so disabled delivery reports unavailable
+instead of suggesting instructions were sent. The existing HTTP/TLS/outbox suite
+now uses `oidc_router` for requests, completion, cancellation and body/origin checks.
+The independent password-spray and hard-lockout suite uses the same configured
+recovery router/store/limiter; its unverified-account fixtures issue decoys and do
+not claim SMTP delivery. The generated endpoint inventory and RFC 9700 coverage
+mapping include `/recover/reset`, with explicit limits on timing evidence.
+
+Production mounting in this branch does not mean deployment. Remaining release
+work includes PAR/PoW/rate/fault matrices, real browser continuation, full binary
+restart/shutdown, the complete gate, fixed-head review, PR merge and rollout.
+
+
+The successful reset fixture also posts both passwords to the ordinary mounted
+login handler: the old password creates no session, while the new password issues
+the normal session cookie and redirects to the original authorization URL. The
+reset response itself issues no session cookie. This is HTTP-level continuation
+evidence; it is not headed-browser, application callback or membership evidence.

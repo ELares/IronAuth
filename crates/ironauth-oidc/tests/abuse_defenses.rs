@@ -21,6 +21,47 @@ use ironauth_config::{OidcConfig, RegulationConfig};
 use ironauth_env::Env;
 use ironauth_store::{AbuseSubject, AuthPath};
 
+// These regulation fixtures use unverified accounts, so issuance is decoy-only.
+// Install explicit delivery capability on the SAME store/limiter state to exercise
+// the enabled recovery route without claiming SMTP delivery in this suite.
+async fn post_recovery(harness: &Harness, body: &str) -> (StatusCode, HeaderMap, String) {
+    use ironauth_oidc::password_reset_smtp::PasswordResetSmtpTransport;
+    use ironauth_oidc::recipient_smtp::{RecipientSmtpConfig, RecipientSmtpTls};
+    use tower::ServiceExt;
+    let transport = PasswordResetSmtpTransport::new(
+        RecipientSmtpConfig {
+            host: "localhost".into(),
+            port: 1,
+            tls: RecipientSmtpTls::Implicit,
+            sender: "auth@example.test".into(),
+            message_id_domain: "example.test".into(),
+            credentials: None,
+            max_in_flight: 1,
+        },
+        "https://auth.example.test",
+        harness.env().clone(),
+    )
+    .unwrap();
+    let response =
+        ironauth_oidc::oidc_router(harness.state().clone().with_password_reset_smtp(transport))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/recover")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+        .await
+        .unwrap();
+    (status, headers, String::from_utf8(body.to_vec()).unwrap())
+}
+
 /// The `retry-after` header value in whole seconds, if present.
 fn retry_after(headers: &HeaderMap) -> Option<u64> {
     headers
@@ -136,16 +177,16 @@ async fn password_spray_throttles_the_password_path_but_not_recovery() {
     );
 
     // The victim's RECOVERY path is governed INDEPENDENTLY: a recovery request still
-    // succeeds (the uniform 200 acknowledgment), so the owner is never locked out of
+    // succeeds (the uniform code-form redirect), so the owner is never locked out of
     // every path.
     let recover = form(&[
         ("identifier", "victim@example.test"),
         ("return_to", &return_to),
     ]);
-    let (recover_status, _h, _b) = harness.post_form("/recover", &recover, None).await;
+    let (recover_status, _h, _b) = post_recovery(&harness, &recover).await;
     assert_eq!(
         recover_status,
-        StatusCode::OK,
+        StatusCode::SEE_OTHER,
         "the recovery path must stay open under password spray"
     );
 
@@ -176,20 +217,20 @@ async fn recovery_is_byte_identical_for_present_and_absent_identifiers() {
         ("identifier", "known@example.test"),
         ("return_to", &return_to),
     ]);
-    let (present_status, _h, present_body) = harness.post_form("/recover", &present, None).await;
+    let (present_status, _h, present_body) = post_recovery(&harness, &present).await;
 
     let absent = form(&[
         ("identifier", "nobody@example.test"),
         ("return_to", &return_to),
     ]);
-    let (absent_status, _h, absent_body) = harness.post_form("/recover", &absent, None).await;
+    let (absent_status, _h, absent_body) = post_recovery(&harness, &absent).await;
 
     assert_eq!(present_status, absent_status);
     assert_eq!(
         present_body, absent_body,
         "recovery must return the same acknowledgment for a present and an absent identifier"
     );
-    assert_eq!(present_status, StatusCode::OK);
+    assert_eq!(present_status, StatusCode::SEE_OTHER);
 }
 
 #[tokio::test]
@@ -348,10 +389,10 @@ async fn hard_lockout_is_reachable_and_confined_to_the_password_path() {
         ("identifier", "locked@example.test"),
         ("return_to", &return_to),
     ]);
-    let (recover_status, _h, _b) = harness.post_form("/recover", &recover, None).await;
+    let (recover_status, _h, _b) = post_recovery(&harness, &recover).await;
     assert_eq!(
         recover_status,
-        StatusCode::OK,
+        StatusCode::SEE_OTHER,
         "recovery stays open even under hard lockout"
     );
 }

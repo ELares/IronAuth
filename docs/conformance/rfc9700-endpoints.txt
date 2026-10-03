@@ -27,6 +27,7 @@
 /par
 /recover
 /recover/cancel
+/recover/reset
 /register
 /revoke
 /risk/disavow

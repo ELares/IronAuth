@@ -743,12 +743,9 @@ pub fn oidc_router(state: OidcState) -> Router {
             "/register",
             get(register::register_get).post(register::register_post),
         )
-        // HUMAN account recovery (issue #64): the anti-enumeration-uniform recovery
-        // request surface, governed on the INDEPENDENT recovery path.
-        .route(
-            "/recover",
-            get(recover::recover_get).post(recover::recover_post),
-        )
+        // Hosted recovery serves an honest unavailable response when delivery is
+        // disabled; it never falls back to the legacy logging-only acknowledgment.
+        .merge(password_reset_request::routes())
         // The recovery cancellation-from-notification-link surface (issue #81): the
         // "this was not me" path that revokes a pending recovery in its delay window.
         .route(

@@ -173,8 +173,8 @@ pub async fn reset_get(State(state): State<OidcState>, headers: HeaderMap) -> Re
     }
 }
 
-/// Process a browser-bound reset completion. This handler is not mounted until
-/// initiation and post-commit owner notices are wired. It never signs the user in.
+/// Process a browser-bound reset completion mounted by the provider router.
+/// It never signs the user in.
 pub async fn reset_post(
     State(state): State<OidcState>,
     headers: HeaderMap,

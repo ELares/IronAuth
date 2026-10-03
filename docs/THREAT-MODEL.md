@@ -585,7 +585,8 @@ Explicit default-off `oidc.password_recovery` settings now install the concrete
 TLS transport at startup, independently of mailbox verification and logging OTP
 senders. Enabled unreadable credentials refuse startup; disabled recovery never
 resolves secrets. Only a root HTTPS public provider URL is accepted. Hosted reset
-handlers are still unwired and must be documented before release.
+handlers now mount through the bounded route factory; disabled delivery reports
+unavailability and never falls back to the legacy acknowledgement.
 
 | STRIDE | Threat | Control |
 | --- | --- | --- |
@@ -629,14 +630,14 @@ reset handlers remain pending. A parsed binding never grants a login session.
 
 ## Hosted reset completion handlers (#1479, integration in progress)
 
-The bounded route factory exists but is not merged into the provider router.
-Issuance and post-commit notices must be integrated before enablement.
+The provider router mounts the bounded request and completion route factory.
+Enabled delivery uses durable terminal notices; deployment remains default off.
 
 | STRIDE | Threat | Control |
 | --- | --- | --- |
 | Spoofing | A posted account or client selects another reset | Strict form schema; browser-bound store context; stored client/continuation scope consistency; separate form CSRF and same-origin checks |
 | Tampering | Edited confirmation or code changes an interrupted request | NFKC normalization on both password fields; eight ASCII digits; exact keyed completion receipt; store revalidation of authority and expiry |
-| Repudiation | A failed response is represented as a new successful mutation or cannot be confirmed during a screening outage | Read-only exact receipt check before current policy/screening; shared locked current-authority validation; no new hash or mutation on a match; new changes still require screening; ambiguous failures offer exact retry or sign-in; completion notification still pending before mount |
+| Repudiation | A failed response is represented as a new successful mutation or cannot be confirmed during a screening outage | Read-only exact receipt check before current policy/screening; shared locked current-authority validation; no new hash or mutation on a match; new changes still require screening; ambiguous failures offer exact retry or sign-in; terminal owner notices are queued atomically |
 | Information disclosure | Rejected secret values or internal failures enter HTML | No secret renderer inputs, generic store/hash errors, escaped policy guidance, shared CSP/no-store and browser-compatible same-origin referrers |
 | Denial of service | Unbounded forms or unregulated password hashing | 16 KiB route body limit; independent recovery counters; policy/strength/screening before admitted hashing; retain retry and rate-limit headers |
 | Elevation | Reset signs in or bypasses stronger factors | Store completion only; no session cookie or role grant; held cases remain held; ordinary login still required |

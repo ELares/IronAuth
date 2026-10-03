@@ -156,13 +156,7 @@ async fn call(
     if let Some(cookie) = cookie {
         req = req.header(header::COOKIE, cookie);
     }
-    let response = crate::password_reset_request::routes()
-        .route(
-            "/recover/cancel",
-            axum::routing::get(crate::recover::recover_cancel_get)
-                .post(crate::recover::recover_cancel_post),
-        )
-        .with_state(state.clone())
+    let response = crate::oidc_router(state.clone())
         .oneshot(req.body(Body::from(body)).unwrap())
         .await
         .unwrap();
@@ -371,6 +365,7 @@ async fn hosted_request_delivers_real_code_and_completes_without_enumerating_ine
         ironauth_store::PasswordResetDelivery::Accepted,
     )
     .await;
+    sign_in_after_reset(&state, &target).await;
 }
 
 #[tokio::test]
@@ -411,8 +406,7 @@ async fn disabled_recovery_and_invalid_origin_never_issue_challenges() {
             StatusCode::PAYLOAD_TOO_LARGE,
         ),
     ] {
-        let response = crate::password_reset_request::routes()
-            .with_state(state.clone())
+        let response = crate::oidc_router(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -723,4 +717,28 @@ async fn cancel_queue_fault_is_retryable(state: &OidcState, db: &TestDatabase, b
     assert!(page.contains("Unable to confirm cancellation"));
     sqlx::raw_sql("DROP TRIGGER reject_cancel_mail_queue ON outbox_messages; DROP FUNCTION reject_cancel_mail_queue();")
         .execute(db.owner_pool()).await.unwrap();
+}
+
+async fn sign_in_after_reset(state: &OidcState, target: &str) {
+    for (password, accepted) in [(OLD, false), (NEW, true)] {
+        let body = serde_urlencoded::to_string([
+            ("identifier", OWNER),
+            ("password", password),
+            ("return_to", target),
+        ])
+        .unwrap();
+        let (status, headers, _) = call(state, "POST", "/login", body, None).await;
+        let signed_in = headers.get_all(header::SET_COOKIE).iter().any(|value| {
+            value
+                .to_str()
+                .is_ok_and(|value| value.starts_with("__Host-ironauth_session=ses_"))
+        });
+        assert_eq!(signed_in, accepted);
+        if accepted {
+            assert_eq!(status, StatusCode::SEE_OTHER);
+            assert_eq!(headers[header::LOCATION], target);
+        } else {
+            assert_eq!(status, StatusCode::OK);
+        }
+    }
 }
