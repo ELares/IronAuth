@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Emit aggregate `recipient_index.prepared` outcomes in the same transaction as the index batch, audit and replay receipt. Failed writes and idempotent replays do not publish extra events (#1475).
+
 - Add documented, permission-checked recipient-index preview and bounded preparation endpoints for existing environments, with atomic audited idempotency and current authorization before replay (issue #1475).
 
 - Refuse offline advisory imports into soft-deleted environments before parsing

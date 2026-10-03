@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Emit aggregate `recipient_index.prepared` outcomes in the same transaction as the index batch, audit and replay receipt. Failed writes and idempotent replays do not publish extra events (#1475).
+
 - Add control-role-only bounded primary-recipient indexing for retained accounts, including deleted rows, with aggregate ambiguity reporting and atomic audit/replay receipts. Indexing never verifies or merges accounts (issue #1475).
 
 - Add audited, repeatable cancellation of the authenticated subject's pending recipient challenge without changing existing verified ownership (#1475).

@@ -41,6 +41,15 @@ async fn audits(h: &Harness) -> i64 {
     .expect("audit count")
 }
 
+async fn events(h: &Harness) -> Vec<Value> {
+    sqlx::query_scalar(
+        "SELECT payload FROM outbox_messages WHERE payload->>'type' = 'recipient_index.prepared'",
+    )
+    .fetch_all(h.db().owner_pool())
+    .await
+    .expect("committed recipient events")
+}
+
 #[tokio::test]
 async fn preview_and_concurrent_replay_advance_once_and_deleted_environment_cannot_replay() {
     let h = Harness::start(50).await;
@@ -52,6 +61,7 @@ async fn preview_and_concurrent_replay_advance_once_and_deleted_environment_cann
     assert_eq!(preview["batch_users"], 1);
     assert_eq!(preview["unindexed_users"], 3);
     assert_eq!(audits(&h).await, 0);
+    assert!(events(&h).await.is_empty());
     let (a, b) = tokio::join!(
         h.post(&path, "batch-1", APPLY),
         h.post(&path, "batch-1", APPLY)
@@ -64,6 +74,12 @@ async fn preview_and_concurrent_replay_advance_once_and_deleted_environment_cann
     assert_eq!(applied["applied"], true);
     assert_eq!(applied["unindexed_users"], 2);
     assert_eq!(audits(&h).await, 1);
+    let emitted = events(&h).await;
+    assert_eq!(emitted.len(), 1, "concurrent replay emits exactly once");
+    assert_eq!(emitted[0]["payload"], applied);
+    assert_eq!(emitted[0]["tenant_id"], tenant);
+    assert_eq!(emitted[0]["environment_id"], environment);
+    ironauth_store::event_catalog::validate_event(&emitted[0]).expect("registered event contract");
     let (_, _, actual) = h.get(&path).await;
     assert_eq!(
         serde_json::from_str::<Value>(&actual).unwrap()["unindexed_users"],
@@ -92,6 +108,7 @@ async fn preview_and_concurrent_replay_advance_once_and_deleted_environment_cann
         1
     );
     assert_eq!(audits(&h).await, 2);
+    assert_eq!(events(&h).await.len(), 2);
     let entries: Vec<Option<String>> = sqlx::query_scalar("SELECT entry_path FROM audit_log WHERE action = 'recipient_verification.index_backfill' ORDER BY occurred_at, id")
         .fetch_all(h.db().owner_pool()).await.expect("stored entry path");
     assert_eq!(entries, vec![None, Some("mcp".to_owned())]);
@@ -105,6 +122,7 @@ async fn preview_and_concurrent_replay_advance_once_and_deleted_environment_cann
     );
     assert_eq!(h.get(&path).await.0, StatusCode::OK);
     assert_eq!(audits(&h).await, 2);
+    assert_eq!(events(&h).await.len(), 2);
 }
 
 #[tokio::test]
@@ -157,6 +175,7 @@ async fn malformed_or_unacknowledged_batches_and_anonymous_requests_do_not_write
         assert_eq!(h.send(request).await.0, StatusCode::UNAUTHORIZED);
     }
     assert_eq!(audits(&h).await, 0);
+    assert!(events(&h).await.is_empty());
 }
 
 #[tokio::test]
@@ -241,6 +260,7 @@ async fn scoped_key_needs_current_permission_even_to_replay_and_cannot_cross_env
         StatusCode::FORBIDDEN
     );
     assert_eq!(audits(&h).await, 2);
+    assert_eq!(events(&h).await.len(), 2);
 }
 
 #[tokio::test]
@@ -284,6 +304,7 @@ async fn audit_failure_rolls_back_indices_and_receipt_so_the_same_key_can_retry(
     let (status, _, _) = h.post(&path, "retry-after-failure", APPLY).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(audits(&h).await, 0);
+    assert!(events(&h).await.is_empty());
     let (status, _, preview) = h.get(&path).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -299,4 +320,42 @@ async fn audit_failure_rolls_back_indices_and_receipt_so_the_same_key_can_retry(
         2
     );
     assert_eq!(audits(&h).await, 1);
+    assert_eq!(events(&h).await.len(), 1);
+}
+
+#[tokio::test]
+async fn event_failure_rolls_back_indices_audit_and_receipt() {
+    let h = Harness::start(50).await;
+    let (_, _, path) = fixture(&h).await;
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_recipient_index_event() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.payload->>'type' = 'recipient_index.prepared' THEN \
+         RAISE EXCEPTION 'synthetic event persistence failure'; END IF; RETURN NEW; END $$; \
+         CREATE TRIGGER reject_recipient_index_event BEFORE INSERT ON outbox_messages \
+         FOR EACH ROW EXECUTE FUNCTION reject_recipient_index_event();",
+    )
+    .execute(h.db().owner_pool())
+    .await
+    .expect("event failure fixture");
+    assert_eq!(
+        h.post(&path, "event-retry", APPLY).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(audits(&h).await, 0);
+    assert!(events(&h).await.is_empty());
+    let (_, _, preview) = h.get(&path).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&preview).unwrap()["unindexed_users"],
+        3
+    );
+    sqlx::raw_sql("DROP TRIGGER reject_recipient_index_event ON outbox_messages; DROP FUNCTION reject_recipient_index_event();")
+        .execute(h.db().owner_pool()).await.expect("restore event persistence");
+    let (status, _, body) = h.post(&path, "event-retry", APPLY).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["unindexed_users"],
+        2
+    );
+    assert_eq!(audits(&h).await, 1);
+    assert_eq!(events(&h).await.len(), 1);
 }

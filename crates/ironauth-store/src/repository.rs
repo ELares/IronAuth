@@ -20864,6 +20864,23 @@ impl ActingRecipientVerificationRepo<'_> {
         limit: u32,
         idempotency: Option<ResolvedIdempotencyWrite<'_, crate::RecipientIndexReport>>,
     ) -> Result<crate::RecipientIndexReport, StoreError> {
+        self.index_backfill_with_event(env, limit, idempotency, None)
+            .await
+    }
+
+    /// Prepare index metadata and emit the resolved batch outcome atomically.
+    /// The event shares the batch, audit and idempotency transaction. A failed
+    /// write or concurrent replay cannot publish a second batch outcome.
+    ///
+    /// # Errors
+    /// As [`Self::index_backfill`], including event persistence failure.
+    pub async fn index_backfill_with_event(
+        &self,
+        env: &Env,
+        limit: u32,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, crate::RecipientIndexReport>>,
+        event: Option<ResolvedEventBuilder<'_, crate::RecipientIndexReport>>,
+    ) -> Result<crate::RecipientIndexReport, StoreError> {
         let scope = self.scope;
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let target = scope.environment();
@@ -20883,6 +20900,9 @@ impl ActingRecipientVerificationRepo<'_> {
                 }
                 let report = recipient_index_report(tx, scope, &batch, true).await?;
                 insert_resolved_idempotency(tx, idempotency, &report).await?;
+                let resolved = event.and_then(|build| build(&report));
+                let borrowed = resolved.as_ref().map(OwnedDomainEvent::borrowed);
+                enqueue_domain_event(tx, env, scope, borrowed.as_ref()).await?;
                 Ok(report)
             }, false,
         ).await

@@ -203,13 +203,15 @@ pub async fn prepare_recipient_index(
         response_status: 200,
         response_body: &render,
     };
+    let event =
+        |report: &RecipientIndexReport| recipient_index_prepared_event(&state, scope, report);
     let result = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .via(entry_path.0)
         .recipient_verification()
-        .index_backfill(state.env(), request.limit, Some(receipt))
+        .index_backfill_with_event(state.env(), request.limit, Some(receipt), Some(&event))
         .await;
     match result {
         Ok(report) => Ok(crate::response::json(
@@ -221,4 +223,29 @@ pub async fn prepare_recipient_index(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn recipient_index_prepared_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    report: &RecipientIndexReport,
+) -> Option<ironauth_store::OwnedDomainEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = scope.environment().to_string();
+    // Only aggregate committed counts leave this boundary, never identifiers,
+    // mailbox addresses, blind indexes, challenge codes or verification proofs.
+    let payload = serde_json::to_value(RecipientIndexView::from(report)).ok()?;
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "recipient_index.prepared",
+        &scope.tenant().to_string(),
+        &subject,
+        state.now_unix_micros() / 1000,
+        &payload,
+    )?;
+    Some(ironauth_store::OwnedDomainEvent {
+        id,
+        subject,
+        envelope,
+    })
 }
