@@ -253,3 +253,6 @@ async fn reset_owner_notice_delivers_cancellation_without_sharing_the_code() {
     };
     assert!(transport.render(&bad).is_err());
 }
+
+#[cfg(feature = "testing")]
+mod delivery_store;

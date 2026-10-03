@@ -286,5 +286,18 @@ through the existing delay/audit gate. Schema/channel reads and SMTP facts do no
 replace the completion transaction's current ownership/case checks. The hosted
 caller must use store-issued subject, primary address, code and case cancellation
 capability, and still enforce risk, regulation and authorization-context checks.
-Unit adapters test fan-out and timeout semantics; the actual hosted browser path
-and an integrated SMTP/store test remain outstanding.
+Unit adapters test fan-out and timeout semantics. The integrated test below now
+covers primary-code SMTP outcomes and durable records; the actual hosted browser
+path and integrated secondary-channel fan-out remain outstanding.
+
+
+The coordinator is now exercised against isolated PostgreSQL and the actual
+certificate-verified TLS relay fixture for primary-code acceptance, explicit
+refusal and disconnection after transmission. Each case checks the durable claim,
+terminal outcome and accepted count, exactly one claim/result audit pair, refusal
+of a repeated coordinator call, and an unchanged password verifier. The fixture
+sets up verified ownership and verifier metadata through store APIs; it does not
+perform hosted registration, verify a reset code, or change a credential. Its
+cancellation URL is test content, not evidence of a usable hosted cancellation
+journey. This is local delivery integration evidence, not Internet mail or browser
+recovery qualification. The test is included with the OIDC `testing` feature.
