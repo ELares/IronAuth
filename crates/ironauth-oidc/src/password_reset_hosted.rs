@@ -3,7 +3,7 @@
 //! Hosted reset completion handlers, not yet mounted. Request issuance and
 //! completion-notice integration must be finished before the router enables them.
 
-use axum::extract::{DefaultBodyLimit, Form, State};
+use axum::extract::{DefaultBodyLimit, Form, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use ironauth_store::{
@@ -74,6 +74,23 @@ async fn resolve(state: &OidcState, headers: &HeaderMap) -> Result<Attempt, Resp
         resume,
         banner,
     })
+}
+
+/// Navigation only: never resolves a reset challenge or grants completion authority.
+async fn expired_navigation(state: &OidcState, target: Option<&str>) -> Response {
+    let Some(resume) = crate::authorize::recovery_resume(state, target).await else {
+        return invalid();
+    };
+    let banner = state.environment_banner(&resume.scope).await;
+    pages::response(
+        StatusCode::BAD_REQUEST,
+        pages::notice_page(
+            ResetNotice::UnavailableAttempt,
+            &resume.return_to,
+            &resume.hints,
+            banner,
+        ),
+    )
 }
 
 fn invalid() -> Response {
@@ -148,9 +165,16 @@ fn notice(attempt: &Attempt, view: ResetNotice<'_>) -> Response {
 
 /// Read the original browser's form or bounded recovery guidance, without sends,
 /// attempt consumption, password mutation, or session creation.
-pub async fn reset_get(State(state): State<OidcState>, headers: HeaderMap) -> Response {
+pub async fn reset_get(
+    State(state): State<OidcState>,
+    Query(navigation): Query<crate::login::ResumeQuery>,
+    headers: HeaderMap,
+) -> Response {
     let attempt = match resolve(&state, &headers).await {
         Ok(value) => value,
+        Err(response) if response.status() == StatusCode::BAD_REQUEST => {
+            return expired_navigation(&state, navigation.return_to.as_deref()).await;
+        }
         Err(response) => return response,
     };
     if !state.password_recovery_delivery_available() {
@@ -177,6 +201,7 @@ pub async fn reset_get(State(state): State<OidcState>, headers: HeaderMap) -> Re
 /// It never signs the user in.
 pub async fn reset_post(
     State(state): State<OidcState>,
+    Query(navigation): Query<crate::login::ResumeQuery>,
     headers: HeaderMap,
     Form(form): Form<ResetForm>,
 ) -> Response {
@@ -190,13 +215,16 @@ pub async fn reset_post(
         );
     }
     let Some(binding) = ResetBrowserBinding::from_headers(&headers) else {
-        return invalid();
+        return expired_navigation(&state, navigation.return_to.as_deref()).await;
     };
     if !binding.accepts_csrf(&form.csrf) {
         return invalid();
     }
     let attempt = match resolve(&state, &headers).await {
         Ok(value) => value,
+        Err(response) if response.status() == StatusCode::BAD_REQUEST => {
+            return expired_navigation(&state, navigation.return_to.as_deref()).await;
+        }
         Err(response) => return response,
     };
     if !state.password_recovery_delivery_available() {

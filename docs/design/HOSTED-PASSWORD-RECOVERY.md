@@ -610,3 +610,15 @@ Recovery strength follows persisted passkeys even when WebAuthn login is disable
 The real-store regression covers synced and device-bound credentials, verifies
 that email recovery remains held, and checks that the credential is retained.
 This does not enable passkey login or claim a browser authenticator ceremony.
+
+
+Natural-expiry Chrome qualification found that dropping the ten-minute reset
+cookie removed every navigation action. Code authority itself lasts five minutes.
+The reset redirect and form action now retain a presentation-only continuation
+query, independently of the browser credential. Missing or expired binding may
+render sign-in and fresh-code links only after registered authorization validation;
+that query never resolves a challenge or authorizes a credential change. Neither
+code expiry nor cookie lifetime is extended. Untrusted external targets receive
+no link. Expired PAR continuations still require an application restart and remain
+a separate qualification gap. Civio's five-minute authentication-flow expiry also
+loses project context; that application-side navigation gap remains outstanding.

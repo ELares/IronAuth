@@ -310,7 +310,12 @@ async fn issue(
     let mut response = pages::response(StatusCode::SEE_OTHER, String::new());
     response.headers_mut().insert(
         header::LOCATION,
-        "/recover/reset".parse().expect("static local path"),
+        format!(
+            "/recover/reset?return_to={}",
+            crate::util::percent_encode_query(&resume.return_to)
+        )
+        .parse()
+        .expect("encoded local recovery navigation"),
     );
     response
         .headers_mut()

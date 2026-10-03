@@ -229,7 +229,13 @@ async fn uniform_and_repeat(state: &OidcState, target: &str, real_cookie: &str) 
     for identifier in ["unknown@example.test", "unverified@example.test"] {
         let (status, headers, _) = request(state, target, identifier, None).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
-        assert_eq!(headers[header::LOCATION], "/recover/reset");
+        assert_eq!(
+            headers[header::LOCATION],
+            format!(
+                "/recover/reset?return_to={}",
+                crate::util::percent_encode_query(target)
+            )
+        );
         let current = cookie(&headers);
         let mut parsed = HeaderMap::new();
         parsed.insert(header::COOKIE, current.parse().unwrap());
@@ -1018,4 +1024,63 @@ async fn recovery_pow_binds_actual_form_scope_endpoint_and_expiry() {
         count, 1,
         "only the correctly bound live proof issued a reset challenge"
     );
+}
+
+#[tokio::test]
+async fn expired_recovery_retains_validated_navigation_without_reset_authority() {
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        1513,
+    );
+    let scope = db.seed_scope(&env).await;
+    let transport =
+        PasswordResetSmtpTransport::new(super::config(), "https://auth.example.test", env.clone())
+            .unwrap();
+    let state = state(&db, &env, scope, Some(transport));
+    let (_, client) = seed(&db, &state, scope).await;
+    let target = resume(&client);
+    let (status, headers, _) = request(&state, &target, "unknown@example.test", None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let path = headers[header::LOCATION].to_str().unwrap().to_owned();
+    let browser = cookie(&headers);
+    let mut original_headers = HeaderMap::new();
+    original_headers.insert(header::COOKIE, browser.parse().unwrap());
+    let csrf = ResetBrowserBinding::from_headers(&original_headers)
+        .unwrap()
+        .csrf_token();
+    clock.advance(Duration::from_secs(601));
+    let body = serde_urlencoded::to_string([
+        ("csrf", csrf.as_str()),
+        ("code", "12345678"),
+        ("new_password", NEW),
+        ("confirm_password", NEW),
+    ])
+    .unwrap();
+    for (method, payload, cookie) in [
+        ("GET", String::new(), None),
+        ("GET", String::new(), Some(browser.as_str())),
+        ("POST", body.clone(), None),
+        ("POST", body, Some(browser.as_str())),
+    ] {
+        let (status, headers, page) = call(&state, method, &path, payload, cookie).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!headers.contains_key(header::SET_COOKIE));
+        assert!(page.contains("Back to sign in"));
+        assert!(page.contains("Request a fresh code"));
+        assert!(!page.contains("name=\"new_password\""));
+        assert!(!page.contains("Your password has been reset"));
+    }
+    let hostile = "/recover/reset?return_to=https%3A%2F%2Fevil.example%2F";
+    let (status, _, page) = call(&state, "GET", hostile, String::new(), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!page.contains("evil.example"));
+    assert!(!page.contains("Request a fresh code"));
+    let attempts: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(attempt_count),0)::bigint FROM password_reset_challenges",
+    )
+    .fetch_one(db.owner_pool())
+    .await
+    .unwrap();
+    assert_eq!(attempts, 0, "navigation is not a reset attempt");
 }

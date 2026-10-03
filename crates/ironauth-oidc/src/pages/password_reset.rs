@@ -31,7 +31,7 @@ pub fn code_page(
         r#"<h1>Reset your password</h1>
 <p class="page-description">If your account is eligible for email recovery, a code will arrive at its verified email address. Check your inbox and spam folder, then enter the code in this browser.</p>
 {error}
-<form method="post" action="/recover/reset">
+<form method="post" action="{reset}">
 <input type="hidden" name="csrf" value="{csrf}">
 <p><label for="reset-code">Recovery code</label><input id="reset-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{8}}" minlength="8" maxlength="8" aria-describedby="reset-code-help" required></p>
 <p id="reset-code-help">Enter the eight-digit code, including any leading zeros. This attempt expires at {expiry}.</p>
@@ -45,6 +45,7 @@ pub fn code_page(
 <p>If you did not request recovery, use the cancellation link in the notification email.</p>"#,
         error = error_banner(error),
         csrf = escape_html(csrf),
+        reset = interaction_href("/recover/reset", return_to),
         expiry = escape_html(expires_at_label),
         guidance = escape_html(password_guidance),
         recover = interaction_href("/recover", return_to),
