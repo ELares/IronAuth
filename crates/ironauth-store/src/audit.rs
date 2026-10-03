@@ -1563,6 +1563,8 @@ pub enum Action {
     EmailOtpSend,
     /// An authenticated recipient challenge was issued, without a session change.
     RecipientVerificationStart,
+    /// A browser-bound password-reset challenge was stored, without claiming delivery.
+    PasswordResetStart,
     /// A control-plane batch indexed existing primary identifiers without verification.
     RecipientIndexBackfill,
     /// The authenticated subject cancelled its pending mailbox challenge.
@@ -2074,6 +2076,7 @@ impl Action {
             Action::AaguidRuleSet => "aaguid.rule.set",
             Action::AaguidRuleRemove => "aaguid.rule.remove",
             Action::EmailOtpSend => "email_otp.send",
+            Action::PasswordResetStart => "password_reset.start",
             Action::RecipientVerificationStart => "recipient_verification.start",
             Action::RecipientIndexBackfill => "recipient_verification.index_backfill",
             Action::RecipientVerificationCancel => "recipient_verification.cancel",

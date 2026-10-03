@@ -80,7 +80,6 @@ use crate::error::StoreError;
 use crate::federation_state::{ConsumedFederationLoginState, NewFederationLoginState};
 use crate::flow::{FlowRecord, NewFlow};
 use crate::flow_version::{FlowVersionRecord, NewFlowVersion};
-use crate::id::RecipientChallengeId;
 use crate::id::{
     AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId,
     AgentPrincipalId, AgentVaultApprovalId, AgentVaultConnectionId, ApiKeyId, AssertionMappingId,
@@ -106,6 +105,7 @@ use crate::id::{
     UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
     WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
+use crate::id::{PasswordResetChallengeId, RecipientChallengeId};
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
 };
@@ -114,6 +114,7 @@ use crate::locale_bundle::{LocaleBundleRecord, NewLocaleBundle};
 use crate::message_feedback::SuppressionReason;
 use crate::message_rate::RateBudget;
 use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
+use crate::password_reset::{NewPasswordReset, PasswordResetAccount, PasswordResetChallenge};
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
 use crate::recipient_verification::{
     NewRecipientChallenge, RecipientAttempt, RecipientChallenge, VerifiedRecipient,
@@ -755,6 +756,15 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn org_role_permissions(&self) -> OrgRolePermissionRepo<'a> {
         OrgRolePermissionRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// Read a browser-bound password-reset challenge without consuming authority.
+    #[must_use]
+    pub fn password_reset(&self) -> PasswordResetRepo<'a> {
+        PasswordResetRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -2180,6 +2190,16 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn aaguid_rules(&self) -> ActingAaguidRuleRepo<'a> {
         ActingAaguidRuleRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// Audited password-reset challenge writes for this scope and actor.
+    #[must_use]
+    pub fn password_reset(&self) -> ActingPasswordResetRepo<'a> {
+        ActingPasswordResetRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -20700,6 +20720,244 @@ async fn current_recipient_owner(
         email,
         identifier: identifiers.first().map(|r| r.get("id")),
     })
+}
+
+/// Internal reset binding, derived under current ownership and account locks.
+struct PasswordResetBinding {
+    subject: String,
+    identifier: String,
+    revision: String,
+    recovery: String,
+    credential_digest: Vec<u8>,
+    email: String,
+}
+
+async fn current_password_reset_binding(
+    tx: &mut Transaction<'_, Postgres>,
+    master: &MasterKey,
+    scope: Scope,
+    account: &PasswordResetAccount<'_>,
+) -> Result<PasswordResetBinding, StoreError> {
+    use sha2::{Digest, Sha256};
+    // Shared lock order: ownership, user, identifiers, verification, recovery,
+    // then reset challenge. Completion must preserve this order too.
+    let owner = current_recipient_owner(tx, master, scope, account.subject).await?;
+    let password: Option<String> = sqlx::query_scalar(
+        "SELECT password_hash FROM users WHERE tenant_id=$1 AND environment_id=$2 \
+         AND id=$3 AND NOT passwordless AND password_hash <> $4",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(account.subject.to_string())
+    .bind(USER_UNUSABLE_PASSWORD_HASH)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let password = password.ok_or(StoreError::NotFound)?;
+    let verified = sqlx::query(
+        "SELECT v.identifier_id,v.revision FROM recipient_email_verifications v \
+         JOIN user_identifiers i ON i.tenant_id=v.tenant_id AND i.environment_id=v.environment_id \
+         AND i.id=v.identifier_id AND i.user_id=v.subject AND i.identifier_type='email' \
+         AND i.canonical_bidx=v.recipient_bidx AND i.verified \
+         WHERE v.tenant_id=$1 AND v.environment_id=$2 AND v.subject=$3 \
+         AND v.recipient_bidx=$4 AND v.identifier_id=$5 FOR UPDATE OF v,i",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(account.subject.to_string())
+    .bind(&owner.bidx)
+    .bind(&owner.identifier)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(StoreError::NotFound)?;
+    let case: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM recovery_flows WHERE tenant_id=$1 AND environment_id=$2 \
+         AND id=$3 AND subject=$4 AND state IN ('initiated','held') \
+         AND method='standard' AND entry_point='lost_password' FOR UPDATE",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(account.recovery.to_string())
+    .bind(account.subject.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(PasswordResetBinding {
+        subject: account.subject.to_string(),
+        identifier: verified.get("identifier_id"),
+        revision: verified.get("revision"),
+        recovery: case.ok_or(StoreError::NotFound)?,
+        credential_digest: Sha256::digest(password.as_bytes()).to_vec(),
+        email: owner.email,
+    })
+}
+
+/// Scoped read-only password-reset hashing input.
+pub struct PasswordResetRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl PasswordResetRepo<'_> {
+    /// Resolve an unexpired, unexhausted pending challenge for its browser binding.
+    /// Absence is uniform across wrong scope, browser, terminal and expired rows.
+    ///
+    /// # Errors
+    /// Persistence failures. This method never consumes proof or changes a password.
+    pub async fn challenge(
+        &self,
+        env: &Env,
+        id: &PasswordResetChallengeId,
+        browser_binding_hash: &[u8; 32],
+    ) -> Result<Option<PasswordResetChallenge>, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let hash: Option<String> = sqlx::query_scalar(
+            "SELECT code_hash FROM password_reset_challenges \
+             WHERE tenant_id=$1 AND environment_id=$2 AND id=$3 AND browser_binding_hash=$4 \
+             AND state='pending' AND attempt_count<5 \
+             AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(browser_binding_hash.as_slice())
+        .bind(epoch_micros(env.clock().now_utc()))
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(hash.map(|code_hash| PasswordResetChallenge { id: *id, code_hash }))
+    }
+}
+
+/// Audited reset challenge writes. Issuance alone is never credential authority.
+pub struct ActingPasswordResetRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingPasswordResetRepo<'_> {
+    /// Store a fresh challenge, deriving real-account authority under row locks.
+    /// Return only the current store-owned delivery address, or None for a decoy.
+    /// A one-minute durable per-account cooldown applies even after completion.
+    /// The caller enforces recovery regulation and actual transport availability
+    /// before calling this method, and hides ineligible outcomes from the browser.
+    ///
+    /// # Errors
+    /// Invalid input, uniformly ineligible account/case, cooldown, or store failure.
+    pub async fn start(
+        &self,
+        env: &Env,
+        spec: NewPasswordReset<'_>,
+    ) -> Result<Option<String>, StoreError> {
+        let scope = self.scope;
+        let now = epoch_micros(env.clock().now_utc());
+        if spec.id.scope() != scope
+            || spec.client.scope() != scope
+            || spec
+                .account
+                .as_ref()
+                .is_some_and(|a| a.subject.scope() != scope || a.recovery.scope() != scope)
+        {
+            return Err(StoreError::NotFound);
+        }
+        if spec.expires_at_unix_micros <= now
+            || spec.expires_at_unix_micros > now.saturating_add(600_000_000)
+            || !spec.code_hash.starts_with("$argon2id$")
+            || spec.code_hash.len() > 512
+            || !spec.authorization_return_to.starts_with("/authorize?")
+            || spec.authorization_return_to.len() > 16384
+            || spec.authorization_return_to.chars().any(char::is_control)
+        {
+            return Err(StoreError::Invalid);
+        }
+        let mut recipient = None;
+        let out = &mut recipient;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::PasswordResetStart,
+                target: spec.id,
+            },
+            async move |tx| {
+                let binding = if let Some(account) = &spec.account {
+                    let master = self.store.master().ok_or(StoreError::Encryption)?;
+                    let bound = current_password_reset_binding(tx, master, scope, account).await?;
+                    replace_pending_password_reset(tx, scope, &bound.subject, now).await?;
+                    Some(bound)
+                } else {
+                    None
+                };
+                insert_password_reset(tx, scope, &spec, binding.as_ref(), now).await?;
+                *out = binding.map(|bound| bound.email);
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        Ok(recipient)
+    }
+}
+
+async fn replace_pending_password_reset(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    subject: &str,
+    now: i64,
+) -> Result<(), StoreError> {
+    let recent: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM password_reset_challenges \
+         WHERE tenant_id=$1 AND environment_id=$2 AND subject=$3 \
+         AND created_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval)",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(subject)
+    .bind(now.saturating_sub(60_000_000))
+    .fetch_one(&mut **tx)
+    .await?;
+    if recent {
+        return Err(StoreError::QuotaExceeded);
+    }
+    sqlx::query(
+        "UPDATE password_reset_challenges SET state='cancelled', \
+         finished_at=TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+         WHERE tenant_id=$1 AND environment_id=$2 AND subject=$3 AND state='pending'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(subject)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_password_reset(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    spec: &NewPasswordReset<'_>,
+    binding: Option<&PasswordResetBinding>,
+    now: i64,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO password_reset_challenges \
+         (id,tenant_id,environment_id,client_id,browser_binding_hash,authorization_return_to, \
+          subject,identifier_id,recipient_revision,recovery_id,credential_digest,code_hash,created_at,expires_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, \
+          TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
+          TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval)",
+    ).bind(spec.id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+    .bind(spec.client.to_string()).bind(spec.browser_binding_hash.as_slice()).bind(spec.authorization_return_to)
+    .bind(binding.map(|b| &b.subject)).bind(binding.map(|b| &b.identifier))
+    .bind(binding.map(|b| &b.revision)).bind(binding.map(|b| &b.recovery))
+    .bind(binding.map(|b| &b.credential_digest)).bind(spec.code_hash).bind(now)
+    .bind(spec.expires_at_unix_micros).execute(&mut **tx).await?;
+    Ok(())
 }
 
 /// Read current subject-bound verification state, never arbitrary stored claims.

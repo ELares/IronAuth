@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Reset schema isolation and lifecycle constraints, not a reset ceremony.
-//! Rows below are metadata fixtures; no user credential is changed by these tests.
+//! Reset schema and issuance isolation, not a complete reset ceremony.
+//! Schema rows are metadata fixtures; repository cases use actual signup and
+//! mailbox verification. No user credential is changed by these tests.
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
@@ -39,7 +40,7 @@ fn sqlstate(error: &sqlx::Error) -> Option<String> {
     error
         .as_database_error()?
         .code()
-        .map(|code| code.into_owned())
+        .map(std::borrow::Cow::into_owned)
 }
 
 #[tokio::test]
@@ -168,4 +169,406 @@ async fn reset_schema_rejects_partial_completion_and_unbounded_attempts() {
     assert_eq!(sqlstate(&error).as_deref(), Some("23514"));
     sqlx::query("UPDATE password_reset_challenges SET state='completed',attempt_count=1,finished_at=created_at+interval '1 minute',completion_request_hash=decode(repeat('ab',32),'hex'),completion_credential_digest=decode(repeat('cd',32),'hex') WHERE id=$1")
         .bind(next.to_string()).execute(db.owner_pool()).await.expect("complete metadata shape is representable; this is not a credential mutation");
+}
+
+const HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aGFzaGhhc2hoYXNo";
+const EMAIL: &str = "Reset.Owner@example.test";
+
+fn now_micros(env: &Env) -> i64 {
+    i64::try_from(
+        env.clock()
+            .now_utc()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_micros(),
+    )
+    .unwrap()
+}
+
+async fn verified_account(db: &TestDatabase, env: &Env, scope: Scope) -> ironauth_store::UserId {
+    use ironauth_store::{CorrelationId, NewRecipientChallenge, RecipientAttempt};
+    let store = db.store();
+    let acting = store
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env));
+    let subject = acting
+        .users()
+        .register(env, EMAIL, HASH, None)
+        .await
+        .unwrap();
+    let id = RecipientChallengeId::generate(env, &scope);
+    acting
+        .recipient_verification()
+        .start(
+            env,
+            NewRecipientChallenge {
+                id: &id,
+                subject: &subject,
+                email: EMAIL,
+                code_hash: HASH,
+                expires_at_unix_micros: now_micros(env) + 300_000_000,
+            },
+        )
+        .await
+        .unwrap();
+    let challenge = store
+        .scoped(scope)
+        .recipient_verification()
+        .challenge(env, &subject, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        acting
+            .recipient_verification()
+            .attempt(env, &subject, &challenge, true)
+            .await
+            .unwrap(),
+        RecipientAttempt::Verified
+    );
+    subject
+}
+
+async fn recovery_case(
+    db: &TestDatabase,
+    env: &Env,
+    subject: &ironauth_store::UserId,
+) -> ironauth_store::RecoveryFlowId {
+    use ironauth_store::{
+        CorrelationId, NewRecoveryFlow, RecoveryEntryPoint, RecoveryFlowId, RecoveryMethod,
+    };
+    let id = RecoveryFlowId::generate(env, &subject.scope());
+    db.store()
+        .scoped(subject.scope())
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .recovery_flows()
+        .initiate(
+            env,
+            NewRecoveryFlow {
+                id: &id,
+                subject,
+                entry_point: RecoveryEntryPoint::LostPassword,
+                recover_acr: "urn:ironauth:acr:pwd",
+                cancel_token_digest: &[7; 32],
+                recipient: EMAIL,
+                hold_until_unix_micros: None,
+                method: RecoveryMethod::Standard,
+            },
+            0,
+        )
+        .await
+        .unwrap()
+}
+
+async fn start_reset(
+    db: &TestDatabase,
+    env: &Env,
+    id: &PasswordResetChallengeId,
+    account: Option<ironauth_store::PasswordResetAccount<'_>>,
+) -> Result<Option<String>, ironauth_store::StoreError> {
+    use ironauth_store::{ClientId, CorrelationId, NewPasswordReset};
+    db.store()
+        .scoped(id.scope())
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .password_reset()
+        .start(
+            env,
+            NewPasswordReset {
+                id,
+                client: &ClientId::generate(env, &id.scope()),
+                browser_binding_hash: &[3; 32],
+                authorization_return_to: "/authorize?client_id=fixture",
+                account,
+                code_hash: HASH,
+                expires_at_unix_micros: now_micros(env) + 300_000_000,
+            },
+        )
+        .await
+}
+
+#[tokio::test]
+async fn reset_issuance_derives_current_authority_and_enforces_browser_scope_and_cooldown() {
+    use ironauth_store::{PasswordResetAccount, StoreError};
+    use sha2::{Digest, Sha256};
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = verified_account(&db, &env, scope).await;
+    let recovery = recovery_case(&db, &env, &subject).await;
+    let id = PasswordResetChallengeId::generate(&env, &scope);
+    assert_eq!(
+        start_reset(
+            &db,
+            &env,
+            &id,
+            Some(PasswordResetAccount {
+                subject: &subject,
+                recovery: &recovery,
+            })
+        )
+        .await
+        .unwrap()
+        .as_deref(),
+        Some(EMAIL)
+    );
+    let row = sqlx::query("SELECT subject,identifier_id,recipient_revision,recovery_id,credential_digest,attempt_count FROM password_reset_challenges WHERE id=$1")
+        .bind(id.to_string()).fetch_one(db.owner_pool()).await.unwrap();
+    let verified = db
+        .store()
+        .scoped(scope)
+        .recipient_verification()
+        .current(&subject, EMAIL)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get::<String, _>("subject"), subject.to_string());
+    assert_eq!(
+        row.get::<String, _>("identifier_id"),
+        verified.identifier_id.to_string()
+    );
+    assert_eq!(
+        row.get::<String, _>("recipient_revision"),
+        verified.revision.to_string()
+    );
+    assert_eq!(row.get::<String, _>("recovery_id"), recovery.to_string());
+    assert_eq!(
+        row.get::<Vec<u8>, _>("credential_digest"),
+        Sha256::digest(HASH.as_bytes()).to_vec()
+    );
+    assert_eq!(row.get::<i32, _>("attempt_count"), 0);
+    let read = db.store().scoped(scope).password_reset();
+    assert_eq!(
+        read.challenge(&env, &id, &[3; 32])
+            .await
+            .unwrap()
+            .unwrap()
+            .code_hash,
+        HASH
+    );
+    assert!(read.challenge(&env, &id, &[4; 32]).await.unwrap().is_none());
+    let other = db.seed_scope(&env).await;
+    assert!(
+        db.store()
+            .scoped(other)
+            .password_reset()
+            .challenge(&env, &id, &[3; 32])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let next = PasswordResetChallengeId::generate(&env, &scope);
+    assert!(matches!(
+        start_reset(
+            &db,
+            &env,
+            &next,
+            Some(PasswordResetAccount {
+                subject: &subject,
+                recovery: &recovery,
+            })
+        )
+        .await,
+        Err(StoreError::QuotaExceeded)
+    ));
+    assert!(read.challenge(&env, &id, &[3; 32]).await.unwrap().is_some());
+    let audit = db.store().scoped(scope).audit().list().await.unwrap();
+    assert_eq!(
+        audit
+            .iter()
+            .filter(|row| row.action == "password_reset.start")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn reset_issuance_refuses_cancelled_or_foreign_cases_and_decoy_has_no_account_binding() {
+    use ironauth_store::{CorrelationId, PasswordResetAccount, RecoveryCancelReason, StoreError};
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = verified_account(&db, &env, scope).await;
+    let recovery = recovery_case(&db, &env, &subject).await;
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .recovery_flows()
+        .cancel(&env, &recovery, RecoveryCancelReason::UserNotification)
+        .await
+        .unwrap();
+    let id = PasswordResetChallengeId::generate(&env, &scope);
+    assert!(matches!(
+        start_reset(
+            &db,
+            &env,
+            &id,
+            Some(PasswordResetAccount {
+                subject: &subject,
+                recovery: &recovery,
+            })
+        )
+        .await,
+        Err(StoreError::NotFound)
+    ));
+    let other = db.seed_scope(&env).await;
+    let foreign = PasswordResetChallengeId::generate(&env, &other);
+    assert!(matches!(
+        start_reset(
+            &db,
+            &env,
+            &foreign,
+            Some(PasswordResetAccount {
+                subject: &subject,
+                recovery: &recovery,
+            })
+        )
+        .await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(start_reset(&db, &env, &id, None).await.unwrap().is_none());
+    let row = sqlx::query("SELECT subject,credential_digest,recipient_revision FROM password_reset_challenges WHERE id=$1")
+        .bind(id.to_string()).fetch_one(db.owner_pool()).await.unwrap();
+    assert!(row.get::<Option<String>, _>("subject").is_none());
+    assert!(row.get::<Option<Vec<u8>>, _>("credential_digest").is_none());
+    assert!(row.get::<Option<String>, _>("recipient_revision").is_none());
+    assert!(
+        db.store()
+            .scoped(scope)
+            .password_reset()
+            .challenge(&env, &id, &[3; 32])
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn reset_issuance_refuses_unverified_accounts_and_another_subjects_case() {
+    use ironauth_store::{CorrelationId, PasswordResetAccount, StoreError};
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let unverified = scoped
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .register(&env, "unverified@example.test", HASH, None)
+        .await
+        .unwrap();
+    let recovery = recovery_case(&db, &env, &unverified).await;
+    let id = PasswordResetChallengeId::generate(&env, &scope);
+    assert!(matches!(
+        start_reset(
+            &db,
+            &env,
+            &id,
+            Some(PasswordResetAccount {
+                subject: &unverified,
+                recovery: &recovery,
+            })
+        )
+        .await,
+        Err(StoreError::NotFound)
+    ));
+    let verified = verified_account(&db, &env, scope).await;
+    assert!(matches!(
+        start_reset(
+            &db,
+            &env,
+            &id,
+            Some(PasswordResetAccount {
+                subject: &verified,
+                recovery: &recovery,
+            })
+        )
+        .await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(
+        scoped
+            .password_reset()
+            .challenge(&env, &id, &[3; 32])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM password_reset_challenges WHERE tenant_id=$1 AND environment_id=$2",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+    assert!(
+        !scoped
+            .audit()
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.action == "password_reset.start")
+    );
+}
+
+#[tokio::test]
+async fn reset_reissue_cancels_prior_authority_and_reads_expire_at_the_deadline() {
+    use ironauth_store::PasswordResetAccount;
+    use std::time::{Duration, SystemTime};
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH + Duration::from_secs(1000), 1479);
+    let scope = db.seed_scope(&env).await;
+    let subject = verified_account(&db, &env, scope).await;
+    let recovery = recovery_case(&db, &env, &subject).await;
+    let first = PasswordResetChallengeId::generate(&env, &scope);
+    start_reset(
+        &db,
+        &env,
+        &first,
+        Some(PasswordResetAccount {
+            subject: &subject,
+            recovery: &recovery,
+        }),
+    )
+    .await
+    .unwrap();
+    clock.advance(Duration::from_secs(61));
+    let second = PasswordResetChallengeId::generate(&env, &scope);
+    start_reset(
+        &db,
+        &env,
+        &second,
+        Some(PasswordResetAccount {
+            subject: &subject,
+            recovery: &recovery,
+        }),
+    )
+    .await
+    .unwrap();
+    let read = db.store().scoped(scope).password_reset();
+    assert!(
+        read.challenge(&env, &first, &[3; 32])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        read.challenge(&env, &second, &[3; 32])
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let prior = sqlx::query("SELECT state,finished_at IS NOT NULL AS finished FROM password_reset_challenges WHERE id=$1")
+        .bind(first.to_string()).fetch_one(db.owner_pool()).await.unwrap();
+    assert_eq!(prior.get::<String, _>("state"), "cancelled");
+    assert!(prior.get::<bool, _>("finished"));
+    clock.advance(Duration::from_secs(300));
+    assert!(
+        read.challenge(&env, &second, &[3; 32])
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

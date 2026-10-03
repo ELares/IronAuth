@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add audited browser-bound reset challenge issuance and reads, deriving verified ownership and credential generation from current store rows and enforcing a durable account resend cooldown (#1479). Issuance does not claim delivery or enable credential reset.
+
 - Factor password verifier mutation and session revocation into a private transaction-owned primitive for atomic recovery composition (#1479); preserve ordinary account-change behavior and verify rollback on an audit failure.
 
 - Add the scoped password-reset challenge schema and redacted typed identifiers, with bounded lifetime/attempts, immutable binding grants and completion-receipt constraints (#1479). This storage foundation does not enable the hosted reset ceremony.

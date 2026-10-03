@@ -1,6 +1,6 @@
 # Hosted password recovery
 
-Status: implementation plan for #1479. This document does not describe a shipped
+Status: implementation in progress for #1479. This document does not describe a shipped
 password-reset capability. Civio onboarding issue encryptixio/civio#455 depends
 on the complete browser journey, not merely the recovery acknowledgement.
 
@@ -122,8 +122,8 @@ Migration 0249 and `PasswordResetChallengeId` introduce only the storage boundar
 The table separates pending, completed, cancelled and refused metadata, requires
 an indivisible real-account binding, and bounds attempts and expiry. Real-store
 schema tests exercise forced row-level security and runtime column grants.
-Repository issuance/completion, atomic credential mutation, actual delivery and
-the hosted form remain unimplemented. A valid metadata row is not proof that a
+Repository completion, atomic proof consumption with credential mutation, actual
+delivery and the hosted form remain unimplemented. A valid metadata row is not proof that a
 password was changed; only the future audited completion transaction may make
 that claim. No deployment is activated by this additive migration alone.
 
@@ -132,3 +132,15 @@ cascade to a private transaction-owned primitive. The public account endpoint
 still requires its existing authentication. This refactor does not confer reset
 authority, revoke offline families on ordinary password changes, or implement the
 pending reset completion API.
+
+Scoped reset issuance now derives the verified mailbox revision and original
+password digest under the shared recipient-ownership and user locks, requires a
+pending standard lost-password case for that subject, and persists its browser
+binding and validated authorization continuation. Reissue is subject to a durable
+one-minute cooldown and cancels the prior pending challenge; completed receipts
+are retained. Decoys carry no account binding. Hashing-input reads require the
+matching browser binding, scope, pending state, expiry and remaining attempts.
+Neither issuance nor a read is permission to mutate a credential. Completion must
+recheck all bound generations and the case delay/cancellation under the same lock
+order. A long held case also needs a usable fresh-code path after the delay; a
+short code must not be treated as bypassing or satisfying that delay.
