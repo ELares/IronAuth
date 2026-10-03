@@ -646,3 +646,24 @@ Enabled delivery uses durable terminal notices; deployment remains default off.
 | Tampering | Browser proof script weakens the hosted page policy | Env-generated CSP nonce through the existing login response helper; same-origin connect/form destinations; server still enforces endpoint/context/scope/expiry and single-use proof |
 | Denial of service | Unbounded forms or unregulated password hashing | 16 KiB route body limit; independent recovery counters; policy/strength/screening before admitted hashing; retain retry and rate-limit headers |
 | Elevation | Reset signs in or bypasses stronger factors | Store completion only; no session cookie or role grant; held cases remain held; ordinary login still required |
+
+
+### Hosted recovery application restart after PAR expiry (#1479)
+
+- Spoofing: the opaque PAR reference and declared client must resolve together in
+  the same scope. No account lookup, session creation or recovery authority comes
+  from the navigation query or its optional restart marker.
+- Tampering: callback, state and response mode come from the pushed record; the
+  current client registration and shared request validator are checked again.
+  Inline replacements, foreign references and removed callback registrations
+  cannot select a return target.
+- Repudiation: navigation reads do not claim a password change, PAR consumption,
+  sign-in or application grant. Existing audited mutation owners remain unchanged.
+- Information disclosure: the link is same-origin and pages use existing no-store
+  and CSP headers. The error response contains no recovery code, password, token
+  or session; it uses the existing OAuth error encoder and issuer binding.
+- Denial of service: this read is bounded to one scoped row, thirty minutes from
+  push, and an unconsumed reference. It sends no mail and never renews a deadline.
+- Elevation of privilege: navigation context cannot be used by the normal live
+  PAR read or atomic consume. Only an error can be returned; a fresh application
+  authorization is required. Missing/old/consumed context fails closed.

@@ -95,7 +95,12 @@ pub async fn request_get(
 ) -> Response {
     let Some(resume) = crate::authorize::recovery_resume(&state, query.return_to.as_deref()).await
     else {
-        return interaction::invalid_link_page();
+        return crate::password_reset_hosted::application_return_page(
+            &state,
+            query.return_to.as_deref(),
+        )
+        .await
+        .unwrap_or_else(interaction::invalid_link_page);
     };
     if !state.password_recovery_delivery_available() {
         return disabled(&state, &resume).await;
@@ -116,7 +121,12 @@ pub async fn request_post(
     }
     let Some(resume) = crate::authorize::recovery_resume(&state, form.return_to.as_deref()).await
     else {
-        return interaction::invalid_link_page();
+        return crate::password_reset_hosted::application_return_page(
+            &state,
+            form.return_to.as_deref(),
+        )
+        .await
+        .unwrap_or_else(interaction::invalid_link_page);
     };
     if !state.password_recovery_delivery_available() {
         return disabled(&state, &resume).await;

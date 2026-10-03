@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add a thirty-minute, client/scope-bound PAR navigation read for hosted recovery error returns (#1479). The live authorization read and atomic consume retain their original expiry and single-use checks.
+
 - Remove unused data-plane DELETE authority from hosted password-reset challenges with forward migration 0250 (#1479). Preserve retained receipts, cancellation aliases and the checksum of already-applied migration 0249.
 
 - Queue one code-free owner warning atomically when a hosted recovery case is cancelled (#1479). Select one latest case-bound challenge across reissues, preserve current mailbox validation, and never allow cancellation-notice eligibility to authorize password completion.

@@ -1084,3 +1084,120 @@ async fn expired_recovery_retains_validated_navigation_without_reset_authority()
     .unwrap();
     assert_eq!(attempts, 0, "navigation is not a reset attempt");
 }
+
+#[tokio::test]
+async fn recovery_returns_to_registered_application_after_par_expires_during_reset() {
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        1479,
+    );
+    let scope = db.seed_scope(&env).await;
+    let (smtp, mail) = fixture(Reply::Accepted, true).await;
+    let state = state(
+        &db,
+        &env,
+        scope,
+        Some(PasswordResetSmtpTransport {
+            smtp,
+            issuer: Url::parse("https://auth.example.test").unwrap(),
+            env: env.clone(),
+        }),
+    );
+    let (subject, client) = seed(&db, &state, scope).await;
+    let direct = format!("{}&state=original-application-state", resume(&client));
+    let (status, _, body) = call(
+        &state,
+        "POST",
+        "/par",
+        direct.strip_prefix("/authorize?").unwrap().to_owned(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let par: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let target = format!(
+        "/authorize?{}",
+        serde_urlencoded::to_string([
+            ("client_id", client.to_string()),
+            (
+                "request_uri",
+                par["request_uri"].as_str().unwrap().to_owned()
+            ),
+        ])
+        .unwrap()
+    );
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .set_require_pushed_authorization_requests(&env, &client, true)
+        .await
+        .unwrap();
+    let (status, headers, _) = request(&state, &target, OWNER, None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let browser = cookie(&headers);
+    let raw = tokio::time::timeout(Duration::from_secs(5), mail)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    clock.advance(Duration::from_secs(par["expires_in"].as_u64().unwrap() + 1));
+    let query = serde_urlencoded::to_string([("return_to", target.as_str())]).unwrap();
+    let reset = format!("/recover/reset?{query}");
+    for path in [&reset, &format!("/recover?{query}")] {
+        let (status, headers, page) = call(&state, "GET", path, String::new(), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page.contains("Return to application and restart sign-in"));
+        assert!(!headers.contains_key(header::SET_COOKIE));
+    }
+    let (status, _, page) = call(&state, "GET", &reset, String::new(), Some(&browser)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Return to application and restart sign-in"));
+    assert!(!page.contains("Back to sign in") && !page.contains("Request another code"));
+    complete_from_mail(&state, &db, &subject, &browser, &raw).await;
+    let (_, _, page) = call(&state, "GET", &reset, String::new(), Some(&browser)).await;
+    assert!(page.contains("Return to application and restart sign-in"));
+    assert!(!page.contains("Back to sign in"));
+    // A successful reset does not revive the PAR or mint any application session.
+    let (status, _, _) = call(&state, "GET", &target, String::new(), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let restart = format!("{reset}&restart=1");
+    let (status, headers, _) = call(&state, "GET", &restart, String::new(), None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(!headers.contains_key(header::SET_COOKIE));
+    assert_recovery_error_return(&headers);
+    // Inline substitutions cannot override the pushed callback or state.
+    let forged = format!("{target}&redirect_uri=https%3A%2F%2Fforeign.example.test&state=forged");
+    let forged = format!(
+        "/recover/reset?{}&restart=1",
+        serde_urlencoded::to_string([("return_to", forged)]).unwrap()
+    );
+    let (_, forged_headers, _) = call(&state, "GET", &forged, String::new(), None).await;
+    assert_eq!(forged_headers[header::LOCATION], headers[header::LOCATION]);
+    // Revoked callback registration removes even navigation permission.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .register_redirect_uris(&env, &client, &["https://replacement.example.test/cb"])
+        .await
+        .unwrap();
+    let (status, headers, page) = call(&state, "GET", &restart, String::new(), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!headers.contains_key(header::LOCATION));
+    assert!(!page.contains("Return to application and restart sign-in"));
+}
+
+fn assert_recovery_error_return(headers: &HeaderMap) {
+    let destination = Url::parse(headers[header::LOCATION].to_str().unwrap()).unwrap();
+    assert_eq!(
+        destination.origin().ascii_serialization(),
+        "https://client.example.test"
+    );
+    assert_eq!(destination.path(), "/cb");
+    let fields: std::collections::HashMap<_, _> = destination.query_pairs().into_owned().collect();
+    assert_eq!(fields.get("state").unwrap(), "original-application-state");
+    assert_eq!(fields.get("error").unwrap(), "access_denied");
+    assert!(!fields.contains_key("code") && !fields.contains_key("access_token"));
+}

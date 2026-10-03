@@ -637,3 +637,27 @@ transactional outbox under the dedicated `password-reset-completion` consumer,
 with challenge ID as the sole payload field, challenge-key idempotency and
 subject ordering. It is not a new public webhook type. Reset/cancellation
 transaction rollback and duplicate-notice tests exercise this producer.
+
+
+An actual hosted Chrome probe reproduced the expired-PAR navigation dead end:
+while the reference was live the cookie-free reset page had a sign-in link; after
+62 real seconds it returned an unavailable notice with no action. No account or
+mail mutation was used for this probe. The prior PAR fixture completed reset
+before expiry, so it did not qualify this case.
+
+Recovery now offers an explicit application restart for a pushed authorization
+request. A separate read retains only navigation context for thirty minutes from
+the original push, remains scope/client bound, and excludes consumed requests.
+The handler revalidates the current registered callback and request parameters,
+then returns only `access_denied` with the stored state, issuer and response mode.
+Inline callback/state parameters cannot override the pushed record. This does
+not renew or consume the PAR, issue a code/session, alter recovery proof, or grant
+application membership. The application must initiate a fresh authorization.
+Direct authorization recovery keeps its existing sign-in/fresh-code actions.
+
+`GET /recover/reset?restart=1&return_to=...` is navigation-only, even when a reset
+cookie exists. PAR recovery forms and result notices use this action instead of
+links which could resume an expired reference. A missing record, consumed request,
+revoked callback, foreign scope/client, or navigation age of thirty minutes fails
+closed without a callback link. No schema migration or additional retention job
+is introduced. Deployed and full-gate qualification of this repair remains pending.

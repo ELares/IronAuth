@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Hosted reset completion handlers, not yet mounted. Request issuance and
-//! completion-notice integration must be finished before the router enables them.
+//! Hosted reset completion and bounded application restart navigation.
 
 use axum::extract::{DefaultBodyLimit, Form, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use ironauth_store::{
     CompletePasswordReset, CorrelationId, PasswordResetContext, PasswordResetOutcome,
 };
@@ -16,8 +15,7 @@ use crate::password_reset_browser::ResetBrowserBinding;
 use crate::password_reset_pages::{self as pages, ResetNotice};
 use crate::state::OidcState;
 
-/// Bounded hosted reset routes, deliberately not merged into the provider router
-/// until issuance and completion notifications are integrated and qualified.
+/// Bounded hosted reset routes mounted by the provider router.
 pub fn routes() -> axum::Router<OidcState> {
     axum::Router::new()
         .route(
@@ -40,6 +38,31 @@ pub struct ResetForm {
     pub new_password: String,
     /// Confirmation, compared after the same NFKC normalization.
     pub confirm_password: String,
+}
+
+/// Navigation fields are never reset or authorization authority.
+#[derive(Deserialize)]
+pub struct ResetQuery {
+    /// Original local authorization reference, revalidated before navigation.
+    pub return_to: Option<String>,
+    /// Explicitly abandon this application authorization and return an error.
+    pub restart: Option<String>,
+}
+
+/// Offer a fresh application entry only for stored, currently registered context.
+pub(crate) async fn application_return_page(
+    state: &OidcState,
+    target: Option<&str>,
+) -> Option<Response> {
+    let (resume, _) = crate::authorize::recovery_application_return(state, target).await?;
+    Some(pages::response(
+        StatusCode::BAD_REQUEST,
+        pages::application_return_page(
+            &resume.return_to,
+            &resume.hints,
+            state.environment_banner(&resume.scope).await,
+        ),
+    ))
 }
 
 struct Attempt {
@@ -79,7 +102,9 @@ async fn resolve(state: &OidcState, headers: &HeaderMap) -> Result<Attempt, Resp
 /// Navigation only: never resolves a reset challenge or grants completion authority.
 async fn expired_navigation(state: &OidcState, target: Option<&str>) -> Response {
     let Some(resume) = crate::authorize::recovery_resume(state, target).await else {
-        return invalid();
+        return application_return_page(state, target)
+            .await
+            .unwrap_or_else(invalid);
     };
     let banner = state.environment_banner(&resume.scope).await;
     pages::response(
@@ -167,9 +192,17 @@ fn notice(attempt: &Attempt, view: ResetNotice<'_>) -> Response {
 /// attempt consumption, password mutation, or session creation.
 pub async fn reset_get(
     State(state): State<OidcState>,
-    Query(navigation): Query<crate::login::ResumeQuery>,
+    Query(navigation): Query<ResetQuery>,
     headers: HeaderMap,
 ) -> Response {
+    if navigation.restart.as_deref() == Some("1") {
+        return crate::authorize::recovery_application_return(
+            &state,
+            navigation.return_to.as_deref(),
+        )
+        .await
+        .map_or_else(invalid, |(_, error)| error.into_response());
+    }
     let attempt = match resolve(&state, &headers).await {
         Ok(value) => value,
         Err(response) if response.status() == StatusCode::BAD_REQUEST => {

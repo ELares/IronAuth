@@ -41,15 +41,25 @@ pub fn code_page(
 <p>Your other authentication factors stay in place. After resetting your password, sign in again to continue.</p>
 <p><button type="submit">Reset password</button></p>
 </form>
-<div class="auth-links"><a href="{recover}">Request another code</a><a href="{login}">Back to sign in</a></div>
+{navigation}
 <p>If you did not request recovery, use the cancellation link in the notification email.</p>"#,
+        navigation = {
+            let restart = application_return_link(return_to);
+            if restart.is_empty() {
+                format!(
+                    "<div class=\"auth-links\"><a href=\"{}\">Request another code</a><a href=\"{}\">Back to sign in</a></div>",
+                    interaction_href("/recover", return_to),
+                    interaction_href("/login", return_to)
+                )
+            } else {
+                restart
+            }
+        },
         error = error_banner(error),
         csrf = escape_html(csrf),
         reset = interaction_href("/recover/reset", return_to),
         expiry = escape_html(expires_at_label),
         guidance = escape_html(password_guidance),
-        recover = interaction_href("/recover", return_to),
-        login = interaction_href("/login", return_to),
     );
     document(
         "Reset your password",
@@ -57,6 +67,41 @@ pub fn code_page(
         hints.lang(),
         hints.display().as_str(),
         environment_banner,
+    )
+}
+
+/// A local, explicit application restart. The handler resolves stored PAR context
+/// and revalidates the registration; this link itself grants no authority.
+fn application_return_link(return_to: &str) -> String {
+    let Some((_, query)) = return_to.split_once('?') else {
+        return String::new();
+    };
+    if !url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == "request_uri") {
+        return String::new();
+    }
+    format!(
+        "<p><a href=\"{}&amp;restart=1\">Return to application and restart sign-in</a></p>",
+        interaction_href("/recover/reset", return_to)
+    )
+}
+
+/// Explain expired application authorization separately from recovery proof.
+#[must_use]
+pub fn application_return_page(
+    return_to: &str,
+    hints: &InteractionHints,
+    banner: Option<&str>,
+) -> String {
+    let body = format!(
+        "<h1>Start a fresh sign-in</h1><p>This application sign-in request is no longer available. Return to the application to start again. This does not change your password.</p>{}",
+        application_return_link(return_to)
+    );
+    document(
+        "Start a fresh sign-in",
+        &body,
+        hints.lang(),
+        hints.display().as_str(),
+        banner,
     )
 }
 
@@ -119,19 +164,28 @@ pub fn notice_page(
         ),
     };
     let mut body = format!(
-        "<h1>{}</h1><p>{}</p><div class=\"auth-links\"><a href=\"{}\">Back to sign in</a>",
+        "<h1>{}</h1><p>{}</p>",
         escape_html(title),
-        escape_html(&message),
-        interaction_href("/login", return_to)
+        escape_html(&message)
     );
-    if request_again {
+    let restart = application_return_link(return_to);
+    if restart.is_empty() {
         let _ = write!(
             body,
-            "<a href=\"{}\">Request a fresh code</a>",
-            interaction_href("/recover", return_to)
+            "<div class=\"auth-links\"><a href=\"{}\">Back to sign in</a>",
+            interaction_href("/login", return_to)
         );
+        if request_again {
+            let _ = write!(
+                body,
+                "<a href=\"{}\">Request a fresh code</a>",
+                interaction_href("/recover", return_to)
+            );
+        }
+        body.push_str("</div>");
+    } else {
+        body.push_str(&restart);
     }
-    body.push_str("</div>");
     document(
         title,
         &body,

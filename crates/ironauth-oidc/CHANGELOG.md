@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Offer an application restart from hosted recovery when a pushed authorization request expires (#1479). Revalidate the registered callback and return only an OAuth error with the original state; never revive authorization or issue a session.
+
 - Keep a validated sign-in and fresh-code path after the recovery cookie expires (#1479). A continuation carried in the reset URL is presentation-only and is revalidated against the registered client before rendering links; it never supplies reset authority.
 
 - Preserve enrolled passkey recovery delays when WebAuthn login is disabled (#1479). Recovery strength follows persisted credentials independently of login endpoint availability.

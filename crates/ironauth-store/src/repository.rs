@@ -11542,6 +11542,44 @@ impl PushedRequestRepo<'_> {
         tx.commit().await?;
         Ok(row.map(|row| row.get::<String, _>("request_params")))
     }
+
+    /// Read bounded navigation context, never authorization authority, for hosted
+    /// recovery's explicit return to the application. Unlike `read`, expiry does
+    /// not hide the original callback, but consumed requests remain unavailable.
+    /// The caller must revalidate the current client registration and may emit
+    /// only an OAuth error, never a code, token, or successful continuation.
+    /// Context is retained for at most thirty minutes from the original push.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for a foreign scope and `Database` on query failure.
+    pub async fn read_for_recovery_navigation(
+        &self,
+        env: &Env,
+        id: &PushedRequestId,
+        presenting_client_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let now_micros = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT request_params FROM pushed_authorization_requests \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+             AND client_id = $4 AND consumed_at IS NULL \
+             AND created_at <= TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             AND created_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval - INTERVAL '30 minutes'",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(presenting_client_id)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<String, _>("request_params")))
+    }
 }
 
 /// The mutating pushed-authorization-request repository (RFC 9126, issue #27).
