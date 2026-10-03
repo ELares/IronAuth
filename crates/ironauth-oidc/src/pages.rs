@@ -43,6 +43,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::hints::InteractionHints;
 
+/// Purpose-specific hosted reset forms and recovery guidance.
+pub mod password_reset;
+
 /// The strict Content-Security-Policy every bootstrap page carries. `default-src
 /// 'none'` denies everything not explicitly re-permitted; [`page_csp`] permits
 /// only the exact embedded stylesheet by its content hash. `form-action 'self'`

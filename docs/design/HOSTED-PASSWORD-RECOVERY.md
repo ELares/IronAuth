@@ -301,3 +301,23 @@ perform hosted registration, verify a reset code, or change a credential. Its
 cancellation URL is test content, not evidence of a usable hosted cancellation
 journey. This is local delivery integration evidence, not Internet mail or browser
 recovery qualification. The test is included with the OIDC `testing` feature.
+
+
+The reset page renderers now provide an existence-uniform code/new-password form
+and distinct server-resolved completion, waiting-period, unavailable-attempt and
+deployment-unavailable notices. The form supports password managers and one-time
+code entry, retains leading zeros, labels its fields and associates policy/expiry
+help. It posts only CSRF proof, code, new password and confirmation; subject, client
+and challenge are never trusted hidden form fields. Submitted passwords/codes are
+not renderer inputs, so error responses cannot refill them. Configuration-derived
+password guidance and the stored expiry/horizon must be supplied by the handler.
+
+Navigation retains the validated application continuation. A missing/expired
+attempt explains that an interrupted successful reset can be followed by ordinary
+sign-in with the chosen password. Waiting pages explain that fresh codes preserve
+the established delay and offer an explicit request page; no notice automatically
+submits or sends mail. Completion wording concerns IronAuth sign-in sessions and
+does not claim immediate revocation of every relying party's cached access token.
+The response helper applies the shared strict CSP, no-store and no-referrer.
+These renderers are not mounted yet; semantics/header tests do not establish a
+rendered browser journey, manual accessibility qualification or live recovery.

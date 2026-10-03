@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add reset code/new-password forms and explicit completed, held, expired and deployment-unavailable guidance (#1479). Preserve the validated application continuation, never refill submitted secrets, and use no-store/no-referrer responses. Hosted handler integration remains pending.
+
 - Connect reset request delivery to required verified-channel selection, concrete SMTP and durable aggregate outcomes (#1479). Send secondary warnings before the primary code, refuse unsupported required channels, preserve uncertainty and bound each batch to 16 seconds. Hosted routes remain pending.
 
 - Add a distinct reset-request owner notice carrying a provider-bound cancellation link without reset proof (#1479). Secondary verified channels can be warned without receiving the primary mailbox's code; hosted channel orchestration remains pending.
