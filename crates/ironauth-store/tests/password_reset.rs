@@ -2649,3 +2649,133 @@ async fn reset_case_preparation_does_not_inherit_a_stronger_recovery_proof() {
         "urn:ironauth:acr:pwd"
     );
 }
+
+#[tokio::test]
+async fn completion_notice_is_queued_once_and_claimed_once_after_commit() {
+    use ironauth_store::{
+        CorrelationId, PASSWORD_RESET_COMPLETION_CONSUMER, PasswordResetDelivery,
+    };
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (subject, _, challenge) = reset_fixture(&db, &env, scope).await;
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let acting = scoped.acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let notices = acting.password_reset();
+    assert!(
+        notices
+            .claim_completion_notice(&env, &challenge.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    complete_reset(&db, &env, &challenge, true, 9)
+        .await
+        .unwrap();
+    complete_reset(&db, &env, &challenge, true, 9)
+        .await
+        .unwrap();
+    let payloads: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload FROM outbox_messages WHERE consumer=$1 AND idempotency_key=$2",
+    )
+    .bind(PASSWORD_RESET_COMPLETION_CONSUMER)
+    .bind(challenge.id.to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        payloads,
+        vec![serde_json::json!({"challenge_id": challenge.id.to_string()})]
+    );
+    let (first, second) = tokio::join!(
+        notices.claim_completion_notice(&env, &challenge.id),
+        notices.claim_completion_notice(&env, &challenge.id),
+    );
+    let claims: Vec<_> = [first.unwrap(), second.unwrap()]
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].subject, subject);
+    assert!(claims[0].recipient.is_some());
+    notices
+        .record_completion_notice(&env, &challenge.id, PasswordResetDelivery::Accepted, 1)
+        .await
+        .unwrap();
+    assert!(
+        notices
+            .record_completion_notice(&env, &challenge.id, PasswordResetDelivery::Uncertain, 0)
+            .await
+            .is_err()
+    );
+    assert!(
+        notices
+            .claim_completion_notice(&env, &challenge.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let status = scoped
+        .password_reset()
+        .completion_notice_status(&challenge.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.started_at_unix_micros.is_some());
+    assert_eq!(status.result, Some(PasswordResetDelivery::Accepted));
+}
+
+#[tokio::test]
+async fn completion_notice_enqueue_failure_rolls_back_password_and_case() {
+    use ironauth_store::PasswordResetOutcome;
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (subject, recovery, challenge) = reset_fixture(&db, &env, scope).await;
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let audits_before = scoped.audit().list().await.unwrap().len();
+    sqlx::raw_sql("CREATE FUNCTION reject_completion_queue() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.consumer='password-reset-completion' THEN RAISE EXCEPTION 'fixture queue failure'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER reject_completion_queue BEFORE INSERT ON outbox_messages FOR EACH ROW EXECUTE FUNCTION reject_completion_queue();")
+        .execute(db.owner_pool()).await.unwrap();
+    assert!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        scoped
+            .users()
+            .password_hash_for_subject(&subject)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(HASH)
+    );
+    assert_eq!(scoped.audit().list().await.unwrap().len(), audits_before);
+    let completed: bool =
+        sqlx::query_scalar("SELECT state='completed' FROM recovery_flows WHERE id=$1")
+            .bind(recovery.to_string())
+            .fetch_one(db.owner_pool())
+            .await
+            .unwrap();
+    assert!(!completed);
+    let pending: bool = sqlx::query_scalar(
+        "SELECT state='pending' AND attempt_count=0 FROM password_reset_challenges WHERE id=$1",
+    )
+    .bind(challenge.id.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .unwrap();
+    assert!(pending);
+    sqlx::raw_sql("DROP TRIGGER reject_completion_queue ON outbox_messages; DROP FUNCTION reject_completion_queue();")
+        .execute(db.owner_pool()).await.unwrap();
+    assert!(matches!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .unwrap(),
+        PasswordResetOutcome::Completed { .. }
+    ));
+}

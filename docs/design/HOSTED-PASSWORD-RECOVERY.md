@@ -462,3 +462,19 @@ that request GET creates no challenge/cookie, and checks disabled recovery retur
 the same unavailable page for known and unknown identifiers. Cross-origin and
 oversized requests set no reset cookie and issue no challenge. These checks do not
 replace end-to-end PAR, regulation/PoW, crash/restart or headed-browser qualification.
+
+
+Completion-notice persistence now shares the credential transaction. The internal
+outbox payload contains only the challenge ID; no email, password, code or
+cancellation capability is queued. Exact receipt retries do not enqueue again.
+An audited claim rechecks original mailbox ownership before any external send.
+The code-free notice has no reset-code expiry requirement. Delivery results are
+terminal, and a claimed attempt is never automatically resent. The consumer lets
+an overlapping bounded SMTP attempt finish, then classifies an unresolved claim
+as uncertain after thirty seconds instead of claiming success or duplicating mail.
+
+Store qualification covers pre-completion refusal, one queue row after receipt
+replay, concurrent single-winner claims, terminal-result immutability and rollback
+of password/case/audit changes when the completion queue insert fails. This is
+store evidence only. Worker boot/shutdown wiring, actual completion SMTP delivery,
+stale-claim restart behavior and mailbox-reassignment qualification remain pending.

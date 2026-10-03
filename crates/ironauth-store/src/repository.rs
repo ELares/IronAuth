@@ -115,9 +115,10 @@ use crate::message_feedback::SuppressionReason;
 use crate::message_rate::RateBudget;
 use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
 use crate::password_reset::{
-    CompletePasswordReset, NewPasswordReset, PasswordResetAccount, PasswordResetChallenge,
-    PasswordResetContext, PasswordResetDelivery, PasswordResetOutcome, PasswordResetReceipt,
-    PreparePasswordResetCase,
+    CompletePasswordReset, NewPasswordReset, PASSWORD_RESET_COMPLETION_CONSUMER,
+    PasswordResetAccount, PasswordResetChallenge, PasswordResetCompletionNotice,
+    PasswordResetContext, PasswordResetDelivery, PasswordResetNoticeStatus, PasswordResetOutcome,
+    PasswordResetReceipt, PreparePasswordResetCase,
 };
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
 use crate::recipient_verification::{
@@ -20935,6 +20936,160 @@ pub struct ActingPasswordResetRepo<'a> {
     acting: ActingContext,
 }
 
+impl PasswordResetRepo<'_> {
+    /// Read completion-notice metadata only. No row is due before reset commit.
+    ///
+    /// # Errors
+    /// Persistence failure or invalid stored status.
+    pub async fn completion_notice_status(
+        &self,
+        id: &PasswordResetChallengeId,
+    ) -> Result<Option<PasswordResetNoticeStatus>, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT completion_notice_state,(extract(epoch FROM completion_notice_started_at)*1000000)::bigint AS started_us \
+             FROM password_reset_challenges WHERE tenant_id=$1 AND environment_id=$2 AND id=$3 AND state='completed'",
+        ).bind(self.scope.tenant().to_string()).bind(self.scope.environment().to_string()).bind(id.to_string())
+        .fetch_optional(&mut *tx).await?;
+        tx.commit().await?;
+        row.map(|row| {
+            let result = match row.get::<String, _>("completion_notice_state").as_str() {
+                "pending" => None,
+                "accepted" => Some(PasswordResetDelivery::Accepted),
+                "refused" => Some(PasswordResetDelivery::Refused),
+                "uncertain" => Some(PasswordResetDelivery::Uncertain),
+                _ => return Err(StoreError::Invalid),
+            };
+            Ok(PasswordResetNoticeStatus {
+                started_at_unix_micros: row.get("started_us"),
+                result,
+            })
+        })
+        .transpose()
+    }
+}
+
+impl ActingPasswordResetRepo<'_> {
+    /// Admit exactly one owner notice only after credential completion commits.
+    /// No code/receipt expiry applies to this code-free notification. A prior
+    /// claim is never reissued, even if its worker lost the SMTP acknowledgement.
+    /// Recheck original mailbox ownership; an ineligible target is returned with
+    /// no recipient so the consumer records refusal without leaking to a new owner.
+    ///
+    /// # Errors
+    /// Store/encryption/audit failure. No external send may precede this commit.
+    pub async fn claim_completion_notice(
+        &self,
+        env: &Env,
+        id: &PasswordResetChallengeId,
+    ) -> Result<Option<PasswordResetCompletionNotice>, StoreError> {
+        let scope = self.scope;
+        if id.scope() != scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, scope).await?;
+        recipient_ownership_lock(&mut tx, scope).await?;
+        let row = sqlx::query(
+            "SELECT subject,recovery_id,identifier_id,recipient_revision FROM password_reset_challenges \
+             WHERE tenant_id=$1 AND environment_id=$2 AND id=$3 AND state='completed' \
+             AND completion_notice_state='pending' AND completion_notice_started_at IS NULL",
+        ).bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
+        .fetch_optional(&mut *tx).await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let subject = UserId::parse_in_scope(&row.get::<String, _>("subject"), &scope)?;
+        let recovery =
+            RecoveryFlowId::parse_in_scope(&row.get::<String, _>("recovery_id"), &scope)?;
+        let recipient = match current_password_reset_binding(
+            &mut tx,
+            self.store.master().ok_or(StoreError::Encryption)?,
+            scope,
+            &PasswordResetAccount {
+                subject: &subject,
+                recovery: &recovery,
+            },
+        )
+        .await
+        {
+            Ok(bound)
+                if bound.identifier == row.get::<String, _>("identifier_id")
+                    && bound.revision == row.get::<String, _>("recipient_revision") =>
+            {
+                Some(bound.email)
+            }
+            Ok(_) | Err(StoreError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+        let now = epoch_micros(env.clock().now_utc());
+        let updated = sqlx::query(
+            "UPDATE password_reset_challenges SET completion_notice_started_at=TIMESTAMPTZ 'epoch'+($4::text||' microseconds')::interval \
+             WHERE tenant_id=$1 AND environment_id=$2 AND id=$3 AND state='completed' \
+             AND completion_notice_state='pending' AND completion_notice_started_at IS NULL",
+        ).bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
+        .bind(now).execute(&mut *tx).await?;
+        if updated.rows_affected() != 1 {
+            return Ok(None);
+        }
+        insert_audit_row(
+            &mut tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::PasswordResetNoticeStarted,
+                target: id,
+            },
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(PasswordResetCompletionNotice { subject, recipient }))
+    }
+
+    /// Record a claimed notice's terminal outcome once, separately from the
+    /// already-committed credential. Failure cannot revert a successful reset.
+    ///
+    /// # Errors
+    /// Invalid count/scope, absent claim, repeated outcome, or audit/store failure.
+    pub async fn record_completion_notice(
+        &self,
+        env: &Env,
+        id: &PasswordResetChallengeId,
+        outcome: PasswordResetDelivery,
+        accepted_channels: u32,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        if accepted_channels > 32
+            || (outcome == PasswordResetDelivery::Accepted && accepted_channels == 0)
+        {
+            return Err(StoreError::Invalid);
+        }
+        let scope = self.scope;
+        let now = epoch_micros(env.clock().now_utc());
+        write_audited(AuditedWrite {
+            store: self.store, scope, acting: &self.acting, env,
+            action: Action::PasswordResetNoticeDelivery, target: id,
+        }, async move |tx| {
+            let updated = sqlx::query(
+                "UPDATE password_reset_challenges SET completion_notice_state=$4,completion_notice_channels=$5, \
+                 completion_notice_finished_at=TIMESTAMPTZ 'epoch'+($6::text||' microseconds')::interval \
+                 WHERE tenant_id=$1 AND environment_id=$2 AND id=$3 AND state='completed' \
+                 AND completion_notice_started_at IS NOT NULL AND completion_notice_state='pending'",
+            ).bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
+            .bind(outcome.as_str()).bind(i64::from(accepted_channels)).bind(now).execute(&mut **tx).await?;
+            if updated.rows_affected() != 1 { return Err(StoreError::Conflict); }
+            Ok(())
+        }, false).await
+    }
+}
+
 impl ActingPasswordResetRepo<'_> {
     /// Create or reuse the pending standard lost-password case under the shared
     /// ownership/account locks. Reuse preserves cancellation and notified delay;
@@ -21446,8 +21601,32 @@ impl ActingPasswordResetRepo<'_> {
             },
             None,
         )
-        .await
+        .await?;
+        enqueue_password_reset_completion(tx, env, scope, &spec.challenge.id, &subject).await
     }
+}
+
+async fn enqueue_password_reset_completion(
+    tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
+    scope: Scope,
+    challenge: &PasswordResetChallengeId,
+    subject: &UserId,
+) -> Result<(), StoreError> {
+    let key = challenge.to_string();
+    enqueue_outbox_in_tx(
+        tx,
+        env,
+        scope,
+        &NewOutboxMessage {
+            consumer: PASSWORD_RESET_COMPLETION_CONSUMER,
+            idempotency_key: &key,
+            ordering_key: &subject.to_string(),
+            payload: serde_json::json!({"challenge_id": key}),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 async fn lock_password_reset(

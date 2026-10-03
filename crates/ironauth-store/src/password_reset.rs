@@ -151,3 +151,24 @@ impl PasswordResetDelivery {
         }
     }
 }
+
+/// Durable outbox consumer for a code-free completed-reset owner notification.
+pub const PASSWORD_RESET_COMPLETION_CONSUMER: &str = "password-reset-completion";
+
+/// Store-owned delivery target after the completed reset's single notice claim.
+/// No Debug/serialization; a missing recipient requires a recorded refusal.
+pub struct PasswordResetCompletionNotice {
+    /// Account bound to the committed reset.
+    pub subject: UserId,
+    /// Still-current verified primary, absent if ownership is no longer eligible.
+    pub recipient: Option<String>,
+}
+
+/// Metadata only, for resolving an interrupted completion-notice attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasswordResetNoticeStatus {
+    /// An external attempt may already have started; it cannot be repeated.
+    pub started_at_unix_micros: Option<i64>,
+    /// A terminal result, or None for work not yet durably confirmed.
+    pub result: Option<PasswordResetDelivery>,
+}

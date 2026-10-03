@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add a durable password-reset completion-notice consumer with verified-channel selection, bounded SMTP and no automatic resend after a claimed attempt (#1479). Worker startup wiring and integrated delivery qualification remain pending.
+
 - Connect hosted recovery request qualification routes to registered authorization validation, browser-bound real/decoy challenges and bounded background SMTP delivery (#1479). Repeated browser requests preserve the existing code form; main-router enablement and completion notices remain pending.
 
 - Add risk/factor-derived preparation of verified password-holder recovery cases (#1479), with fresh cancellation aliases for reused cases and no logging-sender delivery claim. Hosted request issuance remains unwired.

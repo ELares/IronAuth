@@ -216,6 +216,175 @@ fn accumulate(
     }
 }
 
+/// Durable worker for code-free completion warnings. It consumes only a scoped
+/// challenge ID queued in the credential transaction; no reset secret is queued.
+pub struct PasswordResetCompletionConsumer {
+    state: OidcState,
+}
+
+impl PasswordResetCompletionConsumer {
+    /// Use the same concrete SMTP configuration and scoped store as the provider.
+    #[must_use]
+    pub fn new(state: OidcState) -> Self {
+        Self { state }
+    }
+}
+
+impl ironauth_store::outbox::OutboxConsumer for PasswordResetCompletionConsumer {
+    fn name(&self) -> &str {
+        ironauth_store::PASSWORD_RESET_COMPLETION_CONSUMER
+    }
+
+    fn handle<'a>(
+        &'a self,
+        env: &'a ironauth_env::Env,
+        scope: ironauth_store::Scope,
+        message: &'a ironauth_store::OutboxMessage,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), ironauth_store::outbox::ConsumerError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            use ironauth_store::outbox::ConsumerError;
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Payload {
+                challenge_id: String,
+            }
+            let payload: Payload = serde_json::from_value(message.payload.clone())
+                .map_err(|_| ConsumerError::permanent("reset_notice_invalid_payload"))?;
+            let id = PasswordResetChallengeId::parse_in_scope(&payload.challenge_id, &scope)
+                .map_err(|_| ConsumerError::permanent("reset_notice_invalid_scope"))?;
+            deliver_completion_notice(&self.state, env, &id).await
+        })
+    }
+}
+
+fn notice_result(
+    result: PasswordResetDelivery,
+) -> Result<(), ironauth_store::outbox::ConsumerError> {
+    use ironauth_store::outbox::ConsumerError;
+    match result {
+        PasswordResetDelivery::Accepted => Ok(()),
+        PasswordResetDelivery::Refused => Err(ConsumerError::permanent("reset_notice_refused")),
+        PasswordResetDelivery::Uncertain => {
+            Err(ConsumerError::permanent("reset_notice_acceptance_unknown"))
+        }
+    }
+}
+
+async fn deliver_completion_notice(
+    state: &OidcState,
+    env: &ironauth_env::Env,
+    id: &PasswordResetChallengeId,
+) -> Result<(), ironauth_store::outbox::ConsumerError> {
+    use ironauth_store::outbox::ConsumerError;
+    if !state.password_recovery_delivery_available() {
+        return Err(ConsumerError::retryable(
+            "reset_notice_transport_unavailable",
+        ));
+    }
+    let scope = id.scope();
+    let acting = state.store().scoped(scope).acting(
+        ironauth_store::ActorRef::human(ironauth_store::HumanId::generate(env)),
+        CorrelationId::generate(env),
+    );
+    let claim = acting
+        .password_reset()
+        .claim_completion_notice(env, id)
+        .await
+        .map_err(|_| ConsumerError::retryable("reset_notice_store_unavailable"))?;
+    let Some(claim) = claim else {
+        return resume_completion_notice(state, env, id).await;
+    };
+    let identifiers = state
+        .store()
+        .scoped(scope)
+        .user_identifiers()
+        .list_for_user(&claim.subject)
+        .await;
+    let permitted = annotated_recovery_channels(state, scope).await;
+    let plan = match (claim.recipient, identifiers) {
+        (Some(primary), Ok(rows)) => {
+            select_channels(rows, permitted, &primary).map(|mut secondary| {
+                secondary.push(primary);
+                secondary
+            })
+        }
+        _ => None,
+    };
+    let mut accepted = 0;
+    let outcome =
+        if let (Some(channels), Some(transport)) = (plan, state.password_reset_transport()) {
+            tokio::time::timeout(DELIVERY_BUDGET, async {
+                let mut outcome = PasswordResetDelivery::Accepted;
+                for recipient in channels {
+                    let result = transport
+                        .deliver(PasswordResetMessage {
+                            challenge_id: id,
+                            scope,
+                            recipient: &recipient,
+                            notice: PasswordResetNotice::Completed,
+                        })
+                        .await;
+                    accumulate(result, &mut outcome, &mut accepted);
+                }
+                outcome
+            })
+            .await
+            .unwrap_or(PasswordResetDelivery::Uncertain)
+        } else {
+            PasswordResetDelivery::Refused
+        };
+    acting
+        .password_reset()
+        .record_completion_notice(env, id, outcome, accepted)
+        .await
+        .map_err(|_| ConsumerError::retryable("reset_notice_result_unconfirmed"))?;
+    notice_result(outcome)
+}
+
+// A worker retry can finish store bookkeeping, but never repeat an external send.
+// Let an overlapping attempt finish its bounded SMTP batch before classifying a
+// stale claim as unknown. A lost result can never be relabelled accepted here.
+async fn resume_completion_notice(
+    state: &OidcState,
+    env: &ironauth_env::Env,
+    id: &PasswordResetChallengeId,
+) -> Result<(), ironauth_store::outbox::ConsumerError> {
+    use ironauth_store::outbox::ConsumerError;
+    let scoped = state.store().scoped(id.scope());
+    let status = scoped
+        .password_reset()
+        .completion_notice_status(id)
+        .await
+        .map_err(|_| ConsumerError::retryable("reset_notice_store_unavailable"))?
+        .ok_or_else(|| ConsumerError::permanent("reset_notice_not_due"))?;
+    if let Some(result) = status.result {
+        return notice_result(result);
+    }
+    let now = crate::util::epoch_micros(env.clock().now_utc());
+    let Some(started) = status.started_at_unix_micros else {
+        return Err(ConsumerError::retryable("reset_notice_not_claimed"));
+    };
+    if now.saturating_sub(started) < 30_000_000 {
+        return Err(ConsumerError::retryable("reset_notice_in_progress"));
+    }
+    scoped
+        .acting(
+            ironauth_store::ActorRef::human(ironauth_store::HumanId::generate(env)),
+            CorrelationId::generate(env),
+        )
+        .password_reset()
+        .record_completion_notice(env, id, PasswordResetDelivery::Uncertain, 0)
+        .await
+        .map_err(|_| ConsumerError::retryable("reset_notice_result_unconfirmed"))?;
+    notice_result(PasswordResetDelivery::Uncertain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

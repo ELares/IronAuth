@@ -267,9 +267,10 @@ pub use org_policy::{
     resolved_session_pair_is_coherent, validate as validate_org_policy,
 };
 pub use password_reset::{
-    CompletePasswordReset, NewPasswordReset, PasswordResetAccount, PasswordResetChallenge,
-    PasswordResetContext, PasswordResetDelivery, PasswordResetOutcome, PasswordResetReceipt,
-    PreparePasswordResetCase,
+    CompletePasswordReset, NewPasswordReset, PASSWORD_RESET_COMPLETION_CONSUMER,
+    PasswordResetAccount, PasswordResetChallenge, PasswordResetCompletionNotice,
+    PasswordResetContext, PasswordResetDelivery, PasswordResetNoticeStatus, PasswordResetOutcome,
+    PasswordResetReceipt, PreparePasswordResetCase,
 };
 pub use pow_challenge::{NewPowChallenge, PowChallengeView};
 pub use promotion::{

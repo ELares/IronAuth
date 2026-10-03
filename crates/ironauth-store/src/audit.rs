@@ -1575,6 +1575,10 @@ pub enum Action {
     PasswordResetAttempt,
     /// Reset proof, credential and completion receipt committed together.
     PasswordResetComplete,
+    /// One code-free completion-notice attempt was durably admitted.
+    PasswordResetNoticeStarted,
+    /// Actual completion-notice delivery outcome, without message content.
+    PasswordResetNoticeDelivery,
     /// A control-plane batch indexed existing primary identifiers without verification.
     RecipientIndexBackfill,
     /// The authenticated subject cancelled its pending mailbox challenge.
@@ -2088,6 +2092,8 @@ impl Action {
             Action::EmailOtpSend => "email_otp.send",
             Action::PasswordResetAttempt => "password_reset.attempt",
             Action::PasswordResetComplete => "password_reset.complete",
+            Action::PasswordResetNoticeStarted => "password_reset.notice_started",
+            Action::PasswordResetNoticeDelivery => "password_reset.notice_delivery",
             Action::PasswordResetDelivery => "password_reset.delivery",
             Action::PasswordResetDeliveryStarted => "password_reset.delivery_started",
             Action::PasswordResetStart => "password_reset.start",

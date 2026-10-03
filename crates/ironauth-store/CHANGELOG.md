@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Queue code-free password-reset completion notices in the credential transaction, with audited single-attempt claims and immutable terminal delivery outcomes (#1479). Queue failure rolls back completion; receipt retries do not enqueue duplicates.
+
 - Include original issuance time in browser-bound reset context so hosted resend admission can preserve an existing code independently of account eligibility (#1479).
 
 - Prepare or reuse hosted lost-password cases atomically under account locks (#1479). Preserve cancellation and notified delay across resends, retain a monotonic policy duration, and roll back ineligible or unauditable preparation.
