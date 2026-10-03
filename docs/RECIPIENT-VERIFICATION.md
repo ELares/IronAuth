@@ -93,7 +93,11 @@ audience, public subject, nonce, purpose, ownership revision and the short expir
 The proof checks current identifier ownership and direct live-session provenance;
 profile labels and arbitrary stored OIDC claim documents do not establish it.
 Recheck for a new invitation acceptance rather than treating a retained email
-claim as an indefinitely current assertion.
+claim as an indefinitely current assertion. Proof reads use endpoint request
+quotas with the verified client and subject; they do not increment the mailbox
+ceremony's code-attempt counters. Configured IP, client, user and scope request
+limits still apply. Sending and checking codes retain their separate abuse
+regulation, durable resend cooldown and attempt limits.
 
 The application still owns atomic invitation acceptance, permitted grants, audits
 and the saved destination. Mailbox verification alone grants none of those.

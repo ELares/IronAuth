@@ -350,7 +350,18 @@ pub(crate) async fn proof(
         Ok(principal) => principal,
         Err(error) => return error.into_response(),
     };
-    if let Some(error) = regulate(&state, principal.scope, &principal.subject, &headers).await {
+    // A relying-party proof read is not a delivery or code-guess attempt. Keep
+    // request quotas, keyed by verified identity, without consuming the mailbox
+    // ceremony's abuse budget during callback, preview and explicit acceptance.
+    if let Some(error) = state
+        .enforce_request_quota(
+            &principal.scope,
+            &headers,
+            Some(&principal.client_id),
+            Some(&principal.subject.to_string()),
+        )
+        .await
+    {
         return error;
     }
     let current = match state

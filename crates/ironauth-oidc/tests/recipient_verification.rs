@@ -916,3 +916,122 @@ async fn cancellation_does_not_revoke_a_completed_mailbox_proof() {
             .contains("data-verified=\"true\"")
     );
 }
+
+#[tokio::test]
+async fn repeated_proof_reads_leave_the_default_mailbox_ceremony_budget_available() {
+    let h = Harness::start().await;
+    // Harness::start installs OidcConfig::default(), including enabled regulation.
+    let user = h.seed_user(EMAIL, SEED_PASSWORD).await;
+    let cookie = h.session_cookie_at(&user, "pwd", now(&h)).await;
+    let access = token_for(&h, &user).await;
+    let transport = Arc::new(OwnedTransport::default());
+    let router = enabled_router(&h, transport.clone());
+    let body = json!({"email": EMAIL, "nonce": NONCE});
+    for _ in 0..12 {
+        let (status, _, _) = post(
+            &router,
+            &route(&h, "recipient-proof"),
+            None,
+            Some(&access),
+            None,
+            &body,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "unverified reads must not consume code attempts"
+        );
+    }
+    finish(&h, &router, &transport, &cookie).await;
+    for _ in 0..12 {
+        let (status, _, _) = post(
+            &router,
+            &route(&h, "recipient-proof"),
+            None,
+            Some(&access),
+            None,
+            &body,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "current proof reads are not code guesses"
+        );
+    }
+}
+
+#[tokio::test]
+async fn proof_enforces_verified_client_and_subject_request_budgets() {
+    use ironauth_config::{LimitConfig, RateLimitConfig};
+    use ironauth_quota::layered::LIMITING_LAYER_HEADER;
+    for layer in ["client", "user"] {
+        let h = Harness::start().await;
+        let user = h.seed_user(EMAIL, SEED_PASSWORD).await;
+        let access = token_for(&h, &user).await;
+        let limit = LimitConfig {
+            per_second: 1.0,
+            burst: 2.0,
+        };
+        let limits = RateLimitConfig {
+            per_ip: None,
+            per_tenant: None,
+            per_environment: None,
+            per_client: (layer == "client").then_some(limit),
+            per_user: (layer == "user").then_some(limit),
+        };
+        // Install after token issuance so this budget measures only proof calls.
+        let limiter = ironauth_oidc::forward_auth_rules::layered_limiter_from_config(
+            &limits,
+            h.env().clock_arc(),
+        );
+        let router = ironauth_oidc::oidc_router(
+            h.state()
+                .clone()
+                .with_recipient_verification_test_transport(Arc::new(OwnedTransport::default()))
+                .with_layered_limiter(Arc::new(limiter)),
+        );
+        let body = json!({"email": EMAIL, "nonce": NONCE});
+        for _ in 0..2 {
+            let (status, _, body) = post(
+                &router,
+                &route(&h, "recipient-proof"),
+                None,
+                Some(&access),
+                None,
+                &body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "unverified mailbox: {body}");
+            assert_eq!(body["error"], "recipient_not_verified");
+        }
+        let (status, headers, _) = post(
+            &router,
+            &route(&h, "recipient-proof"),
+            None,
+            Some(&access),
+            None,
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(headers[LIMITING_LAYER_HEADER], format!("per_{layer}"));
+        assert!(headers.contains_key(header::RETRY_AFTER));
+        h.clock().advance(Duration::from_secs(2));
+        let (status, _, _) = post(
+            &router,
+            &route(&h, "recipient-proof"),
+            None,
+            Some(&access),
+            None,
+            &body,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "request budget refills without changing mailbox ownership"
+        );
+    }
+}
