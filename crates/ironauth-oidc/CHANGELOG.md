@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Separate authenticated recipient-proof reads from mailbox code-attempt regulation, while enforcing configured request quotas with the verified client and subject (#1477).
+
 - Use the platform certificate roots for recipient SMTP TLS without also compiling a bundled root store. TLS hostname and certificate validation remain mandatory (#1475).
 
 - Add the authenticated mailbox verification page with registered in-scope authorization continuation, current ownership on reload, honest send recovery and scoped cancellation (#1475).
