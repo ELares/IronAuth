@@ -122,16 +122,16 @@ Migration 0249 and `PasswordResetChallengeId` introduce only the storage boundar
 The table separates pending, completed, cancelled and refused metadata, requires
 an indivisible real-account binding, and bounds attempts and expiry. Real-store
 schema tests exercise forced row-level security and runtime column grants.
-Repository completion, atomic proof consumption with credential mutation, actual
-delivery and the hosted form remain unimplemented. A valid metadata row is not proof that a
-password was changed; only the future audited completion transaction may make
-that claim. No deployment is activated by this additive migration alone.
+Actual delivery and the hosted form remain unimplemented. The repository now
+implements completion as described below; deployment remains disabled. A valid
+metadata row is not proof that a password was changed; the audited completion
+transaction and its credential/invalidation effects must be verified together. No deployment is activated by this additive migration alone.
 
 The existing account password change now delegates its verifier write and session
 cascade to a private transaction-owned primitive. The public account endpoint
 still requires its existing authentication. This refactor does not confer reset
-authority, revoke offline families on ordinary password changes, or implement the
-pending reset completion API.
+authority or revoke offline families on ordinary password changes. Reset completion
+uses it within its own larger audited transaction.
 
 Scoped reset issuance now derives the verified mailbox revision and original
 password digest under the shared recipient-ownership and user locks, requires a
@@ -139,8 +139,30 @@ pending standard lost-password case for that subject, and persists its browser
 binding and validated authorization continuation. Reissue is subject to a durable
 one-minute cooldown and cancels the prior pending challenge; completed receipts
 are retained. Decoys carry no account binding. Hashing-input reads require the
-matching browser binding, scope, pending state, expiry and remaining attempts.
+matching browser binding, scope and expiry. Pending rows need remaining attempts;
+completed rows permit only exact-request receipt evaluation.
 Neither issuance nor a read is permission to mutate a credential. Completion must
 recheck all bound generations and the case delay/cancellation under the same lock
 order. A long held case also needs a usable fresh-code path after the delay; a
 short code must not be treated as bypassing or satisfying that delay.
+
+Atomic completion now rechecks the browser binding, exact verifier snapshot,
+current verified ownership and password generation, pending case and delay under
+ordered locks. Wrong codes consume at most five attempts; stale authority closes
+the challenge. Correct proof cannot bypass a held case. Completion changes the
+password, consumes proof, persists a keyed request receipt and resulting password
+digest, completes the case, revokes sessions and offline refresh families/grants,
+and invalidates every remembered device in one audited transaction. Lost-password
+recovery deliberately invalidates remembered devices even where an ordinary
+authenticated password change is configured to preserve them.
+
+Within the original challenge expiry, the same browser can reread the completed
+verifier and retry. Only a matching code, keyed request digest, still-current
+verified owner and resulting credential returns the previous continuation. A retry
+does not rewrite the verifier, reset its timestamp, or emit another completion.
+Expired receipts require ordinary sign-in or a fresh recovery request. The hosted
+caller must compute the keyed digest from the exact normalized request, enforce
+password policy and screening, admit hashing, and satisfy actual required recovery
+notifications before calling completion. These caller obligations are not wired yet.
+Further race/invalidation coverage and transport/hosted qualification remain before
+the full gate, review and deployment.

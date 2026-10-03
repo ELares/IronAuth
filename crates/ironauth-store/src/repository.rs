@@ -114,7 +114,10 @@ use crate::locale_bundle::{LocaleBundleRecord, NewLocaleBundle};
 use crate::message_feedback::SuppressionReason;
 use crate::message_rate::RateBudget;
 use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
-use crate::password_reset::{NewPasswordReset, PasswordResetAccount, PasswordResetChallenge};
+use crate::password_reset::{
+    CompletePasswordReset, NewPasswordReset, PasswordResetAccount, PasswordResetChallenge,
+    PasswordResetOutcome,
+};
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
 use crate::recipient_verification::{
     NewRecipientChallenge, RecipientAttempt, RecipientChallenge, VerifiedRecipient,
@@ -20729,6 +20732,8 @@ struct PasswordResetBinding {
     revision: String,
     recovery: String,
     credential_digest: Vec<u8>,
+    case_state: String,
+    hold_until: Option<i64>,
     email: String,
 }
 
@@ -20769,9 +20774,10 @@ async fn current_password_reset_binding(
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(StoreError::NotFound)?;
-    let case: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM recovery_flows WHERE tenant_id=$1 AND environment_id=$2 \
-         AND id=$3 AND subject=$4 AND state IN ('initiated','held') \
+    let case = sqlx::query(
+        "SELECT id,state,(extract(epoch FROM hold_until)*1000000)::bigint AS hold_us \
+         FROM recovery_flows WHERE tenant_id=$1 AND environment_id=$2 \
+         AND id=$3 AND subject=$4 AND state IN ('initiated','held','completed') \
          AND method='standard' AND entry_point='lost_password' FOR UPDATE",
     )
     .bind(scope.tenant().to_string())
@@ -20784,7 +20790,9 @@ async fn current_password_reset_binding(
         subject: account.subject.to_string(),
         identifier: verified.get("identifier_id"),
         revision: verified.get("revision"),
-        recovery: case.ok_or(StoreError::NotFound)?,
+        recovery: case.as_ref().ok_or(StoreError::NotFound)?.get("id"),
+        case_state: case.as_ref().ok_or(StoreError::NotFound)?.get("state"),
+        hold_until: case.as_ref().ok_or(StoreError::NotFound)?.get("hold_us"),
         credential_digest: Sha256::digest(password.as_bytes()).to_vec(),
         email: owner.email,
     })
@@ -20797,8 +20805,10 @@ pub struct PasswordResetRepo<'a> {
 }
 
 impl PasswordResetRepo<'_> {
-    /// Resolve an unexpired, unexhausted pending challenge for its browser binding.
-    /// Absence is uniform across wrong scope, browser, terminal and expired rows.
+    /// Resolve a verifier for an unexpired pending attempt or exact completion retry.
+    /// A completed row is retained only so a lost response can reverify the same
+    /// request; `complete()` still requires its bound receipt and current generation.
+    /// Absence is uniform across wrong scope/browser, refusal and expiry.
     ///
     /// # Errors
     /// Persistence failures. This method never consumes proof or changes a password.
@@ -20815,7 +20825,7 @@ impl PasswordResetRepo<'_> {
         let hash: Option<String> = sqlx::query_scalar(
             "SELECT code_hash FROM password_reset_challenges \
              WHERE tenant_id=$1 AND environment_id=$2 AND id=$3 AND browser_binding_hash=$4 \
-             AND state='pending' AND attempt_count<5 \
+             AND ((state='pending' AND attempt_count<5) OR state='completed') \
              AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval",
         )
         .bind(self.scope.tenant().to_string())
@@ -20887,6 +20897,9 @@ impl ActingPasswordResetRepo<'_> {
                 let binding = if let Some(account) = &spec.account {
                     let master = self.store.master().ok_or(StoreError::Encryption)?;
                     let bound = current_password_reset_binding(tx, master, scope, account).await?;
+                    if bound.case_state == "completed" {
+                        return Err(StoreError::NotFound);
+                    }
                     replace_pending_password_reset(tx, scope, &bound.subject, now).await?;
                     Some(bound)
                 } else {
@@ -20901,6 +20914,329 @@ impl ActingPasswordResetRepo<'_> {
         .await?;
         Ok(recipient)
     }
+}
+
+impl ActingPasswordResetRepo<'_> {
+    /// Atomically consume reset proof, update the credential and revoke access.
+    /// The caller has admitted hashing, verified the code, screened the new password
+    /// and satisfied required recovery notification policy. This method rechecks
+    /// current store authority and never mints a session or removes stronger factors.
+    /// All trusted devices and offline refresh grants are revoked for lost-password
+    /// recovery, independently of ordinary authenticated password-change settings.
+    ///
+    /// # Errors
+    /// Invalid verifier or persistence/encryption failure. Any write failure rolls
+    /// back proof, password, receipt, recovery state, revocations and audit together.
+    pub async fn complete(
+        &self,
+        env: &Env,
+        spec: CompletePasswordReset<'_>,
+    ) -> Result<PasswordResetOutcome, StoreError> {
+        if spec.challenge.id.scope() != self.scope {
+            return Ok(PasswordResetOutcome::Refused);
+        }
+        if !spec.new_password_hash.starts_with("$argon2id$") || spec.new_password_hash.len() > 512 {
+            return Err(StoreError::Invalid);
+        }
+        let now = epoch_micros(env.clock().now_utc());
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let Some((row, binding)) =
+            lock_password_reset(&mut tx, self.store, self.scope, &spec).await?
+        else {
+            return Ok(PasswordResetOutcome::Refused);
+        };
+        match password_reset_decision(&row, binding.as_ref(), &spec, now) {
+            ResetDecision::Refused => Ok(PasswordResetOutcome::Refused),
+            ResetDecision::Replay => Ok(PasswordResetOutcome::Replayed {
+                authorization_return_to: row.get("authorization_return_to"),
+            }),
+            ResetDecision::Held(until_unix_micros) => {
+                Ok(PasswordResetOutcome::Held { until_unix_micros })
+            }
+            ResetDecision::Failed(terminal) => {
+                record_password_reset_failure(
+                    &mut tx,
+                    self.scope,
+                    &spec.challenge.id,
+                    now,
+                    terminal,
+                )
+                .await?;
+                insert_audit_row(
+                    &mut tx,
+                    &AuditedWrite {
+                        store: self.store,
+                        scope: self.scope,
+                        acting: &self.acting,
+                        env,
+                        action: Action::PasswordResetAttempt,
+                        target: &spec.challenge.id,
+                    },
+                    None,
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(PasswordResetOutcome::Refused)
+            }
+            ResetDecision::Complete => {
+                let bound = binding.ok_or(StoreError::NotFound)?;
+                self.commit_password_reset(&mut tx, env, &spec, &bound, now)
+                    .await?;
+                tx.commit().await?;
+                Ok(PasswordResetOutcome::Completed {
+                    authorization_return_to: row.get("authorization_return_to"),
+                })
+            }
+        }
+    }
+
+    async fn commit_password_reset(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        env: &Env,
+        spec: &CompletePasswordReset<'_>,
+        binding: &PasswordResetBinding,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        use sha2::{Digest, Sha256};
+        let scope = self.scope;
+        let subject = UserId::parse_in_scope(&binding.subject, &scope)?;
+        let recovery = RecoveryFlowId::parse_in_scope(&binding.recovery, &scope)?;
+        let acr = complete_recovery_flow(tx, scope, &binding.recovery, now)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        sqlx::query(
+            "UPDATE password_reset_challenges SET state='completed',attempt_count=attempt_count+1, \
+             finished_at=TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+             completion_request_hash=$5,completion_credential_digest=$6 \
+             WHERE tenant_id=$1 AND environment_id=$2 AND id=$3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(spec.challenge.id.to_string())
+        .bind(now)
+        .bind(spec.request_hash.as_slice())
+        .bind(Sha256::digest(spec.new_password_hash.as_bytes()).to_vec())
+        .execute(&mut **tx)
+        .await?;
+        let devices = sqlx::query(
+            "UPDATE trusted_devices SET revoked_at=TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+             revoke_reason=$5 WHERE tenant_id=$1 AND environment_id=$2 AND subject=$3 AND revoked_at IS NULL",
+        ).bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(&binding.subject)
+        .bind(now).bind(TrustedDeviceRevokeReason::PasswordChange.as_str()).execute(&mut **tx).await?.rows_affected();
+        let mut families = UserRevocation::default();
+        cascade_families_for_subject(tx, scope, &binding.subject, now, true, &mut families).await?;
+        let emit = SessionEndedEmit::from_acting(env, &self.acting);
+        change_password_in_tx(
+            tx,
+            PasswordChangeInTx {
+                scope,
+                subject: &binding.subject,
+                new_password_hash: spec.new_password_hash,
+                keep: None,
+                now_micros: now,
+                emit: &emit,
+            },
+        )
+        .await?;
+        for (action, detail) in [
+            (Action::AccountPasswordChange, "hosted_lost_password"),
+            (
+                Action::TrustedDeviceRevoke,
+                TrustedDeviceRevokeReason::PasswordChange.as_str(),
+            ),
+        ] {
+            if action == Action::TrustedDeviceRevoke && devices == 0 {
+                continue;
+            }
+            insert_audit_row(
+                tx,
+                &AuditedWrite {
+                    store: self.store,
+                    scope,
+                    acting: &self.acting,
+                    env,
+                    action,
+                    target: &subject,
+                },
+                Some(detail),
+            )
+            .await?;
+        }
+        insert_audit_row(
+            tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RecoveryComplete,
+                target: &recovery,
+            },
+            Some(&acr),
+        )
+        .await?;
+        insert_audit_row(
+            tx,
+            &AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::PasswordResetComplete,
+                target: &spec.challenge.id,
+            },
+            None,
+        )
+        .await
+    }
+}
+
+async fn lock_password_reset(
+    tx: &mut Transaction<'_, Postgres>,
+    store: &Store,
+    scope: Scope,
+    spec: &CompletePasswordReset<'_>,
+) -> Result<Option<(PgRow, Option<PasswordResetBinding>)>, StoreError> {
+    recipient_ownership_lock(tx, scope).await?;
+    // Immutable authority is read first only to locate the account locks. The
+    // actual lifecycle row is then re-read under FOR UPDATE, after those locks.
+    let initial = sqlx::query(
+        "SELECT subject,recovery_id FROM password_reset_challenges \
+         WHERE tenant_id=$1 AND environment_id=$2 AND id=$3 AND browser_binding_hash=$4",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(spec.challenge.id.to_string())
+    .bind(spec.browser_binding_hash.as_slice())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(initial) = initial else {
+        return Ok(None);
+    };
+    let binding = if let Some(subject) = initial.get::<Option<String>, _>("subject") {
+        let subject = UserId::parse_in_scope(&subject, &scope)?;
+        let recovery =
+            RecoveryFlowId::parse_in_scope(&initial.get::<String, _>("recovery_id"), &scope)?;
+        match current_password_reset_binding(
+            tx,
+            store.master().ok_or(StoreError::Encryption)?,
+            scope,
+            &PasswordResetAccount {
+                subject: &subject,
+                recovery: &recovery,
+            },
+        )
+        .await
+        {
+            Ok(binding) => Some(binding),
+            Err(StoreError::NotFound) => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    let row = sqlx::query(
+        "SELECT *, (extract(epoch FROM expires_at)*1000000)::bigint AS expires_us \
+         FROM password_reset_challenges WHERE tenant_id=$1 AND environment_id=$2 AND id=$3 \
+         AND browser_binding_hash=$4 FOR UPDATE",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(spec.challenge.id.to_string())
+    .bind(spec.browser_binding_hash.as_slice())
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.map(|row| (row, binding)))
+}
+
+enum ResetDecision {
+    Refused,
+    Failed(bool),
+    Held(i64),
+    Complete,
+    Replay,
+}
+
+fn password_reset_decision(
+    row: &PgRow,
+    binding: Option<&PasswordResetBinding>,
+    spec: &CompletePasswordReset<'_>,
+    now: i64,
+) -> ResetDecision {
+    if row.get::<String, _>("code_hash") != spec.challenge.code_hash
+        || now >= row.get::<i64, _>("expires_us")
+    {
+        return ResetDecision::Refused;
+    }
+    let state: String = row.get("state");
+    let same_owner = binding.is_some_and(|b| {
+        row.get::<Option<String>, _>("identifier_id").as_deref() == Some(&b.identifier)
+            && row
+                .get::<Option<String>, _>("recipient_revision")
+                .as_deref()
+                == Some(&b.revision)
+    });
+    if state == "completed" {
+        return if spec.code_matched
+            && same_owner
+            && binding.is_some_and(|b| {
+                b.case_state == "completed"
+                    && row
+                        .get::<Option<Vec<u8>>, _>("completion_credential_digest")
+                        .as_ref()
+                        == Some(&b.credential_digest)
+            })
+            && row
+                .get::<Option<Vec<u8>>, _>("completion_request_hash")
+                .as_deref()
+                == Some(spec.request_hash.as_slice())
+        {
+            ResetDecision::Replay
+        } else {
+            ResetDecision::Refused
+        };
+    }
+    let attempts: i32 = row.get("attempt_count");
+    if state != "pending" || attempts >= 5 {
+        return ResetDecision::Refused;
+    }
+    if !spec.code_matched {
+        return ResetDecision::Failed(attempts == 4);
+    }
+    let Some(binding) = binding else {
+        return ResetDecision::Failed(true);
+    };
+    if !same_owner
+        || binding.case_state == "completed"
+        || row.get::<Option<Vec<u8>>, _>("credential_digest").as_ref()
+            != Some(&binding.credential_digest)
+    {
+        return ResetDecision::Failed(true);
+    }
+    if let Some(hold) = binding.hold_until
+        && hold > now
+    {
+        return ResetDecision::Held(hold);
+    }
+    ResetDecision::Complete
+}
+
+async fn record_password_reset_failure(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    id: &PasswordResetChallengeId,
+    now: i64,
+    terminal: bool,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE password_reset_challenges SET attempt_count=attempt_count+1, \
+         state=CASE WHEN $4 THEN 'refused' ELSE 'pending' END, \
+         finished_at=CASE WHEN $4 THEN TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval ELSE NULL END \
+         WHERE tenant_id=$1 AND environment_id=$2 AND id=$3",
+    ).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+    .bind(id.to_string()).bind(terminal).bind(now).execute(&mut **tx).await?;
+    Ok(())
 }
 
 async fn replace_pending_password_reset(

@@ -39,3 +39,41 @@ pub struct PasswordResetChallenge {
     /// One-way verifier checked outside the database transaction.
     pub code_hash: String,
 }
+
+/// One admitted code verification and policy-checked new password. The caller
+/// verifies the code against `challenge.code_hash` through the hashing pool.
+pub struct CompletePasswordReset<'a> {
+    /// Immutable verifier snapshot used for the code comparison.
+    pub challenge: &'a PasswordResetChallenge,
+    /// Browser secret digest, never recovered from a posted account identifier.
+    pub browser_binding_hash: &'a [u8; 32],
+    /// Result of verifying the presented code against the exact snapshot.
+    pub code_matched: bool,
+    /// New normalized, screened and policy-checked Argon2id password verifier.
+    pub new_password_hash: &'a str,
+    /// Keyed digest of the exact normalized completion request, not a plain
+    /// password digest. Stable across a retry even when Argon2 salts change.
+    pub request_hash: &'a [u8; 32],
+}
+
+/// Store completion outcome. No outcome creates an authentication session.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PasswordResetOutcome {
+    /// Uniform invalid, stale, exhausted, cancelled or expired authority.
+    Refused,
+    /// Correct proof cannot bypass the existing recovery delay.
+    Held {
+        /// Earliest eligible instant. A fresh code may be needed after the delay.
+        until_unix_micros: i64,
+    },
+    /// Credential, proof, receipt, recovery state and invalidation committed.
+    Completed {
+        /// Validated server-owned continuation to ordinary authentication.
+        authorization_return_to: String,
+    },
+    /// Same request already committed and its resulting credential is still current.
+    Replayed {
+        /// Same server-owned continuation; no new mutation or audit was emitted.
+        authorization_return_to: String,
+    },
+}

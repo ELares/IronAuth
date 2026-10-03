@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add atomic hosted reset completion with current mailbox/credential/case revalidation, bounded attempts, delay enforcement and exact-request receipts (#1479). Password, recovery state, session and offline-family/grant revocation, trusted-device invalidation and audit commit together; no session or stronger-factor removal is granted. Hosted transport and UI remain pending.
+
 - Add audited browser-bound reset challenge issuance and reads, deriving verified ownership and credential generation from current store rows and enforcing a durable account resend cooldown (#1479). Issuance does not claim delivery or enable credential reset.
 
 - Factor password verifier mutation and session revocation into a private transaction-owned primitive for atomic recovery composition (#1479); preserve ordinary account-change behavior and verify rollback on an audit failure.

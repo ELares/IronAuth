@@ -266,7 +266,10 @@ pub use org_policy::{
     is_second_factor_token, normalize as normalize_org_policy, resolve as resolve_org_policy,
     resolved_session_pair_is_coherent, validate as validate_org_policy,
 };
-pub use password_reset::{NewPasswordReset, PasswordResetAccount, PasswordResetChallenge};
+pub use password_reset::{
+    CompletePasswordReset, NewPasswordReset, PasswordResetAccount, PasswordResetChallenge,
+    PasswordResetOutcome,
+};
 pub use pow_challenge::{NewPowChallenge, PowChallengeView};
 pub use promotion::{
     ChangeKind, ConfigDiff, PROMOTED_RESOURCE_TYPES, Plan, PlanError, PromotedResourceType,
