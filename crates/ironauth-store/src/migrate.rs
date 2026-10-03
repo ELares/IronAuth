@@ -2102,6 +2102,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0249_hosted_password_reset.sql"),
         },
+        Migration {
+            version: 250,
+            name: "password_reset_no_delete",
+            // No old or new repository operation deletes reset challenges.
+            // Removing unused authority preserves every supported operation.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0250_password_reset_no_delete.sql"),
+        },
     ]
 }
 

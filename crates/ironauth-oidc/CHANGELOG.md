@@ -18,27 +18,27 @@ range per docs/RELEASING.md.
 
 - Deliver code-free cancelled-reset owner warnings through the durable recovery worker (#1479). Cancellation pages no longer claim mail was delivered and return a retryable unavailable response when the cancellation transaction fails.
 
-- Add a durable password-reset completion-notice consumer with verified-channel selection, bounded SMTP and no automatic resend after a claimed attempt (#1479). The server starts its worker with recovery enabled; isolated HTTP/TLS/outbox qualification covers acceptance, refusal and uncertain acknowledgement. Main-router activation remains pending.
+- Add a durable password-reset completion-notice consumer with verified-channel selection, bounded SMTP and no automatic resend after a claimed attempt (#1479). The server starts its worker with recovery enabled; isolated HTTP/TLS/outbox qualification covers acceptance, refusal and uncertain acknowledgement.
 
-- Connect hosted recovery request qualification routes to registered authorization validation, browser-bound real/decoy challenges and bounded background SMTP delivery (#1479). Repeated browser requests preserve the existing code form; main-router enablement and completion notices remain pending.
+- Connect hosted recovery request qualification routes to registered authorization validation, browser-bound real/decoy challenges and bounded background SMTP delivery (#1479). Repeated browser requests preserve the existing code form.
 
-- Add risk/factor-derived preparation of verified password-holder recovery cases (#1479), with fresh cancellation aliases for reused cases and no logging-sender delivery claim. Hosted request issuance remains unwired.
+- Add risk/factor-derived preparation of verified password-holder recovery cases (#1479), with fresh cancellation aliases for reused cases and no logging-sender delivery claim.
 
 - Check exact committed reset receipts before current password policy and breach screening (#1479), so an interrupted successful response can be confirmed during a screening outage without repeating a credential change. New changes retain mandatory policy, screening and admitted hashing.
 
-- Integrate browser-bound reset GET/POST handlers with CSRF, independent recovery regulation, NFKC confirmation, password policy/screening, admitted hashing and atomic store completion (#1479). The bounded route factory is not mounted until issuance and post-commit notifications are finished. Keep the shared same-origin referrer policy for browser form compatibility.
+- Integrate browser-bound reset GET/POST handlers with CSRF, independent recovery regulation, NFKC confirmation, password policy/screening, admitted hashing and atomic store completion (#1479). Keep the shared same-origin referrer policy for browser form compatibility.
 
-- Add reset code/new-password forms and explicit completed, held, expired and deployment-unavailable guidance (#1479). Preserve the validated application continuation, never refill submitted secrets, and apply shared form-page response headers. Hosted handler integration remains pending.
+- Add reset code/new-password forms and explicit completed, held, expired and deployment-unavailable guidance (#1479). Preserve the validated application continuation, never refill submitted secrets, and apply shared form-page response headers.
 
-- Connect reset request delivery to required verified-channel selection, concrete SMTP and durable aggregate outcomes (#1479). Send secondary warnings before the primary code, refuse unsupported required channels, preserve uncertainty and bound each batch to 16 seconds. Hosted routes remain pending.
+- Connect reset request delivery to required verified-channel selection, concrete SMTP and durable aggregate outcomes (#1479). Send secondary warnings before the primary code, refuse unsupported required channels, preserve uncertainty and bound each batch to 16 seconds.
 
-- Add a distinct reset-request owner notice carrying a provider-bound cancellation link without reset proof (#1479). Secondary verified channels can be warned without receiving the primary mailbox's code; hosted channel orchestration remains pending.
+- Add a distinct reset-request owner notice carrying a provider-bound cancellation link without reset proof (#1479). Secondary verified channels can be warned without receiving the primary mailbox's code.
 
-- Add purpose-specific reset browser binding, strict bounded cookie parsing, challenge-bound CSRF verification and keyed exact-request receipts (#1479). The cookie is separate from authentication and persists only for the bounded retry window; hosted handlers remain pending.
+- Add purpose-specific reset browser binding, strict bounded cookie parsing, challenge-bound CSRF verification and keyed exact-request receipts (#1479). The cookie is separate from authentication and persists only for the bounded retry window.
 
-- Construct configured reset SMTP only when explicitly enabled and expose a concrete state installer independent from mailbox verification or logging OTP senders (#1479); hosted recovery orchestration remains pending.
+- Construct configured reset SMTP only when explicitly enabled and expose a concrete state installer independent from mailbox verification or logging OTP senders (#1479).
 
-- Add a purpose-specific password-reset SMTP transport with provider-bound cancellation links, exact code expiry and distinct completion notices (#1479). Share bounded certificate-verified SMTP mechanics with mailbox verification; no hosted recovery is enabled until separate configuration and orchestration are wired.
+- Add a purpose-specific password-reset SMTP transport with provider-bound cancellation links, exact code expiry and distinct completion notices (#1479). Share bounded certificate-verified SMTP mechanics with mailbox verification; recovery remains default-off and requires explicit configuration.
 
 - Separate authenticated recipient-proof reads from mailbox code-attempt regulation, while enforcing configured request quotas with the verified client and subject (#1477).
 

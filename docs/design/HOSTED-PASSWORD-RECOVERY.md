@@ -622,3 +622,18 @@ code expiry nor cookie lifetime is extended. Untrusted external targets receive
 no link. Expired PAR continuations still require an application restart and remain
 a separate qualification gap. Civio's five-minute authentication-flow expiry also
 loses project context; that application-side navigation gap remains outstanding.
+
+
+Migration 0250 removes unused data-plane DELETE authority from reset challenges.
+Recovery operations retain receipts and cancellation aliases and have no delete
+caller. A forward migration preserves the 0249 checksum already applied in the
+isolated qualification deployment. The production-chain inventory includes both
+migrations; historical upgrade fixtures remove the 0249 table and delay column
+before replaying the complete chain, while the delete-permission allowlist stays
+unchanged and an actual app-role DELETE is required to fail.
+
+The producer census includes `enqueue_password_reset_completion`: it uses the
+transactional outbox under the dedicated `password-reset-completion` consumer,
+with challenge ID as the sole payload field, challenge-key idempotency and
+subject ordering. It is not a new public webhook type. Reset/cancellation
+transaction rollback and duplicate-notice tests exercise this producer.

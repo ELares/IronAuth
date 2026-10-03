@@ -45,6 +45,65 @@ fn sqlstate(error: &sqlx::Error) -> Option<String> {
 }
 
 #[tokio::test]
+async fn reset_delete_grant_upgrade_preserves_existing_records_and_ledger() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = PasswordResetChallengeId::generate(&env, &scope);
+    insert_fixture(&db, scope, &id, true).await.unwrap();
+    // Reproduce only the previous grant and ledger boundary in this owned fixture.
+    sqlx::raw_sql("DELETE FROM _schema_migrations WHERE version=250; GRANT DELETE ON password_reset_challenges TO ironauth_app")
+        .execute(db.owner_pool()).await.unwrap();
+    let before: String = sqlx::query_scalar(
+        "SELECT row_to_json(p)::text FROM password_reset_challenges p WHERE id=$1",
+    )
+    .bind(id.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .unwrap();
+    let ledger: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(m)::text FROM _schema_migrations m ORDER BY version",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .unwrap();
+    let report = ironauth_store::MigrationRunner::new(db.owner_pool())
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(report.newly_applied(), [250]);
+    let after: String = sqlx::query_scalar(
+        "SELECT row_to_json(p)::text FROM password_reset_challenges p WHERE id=$1",
+    )
+    .bind(id.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .unwrap();
+    assert_eq!(before, after);
+    let retained: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(m)::text FROM _schema_migrations m WHERE version<250 ORDER BY version",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .unwrap();
+    assert_eq!(ledger, retained);
+    let error = sqlx::query("DELETE FROM password_reset_challenges WHERE id=$1")
+        .bind(id.to_string())
+        .execute(db.app_pool())
+        .await
+        .expect_err("forward upgrade removes unused delete authority");
+    assert_eq!(sqlstate(&error).as_deref(), Some("42501"));
+    assert!(
+        ironauth_store::MigrationRunner::new(db.owner_pool())
+            .run()
+            .await
+            .unwrap()
+            .newly_applied()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn reset_schema_forces_scope_and_refuses_authority_rewrites() {
     let db = TestDatabase::start().await;
     let env = Env::system();
@@ -64,21 +123,29 @@ async fn reset_schema_forces_scope_and_refuses_authority_rewrites() {
         .await
         .unwrap();
     assert_eq!(count, 0);
-    for query in [
-        "DELETE FROM password_reset_challenges WHERE id=$1",
-        "UPDATE password_reset_challenges SET attempt_count=1 WHERE id=$1",
-    ] {
-        assert_eq!(
-            sqlx::query(query)
-                .bind(id.to_string())
-                .execute(&mut *tx)
-                .await
-                .unwrap()
-                .rows_affected(),
-            0
-        );
-    }
+    assert_eq!(
+        sqlx::query("UPDATE password_reset_challenges SET attempt_count=1 WHERE id=$1")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected(),
+        0
+    );
     tx.commit().await.unwrap();
+
+    for selected in [scope, other] {
+        let mut tx = db.app_pool().begin().await.unwrap();
+        sqlx::query("SELECT set_config('ironauth.tenant_id',$1,true),set_config('ironauth.environment_id',$2,true)")
+            .bind(selected.tenant().to_string()).bind(selected.environment().to_string()).execute(&mut *tx).await.unwrap();
+        let error = sqlx::query("DELETE FROM password_reset_challenges WHERE id=$1")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect_err("runtime cannot delete either local or foreign recovery evidence");
+        assert_eq!(sqlstate(&error).as_deref(), Some("42501"));
+        tx.rollback().await.unwrap();
+    }
 
     let mut tx = db.app_pool().begin().await.unwrap();
     sqlx::query("SELECT set_config('ironauth.tenant_id',$1,true),set_config('ironauth.environment_id',$2,true)")

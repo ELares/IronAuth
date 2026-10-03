@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Remove unused data-plane DELETE authority from hosted password-reset challenges with forward migration 0250 (#1479). Preserve retained receipts, cancellation aliases and the checksum of already-applied migration 0249.
+
 - Queue one code-free owner warning atomically when a hosted recovery case is cancelled (#1479). Select one latest case-bound challenge across reissues, preserve current mailbox validation, and never allow cancellation-notice eligibility to authorize password completion.
 
 - Queue code-free password-reset completion notices in the credential transaction, with audited single-attempt claims and immutable terminal delivery outcomes (#1479). Queue failure rolls back completion; receipt retries do not enqueue duplicates.
@@ -24,15 +26,15 @@ range per docs/RELEASING.md.
 
 - Retain a separate hashed cancellation capability for each real reset challenge (#1479). Fresh codes can share the original delayed recovery case; old notification links still resolve after code expiry or reissue, and cannot cancel across scopes. Plaintext cancellation secrets are not retained.
 
-- Require a durable accepted delivery result before hosted password reset completion or receipt replay (#1479). Pending, refused and uncertain delivery cannot authorize a reset; terminal delivery records are audited and cannot be relabelled through the repository. Hosted transport orchestration remains pending.
+- Require a durable accepted delivery result before hosted password reset completion or receipt replay (#1479). Pending, refused and uncertain delivery cannot authorize a reset; terminal delivery records are audited and cannot be relabelled through the repository.
 
-- Add atomic hosted reset completion with current mailbox/credential/case revalidation, bounded attempts, delay enforcement and exact-request receipts (#1479). Password, recovery state, session and offline-family/grant revocation, trusted-device invalidation and audit commit together; no session or stronger-factor removal is granted. Hosted transport and UI remain pending.
+- Add atomic hosted reset completion with current mailbox/credential/case revalidation, bounded attempts, delay enforcement and exact-request receipts (#1479). Password, recovery state, session and offline-family/grant revocation, trusted-device invalidation and audit commit together; no session or stronger-factor removal is granted.
 
 - Add audited browser-bound reset challenge issuance and reads, deriving verified ownership and credential generation from current store rows and enforcing a durable account resend cooldown (#1479). Issuance does not claim delivery or enable credential reset.
 
 - Factor password verifier mutation and session revocation into a private transaction-owned primitive for atomic recovery composition (#1479); preserve ordinary account-change behavior and verify rollback on an audit failure.
 
-- Add the scoped password-reset challenge schema and redacted typed identifiers, with bounded lifetime/attempts, immutable binding grants and completion-receipt constraints (#1479). This storage foundation does not enable the hosted reset ceremony.
+- Add the scoped password-reset challenge schema and redacted typed identifiers, with bounded lifetime/attempts, immutable binding grants and completion-receipt constraints (#1479).
 
 - Repair the missing control-role DELETE grant required by verified advisory projection replacement, through forward migration 0248; serving roles remain read-only.
 
