@@ -716,10 +716,6 @@ fn read_only_mismatch(
             "{property} is supplied by the transmitter and cannot be changed"
         )))
     };
-    // NESTED RATHER THAN LET-CHAINED. `if let ... && cond` is a let chain, stable only from
-    // Rust 1.88, and this workspace promises 1.85: the `msrv` lane compiles the shipped
-    // graph at that version and these six were failing it. The nesting is uglier and it is
-    // what the promised floor costs.
     if let Some(aud) = &request.aud
         && *aud != current.audience
     {
