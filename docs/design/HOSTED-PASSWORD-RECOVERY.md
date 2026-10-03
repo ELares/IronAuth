@@ -501,3 +501,19 @@ password change and exact receipt, record refusal or uncertainty, and do not res
 These are isolated TLS/PostgreSQL tests, not Internet delivery or a headed browser.
 Crash/restart classification, mailbox reassignment, full binary lifecycle and main
 route activation remain outstanding before release.
+
+
+Additional completion-notice fault qualification now exercises a persisted delivery
+claim with newly constructed worker instances. A recent unresolved claim schedules
+a retry; after the bounded attempt and retry jitter window, the next worker records
+uncertainty and dead-letters the work without contacting the accepting TLS fixture.
+The committed password and exact receipt remain valid. This simulates loss of a
+worker between claim and result; it is not an operating-system process crash test.
+Store fixtures separately verify foreign-scope refusal, delivery eligibility after
+code expiry, refusal after mailbox reverification, and audited rollback of claim
+and outcome writes without reverting the completed password change.
+
+The cancellation page still uses the existing recovery notifier and claims that
+registered channels were alerted. Actual cancellation delivery must replace that
+legacy path before this ceremony is enabled; completion-notice tests do not prove
+cancellation delivery or mailbox transfer to a different account.

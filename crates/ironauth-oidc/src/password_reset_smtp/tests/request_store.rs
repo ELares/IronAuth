@@ -527,3 +527,88 @@ async fn completion_mail_failure_keeps_reset_committed_and_does_not_resend() {
         complete_from_mail(&state, &db, &subject, &browser, &raw).await;
     }
 }
+
+#[tokio::test]
+async fn restarted_completion_worker_classifies_stale_claim_without_sending_again() {
+    use crate::password_reset_delivery::PasswordResetCompletionConsumer;
+    use ironauth_store::outbox::{OutboxWorker, WorkerSettings};
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        1499,
+    );
+    let scope = db.seed_scope(&env).await;
+    let (smtp, mail) = fixture(Reply::Accepted, true).await;
+    let state = state(
+        &db,
+        &env,
+        scope,
+        Some(PasswordResetSmtpTransport {
+            smtp,
+            issuer: Url::parse("https://auth.example.test").unwrap(),
+            env: env.clone(),
+        }),
+    );
+    let (subject, client) = seed(&db, &state, scope).await;
+    let (_, headers, _) = request(&state, &resume(&client), OWNER, None).await;
+    let browser = cookie(&headers);
+    let raw = tokio::time::timeout(Duration::from_secs(5), mail)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    complete_from_mail(&state, &db, &subject, &browser, &raw).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::COOKIE, browser.parse().unwrap());
+    let binding = ResetBrowserBinding::from_headers(&headers).unwrap();
+    // Persist the claim that would survive a crash before recording SMTP outcome.
+    assert!(
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .password_reset()
+            .claim_completion_notice(&env, binding.challenge())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let (smtp, unexpected_mail) = fixture(Reply::Accepted, true).await;
+    let state = state.with_password_reset_smtp(PasswordResetSmtpTransport {
+        smtp,
+        issuer: Url::parse("https://auth.example.test").unwrap(),
+        env: env.clone(),
+    });
+    let worker = || {
+        OutboxWorker::new(
+            db.store().clone(),
+            env.clone(),
+            Arc::new(PasswordResetCompletionConsumer::new(state.clone())),
+            WorkerSettings::default(),
+        )
+    };
+    let first = worker().run_once(scope).await.unwrap();
+    assert_eq!(first.retried, 1);
+    assert_eq!(first.completed, 0);
+    // The retry schedule includes up to thirty seconds of jitter.
+    clock.advance(Duration::from_secs(61));
+    let restarted = worker();
+    let second = restarted.run_once(scope).await.unwrap();
+    assert_eq!(second.dead_lettered, 1);
+    assert_eq!(second.completed, 0);
+    assert_eq!(restarted.run_once(scope).await.unwrap().claimed, 0);
+    assert!(!unexpected_mail.is_finished());
+    unexpected_mail.abort();
+    let result = db
+        .store()
+        .scoped(scope)
+        .password_reset()
+        .completion_notice_status(binding.challenge())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        result.result,
+        Some(ironauth_store::PasswordResetDelivery::Uncertain)
+    );
+    complete_from_mail(&state, &db, &subject, &browser, &raw).await;
+}

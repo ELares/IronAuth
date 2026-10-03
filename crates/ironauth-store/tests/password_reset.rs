@@ -2779,3 +2779,152 @@ async fn completion_notice_enqueue_failure_rolls_back_password_and_case() {
         PasswordResetOutcome::Completed { .. }
     ));
 }
+
+#[tokio::test]
+async fn completion_notice_survives_code_expiry_but_rechecks_mailbox_epoch_and_scope() {
+    use ironauth_store::CorrelationId;
+    use std::time::{Duration, SystemTime};
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH + Duration::from_secs(1000), 1498);
+    let scope = db.seed_scope(&env).await;
+    let other = db.seed_scope(&env).await;
+    let (_, _, first) = reset_fixture(&db, &env, scope).await;
+    let (subject, _, second) = reset_fixture(&db, &env, other).await;
+    for challenge in [&first, &second] {
+        complete_reset(&db, &env, challenge, true, 9).await.unwrap();
+    }
+    clock.advance(Duration::from_secs(601));
+    verify_reset_mailbox(&db, &env, &subject).await;
+    let store = db.store();
+    let acting = store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    assert!(
+        acting
+            .password_reset()
+            .claim_completion_notice(&env, &second.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scoped(scope)
+            .password_reset()
+            .completion_notice_status(&second.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let first_claim = acting
+        .password_reset()
+        .claim_completion_notice(&env, &first.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(first_claim.recipient.is_some());
+    let second_claim = store
+        .scoped(other)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .password_reset()
+        .claim_completion_notice(&env, &second.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        second_claim.recipient.is_none(),
+        "new mailbox epoch must not inherit the notice"
+    );
+}
+
+#[tokio::test]
+async fn completion_notice_audit_faults_roll_back_claim_and_result_without_reverting_password() {
+    use ironauth_store::{CorrelationId, PasswordResetDelivery};
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (subject, _, challenge) = reset_fixture(&db, &env, scope).await;
+    complete_reset(&db, &env, &challenge, true, 9)
+        .await
+        .unwrap();
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let acting = scoped.acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let notices = acting.password_reset();
+    sqlx::raw_sql("CREATE FUNCTION reject_completion_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.action='password_reset.notice_started' THEN RAISE EXCEPTION 'fixture audit failure'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER reject_completion_audit BEFORE INSERT ON audit_log FOR EACH ROW EXECUTE FUNCTION reject_completion_audit();")
+        .execute(db.owner_pool()).await.unwrap();
+    assert!(
+        notices
+            .claim_completion_notice(&env, &challenge.id)
+            .await
+            .is_err()
+    );
+    assert!(
+        scoped
+            .password_reset()
+            .completion_notice_status(&challenge.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .started_at_unix_micros
+            .is_none()
+    );
+    sqlx::raw_sql("CREATE OR REPLACE FUNCTION reject_completion_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.action='password_reset.notice_delivery' THEN RAISE EXCEPTION 'fixture audit failure'; END IF; RETURN NEW; END $$;")
+        .execute(db.owner_pool()).await.unwrap();
+    assert!(
+        notices
+            .claim_completion_notice(&env, &challenge.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        notices
+            .record_completion_notice(&env, &challenge.id, PasswordResetDelivery::Accepted, 1)
+            .await
+            .is_err()
+    );
+    let status = scoped
+        .password_reset()
+        .completion_notice_status(&challenge.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.started_at_unix_micros.is_some());
+    assert_eq!(status.result, None);
+    assert!(
+        notices
+            .claim_completion_notice(&env, &challenge.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        scoped
+            .users()
+            .password_hash_for_subject(&subject)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(NEW_HASH)
+    );
+    sqlx::raw_sql("DROP TRIGGER reject_completion_audit ON audit_log; DROP FUNCTION reject_completion_audit();")
+        .execute(db.owner_pool()).await.unwrap();
+    notices
+        .record_completion_notice(&env, &challenge.id, PasswordResetDelivery::Uncertain, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        scoped
+            .password_reset()
+            .completion_notice_status(&challenge.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .result,
+        Some(PasswordResetDelivery::Uncertain)
+    );
+}
