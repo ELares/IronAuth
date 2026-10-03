@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Solve built-in proof-of-work automatically on the hosted recovery form when enabled (#1479). Use a nonce-authorized same-origin script, bounded browser work, accessible progress and retry feedback, and suppress duplicate submits. External challenge widgets still require explicit client integration.
+
 - Mount browser-bound password recovery in the provider router (#1479), replacing the logging-only request acknowledgement. Configured recovery issues real/decoy code forms; disabled delivery explicitly reports unavailable. Main-router HTTP/TLS tests cover reset and cancellation without implicit sign-in.
 
 - Deliver code-free cancelled-reset owner warnings through the durable recovery worker (#1479). Cancellation pages no longer claim mail was delivered and return a retryable unavailable response when the cancellation transaction fails.

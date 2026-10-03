@@ -49,6 +49,22 @@ fn state(
     scope: Scope,
     transport: Option<PasswordResetSmtpTransport>,
 ) -> OidcState {
+    state_with_config(
+        db,
+        env,
+        scope,
+        transport,
+        &ironauth_config::OidcConfig::default(),
+    )
+}
+
+fn state_with_config(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    transport: Option<PasswordResetSmtpTransport>,
+    config: &ironauth_config::OidcConfig,
+) -> OidcState {
     let key = ironauth_jose::SigningKey::generate_ed25519(Some("reset-test".into()), env.entropy())
         .unwrap();
     let registry = IssuerRegistry::new("https://auth.example.test", JwksCacheWindow::clamped(60));
@@ -65,7 +81,7 @@ fn state(
         db.store().clone(),
         env.clone(),
         Arc::new(registry),
-        &ironauth_config::OidcConfig::default(),
+        config,
         "https://auth.example.test",
     )
     .with_breach_provider(Arc::new(EmptyCorpus));
@@ -843,6 +859,78 @@ async fn recovery_preserves_live_par_and_rejects_wrong_client_and_expired_contex
         document["expires_in"].as_u64().unwrap() + 1,
     ));
     let (status, headers, _) = request(&state, &target, OWNER, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!headers.contains_key(header::SET_COOKIE));
+}
+
+#[tokio::test]
+async fn builtin_recovery_pow_form_and_gate_accept_single_use_proof() {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let db = TestDatabase::start().await;
+    let env = env();
+    let scope = db.seed_scope(&env).await;
+    let mut config = ironauth_config::OidcConfig::default();
+    config.registration_abuse.pow.enabled = true;
+    config.registration_abuse.pow.difficulty_bits = 8;
+    let transport =
+        PasswordResetSmtpTransport::new(super::config(), "https://auth.example.test", env.clone())
+            .unwrap();
+    let state = state_with_config(&db, &env, scope, Some(transport), &config);
+    let (_, client) = seed(&db, &state, scope).await;
+    let target = resume(&client);
+    let query = serde_urlencoded::to_string([("return_to", target.as_str())]).unwrap();
+    let (status, headers, page) = call(
+        &state,
+        "GET",
+        &format!("/recover?{query}"),
+        String::new(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("recovery-verification") && page.contains("crypto.subtle.digest"));
+    let nonce = page
+        .split("<script nonce=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    assert!(
+        headers[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap()
+            .contains(&format!("'nonce-{nonce}'"))
+    );
+    if let Ok(path) = std::env::var("IRONAUTH_RECOVERY_RENDER_ARTIFACT") {
+        std::fs::write(path, serde_json::to_vec(&serde_json::json!({"html": page, "csp": headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap()})).unwrap()).unwrap();
+    }
+    for identifier in [OWNER, "unknown@example.test"] {
+        let (status, headers, _) = request(&state, &target, identifier, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!headers.contains_key(header::SET_COOKIE));
+    }
+    let crate::pow_gate::ChallengeIssue::Issued(challenge) =
+        crate::pow_gate::issue_builtin_challenge(&state, scope, "recover", "recovery-fixture")
+            .await
+    else {
+        panic!("fixture challenge issuance failed")
+    };
+    let nonce =
+        crate::pow::solve(&challenge.challenge, challenge.difficulty_bits, 100_000).unwrap();
+    let body = serde_urlencoded::to_string([
+        ("identifier", "unknown@example.test".to_owned()),
+        ("return_to", target),
+        ("pow_challenge_id", challenge.id.to_string()),
+        ("pow_nonce", URL_SAFE_NO_PAD.encode(nonce)),
+        ("pow_context", "recovery-fixture".to_owned()),
+    ])
+    .unwrap();
+    let (status, headers, _) = call(&state, "POST", "/recover", body.clone(), None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(headers.contains_key(header::SET_COOKIE));
+    let (status, headers, _) = call(&state, "POST", "/recover", body, None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(!headers.contains_key(header::SET_COOKIE));
 }

@@ -581,3 +581,22 @@ the recovery form has no challenge solver or proof fields. Reloading the form
 cannot satisfy that gate. The built-in solver and its browser qualification are
 required before enabling that policy in this hosted ceremony. External challenge
 widgets require their own explicit client integration; none is claimed here.
+
+
+The built-in proof-of-work form gap is now addressed in the branch. When built-in
+verification is enabled, the recovery renderer includes the solver under an
+Env-generated script nonce and the existing strict hosted-login CSP. Submission
+fetches a challenge from the validated scope on the same origin, solves SHA-256
+locally, and submits the proof once. It rejects malformed challenge responses and
+changed form input, suppresses overlapping submissions, limits fetch/solve time,
+and exposes progress/retry text through an accessible status region. No external
+script, challenge service or automatic reset-code resend is introduced.
+
+The server fixture covers the rendered nonce/CSP, missing proof for known/unknown
+accounts, successful decoy issuance with a valid proof and refusal of proof replay.
+A separate headed Chrome check serves the actual Rust-rendered HTML and CSP with
+local challenge/submission fixtures; it verifies the browser's SHA-256 proof,
+duplicate-submit suppression, rate-limit retry, malformed challenges and changed
+input. This is browser solver evidence with fixture endpoints, not a full live
+Rust/browser recovery or Internet email test. External-provider widget integration
+and additional proof expiry/context cases remain outstanding.

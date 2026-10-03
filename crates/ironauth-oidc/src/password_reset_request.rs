@@ -38,16 +38,32 @@ async fn request_page(
     error: Option<&str>,
 ) -> Response {
     let banner = state.environment_banner(&resume.scope).await;
-    pages::response(
-        status,
-        crate::pages::recover_page(
-            resume.hints.login_hint().unwrap_or_default(),
-            &resume.return_to,
-            error,
-            &resume.hints,
-            banner,
-        ),
-    )
+    let pow = &state.registration_abuse_config().pow;
+    let nonce = (pow.enabled && !state.challenge_provider().kind().is_external())
+        .then(|| crate::login::passkey_nonce(state));
+    let challenge_url = format!(
+        "/t/{}/e/{}/pow/challenge",
+        resume.scope.tenant(),
+        resume.scope.environment()
+    );
+    let verification = nonce
+        .as_ref()
+        .map(|nonce| crate::pages::RecoveryVerificationUi {
+            nonce,
+            challenge_url: &challenge_url,
+        });
+    let body = crate::pages::recover_page(
+        resume.hints.login_hint().unwrap_or_default(),
+        &resume.return_to,
+        error,
+        &resume.hints,
+        banner,
+        verification.as_ref(),
+    );
+    match nonce {
+        Some(nonce) => crate::pages::login_html(status, body, &nonce),
+        None => pages::response(status, body),
+    }
 }
 
 async fn disabled(state: &OidcState, resume: &ResumeTarget) -> Response {
