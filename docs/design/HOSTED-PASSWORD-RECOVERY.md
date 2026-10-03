@@ -166,3 +166,13 @@ password policy and screening, admit hashing, and satisfy actual required recove
 notifications before calling completion. These caller obligations are not wired yet.
 Further race/invalidation coverage and transport/hosted qualification remain before
 the full gate, review and deployment.
+
+The real-store authority checks also cover a newly verified mailbox revision
+invalidating both pending proof and a completed receipt, receipt refusal after a
+later password change, and wrong-browser/scope/verifier requests leaving the
+attempt budget untouched. A forced final audit failure leaves offline families,
+their grants, remembered devices and the session-ended outbox unchanged. Concurrent
+completion/cancellation and completion/password-change checks assert the committed
+winner and current credential, with a deadline to catch lock hangs. These checks
+exercise isolated database fixtures; they do not establish delivered recovery mail,
+Internet delivery, or a completed hosted browser journey.

@@ -185,17 +185,13 @@ fn now_micros(env: &Env) -> i64 {
     .unwrap()
 }
 
-async fn verified_account(db: &TestDatabase, env: &Env, scope: Scope) -> ironauth_store::UserId {
+async fn verify_reset_mailbox(db: &TestDatabase, env: &Env, subject: &ironauth_store::UserId) {
     use ironauth_store::{CorrelationId, NewRecipientChallenge, RecipientAttempt};
+    let scope = subject.scope();
     let store = db.store();
     let acting = store
         .scoped(scope)
         .acting(db.test_actor(env), CorrelationId::generate(env));
-    let subject = acting
-        .users()
-        .register(env, EMAIL, HASH, None)
-        .await
-        .unwrap();
     let id = RecipientChallengeId::generate(env, &scope);
     acting
         .recipient_verification()
@@ -203,7 +199,7 @@ async fn verified_account(db: &TestDatabase, env: &Env, scope: Scope) -> ironaut
             env,
             NewRecipientChallenge {
                 id: &id,
-                subject: &subject,
+                subject,
                 email: EMAIL,
                 code_hash: HASH,
                 expires_at_unix_micros: now_micros(env) + 300_000_000,
@@ -214,18 +210,31 @@ async fn verified_account(db: &TestDatabase, env: &Env, scope: Scope) -> ironaut
     let challenge = store
         .scoped(scope)
         .recipient_verification()
-        .challenge(env, &subject, &id)
+        .challenge(env, subject, &id)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
         acting
             .recipient_verification()
-            .attempt(env, &subject, &challenge, true)
+            .attempt(env, subject, &challenge, true)
             .await
             .unwrap(),
         RecipientAttempt::Verified
     );
+}
+
+async fn verified_account(db: &TestDatabase, env: &Env, scope: Scope) -> ironauth_store::UserId {
+    use ironauth_store::CorrelationId;
+    let subject = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .users()
+        .register(env, EMAIL, HASH, None)
+        .await
+        .unwrap();
+    verify_reset_mailbox(db, env, &subject).await;
     subject
 }
 
@@ -1072,60 +1081,15 @@ async fn reset_offline_grant(
 
 #[tokio::test]
 async fn reset_completion_revokes_offline_family_grant_and_remembered_device() {
-    use ironauth_store::{
-        CorrelationId, NewRefreshFamily, NewTrustedDevice, PasswordResetOutcome, RefreshFamilyId,
-        RefreshTokenId, refresh_token_digest,
-    };
+    use ironauth_store::{PasswordResetOutcome, StoreError};
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     let (subject, _, challenge) = reset_fixture(&db, &env, scope).await;
     let session = reset_session(&db, &env, &subject).await;
-    let grant = reset_offline_grant(&db, &env, scope, &subject.to_string(), Some(&session)).await;
+    let (family, device) = reset_access_fixture(&db, &env, &subject, &session).await;
     let store = db.store();
     let scoped = store.scoped(scope);
-    let acting = scoped.acting(db.test_actor(&env), CorrelationId::generate(&env));
-    let family = RefreshFamilyId::generate(&env, &scope);
-    let token = RefreshTokenId::generate(&env, &scope);
-    acting
-        .refresh()
-        .issue(
-            &env,
-            NewRefreshFamily {
-                family_id: &family,
-                token_jti: &token,
-                token_digest: &refresh_token_digest("fixture-refresh"),
-                grant_id: &grant,
-                subject: &subject.to_string(),
-                client_id: "cli_family",
-                scope: Some("openid offline_access"),
-                auth_methods: "pwd",
-                auth_time_unix_micros: None,
-                offline: true,
-                created_at_unix_micros: now_micros(&env),
-                idle_expires_at_unix_micros: 4_102_444_800_000_000,
-                absolute_expires_at_unix_micros: 4_102_444_800_000_000,
-                dpop_jkt: None,
-            },
-        )
-        .await
-        .unwrap();
-    let device = acting
-        .trusted_devices()
-        .remember(
-            &env,
-            &subject,
-            NewTrustedDevice {
-                device_secret_hash: &[5; 32],
-                session_lineage: &session.to_string(),
-                user_agent: "isolated reset fixture",
-                coarse_location: "fixture",
-                max_age_expires_micros: 4_102_444_800_000_000,
-                idle_expires_micros: 4_102_444_800_000_000,
-            },
-        )
-        .await
-        .unwrap();
     assert!(
         scoped
             .trusted_devices()
@@ -1134,6 +1098,39 @@ async fn reset_completion_revokes_offline_family_grant_and_remembered_device() {
             .unwrap()
             .is_some()
     );
+    let audit_before = scoped.audit().list().await.unwrap().len();
+    reset_audit_fault(&db, true).await;
+    assert!(matches!(
+        complete_reset(&db, &env, &challenge, true, 9).await,
+        Err(StoreError::Database(_))
+    ));
+    assert_eq!(reset_refresh_revoked(&db, &family).await, (false, false));
+    assert!(
+        scoped
+            .trusted_devices()
+            .validate(&device, &subject, &[5; 32], now_micros(&env))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        scoped
+            .sessions()
+            .get(&session, 0, 0)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        scoped
+            .session_events()
+            .pending(100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(scoped.audit().list().await.unwrap().len(), audit_before);
+    reset_audit_fault(&db, false).await;
     assert!(matches!(
         complete_reset(&db, &env, &challenge, true, 9)
             .await
@@ -1148,10 +1145,7 @@ async fn reset_completion_revokes_offline_family_grant_and_remembered_device() {
             .unwrap()
             .is_none()
     );
-    let row = sqlx::query("SELECT f.revoked_at IS NOT NULL AS family_revoked,g.revoked_at IS NOT NULL AS grant_revoked FROM refresh_families f JOIN grants g ON g.id=f.grant_id WHERE f.id=$1")
-        .bind(family.to_string()).fetch_one(db.owner_pool()).await.unwrap();
-    assert!(row.get::<bool, _>("family_revoked"));
-    assert!(row.get::<bool, _>("grant_revoked"));
+    assert_eq!(reset_refresh_revoked(&db, &family).await, (true, true));
     let events = scoped.session_events().pending(100).await.unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].session_id, session.to_string());
@@ -1188,5 +1182,341 @@ async fn reset_completion_refuses_a_held_case_without_its_delay_horizon() {
             .unwrap()
             .as_deref(),
         Some(HASH)
+    );
+}
+
+#[tokio::test]
+async fn reset_pending_proof_and_completed_receipt_reject_a_new_mailbox_verification_epoch() {
+    use ironauth_store::PasswordResetOutcome;
+    use std::time::{Duration, SystemTime};
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH + Duration::from_secs(1000), 1481);
+    let scope = db.seed_scope(&env).await;
+    let (subject, _, pending) = reset_fixture(&db, &env, scope).await;
+    let other_scope = db.seed_scope(&env).await;
+    let (other, _, completed) = reset_fixture(&db, &env, other_scope).await;
+    assert!(matches!(
+        complete_reset(&db, &env, &completed, true, 9)
+            .await
+            .unwrap(),
+        PasswordResetOutcome::Completed { .. }
+    ));
+    clock.advance(Duration::from_secs(61));
+    verify_reset_mailbox(&db, &env, &subject).await;
+    verify_reset_mailbox(&db, &env, &other).await;
+    assert_eq!(
+        complete_reset(&db, &env, &pending, true, 9).await.unwrap(),
+        PasswordResetOutcome::Refused
+    );
+    assert_eq!(
+        complete_reset(&db, &env, &completed, true, 9)
+            .await
+            .unwrap(),
+        PasswordResetOutcome::Refused
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .password_hash_for_subject(&subject)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(HASH)
+    );
+    assert_eq!(
+        db.store()
+            .scoped(other_scope)
+            .users()
+            .password_hash_for_subject(&other)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(NEW_HASH)
+    );
+}
+
+#[tokio::test]
+async fn reset_completed_receipt_cannot_overwrite_a_later_password_change() {
+    use ironauth_store::{CorrelationId, PasswordResetOutcome};
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (subject, _, challenge) = reset_fixture(&db, &env, scope).await;
+    assert!(matches!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .unwrap(),
+        PasswordResetOutcome::Completed { .. }
+    ));
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    scoped
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .change_password(&env, &subject, HASH, None, "fixture_later_password_change")
+        .await
+        .unwrap();
+    assert_eq!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .unwrap(),
+        PasswordResetOutcome::Refused
+    );
+    assert_eq!(
+        scoped
+            .users()
+            .password_hash_for_subject(&subject)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(HASH)
+    );
+    assert_eq!(
+        scoped
+            .audit()
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row.action == "password_reset.complete")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn reset_completion_rejects_wrong_browser_scope_and_verifier_snapshot_without_spending_attempts()
+ {
+    use ironauth_store::{
+        CompletePasswordReset, CorrelationId, PasswordResetChallenge, PasswordResetOutcome,
+    };
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let other = db.seed_scope(&env).await;
+    let (subject, _, challenge) = reset_fixture(&db, &env, scope).await;
+    for (request_scope, binding) in [(other, [3; 32]), (scope, [4; 32])] {
+        assert_eq!(
+            db.store()
+                .scoped(request_scope)
+                .acting(db.test_actor(&env), CorrelationId::generate(&env))
+                .password_reset()
+                .complete(
+                    &env,
+                    CompletePasswordReset {
+                        challenge: &challenge,
+                        browser_binding_hash: &binding,
+                        code_matched: true,
+                        new_password_hash: NEW_HASH,
+                        request_hash: &[9; 32],
+                    }
+                )
+                .await
+                .unwrap(),
+            PasswordResetOutcome::Refused
+        );
+    }
+    let forged = PasswordResetChallenge {
+        id: challenge.id,
+        code_hash: NEW_HASH.to_string(),
+    };
+    assert_eq!(
+        complete_reset(&db, &env, &forged, true, 9).await.unwrap(),
+        PasswordResetOutcome::Refused
+    );
+    let count: i32 =
+        sqlx::query_scalar("SELECT attempt_count FROM password_reset_challenges WHERE id=$1")
+            .bind(challenge.id.to_string())
+            .fetch_one(db.owner_pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .password_hash_for_subject(&subject)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(HASH)
+    );
+}
+
+async fn reset_access_fixture(
+    db: &TestDatabase,
+    env: &Env,
+    subject: &ironauth_store::UserId,
+    session: &ironauth_store::SessionId,
+) -> (
+    ironauth_store::RefreshFamilyId,
+    ironauth_store::TrustedDeviceId,
+) {
+    use ironauth_store::{
+        CorrelationId, NewRefreshFamily, NewTrustedDevice, RefreshFamilyId, RefreshTokenId,
+        refresh_token_digest,
+    };
+    let scope = subject.scope();
+    let grant = reset_offline_grant(db, env, scope, &subject.to_string(), Some(session)).await;
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let acting = scoped.acting(db.test_actor(env), CorrelationId::generate(env));
+    let family = RefreshFamilyId::generate(env, &scope);
+    let token = RefreshTokenId::generate(env, &scope);
+    acting
+        .refresh()
+        .issue(
+            env,
+            NewRefreshFamily {
+                family_id: &family,
+                token_jti: &token,
+                token_digest: &refresh_token_digest("fixture-refresh"),
+                grant_id: &grant,
+                subject: &subject.to_string(),
+                client_id: "cli_family",
+                scope: Some("openid offline_access"),
+                auth_methods: "pwd",
+                auth_time_unix_micros: None,
+                offline: true,
+                created_at_unix_micros: now_micros(env),
+                idle_expires_at_unix_micros: 4_102_444_800_000_000,
+                absolute_expires_at_unix_micros: 4_102_444_800_000_000,
+                dpop_jkt: None,
+            },
+        )
+        .await
+        .unwrap();
+    let device = acting
+        .trusted_devices()
+        .remember(
+            env,
+            subject,
+            NewTrustedDevice {
+                device_secret_hash: &[5; 32],
+                session_lineage: &session.to_string(),
+                user_agent: "isolated reset fixture",
+                coarse_location: "fixture",
+                max_age_expires_micros: 4_102_444_800_000_000,
+                idle_expires_micros: 4_102_444_800_000_000,
+            },
+        )
+        .await
+        .unwrap();
+    (family, device)
+}
+
+async fn reset_refresh_revoked(
+    db: &TestDatabase,
+    family: &ironauth_store::RefreshFamilyId,
+) -> (bool, bool) {
+    let row = sqlx::query("SELECT f.revoked_at IS NOT NULL AS family_revoked,g.revoked_at IS NOT NULL AS grant_revoked FROM refresh_families f JOIN grants g ON g.id=f.grant_id WHERE f.id=$1")
+        .bind(family.to_string()).fetch_one(db.owner_pool()).await.unwrap();
+    (row.get("family_revoked"), row.get("grant_revoked"))
+}
+
+async fn reset_audit_fault(db: &TestDatabase, enabled: bool) {
+    let sql = if enabled {
+        "CREATE FUNCTION reject_reset_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.action='password_reset.complete' THEN RAISE EXCEPTION 'injected reset failure'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER reject_reset_audit BEFORE INSERT ON audit_log FOR EACH ROW EXECUTE FUNCTION reject_reset_audit();"
+    } else {
+        "DROP TRIGGER reject_reset_audit ON audit_log; DROP FUNCTION reject_reset_audit();"
+    };
+    sqlx::raw_sql(sql).execute(db.owner_pool()).await.unwrap();
+}
+
+#[tokio::test]
+async fn reset_completion_and_cancellation_have_one_committed_winner() {
+    use ironauth_store::{
+        CorrelationId, PasswordResetOutcome, RecoveryCancelReason, RecoveryState,
+    };
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (subject, recovery, challenge) = reset_fixture(&db, &env, scope).await;
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let acting = scoped.acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let cases = acting.recovery_flows();
+    let results = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            complete_reset(&db, &env, &challenge, true, 9),
+            cases.cancel(&env, &recovery, RecoveryCancelReason::UserNotification)
+        )
+    })
+    .await
+    .expect("completion/cancellation must not deadlock");
+    let (completion, cancelled) = (results.0.unwrap(), results.1.unwrap());
+    let state = scoped
+        .recovery_flows()
+        .get(&recovery)
+        .await
+        .unwrap()
+        .unwrap()
+        .state;
+    let password = scoped
+        .users()
+        .password_hash_for_subject(&subject)
+        .await
+        .unwrap()
+        .unwrap();
+    if cancelled {
+        assert_eq!(completion, PasswordResetOutcome::Refused);
+        assert_eq!(state, RecoveryState::Cancelled);
+        assert_eq!(password, HASH);
+    } else {
+        assert!(matches!(completion, PasswordResetOutcome::Completed { .. }));
+        assert_eq!(state, RecoveryState::Completed);
+        assert_eq!(password, NEW_HASH);
+    }
+}
+
+#[tokio::test]
+async fn reset_completion_racing_password_change_never_overwrites_the_later_generation() {
+    use ironauth_store::{CorrelationId, PasswordResetOutcome};
+    const LATER_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$dGhpcmRzYWx0$dGhpcmRoYXNo";
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (subject, _, challenge) = reset_fixture(&db, &env, scope).await;
+    let _session = reset_session(&db, &env, &subject).await;
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let acting = scoped.acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let users = acting.users();
+    let results = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            complete_reset(&db, &env, &challenge, true, 9),
+            users.change_password(
+                &env,
+                &subject,
+                LATER_HASH,
+                None,
+                "fixture_concurrent_change"
+            )
+        )
+    })
+    .await
+    .expect("completion/password change must not deadlock");
+    results.1.unwrap();
+    assert!(matches!(
+        results.0.unwrap(),
+        PasswordResetOutcome::Completed { .. } | PasswordResetOutcome::Refused
+    ));
+    assert_eq!(
+        scoped
+            .users()
+            .password_hash_for_subject(&subject)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(LATER_HASH)
+    );
+    assert_eq!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .unwrap(),
+        PasswordResetOutcome::Refused
     );
 }
