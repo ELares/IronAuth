@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Preserve enrolled passkey recovery delays when WebAuthn login is disabled (#1479). Recovery strength follows persisted credentials independently of login endpoint availability.
+
 - Bind hosted recovery browser verification to the submitted account and sign-in continuation (#1479). Reject substituted inputs, foreign scope/endpoint challenges and expired proofs before issuing reset challenges.
 
 - Solve built-in proof-of-work automatically on the hosted recovery form when enabled (#1479). Use a nonce-authorized same-origin script, bounded browser work, accessible progress and retry feedback, and suppress duplicate submits. External challenge widgets still require explicit client integration.

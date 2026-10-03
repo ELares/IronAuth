@@ -344,23 +344,23 @@ fn cancel_link(state: &OidcState, token: &str) -> String {
 /// skipping the delay window. `is_ok_and`-style fail-OPEN here would create a
 /// security-reducing recovery as `initiated` on any transient error.
 async fn account_strength_acr(state: &OidcState, scope: Scope, subject: &UserId) -> &'static str {
-    if state.webauthn_enabled() {
-        match state
-            .store()
-            .scoped(scope)
-            .webauthn_credentials()
-            .strongest_strength(subject)
-            .await
-        {
-            Ok(Some(flags)) => {
-                return passkey_factor(flags.backup_eligible, flags.attestation_verified)
-                    .strength_acr();
-            }
-            Ok(None) => {}
-            // Fail CLOSED: a read fault posture is the ladder's strongest rung, so the
-            // recovery is held.
-            Err(_) => return RecoveryFactor::AttestedPasskey.strength_acr(),
+    // Login availability does not erase an enrolled factor. Recovery posture
+    // follows persisted credentials even when the WebAuthn endpoint is disabled.
+    match state
+        .store()
+        .scoped(scope)
+        .webauthn_credentials()
+        .strongest_strength(subject)
+        .await
+    {
+        Ok(Some(flags)) => {
+            return passkey_factor(flags.backup_eligible, flags.attestation_verified)
+                .strength_acr();
         }
+        Ok(None) => {}
+        // Fail CLOSED: a read fault posture is the ladder's strongest rung, so the
+        // recovery is held.
+        Err(_) => return RecoveryFactor::AttestedPasskey.strength_acr(),
     }
     match state
         .store()

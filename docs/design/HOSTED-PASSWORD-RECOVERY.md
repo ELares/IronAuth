@@ -604,3 +604,9 @@ or continuation inputs, foreign scope/endpoint challenges and expired proofs.
 The server recomputes the SHA-256 context from the exact submitted UTF-8 JSON
 array before consuming a built-in proof. Rejected input substitutions preserve
 the correctly bound proof, and only the valid submission issues a reset challenge.
+
+
+Recovery strength follows persisted passkeys even when WebAuthn login is disabled.
+The real-store regression covers synced and device-bound credentials, verifies
+that email recovery remains held, and checks that the credential is retained.
+This does not enable passkey login or claim a browser authenticator ceremony.

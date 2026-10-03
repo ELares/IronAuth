@@ -590,6 +590,7 @@ unavailability and never falls back to the legacy acknowledgement.
 
 | STRIDE | Threat | Control |
 | --- | --- | --- |
+| Elevation | Disabling a login endpoint causes recovery to ignore an enrolled stronger factor | Recovery strength always probes persisted passkeys, independently of WebAuthn login availability; read faults retain the strongest posture; synced and device-bound regression fixtures remain held |
 | Spoofing | A forged application continuation initiates a reset | Registered client and exact callback, duplicate-parameter rejection, shared PKCE/request/resource validation, live issuer and read-only PAR resolution before identifier lookup; no direct unresolved request object |
 | Information disclosure | Request response reveals whether SMTP was attempted | Real and decoy challenges share redirect/cookie/form shape; actual SMTP runs after persistence in a transient bounded task; existing unknown-account decoy work retained; response-shape tests do not prove every database timing path equivalent |
 | Tampering | A solved browser challenge is reused with another account or continuation | Recompute context from exact submitted inputs before built-in proof verification; stored scope, endpoint, expiry and single-use checks remain required; main-router tests cover substitution and expiry |
