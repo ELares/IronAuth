@@ -321,3 +321,17 @@ does not claim immediate revocation of every relying party's cached access token
 The response helper applies the shared strict CSP, no-store and no-referrer.
 These renderers are not mounted yet; semantics/header tests do not establish a
 rendered browser journey, manual accessibility qualification or live recovery.
+
+
+`password_reset().context()` now reads immutable server-owned client, continuation,
+code expiry and internal audit subject under the original browser digest and scope.
+It accepts no posted account or redirect. Its fixed lifetime is ten minutes from
+issuance, matching the maximum cookie window; the shorter code/receipt expiry is
+still independently enforced by `challenge()` and completion. Expired or replaced
+codes can therefore keep sign-in navigation without becoming usable reset proof.
+The context type has no Debug or serialization and its optional subject must never
+change the existence-uniform public form. The hosted handler must validate the
+stored authorization interaction/client and use the subject only for appropriate
+internal audit attribution, never render account existence. Context reads perform
+no mutation or audit and return nothing for another scope/browser or at the exact
+end of the window. The regression test covers both real and decoy attempts.

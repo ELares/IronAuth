@@ -44,6 +44,20 @@ pub struct PasswordResetChallenge {
     pub code_hash: String,
 }
 
+/// Internal presentation/audit context for the browser that started a reset.
+/// No Debug or serialization: subject presence must never change the public
+/// existence-uniform form. This metadata is not credential or session authority.
+pub struct PasswordResetContext {
+    /// Client retained at issuance, never recovered from a posted redirect.
+    pub client: ClientId,
+    /// Server-owned local authorization continuation.
+    pub authorization_return_to: String,
+    /// Exact expiry of the code; context may outlive it within the browser window.
+    pub expires_at_unix_micros: i64,
+    /// Store-bound subject for internal audit attribution, absent on decoys.
+    pub subject: Option<UserId>,
+}
+
 /// One admitted code verification and policy-checked new password. The caller
 /// verifies the code against `challenge.code_hash` through the hashing pool.
 pub struct CompletePasswordReset<'a> {

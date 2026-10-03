@@ -609,6 +609,7 @@ reset handlers remain pending. A parsed binding never grants a login session.
 
 | STRIDE | Threat | Control |
 | --- | --- | --- |
+| Tampering | Expired-code navigation is interpreted as live reset authority | Separate browser-bound context read preserves only immutable client/continuation/expiry within ten minutes; code verifier and completion enforce their own shorter lifetime; optional audit subject is internal and never changes public form shape |
 | Spoofing | Another browser or challenge borrows a reset form | Independent 256-bit Env secret; stored binding digest; challenge-bound HMAC form proof; exact scoped row resolution still required |
 | Tampering | Ambiguous cookies or edited retry fields alter authority | Reject duplicate/malformed reset cookies; separate MAC domains and length-prefixed fields; exact normalized password/code receipt; constant-time CSRF verification |
 | Repudiation | A lost response applies another password change | Cookie reconstructs the same keyed request digest across restart; existing atomic store receipt refuses changed requests; bounded database lifetime remains authoritative |

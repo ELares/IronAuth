@@ -116,7 +116,7 @@ use crate::message_rate::RateBudget;
 use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
 use crate::password_reset::{
     CompletePasswordReset, NewPasswordReset, PasswordResetAccount, PasswordResetChallenge,
-    PasswordResetDelivery, PasswordResetOutcome,
+    PasswordResetContext, PasswordResetDelivery, PasswordResetOutcome,
 };
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
 use crate::recipient_verification::{
@@ -20805,6 +20805,53 @@ pub struct PasswordResetRepo<'a> {
 }
 
 impl PasswordResetRepo<'_> {
+    /// Read server-owned presentation context for the original browser only.
+    /// Context lasts at most ten minutes from issuance, including expired,
+    /// replaced or completed codes, so an interrupted flow can retain its sign-in
+    /// destination. It does not expose a verifier or authorize completion. Use
+    /// `challenge()` independently for the shorter code/receipt lifetime.
+    ///
+    /// # Errors
+    /// Persistence failure or malformed stored typed identifiers.
+    pub async fn context(
+        &self,
+        env: &Env,
+        id: &PasswordResetChallengeId,
+        browser_binding_hash: &[u8; 32],
+    ) -> Result<Option<PasswordResetContext>, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT client_id,authorization_return_to,subject, \
+             (extract(epoch FROM expires_at)*1000000)::bigint AS expires_us \
+             FROM password_reset_challenges WHERE tenant_id=$1 AND environment_id=$2 \
+             AND id=$3 AND browser_binding_hash=$4 \
+             AND created_at <= TIMESTAMPTZ 'epoch'+($5::text||' microseconds')::interval \
+             AND created_at+interval '10 minutes' > TIMESTAMPTZ 'epoch'+($5::text||' microseconds')::interval",
+        ).bind(self.scope.tenant().to_string()).bind(self.scope.environment().to_string())
+        .bind(id.to_string()).bind(browser_binding_hash.as_slice()).bind(epoch_micros(env.clock().now_utc()))
+        .fetch_optional(&mut *tx).await?;
+        tx.commit().await?;
+        row.map(|row| {
+            let client = ClientId::parse_in_scope(&row.get::<String, _>("client_id"), &self.scope)
+                .map_err(|_| StoreError::Invalid)?;
+            let subject = row
+                .get::<Option<String>, _>("subject")
+                .map(|raw| UserId::parse_in_scope(&raw, &self.scope))
+                .transpose()
+                .map_err(|_| StoreError::Invalid)?;
+            Ok(PasswordResetContext {
+                client,
+                subject,
+                authorization_return_to: row.get("authorization_return_to"),
+                expires_at_unix_micros: row.get("expires_us"),
+            })
+        })
+        .transpose()
+    }
+
     /// Resolve a verifier for an unexpired pending attempt or exact completion retry.
     /// A completed row is retained only so a lost response can reverify the same
     /// request; `complete()` still requires its bound receipt and current generation.

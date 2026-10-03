@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add browser-bound reset presentation context with the stored client, continuation and exact code expiry (#1479). Navigation can survive code expiry within the original ten-minute browser window without extending proof or completion authority; account presence remains internal.
+
 - Add audited, subject-bound reset delivery admission before external mail (#1479). Only one concurrent caller can claim a challenge; an interrupted claimed attempt cannot be automatically resent after restart.
 
 - Anchor a held reset case's full waiting period to its first durable accepted notification (#1479). Failed initial delivery cannot silently consume the delay; subsequent code deliveries preserve the established horizon. The horizon update and delivery audit roll back together.

@@ -2099,3 +2099,92 @@ async fn reset_delivery_claim_has_one_winner_and_cannot_be_replayed_after_interr
         1
     );
 }
+
+#[tokio::test]
+async fn reset_context_retains_navigation_after_code_expiry_but_not_past_browser_window() {
+    use std::time::{Duration, SystemTime};
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH + Duration::from_secs(1000), 1491);
+    let scope = db.seed_scope(&env).await;
+    let foreign = db.seed_scope(&env).await;
+    let (subject, _, challenge) = pending_reset_fixture(&db, &env, scope).await;
+    let decoy = PasswordResetChallengeId::generate(&env, &scope);
+    start_reset(&db, &env, &decoy, None).await.unwrap();
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let read = scoped.password_reset();
+    assert!(
+        read.context(&env, &challenge.id, &[4; 32])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .scoped(foreign)
+            .password_reset()
+            .context(&env, &challenge.id, &[3; 32])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let original = read
+        .context(&env, &challenge.id, &[3; 32])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.subject, Some(subject));
+    assert_eq!(original.client.scope(), scope);
+    assert_eq!(
+        original.authorization_return_to,
+        "/authorize?client_id=fixture"
+    );
+    assert_eq!(
+        original.expires_at_unix_micros,
+        now_micros(&env) + 300_000_000
+    );
+    // Losing the completion response must not lose this browser's navigation.
+    record_reset_delivery(
+        &db,
+        &env,
+        &challenge.id,
+        ironauth_store::PasswordResetDelivery::Accepted,
+        1,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .unwrap(),
+        ironauth_store::PasswordResetOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        read.context(&env, &challenge.id, &[3; 32])
+            .await
+            .unwrap()
+            .unwrap()
+            .client,
+        original.client
+    );
+    let audit_before = scoped.audit().list().await.unwrap().len();
+    clock.advance(Duration::from_secs(300));
+    for id in [&challenge.id, &decoy] {
+        assert!(read.challenge(&env, id, &[3; 32]).await.unwrap().is_none());
+        let context = read.context(&env, id, &[3; 32]).await.unwrap().unwrap();
+        assert_eq!(
+            context.authorization_return_to,
+            original.authorization_return_to
+        );
+        assert_eq!(
+            context.expires_at_unix_micros,
+            original.expires_at_unix_micros
+        );
+        assert_eq!(context.subject.is_some(), id == &challenge.id);
+    }
+    assert_eq!(scoped.audit().list().await.unwrap().len(), audit_before);
+    clock.advance(Duration::from_secs(300));
+    for id in [&challenge.id, &decoy] {
+        assert!(read.context(&env, id, &[3; 32]).await.unwrap().is_none());
+    }
+}
