@@ -188,7 +188,7 @@ fn touches_the_event_feed_other_than_appending(text: &str) -> bool {
 /// 76 -> 81 (#1437 integration): the sign-then-encrypt path resolves the client's
 /// current dynamic-registration metadata after signing, including for a client
 /// without encryption configured. Its isolated trace block is SET TRANSACTION,
-/// two scope set_config calls, SELECT of the encryption registration, and COMMIT.
+/// two scope `set_config` calls, SELECT of the encryption registration, and COMMIT.
 /// That path already exists in baseline 832a7c01; recipient delivery adds no query
 /// to redemption. The block is pinned below alongside the FAPI lookup so this
 /// budget increase accounts for those five statements specifically. This is a
