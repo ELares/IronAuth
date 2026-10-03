@@ -108,13 +108,22 @@ fn the_pinned_wasmtime_version_matches_cargo_toml() {
             rest.split('"').next()
         })
         .expect("the manifest declares a wasmtime version");
-    // The constant is private, so this reads it the way the key does: by building a key with the
-    // known version prefix and asserting the manifest agrees with what the module documents.
+    // Read the actual constant used by the compatibility key, rather than comparing
+    // the manifest with a second unrelated version literal in this test.
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/engine.rs"))
+        .expect("read the artifact key implementation");
+    let version = source
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("const WASMTIME_VERSION: &str = \"")?
+                .split('"')
+                .next()
+        })
+        .expect("artifact key declares its compiler version");
     assert_eq!(
-        declared, "48",
-        "the wasmtime dependency moved to {declared}; update WASMTIME_VERSION in engine.rs so \
-         the artifact key changes with it, or this build will load artifacts compiled by a \
-         different compiler"
+        declared,
+        format!("={version}"),
+        "the compiler must be pinned exactly and agree with the artifact key"
     );
 }
 

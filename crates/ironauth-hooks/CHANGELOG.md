@@ -6,7 +6,7 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- Require Wasmtime 48.0.4 or later in the 48.x series to pick up published runtime and WASI security fixes detected by the local dependency gate (#1475).
+- Pin Wasmtime and WASI to 48.0.5 to pick up published runtime and WASI security fixes detected by the local dependency gate. Bind the compiled-artifact cache key to the exact compiler version (#1475).
 
 - Build the TypeScript hook test component from checked-in source and locked
   npm dependencies instead of committing a WASM binary. The full gate and CI

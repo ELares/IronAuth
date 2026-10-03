@@ -33,7 +33,7 @@ sha2.workspace = true
 # runtime never compiles a hook on the request path, only deserializes what deployment
 # already compiled. See `engine.rs` for why that distinction is a security boundary and
 # not just a latency one.
-wasmtime = { version = "48.0.4", default-features = false, features = [
+wasmtime = { version = "=48.0.5", default-features = false, features = [
     "component-model",
     "cranelift",
     "runtime",
@@ -43,8 +43,8 @@ wasmtime = { version = "48.0.4", default-features = false, features = [
 # linker; see `sandbox.rs` for the list and for what is deliberately left out. The count is
 # documentation; what actually pins the sandbox are the escape fixtures in guests/, one per
 # absent capability family, each asserted to fail at instantiation.
-wasmtime-wasi = "48.0.4"
-wasmtime-wasi-io = "48.0.4"
+wasmtime-wasi = "=48.0.5"
+wasmtime-wasi-io = "=48.0.5"
 
 [dev-dependencies]
 # For ONE test: that calling `customize` from a tokio worker thread panics. That is a real
