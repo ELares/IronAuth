@@ -1567,6 +1567,8 @@ pub enum Action {
     PasswordResetStart,
     /// A terminal delivery outcome was recorded without message content.
     PasswordResetDelivery,
+    /// Claim one hosted reset delivery attempt before any external send.
+    PasswordResetDeliveryStarted,
     /// A reset attempt consumed its bounded budget without changing a credential.
     PasswordResetAttempt,
     /// Reset proof, credential and completion receipt committed together.
@@ -2085,6 +2087,7 @@ impl Action {
             Action::PasswordResetAttempt => "password_reset.attempt",
             Action::PasswordResetComplete => "password_reset.complete",
             Action::PasswordResetDelivery => "password_reset.delivery",
+            Action::PasswordResetDeliveryStarted => "password_reset.delivery_started",
             Action::PasswordResetStart => "password_reset.start",
             Action::RecipientVerificationStart => "recipient_verification.start",
             Action::RecipientIndexBackfill => "recipient_verification.index_backfill",

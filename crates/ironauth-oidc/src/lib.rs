@@ -150,6 +150,7 @@ mod par;
 mod password;
 /// Bounded SMTP delivery for subject-bound verification; activation remains gated.
 pub mod password_reset_browser;
+pub mod password_reset_delivery;
 pub mod password_reset_smtp;
 /// The pure permission-claim budget (issue #98). LIVE: `tokens::mint_at_jwt` calls
 /// it on every `at+jwt` access token that carries a resolved permission set, on both

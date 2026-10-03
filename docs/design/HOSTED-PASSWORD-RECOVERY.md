@@ -264,3 +264,27 @@ The primary verified mailbox receives the purpose-specific code; other required
 verified channels must receive owner warnings. An email-only adapter must refuse
 completion if a required phone channel cannot be notified, not silently omit it.
 Selection, fan-out and durable aggregation are still hosted caller obligations.
+
+
+`password_reset_delivery::send_reset_request` now claims a newly issued real
+challenge under its resolved subject before any send. The audited
+`delivery_started_at` is set once. Concurrent calls have one winner, and a new
+process cannot re-claim an interrupted attempt. No page read, completion or
+automatic retry should invoke delivery. A lost claim/outcome response requires
+explicit fresh recovery through the usual resend cooldown, not another send of
+the same code. A failed outcome write never triggers mail retry.
+
+The coordinator reads currently verified identifiers and schema-permitted recovery
+channels. It requires the verified primary returned by issuance, canonicalizes and
+deduplicates recipients through the shared identifier policy, bounds the set to
+32, and refuses unsupported required channels before sending. Required secondary
+email warnings are attempted first; only acknowledgement of every warning permits
+the primary code send. Refusal never overwrites uncertainty. A 16-second total
+transport budget bounds the batch, retains the acknowledged prefix count, and
+records uncertainty for an interrupted attempt. The terminal result is persisted
+through the existing delay/audit gate. Schema/channel reads and SMTP facts do not
+replace the completion transaction's current ownership/case checks. The hosted
+caller must use store-issued subject, primary address, code and case cancellation
+capability, and still enforce risk, regulation and authorization-context checks.
+Unit adapters test fan-out and timeout semantics; the actual hosted browser path
+and an integrated SMTP/store test remain outstanding.

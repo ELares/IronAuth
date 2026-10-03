@@ -1103,7 +1103,10 @@ mod tests {
 /// A read fault is also [`RecoveryChannels::Any`]. This path NOTIFIES an account owner that
 /// their account is being recovered, so failing it closed would suppress the warning, which is
 /// the opposite of safe here.
-async fn annotated_recovery_channels(state: &OidcState, scope: Scope) -> RecoveryChannels {
+pub(crate) async fn annotated_recovery_channels(
+    state: &OidcState,
+    scope: Scope,
+) -> RecoveryChannels {
     let Ok(Some(active)) = state.store().scoped(scope).trait_schemas().active().await else {
         return RecoveryChannels::Any;
     };
@@ -1124,7 +1127,7 @@ async fn annotated_recovery_channels(state: &OidcState, scope: Scope) -> Recover
 
 /// The recovery channels a notification may reach (issue #53, criterion 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecoveryChannels {
+pub(crate) enum RecoveryChannels {
     /// No active schema, or none that annotates a recovery channel: every verified email and
     /// phone, which is the behaviour that predates the annotation being honoured.
     Any,
@@ -1136,7 +1139,7 @@ enum RecoveryChannels {
 
 impl RecoveryChannels {
     /// Whether `kind` may receive a recovery notification.
-    fn permits(self, kind: IdentifierType) -> bool {
+    pub(crate) fn permits(self, kind: IdentifierType) -> bool {
         match self {
             Self::Any => matches!(kind, IdentifierType::Email | IdentifierType::Phone),
             Self::Only { email, phone } => match kind {

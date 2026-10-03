@@ -2041,3 +2041,61 @@ async fn reset_first_accepted_notice_starts_full_delay_and_resends_do_not_restar
         PasswordResetOutcome::Completed { .. }
     ));
 }
+
+#[tokio::test]
+async fn reset_delivery_claim_has_one_winner_and_cannot_be_replayed_after_interruption() {
+    use ironauth_store::{CorrelationId, StoreError};
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (subject, _, challenge) = pending_reset_fixture(&db, &env, scope).await;
+    let wrong = ironauth_store::UserId::generate(&env, &scope);
+    let store = db.store();
+    let acting = store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    assert!(matches!(
+        acting
+            .password_reset()
+            .claim_delivery(&env, &challenge.id, &wrong)
+            .await,
+        Err(StoreError::Conflict)
+    ));
+    let first = acting.password_reset();
+    let second = acting.password_reset();
+    let (a, b) = tokio::join!(
+        first.claim_delivery(&env, &challenge.id, &subject),
+        second.claim_delivery(&env, &challenge.id, &subject)
+    );
+    assert_ne!(a.is_ok(), b.is_ok());
+    assert!(matches!(
+        if a.is_err() { a } else { b },
+        Err(StoreError::Conflict)
+    ));
+    let restarted = store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    assert!(matches!(
+        restarted
+            .password_reset()
+            .claim_delivery(&env, &challenge.id, &subject)
+            .await,
+        Err(StoreError::Conflict)
+    ));
+    let row = sqlx::query("SELECT delivery_state,delivery_started_at IS NOT NULL AS started FROM password_reset_challenges WHERE id=$1")
+        .bind(challenge.id.to_string()).fetch_one(db.owner_pool()).await.unwrap();
+    assert_eq!(row.get::<String, _>("delivery_state"), "pending");
+    assert!(row.get::<bool, _>("started"));
+    assert_eq!(
+        store
+            .scoped(scope)
+            .audit()
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row.action == "password_reset.delivery_started")
+            .count(),
+        1
+    );
+}

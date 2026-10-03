@@ -24,6 +24,8 @@ CREATE TABLE password_reset_challenges (
         CHECK (delivery_state IN ('pending', 'accepted', 'refused', 'uncertain')),
     notified_channels integer NOT NULL DEFAULT 0 CHECK (notified_channels BETWEEN 0 AND 32),
     delivery_finished_at timestamptz,
+    -- Durable one-attempt admission, never cleared on timeout or process restart.
+    delivery_started_at timestamptz CHECK (delivery_started_at >= created_at),
     CONSTRAINT password_reset_delivery CHECK (
         (delivery_state = 'pending' AND notified_channels = 0 AND delivery_finished_at IS NULL)
         OR
@@ -92,4 +94,4 @@ CREATE POLICY password_reset_challenges_scope ON password_reset_challenges
 GRANT SELECT, INSERT, DELETE ON password_reset_challenges TO ironauth_app;
 GRANT UPDATE (attempt_count, state, finished_at, completion_request_hash,
               completion_credential_digest, delivery_state, notified_channels,
-              delivery_finished_at) ON password_reset_challenges TO ironauth_app;
+              delivery_finished_at, delivery_started_at) ON password_reset_challenges TO ironauth_app;

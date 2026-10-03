@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add audited, subject-bound reset delivery admission before external mail (#1479). Only one concurrent caller can claim a challenge; an interrupted claimed attempt cannot be automatically resent after restart.
+
 - Anchor a held reset case's full waiting period to its first durable accepted notification (#1479). Failed initial delivery cannot silently consume the delay; subsequent code deliveries preserve the established horizon. The horizon update and delivery audit roll back together.
 
 - Retain a separate hashed cancellation capability for each real reset challenge (#1479). Fresh codes can share the original delayed recovery case; old notification links still resolve after code expiry or reissue, and cannot cancel across scopes. Plaintext cancellation secrets are not retained.

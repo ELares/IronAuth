@@ -2358,6 +2358,12 @@ impl OidcState {
         self.password_reset_transport.is_some()
     }
 
+    pub(crate) fn password_reset_transport(
+        &self,
+    ) -> Option<&dyn crate::password_reset_smtp::PasswordResetTransport> {
+        self.password_reset_transport.as_deref()
+    }
+
     /// Install the concrete TLS SMTP adapter for the hosted recipient ceremony.
     /// Logging/no-op senders cannot use this production entry point. The caller
     /// must resolve validated operator configuration; scoped ownership readiness

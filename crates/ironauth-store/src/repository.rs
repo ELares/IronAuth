@@ -20918,6 +20918,40 @@ impl ActingPasswordResetRepo<'_> {
 }
 
 impl ActingPasswordResetRepo<'_> {
+    /// Claim the only mail attempt for a newly issued real reset challenge.
+    /// A crash after this commits never permits automatic resend. The owner can
+    /// explicitly request a fresh challenge through the usual cooldown instead.
+    ///
+    /// # Errors
+    /// Wrong scope/subject, stale or already claimed challenge, or audit failure.
+    pub async fn claim_delivery(
+        &self,
+        env: &Env,
+        id: &PasswordResetChallengeId,
+        subject: &UserId,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        if id.scope() != scope || subject.scope() != scope {
+            return Err(StoreError::NotFound);
+        }
+        let now = epoch_micros(env.clock().now_utc());
+        write_audited(AuditedWrite {
+            store: self.store, scope, acting: &self.acting, env,
+            action: Action::PasswordResetDeliveryStarted, target: id,
+        }, async move |tx| {
+            recipient_ownership_lock(tx, scope).await?;
+            let result = sqlx::query(
+                "UPDATE password_reset_challenges SET delivery_started_at=TIMESTAMPTZ 'epoch'+($5::text||' microseconds')::interval \
+                 WHERE tenant_id=$1 AND environment_id=$2 AND id=$3 AND subject=$4 \
+                 AND state='pending' AND delivery_state='pending' AND delivery_started_at IS NULL \
+                 AND expires_at > TIMESTAMPTZ 'epoch'+($5::text||' microseconds')::interval",
+            ).bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
+            .bind(subject.to_string()).bind(now).execute(&mut **tx).await?;
+            if result.rows_affected() != 1 { return Err(StoreError::Conflict); }
+            Ok(())
+        }, false).await
+    }
+
     /// Record one terminal transport result for a pending challenge. The caller
     /// must aggregate the code and every required owner notice using actual
     /// adapter acknowledgements, never a logging/no-op sender invocation.
