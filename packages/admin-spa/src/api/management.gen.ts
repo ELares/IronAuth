@@ -2968,6 +2968,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/recipient-verification/index": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Preview a bounded batch by decrypting its retained primary identifiers.
+         *     Like other management reads, this remains available for a soft-deleted environment.
+         */
+        get: operations["previewRecipientIndex"];
+        put?: never;
+        /**
+         * Prepare the next bounded batch. Retry a lost response with the same key;
+         *     use a new key to advance. No account is merged or marked email-verified.
+         */
+        post: operations["prepareRecipientIndex"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals": {
         parameters: {
             query?: never;
@@ -8212,6 +8236,20 @@ export interface components {
              */
             url_path: string;
         };
+        PrepareRecipientIndexRequest: {
+            /**
+             * @description Required acknowledgement that all identity writers support recipient indexing.
+             *     The server does not attest binary versions. Older writers can make the
+             *     environment incomplete again, which blocks recipient proof until repaired.
+             */
+            all_writers_upgraded: boolean;
+            /**
+             * Format: int32
+             * @description Maximum retained users to index, from 1 through 100 (default 100).
+             * @default 100
+             */
+            limit: number;
+        };
         /** @description A page of project grants. */
         ProjectGrantListView: {
             /** @description The live grants of this organization, oldest first. */
@@ -8318,6 +8356,42 @@ export interface components {
              * @example usr_...
              */
             subject_id: string;
+        };
+        RecipientIndexView: {
+            /**
+             * Format: int64
+             * @description Ambiguous mailbox groups among already indexed primary and typed emails.
+             *     Further batches can reveal more ambiguity. No accounts are merged.
+             */
+            ambiguous_indexed_mailboxes: number;
+            /** @description Whether this response describes a committed write rather than a preview. */
+            applied: boolean;
+            /**
+             * Format: int32
+             * @description Examined primary identifiers reserving a canonical email ownership index.
+             *     This does not mean those addresses are deliverable or verified.
+             */
+            batch_mailbox_users: number;
+            /**
+             * Format: int32
+             * @description Retained users examined in this batch.
+             */
+            batch_users: number;
+            /**
+             * @description Every retained user has index metadata. This does not establish mailbox
+             *     verification, delivery readiness, or the absence of ambiguous ownership.
+             */
+            index_complete: boolean;
+            /**
+             * Format: int64
+             * @description All retained users, including soft-deleted accounts, in this environment.
+             */
+            total_users: number;
+            /**
+             * Format: int64
+             * @description Retained users still lacking index metadata at the time of the transaction.
+             */
+            unindexed_users: number;
         };
         /** @description One identity that failed validation, with the fields that failed. */
         RecordFailureView: {
@@ -25077,6 +25151,161 @@ export interface operations {
             };
             /** @description The environment is absent, soft-deleted, not in this scope, or the dimension has no stored override */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    previewRecipientIndex: {
+        parameters: {
+            query?: {
+                /** @description Maximum retained users to inspect, from 1 through 100 (default 100). */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                tenant_id: string;
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Aggregate preview; no indices or verification state changed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecipientIndexView"];
+                };
+            };
+            /** @description Invalid batch bound or query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Insufficient permission or wrong scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unreadable stored identifier or persistence failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    prepareRecipientIndex: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replay returns the original batch response without advancing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                tenant_id: string;
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrepareRecipientIndexRequest"];
+            };
+        };
+        responses: {
+            /** @description Index metadata, audit and response committed atomically */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecipientIndexView"];
+                };
+            };
+            /** @description Invalid batch, missing acknowledgement or Idempotency-Key */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential; writes can require fresh privilege */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Insufficient permission or wrong scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found or not live */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unreadable identifier or persistence failure; batch rolled back */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
