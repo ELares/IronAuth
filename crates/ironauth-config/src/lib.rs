@@ -24,7 +24,10 @@ mod dsn;
 mod features;
 mod recipient;
 mod secret;
-pub use recipient::{RecipientSmtpSecurity, RecipientSmtpSettings, RecipientVerificationConfig};
+pub use recipient::{
+    PasswordRecoveryConfig, RecipientSmtpSecurity, RecipientSmtpSettings,
+    RecipientVerificationConfig,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -4064,6 +4067,9 @@ pub struct OidcConfig {
     /// Subject-bound mailbox verification for relying-party invitations.
     pub recipient_verification: RecipientVerificationConfig,
 
+    /// Explicit TLS delivery for hosted lost-password recovery, default disabled.
+    pub password_recovery: PasswordRecoveryConfig,
+
     /// The Dynamic Client Registration exposure switch (issue #31): `closed`
     /// (management API only), `token_gated` (a valid initial access token is
     /// required), or `open` (anonymous registration allowed, but the resulting
@@ -4777,6 +4783,7 @@ impl Default for OidcConfig {
             par_ttl_secs: 60,
             registration_enabled: false,
             recipient_verification: RecipientVerificationConfig::default(),
+            password_recovery: PasswordRecoveryConfig::default(),
             registration_mode: RegistrationMode::TokenGated,
             regulation: RegulationConfig::default(),
             risk: RiskConfig::default(),
@@ -6799,6 +6806,14 @@ impl Config {
     /// added by later issues must register their secret fields here so the
     /// literal-form lint keeps covering the whole tree.
     fn for_each_secret(&self, mut visit: impl FnMut(&str, &Secret)) {
+        if let Some(smtp) = &self.oidc.password_recovery.smtp {
+            if let Some(secret) = &smtp.username {
+                visit("oidc.password_recovery.smtp.username", secret);
+            }
+            if let Some(secret) = &smtp.password {
+                visit("oidc.password_recovery.smtp.password", secret);
+            }
+        }
         if let Some(smtp) = &self.oidc.recipient_verification.smtp {
             if let Some(secret) = &smtp.username {
                 visit("oidc.recipient_verification.smtp.username", secret);
@@ -6832,6 +6847,9 @@ impl Config {
     /// exceeds its ceiling (a bound an operator can raise without limit is not
     /// one), or for any of the other per-section rules below.
     fn validate(&self) -> Result<(), ConfigError> {
+        self.oidc
+            .password_recovery
+            .validate(self.oidc.enabled, self.server.public_url.as_deref())?;
         self.oidc
             .recipient_verification
             .validate(self.oidc.enabled, self.server.public_url.as_deref())?;

@@ -122,7 +122,7 @@ Migration 0249 and `PasswordResetChallengeId` introduce only the storage boundar
 The table separates pending, completed, cancelled and refused metadata, requires
 an indivisible real-account binding, and bounds attempts and expiry. Real-store
 schema tests exercise forced row-level security and runtime column grants.
-Actual delivery and the hosted form remain unimplemented. The repository now
+Hosted delivery orchestration and the reset form remain unimplemented. The repository now
 implements completion as described below; deployment remains disabled. A valid
 metadata row is not proof that a password was changed; the audited completion
 transaction and its credential/invalidation effects must be verified together. No deployment is activated by this additive migration alone.
@@ -184,7 +184,16 @@ Both reuse the existing bounded certificate-verified relay mechanics, while keep
 reset types and message identities separate from mailbox verification. Constructor
 validation currently requires the root HTTPS public provider URL, not a scoped
 issuer path. Actual TLS fixture tests cover accepted/refused/uncertain outcomes and
-certificate refusal; they do not establish Internet delivery. Operator configuration,
-state installation and hosted orchestration are still unwired. The caller must
+certificate refusal; they do not establish Internet delivery. Independent default-off operator configuration and concrete state installation
+are now wired; hosted orchestration remains unwired. The caller must
 supply the actual recovery case's cancellation capability and send a completion
 notice only after the credential transaction commits.
+
+
+The transport is configured separately with `oidc.password_recovery.enabled` and
+`oidc.password_recovery.smtp`. SMTP fields and secret references follow the shared
+relay contract in the generated configuration reference. Enabling requires OIDC,
+a root HTTPS `server.public_url` and valid relay settings. The binary resolves
+credentials only when enabled and refuses startup if they cannot be read. The
+state availability method reports configured delivery, not tested relay reachability
+or a completed hosted reset. No live deployment has been enabled by this change.

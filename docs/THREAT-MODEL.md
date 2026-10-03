@@ -581,9 +581,11 @@ completion does not repair conflicting owners or establish mailbox possession.
 
 ## Hosted password-reset SMTP content boundary (#1479, implementation in progress)
 
-This transport is not yet installed by configuration or a hosted handler. It adds
-purpose-specific reset messages over the bounded TLS SMTP mechanics. Browser and
-operator enablement must be documented with the hosted surface before release.
+Explicit default-off `oidc.password_recovery` settings now install the concrete
+TLS transport at startup, independently of mailbox verification and logging OTP
+senders. Enabled unreadable credentials refuse startup; disabled recovery never
+resolves secrets. Only a root HTTPS public provider URL is accepted. Hosted reset
+handlers are still unwired and must be documented before release.
 
 | STRIDE | Threat | Control |
 | --- | --- | --- |

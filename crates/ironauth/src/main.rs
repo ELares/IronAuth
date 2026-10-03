@@ -1807,6 +1807,16 @@ async fn build_oidc_plane(
     forward_auth: Option<std::sync::Arc<ironauth_oidc::forward_auth_rules::ForwardAuthRuntime>>,
     access_rules: std::sync::Arc<ironauth_oidc::rules::RuleSet>,
 ) -> Option<OidcPlane> {
+    let Ok(reset_transport) =
+        ironauth_oidc::password_reset_smtp::PasswordResetSmtpTransport::configured(
+            &config.oidc.password_recovery,
+            config.server.public_url.as_deref(),
+            env.clone(),
+        )
+    else {
+        tracing::error!("password recovery SMTP configuration is unavailable; refusing startup");
+        std::process::exit(1);
+    };
     let Ok(recipient_transport) = ironauth_oidc::recipient_smtp::RecipientSmtpTransport::configured(
         &config.oidc.recipient_verification,
         env.clone(),
@@ -2218,6 +2228,11 @@ async fn build_oidc_plane(
         },
         |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::SmsSender>,
     ));
+    let state = if let Some(transport) = reset_transport {
+        state.with_password_reset_smtp(transport)
+    } else {
+        state
+    };
     let state = if let Some(transport) = recipient_transport {
         state.with_recipient_verification_smtp(transport)
     } else {

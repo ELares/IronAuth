@@ -178,3 +178,43 @@ fn reset_mail_refuses_expired_or_overlong_lifetimes_and_non_numeric_codes() {
         assert!(PasswordResetSmtpTransport::new(config(), issuer, super::tests::env()).is_err());
     }
 }
+
+#[test]
+fn disabled_recovery_never_resolves_secrets_and_enabled_failures_are_value_free() {
+    use ironauth_config::{
+        PasswordRecoveryConfig, RecipientSmtpSecurity, RecipientSmtpSettings, Secret, SecretString,
+    };
+    let mut config = PasswordRecoveryConfig {
+        enabled: false,
+        smtp: Some(RecipientSmtpSettings {
+            host: "localhost".into(),
+            port: 465,
+            security: RecipientSmtpSecurity::Implicit,
+            sender: "recovery@example.test".into(),
+            message_id_domain: "auth.example.test".into(),
+            username: Some(Secret::Literal(SecretString::new("fixture-user"))),
+            password: Some(Secret::File(
+                "/nonexistent/ironauth-reset-1479/password".into(),
+            )),
+            max_in_flight: 1,
+        }),
+    };
+    assert!(
+        PasswordResetSmtpTransport::configured(&config, None, env())
+            .unwrap()
+            .is_none()
+    );
+    config.enabled = true;
+    let error =
+        PasswordResetSmtpTransport::configured(&config, Some("https://auth.example.test"), env())
+            .unwrap_err();
+    assert_eq!(error.to_string(), "invalid recipient SMTP configuration");
+    config.smtp.as_mut().unwrap().password =
+        Some(Secret::Literal(SecretString::new("fixture-password")));
+    assert!(
+        PasswordResetSmtpTransport::configured(&config, Some("https://auth.example.test"), env())
+            .unwrap()
+            .is_some()
+    );
+    assert!(PasswordResetSmtpTransport::configured(&config, None, env()).is_err());
+}

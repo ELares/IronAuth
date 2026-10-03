@@ -82,6 +82,27 @@ impl std::fmt::Debug for PasswordResetSmtpTransport {
 }
 
 impl PasswordResetSmtpTransport {
+    /// Resolve relay secrets only for explicitly enabled recovery delivery.
+    ///
+    /// # Errors
+    /// A value-free error for invalid or unreadable enabled configuration.
+    pub fn configured(
+        config: &ironauth_config::PasswordRecoveryConfig,
+        public_url: Option<&str>,
+        env: Env,
+    ) -> Result<Option<Self>, RecipientSmtpConfigError> {
+        if !config.enabled {
+            return Ok(None);
+        }
+        let settings = config.smtp.as_ref().ok_or(RecipientSmtpConfigError)?;
+        Self::new(
+            RecipientSmtpConfig::resolve(settings)?,
+            public_url.ok_or(RecipientSmtpConfigError)?,
+            env,
+        )
+        .map(Some)
+    }
+
     /// Construct explicit TLS delivery for a root HTTPS provider origin.
     ///
     /// # Errors

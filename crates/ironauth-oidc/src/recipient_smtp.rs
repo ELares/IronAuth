@@ -61,6 +61,40 @@ pub struct RecipientSmtpConfig {
     pub max_in_flight: usize,
 }
 
+impl RecipientSmtpConfig {
+    pub(crate) fn resolve(
+        smtp: &ironauth_config::RecipientSmtpSettings,
+    ) -> Result<Self, RecipientSmtpConfigError> {
+        let credentials = match (&smtp.username, &smtp.password) {
+            (Some(user), Some(password)) => Some((
+                user.resolve()
+                    .map_err(|_| RecipientSmtpConfigError)?
+                    .expose()
+                    .to_owned(),
+                password
+                    .resolve()
+                    .map_err(|_| RecipientSmtpConfigError)?
+                    .expose()
+                    .to_owned(),
+            )),
+            (None, None) => None,
+            _ => return Err(RecipientSmtpConfigError),
+        };
+        Ok(RecipientSmtpConfig {
+            host: smtp.host.clone(),
+            port: smtp.port,
+            tls: match smtp.security {
+                ironauth_config::RecipientSmtpSecurity::Implicit => RecipientSmtpTls::Implicit,
+                ironauth_config::RecipientSmtpSecurity::StartTls => RecipientSmtpTls::StartTls,
+            },
+            sender: smtp.sender.clone(),
+            message_id_domain: smtp.message_id_domain.clone(),
+            credentials,
+            max_in_flight: smtp.max_in_flight,
+        })
+    }
+}
+
 /// SMTP adapter whose Debug representation contains no configuration or secrets.
 pub struct RecipientSmtpTransport {
     client: AsyncSmtpTransport<Tokio1Executor>,
@@ -102,37 +136,7 @@ impl RecipientSmtpTransport {
             return Ok(None);
         }
         let smtp = config.smtp.as_ref().ok_or(RecipientSmtpConfigError)?;
-        let credentials = match (&smtp.username, &smtp.password) {
-            (Some(user), Some(password)) => Some((
-                user.resolve()
-                    .map_err(|_| RecipientSmtpConfigError)?
-                    .expose()
-                    .to_owned(),
-                password
-                    .resolve()
-                    .map_err(|_| RecipientSmtpConfigError)?
-                    .expose()
-                    .to_owned(),
-            )),
-            (None, None) => None,
-            _ => return Err(RecipientSmtpConfigError),
-        };
-        Self::new(
-            RecipientSmtpConfig {
-                host: smtp.host.clone(),
-                port: smtp.port,
-                tls: match smtp.security {
-                    ironauth_config::RecipientSmtpSecurity::Implicit => RecipientSmtpTls::Implicit,
-                    ironauth_config::RecipientSmtpSecurity::StartTls => RecipientSmtpTls::StartTls,
-                },
-                sender: smtp.sender.clone(),
-                message_id_domain: smtp.message_id_domain.clone(),
-                credentials,
-                max_in_flight: smtp.max_in_flight,
-            },
-            env,
-        )
-        .map(Some)
+        Self::new(RecipientSmtpConfig::resolve(smtp)?, env).map(Some)
     }
 
     /// Construct a relay with verified TLS and bounded command deadlines.
