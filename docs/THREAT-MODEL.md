@@ -613,7 +613,22 @@ reset handlers remain pending. A parsed binding never grants a login session.
 | Spoofing | Another browser or challenge borrows a reset form | Independent 256-bit Env secret; stored binding digest; challenge-bound HMAC form proof; exact scoped row resolution still required |
 | Tampering | Ambiguous cookies or edited retry fields alter authority | Reject duplicate/malformed reset cookies; separate MAC domains and length-prefixed fields; exact normalized password/code receipt; constant-time CSRF verification |
 | Repudiation | A lost response applies another password change | Cookie reconstructs the same keyed request digest across restart; existing atomic store receipt refuses changed requests; bounded database lifetime remains authoritative |
-| Information disclosure | Error pages echo passwords/codes or send recovery context in referrers | Renderers accept no submitted code/password values; escape context and guidance; response helper uses no-store/no-referrer and shared strict CSP; only CSRF proof is hidden authority input |
+| Information disclosure | Error pages echo passwords/codes or send recovery context in referrers | Renderers accept no submitted code/password values; escape context and guidance; response helper uses no-store, same-origin referrers and shared strict CSP; only CSRF proof is hidden authority input |
 | Information disclosure | Browser secret becomes a session token or appears in debug logs | Separate host-only Secure/HttpOnly cookie with sensitive header flag; no Debug/Clone/serialization on binding; best-effort secret wipe on drop; handler must use no-store and referrer protections |
 | Denial of service | Cookie parsing or retry has unbounded input/lifetime | Aggregate 8192-byte cookie budget; fixed 32-byte secret; at most ten-minute cookie; handler must additionally bound body and admit hashing |
 | Elevation | Possessing the binding substitutes for recovery proof | Binding alone never mutates credentials; code, accepted notifications, current authority and case delay/cancellation remain store requirements; same-origin checks still required at handler |
+
+
+## Hosted reset completion handlers (#1479, integration in progress)
+
+The bounded route factory exists but is not merged into the provider router.
+Issuance and post-commit notices must be integrated before enablement.
+
+| STRIDE | Threat | Control |
+| --- | --- | --- |
+| Spoofing | A posted account or client selects another reset | Strict form schema; browser-bound store context; stored client/continuation scope consistency; separate form CSRF and same-origin checks |
+| Tampering | Edited confirmation or code changes an interrupted request | NFKC normalization on both password fields; eight ASCII digits; exact keyed completion receipt; store revalidation of authority and expiry |
+| Repudiation | A failed response is represented as a new successful mutation | Distinct store outcomes; atomic receipt replay; ambiguous failures offer exact retry or sign-in; completion notification still pending before mount |
+| Information disclosure | Rejected secret values or internal failures enter HTML | No secret renderer inputs, generic store/hash errors, escaped policy guidance, shared CSP/no-store and browser-compatible same-origin referrers |
+| Denial of service | Unbounded forms or unregulated password hashing | 16 KiB route body limit; independent recovery counters; policy/strength/screening before admitted hashing; retain retry and rate-limit headers |
+| Elevation | Reset signs in or bypasses stronger factors | Store completion only; no session cookie or role grant; held cases remain held; ordinary login still required |

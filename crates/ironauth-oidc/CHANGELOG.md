@@ -6,7 +6,9 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- Add reset code/new-password forms and explicit completed, held, expired and deployment-unavailable guidance (#1479). Preserve the validated application continuation, never refill submitted secrets, and use no-store/no-referrer responses. Hosted handler integration remains pending.
+- Integrate browser-bound reset GET/POST handlers with CSRF, independent recovery regulation, NFKC confirmation, password policy/screening, admitted hashing and atomic store completion (#1479). The bounded route factory is not mounted until issuance and post-commit notifications are finished. Keep the shared same-origin referrer policy for browser form compatibility.
+
+- Add reset code/new-password forms and explicit completed, held, expired and deployment-unavailable guidance (#1479). Preserve the validated application continuation, never refill submitted secrets, and apply shared form-page response headers. Hosted handler integration remains pending.
 
 - Connect reset request delivery to required verified-channel selection, concrete SMTP and durable aggregate outcomes (#1479). Send secondary warnings before the primary code, refuse unsupported required channels, preserve uncertainty and bound each batch to 16 seconds. Hosted routes remain pending.
 

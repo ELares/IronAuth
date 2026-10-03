@@ -8,7 +8,7 @@ use super::{document, error_banner, escape_html, interaction_href};
 use crate::hints::InteractionHints;
 use std::fmt::Write as _;
 
-use axum::http::{StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::Response;
 
 /// Render the same code-entry form for eligible, unknown and ineligible accounts.
@@ -127,20 +127,17 @@ pub fn notice_page(
     )
 }
 
-/// Apply the shared page hardening plus no-referrer for the reset ceremony.
+/// Apply shared form-page hardening, including same-origin referrers so browsers
+/// retain usable Origin metadata on POST. No code or password is in the URL.
 #[must_use]
 pub fn response(status: StatusCode, html: String) -> Response {
-    let mut response = super::secure_html(status, html);
-    response.headers_mut().insert(
-        header::REFERRER_POLICY,
-        axum::http::HeaderValue::from_static("no-referrer"),
-    );
-    response
+    super::secure_html(status, html)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::header;
 
     #[test]
     fn reset_form_escapes_context_and_never_posts_account_or_password_defaults() {
@@ -227,7 +224,7 @@ mod tests {
         );
         let headers = response.headers();
         assert_eq!(headers[header::CACHE_CONTROL], "no-store");
-        assert_eq!(headers[header::REFERRER_POLICY], "no-referrer");
+        assert_eq!(headers[header::REFERRER_POLICY], "same-origin");
         assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY");
         assert!(
             headers[header::CONTENT_SECURITY_POLICY]

@@ -318,7 +318,9 @@ sign-in with the chosen password. Waiting pages explain that fresh codes preserv
 the established delay and offer an explicit request page; no notice automatically
 submits or sends mail. Completion wording concerns IronAuth sign-in sessions and
 does not claim immediate revocation of every relying party's cached access token.
-The response helper applies the shared strict CSP, no-store and no-referrer.
+The response helper applies the shared strict CSP, no-store and same-origin referrer
+policy. This retains usable Origin metadata for form submissions while refusing
+cross-origin referrer disclosure; reset codes and passwords never enter URLs.
 These renderers are not mounted yet; semantics/header tests do not establish a
 rendered browser journey, manual accessibility qualification or live recovery.
 
@@ -335,3 +337,17 @@ stored authorization interaction/client and use the subject only for appropriate
 internal audit attribution, never render account existence. Context reads perform
 no mutation or audit and return nothing for another scope/browser or at the exact
 end of the window. The regression test covers both real and decoy attempts.
+
+
+The hosted reset module now connects GET/POST processing to the stored context,
+browser binding, purpose-specific CSRF, independent recovery-path regulation,
+password normalization/confirmation, configured sole-factor policy and strength,
+breach screening, admitted code verification/new-password hashing, keyed request
+receipt and atomic completion. It rejects browser-supplied authority fields and
+retains hash-admission rate/retry headers in HTML error responses. No result mints
+a session; successful and replayed completions lead to ordinary sign-in guidance.
+The route factory bounds forms to 16 KiB but is deliberately not merged into the
+provider router yet. Case preparation/issuance, post-commit notifications and
+real-store successful HTTP flows remain required before enablement. Exact retry
+across changed or unavailable screening policy also needs qualification: the
+current handler repeats screening before it reaches the stored receipt.
