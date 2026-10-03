@@ -54,6 +54,16 @@ A feed that fails signature verification is rejected **entirely** in both paths
 rejection is logged as a security event. The banner surface
 (`GET .../security/advisories`) renders only accepted advisories.
 
+The accepted set is deployment-wide. Replacement writers serialize so concurrent
+polls or imports leave one complete verified set. Migration 0248 completes the
+control role's replacement grant; the serving role remains read-only. An offline
+import publishes `security_advisory.imported` in the requesting management scope's
+event stream in the same transaction as the replacement. Its aggregate payload
+contains only `advisory_count` and `deployment_global: true`; it does not contain
+advisory contents or claim to fan out to every environment. A failed event write
+rolls back the replacement, and a failed replacement publishes nothing.
+
+
 ## The air-gapped install, end to end
 
 The procedure below is the one the no-egress lane exercises (loopback instead
