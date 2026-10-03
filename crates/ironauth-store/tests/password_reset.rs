@@ -2118,6 +2118,7 @@ async fn reset_context_retains_navigation_after_code_expiry_but_not_past_browser
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(original.created_at_unix_micros, now_micros(&env));
     assert_eq!(original.subject, Some(subject));
     assert_eq!(original.client.scope(), scope);
     assert_eq!(
@@ -2157,6 +2158,10 @@ async fn reset_context_retains_navigation_after_code_expiry_but_not_past_browser
     for id in [&challenge.id, &decoy] {
         assert!(read.challenge(&env, id, &[3; 32]).await.unwrap().is_none());
         let context = read.context(&env, id, &[3; 32]).await.unwrap().unwrap();
+        assert_eq!(
+            context.created_at_unix_micros,
+            original.created_at_unix_micros
+        );
         assert_eq!(
             context.authorization_return_to,
             original.authorization_return_to

@@ -68,6 +68,8 @@ pub struct PasswordResetContext {
     pub client: ClientId,
     /// Server-owned local authorization continuation.
     pub authorization_return_to: String,
+    /// Original issuance time, for an existence-independent browser resend delay.
+    pub created_at_unix_micros: i64,
     /// Exact expiry of the code; context may outlive it within the browser window.
     pub expires_at_unix_micros: i64,
     /// Store-bound subject for internal audit attribution, absent on decoys.

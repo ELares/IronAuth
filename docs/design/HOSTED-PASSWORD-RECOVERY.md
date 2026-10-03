@@ -123,8 +123,8 @@ The table separates pending, completed, cancelled and refused metadata, requires
 an indivisible real-account binding, and bounds attempts and expiry. Real-store
 schema tests exercise forced row-level security and runtime column grants.
 Delivery coordination, page rendering and completion handlers are implemented as
-described below. Initial hosted issuance and completion notices remain unwired;
-deployment remains disabled. A valid
+described below. The qualification router connects initial hosted issuance; completion notices
+and main-router activation remain unwired. Deployment remains disabled. A valid
 metadata row is not proof that a password was changed; the audited completion
 transaction and its credential/invalidation effects must be verified together. No deployment is activated by this additive migration alone.
 
@@ -351,8 +351,9 @@ receipt and atomic completion. It rejects browser-supplied authority fields and
 retains hash-admission rate/retry headers in HTML error responses. No result mints
 a session; successful and replayed completions lead to ordinary sign-in guidance.
 The route factory bounds forms to 16 KiB but is deliberately not merged into the
-provider router yet. Case preparation/issuance, post-commit notifications and
-a successful initial HTTP reset remain required before enablement. An independent
+provider router yet. Initial issuance and a successful HTTP reset are covered by
+the qualification router below; post-commit notices and browser qualification
+remain required before enablement. An independent
 receipt read now precedes policy/screening as described below.
 
 
@@ -403,9 +404,9 @@ notification evidence must remain available while the case is pending.
 The OIDC preparation helper evaluates current recovery risk and strongest-factor
 policy, suppresses blocked/ineligible requests internally, and creates a fresh
 high-entropy cancellation token naming the returned case. It calls no logging
-sender and claims no delivery. The request handler still needs to invoke it, bind
-its cancellation digest to a fresh challenge, and call actual delivery through the
-existing coordinator with an existence-uniform browser response.
+sender and claims no delivery. The request qualification handler below invokes it, binds its cancellation
+digest to a fresh challenge, and calls actual delivery through the existing
+coordinator with the same public form for eligible and ineligible accounts.
 
 
 Real-store tests exercise concurrent case creation returning one identity, no-op
@@ -417,3 +418,47 @@ OIDC integration fixture verifies risk blocking before mutation, forced delay on
 the reused case, and fresh provider-origin cancellation tokens naming that case.
 These are preparation/receipt tests, not successful initial hosted issuance or
 actual reset-email delivery.
+
+
+The request qualification router now combines bounded GET/POST `/recover` with
+completion routes, without mounting them on the main provider. Before identifier
+lookup it revalidates the registered client, exact callback, PKCE and authorization
+parameters through the shared validator, peeks live PAR without consuming it, and
+checks resource policy and the environment issuer. Direct request objects must
+first pass through normal authorization resolution. Invalid/ambiguous context does
+not set a reset cookie or issue a challenge. Disabled transport gives an honest
+deployment-wide unavailable response. GET renders only; POST checks origin,
+proof-of-work when required, and independent recovery regulation.
+
+Each admitted request hashes a fresh eight-digit code, then stores either a real
+challenge using current verified ownership and the prepared case, or a decoy for
+unknown/ineligible/cooldown-suppressed requests. Both redirect to the same code form
+with the same cookie shape. A recent valid browser binding imposes an independent
+one-minute resend delay before identifier lookup; the notice links to the current
+code form and does not replace or extend its cookie. Context now includes immutable
+issuance time for that check. This prevents an accidental repeat click from making
+a delivered code unusable by overwriting its cookie with a cooldown decoy.
+
+Actual delivery runs in a transient task through the existing bounded coordinator,
+after successful real challenge persistence. SMTP response latency is therefore
+absent from the public request response. The task retains secrets only in memory,
+uses the durable single-attempt delivery claim, and has no automatic retry or
+plaintext queue. A crash requires an explicit fresh request. The unknown branch
+still performs the existing decoy risk/store work; identical public form responses
+do not establish equal timing for every account-dependent database operation.
+
+The integrated HTTP/TLS/PostgreSQL fixture exercises a real request, receives its
+actual code from the local TLS inbox, submits the code and a new password, and
+checks the new verifier accepts the new password and rejects the old one without
+issuing a session cookie. Registered callback/PKCE/duplicate/fragment rejection,
+unknown/unverified code-form equivalence and browser resend protection are covered.
+Registration, mailbox verification and an empty breach corpus are test fixtures.
+Completion notices, full headed-browser continuation and main-router enablement
+remain outstanding; local TLS evidence is not Internet email delivery.
+
+
+The final request fixture also rejects an unregistered resource indicator, confirms
+that request GET creates no challenge/cookie, and checks disabled recovery returns
+the same unavailable page for known and unknown identifiers. Cross-origin and
+oversized requests set no reset cookie and issue no challenge. These checks do not
+replace end-to-end PAR, regulation/PoW, crash/restart or headed-browser qualification.

@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Include original issuance time in browser-bound reset context so hosted resend admission can preserve an existing code independently of account eligibility (#1479).
+
 - Prepare or reuse hosted lost-password cases atomically under account locks (#1479). Preserve cancellation and notified delay across resends, retain a monotonic policy duration, and roll back ineligible or unauditable preparation.
 
 - Add an independent read-only exact reset receipt check (#1479), sharing completion's current-owner/credential/case validation. Receipt confirmation needs no new password hash or screening result and cannot spend attempts or mutate credentials.

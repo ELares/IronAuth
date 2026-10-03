@@ -673,6 +673,58 @@ async fn resolve_pushed_request(
     Ok((stored, Some(context)))
 }
 
+/// Revalidate a hosted recovery continuation before any account lookup or send.
+/// This is a read-only check of the registered client and its exact authorization
+/// parameters. PAR is peeked, never consumed. Direct request objects must first
+/// pass through authorize's normal resolution into a hosted continuation.
+pub(crate) async fn recovery_resume(
+    state: &OidcState,
+    raw: Option<&str>,
+) -> Option<crate::interaction::ResumeTarget> {
+    let raw = raw.filter(|value| value.len() <= 16384 && !value.contains('#'))?;
+    let resume = crate::interaction::parse_resume(Some(raw))?;
+    let query = raw.strip_prefix("/authorize?")?;
+    let mut params: AuthorizeParams = serde_urlencoded::from_str(query).ok()?;
+    params.resources = resource::resources_from_encoded(query);
+    if params.request.is_some() {
+        return None;
+    }
+    let (params, pushed) = resolve_pushed_request(state, params).await.ok()?;
+    if params.request.is_some()
+        || ClientId::parse_declared_scope(params.client_id.as_deref()?).ok()? != resume.client_id
+    {
+        return None;
+    }
+    state.issuer_entry(&resume.scope).await?;
+    let record = state
+        .store()
+        .scoped(resume.scope)
+        .clients()
+        .get(&resume.client_id)
+        .await
+        .ok()?;
+    let client = ResolvedClient::Registered(&record);
+    if pushed.is_none()
+        && (state.require_pushed_authorization_requests()
+            || client.require_pushed_authorization_requests())
+    {
+        return None;
+    }
+    let hardened = crate::fapi_hardened::is_hardened(state, resume.scope)
+        .await
+        .ok()?;
+    validate_request(state, &client, &params, hardened, pushed.is_some()).ok()?;
+    validate_authorize_resources(
+        state,
+        resume.scope,
+        StoredClientId::Registered(&resume.client_id),
+        &params.resources,
+    )
+    .await
+    .ok()?;
+    Some(resume)
+}
+
 /// Atomically consume the pushed request behind `context` at the moment of code
 /// issuance (RFC 9126, issue #27), returning whether this call WON the single-use
 /// race. The `client_id` filter is inside the atomic consume, so the binding holds and

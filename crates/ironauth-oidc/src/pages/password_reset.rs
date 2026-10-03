@@ -59,6 +59,19 @@ pub fn code_page(
     )
 }
 
+/// A browser-wide resend delay keeps the original code form reachable without
+/// disclosing whether its request resolved an eligible account.
+#[must_use]
+pub fn recent_request_page() -> String {
+    document(
+        "A recovery code was recently requested",
+        "<h1>A recovery code was recently requested</h1><p>Wait a minute before requesting another code. You can still use the code-entry page for your current request.</p><p><a href=\"/recover/reset\">Enter your current code</a></p>",
+        "en",
+        "page",
+        None,
+    )
+}
+
 /// Server-resolved lifecycle outcomes, not browser-selected status values.
 #[derive(Clone, Copy)]
 pub enum ResetNotice<'a> {

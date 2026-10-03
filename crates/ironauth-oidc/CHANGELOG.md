@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Connect hosted recovery request qualification routes to registered authorization validation, browser-bound real/decoy challenges and bounded background SMTP delivery (#1479). Repeated browser requests preserve the existing code form; main-router enablement and completion notices remain pending.
+
 - Add risk/factor-derived preparation of verified password-holder recovery cases (#1479), with fresh cancellation aliases for reused cases and no logging-sender delivery claim. Hosted request issuance remains unwired.
 
 - Check exact committed reset receipts before current password policy and breach screening (#1479), so an interrupted successful response can be confirmed during a screening outage without repeating a credential change. New changes retain mandatory policy, screening and admitted hashing.

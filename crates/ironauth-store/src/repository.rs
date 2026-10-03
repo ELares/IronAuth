@@ -20864,6 +20864,7 @@ impl PasswordResetRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT client_id,authorization_return_to,subject, \
+             (extract(epoch FROM created_at)*1000000)::bigint AS created_us, \
              (extract(epoch FROM expires_at)*1000000)::bigint AS expires_us \
              FROM password_reset_challenges WHERE tenant_id=$1 AND environment_id=$2 \
              AND id=$3 AND browser_binding_hash=$4 \
@@ -20885,6 +20886,7 @@ impl PasswordResetRepo<'_> {
                 client,
                 subject,
                 authorization_return_to: row.get("authorization_return_to"),
+                created_at_unix_micros: row.get("created_us"),
                 expires_at_unix_micros: row.get("expires_us"),
             })
         })
