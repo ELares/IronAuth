@@ -179,6 +179,15 @@ async fn recent_browser_attempt(state: &OidcState, headers: &HeaderMap) -> Optio
     Some(response)
 }
 
+// Match the browser's UTF-8 JSON array exactly. This is a binding to public form
+// inputs, not a credential; no account lookup or client-controlled authority here.
+pub(crate) fn proof_context(return_to: &str, identifier: &str) -> String {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let encoded = serde_json::to_vec(&[return_to, identifier]).expect("string array serializes");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(encoded))
+}
+
 async fn admission(
     state: &OidcState,
     resume: &ResumeTarget,
@@ -188,6 +197,19 @@ async fn admission(
 ) -> Option<Response> {
     let ip = crate::abuse::resolved_client_ip(headers);
     if crate::pow_gate::challenge_required(state, ip.as_deref(), false) {
+        if !state.challenge_provider().kind().is_external()
+            && form.pow_context.as_deref()
+                != Some(
+                    proof_context(
+                        form.return_to.as_deref().unwrap_or_default(),
+                        form.identifier.as_deref().unwrap_or_default(),
+                    )
+                    .as_str(),
+                )
+        {
+            return Some(request_page(state, resume, StatusCode::BAD_REQUEST,
+                Some("Complete the browser verification for these account details before trying again.")).await);
+        }
         let proof = crate::pow_gate::PresentedSolution {
             challenge_id: form.pow_challenge_id.as_deref(),
             nonce: form.pow_nonce.as_deref(),

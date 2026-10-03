@@ -911,9 +911,9 @@ async fn builtin_recovery_pow_form_and_gate_accept_single_use_proof() {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(!headers.contains_key(header::SET_COOKIE));
     }
+    let context = crate::password_reset_request::proof_context(&target, "unknown@example.test");
     let crate::pow_gate::ChallengeIssue::Issued(challenge) =
-        crate::pow_gate::issue_builtin_challenge(&state, scope, "recover", "recovery-fixture")
-            .await
+        crate::pow_gate::issue_builtin_challenge(&state, scope, "recover", &context).await
     else {
         panic!("fixture challenge issuance failed")
     };
@@ -924,7 +924,7 @@ async fn builtin_recovery_pow_form_and_gate_accept_single_use_proof() {
         ("return_to", target),
         ("pow_challenge_id", challenge.id.to_string()),
         ("pow_nonce", URL_SAFE_NO_PAD.encode(nonce)),
-        ("pow_context", "recovery-fixture".to_owned()),
+        ("pow_context", context),
     ])
     .unwrap();
     let (status, headers, _) = call(&state, "POST", "/recover", body.clone(), None).await;
@@ -933,4 +933,89 @@ async fn builtin_recovery_pow_form_and_gate_accept_single_use_proof() {
     let (status, headers, _) = call(&state, "POST", "/recover", body, None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(!headers.contains_key(header::SET_COOKIE));
+}
+
+async fn solved_recovery_form(
+    state: &OidcState,
+    scope: Scope,
+    target: &str,
+    endpoint: &str,
+) -> String {
+    use base64::Engine;
+    let identifier = "unknown@example.test";
+    let context = crate::password_reset_request::proof_context(target, identifier);
+    let crate::pow_gate::ChallengeIssue::Issued(challenge) =
+        crate::pow_gate::issue_builtin_challenge(state, scope, endpoint, &context).await
+    else {
+        panic!("fixture challenge issuance failed")
+    };
+    let nonce =
+        crate::pow::solve(&challenge.challenge, challenge.difficulty_bits, 100_000).unwrap();
+    serde_urlencoded::to_string([
+        ("identifier", identifier.to_owned()),
+        ("return_to", target.to_owned()),
+        ("pow_challenge_id", challenge.id.to_string()),
+        (
+            "pow_nonce",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce),
+        ),
+        ("pow_context", context),
+    ])
+    .unwrap()
+}
+
+#[tokio::test]
+async fn recovery_pow_binds_actual_form_scope_endpoint_and_expiry() {
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        1503,
+    );
+    let scope = db.seed_scope(&env).await;
+    let foreign = db.seed_scope(&env).await;
+    let mut config = ironauth_config::OidcConfig::default();
+    config.registration_abuse.pow.enabled = true;
+    config.registration_abuse.pow.difficulty_bits = 8;
+    let transport =
+        PasswordResetSmtpTransport::new(super::config(), "https://auth.example.test", env.clone())
+            .unwrap();
+    let state = state_with_config(&db, &env, scope, Some(transport), &config);
+    let (_, client) = seed(&db, &state, scope).await;
+    let target = resume(&client);
+    let valid = solved_recovery_form(&state, scope, &target, "recover").await;
+    let mut altered: Vec<(String, String)> = serde_urlencoded::from_str(&valid).unwrap();
+    altered
+        .iter_mut()
+        .find(|(key, _)| key == "return_to")
+        .unwrap()
+        .1
+        .push_str("&state=changed");
+    for body in [
+        valid.replace("unknown%40example.test", "different%40example.test"),
+        serde_urlencoded::to_string(&altered).unwrap(),
+        solved_recovery_form(&state, foreign, &target, "recover").await,
+        solved_recovery_form(&state, scope, &target, "register").await,
+    ] {
+        let (status, headers, _) = call(&state, "POST", "/recover", body, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!headers.contains_key(header::SET_COOKIE));
+    }
+    // Rejected context substitutions must not consume the correctly bound proof.
+    let (status, _, _) = call(&state, "POST", "/recover", valid, None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let expired = solved_recovery_form(&state, scope, &target, "recover").await;
+    clock.advance(Duration::from_secs(
+        config.registration_abuse.pow.challenge_ttl_secs + 1,
+    ));
+    let (status, headers, _) = call(&state, "POST", "/recover", expired, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!headers.contains_key(header::SET_COOKIE));
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM password_reset_challenges")
+        .fetch_one(db.owner_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "only the correctly bound live proof issued a reset challenge"
+    );
 }

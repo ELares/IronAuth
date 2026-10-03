@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Bind hosted recovery browser verification to the submitted account and sign-in continuation (#1479). Reject substituted inputs, foreign scope/endpoint challenges and expired proofs before issuing reset challenges.
+
 - Solve built-in proof-of-work automatically on the hosted recovery form when enabled (#1479). Use a nonce-authorized same-origin script, bounded browser work, accessible progress and retry feedback, and suppress duplicate submits. External challenge widgets still require explicit client integration.
 
 - Mount browser-bound password recovery in the provider router (#1479), replacing the logging-only request acknowledgement. Configured recovery issues real/decoy code forms; disabled delivery explicitly reports unavailable. Main-router HTTP/TLS tests cover reset and cancellation without implicit sign-in.

@@ -599,4 +599,8 @@ local challenge/submission fixtures; it verifies the browser's SHA-256 proof,
 duplicate-submit suppression, rate-limit retry, malformed challenges and changed
 input. This is browser solver evidence with fixture endpoints, not a full live
 Rust/browser recovery or Internet email test. External-provider widget integration
-and additional proof expiry/context cases remain outstanding.
+remains outstanding. The main-router store matrix now rejects changed identifier
+or continuation inputs, foreign scope/endpoint challenges and expired proofs.
+The server recomputes the SHA-256 context from the exact submitted UTF-8 JSON
+array before consuming a built-in proof. Rejected input substitutions preserve
+the correctly bound proof, and only the valid submission issues a reset challenge.
