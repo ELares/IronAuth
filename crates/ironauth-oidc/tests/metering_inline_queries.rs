@@ -185,7 +185,15 @@ fn touches_the_event_feed_other_than_appending(text: &str) -> bool {
 /// calls, SELECT `fapi_hardened`, and COMMIT. The driver does not log BEGIN here.
 /// The regression below pins that exact contiguous block as well as the total;
 /// neither metering work nor the recipient ceremony is added to token issuance.
-const REDEMPTION_STATEMENTS: usize = 76;
+/// 76 -> 81 (#1437 integration): the sign-then-encrypt path resolves the client's
+/// current dynamic-registration metadata after signing, including for a client
+/// without encryption configured. Its isolated trace block is SET TRANSACTION,
+/// two scope set_config calls, SELECT of the encryption registration, and COMMIT.
+/// That path already exists in baseline 832a7c01; recipient delivery adds no query
+/// to redemption. The block is pinned below alongside the FAPI lookup so this
+/// budget increase accounts for those five statements specifically. This is a
+/// client-policy read, not an event-feed read or an inline metering aggregate.
+const REDEMPTION_STATEMENTS: usize = 81;
 
 fn assert_redemption_budget(redemption: &str) {
     let statements = statement_count(redemption);
@@ -206,6 +214,22 @@ fn assert_redemption_budget(redemption: &str) {
     assert_eq!(
         policy_reads, 1,
         "the measured five-statement current policy read must execute once"
+    );
+    let encryption_reads = query_lines
+        .windows(5)
+        .filter(|window| {
+            window[0].contains("set transaction isolation level read committed")
+                && window[1].contains("set_config('ironauth.tenant_id'")
+                && window[2].contains("set_config('ironauth.environment_id'")
+                && window[3].contains("id_token_encrypted_response_alg")
+                && window[3].contains("registration_access_token_hash")
+                && window[3].contains("from clients")
+                && window[4].contains("commit")
+        })
+        .count();
+    assert_eq!(
+        encryption_reads, 1,
+        "the measured five-statement encryption-registration read must execute once"
     );
     if statements != REDEMPTION_STATEMENTS {
         for line in &query_lines {
