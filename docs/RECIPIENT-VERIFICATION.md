@@ -145,3 +145,15 @@ prove the challenge, cancellation, current-proof and hosted-page authentication
 boundaries. Rendered-page Chrome fixtures prove UI behavior only. None substitutes
 for actual permitted-mailbox delivery, source/build/schema-matched deployment,
 representative users or the completed Civio invitation journey.
+
+### Index preparation events
+
+Each committed management batch emits `recipient_index.prepared` in the same
+transaction as the index metadata, audit row and idempotency receipt. The payload
+contains the aggregate report returned to the caller, including the remaining
+unindexed count and whether indexing is complete. It contains no identifiers,
+mailbox addresses, blind indexes, codes or recipient proofs. A batch that finds
+no remaining users still reports its committed zero-user outcome; a replay emits
+nothing new. Failure to persist the event or audit rolls back the whole batch.
+These events describe index preparation, never successful mailbox verification
+or message delivery.

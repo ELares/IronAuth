@@ -72,6 +72,7 @@ crates/ironauth-store/src/repository.rs:extend_with_event:1
 crates/ironauth-store/src/repository.rs:grant_secret:2
 crates/ironauth-store/src/repository.rs:hard_delete_with_event:1
 crates/ironauth-store/src/repository.rs:hygiene_refusal:1
+crates/ironauth-store/src/repository.rs:index_backfill_with_event:1
 crates/ironauth-store/src/repository.rs:issue_with_event:1
 crates/ironauth-store/src/repository.rs:lift_with_event:1
 crates/ironauth-store/src/repository.rs:link_external_id_with_event:1
