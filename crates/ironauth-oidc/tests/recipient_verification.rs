@@ -642,6 +642,7 @@ async fn enabled_anonymous_routes_refuse_live_and_absent_scopes_without_effects(
     );
     let before = recipient_rows(&h).await;
     for (operation, body) in [
+        ("email-verification/cancel", json!({})),
         (
             "email-verification/start",
             json!({"email": "owner@example.test"}),
