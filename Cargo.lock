@@ -2335,6 +2335,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "ciborium",
+ "hmac 0.13.0",
  "http",
  "http-body-util",
  "httpdate",

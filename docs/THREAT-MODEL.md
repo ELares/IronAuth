@@ -596,3 +596,18 @@ handlers are still unwired and must be documented before release.
 | Information disclosure | Codes, cancellation capabilities or SMTP secrets enter logs | No Debug/serialization on secret-bearing message/config; value-free errors; redacted transport Debug; no plaintext notice outbox |
 | Denial of service | Secret-bearing messages wait indefinitely | Shared no-wait concurrency admission and bounded socket/overall send deadlines; eight-digit code, bounded cancellation URL and expiry |
 | Elevation | Email delivery itself resets a password or grants a session | Transport cannot mutate credentials; separate atomic store completion still requires browser-bound proof and current authority; real handler obligations remain unwired |
+
+
+## Hosted reset browser binding (#1479, implementation in progress)
+
+This purpose-specific cookie parser and form-proof helper is implemented; hosted
+reset handlers remain pending. A parsed binding never grants a login session.
+
+| STRIDE | Threat | Control |
+| --- | --- | --- |
+| Spoofing | Another browser or challenge borrows a reset form | Independent 256-bit Env secret; stored binding digest; challenge-bound HMAC form proof; exact scoped row resolution still required |
+| Tampering | Ambiguous cookies or edited retry fields alter authority | Reject duplicate/malformed reset cookies; separate MAC domains and length-prefixed fields; exact normalized password/code receipt; constant-time CSRF verification |
+| Repudiation | A lost response applies another password change | Cookie reconstructs the same keyed request digest across restart; existing atomic store receipt refuses changed requests; bounded database lifetime remains authoritative |
+| Information disclosure | Browser secret becomes a session token or appears in debug logs | Separate host-only Secure/HttpOnly cookie with sensitive header flag; no Debug/Clone/serialization on binding; best-effort secret wipe on drop; handler must use no-store and referrer protections |
+| Denial of service | Cookie parsing or retry has unbounded input/lifetime | Aggregate 8192-byte cookie budget; fixed 32-byte secret; at most ten-minute cookie; handler must additionally bound body and admit hashing |
+| Elevation | Possessing the binding substitutes for recovery proof | Binding alone never mutates credentials; code, accepted notifications, current authority and case delay/cancellation remain store requirements; same-origin checks still required at handler |

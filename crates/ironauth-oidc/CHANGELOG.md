@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add purpose-specific reset browser binding, strict bounded cookie parsing, challenge-bound CSRF verification and keyed exact-request receipts (#1479). The cookie is separate from authentication and persists only for the bounded retry window; hosted handlers remain pending.
+
 - Construct configured reset SMTP only when explicitly enabled and expose a concrete state installer independent from mailbox verification or logging OTP senders (#1479); hosted recovery orchestration remains pending.
 
 - Add a purpose-specific password-reset SMTP transport with provider-bound cancellation links, exact code expiry and distinct completion notices (#1479). Share bounded certificate-verified SMTP mechanics with mailbox verification; no hosted recovery is enabled until separate configuration and orchestration are wired.

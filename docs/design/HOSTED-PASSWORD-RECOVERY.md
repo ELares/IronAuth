@@ -225,3 +225,22 @@ Challenge cleanup must retain these digests while the associated case is pending
 This avoids storing recoverable cancellation secrets or requiring another operator
 key. The repository tests exercise reissue after the original code expires and
 both cancellation and completion outcomes; hosted orchestration remains pending.
+
+
+The browser-binding helper now generates a separate 256-bit secret through Env.
+Only its SHA-256 digest is stored with the reset challenge. The wire cookie is
+`__Host-ironauth_reset`, Secure, HttpOnly, SameSite=Lax, Path=/, with no Domain and
+a fixed ten-minute maximum age. Its header is marked sensitive. Parsing bounds
+all Cookie headers together and rejects duplicate reset names or malformed values.
+The authoritative row expiry can be shorter; reading the cookie never proves a
+live case. Do not renew it on reads or erase it immediately after completion,
+since the original browser needs its bounded exact-response retry opportunity.
+
+CSRF uses HMAC-SHA256 keyed by the browser secret and bound to the scoped challenge.
+The completion receipt uses a different domain and length-prefixed challenge,
+exact code and already normalized new password. A restored cookie reproduces the
+receipt across provider restarts without storing plaintext or adding an operator
+key. A changed browser, challenge, code or normalized password produces another
+digest. The handler must still validate same-origin POST, bound the form, enforce
+policy/screening and admitted hashing, and recheck the store-owned scope/lifetime.
+These helpers do not yet expose a reset route or complete the browser journey.

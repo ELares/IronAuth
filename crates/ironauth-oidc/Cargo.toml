@@ -136,6 +136,7 @@ base64.workspace = true
 # SHA-256 for the PKCE S256 code_challenge derivation. Pure Rust, permissive,
 # already in the tree via ironauth-store; no new crate.
 sha2.workspace = true
+hmac.workspace = true
 tracing.workspace = true
 # The metrics facade (already in the tree; the server installs the Prometheus
 # recorder). Meters authorization-code reuse and redeem faults so a dropped
