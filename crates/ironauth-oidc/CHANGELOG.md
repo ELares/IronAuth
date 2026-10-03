@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add a distinct reset-request owner notice carrying a provider-bound cancellation link without reset proof (#1479). Secondary verified channels can be warned without receiving the primary mailbox's code; hosted channel orchestration remains pending.
+
 - Add purpose-specific reset browser binding, strict bounded cookie parsing, challenge-bound CSRF verification and keyed exact-request receipts (#1479). The cookie is separate from authentication and persists only for the bounded retry window; hosted handlers remain pending.
 
 - Construct configured reset SMTP only when explicitly enabled and expose a concrete state installer independent from mailbox verification or logging OTP senders (#1479); hosted recovery orchestration remains pending.

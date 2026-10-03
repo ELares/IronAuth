@@ -1910,3 +1910,134 @@ async fn reset_reissue_preserves_case_delay_and_expired_code_cancellation_links(
         }
     }
 }
+
+#[tokio::test]
+async fn reset_first_accepted_notice_starts_full_delay_and_resends_do_not_restart_it() {
+    use ironauth_store::{PasswordResetAccount, PasswordResetDelivery, PasswordResetOutcome};
+    use std::time::{Duration, SystemTime};
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH + Duration::from_secs(1000), 1487);
+    let scope = db.seed_scope(&env).await;
+    let (subject, case, first) = pending_reset_fixture(&db, &env, scope).await;
+    let initial_hold = now_micros(&env) + 3_600_000_000;
+    sqlx::query("UPDATE recovery_flows SET state='held',hold_until=TIMESTAMPTZ 'epoch'+($2::text||' microseconds')::interval WHERE id=$1")
+        .bind(case.to_string()).bind(initial_hold).execute(db.owner_pool()).await.unwrap();
+    record_reset_delivery(&db, &env, &first.id, PasswordResetDelivery::Refused, 0)
+        .await
+        .unwrap();
+    clock.advance(Duration::from_secs(3601));
+    let fresh = PasswordResetChallengeId::generate(&env, &scope);
+    start_reset(
+        &db,
+        &env,
+        &fresh,
+        Some(PasswordResetAccount {
+            subject: &subject,
+            recovery: &case,
+        }),
+    )
+    .await
+    .unwrap();
+    let notified_hold = now_micros(&env) + 3_600_000_000;
+    sqlx::raw_sql("CREATE FUNCTION reject_notice_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.action='password_reset.delivery' THEN RAISE EXCEPTION 'injected notice audit failure'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER reject_notice_audit BEFORE INSERT ON audit_log FOR EACH ROW EXECUTE FUNCTION reject_notice_audit();")
+        .execute(db.owner_pool()).await.unwrap();
+    assert!(
+        record_reset_delivery(&db, &env, &fresh, PasswordResetDelivery::Accepted, 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .recovery_flows()
+            .by_cancel_digest(&[7; 32])
+            .await
+            .unwrap()
+            .unwrap()
+            .hold_until_unix_micros,
+        Some(initial_hold)
+    );
+    sqlx::raw_sql(
+        "DROP TRIGGER reject_notice_audit ON audit_log; DROP FUNCTION reject_notice_audit();",
+    )
+    .execute(db.owner_pool())
+    .await
+    .unwrap();
+    record_reset_delivery(&db, &env, &fresh, PasswordResetDelivery::Accepted, 1)
+        .await
+        .unwrap();
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let challenge = scoped
+        .password_reset()
+        .challenge(&env, &fresh, &[3; 32])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .unwrap(),
+        PasswordResetOutcome::Held {
+            until_unix_micros: notified_hold
+        }
+    );
+    // A resend inside the waiting period retains the first accepted notice's horizon.
+    clock.advance(Duration::from_secs(61));
+    let resend = PasswordResetChallengeId::generate(&env, &scope);
+    start_reset(
+        &db,
+        &env,
+        &resend,
+        Some(PasswordResetAccount {
+            subject: &subject,
+            recovery: &case,
+        }),
+    )
+    .await
+    .unwrap();
+    record_reset_delivery(&db, &env, &resend, PasswordResetDelivery::Accepted, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        scoped
+            .recovery_flows()
+            .by_cancel_digest(&[7; 32])
+            .await
+            .unwrap()
+            .unwrap()
+            .hold_until_unix_micros,
+        Some(notified_hold)
+    );
+    // The final fresh code can complete exactly when the notified delay has elapsed.
+    clock.advance(Duration::from_secs(3539));
+    let ready = PasswordResetChallengeId::generate(&env, &scope);
+    start_reset(
+        &db,
+        &env,
+        &ready,
+        Some(PasswordResetAccount {
+            subject: &subject,
+            recovery: &case,
+        }),
+    )
+    .await
+    .unwrap();
+    record_reset_delivery(&db, &env, &ready, PasswordResetDelivery::Accepted, 1)
+        .await
+        .unwrap();
+    let challenge = scoped
+        .password_reset()
+        .challenge(&env, &ready, &[3; 32])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .unwrap(),
+        PasswordResetOutcome::Completed { .. }
+    ));
+}

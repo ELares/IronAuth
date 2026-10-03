@@ -244,3 +244,23 @@ key. A changed browser, challenge, code or normalized password produces another
 digest. The handler must still validate same-origin POST, bound the form, enforce
 policy/screening and admitted hashing, and recheck the store-owned scope/lifetime.
 These helpers do not yet expose a reset route or complete the browser journey.
+
+
+A held case's initial horizon is provisional until actual required notifications
+are durably accepted. Recording the first accepted reset delivery extends that
+horizon to at least acceptance time plus the original configured waiting period.
+The case lock precedes the challenge write, matching completion's lock order, and
+the horizon, delivery result and audit commit together. A failed delivery or failed
+audit cannot consume the notified delay. Once an accepted challenge exists for
+the case, resends preserve its established horizon, including fresh codes after
+the delay. Retain accepted delivery evidence while the case is pending as well as
+its cancellation aliases. Missing/malformed or terminal real cases cannot record
+accepted delivery. These real-store tests simulate transport acceptance; the hosted
+caller still must establish it from actual required channel acknowledgements.
+
+The SMTP content contract now has a separate requested-owner notice with a usable
+cancellation action and a distinct message identity. It contains no reset code.
+The primary verified mailbox receives the purpose-specific code; other required
+verified channels must receive owner warnings. An email-only adapter must refuse
+completion if a required phone channel cannot be notified, not silently omit it.
+Selection, fan-out and durable aggregation are still hosted caller obligations.

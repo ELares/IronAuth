@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Anchor a held reset case's full waiting period to its first durable accepted notification (#1479). Failed initial delivery cannot silently consume the delay; subsequent code deliveries preserve the established horizon. The horizon update and delivery audit roll back together.
+
 - Retain a separate hashed cancellation capability for each real reset challenge (#1479). Fresh codes can share the original delayed recovery case; old notification links still resolve after code expiry or reissue, and cannot cancel across scopes. Plaintext cancellation secrets are not retained.
 
 - Require a durable accepted delivery result before hosted password reset completion or receipt replay (#1479). Pending, refused and uncertain delivery cannot authorize a reset; terminal delivery records are audited and cannot be relabelled through the repository. Hosted transport orchestration remains pending.

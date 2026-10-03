@@ -24,6 +24,11 @@ pub enum PasswordResetNotice<'a> {
         /// Validated provider cancellation URL, never an application redirect.
         cancel_url: &'a str,
     },
+    /// Owner warning for another required verified channel, without reset proof.
+    Requested {
+        /// Usable cancellation action for the same recovery case.
+        cancel_url: &'a str,
+    },
     /// Notification after the credential transaction committed.
     Completed,
 }
@@ -189,6 +194,22 @@ impl PasswordResetSmtpTransport {
                     escape_html(&cancel)
                 );
                 ("code", "Reset your IronAuth password", text, html)
+            }
+            PasswordResetNotice::Requested { cancel_url } => {
+                let cancel = self.cancel_url(cancel_url)?;
+                let text = format!(
+                    "A password reset was requested for your IronAuth account. If you did not request it, cancel the recovery: {cancel}\r\nThis notification does not contain a reset code and does not sign you in."
+                );
+                let html = format!(
+                    "<p>A password reset was requested for your IronAuth account.</p><p>If you did not request it, <a href=\"{}\">cancel the recovery</a>.</p><p>This notification does not contain a reset code and does not sign you in.</p>",
+                    escape_html(&cancel)
+                );
+                (
+                    "requested",
+                    "Password reset requested for your IronAuth account",
+                    text,
+                    html,
+                )
             }
             PasswordResetNotice::Completed => {
                 let text = "Your IronAuth password was reset. You have been signed out on your devices. Sign in with your new password and your usual authentication factors. If you did not make this change, contact your administrator immediately.".to_owned();

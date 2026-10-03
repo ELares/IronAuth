@@ -218,3 +218,38 @@ fn disabled_recovery_never_resolves_secrets_and_enabled_failures_are_value_free(
     );
     assert!(PasswordResetSmtpTransport::configured(&config, None, env()).is_err());
 }
+
+#[tokio::test]
+async fn reset_owner_notice_delivers_cancellation_without_sharing_the_code() {
+    let (smtp, task) = fixture(Reply::Accepted, true).await;
+    let env = env();
+    let current = scope(&env);
+    let id = PasswordResetChallengeId::generate(&env, &current);
+    let transport = PasswordResetSmtpTransport {
+        smtp,
+        issuer: Url::parse("https://auth.example.test").unwrap(),
+        env,
+    };
+    let message = PasswordResetMessage {
+        notice: PasswordResetNotice::Requested {
+            cancel_url: "https://auth.example.test/recover/cancel?token=fixture-owner-cancel",
+        },
+        ..code(&id, current)
+    };
+    assert_eq!(transport.deliver(message).await, Ok(()));
+    let raw = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(raw.contains(&format!("Message-ID: <{id}-requested@auth.example.test>")));
+    assert!(raw.contains("recover/cancel?token=fixture-owner-cancel"));
+    assert!(!raw.contains("12345678"));
+    let bad = PasswordResetMessage {
+        notice: PasswordResetNotice::Requested {
+            cancel_url: "https://foreign.test/recover/cancel?token=x",
+        },
+        ..code(&id, current)
+    };
+    assert!(transport.render(&bad).is_err());
+}

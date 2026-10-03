@@ -595,6 +595,8 @@ handlers are still unwired and must be documented before release.
 | Tampering | Fresh-code reissue invalidates an earlier owner cancellation link or restarts its waiting period | Immutable per-challenge cancellation digest resolves the same scoped, subject-bound standard lost-password case; old digests remain usable after code expiry/reissue; the case retains delay and terminal status |
 | Information disclosure | Codes, cancellation capabilities or SMTP secrets enter logs | No Debug/serialization on secret-bearing message/config; value-free errors; redacted transport Debug; no plaintext notice outbox |
 | Denial of service | Secret-bearing messages wait indefinitely | Shared no-wait concurrency admission and bounded socket/overall send deadlines; eight-digit code, bounded cancellation URL and expiry |
+| Elevation | An undelivered initial request consumes a security waiting period | First accepted required notification anchors the full case delay under lock; later resends preserve it; horizon and delivery audit roll back together |
+| Information disclosure | Secondary owner warnings distribute the primary reset code | Separate requested-owner content carries cancellation only, with a distinct message identity and the same provider-origin validation |
 | Elevation | Email delivery itself resets a password or grants a session | Transport cannot mutate credentials; separate atomic store completion still requires browser-bound proof and current authority; real handler obligations remain unwired |
 
 

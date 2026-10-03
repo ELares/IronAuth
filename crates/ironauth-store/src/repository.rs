@@ -20947,6 +20947,9 @@ impl ActingPasswordResetRepo<'_> {
             action: Action::PasswordResetDelivery, target: id,
         }, async move |tx| {
             recipient_ownership_lock(tx, scope).await?;
+            if result == PasswordResetDelivery::Accepted {
+                anchor_reset_notification_delay(tx, scope, id, now).await?;
+            }
             let updated = sqlx::query(
                 "UPDATE password_reset_challenges SET delivery_state=$4,notified_channels=$5, \
                  delivery_finished_at=TIMESTAMPTZ 'epoch'+($6::text||' microseconds')::interval \
@@ -21317,6 +21320,51 @@ async fn replace_pending_password_reset(
     .bind(now)
     .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+// Called under the ownership lock, before locking/updating the challenge, so the
+// order agrees with completion (case before challenge). Only the first accepted
+// notification starts a held case's full waiting period. Code resends retain it.
+async fn anchor_reset_notification_delay(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    id: &PasswordResetChallengeId,
+    now: i64,
+) -> Result<(), StoreError> {
+    let row = sqlx::query(
+        "SELECT r.id,r.state,(extract(epoch FROM (r.hold_until-r.initiated_at))*1000000)::bigint AS delay_us \
+         FROM recovery_flows r JOIN password_reset_challenges p \
+         ON p.tenant_id=r.tenant_id AND p.environment_id=r.environment_id \
+         AND p.recovery_id=r.id AND p.subject=r.subject \
+         WHERE p.tenant_id=$1 AND p.environment_id=$2 AND p.id=$3 \
+         AND r.method='standard' AND r.entry_point='lost_password' FOR UPDATE OF r",
+    ).bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
+    .fetch_optional(&mut **tx).await?.ok_or(StoreError::Conflict)?;
+    let state: String = row.get("state");
+    let delay: Option<i64> = row.get("delay_us");
+    if !matches!(state.as_str(), "initiated" | "held")
+        || (state == "held" && delay.is_none())
+        || delay.is_some_and(|value| value < 0)
+    {
+        return Err(StoreError::Conflict);
+    }
+    if delay.is_some() {
+        sqlx::query(
+            "UPDATE recovery_flows r SET hold_until=GREATEST(hold_until, \
+             TIMESTAMPTZ 'epoch'+($4::text||' microseconds')::interval+(hold_until-initiated_at)) \
+             WHERE tenant_id=$1 AND environment_id=$2 AND id=$3 \
+             AND NOT EXISTS (SELECT 1 FROM password_reset_challenges p WHERE p.tenant_id=$1 \
+               AND p.environment_id=$2 AND p.recovery_id=r.id AND p.subject=r.subject \
+               AND p.delivery_state='accepted')",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(row.get::<String, _>("id"))
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
