@@ -152,19 +152,30 @@ impl PasswordResetDelivery {
     }
 }
 
-/// Durable outbox consumer for a code-free completed-reset owner notification.
+/// Durable outbox consumer for code-free completed or cancelled reset warnings.
 pub const PASSWORD_RESET_COMPLETION_CONSUMER: &str = "password-reset-completion";
 
-/// Store-owned delivery target after the completed reset's single notice claim.
+/// The committed terminal recovery transition, with no recipient or secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordResetNoticeKind {
+    /// The credential change committed.
+    Completed,
+    /// The recovery case was cancelled without changing the password.
+    Cancelled,
+}
+
+/// A verified target for a terminal recovery owner warning.
 /// No Debug/serialization; a missing recipient requires a recorded refusal.
 pub struct PasswordResetCompletionNotice {
+    /// The committed transition, never selected by an outbox payload.
+    pub kind: PasswordResetNoticeKind,
     /// Account bound to the committed reset.
     pub subject: UserId,
     /// Still-current verified primary, absent if ownership is no longer eligible.
     pub recipient: Option<String>,
 }
 
-/// Metadata only, for resolving an interrupted completion-notice attempt.
+/// Metadata only, for resolving an interrupted terminal owner-notice attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PasswordResetNoticeStatus {
     /// An external attempt may already have started; it cannot be repeated.

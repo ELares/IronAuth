@@ -517,3 +517,28 @@ The cancellation page still uses the existing recovery notifier and claims that
 registered channels were alerted. Actual cancellation delivery must replace that
 legacy path before this ceremony is enabled; completion-notice tests do not prove
 cancellation delivery or mailbox transfer to a different account.
+
+
+Hosted cancellation now queues a code-free owner warning inside the existing case
+cancellation transaction. Only a successful pending-to-cancelled transition queues
+work, and reissued challenges sharing a case produce one warning using the newest
+bound challenge. The internal terminal-kind marker chooses cancellation versus
+completion content; the payload still carries only a challenge ID. Superseding a
+code alone does not mark a notice due. Cancellation-notice ownership lookup may
+read a cancelled case, while issuance/completion retain their original case rules.
+The completion worker also drains these terminal cancellation notices with the
+same single-attempt claim and outcome policy. Legacy recovery notifier hooks are
+retained for other integrations; they are not evidence of SMTP delivery.
+
+The cancellation POST now preserves transaction failure as a generic retryable
+503 response rather than reporting success. Successful/invalid/repeated requests
+retain uniform acknowledgement without claiming that mail has already arrived.
+Queue failure rolls back cancellation, allowing the original link to be retried.
+
+
+Qualification now covers the actual HTTP cancellation link from a locally delivered
+TLS code email: scanner GET preserves the pending case, injected queue failure
+returns retryable 503 and preserves the link, successful POST plus repeat queue one
+code-free TLS warning, and the original password remains valid. The full 38-test
+reset store suite and two existing legacy cancellation tests pass. This does not
+claim Internet mail, browser qualification, or full process restart evidence.

@@ -157,6 +157,11 @@ async fn call(
         req = req.header(header::COOKIE, cookie);
     }
     let response = crate::password_reset_request::routes()
+        .route(
+            "/recover/cancel",
+            axum::routing::get(crate::recover::recover_cancel_get)
+                .post(crate::recover::recover_cancel_post),
+        )
         .with_state(state.clone())
         .oneshot(req.body(Body::from(body)).unwrap())
         .await
@@ -611,4 +616,111 @@ async fn restarted_completion_worker_classifies_stale_claim_without_sending_agai
         Some(ironauth_store::PasswordResetDelivery::Uncertain)
     );
     complete_from_mail(&state, &db, &subject, &browser, &raw).await;
+}
+
+#[tokio::test]
+async fn cancellation_link_is_scanner_safe_and_delivers_one_code_free_warning() {
+    let db = TestDatabase::start().await;
+    let env = env();
+    let scope = db.seed_scope(&env).await;
+    let (smtp, mail) = fixture(Reply::Accepted, true).await;
+    let state = state(
+        &db,
+        &env,
+        scope,
+        Some(PasswordResetSmtpTransport {
+            smtp,
+            issuer: Url::parse("https://auth.example.test").unwrap(),
+            env: env.clone(),
+        }),
+    );
+    let (subject, client) = seed(&db, &state, scope).await;
+    let (status, _, _) = request(&state, &resume(&client), OWNER, None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let raw = tokio::time::timeout(Duration::from_secs(5), mail)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let link = raw
+        .split("cancel it: ")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let url = Url::parse(link).unwrap();
+    let token = url
+        .query_pairs()
+        .find(|(key, _)| key == "token")
+        .unwrap()
+        .1
+        .into_owned();
+    let path = format!("{}?{}", url.path(), url.query().unwrap());
+    let (status, _, _) = call(&state, "GET", &path, String::new(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(crate::recovery::cancel_token_is_live(&state, &token).await);
+    let body = serde_urlencoded::to_string([("token", token.as_str())]).unwrap();
+    cancel_queue_fault_is_retryable(&state, &db, &body).await;
+    assert!(crate::recovery::cancel_token_is_live(&state, &token).await);
+    for _ in 0..2 {
+        let (status, headers, page) =
+            call(&state, "POST", "/recover/cancel", body.clone(), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!headers.contains_key(header::SET_COOKIE));
+        assert!(!page.contains("alerted your"));
+    }
+    assert!(!crate::recovery::cancel_token_is_live(&state, &token).await);
+    drain_cancel_notice(&state, &db, scope).await;
+    let hash = db
+        .store()
+        .scoped(scope)
+        .users()
+        .password_hash_for_subject(&subject)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state.verify_password(&scope, OLD, &hash).await.unwrap());
+    assert!(!state.verify_password(&scope, NEW, &hash).await.unwrap());
+}
+
+async fn drain_cancel_notice(state: &OidcState, db: &TestDatabase, scope: Scope) {
+    use crate::password_reset_delivery::PasswordResetCompletionConsumer;
+    use ironauth_store::outbox::{OutboxWorker, WorkerSettings};
+    let (smtp, mail) = fixture(Reply::Accepted, true).await;
+    let delivery_state = state
+        .clone()
+        .with_password_reset_smtp(PasswordResetSmtpTransport {
+            smtp,
+            issuer: Url::parse("https://auth.example.test").unwrap(),
+            env: state.env().clone(),
+        });
+    let worker = OutboxWorker::new(
+        db.store().clone(),
+        state.env().clone(),
+        Arc::new(PasswordResetCompletionConsumer::new(delivery_state)),
+        WorkerSettings::default(),
+    );
+    let drained = worker.run_once(scope).await.unwrap();
+    assert_eq!(drained.completed, 1);
+    let raw = tokio::time::timeout(Duration::from_secs(5), mail)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(raw.contains("Your IronAuth password reset was cancelled"));
+    assert!(!raw.contains("reset code is") && !raw.contains("ira_rcv_") && !raw.contains(OLD));
+    assert_eq!(worker.run_once(scope).await.unwrap().claimed, 0);
+}
+
+async fn cancel_queue_fault_is_retryable(state: &OidcState, db: &TestDatabase, body: &str) {
+    sqlx::raw_sql("CREATE FUNCTION reject_cancel_mail_queue() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.consumer='password-reset-completion' THEN RAISE EXCEPTION 'fixture queue fault'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER reject_cancel_mail_queue BEFORE INSERT ON outbox_messages FOR EACH ROW EXECUTE FUNCTION reject_cancel_mail_queue();")
+        .execute(db.owner_pool()).await.unwrap();
+    let (status, _, page) = call(state, "POST", "/recover/cancel", body.to_owned(), None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(page.contains("Unable to confirm cancellation"));
+    sqlx::raw_sql("DROP TRIGGER reject_cancel_mail_queue ON outbox_messages; DROP FUNCTION reject_cancel_mail_queue();")
+        .execute(db.owner_pool()).await.unwrap();
 }

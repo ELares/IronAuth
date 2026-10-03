@@ -31,6 +31,8 @@ pub enum PasswordResetNotice<'a> {
     },
     /// Notification after the credential transaction committed.
     Completed,
+    /// Notification after a recovery cancellation committed.
+    Cancelled,
 }
 
 /// A reset message is deliberately not a mailbox-verification or login message.
@@ -207,6 +209,16 @@ impl PasswordResetSmtpTransport {
                 (
                     "requested",
                     "Password reset requested for your IronAuth account",
+                    text,
+                    html,
+                )
+            }
+            PasswordResetNotice::Cancelled => {
+                let text = "Your IronAuth password reset request was cancelled. This request can no longer change your password. If you did not request this recovery, contact your administrator.".to_owned();
+                let html = format!("<p>{}</p>", escape_html(&text));
+                (
+                    "cancelled",
+                    "Your IronAuth password reset was cancelled",
                     text,
                     html,
                 )

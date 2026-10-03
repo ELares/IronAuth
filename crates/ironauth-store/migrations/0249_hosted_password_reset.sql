@@ -102,9 +102,11 @@ ALTER TABLE recovery_flows ADD COLUMN password_reset_delay_us bigint
     CHECK (password_reset_delay_us >= 0);
 GRANT UPDATE (password_reset_delay_us) ON recovery_flows TO ironauth_app;
 
--- A completion notification becomes due only with state=completed. The outbox
+-- A terminal owner notification becomes due only after completion or cancellation. The outbox
 -- carries its challenge ID, never its code, password, address or cancellation URL.
 ALTER TABLE password_reset_challenges
+    ADD COLUMN owner_notice_kind text CHECK (owner_notice_kind IN ('completed','cancelled')),
+    ADD CONSTRAINT password_reset_notice_kind CHECK (owner_notice_kind IS NULL OR owner_notice_kind=state),
     ADD COLUMN completion_notice_state text NOT NULL DEFAULT 'pending'
         CHECK (completion_notice_state IN ('pending','accepted','refused','uncertain')),
     ADD COLUMN completion_notice_started_at timestamptz,
@@ -113,7 +115,7 @@ ALTER TABLE password_reset_challenges
         CHECK (completion_notice_channels BETWEEN 0 AND 32),
     ADD CONSTRAINT password_reset_notice_claim CHECK (
         completion_notice_started_at IS NULL OR
-        (state='completed' AND completion_notice_started_at >= finished_at)),
+        (owner_notice_kind IS NOT NULL AND completion_notice_started_at >= finished_at)),
     ADD CONSTRAINT password_reset_notice_result CHECK (
         (completion_notice_state='pending' AND completion_notice_finished_at IS NULL
          AND completion_notice_channels=0)
@@ -123,6 +125,6 @@ ALTER TABLE password_reset_challenges
          AND completion_notice_finished_at >= completion_notice_started_at
          AND (completion_notice_state<>'accepted' OR completion_notice_channels>0))
     );
-GRANT UPDATE (completion_notice_state,completion_notice_started_at,
+GRANT UPDATE (owner_notice_kind,completion_notice_state,completion_notice_started_at,
               completion_notice_finished_at,completion_notice_channels)
     ON password_reset_challenges TO ironauth_app;

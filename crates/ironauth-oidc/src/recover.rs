@@ -233,9 +233,9 @@ pub struct CancelForm {
 }
 
 /// `POST /recover/cancel`: revoke a pending recovery from its notification-link token
-/// (issue #81). ALWAYS returns the SAME uniform acknowledgment: a valid token cancels the
-/// pending recovery (and notifies every channel), an invalid or stale one is a no-op,
-/// neither observable in the response.
+/// (issue #81). Valid, invalid and repeated tokens share the acknowledgment after
+/// successful store access. A persistence failure returns retryable unavailability
+/// instead of claiming cancellation. Hosted cases queue a terminal owner notice.
 pub async fn recover_cancel_post(
     State(state): State<OidcState>,
     headers: HeaderMap,
@@ -247,13 +247,24 @@ pub async fn recover_cancel_post(
     }
     let token = form.token.as_deref().unwrap_or_default();
     // Uniform: a valid or invalid token both return the same acknowledgment.
-    let _ = crate::recovery::cancel_from_token(&state, token).await;
+    if crate::recovery::cancel_from_token_result(&state, token)
+        .await
+        .is_err()
+    {
+        return pages::secure_html(
+            StatusCode::SERVICE_UNAVAILABLE,
+            pages::notice_page(
+                "Unable to confirm cancellation",
+                "Please retry this cancellation link. We could not confirm that the recovery request was cancelled.",
+            ),
+        );
+    }
     pages::secure_html(
         StatusCode::OK,
         pages::notice_page(
             "Recovery cancelled",
-            "If a recovery request was pending, we have cancelled it and alerted your \
-             registered channels.",
+            "If a recovery request was pending, it has been cancelled. A security notice \
+             will be attempted through the configured delivery service.",
         ),
     )
 }

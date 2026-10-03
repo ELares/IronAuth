@@ -327,7 +327,14 @@ async fn deliver_completion_notice(
                             challenge_id: id,
                             scope,
                             recipient: &recipient,
-                            notice: PasswordResetNotice::Completed,
+                            notice: match claim.kind {
+                                ironauth_store::PasswordResetNoticeKind::Completed => {
+                                    PasswordResetNotice::Completed
+                                }
+                                ironauth_store::PasswordResetNoticeKind::Cancelled => {
+                                    PasswordResetNotice::Cancelled
+                                }
+                            },
                         })
                         .await;
                     accumulate(result, &mut outcome, &mut accepted);
@@ -502,6 +509,7 @@ mod tests {
                 PasswordResetNotice::Code { .. } => "code",
                 PasswordResetNotice::Requested { .. } => "notice",
                 PasswordResetNotice::Completed => "completed",
+                PasswordResetNotice::Cancelled => "cancelled",
             };
             self.sent
                 .lock()

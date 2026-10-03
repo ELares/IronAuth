@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Deliver code-free cancelled-reset owner warnings through the durable recovery worker (#1479). Cancellation pages no longer claim mail was delivered and return a retryable unavailable response when the cancellation transaction fails.
+
 - Add a durable password-reset completion-notice consumer with verified-channel selection, bounded SMTP and no automatic resend after a claimed attempt (#1479). The server starts its worker with recovery enabled; isolated HTTP/TLS/outbox qualification covers acceptance, refusal and uncertain acknowledgement. Main-router activation remains pending.
 
 - Connect hosted recovery request qualification routes to registered authorization validation, browser-bound real/decoy challenges and bounded background SMTP delivery (#1479). Repeated browser requests preserve the existing code form; main-router enablement and completion notices remain pending.

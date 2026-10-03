@@ -904,25 +904,35 @@ pub async fn cancel_token_is_live(state: &OidcState, token: &str) -> bool {
 /// recovery), and notify every channel of the cancellation. Returns whether a pending
 /// flow was cancelled. A forged, stale, or already-terminal token is the uniform no-op.
 pub async fn cancel_from_token(state: &OidcState, token: &str) -> bool {
+    cancel_from_token_result(state, token)
+        .await
+        .unwrap_or(false)
+}
+
+/// Preserve store failure for the hosted response; it must not claim cancellation.
+pub(crate) async fn cancel_from_token_result(
+    state: &OidcState,
+    token: &str,
+) -> Result<bool, ironauth_store::StoreError> {
     let Some(handle) = flow_id_from_cancel_token(token) else {
-        return false;
+        return Ok(false);
     };
     let Ok(flow_id) = RecoveryFlowId::parse_declared_scope(handle) else {
-        return false;
+        return Ok(false);
     };
     let scope = flow_id.scope();
     let digest = cancel_token_digest(token);
-    let Ok(Some(record)) = state
+    let Some(record) = state
         .store()
         .scoped(scope)
         .recovery_flows()
         .by_cancel_digest(&digest)
-        .await
+        .await?
     else {
-        return false;
+        return Ok(false);
     };
     if !record.state.is_pending() {
-        return false;
+        return Ok(false);
     }
     let Ok(subject) = state
         .store()
@@ -930,7 +940,7 @@ pub async fn cancel_from_token(state: &OidcState, token: &str) -> bool {
         .users()
         .parse_id(&record.subject)
     else {
-        return false;
+        return Ok(false);
     };
     let cancelled = state
         .store()
@@ -945,13 +955,12 @@ pub async fn cancel_from_token(state: &OidcState, token: &str) -> bool {
             &record.id,
             RecoveryCancelReason::UserNotification,
         )
-        .await
-        .unwrap_or(false);
+        .await?;
     if cancelled {
         // Completion and cancellation notify AGAIN, so the owner sees the flow closed.
         notify_all_channels(state, scope, &subject, None).await;
     }
-    cancelled
+    Ok(cancelled)
 }
 
 /// Evaluate a factor change against an active recovery under THE DOWNGRADE INVARIANT

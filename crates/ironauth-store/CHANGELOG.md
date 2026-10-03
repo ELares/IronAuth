@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Queue one code-free owner warning atomically when a hosted recovery case is cancelled (#1479). Select one latest case-bound challenge across reissues, preserve current mailbox validation, and never allow cancellation-notice eligibility to authorize password completion.
+
 - Queue code-free password-reset completion notices in the credential transaction, with audited single-attempt claims and immutable terminal delivery outcomes (#1479). Queue failure rolls back completion; receipt retries do not enqueue duplicates.
 
 - Include original issuance time in browser-bound reset context so hosted resend admission can preserve an existing code independently of account eligibility (#1479).

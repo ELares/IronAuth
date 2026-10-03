@@ -2928,3 +2928,96 @@ async fn completion_notice_audit_faults_roll_back_claim_and_result_without_rever
         Some(PasswordResetDelivery::Uncertain)
     );
 }
+
+#[tokio::test]
+async fn cancellation_queues_one_owner_notice_and_rolls_back_if_queue_fails() {
+    use ironauth_store::{
+        CorrelationId, PASSWORD_RESET_COMPLETION_CONSUMER, PasswordResetNoticeKind,
+        RecoveryCancelReason,
+    };
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (subject, recovery, challenge) = reset_fixture(&db, &env, scope).await;
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let acting = scoped.acting(db.test_actor(&env), CorrelationId::generate(&env));
+    sqlx::raw_sql("CREATE FUNCTION reject_cancel_queue() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.consumer='password-reset-completion' THEN RAISE EXCEPTION 'fixture queue failure'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER reject_cancel_queue BEFORE INSERT ON outbox_messages FOR EACH ROW EXECUTE FUNCTION reject_cancel_queue();")
+        .execute(db.owner_pool()).await.unwrap();
+    assert!(
+        acting
+            .recovery_flows()
+            .cancel(&env, &recovery, RecoveryCancelReason::UserNotification)
+            .await
+            .is_err()
+    );
+    assert!(
+        scoped
+            .password_reset()
+            .completion_notice_status(&challenge.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let pending: bool =
+        sqlx::query_scalar("SELECT state IN ('initiated','held') FROM recovery_flows WHERE id=$1")
+            .bind(recovery.to_string())
+            .fetch_one(db.owner_pool())
+            .await
+            .unwrap();
+    assert!(pending);
+    sqlx::raw_sql(
+        "DROP TRIGGER reject_cancel_queue ON outbox_messages; DROP FUNCTION reject_cancel_queue();",
+    )
+    .execute(db.owner_pool())
+    .await
+    .unwrap();
+    assert!(
+        acting
+            .recovery_flows()
+            .cancel(&env, &recovery, RecoveryCancelReason::UserNotification)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !acting
+            .recovery_flows()
+            .cancel(&env, &recovery, RecoveryCancelReason::UserNotification)
+            .await
+            .unwrap()
+    );
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_messages WHERE consumer=$1 AND idempotency_key=$2",
+    )
+    .bind(PASSWORD_RESET_COMPLETION_CONSUMER)
+    .bind(challenge.id.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+    let claim = acting
+        .password_reset()
+        .claim_completion_notice(&env, &challenge.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.kind, PasswordResetNoticeKind::Cancelled);
+    assert!(claim.recipient.is_some());
+    assert_eq!(
+        scoped
+            .users()
+            .password_hash_for_subject(&subject)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(HASH)
+    );
+    assert!(matches!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .unwrap(),
+        ironauth_store::PasswordResetOutcome::Refused
+    ));
+}
