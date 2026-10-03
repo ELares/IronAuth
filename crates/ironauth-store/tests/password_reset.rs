@@ -135,6 +135,11 @@ async fn reset_schema_rejects_partial_completion_and_unbounded_attempts() {
     insert_fixture(&db, scope, &id, true).await.unwrap();
     for change in [
         "attempt_count=6",
+        "delivery_state='accepted'",
+        "delivery_state='accepted',delivery_finished_at=created_at,notified_channels=0",
+        "delivery_state='pending',notified_channels=1",
+        "delivery_state='uncertain',delivery_finished_at=created_at-interval '1 second'",
+        "state='completed',attempt_count=1,finished_at=created_at+interval '1 minute',completion_request_hash=decode(repeat('ab',32),'hex'),completion_credential_digest=decode(repeat('cd',32),'hex')",
         "attempt_count=-1",
         "expires_at=created_at",
         "expires_at=created_at+interval '11 minutes'",
@@ -164,10 +169,10 @@ async fn reset_schema_rejects_partial_completion_and_unbounded_attempts() {
     insert_fixture(&db, scope, &next, true).await.unwrap();
     let decoy = PasswordResetChallengeId::generate(&env, &scope);
     insert_fixture(&db, scope, &decoy, false).await.unwrap();
-    let error = sqlx::query("UPDATE password_reset_challenges SET state='completed',attempt_count=1,finished_at=created_at+interval '1 minute',completion_request_hash=decode(repeat('ab',32),'hex'),completion_credential_digest=decode(repeat('cd',32),'hex') WHERE id=$1")
+    let error = sqlx::query("UPDATE password_reset_challenges SET delivery_state='accepted',notified_channels=1,delivery_finished_at=created_at,state='completed',attempt_count=1,finished_at=created_at+interval '1 minute',completion_request_hash=decode(repeat('ab',32),'hex'),completion_credential_digest=decode(repeat('cd',32),'hex') WHERE id=$1")
         .bind(decoy.to_string()).execute(db.owner_pool()).await.expect_err("decoy cannot become completed authority");
     assert_eq!(sqlstate(&error).as_deref(), Some("23514"));
-    sqlx::query("UPDATE password_reset_challenges SET state='completed',attempt_count=1,finished_at=created_at+interval '1 minute',completion_request_hash=decode(repeat('ab',32),'hex'),completion_credential_digest=decode(repeat('cd',32),'hex') WHERE id=$1")
+    sqlx::query("UPDATE password_reset_challenges SET delivery_state='accepted',notified_channels=1,delivery_finished_at=created_at,state='completed',attempt_count=1,finished_at=created_at+interval '1 minute',completion_request_hash=decode(repeat('ab',32),'hex'),completion_credential_digest=decode(repeat('cd',32),'hex') WHERE id=$1")
         .bind(next.to_string()).execute(db.owner_pool()).await.expect("complete metadata shape is representable; this is not a credential mutation");
 }
 
@@ -584,7 +589,7 @@ async fn reset_reissue_cancels_prior_authority_and_reads_expire_at_the_deadline(
 
 const NEW_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$bmV3c2FsdG5ldw$bmV3aGFzaG5ldw";
 
-async fn reset_fixture(
+async fn pending_reset_fixture(
     db: &TestDatabase,
     env: &Env,
     scope: Scope,
@@ -616,6 +621,48 @@ async fn reset_fixture(
         .unwrap()
         .unwrap();
     (subject, recovery, challenge)
+}
+
+// Isolated store tests explicitly simulate adapter acceptance. Actual SMTP
+// transport tests are separate; this helper is not evidence of delivered mail.
+async fn reset_fixture(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+) -> (
+    ironauth_store::UserId,
+    ironauth_store::RecoveryFlowId,
+    ironauth_store::PasswordResetChallenge,
+) {
+    let fixture = pending_reset_fixture(db, env, scope).await;
+    record_reset_delivery(
+        db,
+        env,
+        &fixture.2.id,
+        ironauth_store::PasswordResetDelivery::Accepted,
+        1,
+    )
+    .await
+    .unwrap();
+    fixture
+}
+
+async fn record_reset_delivery(
+    db: &TestDatabase,
+    env: &Env,
+    id: &PasswordResetChallengeId,
+    result: ironauth_store::PasswordResetDelivery,
+    channels: u32,
+) -> Result<(), ironauth_store::StoreError> {
+    db.store()
+        .scoped(id.scope())
+        .acting(
+            db.test_actor(env),
+            ironauth_store::CorrelationId::generate(env),
+        )
+        .password_reset()
+        .record_delivery(env, id, result, channels)
+        .await
 }
 
 async fn complete_reset(
@@ -1518,5 +1565,218 @@ async fn reset_completion_racing_password_change_never_overwrites_the_later_gene
             .await
             .unwrap(),
         PasswordResetOutcome::Refused
+    );
+}
+
+#[tokio::test]
+async fn reset_completion_requires_durable_acceptance_of_required_notifications() {
+    use ironauth_store::{PasswordResetDelivery, PasswordResetOutcome, StoreError};
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (subject, _, challenge) = pending_reset_fixture(&db, &env, scope).await;
+    assert_eq!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .unwrap(),
+        PasswordResetOutcome::Refused
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .password_hash_for_subject(&subject)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(HASH)
+    );
+    assert!(matches!(
+        record_reset_delivery(&db, &env, &challenge.id, PasswordResetDelivery::Accepted, 0).await,
+        Err(StoreError::Invalid)
+    ));
+    record_reset_delivery(&db, &env, &challenge.id, PasswordResetDelivery::Accepted, 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        record_reset_delivery(&db, &env, &challenge.id, PasswordResetDelivery::Accepted, 1).await,
+        Err(StoreError::Conflict)
+    ));
+    assert!(matches!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .unwrap(),
+        PasswordResetOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .audit()
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row.action == "password_reset.delivery")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn reset_refused_or_uncertain_delivery_cannot_be_relabelled_as_accepted() {
+    use ironauth_store::{PasswordResetDelivery, PasswordResetOutcome, StoreError};
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    for delivery in [
+        PasswordResetDelivery::Refused,
+        PasswordResetDelivery::Uncertain,
+    ] {
+        let scope = db.seed_scope(&env).await;
+        let (subject, _, challenge) = pending_reset_fixture(&db, &env, scope).await;
+        record_reset_delivery(&db, &env, &challenge.id, delivery, 0)
+            .await
+            .unwrap();
+        assert!(matches!(
+            record_reset_delivery(&db, &env, &challenge.id, PasswordResetDelivery::Accepted, 1)
+                .await,
+            Err(StoreError::Conflict)
+        ));
+        assert_eq!(
+            complete_reset(&db, &env, &challenge, true, 9)
+                .await
+                .unwrap(),
+            PasswordResetOutcome::Refused
+        );
+        assert_eq!(
+            db.store()
+                .scoped(scope)
+                .users()
+                .password_hash_for_subject(&subject)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(HASH)
+        );
+        let row = sqlx::query(
+            "SELECT delivery_state,attempt_count FROM password_reset_challenges WHERE id=$1",
+        )
+        .bind(challenge.id.to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("delivery_state"), delivery.as_str());
+        assert_eq!(row.get::<i32, _>("attempt_count"), 0);
+    }
+}
+
+#[tokio::test]
+async fn reset_undelivered_decoy_still_has_the_same_wrong_code_attempt_budget() {
+    use ironauth_store::PasswordResetOutcome;
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = PasswordResetChallengeId::generate(&env, &scope);
+    start_reset(&db, &env, &id, None).await.unwrap();
+    let challenge = db
+        .store()
+        .scoped(scope)
+        .password_reset()
+        .challenge(&env, &id, &[3; 32])
+        .await
+        .unwrap()
+        .unwrap();
+    for _ in 0..6 {
+        assert_eq!(
+            complete_reset(&db, &env, &challenge, false, 9)
+                .await
+                .unwrap(),
+            PasswordResetOutcome::Refused
+        );
+    }
+    let count: i32 =
+        sqlx::query_scalar("SELECT attempt_count FROM password_reset_challenges WHERE id=$1")
+            .bind(id.to_string())
+            .fetch_one(db.owner_pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 5);
+}
+
+#[tokio::test]
+async fn reset_delivery_audit_failure_rolls_back_acceptance_and_retry_commits_once() {
+    use ironauth_store::{CorrelationId, PasswordResetDelivery, PasswordResetOutcome, StoreError};
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let foreign = db.seed_scope(&env).await;
+    let (_, _, challenge) = pending_reset_fixture(&db, &env, scope).await;
+    assert!(matches!(
+        db.store()
+            .scoped(foreign)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .password_reset()
+            .record_delivery(&env, &challenge.id, PasswordResetDelivery::Accepted, 1)
+            .await,
+        Err(StoreError::NotFound)
+    ));
+    sqlx::raw_sql("CREATE FUNCTION reject_delivery_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.action='password_reset.delivery' THEN RAISE EXCEPTION 'injected delivery audit failure'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER reject_delivery_audit BEFORE INSERT ON audit_log FOR EACH ROW EXECUTE FUNCTION reject_delivery_audit();")
+        .execute(db.owner_pool()).await.unwrap();
+    assert!(
+        record_reset_delivery(&db, &env, &challenge.id, PasswordResetDelivery::Accepted, 1)
+            .await
+            .is_err()
+    );
+    let row = sqlx::query("SELECT delivery_state,notified_channels,delivery_finished_at IS NULL AS unfinished FROM password_reset_challenges WHERE id=$1")
+        .bind(challenge.id.to_string()).fetch_one(db.owner_pool()).await.unwrap();
+    assert_eq!(row.get::<String, _>("delivery_state"), "pending");
+    assert_eq!(row.get::<i32, _>("notified_channels"), 0);
+    assert!(row.get::<bool, _>("unfinished"));
+    assert_eq!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .unwrap(),
+        PasswordResetOutcome::Refused
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .audit()
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row.action == "password_reset.delivery")
+            .count(),
+        0
+    );
+    sqlx::raw_sql(
+        "DROP TRIGGER reject_delivery_audit ON audit_log; DROP FUNCTION reject_delivery_audit();",
+    )
+    .execute(db.owner_pool())
+    .await
+    .unwrap();
+    // Retry persisting the already observed transport result, not sending mail again.
+    record_reset_delivery(&db, &env, &challenge.id, PasswordResetDelivery::Accepted, 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .unwrap(),
+        PasswordResetOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .audit()
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row.action == "password_reset.delivery")
+            .count(),
+        1
     );
 }

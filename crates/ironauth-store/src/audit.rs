@@ -1565,6 +1565,8 @@ pub enum Action {
     RecipientVerificationStart,
     /// A browser-bound password-reset challenge was stored, without claiming delivery.
     PasswordResetStart,
+    /// A terminal delivery outcome was recorded without message content.
+    PasswordResetDelivery,
     /// A reset attempt consumed its bounded budget without changing a credential.
     PasswordResetAttempt,
     /// Reset proof, credential and completion receipt committed together.
@@ -2082,6 +2084,7 @@ impl Action {
             Action::EmailOtpSend => "email_otp.send",
             Action::PasswordResetAttempt => "password_reset.attempt",
             Action::PasswordResetComplete => "password_reset.complete",
+            Action::PasswordResetDelivery => "password_reset.delivery",
             Action::PasswordResetStart => "password_reset.start",
             Action::RecipientVerificationStart => "recipient_verification.start",
             Action::RecipientIndexBackfill => "recipient_verification.index_backfill",

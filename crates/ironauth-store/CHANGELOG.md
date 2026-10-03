@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Require a durable accepted delivery result before hosted password reset completion or receipt replay (#1479). Pending, refused and uncertain delivery cannot authorize a reset; terminal delivery records are audited and cannot be relabelled through the repository. Hosted transport orchestration remains pending.
+
 - Add atomic hosted reset completion with current mailbox/credential/case revalidation, bounded attempts, delay enforcement and exact-request receipts (#1479). Password, recovery state, session and offline-family/grant revocation, trusted-device invalidation and audit commit together; no session or stronger-factor removal is granted. Hosted transport and UI remain pending.
 
 - Add audited browser-bound reset challenge issuance and reads, deriving verified ownership and credential generation from current store rows and enforcing a durable account resend cooldown (#1479). Issuance does not claim delivery or enable credential reset.

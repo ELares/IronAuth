@@ -116,7 +116,7 @@ use crate::message_rate::RateBudget;
 use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
 use crate::password_reset::{
     CompletePasswordReset, NewPasswordReset, PasswordResetAccount, PasswordResetChallenge,
-    PasswordResetOutcome,
+    PasswordResetDelivery, PasswordResetOutcome,
 };
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
 use crate::recipient_verification::{
@@ -20917,6 +20917,47 @@ impl ActingPasswordResetRepo<'_> {
 }
 
 impl ActingPasswordResetRepo<'_> {
+    /// Record one terminal transport result for a pending challenge. The caller
+    /// must aggregate the code and every required owner notice using actual
+    /// adapter acknowledgements, never a logging/no-op sender invocation.
+    /// No address, code, cancellation capability or server reply is persisted.
+    ///
+    /// # Errors
+    /// Invalid count, foreign scope, a late/duplicate result, or store failure.
+    pub async fn record_delivery(
+        &self,
+        env: &Env,
+        id: &PasswordResetChallengeId,
+        result: PasswordResetDelivery,
+        notified_channels: u32,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        if notified_channels > 32
+            || (result == PasswordResetDelivery::Accepted && notified_channels == 0)
+        {
+            return Err(StoreError::Invalid);
+        }
+        let scope = self.scope;
+        let now = epoch_micros(env.clock().now_utc());
+        write_audited(AuditedWrite {
+            store: self.store, scope, acting: &self.acting, env,
+            action: Action::PasswordResetDelivery, target: id,
+        }, async move |tx| {
+            recipient_ownership_lock(tx, scope).await?;
+            let updated = sqlx::query(
+                "UPDATE password_reset_challenges SET delivery_state=$4,notified_channels=$5, \
+                 delivery_finished_at=TIMESTAMPTZ 'epoch'+($6::text||' microseconds')::interval \
+                 WHERE tenant_id=$1 AND environment_id=$2 AND id=$3 AND state='pending' \
+                 AND delivery_state='pending' AND expires_at > TIMESTAMPTZ 'epoch'+($6::text||' microseconds')::interval",
+            ).bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
+            .bind(result.as_str()).bind(i64::from(notified_channels)).bind(now).execute(&mut **tx).await?;
+            if updated.rows_affected() != 1 { return Err(StoreError::Conflict); }
+            Ok(())
+        }, false).await
+    }
+
     /// Atomically consume reset proof, update the credential and revoke access.
     /// The caller has admitted hashing, verified the code, screened the new password
     /// and satisfied required recovery notification policy. This method rechecks
@@ -21178,7 +21219,8 @@ fn password_reset_decision(
                 == Some(&b.revision)
     });
     if state == "completed" {
-        return if spec.code_matched
+        return if row.get::<String, _>("delivery_state") == "accepted"
+            && spec.code_matched
             && same_owner
             && binding.is_some_and(|b| {
                 b.case_state == "completed"
@@ -21203,6 +21245,9 @@ fn password_reset_decision(
     }
     if !spec.code_matched {
         return ResetDecision::Failed(attempts == 4);
+    }
+    if row.get::<String, _>("delivery_state") != "accepted" {
+        return ResetDecision::Refused;
     }
     let Some(binding) = binding else {
         return ResetDecision::Failed(true);

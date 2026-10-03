@@ -197,3 +197,16 @@ a root HTTPS `server.public_url` and valid relay settings. The binary resolves
 credentials only when enabled and refuses startup if they cannot be read. The
 state availability method reports configured delivery, not tested relay reachability
 or a completed hosted reset. No live deployment has been enabled by this change.
+
+
+The reset challenge now records an audited terminal delivery result and accepted
+channel count before credential completion is permitted. Pending, refused and
+uncertain delivery cannot authorize completion or receipt replay. A terminal result
+cannot be relabelled through the repository; late results for an expired, cancelled
+or consumed challenge fail. Incorrect codes retain the same five-attempt budget
+for undelivered real and decoy challenges. Schema constraints also require accepted
+delivery for a completed challenge. The trusted hosted caller must aggregate actual
+transport acknowledgements for the code and every required owner notice; the
+existing recovery logging sender cannot establish this result. Store tests simulate
+adapter outcomes and do not establish actual notification delivery. Hosted wiring
+and delayed-case reissue with a usable cancellation action remain outstanding.

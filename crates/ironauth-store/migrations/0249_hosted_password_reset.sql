@@ -17,6 +17,19 @@ CREATE TABLE password_reset_challenges (
     credential_digest bytea,
     code_hash text NOT NULL CHECK (octet_length(code_hash) BETWEEN 1 AND 1024),
     attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 5),
+    -- Actual acceptance of the code and every required owner notification, never
+    -- a logging sender invocation. The adapter records one terminal send result.
+    delivery_state text NOT NULL DEFAULT 'pending'
+        CHECK (delivery_state IN ('pending', 'accepted', 'refused', 'uncertain')),
+    notified_channels integer NOT NULL DEFAULT 0 CHECK (notified_channels BETWEEN 0 AND 32),
+    delivery_finished_at timestamptz,
+    CONSTRAINT password_reset_delivery CHECK (
+        (delivery_state = 'pending' AND notified_channels = 0 AND delivery_finished_at IS NULL)
+        OR
+        (delivery_state <> 'pending' AND delivery_finished_at IS NOT NULL
+         AND delivery_finished_at >= created_at
+         AND (delivery_state <> 'accepted' OR notified_channels > 0))
+    ),
     state text NOT NULL DEFAULT 'pending'
         CHECK (state IN ('pending', 'completed', 'cancelled', 'refused')),
     created_at timestamptz NOT NULL,
@@ -48,7 +61,7 @@ CREATE TABLE password_reset_challenges (
          AND finished_at >= created_at
          AND completion_request_hash IS NULL AND completion_credential_digest IS NULL)
         OR
-        (state = 'completed' AND subject IS NOT NULL AND attempt_count > 0
+        (state = 'completed' AND delivery_state = 'accepted' AND subject IS NOT NULL AND attempt_count > 0
          AND finished_at IS NOT NULL AND finished_at >= created_at
          AND finished_at < expires_at
          AND completion_request_hash IS NOT NULL AND octet_length(completion_request_hash) = 32
@@ -71,4 +84,5 @@ CREATE POLICY password_reset_challenges_scope ON password_reset_challenges
        AND environment_id = current_setting('ironauth.environment_id', true));
 GRANT SELECT, INSERT, DELETE ON password_reset_challenges TO ironauth_app;
 GRANT UPDATE (attempt_count, state, finished_at, completion_request_hash,
-              completion_credential_digest) ON password_reset_challenges TO ironauth_app;
+              completion_credential_digest, delivery_state, notified_channels,
+              delivery_finished_at) ON password_reset_challenges TO ironauth_app;

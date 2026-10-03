@@ -77,3 +77,27 @@ pub enum PasswordResetOutcome {
         authorization_return_to: String,
     },
 }
+
+/// Terminal result of one actual reset-mail attempt. Only acceptance of the code
+/// and every required owner notice permits completion; uncertain mail is distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordResetDelivery {
+    /// Code and all required notices were accepted by the configured transport.
+    Accepted,
+    /// At least one required send was refused before acceptance.
+    Refused,
+    /// At least one required acceptance could not be established.
+    Uncertain,
+}
+
+impl PasswordResetDelivery {
+    /// Stable storage tag, never a raw transport response.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Refused => "refused",
+            Self::Uncertain => "uncertain",
+        }
+    }
+}
