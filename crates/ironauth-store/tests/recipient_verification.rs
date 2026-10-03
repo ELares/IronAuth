@@ -646,3 +646,196 @@ async fn reissue_replaces_an_active_challenge_and_keeps_one_row_per_subject() {
         "two starts and exactly one committed verification"
     );
 }
+
+async fn make_legacy(db: &TestDatabase, scope: Scope) {
+    sqlx::query("UPDATE users SET recipient_email_indexed = false, recipient_email_bidx = NULL WHERE tenant_id = $1 AND environment_id = $2")
+        .bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+        .execute(db.owner_pool()).await.expect("simulate pre-index retained rows");
+}
+
+async fn backfill(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    limit: u32,
+) -> Result<ironauth_store::RecipientIndexReport, StoreError> {
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .recipient_verification()
+        .index_backfill(env, limit, None)
+        .await
+}
+
+async fn retained_account_data(db: &TestDatabase, scope: Scope) -> Vec<serde_json::Value> {
+    sqlx::query_scalar("SELECT to_jsonb(u) - 'recipient_email_indexed' - 'recipient_email_bidx' FROM users u WHERE tenant_id = $1 AND environment_id = $2 ORDER BY id")
+        .bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+        .fetch_all(db.owner_pool()).await.expect("retained encrypted account data")
+}
+
+#[tokio::test]
+async fn legacy_index_batches_preserve_every_other_account_column_and_never_verify() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let foreign = db.seed_scope(&env).await;
+    let owner = signup(&db, &env, scope, EMAIL).await;
+    let retired = signup(&db, &env, scope, "retired@example.test").await;
+    signup(&db, &env, foreign, "foreign@example.test").await;
+    sqlx::query("UPDATE users SET deleted_at = now() WHERE id = $1")
+        .bind(retired.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("retained deleted fixture");
+    make_legacy(&db, scope).await;
+    make_legacy(&db, foreign).await;
+    let before = retained_account_data(&db, scope).await;
+    let foreign_before = retained_account_data(&db, foreign).await;
+    let preview = db
+        .control_store()
+        .scoped(scope)
+        .recipient_verification()
+        .index_preview(1)
+        .await
+        .expect("preview");
+    assert!(!preview.applied);
+    assert_eq!(
+        (
+            preview.total_users,
+            preview.unindexed_users,
+            preview.batch_users
+        ),
+        (2, 2, 1)
+    );
+    assert_eq!(audit_count(&db).await, 0);
+    let first = backfill(&db, &env, scope, 1).await.expect("first batch");
+    assert!(first.applied);
+    assert!(!first.index_complete);
+    assert_eq!(first.unindexed_users, 1);
+    let last = backfill(&db, &env, scope, 1)
+        .await
+        .expect("last batch includes deleted user");
+    assert!(last.index_complete);
+    assert_eq!(last.ambiguous_indexed_mailboxes, 0);
+    let empty = backfill(&db, &env, scope, 1)
+        .await
+        .expect("complete is repeatable");
+    assert_eq!(empty.batch_users, 0);
+    assert_eq!(retained_account_data(&db, scope).await, before);
+    assert_eq!(retained_account_data(&db, foreign).await, foreign_before);
+    let untouched = db
+        .control_store()
+        .scoped(foreign)
+        .recipient_verification()
+        .index_preview(100)
+        .await
+        .expect("foreign preview");
+    assert_eq!(untouched.unindexed_users, 1);
+    assert!(
+        !verified(&db, &owner, EMAIL).await,
+        "indexing is not verification"
+    );
+    assert_eq!(audit_count(&db).await, 3);
+    assert!(
+        issue(&db, &env, &owner, EMAIL).await.is_ok(),
+        "indexed unique owner can begin the real ceremony"
+    );
+    for limit in [0, 101, u32::MAX] {
+        assert!(matches!(
+            backfill(&db, &env, scope, limit).await,
+            Err(StoreError::Invalid)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn legacy_index_reports_unicode_primary_and_foreign_typed_ambiguity_without_merging() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let owner = signup(&db, &env, scope, EMAIL).await;
+    signup(&db, &env, scope, "Ｏwner@example.test").await;
+    let other = signup(&db, &env, scope, "other@example.test").await;
+    add_typed(&db, &env, &other, "OWNER@example.test", false).await;
+    make_legacy(&db, scope).await;
+    let before = retained_account_data(&db, scope).await;
+    let report = backfill(&db, &env, scope, 100)
+        .await
+        .expect("index ambiguous rows");
+    assert!(
+        report.index_complete,
+        "complete metadata does not promise unambiguous ownership"
+    );
+    assert_eq!(report.total_users, 3);
+    assert_eq!(report.ambiguous_indexed_mailboxes, 1);
+    assert_eq!(retained_account_data(&db, scope).await, before);
+    assert!(!verified(&db, &owner, EMAIL).await);
+    assert!(matches!(
+        issue(&db, &env, &owner, EMAIL).await,
+        Err(StoreError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn unreadable_legacy_identifier_rolls_back_batch_and_audit_and_runtime_cannot_write_indices()
+{
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let owner = signup(&db, &env, scope, EMAIL).await;
+    signup(&db, &env, scope, "another@example.test").await;
+    make_legacy(&db, scope).await;
+    let denied = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .recipient_verification()
+        .index_backfill(&env, 100, None)
+        .await;
+    match denied {
+        Err(StoreError::Database(error)) => assert_eq!(
+            error.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("42501")
+        ),
+        other => panic!("runtime role must receive SQL permission denial: {other:?}"),
+    }
+    let sealed: Vec<u8> = sqlx::query_scalar("SELECT identifier_sealed FROM users WHERE id = $1")
+        .bind(owner.to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("sealed fixture");
+    sqlx::query("UPDATE users SET identifier_sealed = $2 WHERE id = $1")
+        .bind(owner.to_string())
+        .bind(vec![0_u8; 50])
+        .execute(db.owner_pool())
+        .await
+        .expect("corrupt ciphertext fixture");
+    assert!(backfill(&db, &env, scope, 100).await.is_err());
+    assert!(
+        db.control_store()
+            .scoped(scope)
+            .recipient_verification()
+            .index_preview(100)
+            .await
+            .is_err()
+    );
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM users WHERE NOT recipient_email_indexed")
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("unchanged index count");
+    assert_eq!(remaining, 2);
+    assert_eq!(audit_count(&db).await, 0);
+    sqlx::query("UPDATE users SET identifier_sealed = $2 WHERE id = $1")
+        .bind(owner.to_string())
+        .bind(sealed)
+        .execute(db.owner_pool())
+        .await
+        .expect("repair fixture only");
+    assert!(
+        backfill(&db, &env, scope, 100)
+            .await
+            .expect("retry after repair")
+            .index_complete
+    );
+}

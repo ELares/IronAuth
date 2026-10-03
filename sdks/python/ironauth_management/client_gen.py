@@ -964,6 +964,14 @@ class Client:
         """DRY REPLAY a supplied context through a journey's plan (issue #91): evaluate the REAL step up and risk evaluators with EVERY write disabled and project the reachable path. Despite the POST verb this is READ ONLY / SIDE EFFECT FREE: it carries a context body but writes NO row anywhere (no flow, session, risk, jti, or trace row). The `POST` is only because the supplied context does not fit a URL. POST /v1/tenants/{tenant_id}/environments/{environment_id}/diagnostics/flow/dry-run."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/diagnostics/flow/dry-run", query, body)
 
+    def prepare_recipient_index(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Prepare the next bounded batch. Retry a lost response with the same key; use a new key to advance. No account is merged or marked email-verified. POST /v1/tenants/{tenant_id}/environments/{environment_id}/recipient-verification/index."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/recipient-verification/index", query, body)
+
+    def preview_recipient_index(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Preview a bounded batch by decrypting its retained primary identifiers. Like other management reads, this remains available for a soft-deleted environment. GET /v1/tenants/{tenant_id}/environments/{environment_id}/recipient-verification/index."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/recipient-verification/index", query, None)
+
     def probe_password_hashing(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Run the Argon2id tuning probe on this host and return a recommendation. POST /v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/password-hashing/probe", query, body)

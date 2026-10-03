@@ -83,8 +83,8 @@ verified identifier or change application access.
 
 Existing accounts are not presumed verified or indexed. The scoped store refuses
 recipient operations if primary-identifier indexing is incomplete or ownership
-is ambiguous. Controlled existing-scope backfill remains a required integration
-step; direct edits to verified flags or arbitrary OIDC claims are not substitutes.
+is ambiguous. Prepare existing scopes through the management API below; direct
+edits to verified flags or arbitrary OIDC claims are not substitutes.
 
 After verification, the relying party must obtain a fresh online result from
 `POST /t/{tenant}/e/{environment}/account/recipient-proof` using the current direct
@@ -97,6 +97,45 @@ claim as an indefinitely current assertion.
 
 The application still owns atomic invitation acceptance, permitted grants, audits
 and the saved destination. Mailbox verification alone grants none of those.
+
+## Preparing an existing environment
+
+Upgrade every identity-writing process before preparation. Apply migration 0247
+through the normal migration workflow. It grants only the control-plane role
+permission to update the two primary-recipient index columns; the serving role
+cannot rewrite them. Retained deleted users are included because their canonical
+identifiers still reserve ownership.
+
+1. Read `GET /v1/tenants/{tenant}/environments/{environment}/recipient-verification/index?limit=100`
+   with an unconfined environment-authorized credential carrying `management.read`. The
+   preview decrypts the next bounded batch without changing index or verification
+   data, and remains readable in a soft-deleted environment. It returns counts, never identifiers, hashes or mailbox addresses.
+2. Apply `POST` to the same path with `management.write_users`, fresh privilege
+   when sudo is configured, an `Idempotency-Key`, and the JSON body
+   `{"limit":100,"all_writers_upgraded":true}`. The acknowledgement records the
+   caller's rollout prerequisite; it is not server attestation of deployed binary
+   versions. The allowed batch size is 1 through 100, default 100.
+3. Retry a lost response using exactly the same key and body. A replay returns
+   the original batch result without advancing. Use a new key for each subsequent
+   batch until `unindexed_users` is zero. Each batch's index updates, audit entry
+   (`recipient_verification.index_backfill`) and replay receipt commit together.
+4. Inspect `ambiguous_indexed_mailboxes`. This covers currently indexed primary
+   and typed-email ownership; later batches can reveal further conflicts. The
+   operation never merges accounts, chooses an owner, rewrites credentials, or
+   marks a mailbox verified. `index_complete=true` means metadata coverage only.
+   Affected ambiguous accounts remain unable to obtain recipient proof.
+5. Complete the hosted mailbox ceremony and test a fresh relying-party proof.
+   A pre-existing verified flag alone does not satisfy that ceremony.
+
+Unreadable ciphertext aborts the entire batch, preserving all account data and
+its existing indexes. Repair its underlying key/data problem through the normal
+recovery process before retrying. A five-second per-statement timeout bounds
+queries and lock waits; failed requests do not commit partial batches. The
+preview/apply and normal identity writers share the scoped ownership lock.
+An older writer can introduce another unindexed user after preparation; current
+proof checks then fail closed again. A completed report is not a permanent
+readiness certificate. Credentials, permissions, unconfined scope, current environment
+liveness and configured privilege freshness are checked before a POST replay.
 
 ## Qualification boundaries
 

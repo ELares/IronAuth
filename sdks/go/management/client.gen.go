@@ -1660,6 +1660,20 @@ func (c *Client) PostFlowDryRun(tenant_id string, environment_id string, query u
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/diagnostics/flow/dry-run", query, body)
 }
 
+// PrepareRecipientIndex performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/recipient-verification/index.
+//
+// Prepare the next bounded batch. Retry a lost response with the same key; use a new key to advance. No account is merged or marked email-verified.
+func (c *Client) PrepareRecipientIndex(tenant_id string, environment_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/recipient-verification/index", query, body)
+}
+
+// PreviewRecipientIndex performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/recipient-verification/index.
+//
+// Preview a bounded batch by decrypting its retained primary identifiers. Like other management reads, this remains available for a soft-deleted environment.
+func (c *Client) PreviewRecipientIndex(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/recipient-verification/index", query, nil)
+}
+
 // ProbePasswordHashing performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe.
 //
 // Run the Argon2id tuning probe on this host and return a recommendation.

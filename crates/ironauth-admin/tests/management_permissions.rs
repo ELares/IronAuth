@@ -87,6 +87,8 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("listManagementKeys", ManagementPermission::Read),
     // The user surface: the first operations where the declaration is actually ENFORCED,
     // because unlike the credential surface these are reachable by a management key.
+    ("previewRecipientIndex", ManagementPermission::Read),
+    ("prepareRecipientIndex", ManagementPermission::WriteUsers),
     ("createUser", ManagementPermission::WriteUsers),
     ("deleteUser", ManagementPermission::WriteUsers),
     ("listUsers", ManagementPermission::Read),
@@ -844,6 +846,10 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
 /// the false coverage claim this list exists to prevent. Hand-maintained, and only for
 /// operations somebody actually checked.
 const PERMISSION_PROVEN: &[&str] = &[
+    // Actual scoped-key read/write permission directions and replay revocation in
+    // recipient_index::scoped_key_needs_current_permission_even_to_replay_and_cannot_cross_environments.
+    "previewRecipientIndex",
+    "prepareRecipientIndex",
     // delegated_admin::advisory_routes_require_their_specific_read_and_config_permissions
     "listSecurityAdvisories",
     "importSecurityAdvisories",
@@ -1178,12 +1184,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        252,
+        254,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        108,
+        110,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -1196,6 +1202,10 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
 /// The admin source, read at COMPILE time so this cannot be fooled by a working tree that
 /// differs from what was built.
 const ADMIN_SOURCES: &[(&str, &str)] = &[
+    (
+        "recipient_index.rs",
+        include_str!("../src/recipient_index.rs"),
+    ),
     // Listed the moment the module existed: a file NOT enumerated here is one this gate never
     // reads, so its classification comments and its gate calls could disagree silently.
     ("agents.rs", include_str!("../src/agents.rs")),

@@ -1034,3 +1034,8 @@ required-features = ["testing"]
 name = "scim_push_transport"
 path = "tests/scim_push_transport.rs"
 required-features = ["testing"]
+
+[[test]]
+name = "recipient_index"
+path = "tests/recipient_index.rs"
+required-features = ["testing"]

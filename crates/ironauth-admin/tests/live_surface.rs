@@ -3342,6 +3342,15 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/sms-otp/allowlist/44"),
         ),
         Case::empty(
+            "recipient_index.previewRecipientIndex", "GET",
+            format!("{base}/recipient-verification/index"),
+        ),
+        Case::json(
+            "recipient_index.prepareRecipientIndex", "POST",
+            format!("{base}/recipient-verification/index"),
+            &serde_json::json!({ "all_writers_upgraded": true, "limit": 1 }),
+        ),
+        Case::empty(
             "identifiers.getIdentifierUniqueness",
             "GET",
             format!("{base}/identifier-uniqueness"),

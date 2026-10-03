@@ -430,6 +430,8 @@ use crate::views::{
         crate::sessions::get_refresh_family,
         crate::consents::list_user_consents,
         crate::consents::revoke_user_consent,
+        crate::recipient_index::preview_recipient_index,
+        crate::recipient_index::prepare_recipient_index,
         crate::users::create_user,
         crate::users::list_users,
         crate::users::get_user,
@@ -537,6 +539,8 @@ use crate::views::{
         crate::sudo::elevate_sudo,
     ),
     components(schemas(
+        crate::recipient_index::RecipientIndexView,
+        crate::recipient_index::PrepareRecipientIndexRequest,
         ErrorBody,
         crate::scim_connections::ScimConnectionView,
         crate::scim_push_connections::ScimPushConnectionView,

@@ -156,6 +156,7 @@ mod provision;
 mod queues;
 mod quota;
 mod ratelimit;
+mod recipient_index;
 mod recovery_approvals;
 mod resource_servers;
 mod resource_types;
@@ -1262,6 +1263,10 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents/{client_id}/revoke",
             post(consents::revoke_user_consent),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/recipient-verification/index",
+            get(recipient_index::preview_recipient_index).post(recipient_index::prepare_recipient_index),
         )
         // Admin user CRUD, lifecycle, and external ids (issue #52). The static
         // suffixes (`/state`, `/external-id`) are siblings of the parameterized

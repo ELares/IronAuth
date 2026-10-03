@@ -557,3 +557,23 @@ never codes or tokens. POST start/verify/cancel require the exact Origin and a
 fresh direct session. Cancellation takes the ownership lock and audits challenge
 consumption atomically, without modifying established verification or sessions.
 Unknown request outcomes remain unknown in the UI; no automatic resend occurs.
+
+
+## Surface: existing-account recipient index management (issue #1475)
+
+Management GET previews and POST prepares at most 100 retained primary
+identifiers in the credential's exact environment, including soft-deleted users.
+It returns aggregate counts and never asserts that metadata is mailbox proof.
+
+| STRIDE | Threat | Control |
+| --- | --- | --- |
+| Spoofing | A foreign operator or scoped key prepares another environment | Operator-owned tenant/environment resolution, unconfined credential scope fence, read/write-users permissions; configured sudo freshness for writes |
+| Tampering | Supplied email, stale preview or mixed writers assigns ownership | No caller-supplied identity; decrypt stored current primary data under the shared ownership lock; same canonicalization as ordinary writers; unindexed or ambiguous current ownership blocks proof |
+| Repudiation | A lost reply advances twice or indices commit without audit | Required credential-scoped Idempotency-Key; atomic index, resolved response and audit transaction; concurrent duplicate rolls back before replay |
+| Information disclosure | Migration diagnostics reveal mailbox or sealed content | Aggregate response only; no raw identifier, blind index, code or key returned; persistence errors use normal redacted error handling |
+| Denial of service | Unbounded batch or lock wait blocks identity writes | Validated batch of 1 through 100; five-second per-statement timeout; partial batches roll back on failure; existing management headers are placeholders, not an enforced rate limit |
+| Elevation | Index completion grants verification or a replay bypasses revoked authority | Changes restricted to two control-role index columns; no verification, password, session or identity mutation; permissions, configured fresh privilege and live environment checked before replay |
+
+`all_writers_upgraded` is an explicit operator acknowledgement, not a server
+attestation of running versions. Ambiguity counts cover indexed rows only;
+completion does not repair conflicting owners or establish mailbox possession.

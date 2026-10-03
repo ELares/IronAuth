@@ -179,3 +179,16 @@ SQL checksum are accepted as a compatibility pair, without rewriting existing
 ledger rows. Forward repair 0243 validates the full guardrail view and retains
 its FIPS column, grants, owner and existing column positions. Every other changed
 checksum or unexpected view definition still refuses startup.
+
+
+### Controlled existing-scope index preparation (issue #1475)
+
+Migration 0247 and the documented management GET/POST
+`/v1/tenants/{tenant}/environments/{environment}/recipient-verification/index`
+provide the bounded preparation path. See [the operator workflow](../RECIPIENT-VERIFICATION.md#preparing-an-existing-environment).
+The store reuses current identifier decryption and canonicalization under the
+ownership lock and updates only primary-index metadata. An aggregate preview is
+not a durable authorization to mutate later; each apply reads current rows.
+Idempotent replay preserves the original batch result, and authorization/liveness
+are rechecked before returning it. Index completeness, unambiguous ownership,
+deliverability and verified mailbox possession remain separate requirements.

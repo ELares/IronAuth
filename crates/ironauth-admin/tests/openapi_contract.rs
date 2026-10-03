@@ -310,6 +310,8 @@ fn operation_ids_are_the_stable_set() {
             "pinFlowVersion",
             "planConfigPromotion",
             "postFlowDryRun",
+            "prepareRecipientIndex",
+            "previewRecipientIndex",
             "probePasswordHashing",
             "publishUsage",
             "purgeTenant",
@@ -527,6 +529,7 @@ fn every_post_documents_the_idempotency_key_header() {
         // Implemented all along, documented by nothing: both routes call
         // `required_key`, so the published spec omitted a header they REFUSE without.
         "addUserIdentifier",
+        "prepareRecipientIndex",
         "applyIdentifierUniqueness",
         "abandonMigrationRun",
         "rotateWebhookEndpointSecret",
@@ -709,6 +712,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/queues",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/quota/limits",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/recipient-verification/index",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/refresh-families/{family_id}",
@@ -815,6 +819,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/permissions",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/portal-links",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/recipient-verification/index",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/approve",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals/{flow_id}/reject",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules",
@@ -976,7 +981,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        313,
+        315,
         "the documented route count is pinned"
     );
 

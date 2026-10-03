@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add documented, permission-checked recipient-index preview and bounded preparation endpoints for existing environments, with atomic audited idempotency and current authorization before replay (issue #1475).
+
 - Refuse offline advisory imports into soft-deleted environments before parsing
   their body, matching the management write boundary and preserving read access.
 

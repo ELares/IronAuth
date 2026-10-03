@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add control-role-only bounded primary-recipient indexing for retained accounts, including deleted rows, with aggregate ambiguity reporting and atomic audit/replay receipts. Indexing never verifies or merges accounts (issue #1475).
+
 - Add audited, repeatable cancellation of the authenticated subject's pending recipient challenge without changing existing verified ownership (#1475).
 
 - Reconcile the recipient stack with published migrations 0241 and 0242 by assigning its new migrations 0243 through 0246. Repair the exact historical FIPS view collision without rewriting accepted ledger rows; retain the FIPS projection, existing view columns, ownership and grants on forward repair.

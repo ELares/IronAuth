@@ -20517,6 +20517,94 @@ async fn recipient_ownership_lock(
     Ok(())
 }
 
+// Index preparation is shared by preview/apply so a dry run decrypts the same
+// retained data that a write will examine. Never expose this secret-bearing type.
+struct RecipientIndexEntry {
+    id: String,
+    bidx: Option<Vec<u8>>,
+}
+
+async fn recipient_index_batch(
+    tx: &mut Transaction<'_, Postgres>,
+    master: &MasterKey,
+    scope: Scope,
+    limit: u32,
+) -> Result<Vec<RecipientIndexEntry>, StoreError> {
+    if !(1..=100).contains(&limit) {
+        return Err(StoreError::Invalid);
+    }
+    sqlx::query("SELECT set_config('statement_timeout', '5s', true)")
+        .execute(&mut **tx)
+        .await?;
+    recipient_ownership_lock(tx, scope).await?;
+    let rows = sqlx::query(
+        "SELECT id, identifier_sealed, pii_dek_version FROM users \
+         WHERE tenant_id = $1 AND environment_id = $2 AND NOT recipient_email_indexed \
+         ORDER BY id LIMIT $3 FOR UPDATE",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(i64::from(limit))
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut batch = Vec::with_capacity(rows.len());
+    for row in rows {
+        let version: i32 = row.get("pii_dek_version");
+        let dek = fetch_dek_by_version(tx, scope, master, version).await?;
+        let sealed: Vec<u8> = row.get("identifier_sealed");
+        let raw = String::from_utf8(dek.open(
+            &user_pii_seal_aad(scope, USER_IDENTIFIER_PURPOSE, version),
+            &Sealed::from_bytes(sealed)?,
+        )?)
+        .map_err(|_| StoreError::Encryption)?;
+        batch.push(RecipientIndexEntry {
+            id: row.get("id"),
+            bidx: primary_recipient_index(master, scope, &raw),
+        });
+    }
+    Ok(batch)
+}
+
+async fn recipient_index_report(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    batch: &[RecipientIndexEntry],
+    applied: bool,
+) -> Result<crate::RecipientIndexReport, StoreError> {
+    let row = sqlx::query(
+        "SELECT count(*) AS total, count(*) FILTER (WHERE NOT recipient_email_indexed) AS remaining \
+         FROM users WHERE tenant_id = $1 AND environment_id = $2",
+    ).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+    .fetch_one(&mut **tx).await?;
+    let remaining: i64 = row.get("remaining");
+    let ambiguous: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ( \
+           SELECT bidx FROM ( \
+             SELECT recipient_email_bidx AS bidx, id AS subject, true AS is_primary FROM users \
+               WHERE tenant_id = $1 AND environment_id = $2 AND recipient_email_indexed \
+               AND recipient_email_bidx IS NOT NULL \
+             UNION ALL \
+             SELECT canonical_bidx AS bidx, user_id AS subject, false AS is_primary FROM user_identifiers \
+               WHERE tenant_id = $1 AND environment_id = $2 AND identifier_type = 'email' \
+           ) owners GROUP BY bidx HAVING count(DISTINCT subject) > 1 \
+             OR count(*) FILTER (WHERE is_primary) > 1 OR count(*) FILTER (WHERE NOT is_primary) > 1 \
+         ) conflicts",
+    ).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+    .fetch_one(&mut **tx).await?;
+    Ok(crate::RecipientIndexReport {
+        applied,
+        batch_users: u32::try_from(batch.len()).map_err(|_| StoreError::Invalid)?,
+        batch_mailbox_users: u32::try_from(
+            batch.iter().filter(|entry| entry.bidx.is_some()).count(),
+        )
+        .map_err(|_| StoreError::Invalid)?,
+        total_users: row.get("total"),
+        unindexed_users: remaining,
+        ambiguous_indexed_mailboxes: ambiguous,
+        index_complete: remaining == 0,
+    })
+}
+
 struct RecipientOwner {
     bidx: Vec<u8>,
     email: String,
@@ -20606,6 +20694,23 @@ pub struct RecipientVerificationRepo<'a> {
 }
 
 impl RecipientVerificationRepo<'_> {
+    /// Inspect the next bounded legacy batch without changing indices or ownership.
+    /// Includes all retained users; ambiguous ownership is reported, never selected.
+    ///
+    /// # Errors
+    /// Invalid batch bound (1..=100), unreadable primary ciphertext, or a store failure.
+    pub async fn index_preview(
+        &self,
+        limit: u32,
+    ) -> Result<crate::RecipientIndexReport, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let batch = recipient_index_batch(&mut tx, master, self.scope, limit).await?;
+        let report = recipient_index_report(&mut tx, self.scope, &batch, false).await?;
+        tx.commit().await?;
+        Ok(report)
+    }
+
     /// Require an access token issued on a direct interactive authorization-code
     /// grant and a currently live, non-impersonated session. Exchange and machine
     /// grants cannot be mistaken for an invited person's own sign-in.
@@ -20748,6 +20853,44 @@ pub struct ActingRecipientVerificationRepo<'a> {
 }
 
 impl ActingRecipientVerificationRepo<'_> {
+    /// Index the next bounded legacy batch under the control-plane database grant.
+    /// Re-reads the current sealed identifiers under the ownership lock. Only the
+    /// two index columns change; verified flags, identities and credentials do not.
+    /// The response receipt and audit commit with the batch or all roll back.
+    ///
+    /// # Errors
+    /// Invalid bound, unreadable primary ciphertext, runtime role denial, store
+    /// failure or an idempotency race (the HTTP caller then replays the winner).
+    pub async fn index_backfill(
+        &self,
+        env: &Env,
+        limit: u32,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, crate::RecipientIndexReport>>,
+    ) -> Result<crate::RecipientIndexReport, StoreError> {
+        let scope = self.scope;
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let target = scope.environment();
+        write_audited(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env,
+                action: Action::RecipientIndexBackfill, target: &target },
+            async move |tx| {
+                let batch = recipient_index_batch(tx, master, scope, limit).await?;
+                for entry in &batch {
+                    let updated = sqlx::query(
+                        "UPDATE users SET recipient_email_bidx = $4, recipient_email_indexed = true \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                         AND NOT recipient_email_indexed",
+                    ).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+                    .bind(&entry.id).bind(&entry.bidx).execute(&mut **tx).await?;
+                    if updated.rows_affected() != 1 { return Err(StoreError::Conflict); }
+                }
+                let report = recipient_index_report(tx, scope, &batch, true).await?;
+                insert_resolved_idempotency(tx, idempotency, &report).await?;
+                Ok(report)
+            }, false,
+        ).await
+    }
+
     /// Cancel this authenticated subject's current challenge, including one whose
     /// send response was lost. Serializes with issue/verify and never clears an
     /// already established ownership proof. Repeating cancellation is harmless.

@@ -270,6 +270,7 @@ pub use promotion::{
     PromotionApplyError, PromotionOutcome, ResourceChange, collect_references,
     diff as diff_snapshots, evaluate_plan, plan_promotion, revision as promotion_revision,
 };
+pub use recipient_verification::RecipientIndexReport;
 pub use recipient_verification::{
     NewRecipientChallenge, RecipientAttempt, RecipientChallenge, VerifiedRecipient,
 };

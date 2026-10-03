@@ -1210,6 +1210,14 @@ fn user_cases(base: &str, ids: &Ids) -> Vec<Case> {
             body: None,
         },
         Case {
+            label: "recipient_index.prepareRecipientIndex",
+            method: "POST",
+            path: format!("{base}/recipient-verification/index"),
+            body: Some(body_of(
+                &serde_json::json!({ "all_writers_upgraded": true }),
+            )),
+        },
+        Case {
             label: "identifiers.applyIdentifierUniqueness",
             method: "POST",
             path: format!("{base}/identifier-uniqueness/apply"),
