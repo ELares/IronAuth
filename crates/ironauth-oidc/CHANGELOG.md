@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Use the platform certificate roots for recipient SMTP TLS without also compiling a bundled root store. TLS hostname and certificate validation remain mandatory (#1475).
+
 - Add the authenticated mailbox verification page with registered in-scope authorization continuation, current ownership on reload, honest send recovery and scoped cancellation (#1475).
 
 - Add a bounded TLS SMTP adapter for subject-bound recipient verification (#1475),

@@ -17,7 +17,7 @@ autotests = false
 
 [dependencies]
 # SMTP only; no HTTP client, pooling, tracing, or implicit message clock/entropy.
-lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "ring", "rustls-native-certs"] }
+lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "tokio1-rustls", "ring", "rustls-native-certs"] }
 httpdate = "1"
 # The delivery seam (`VerificationSender`) is held as `Arc<dyn ...>`, so it must stay
 # dyn-safe, and native `async fn` in traits is not. One method needs to await a
