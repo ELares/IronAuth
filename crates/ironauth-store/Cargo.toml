@@ -1187,3 +1187,8 @@ required-features = ["testing"]
 name = "dynamic_registration"
 path = "tests/dynamic_registration.rs"
 required-features = ["testing"]
+
+[[test]]
+name = "password_reset"
+path = "tests/password_reset.rs"
+required-features = ["testing"]

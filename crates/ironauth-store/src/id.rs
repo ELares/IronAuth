@@ -1536,6 +1536,15 @@ impl ScopedKind for RecipientChallengeKind {
     const PREFIX: &'static str = "rcp";
 }
 
+/// Marker for a hosted password-reset challenge (`prc_`, issue #1479).
+/// The handle is browser-bound and has an independent purpose-specific code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PasswordResetChallengeKind;
+impl ScopedKind for PasswordResetChallengeKind {
+    const PREFIX: &'static str = "prc";
+    const REDACT_DEBUG: bool = true;
+}
+
 /// Marker for a scanner-safe magic-link token (`mlk_`), one row in the per-user
 /// magic-link set (issue #68): the SHA-256 digest of a high-entropy bearer token,
 /// single-active per (subject, purpose), single-use. A tenant-scoped resource: the id
@@ -2316,6 +2325,9 @@ pub type AbuseBanId = ScopedId<AbuseBanKind>;
 pub type EmailOtpCodeId = ScopedId<EmailOtpCodeKind>;
 /// An authenticated recipient verification challenge (`rcp_`, issue #1436).
 pub type RecipientChallengeId = ScopedId<RecipientChallengeKind>;
+/// A browser-bound hosted password-reset challenge (`prc_`, issue #1479).
+/// This cannot be parsed as a login OTP or recipient-verification challenge.
+pub type PasswordResetChallengeId = ScopedId<PasswordResetChallengeKind>;
 /// A magic-link token identifier (`mlk_...`), one row in the per-user magic-link set
 /// and the scope-declaring routing handle embedded in the `ira_mlk_<id>~<secret>` wire
 /// token (issue #68). Its debug form redacts the payload (it is part of a bearer token).

@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add the scoped password-reset challenge schema and redacted typed identifiers, with bounded lifetime/attempts, immutable binding grants and completion-receipt constraints (#1479). This storage foundation does not enable the hosted reset ceremony.
+
 - Repair the missing control-role DELETE grant required by verified advisory projection replacement, through forward migration 0248; serving roles remain read-only.
 
 - Publish `security_advisory.imported` atomically with an offline verified projection replacement. The importing scope receives aggregate counts with explicit deployment-wide projection semantics; no advisory content enters the event (#1475 gate repair).

@@ -112,3 +112,14 @@ old-password refusal, new-password success, interrupted recovery and original
 Civio destination, with no implicit Civio membership or project grant. Retain the
 actual build, store, fixture and failures. An isolated inbox is not internet
 mail delivery; automated browser observations are not the required human study.
+
+## Storage implementation progress
+
+Migration 0249 and `PasswordResetChallengeId` introduce only the storage boundary.
+The table separates pending, completed, cancelled and refused metadata, requires
+an indivisible real-account binding, and bounds attempts and expiry. Real-store
+schema tests exercise forced row-level security and runtime column grants.
+Repository issuance/completion, atomic credential mutation, actual delivery and
+the hosted form remain unimplemented. A valid metadata row is not proof that a
+password was changed; only the future audited completion transaction may make
+that claim. No deployment is activated by this additive migration alone.
