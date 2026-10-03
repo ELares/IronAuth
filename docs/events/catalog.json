@@ -3116,6 +3116,31 @@
       "type": "scim_push_connection.deleted"
     },
     {
+      "domain": "security_advisory",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "advisory_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "deployment_global": {
+            "enum": [
+              true
+            ],
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "advisory_count",
+          "deployment_global"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "security_advisory.imported"
+    },
+    {
       "domain": "session",
       "payload_schema": {
         "additionalProperties": false,

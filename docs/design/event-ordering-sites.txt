@@ -95,6 +95,7 @@ crates/ironauth-store/src/repository.rs:remove_allowlist_country_with_event:1
 crates/ironauth-store/src/repository.rs:remove_with_event:5
 crates/ironauth-store/src/repository.rs:reorder:1
 crates/ironauth-store/src/repository.rs:reparent_with_event:1
+crates/ironauth-store/src/repository.rs:replace_all_with_event:1
 crates/ironauth-store/src/repository.rs:request_backup_with_event:1
 crates/ironauth-store/src/repository.rs:request_dead_letter_replay:1
 crates/ironauth-store/src/repository.rs:request_dead_letter_replay_with_event:2
