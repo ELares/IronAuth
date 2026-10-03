@@ -1160,3 +1160,33 @@ async fn reset_completion_revokes_offline_family_grant_and_remembered_device() {
         ironauth_store::SessionEndCause::PasswordChanged
     );
 }
+
+#[tokio::test]
+async fn reset_completion_refuses_a_held_case_without_its_delay_horizon() {
+    use ironauth_store::PasswordResetOutcome;
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (subject, recovery, challenge) = reset_fixture(&db, &env, scope).await;
+    sqlx::query("UPDATE recovery_flows SET state='held',hold_until=NULL WHERE id=$1")
+        .bind(recovery.to_string())
+        .execute(db.owner_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .unwrap(),
+        PasswordResetOutcome::Refused
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .password_hash_for_subject(&subject)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(HASH)
+    );
+}

@@ -21209,6 +21209,7 @@ fn password_reset_decision(
     };
     if !same_owner
         || binding.case_state == "completed"
+        || (binding.case_state == "held" && binding.hold_until.is_none())
         || row.get::<Option<Vec<u8>>, _>("credential_digest").as_ref()
             != Some(&binding.credential_digest)
     {
