@@ -742,3 +742,107 @@ async fn sign_in_after_reset(state: &OidcState, target: &str) {
         }
     }
 }
+
+#[tokio::test]
+async fn recovery_preserves_live_par_and_rejects_wrong_client_and_expired_context() {
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        1501,
+    );
+    let scope = db.seed_scope(&env).await;
+    let (smtp, mail) = fixture(Reply::Accepted, true).await;
+    let state = state(
+        &db,
+        &env,
+        scope,
+        Some(PasswordResetSmtpTransport {
+            smtp,
+            issuer: Url::parse("https://auth.example.test").unwrap(),
+            env: env.clone(),
+        }),
+    );
+    let (subject, client) = seed(&db, &state, scope).await;
+    let direct = resume(&client);
+    let (status, _, body) = call(
+        &state,
+        "POST",
+        "/par",
+        direct.strip_prefix("/authorize?").unwrap().to_owned(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let document: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let request_uri = document["request_uri"].as_str().unwrap();
+    let id = ironauth_store::PushedRequestId::parse_in_scope(
+        request_uri
+            .strip_prefix("urn:ietf:params:oauth:request_uri:")
+            .unwrap(),
+        &scope,
+    )
+    .unwrap();
+    let target = format!(
+        "/authorize?{}",
+        serde_urlencoded::to_string([
+            ("client_id", client.to_string()),
+            ("request_uri", request_uri.to_owned()),
+        ])
+        .unwrap()
+    );
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .set_require_pushed_authorization_requests(&env, &client, true)
+        .await
+        .unwrap();
+    for invalid in [
+        direct,
+        format!("{target}&client_id={client}"),
+        format!(
+            "/authorize?client_id={client}&request_uri=https%3A%2F%2Fforeign.example.test%2Frequest"
+        ),
+    ] {
+        let (status, headers, _) = request(&state, &invalid, OWNER, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!headers.contains_key(header::SET_COOKIE));
+    }
+    let other = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "other recovery client")
+        .await
+        .unwrap();
+    let wrong = target.replace(&client.to_string(), &other.to_string());
+    let (status, headers, _) = request(&state, &wrong, OWNER, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!headers.contains_key(header::SET_COOKIE));
+    let (status, headers, _) = request(&state, &target, OWNER, None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let browser = cookie(&headers);
+    let raw = tokio::time::timeout(Duration::from_secs(5), mail)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    complete_from_mail(&state, &db, &subject, &browser, &raw).await;
+    sign_in_after_reset(&state, &target).await;
+    assert!(
+        db.store()
+            .scoped(scope)
+            .pushed_authorization_requests()
+            .read(&env, &id, &client.to_string())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    clock.advance(Duration::from_secs(
+        document["expires_in"].as_u64().unwrap() + 1,
+    ));
+    let (status, headers, _) = request(&state, &target, OWNER, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!headers.contains_key(header::SET_COOKIE));
+}

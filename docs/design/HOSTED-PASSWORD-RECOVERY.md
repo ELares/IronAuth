@@ -564,3 +564,20 @@ login handler: the old password creates no session, while the new password issue
 the normal session cookie and redirects to the original authorization URL. The
 reset response itself issues no session cookie. This is HTTP-level continuation
 evidence; it is not headed-browser, application callback or membership evidence.
+
+
+PAR qualification now pushes a real request through the main `/par` endpoint,
+uses its reference through recovery, receives the reset code over local TLS,
+completes the password change and signs in to the original authorization URL.
+The pushed request remains live and unconsumed until authorization. The fixture
+also rejects another client, duplicate client parameters, external request URIs,
+direct authorization when the client requires PAR, and an expired PAR reference.
+This does not prove successful application callback after a long recovery delay;
+PAR expiry remains authoritative and must not be silently extended.
+
+A remaining hosted usability gap was confirmed by reading the current recovery
+renderer: when optional proof-of-work is required, POST validates the proof but
+the recovery form has no challenge solver or proof fields. Reloading the form
+cannot satisfy that gate. The built-in solver and its browser qualification are
+required before enabling that policy in this hosted ceremony. External challenge
+widgets require their own explicit client integration; none is claimed here.
