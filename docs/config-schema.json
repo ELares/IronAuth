@@ -2438,7 +2438,7 @@
       "properties": {
         "enabled": {
           "default": false,
-          "description": "Install actual TLS delivery. The default is disabled.",
+          "description": "Install actual TLS delivery and the durable completion-notice worker.\nRequires a mounted OIDC plane and a working control-plane connection for\ndelivery scope enumeration (`admin.control_database_url`, or the database\nfallback in dev mode). Startup refuses activation if those prerequisites\nfail. The default is disabled.",
           "type": "boolean"
         },
         "smtp": {

@@ -76,7 +76,11 @@ fn dns_name(value: &str) -> bool {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct PasswordRecoveryConfig {
-    /// Install actual TLS delivery. The default is disabled.
+    /// Install actual TLS delivery and the durable completion-notice worker.
+    /// Requires a mounted OIDC plane and a working control-plane connection for
+    /// delivery scope enumeration (`admin.control_database_url`, or the database
+    /// fallback in dev mode). Startup refuses activation if those prerequisites
+    /// fail. The default is disabled.
     pub enabled: bool,
     /// Deployment-owned relay and secret references.
     pub smtp: Option<RecipientSmtpSettings>,

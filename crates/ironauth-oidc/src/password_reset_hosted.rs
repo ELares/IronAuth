@@ -469,7 +469,7 @@ mod tests {
         use tower::ServiceExt;
         let env = ironauth_env::Env::system();
         // No database is started: these refusals must happen before any store read.
-        let pool = sqlx::postgres::PgPoolOptions::new()
+        let pool = sqlx::postgres::PgPoolOptions::new() // request-path-connection-allow: cfg(test) lazy fixture proves refusal before any database access; never compiled into request handlers.
             .connect_lazy("postgres://localhost/unused")
             .unwrap();
         let registry = crate::issuer::IssuerRegistry::new(
