@@ -715,6 +715,85 @@ pub async fn initiate_recovery(
     }
 }
 
+/// Prepared lost-password case and a fresh cancellation capability for issuance.
+/// Never logged or serialized. The caller must store the digest on its new reset
+/// challenge and deliver the URL only to store-owned verified channels.
+pub struct PreparedPasswordResetCase {
+    /// Pending case returned by the atomic preparation transaction.
+    pub id: RecoveryFlowId,
+    /// Digest for the per-challenge cancellation alias.
+    pub cancellation_digest: [u8; 32],
+    /// Fresh provider-origin cancellation action naming that same case.
+    pub cancellation_url: String,
+}
+
+/// Apply current risk and strongest-factor delay policy, then atomically prepare
+/// or reuse a verified password-holder's standard lost-password case. No logging
+/// sender is called and no notification is claimed. Suppression is internal;
+/// the hosted request must use the same public ceremony for ineligible accounts.
+pub async fn prepare_password_reset_case(
+    state: &OidcState,
+    scope: Scope,
+    subject: &UserId,
+    client_ip: Option<&str>,
+) -> Option<PreparedPasswordResetCase> {
+    if subject.scope() != scope || !state.password_recovery_delivery_available() {
+        return None;
+    }
+    let proven = crate::recovery_proof::from_notified_channel(scope, *subject);
+    let recover_acr = proven.factor().strength_acr();
+    let directive = state.evaluate_recovery_risk(&RiskEvent {
+        scope,
+        subject,
+        entry_point: RecoveryEntryPoint::LostPassword,
+        recover_acr,
+        client_ip,
+    });
+    if directive == RiskDirective::Block {
+        return None;
+    }
+    let strongest = account_strength_acr(state, scope, subject).await;
+    let delayed = directive == RiskDirective::ForceDelay
+        || !step_up::acr_satisfies(recover_acr, strongest, &state.acr_order());
+    let settings = state.recovery_settings();
+    let delay = if delayed { settings.delay_secs } else { 0 };
+    let delay_micros = i64::try_from(delay).ok()?.checked_mul(1_000_000)?;
+    let cooldown_micros = i64::try_from(settings.cooldown_secs)
+        .ok()?
+        .checked_mul(1_000_000)?;
+    let proposed = RecoveryFlowId::generate(state.env(), &scope);
+    let initial_token = generate_cancel_token(state, &proposed);
+    let initial_digest: [u8; 32] = cancel_token_digest(&initial_token).try_into().ok()?;
+    let id = state
+        .store()
+        .scoped(scope)
+        .acting(
+            ironauth_store::ActorRef::human(ironauth_store::HumanId::generate(state.env())),
+            CorrelationId::generate(state.env()),
+        )
+        .password_reset()
+        .prepare_case(
+            state.env(),
+            ironauth_store::PreparePasswordResetCase {
+                id: &proposed,
+                subject,
+                cancellation_token_digest: &initial_digest,
+                delay_micros,
+                cooldown_micros,
+            },
+        )
+        .await
+        .ok()?;
+    // Reuse can return a different ID. Every challenge gets its own fresh secret
+    // naming the actual case, without invalidating any previous cancellation link.
+    let token = generate_cancel_token(state, &id);
+    Some(PreparedPasswordResetCase {
+        id,
+        cancellation_digest: cancel_token_digest(&token).try_into().ok()?,
+        cancellation_url: cancel_link(state, &token),
+    })
+}
+
 /// The anti-timing DECOY for an UNKNOWN recovery identifier (issue #81 MEDIUM-1). A KNOWN
 /// identifier runs [`initiate_recovery`]: a risk-seam call + the cooldown COUNT + the
 /// strongest-factor projection + the channel fan-out read + a flow INSERT + N sends. An

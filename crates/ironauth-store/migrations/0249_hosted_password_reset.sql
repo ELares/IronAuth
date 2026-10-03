@@ -95,3 +95,9 @@ GRANT SELECT, INSERT, DELETE ON password_reset_challenges TO ironauth_app;
 GRANT UPDATE (attempt_count, state, finished_at, completion_request_hash,
               completion_credential_digest, delivery_state, notified_channels,
               delivery_finished_at, delivery_started_at) ON password_reset_challenges TO ironauth_app;
+
+-- Persist the policy duration separately from the absolute, notification-anchored
+-- horizon. Reusing a case must not mistake mail latency for its required delay.
+ALTER TABLE recovery_flows ADD COLUMN password_reset_delay_us bigint
+    CHECK (password_reset_delay_us >= 0);
+GRANT UPDATE (password_reset_delay_us) ON recovery_flows TO ironauth_app;

@@ -1565,6 +1565,8 @@ pub enum Action {
     RecipientVerificationStart,
     /// A browser-bound password-reset challenge was stored, without claiming delivery.
     PasswordResetStart,
+    /// Prepare or strengthen a lost-password case without sending mail.
+    PasswordResetCasePrepare,
     /// A terminal delivery outcome was recorded without message content.
     PasswordResetDelivery,
     /// Claim one hosted reset delivery attempt before any external send.
@@ -2089,6 +2091,7 @@ impl Action {
             Action::PasswordResetDelivery => "password_reset.delivery",
             Action::PasswordResetDeliveryStarted => "password_reset.delivery_started",
             Action::PasswordResetStart => "password_reset.start",
+            Action::PasswordResetCasePrepare => "password_reset.case_prepare",
             Action::RecipientVerificationStart => "recipient_verification.start",
             Action::RecipientIndexBackfill => "recipient_verification.index_backfill",
             Action::RecipientVerificationCancel => "recipient_verification.cancel",

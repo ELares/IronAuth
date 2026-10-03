@@ -13,6 +13,22 @@ pub struct PasswordResetAccount<'a> {
     pub recovery: &'a RecoveryFlowId,
 }
 
+/// Server-derived policy for preparing or reusing a lost-password recovery case.
+/// No Debug/serialization; cancellation input is only a high-entropy token digest.
+pub struct PreparePasswordResetCase<'a> {
+    /// Proposed fresh case ID, used only when no pending case can be reused.
+    pub id: &'a RecoveryFlowId,
+    /// Resolved subject, whose current eligibility is checked transactionally.
+    pub subject: &'a UserId,
+    /// Digest of a fresh cancellation token naming the proposed case ID.
+    pub cancellation_token_digest: &'a [u8; 32],
+    /// Required notified waiting period from current risk/factor policy; zero
+    /// means no new delay. A previously required delay is never shortened.
+    pub delay_micros: i64,
+    /// Minimum interval between new recovery cases; resend has its own cooldown.
+    pub cooldown_micros: i64,
+}
+
 /// A new browser-bound ceremony. No plaintext password, code or binding secret.
 pub struct NewPasswordReset<'a> {
     /// Fresh scoped handle.

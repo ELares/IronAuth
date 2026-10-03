@@ -117,6 +117,7 @@ use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
 use crate::password_reset::{
     CompletePasswordReset, NewPasswordReset, PasswordResetAccount, PasswordResetChallenge,
     PasswordResetContext, PasswordResetDelivery, PasswordResetOutcome, PasswordResetReceipt,
+    PreparePasswordResetCase,
 };
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
 use crate::recipient_verification::{
@@ -20933,6 +20934,191 @@ pub struct ActingPasswordResetRepo<'a> {
 }
 
 impl ActingPasswordResetRepo<'_> {
+    /// Create or reuse the pending standard lost-password case under the shared
+    /// ownership/account locks. Reuse preserves cancellation and notified delay;
+    /// stricter server policy can only increase its required waiting period.
+    /// Eligibility and every case/audit change commit together. No mail is sent.
+    /// The caller evaluates risk first and generates a fresh case-bound cancel
+    /// token for the returned ID before issuing each challenge.
+    ///
+    /// # Errors
+    /// Foreign scope, ineligible account, invalid policy, cooldown or store failure.
+    pub async fn prepare_case(
+        &self,
+        env: &Env,
+        spec: PreparePasswordResetCase<'_>,
+    ) -> Result<RecoveryFlowId, StoreError> {
+        let scope = self.scope;
+        if spec.subject.scope() != scope || spec.id.scope() != scope {
+            return Err(StoreError::NotFound);
+        }
+        let now = epoch_micros(env.clock().now_utc());
+        if spec.delay_micros < 0
+            || spec.cooldown_micros < 0
+            || now.checked_add(spec.delay_micros).is_none()
+        {
+            return Err(StoreError::Invalid);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        recipient_ownership_lock(&mut tx, scope).await?;
+        let owner = current_recipient_owner(&mut tx, master, scope, spec.subject).await?;
+        let pending = sqlx::query(
+            "SELECT id,state,password_reset_delay_us, \
+             (extract(epoch FROM (hold_until-initiated_at))*1000000)::bigint AS legacy_delay_us \
+             FROM recovery_flows WHERE tenant_id=$1 AND environment_id=$2 AND subject=$3 \
+             AND method='standard' AND entry_point='lost_password' AND recover_acr='urn:ironauth:acr:pwd' \
+             AND state IN ('initiated','held') \
+             ORDER BY initiated_at DESC,id DESC LIMIT 1 FOR UPDATE",
+        ).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+        .bind(spec.subject.to_string()).fetch_optional(&mut *tx).await?;
+        let (id, changed, created) = if let Some(row) = pending {
+            let id = RecoveryFlowId::parse_in_scope(&row.get::<String, _>("id"), &scope)?;
+            let changed =
+                strengthen_password_reset_case(&mut tx, scope, &id, &row, spec.delay_micros, now)
+                    .await?;
+            (id, changed, false)
+        } else {
+            insert_password_reset_case(&mut tx, self.store, scope, env, &spec, &owner.email, now)
+                .await?;
+            (*spec.id, true, true)
+        };
+        // This reuses issuance's current verified owner, password-holder and case
+        // checks. Failure rolls back a newly inserted or strengthened case too.
+        current_password_reset_binding(
+            &mut tx,
+            master,
+            scope,
+            &PasswordResetAccount {
+                subject: spec.subject,
+                recovery: &id,
+            },
+        )
+        .await?;
+        if created {
+            insert_audit_row(
+                &mut tx,
+                &AuditedWrite {
+                    store: self.store,
+                    scope,
+                    acting: &self.acting,
+                    env,
+                    action: Action::RecoveryInitiate,
+                    target: &id,
+                },
+                Some("entry=lost_password;acr=urn:ironauth:acr:pwd;channels=0"),
+            )
+            .await?;
+        }
+        if changed {
+            insert_audit_row(
+                &mut tx,
+                &AuditedWrite {
+                    store: self.store,
+                    scope,
+                    acting: &self.acting,
+                    env,
+                    action: Action::PasswordResetCasePrepare,
+                    target: &id,
+                },
+                Some(if created {
+                    "created"
+                } else {
+                    "policy_strengthened"
+                }),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(id)
+    }
+}
+
+async fn insert_password_reset_case(
+    tx: &mut Transaction<'_, Postgres>,
+    store: &Store,
+    scope: Scope,
+    env: &Env,
+    spec: &PreparePasswordResetCase<'_>,
+    recipient: &str,
+    now: i64,
+) -> Result<(), StoreError> {
+    let recent: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM recovery_flows WHERE tenant_id=$1 AND environment_id=$2 \
+         AND subject=$3 AND initiated_at >= TIMESTAMPTZ 'epoch'+($4::text||' microseconds')::interval)",
+    ).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+    .bind(spec.subject.to_string()).bind(now.saturating_sub(spec.cooldown_micros))
+    .fetch_one(&mut **tx).await?;
+    if recent {
+        return Err(StoreError::Conflict);
+    }
+    let (version, dek) =
+        fetch_active_dek(tx, scope, store.master().ok_or(StoreError::Encryption)?).await?;
+    let sealed = dek.seal(
+        env.entropy(),
+        &recovery_recipient_seal_aad(scope, &spec.id.to_string(), version),
+        recipient.as_bytes(),
+    );
+    sqlx::query(
+        "INSERT INTO recovery_flows (id,tenant_id,environment_id,subject,state,entry_point,recover_acr, \
+         cancel_token_digest,recipient_sealed,pii_dek_version,initiated_at,hold_until,method,password_reset_delay_us) \
+         VALUES ($1,$2,$3,$4,$5,'lost_password','urn:ironauth:acr:pwd',$6,$7,$8, \
+         TIMESTAMPTZ 'epoch'+($9::text||' microseconds')::interval, \
+         CASE WHEN $10::bigint > 0 THEN TIMESTAMPTZ 'epoch'+(($9::bigint+$10)::text||' microseconds')::interval ELSE NULL END, \
+         'standard',$10)",
+    ).bind(spec.id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+    .bind(spec.subject.to_string()).bind(if spec.delay_micros > 0 { "held" } else { "initiated" })
+    .bind(spec.cancellation_token_digest.as_slice()).bind(sealed.into_bytes()).bind(version)
+    .bind(now).bind(spec.delay_micros).execute(&mut **tx).await?;
+    Ok(())
+}
+
+async fn strengthen_password_reset_case(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    id: &RecoveryFlowId,
+    row: &PgRow,
+    required: i64,
+    now: i64,
+) -> Result<bool, StoreError> {
+    let stored: Option<i64> = row.get("password_reset_delay_us");
+    let legacy: Option<i64> = row.get("legacy_delay_us");
+    if row.get::<String, _>("state") == "held" && legacy.is_none() {
+        return Err(StoreError::Conflict);
+    }
+    let previous = stored.or(legacy).unwrap_or(0);
+    if previous < 0 {
+        return Err(StoreError::Conflict);
+    }
+    let delay = previous.max(required);
+    if stored == Some(delay) {
+        return Ok(false);
+    }
+    // Total required wait is measured from the original accepted notification.
+    // Policy increases extend that horizon, while resends never restart it. A
+    // never-notified case remains provisional until record_delivery anchors it.
+    sqlx::query(
+        "UPDATE recovery_flows r SET password_reset_delay_us=$4, \
+         state=CASE WHEN $4 > 0 THEN 'held' ELSE state END, \
+         hold_until=CASE WHEN $4 > 0 THEN GREATEST(hold_until, \
+           COALESCE((SELECT min(p.delivery_finished_at) FROM password_reset_challenges p \
+             WHERE p.tenant_id=$1 AND p.environment_id=$2 AND p.recovery_id=r.id \
+             AND p.subject=r.subject AND p.delivery_state='accepted'), \
+             TIMESTAMPTZ 'epoch'+($5::text||' microseconds')::interval) \
+           +($4::text||' microseconds')::interval) ELSE hold_until END \
+         WHERE tenant_id=$1 AND environment_id=$2 AND id=$3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(id.to_string())
+    .bind(delay)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(true)
+}
+
+impl ActingPasswordResetRepo<'_> {
     /// Store a fresh challenge, deriving real-account authority under row locks.
     /// Return only the current store-owned delivery address, or None for a decoy.
     /// A one-minute durable per-account cooldown applies even after completion.
@@ -21458,14 +21644,20 @@ async fn anchor_reset_notification_delay(
     now: i64,
 ) -> Result<(), StoreError> {
     let row = sqlx::query(
-        "SELECT r.id,r.state,(extract(epoch FROM (r.hold_until-r.initiated_at))*1000000)::bigint AS delay_us \
+        "SELECT r.id,r.state,COALESCE(r.password_reset_delay_us, \
+         (extract(epoch FROM (r.hold_until-r.initiated_at))*1000000)::bigint) AS delay_us \
          FROM recovery_flows r JOIN password_reset_challenges p \
          ON p.tenant_id=r.tenant_id AND p.environment_id=r.environment_id \
          AND p.recovery_id=r.id AND p.subject=r.subject \
          WHERE p.tenant_id=$1 AND p.environment_id=$2 AND p.id=$3 \
          AND r.method='standard' AND r.entry_point='lost_password' FOR UPDATE OF r",
-    ).bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
-    .fetch_optional(&mut **tx).await?.ok_or(StoreError::Conflict)?;
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(StoreError::Conflict)?;
     let state: String = row.get("state");
     let delay: Option<i64> = row.get("delay_us");
     if !matches!(state.as_str(), "initiated" | "held")
@@ -21474,10 +21666,10 @@ async fn anchor_reset_notification_delay(
     {
         return Err(StoreError::Conflict);
     }
-    if delay.is_some() {
+    if delay.is_some_and(|value| value > 0) {
         sqlx::query(
             "UPDATE recovery_flows r SET hold_until=GREATEST(hold_until, \
-             TIMESTAMPTZ 'epoch'+($4::text||' microseconds')::interval+(hold_until-initiated_at)) \
+             TIMESTAMPTZ 'epoch'+($4::text||' microseconds')::interval+($5::text||' microseconds')::interval) \
              WHERE tenant_id=$1 AND environment_id=$2 AND id=$3 \
              AND NOT EXISTS (SELECT 1 FROM password_reset_challenges p WHERE p.tenant_id=$1 \
                AND p.environment_id=$2 AND p.recovery_id=r.id AND p.subject=r.subject \
@@ -21487,6 +21679,7 @@ async fn anchor_reset_notification_delay(
         .bind(scope.environment().to_string())
         .bind(row.get::<String, _>("id"))
         .bind(now)
+        .bind(delay)
         .execute(&mut **tx)
         .await?;
     }

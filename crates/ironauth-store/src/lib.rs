@@ -269,6 +269,7 @@ pub use org_policy::{
 pub use password_reset::{
     CompletePasswordReset, NewPasswordReset, PasswordResetAccount, PasswordResetChallenge,
     PasswordResetContext, PasswordResetDelivery, PasswordResetOutcome, PasswordResetReceipt,
+    PreparePasswordResetCase,
 };
 pub use pow_challenge::{NewPowChallenge, PowChallengeView};
 pub use promotion::{

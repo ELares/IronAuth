@@ -1790,12 +1790,65 @@ async fn reset_delivery_audit_failure_rolls_back_acceptance_and_retry_commits_on
     );
 }
 
+async fn start_case_reset(
+    db: &TestDatabase,
+    env: &Env,
+    id: &PasswordResetChallengeId,
+    subject: &ironauth_store::UserId,
+    case: &ironauth_store::RecoveryFlowId,
+) {
+    start_reset(
+        db,
+        env,
+        id,
+        Some(ironauth_store::PasswordResetAccount {
+            subject,
+            recovery: case,
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+async fn settle_reissued_case(
+    db: &TestDatabase,
+    env: &Env,
+    old_digest: &[u8],
+    challenge: &ironauth_store::PasswordResetChallenge,
+    cancel: bool,
+) {
+    use ironauth_store::{CorrelationId, PasswordResetOutcome, RecoveryCancelReason};
+    let scoped = db.store().scoped(challenge.id.scope());
+    if cancel {
+        let record = scoped
+            .recovery_flows()
+            .by_cancel_digest(old_digest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            scoped
+                .acting(db.test_actor(env), CorrelationId::generate(env))
+                .recovery_flows()
+                .cancel(env, &record.id, RecoveryCancelReason::UserNotification)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            complete_reset(db, env, challenge, true, 9).await.unwrap(),
+            PasswordResetOutcome::Refused
+        );
+    } else {
+        assert!(matches!(
+            complete_reset(db, env, challenge, true, 9).await.unwrap(),
+            PasswordResetOutcome::Completed { .. }
+        ));
+    }
+}
+
 #[tokio::test]
 async fn reset_reissue_preserves_case_delay_and_expired_code_cancellation_links() {
-    use ironauth_store::{
-        CorrelationId, PasswordResetAccount, PasswordResetDelivery, PasswordResetOutcome,
-        RecoveryCancelReason,
-    };
+    use ironauth_store::{PasswordResetDelivery, PasswordResetOutcome};
     use sha2::{Digest, Sha256};
     use std::time::{Duration, SystemTime};
     let db = TestDatabase::start().await;
@@ -1815,17 +1868,7 @@ async fn reset_reissue_preserves_case_delay_and_expired_code_cancellation_links(
         );
         clock.advance(Duration::from_secs(3601));
         let next = PasswordResetChallengeId::generate(&env, &scope);
-        start_reset(
-            &db,
-            &env,
-            &next,
-            Some(PasswordResetAccount {
-                subject: &subject,
-                recovery: &case,
-            }),
-        )
-        .await
-        .unwrap();
+        start_case_reset(&db, &env, &next, &subject, &case).await;
         record_reset_delivery(&db, &env, &next, PasswordResetDelivery::Accepted, 1)
             .await
             .unwrap();
@@ -1867,35 +1910,7 @@ async fn reset_reissue_preserves_case_delay_and_expired_code_cancellation_links(
                     .is_none()
             );
         }
-        if cancel {
-            let record = scoped
-                .recovery_flows()
-                .by_cancel_digest(&old_digest)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(
-                scoped
-                    .acting(db.test_actor(&env), CorrelationId::generate(&env))
-                    .recovery_flows()
-                    .cancel(&env, &record.id, RecoveryCancelReason::UserNotification)
-                    .await
-                    .unwrap()
-            );
-            assert_eq!(
-                complete_reset(&db, &env, &challenge, true, 9)
-                    .await
-                    .unwrap(),
-                PasswordResetOutcome::Refused
-            );
-        } else {
-            assert!(matches!(
-                complete_reset(&db, &env, &challenge, true, 9)
-                    .await
-                    .unwrap(),
-                PasswordResetOutcome::Completed { .. }
-            ));
-        }
+        settle_reissued_case(&db, &env, &old_digest, &challenge, cancel).await;
         for digest in [old_digest.as_slice(), new_digest.as_slice()] {
             assert!(
                 !scoped
@@ -1913,7 +1928,7 @@ async fn reset_reissue_preserves_case_delay_and_expired_code_cancellation_links(
 
 #[tokio::test]
 async fn reset_first_accepted_notice_starts_full_delay_and_resends_do_not_restart_it() {
-    use ironauth_store::{PasswordResetAccount, PasswordResetDelivery, PasswordResetOutcome};
+    use ironauth_store::{PasswordResetDelivery, PasswordResetOutcome};
     use std::time::{Duration, SystemTime};
     let db = TestDatabase::start().await;
     let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH + Duration::from_secs(1000), 1487);
@@ -1927,17 +1942,7 @@ async fn reset_first_accepted_notice_starts_full_delay_and_resends_do_not_restar
         .unwrap();
     clock.advance(Duration::from_secs(3601));
     let fresh = PasswordResetChallengeId::generate(&env, &scope);
-    start_reset(
-        &db,
-        &env,
-        &fresh,
-        Some(PasswordResetAccount {
-            subject: &subject,
-            recovery: &case,
-        }),
-    )
-    .await
-    .unwrap();
+    start_case_reset(&db, &env, &fresh, &subject, &case).await;
     let notified_hold = now_micros(&env) + 3_600_000_000;
     sqlx::raw_sql("CREATE FUNCTION reject_notice_audit() RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN IF NEW.action='password_reset.delivery' THEN RAISE EXCEPTION 'injected notice audit failure'; END IF; RETURN NEW; END $$;
@@ -1987,17 +1992,7 @@ async fn reset_first_accepted_notice_starts_full_delay_and_resends_do_not_restar
     // A resend inside the waiting period retains the first accepted notice's horizon.
     clock.advance(Duration::from_secs(61));
     let resend = PasswordResetChallengeId::generate(&env, &scope);
-    start_reset(
-        &db,
-        &env,
-        &resend,
-        Some(PasswordResetAccount {
-            subject: &subject,
-            recovery: &case,
-        }),
-    )
-    .await
-    .unwrap();
+    start_case_reset(&db, &env, &resend, &subject, &case).await;
     record_reset_delivery(&db, &env, &resend, PasswordResetDelivery::Accepted, 1)
         .await
         .unwrap();
@@ -2014,17 +2009,7 @@ async fn reset_first_accepted_notice_starts_full_delay_and_resends_do_not_restar
     // The final fresh code can complete exactly when the notified delay has elapsed.
     clock.advance(Duration::from_secs(3539));
     let ready = PasswordResetChallengeId::generate(&env, &scope);
-    start_reset(
-        &db,
-        &env,
-        &ready,
-        Some(PasswordResetAccount {
-            subject: &subject,
-            recovery: &case,
-        }),
-    )
-    .await
-    .unwrap();
+    start_case_reset(&db, &env, &ready, &subject, &case).await;
     record_reset_delivery(&db, &env, &ready, PasswordResetDelivery::Accepted, 1)
         .await
         .unwrap();
@@ -2282,5 +2267,380 @@ async fn reset_receipt_read_confirms_only_current_completed_exact_request_withou
         .await
         .unwrap()
         .is_none()
+    );
+}
+
+async fn prepare_case(
+    db: &TestDatabase,
+    env: &Env,
+    subject: &ironauth_store::UserId,
+    delay_micros: i64,
+) -> Result<ironauth_store::RecoveryFlowId, ironauth_store::StoreError> {
+    use ironauth_store::{CorrelationId, PreparePasswordResetCase, RecoveryFlowId};
+    use sha2::{Digest, Sha256};
+    let scope = subject.scope();
+    let id = RecoveryFlowId::generate(env, &scope);
+    // Fixture only: the hosted caller hashes a high-entropy case-bound token.
+    let digest: [u8; 32] = Sha256::digest(id.to_string()).into();
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .password_reset()
+        .prepare_case(
+            env,
+            PreparePasswordResetCase {
+                id: &id,
+                subject,
+                cancellation_token_digest: &digest,
+                delay_micros,
+                cooldown_micros: 60_000_000,
+            },
+        )
+        .await
+}
+
+#[tokio::test]
+async fn reset_case_preparation_serializes_creation_and_preserves_identity() {
+    use std::time::Duration;
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let subject = verified_account(&db, &env, scope).await;
+    let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            prepare_case(&db, &env, &subject, 0),
+            prepare_case(&db, &env, &subject, 0)
+        )
+    })
+    .await
+    .expect("case preparation must not deadlock");
+    let id = first.unwrap();
+    assert_eq!(id, second.unwrap());
+    assert_eq!(prepare_case(&db, &env, &subject, 0).await.unwrap(), id);
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM recovery_flows WHERE subject=$1")
+        .bind(subject.to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+    let actions = db.store().scoped(scope).audit().list().await.unwrap();
+    for action in ["recovery.initiate", "password_reset.case_prepare"] {
+        assert_eq!(actions.iter().filter(|row| row.action == action).count(), 1);
+    }
+    let flow = db
+        .store()
+        .scoped(scope)
+        .recovery_flows()
+        .get(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(flow.state, ironauth_store::RecoveryState::Initiated);
+    assert!(flow.hold_until_unix_micros.is_none());
+    let challenges: i64 = sqlx::query_scalar("SELECT count(*) FROM password_reset_challenges")
+        .fetch_one(db.owner_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        challenges, 0,
+        "preparation does not issue or deliver a code"
+    );
+}
+
+#[tokio::test]
+async fn reset_case_preparation_keeps_notified_delay_and_monotonic_policy() {
+    use ironauth_store::PasswordResetDelivery;
+    use sha2::{Digest, Sha256};
+    use std::time::{Duration, SystemTime};
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH + Duration::from_secs(1000), 1494);
+    let scope = db.seed_scope(&env).await;
+    let subject = verified_account(&db, &env, scope).await;
+    let case = prepare_case(&db, &env, &subject, 3_600_000_000)
+        .await
+        .unwrap();
+    clock.advance(Duration::from_secs(4000));
+    assert_eq!(
+        prepare_case(&db, &env, &subject, 3_600_000_000)
+            .await
+            .unwrap(),
+        case
+    );
+    let id = PasswordResetChallengeId::generate(&env, &scope);
+    start_case_reset(&db, &env, &id, &subject, &case).await;
+    let accepted_at = now_micros(&env);
+    record_reset_delivery(&db, &env, &id, PasswordResetDelivery::Accepted, 1)
+        .await
+        .unwrap();
+    let cases = db.store().scoped(scope).recovery_flows();
+    assert_eq!(
+        cases
+            .get(&case)
+            .await
+            .unwrap()
+            .unwrap()
+            .hold_until_unix_micros,
+        Some(accepted_at + 3_600_000_000)
+    );
+    clock.advance(Duration::from_secs(3601));
+    for delay in [3_600_000_000, 0] {
+        assert_eq!(
+            prepare_case(&db, &env, &subject, delay).await.unwrap(),
+            case
+        );
+        assert_eq!(
+            cases
+                .get(&case)
+                .await
+                .unwrap()
+                .unwrap()
+                .hold_until_unix_micros,
+            Some(accepted_at + 3_600_000_000)
+        );
+    }
+    assert_eq!(
+        prepare_case(&db, &env, &subject, 7_200_000_000)
+            .await
+            .unwrap(),
+        case
+    );
+    assert_eq!(
+        cases
+            .get(&case)
+            .await
+            .unwrap()
+            .unwrap()
+            .hold_until_unix_micros,
+        Some(accepted_at + 7_200_000_000)
+    );
+    let fresh = PasswordResetChallengeId::generate(&env, &scope);
+    start_case_reset(&db, &env, &fresh, &subject, &case).await;
+    record_reset_delivery(&db, &env, &fresh, PasswordResetDelivery::Accepted, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        cases
+            .get(&case)
+            .await
+            .unwrap()
+            .unwrap()
+            .hold_until_unix_micros,
+        Some(accepted_at + 7_200_000_000)
+    );
+    // Both old challenge cancellation aliases and the original case still exist.
+    for handle in [id.to_string(), fresh.to_string(), case.to_string()] {
+        assert_eq!(
+            cases
+                .by_cancel_digest(&Sha256::digest(handle))
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            case
+        );
+    }
+}
+
+#[tokio::test]
+async fn reset_case_preparation_rolls_back_ineligibility_audit_failure_and_respects_cooldown() {
+    use ironauth_store::{CorrelationId, RecoveryCancelReason, StoreError};
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acting = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let subject = acting
+        .users()
+        .register(&env, EMAIL, HASH, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        prepare_case(&db, &env, &subject, 0).await,
+        Err(StoreError::NotFound)
+    ));
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM recovery_flows")
+        .fetch_one(db.owner_pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    verify_reset_mailbox(&db, &env, &subject).await;
+    sqlx::raw_sql("CREATE FUNCTION reject_case_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.action='password_reset.case_prepare' THEN RAISE EXCEPTION 'injected case audit failure'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER reject_case_audit BEFORE INSERT ON audit_log FOR EACH ROW EXECUTE FUNCTION reject_case_audit();")
+        .execute(db.owner_pool()).await.unwrap();
+    assert!(prepare_case(&db, &env, &subject, 0).await.is_err());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM recovery_flows")
+        .fetch_one(db.owner_pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    sqlx::raw_sql(
+        "DROP TRIGGER reject_case_audit ON audit_log; DROP FUNCTION reject_case_audit();",
+    )
+    .execute(db.owner_pool())
+    .await
+    .unwrap();
+    let id = prepare_case(&db, &env, &subject, 0).await.unwrap();
+    assert!(
+        acting
+            .recovery_flows()
+            .cancel(&env, &id, RecoveryCancelReason::UserNotification)
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        prepare_case(&db, &env, &subject, 0).await,
+        Err(StoreError::Conflict)
+    ));
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .password_hash_for_subject(&subject)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(HASH)
+    );
+}
+
+#[tokio::test]
+async fn reset_case_preparation_cannot_commit_policy_change_without_audit_or_cross_scope() {
+    use ironauth_store::{CorrelationId, PreparePasswordResetCase, RecoveryFlowId, StoreError};
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let other = db.seed_scope(&env).await;
+    let subject = verified_account(&db, &env, scope).await;
+    let case = prepare_case(&db, &env, &subject, 0).await.unwrap();
+    let before = db
+        .store()
+        .scoped(scope)
+        .recovery_flows()
+        .get(&case)
+        .await
+        .unwrap()
+        .unwrap();
+    let proposed = RecoveryFlowId::generate(&env, &other);
+    assert!(matches!(
+        db.store()
+            .scoped(other)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .password_reset()
+            .prepare_case(
+                &env,
+                PreparePasswordResetCase {
+                    id: &proposed,
+                    subject: &subject,
+                    cancellation_token_digest: &[5; 32],
+                    delay_micros: 1_000_000,
+                    cooldown_micros: 0,
+                }
+            )
+            .await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        prepare_case(&db, &env, &subject, -1).await,
+        Err(StoreError::Invalid)
+    ));
+    sqlx::raw_sql("CREATE FUNCTION reject_case_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.action='password_reset.case_prepare' THEN RAISE EXCEPTION 'injected case audit failure'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER reject_case_audit BEFORE INSERT ON audit_log FOR EACH ROW EXECUTE FUNCTION reject_case_audit();")
+        .execute(db.owner_pool()).await.unwrap();
+    assert!(
+        prepare_case(&db, &env, &subject, 3_600_000_000)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .recovery_flows()
+            .get(&case)
+            .await
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    let duration: Option<i64> =
+        sqlx::query_scalar("SELECT password_reset_delay_us FROM recovery_flows WHERE id=$1")
+            .bind(case.to_string())
+            .fetch_one(db.owner_pool())
+            .await
+            .unwrap();
+    assert_eq!(duration, Some(0));
+    sqlx::raw_sql(
+        "DROP TRIGGER reject_case_audit ON audit_log; DROP FUNCTION reject_case_audit();",
+    )
+    .execute(db.owner_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        prepare_case(&db, &env, &subject, 3_600_000_000)
+            .await
+            .unwrap(),
+        case
+    );
+    let after = db
+        .store()
+        .scoped(scope)
+        .recovery_flows()
+        .get(&case)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, ironauth_store::RecoveryState::Held);
+    assert!(after.hold_until_unix_micros.is_some());
+    assert_eq!(
+        after.initiated_at_unix_micros,
+        before.initiated_at_unix_micros
+    );
+}
+
+#[tokio::test]
+async fn reset_case_preparation_does_not_inherit_a_stronger_recovery_proof() {
+    use ironauth_store::{
+        CorrelationId, NewRecoveryFlow, RecoveryEntryPoint, RecoveryFlowId, RecoveryMethod,
+    };
+    use std::time::{Duration, SystemTime};
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH + Duration::from_secs(1000), 1495);
+    let scope = db.seed_scope(&env).await;
+    let subject = verified_account(&db, &env, scope).await;
+    let strong = RecoveryFlowId::generate(&env, &scope);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .recovery_flows()
+        .initiate(
+            &env,
+            NewRecoveryFlow {
+                id: &strong,
+                subject: &subject,
+                entry_point: RecoveryEntryPoint::LostPassword,
+                recover_acr: "urn:ironauth:acr:mfa",
+                cancel_token_digest: &[6; 32],
+                recipient: EMAIL,
+                hold_until_unix_micros: None,
+                method: RecoveryMethod::Standard,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    clock.advance(Duration::from_secs(61));
+    let reset = prepare_case(&db, &env, &subject, 0).await.unwrap();
+    assert_ne!(reset, strong);
+    let cases = db.store().scoped(scope).recovery_flows();
+    assert_eq!(
+        cases.get(&strong).await.unwrap().unwrap().recover_acr,
+        "urn:ironauth:acr:mfa"
+    );
+    assert_eq!(
+        cases.get(&reset).await.unwrap().unwrap().recover_acr,
+        "urn:ironauth:acr:pwd"
     );
 }

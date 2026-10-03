@@ -297,3 +297,80 @@ async fn committed_http_receipt_survives_screening_outage_and_stricter_policy_wi
         Some(chosen_hash.as_str())
     );
 }
+
+#[derive(Debug)]
+struct FixedRecoveryRisk(crate::recovery::RiskDirective);
+
+impl crate::recovery::RiskEvaluator for FixedRecoveryRisk {
+    fn evaluate_recovery(
+        &self,
+        _: &crate::recovery::RiskEvent<'_>,
+    ) -> crate::recovery::RiskDirective {
+        self.0
+    }
+}
+
+#[tokio::test]
+async fn preparation_applies_risk_and_reuses_case_with_fresh_cancellation_alias() {
+    use crate::recovery::{RiskDirective, prepare_password_reset_case};
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let state = outage_state(&db, &env);
+    let hash = state.hash_password(&scope, CHOSEN).await.unwrap();
+    let subject = verified_subject(&db, &env, scope, &hash).await;
+    let before = db.store().scoped(scope).audit().list().await.unwrap().len();
+    let blocked = state
+        .clone()
+        .with_risk_evaluator(Arc::new(FixedRecoveryRisk(RiskDirective::Block)));
+    assert!(
+        prepare_password_reset_case(&blocked, scope, &subject, None)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        db.store().scoped(scope).audit().list().await.unwrap().len(),
+        before
+    );
+    let first = prepare_password_reset_case(&state, scope, &subject, None)
+        .await
+        .unwrap();
+    let forced = state.with_risk_evaluator(Arc::new(FixedRecoveryRisk(RiskDirective::ForceDelay)));
+    let next = prepare_password_reset_case(&forced, scope, &subject, None)
+        .await
+        .unwrap();
+    assert_eq!(first.id, next.id);
+    assert_ne!(first.cancellation_digest, next.cancellation_digest);
+    let flow = db
+        .store()
+        .scoped(scope)
+        .recovery_flows()
+        .get(&next.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(flow.state, ironauth_store::RecoveryState::Held);
+    assert!(flow.hold_until_unix_micros.is_some());
+    for prepared in [first, next] {
+        let url = url::Url::parse(&prepared.cancellation_url).unwrap();
+        assert_eq!(
+            url.origin().ascii_serialization(),
+            "https://auth.example.test"
+        );
+        assert_eq!(url.path(), "/recover/cancel");
+        let token = url
+            .query_pairs()
+            .find(|(key, _)| key == "token")
+            .unwrap()
+            .1
+            .into_owned();
+        assert_eq!(
+            crate::recovery::flow_id_from_cancel_token(&token),
+            Some(prepared.id.to_string().as_str())
+        );
+        assert_eq!(
+            crate::recovery::cancel_token_digest(&token),
+            prepared.cancellation_digest
+        );
+    }
+}

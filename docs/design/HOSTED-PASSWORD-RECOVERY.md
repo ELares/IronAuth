@@ -381,3 +381,39 @@ stricter password policy. Neither retry changes the verifier, adds an audit reco
 reflects submitted secrets, or issues a session cookie. This test simulates delivery
 acceptance and the initial committed transaction; it does not establish initial
 hosted issuance, SMTP delivery or the complete browser journey.
+
+
+Case preparation now serializes hosted requests under the shared ownership and
+account locks. It reuses the newest pending password-rung standard lost-password case and checks
+the same current verified-owner/password-holder binding as issuance. If no case
+exists, the configured new-case cooldown is checked inside that transaction and
+the recipient is selected from the stored primary address and sealed at rest.
+Ineligible accounts or audit failures roll back preparation. Reuse does not change
+case identity, original cancellation digest or initiation time. The code-issuance
+cooldown remains separate and still applies to every fresh challenge.
+
+The required delay duration is stored separately from the absolute horizon. Actual
+first accepted delivery anchors the full duration; ordinary resends preserve it
+even after the wait has elapsed. Stronger policy can increase the total required
+wait from the original accepted notification; weaker policy cannot shorten it.
+Legacy pending cases conservatively import their prior duration, and unnotified
+cases retain a provisional horizon until actual acceptance. Existing accepted
+notification evidence must remain available while the case is pending.
+
+The OIDC preparation helper evaluates current recovery risk and strongest-factor
+policy, suppresses blocked/ineligible requests internally, and creates a fresh
+high-entropy cancellation token naming the returned case. It calls no logging
+sender and claims no delivery. The request handler still needs to invoke it, bind
+its cancellation digest to a fresh challenge, and call actual delivery through the
+existing coordinator with an existence-uniform browser response.
+
+
+Real-store tests exercise concurrent case creation returning one identity, no-op
+reuse without duplicate initiation audits, preservation of expired/renewed-code
+cancellation aliases, acceptance-anchored delay, and stricter/weaker policy changes.
+They also cover rollback of ineligible creation and audit-failed policy updates,
+foreign scope, invalid delay and cancellation followed by new-case cooldown. The
+OIDC integration fixture verifies risk blocking before mutation, forced delay on
+the reused case, and fresh provider-origin cancellation tokens naming that case.
+These are preparation/receipt tests, not successful initial hosted issuance or
+actual reset-email delivery.

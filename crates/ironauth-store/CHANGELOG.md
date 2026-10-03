@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Prepare or reuse hosted lost-password cases atomically under account locks (#1479). Preserve cancellation and notified delay across resends, retain a monotonic policy duration, and roll back ineligible or unauditable preparation.
+
 - Add an independent read-only exact reset receipt check (#1479), sharing completion's current-owner/credential/case validation. Receipt confirmation needs no new password hash or screening result and cannot spend attempts or mutate credentials.
 
 - Add browser-bound reset presentation context with the stored client, continuation and exact code expiry (#1479). Navigation can survive code expiry within the original ten-minute browser window without extending proof or completion authority; account presence remains internal.
