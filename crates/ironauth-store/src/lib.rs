@@ -268,7 +268,7 @@ pub use org_policy::{
 };
 pub use password_reset::{
     CompletePasswordReset, NewPasswordReset, PasswordResetAccount, PasswordResetChallenge,
-    PasswordResetContext, PasswordResetDelivery, PasswordResetOutcome,
+    PasswordResetContext, PasswordResetDelivery, PasswordResetOutcome, PasswordResetReceipt,
 };
 pub use pow_challenge::{NewPowChallenge, PowChallengeView};
 pub use promotion::{

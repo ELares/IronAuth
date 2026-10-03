@@ -225,7 +225,7 @@ pub async fn reset_post(
     complete(&state, &attempt, &form).await
 }
 
-fn validate_input(state: &OidcState, form: &ResetForm) -> Result<String, String> {
+fn validate_input(form: &ResetForm) -> Result<String, String> {
     if form.code.len() != 8 || !form.code.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err("Enter the eight-digit recovery code.".to_owned());
     }
@@ -233,16 +233,48 @@ fn validate_input(state: &OidcState, form: &ResetForm) -> Result<String, String>
     if normalized != ironauth_screening::normalize_nfkc(&form.confirm_password) {
         return Err("The passwords do not match. Enter them again.".to_owned());
     }
-    let policy = state.password_policy();
-    policy
-        .evaluate(&normalized, ironauth_screening::FactorContext::SoleFactor)
-        .and_then(|()| policy.evaluate_strength(&normalized))
-        .map_err(|error| error.message())?;
     Ok(normalized)
 }
 
+async fn screen_new_password(
+    state: &OidcState,
+    attempt: &Attempt,
+    normalized: &str,
+) -> Result<(), Response> {
+    let policy = state.password_policy();
+    if let Err(error) = policy
+        .evaluate(normalized, ironauth_screening::FactorContext::SoleFactor)
+        .and_then(|()| policy.evaluate_strength(normalized))
+    {
+        return Err(form_page(
+            state,
+            attempt,
+            StatusCode::BAD_REQUEST,
+            Some(&error.message()),
+        ));
+    }
+    match state
+        .screen_password(&attempt.resume.scope, normalized)
+        .await
+    {
+        crate::state::ScreenDecision::Allowed => Ok(()),
+        crate::state::ScreenDecision::Breached => Err(form_page(
+            state,
+            attempt,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some(crate::state::BREACHED_PASSWORD_MESSAGE),
+        )),
+        crate::state::ScreenDecision::RefusedUnavailable => Err(form_page(
+            state,
+            attempt,
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some(crate::state::SCREENING_UNAVAILABLE_MESSAGE),
+        )),
+    }
+}
+
 async fn complete(state: &OidcState, attempt: &Attempt, form: &ResetForm) -> Response {
-    let normalized = match validate_input(state, form) {
+    let normalized = match validate_input(form) {
         Ok(value) => value,
         Err(message) => return form_page(state, attempt, StatusCode::BAD_REQUEST, Some(&message)),
     };
@@ -262,25 +294,6 @@ async fn complete(state: &OidcState, attempt: &Attempt, form: &ResetForm) -> Res
         Ok(None) => return notice(attempt, ResetNotice::UnavailableAttempt),
         Err(_) => return unavailable(),
     };
-    match state.screen_password(&scope, &normalized).await {
-        crate::state::ScreenDecision::Allowed => {}
-        crate::state::ScreenDecision::Breached => {
-            return form_page(
-                state,
-                attempt,
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Some(crate::state::BREACHED_PASSWORD_MESSAGE),
-            );
-        }
-        crate::state::ScreenDecision::RefusedUnavailable => {
-            return form_page(
-                state,
-                attempt,
-                StatusCode::SERVICE_UNAVAILABLE,
-                Some(crate::state::SCREENING_UNAVAILABLE_MESSAGE),
-            );
-        }
-    }
     let matched = match state
         .verify_password(&scope, &form.code, &challenge.code_hash)
         .await
@@ -288,6 +301,31 @@ async fn complete(state: &OidcState, attempt: &Attempt, form: &ResetForm) -> Res
         Ok(value) => value,
         Err(error) => return hash_rejection(state, attempt, &error),
     };
+    let request_hash = attempt
+        .binding
+        .completion_request_hash(&form.code, &normalized);
+    match state
+        .store()
+        .scoped(scope)
+        .password_reset()
+        .receipt(
+            state.env(),
+            ironauth_store::PasswordResetReceipt {
+                challenge: &challenge,
+                browser_binding_hash: &attempt.binding.binding_hash(),
+                code_matched: matched,
+                request_hash: &request_hash,
+            },
+        )
+        .await
+    {
+        Ok(Some(_)) => return notice(attempt, ResetNotice::Completed),
+        Ok(None) => {}
+        Err(_) => return unavailable(),
+    }
+    if let Err(response) = screen_new_password(state, attempt, &normalized).await {
+        return response;
+    }
     let hash = match state.hash_password(&scope, &normalized).await {
         Ok(value) => value,
         Err(error) => return hash_rejection(state, attempt, &error),
@@ -454,4 +492,6 @@ mod tests {
             assert!(!response.headers().contains_key(header::SET_COOKIE));
         }
     }
+    #[cfg(feature = "testing")]
+    mod store_receipt;
 }

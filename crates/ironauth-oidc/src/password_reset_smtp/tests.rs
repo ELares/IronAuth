@@ -30,7 +30,7 @@ fn config() -> RecipientSmtpConfig {
     }
 }
 
-fn code<'a>(id: &'a PasswordResetChallengeId, scope: Scope) -> PasswordResetMessage<'a> {
+fn code(id: &PasswordResetChallengeId, scope: Scope) -> PasswordResetMessage<'_> {
     PasswordResetMessage {
         challenge_id: id,
         scope,

@@ -74,6 +74,20 @@ pub struct CompletePasswordReset<'a> {
     pub request_hash: &'a [u8; 32],
 }
 
+/// Already-verified browser/code proof for a read-only completion receipt check.
+/// No password verifier or policy result is needed: this can only confirm an
+/// earlier exact request, never perform or authorize a new password change.
+pub struct PasswordResetReceipt<'a> {
+    /// Exact verifier snapshot used by the admitted code check.
+    pub challenge: &'a PasswordResetChallenge,
+    /// Original browser-secret digest.
+    pub browser_binding_hash: &'a [u8; 32],
+    /// Result of verifying the presented code against the exact snapshot.
+    pub code_matched: bool,
+    /// Keyed digest of the exact normalized original completion request.
+    pub request_hash: &'a [u8; 32],
+}
+
 /// Store completion outcome. No outcome creates an authentication session.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PasswordResetOutcome {

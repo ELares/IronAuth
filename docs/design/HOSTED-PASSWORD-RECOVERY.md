@@ -122,8 +122,9 @@ Migration 0249 and `PasswordResetChallengeId` introduce only the storage boundar
 The table separates pending, completed, cancelled and refused metadata, requires
 an indivisible real-account binding, and bounds attempts and expiry. Real-store
 schema tests exercise forced row-level security and runtime column grants.
-Hosted delivery orchestration and the reset form remain unimplemented. The repository now
-implements completion as described below; deployment remains disabled. A valid
+Delivery coordination, page rendering and completion handlers are implemented as
+described below. Initial hosted issuance and completion notices remain unwired;
+deployment remains disabled. A valid
 metadata row is not proof that a password was changed; the audited completion
 transaction and its credential/invalidation effects must be verified together. No deployment is activated by this additive migration alone.
 
@@ -163,7 +164,8 @@ does not rewrite the verifier, reset its timestamp, or emit another completion.
 Expired receipts require ordinary sign-in or a fresh recovery request. The hosted
 caller must compute the keyed digest from the exact normalized request, enforce
 password policy and screening, admit hashing, and satisfy actual required recovery
-notifications before calling completion. These caller obligations are not wired yet.
+notifications before calling completion. Completion handlers enforce policy,
+screening and hashing; initial issuance and post-commit notices remain unwired.
 Further race/invalidation coverage and transport/hosted qualification remain before
 the full gate, review and deployment.
 
@@ -243,7 +245,8 @@ receipt across provider restarts without storing plaintext or adding an operator
 key. A changed browser, challenge, code or normalized password produces another
 digest. The handler must still validate same-origin POST, bound the form, enforce
 policy/screening and admitted hashing, and recheck the store-owned scope/lifetime.
-These helpers do not yet expose a reset route or complete the browser journey.
+The completion handlers below use these helpers. The routes remain unmounted
+until the full recovery journey is integrated.
 
 
 A held case's initial horizon is provisional until actual required notifications
@@ -263,7 +266,8 @@ cancellation action and a distinct message identity. It contains no reset code.
 The primary verified mailbox receives the purpose-specific code; other required
 verified channels must receive owner warnings. An email-only adapter must refuse
 completion if a required phone channel cannot be notified, not silently omit it.
-Selection, fan-out and durable aggregation are still hosted caller obligations.
+The delivery coordinator below implements selection, fan-out and durable
+aggregation; initial hosted issuance must invoke it with store-owned authority.
 
 
 `password_reset_delivery::send_reset_request` now claims a newly issued real
@@ -348,6 +352,32 @@ retains hash-admission rate/retry headers in HTML error responses. No result min
 a session; successful and replayed completions lead to ordinary sign-in guidance.
 The route factory bounds forms to 16 KiB but is deliberately not merged into the
 provider router yet. Case preparation/issuance, post-commit notifications and
-real-store successful HTTP flows remain required before enablement. Exact retry
-across changed or unavailable screening policy also needs qualification: the
-current handler repeats screening before it reaches the stored receipt.
+a successful initial HTTP reset remain required before enablement. An independent
+receipt read now precedes policy/screening as described below.
+
+
+`password_reset().receipt()` confirms only an already-completed exact request,
+using the same locked current-owner, mailbox revision, resulting credential,
+completed-case, accepted-delivery, code snapshot and expiry checks as completion.
+It accepts no new-password verifier or screening result and performs no mutation,
+attempt consumption or audit. Both correct and incorrect code-check results take
+the same account/receipt reads; a pending challenge never becomes a receipt.
+
+The hosted handler now normalizes and compares password confirmation, verifies
+the code through admission, and checks this keyed receipt before enforcing current
+password policy and calling breach screening. Only a matching committed receipt
+can return completion at this stage. Every new credential change still passes
+policy/strength, mandatory screening and admitted new-password hashing before the
+atomic completion write. This separates acknowledgement of an existing result
+from permission to make a new change; current ownership and credential changes
+still invalidate the old receipt. No receipt grants an authentication session.
+
+
+An actual HTTP integration test against isolated PostgreSQL confirms that a pending
+reset is refused during a fail-closed screening outage without changing its
+credential. After a store-fixture completion models an earlier committed response
+that was lost, exact HTTP retries succeed both during the outage and under a newly
+stricter password policy. Neither retry changes the verifier, adds an audit record,
+reflects submitted secrets, or issues a session cookie. This test simulates delivery
+acceptance and the initial committed transaction; it does not establish initial
+hosted issuance, SMTP delivery or the complete browser journey.

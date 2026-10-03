@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Check exact committed reset receipts before current password policy and breach screening (#1479), so an interrupted successful response can be confirmed during a screening outage without repeating a credential change. New changes retain mandatory policy, screening and admitted hashing.
+
 - Integrate browser-bound reset GET/POST handlers with CSRF, independent recovery regulation, NFKC confirmation, password policy/screening, admitted hashing and atomic store completion (#1479). The bounded route factory is not mounted until issuance and post-commit notifications are finished. Keep the shared same-origin referrer policy for browser form compatibility.
 
 - Add reset code/new-password forms and explicit completed, held, expired and deployment-unavailable guidance (#1479). Preserve the validated application continuation, never refill submitted secrets, and apply shared form-page response headers. Hosted handler integration remains pending.

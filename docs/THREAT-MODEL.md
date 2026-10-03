@@ -628,7 +628,7 @@ Issuance and post-commit notices must be integrated before enablement.
 | --- | --- | --- |
 | Spoofing | A posted account or client selects another reset | Strict form schema; browser-bound store context; stored client/continuation scope consistency; separate form CSRF and same-origin checks |
 | Tampering | Edited confirmation or code changes an interrupted request | NFKC normalization on both password fields; eight ASCII digits; exact keyed completion receipt; store revalidation of authority and expiry |
-| Repudiation | A failed response is represented as a new successful mutation | Distinct store outcomes; atomic receipt replay; ambiguous failures offer exact retry or sign-in; completion notification still pending before mount |
+| Repudiation | A failed response is represented as a new successful mutation or cannot be confirmed during a screening outage | Read-only exact receipt check before current policy/screening; shared locked current-authority validation; no new hash or mutation on a match; new changes still require screening; ambiguous failures offer exact retry or sign-in; completion notification still pending before mount |
 | Information disclosure | Rejected secret values or internal failures enter HTML | No secret renderer inputs, generic store/hash errors, escaped policy guidance, shared CSP/no-store and browser-compatible same-origin referrers |
 | Denial of service | Unbounded forms or unregulated password hashing | 16 KiB route body limit; independent recovery counters; policy/strength/screening before admitted hashing; retain retry and rate-limit headers |
 | Elevation | Reset signs in or bypasses stronger factors | Store completion only; no session cookie or role grant; held cases remain held; ordinary login still required |

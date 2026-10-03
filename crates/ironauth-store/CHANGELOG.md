@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add an independent read-only exact reset receipt check (#1479), sharing completion's current-owner/credential/case validation. Receipt confirmation needs no new password hash or screening result and cannot spend attempts or mutate credentials.
+
 - Add browser-bound reset presentation context with the stored client, continuation and exact code expiry (#1479). Navigation can survive code expiry within the original ten-minute browser window without extending proof or completion authority; account presence remains internal.
 
 - Add audited, subject-bound reset delivery admission before external mail (#1479). Only one concurrent caller can claim a challenge; an interrupted claimed attempt cannot be automatically resent after restart.

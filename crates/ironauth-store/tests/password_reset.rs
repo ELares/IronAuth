@@ -2188,3 +2188,99 @@ async fn reset_context_retains_navigation_after_code_expiry_but_not_past_browser
         assert!(read.context(&env, id, &[3; 32]).await.unwrap().is_none());
     }
 }
+
+#[tokio::test]
+async fn reset_receipt_read_confirms_only_current_completed_exact_request_without_mutation() {
+    use ironauth_store::{PasswordResetOutcome, PasswordResetReceipt};
+    use std::time::{Duration, SystemTime};
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH + Duration::from_secs(1000), 1493);
+    let scope = db.seed_scope(&env).await;
+    let other = db.seed_scope(&env).await;
+    let (subject, _, challenge) = reset_fixture(&db, &env, scope).await;
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let read = scoped.password_reset();
+    let before = scoped.audit().list().await.unwrap().len();
+    assert!(
+        read.receipt(
+            &env,
+            PasswordResetReceipt {
+                challenge: &challenge,
+                browser_binding_hash: &[3; 32],
+                code_matched: true,
+                request_hash: &[9; 32]
+            }
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let attempts: i32 =
+        sqlx::query_scalar("SELECT attempt_count FROM password_reset_challenges WHERE id=$1")
+            .bind(challenge.id.to_string())
+            .fetch_one(db.owner_pool())
+            .await
+            .unwrap();
+    assert_eq!(attempts, 0);
+    assert_eq!(scoped.audit().list().await.unwrap().len(), before);
+    assert!(matches!(
+        complete_reset(&db, &env, &challenge, true, 9)
+            .await
+            .unwrap(),
+        PasswordResetOutcome::Completed { .. }
+    ));
+    let completed_audits = scoped.audit().list().await.unwrap().len();
+    for (request_scope, browser, matched, request, expected) in [
+        (scope, [3; 32], true, [9; 32], true),
+        (scope, [4; 32], true, [9; 32], false),
+        (scope, [3; 32], false, [9; 32], false),
+        (scope, [3; 32], true, [8; 32], false),
+        (other, [3; 32], true, [9; 32], false),
+    ] {
+        let result = store
+            .scoped(request_scope)
+            .password_reset()
+            .receipt(
+                &env,
+                PasswordResetReceipt {
+                    challenge: &challenge,
+                    browser_binding_hash: &browser,
+                    code_matched: matched,
+                    request_hash: &request,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.is_some(), expected);
+        if expected {
+            assert_eq!(result.as_deref(), Some("/authorize?client_id=fixture"));
+        }
+    }
+    assert_eq!(scoped.audit().list().await.unwrap().len(), completed_audits);
+    assert_eq!(
+        scoped
+            .users()
+            .password_hash_for_subject(&subject)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(NEW_HASH)
+    );
+    clock.advance(Duration::from_secs(61));
+    verify_reset_mailbox(&db, &env, &subject).await;
+    assert!(
+        read.receipt(
+            &env,
+            PasswordResetReceipt {
+                challenge: &challenge,
+                browser_binding_hash: &[3; 32],
+                code_matched: true,
+                request_hash: &[9; 32]
+            }
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+}

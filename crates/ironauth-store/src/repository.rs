@@ -116,7 +116,7 @@ use crate::message_rate::RateBudget;
 use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
 use crate::password_reset::{
     CompletePasswordReset, NewPasswordReset, PasswordResetAccount, PasswordResetChallenge,
-    PasswordResetContext, PasswordResetDelivery, PasswordResetOutcome,
+    PasswordResetContext, PasswordResetDelivery, PasswordResetOutcome, PasswordResetReceipt,
 };
 use crate::pow_challenge::{NewPowChallenge, PowChallengeView};
 use crate::recipient_verification::{
@@ -20805,6 +20805,44 @@ pub struct PasswordResetRepo<'a> {
 }
 
 impl PasswordResetRepo<'_> {
+    /// Confirm a completed exact request without screening or hashing a new
+    /// password. Rechecks current owner, resulting credential and completed case
+    /// under the same locks as completion. A pending/incorrect/stale request is
+    /// uniformly absent and never spends attempts, changes credentials or audits.
+    ///
+    /// # Errors
+    /// Store/encryption failure. No result grants a session or new reset authority.
+    pub async fn receipt(
+        &self,
+        env: &Env,
+        spec: PasswordResetReceipt<'_>,
+    ) -> Result<Option<String>, StoreError> {
+        if spec.challenge.id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let Some((row, binding)) =
+            lock_password_reset(&mut tx, self.store, self.scope, &spec).await?
+        else {
+            return Ok(None);
+        };
+        let result = if matches!(
+            password_reset_decision(
+                &row,
+                binding.as_ref(),
+                &spec,
+                epoch_micros(env.clock().now_utc())
+            ),
+            ResetDecision::Replay
+        ) {
+            Some(row.get("authorization_return_to"))
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(result)
+    }
+
     /// Read server-owned presentation context for the original browser only.
     /// Context lasts at most ten minutes from issuance, including expired,
     /// replaced or completed codes, so an interrupted flow can retain its sign-in
@@ -21066,12 +21104,18 @@ impl ActingPasswordResetRepo<'_> {
         }
         let now = epoch_micros(env.clock().now_utc());
         let mut tx = begin_scoped(self.store, self.scope).await?;
+        let proof = PasswordResetReceipt {
+            challenge: spec.challenge,
+            browser_binding_hash: spec.browser_binding_hash,
+            code_matched: spec.code_matched,
+            request_hash: spec.request_hash,
+        };
         let Some((row, binding)) =
-            lock_password_reset(&mut tx, self.store, self.scope, &spec).await?
+            lock_password_reset(&mut tx, self.store, self.scope, &proof).await?
         else {
             return Ok(PasswordResetOutcome::Refused);
         };
-        match password_reset_decision(&row, binding.as_ref(), &spec, now) {
+        match password_reset_decision(&row, binding.as_ref(), &proof, now) {
             ResetDecision::Refused => Ok(PasswordResetOutcome::Refused),
             ResetDecision::Replay => Ok(PasswordResetOutcome::Replayed {
                 authorization_return_to: row.get("authorization_return_to"),
@@ -21222,7 +21266,7 @@ async fn lock_password_reset(
     tx: &mut Transaction<'_, Postgres>,
     store: &Store,
     scope: Scope,
-    spec: &CompletePasswordReset<'_>,
+    spec: &PasswordResetReceipt<'_>,
 ) -> Result<Option<(PgRow, Option<PasswordResetBinding>)>, StoreError> {
     recipient_ownership_lock(tx, scope).await?;
     // Immutable authority is read first only to locate the account locks. The
@@ -21287,7 +21331,7 @@ enum ResetDecision {
 fn password_reset_decision(
     row: &PgRow,
     binding: Option<&PasswordResetBinding>,
-    spec: &CompletePasswordReset<'_>,
+    spec: &PasswordResetReceipt<'_>,
     now: i64,
 ) -> ResetDecision {
     if row.get::<String, _>("code_hash") != spec.challenge.code_hash
