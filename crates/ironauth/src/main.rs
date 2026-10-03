@@ -2218,13 +2218,13 @@ async fn build_oidc_plane(
         },
         |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::SmsSender>,
     ));
-    // Installed after the chain because it is CONDITIONAL: a disabled hook, or one whose
-    // allowlist is empty, resolves to `None` and issuance is byte-for-byte unchanged.
     let state = if let Some(transport) = recipient_transport {
         state.with_recipient_verification_smtp(transport)
     } else {
         state
     };
+    // Installed after the chain because it is CONDITIONAL: a disabled hook, or one whose
+    // allowlist is empty, resolves to `None` and issuance is byte-for-byte unchanged.
     let state = match &claims_enrichment_hook {
         Some(hook) => state.with_claims_enrichment_hook(std::sync::Arc::clone(hook)),
         None => state,

@@ -7470,7 +7470,7 @@ async fn a_request_for_somebody_who_is_not_a_member_is_refused() {
 }
 
 #[tokio::test]
-async fn advisory_routes_require_their_specific_read_and_config_permissions() {
+async fn advisory_routes_require_read_permission_and_operator_import() {
     let h = Harness::start(50).await;
     let (tenant, environment) = h.create_tenant("advisory-permissions", "k-tenant").await;
     let (key_id, secret) = mint_key(&h, &tenant, &environment, "k-mint").await;
@@ -7487,7 +7487,7 @@ async fn advisory_routes_require_their_specific_read_and_config_permissions() {
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert!(body.contains("management.write_config"), "{body}");
+    assert!(body.contains("plane=operator"), "{body}");
     restrict(
         &h,
         &tenant,
@@ -7503,12 +7503,12 @@ async fn advisory_routes_require_their_specific_read_and_config_permissions() {
         .post_as(
             &format!("{base}/import"),
             &secret,
-            "advisory-config-admitted",
+            "advisory-config-refused",
             r#"{"feed":"{}"}"#,
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains("advisory feed is disabled"), "{body}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("plane=operator"), "{body}");
 }
 
 fn advisory_import_router(h: &Harness, key: &ironauth_jose::SigningKey) -> axum::Router {
@@ -7528,11 +7528,20 @@ fn advisory_import_router(h: &Harness, key: &ironauth_jose::SigningKey) -> axum:
 }
 
 async fn import_advisory_bundle(router: &axum::Router, path: &str, feed: &str) -> StatusCode {
+    import_advisory_bundle_as(router, path, feed, OPERATOR_TOKEN).await
+}
+
+async fn import_advisory_bundle_as(
+    router: &axum::Router,
+    path: &str,
+    feed: &str,
+    credential: &str,
+) -> StatusCode {
     use tower::ServiceExt as _;
     let request = axum::http::Request::builder()
         .method("POST")
         .uri(path)
-        .header("authorization", common::bearer(OPERATOR_TOKEN))
+        .header("authorization", common::bearer(credential))
         .header("content-type", "application/json")
         .body(axum::body::Body::from(
             serde_json::json!({"feed": feed}).to_string(),
@@ -7562,6 +7571,36 @@ async fn accepted_advisory_count(h: &Harness) -> i64 {
         .expect("accepted projection count")
 }
 
+async fn assert_scoped_advisory_import_refused(
+    h: &Harness,
+    router: &axum::Router,
+    tenant: &str,
+    environment: &str,
+    path: &str,
+    feed: &str,
+) {
+    let (key_id, secret) = mint_key(h, tenant, environment, "scoped-import-key").await;
+    // Even unrestricted environment credentials cannot replace deployment-wide data.
+    assert_eq!(
+        import_advisory_bundle_as(router, path, feed, &secret).await,
+        StatusCode::FORBIDDEN
+    );
+    restrict(
+        h,
+        tenant,
+        environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    assert_eq!(
+        import_advisory_bundle_as(router, path, feed, &secret).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(accepted_advisory_count(h).await, 0);
+    assert!(advisory_import_events(h).await.is_empty());
+}
+
 #[tokio::test]
 async fn advisory_import_announces_only_verified_committed_projection_replacements() {
     let h = Harness::start(50).await;
@@ -7580,6 +7619,7 @@ async fn advisory_import_announces_only_verified_committed_projection_replacemen
         }]),
         &key,
     );
+    assert_scoped_advisory_import_refused(&h, &router, &tenant, &environment, &path, &feed).await;
     let tampered = feed.replace("SYNTHETIC-ONLY-001", "SYNTHETIC-ONLY-002");
     assert_eq!(
         import_advisory_bundle(&router, &path, &tampered).await,

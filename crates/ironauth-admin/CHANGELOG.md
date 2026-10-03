@@ -6,6 +6,7 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Require deployment-operator credentials for offline advisory imports because the accepted projection is deployment-wide; environment-scoped keys remain eligible for permission-checked reads.
 - Publish `security_advisory.imported` atomically with an offline verified projection replacement. The importing scope receives aggregate counts with explicit deployment-wide projection semantics; no advisory content enters the event (#1475 gate repair).
 
 - Emit aggregate `recipient_index.prepared` outcomes in the same transaction as the index batch, audit and replay receipt. Failed writes and idempotent replays do not publish extra events (#1475).

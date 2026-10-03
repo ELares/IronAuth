@@ -54,7 +54,10 @@ A feed that fails signature verification is rejected **entirely** in both paths
 rejection is logged as a security event. The banner surface
 (`GET .../security/advisories`) renders only accepted advisories.
 
-The accepted set is deployment-wide. Replacement writers serialize so concurrent
+The accepted set is deployment-wide, so offline imports require deployment-operator
+credentials. Environment-scoped management keys cannot import, including keys with
+`management.write_config`; reads retain their existing permission checks.
+Replacement writers serialize so concurrent
 polls or imports leave one complete verified set. Migration 0248 completes the
 control role's replacement grant; the serving role remains read-only. An offline
 import publishes `security_advisory.imported` in the requesting management scope's

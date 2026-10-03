@@ -50681,9 +50681,6 @@ pub fn verify_chain_entries(
         // The first entry examined may be mid-chain after a retention prune, so its
         // `prev_hash` commits to an entry that is legitimately gone. Continuity is
         // checked from the second entry onward.
-        //
-        // Written as a nested `if` rather than a let-chain: let-chains need Rust 1.88
-        // and this crate's MSRV is 1.85.
         if let Some(previous) = expected_prev
             && entry.prev_hash != previous
         {

@@ -133,7 +133,8 @@ pub async fn import_security_advisories(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
-    principal.require_permission(ManagementPermission::WriteConfig)?;
+    // The projection is deployment-wide, even though this route carries a scope.
+    principal.require_operator()?;
     require_live_environment(&state, &scope).await?;
     let request: AdvisoryImportRequest = parse_json(&body)?;
 
