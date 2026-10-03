@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Publish `security_advisory.imported` atomically with an offline verified projection replacement. The importing scope receives aggregate counts with explicit deployment-wide projection semantics; no advisory content enters the event (#1475 gate repair).
+
 - Emit aggregate `recipient_index.prepared` outcomes in the same transaction as the index batch, audit and replay receipt. Failed writes and idempotent replays do not publish extra events (#1475).
 
 - Add documented, permission-checked recipient-index preview and bounded preparation endpoints for existing environments, with atomic audited idempotency and current authorization before replay (issue #1475).

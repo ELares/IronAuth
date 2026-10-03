@@ -13482,28 +13482,28 @@ impl SecurityAdvisoryRepo<'_> {
         source: &str,
     ) -> Result<(), StoreError> {
         let mut tx = self.store.pool().begin().await?;
-        sqlx::query("DELETE FROM security_advisories")
-            .execute(&mut *tx)
-            .await?;
-        for advisory in advisories {
-            sqlx::query(
-                "INSERT INTO security_advisories \
-                 (id, title, severity, affected_versions, summary, published_at, source) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            )
-            .bind(&advisory.id)
-            .bind(&advisory.title)
-            .bind(advisory.severity.as_str())
-            .bind(
-                &serde_json::to_string(&advisory.affected_versions)
-                    .map_err(|_| StoreError::Encryption)?,
-            )
-            .bind(&advisory.summary)
-            .bind(advisory.published_at)
-            .bind(source)
-            .execute(&mut *tx)
-            .await?;
-        }
+        replace_security_advisories_in_tx(&mut tx, advisories, source).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Replace the deployment-wide verified projection and announce the import
+    /// in the requesting management scope's event stream, atomically. The event
+    /// records that import, not a tenant-local advisory set or cross-scope fan-out.
+    ///
+    /// # Errors
+    /// Persistence or event append failure rolls back both the projection and event.
+    pub async fn replace_all_with_event(
+        &self,
+        env: &Env,
+        scope: Scope,
+        advisories: &[crate::advisory::AdvisoryRecord],
+        source: &str,
+        event: &DomainEvent<'_>,
+    ) -> Result<(), StoreError> {
+        let mut tx = begin_scoped(self.store, scope).await?;
+        replace_security_advisories_in_tx(&mut tx, advisories, source).await?;
+        enqueue_domain_event(&mut tx, env, scope, Some(event)).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -13537,6 +13537,42 @@ impl SecurityAdvisoryRepo<'_> {
         }
         Ok(out)
     }
+}
+
+async fn replace_security_advisories_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    advisories: &[crate::advisory::AdvisoryRecord],
+    source: &str,
+) -> Result<(), StoreError> {
+    // Both the poll and offline import replace one deployment-wide set. Serialize
+    // writers before DELETE so concurrent replacements cannot leave a union of
+    // two separately verified feeds. Ordinary banner readers remain unblocked.
+    sqlx::query("LOCK TABLE security_advisories IN EXCLUSIVE MODE")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM security_advisories")
+        .execute(&mut **tx)
+        .await?;
+    for advisory in advisories {
+        sqlx::query(
+            "INSERT INTO security_advisories \
+                 (id, title, severity, affected_versions, summary, published_at, source) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(&advisory.id)
+        .bind(&advisory.title)
+        .bind(advisory.severity.as_str())
+        .bind(
+            &serde_json::to_string(&advisory.affected_versions)
+                .map_err(|_| StoreError::Encryption)?,
+        )
+        .bind(&advisory.summary)
+        .bind(advisory.published_at)
+        .bind(source)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 /// Scoped client-authentication diagnostic records.

@@ -98,6 +98,19 @@ pub fn envelope_schema() -> Value {
 /// event cannot reach the wire uncatalogued: the enforcement is the delivery path itself.
 const REGISTERED: &[(&str, u32, &str)] = &[
     (
+        "security_advisory.imported",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "advisory_count": {"type": "integer", "minimum": 0},
+                "deployment_global": {"type": "boolean", "enum": [true]}
+            },
+            "required": ["advisory_count", "deployment_global"]
+        }"#,
+    ),
+    (
         "recipient_index.prepared",
         1,
         r#"{

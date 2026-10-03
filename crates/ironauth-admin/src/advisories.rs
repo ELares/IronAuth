@@ -188,11 +188,43 @@ pub async fn import_security_advisories(
             published_at: advisory.published_at,
         })
         .collect();
+    let event = advisory_imported_event(&state, scope, records.len())?;
     state
         .store()
         .security_advisories()
-        .replace_all(&records, "offline-import")
+        .replace_all_with_event(
+            state.env(),
+            scope,
+            &records,
+            "offline-import",
+            &event.domain_event(),
+        )
         .await
         .map_err(ApiError::from)?;
     Ok(no_content())
+}
+
+fn advisory_imported_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    count: usize,
+) -> Result<crate::events::PendingEvent, ApiError> {
+    let id = format!(
+        "evt_{}",
+        ironauth_store::CorrelationId::generate(state.env())
+    );
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "security_advisory.imported",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({"advisory_count": count, "deployment_global": true}),
+    )
+    .ok_or(ApiError::Internal)?;
+    Ok(crate::events::PendingEvent {
+        id,
+        subject: "security-advisory-projection".to_owned(),
+        envelope,
+    })
 }

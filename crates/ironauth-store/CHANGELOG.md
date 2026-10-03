@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Repair the missing control-role DELETE grant required by verified advisory projection replacement, through forward migration 0248; serving roles remain read-only.
+
+- Publish `security_advisory.imported` atomically with an offline verified projection replacement. The importing scope receives aggregate counts with explicit deployment-wide projection semantics; no advisory content enters the event (#1475 gate repair).
+
 - Emit aggregate `recipient_index.prepared` outcomes in the same transaction as the index batch, audit and replay receipt. Failed writes and idempotent replays do not publish extra events (#1475).
 
 - Add control-role-only bounded primary-recipient indexing for retained accounts, including deleted rows, with aggregate ambiguity reporting and atomic audit/replay receipts. Indexing never verifies or merges accounts (issue #1475).
