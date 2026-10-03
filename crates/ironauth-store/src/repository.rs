@@ -19959,34 +19959,16 @@ impl ActingUserRepo<'_> {
                 target: subject,
             },
             async move |tx| {
-                // Write the new verifier. A subject that names no user flips no row,
-                // which is a NotFound that rolls the whole audited write back (no
-                // password change, no session revocation, no audit row).
-                let updated = sqlx::query(
-                    "UPDATE users SET password_hash = $1 \
-                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
-                )
-                .bind(new_password_hash)
-                .bind(&subject_text)
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .execute(&mut **tx)
-                .await?;
-                if updated.rows_affected() == 0 {
-                    return Err(StoreError::NotFound);
-                }
-                // Every OTHER live session of the user is revoked in this same
-                // transaction. The keep session (the browser making the change) is
-                // preserved. Each drives one session-ended cascade and one fan-out
-                // event, exactly as an admin revoke does.
-                *out = revoke_other_sessions_in_tx(
+                *out = change_password_in_tx(
                     tx,
-                    scope,
-                    &subject_text,
-                    keep_text.as_deref(),
-                    SessionEndCause::PasswordChanged,
-                    now_micros,
-                    &emit,
+                    PasswordChangeInTx {
+                        scope,
+                        subject: &subject_text,
+                        new_password_hash,
+                        keep: keep_text.as_deref(),
+                        now_micros,
+                        emit: &emit,
+                    },
                 )
                 .await?;
                 Ok(())
@@ -28157,6 +28139,51 @@ async fn cascade_families_for_subject(
         .await?;
     }
     Ok(())
+}
+
+/// Credential mutation parameters for a transaction owned by the audited caller.
+/// No proof is consumed or transaction committed by this private primitive.
+struct PasswordChangeInTx<'a, 'env> {
+    scope: Scope,
+    subject: &'a str,
+    new_password_hash: &'a str,
+    keep: Option<&'a str>,
+    now_micros: i64,
+    emit: &'a SessionEndedEmit<'env>,
+}
+
+/// Write the verifier and cascade session revocation in the caller's transaction.
+/// The caller must first validate its credential-change authority and must append
+/// its audit and any consumed-proof receipt before committing. Ordinary password
+/// changes preserve offline refresh families; recovery must additionally invoke
+/// the subject-wide hard-kill cascade in this same transaction.
+async fn change_password_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    change: PasswordChangeInTx<'_, '_>,
+) -> Result<UserRevocation, StoreError> {
+    let updated = sqlx::query(
+        "UPDATE users SET password_hash = $1 \
+         WHERE id = $2 AND tenant_id = $3 AND environment_id = $4",
+    )
+    .bind(change.new_password_hash)
+    .bind(change.subject)
+    .bind(change.scope.tenant().to_string())
+    .bind(change.scope.environment().to_string())
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    revoke_other_sessions_in_tx(
+        tx,
+        change.scope,
+        change.subject,
+        change.keep,
+        SessionEndCause::PasswordChanged,
+        change.now_micros,
+        change.emit,
+    )
+    .await
 }
 
 /// Revoke every LIVE session of `subject` EXCEPT `keep`, inside an OPEN transaction

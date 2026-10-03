@@ -68,8 +68,11 @@ A successful credential mutation needs a single audited database transaction:
 - Roll everything back on a store failure. Retain a bounded completion receipt so
   a lost response cannot leave a reusable code or an untracked password change.
 
-The existing `users().change_password(..., None, ...)` has the required session
-cascade, but calling it after independently consuming a code is not atomic.
+The existing `users().change_password(..., None, ...)` has the browser-session
+cascade, but preserves offline refresh families. Recovery must also revoke those
+families and their grants through the subject-wide hard-kill cascade in the same
+transaction. Calling ordinary password change after independently consuming a
+code is not atomic.
 Factor out transaction-owned primitives rather than composing separate writes.
 Do not treat a consumed code or a minted ordinary session as reusable reset
 permission. Retry/status reads must not reveal a new verifier or another user's
@@ -123,3 +126,9 @@ Repository issuance/completion, atomic credential mutation, actual delivery and
 the hosted form remain unimplemented. A valid metadata row is not proof that a
 password was changed; only the future audited completion transaction may make
 that claim. No deployment is activated by this additive migration alone.
+
+The existing account password change now delegates its verifier write and session
+cascade to a private transaction-owned primitive. The public account endpoint
+still requires its existing authentication. This refactor does not confer reset
+authority, revoke offline families on ordinary password changes, or implement the
+pending reset completion API.
