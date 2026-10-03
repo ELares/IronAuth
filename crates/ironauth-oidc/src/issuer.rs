@@ -931,22 +931,21 @@ impl IssuerRegistry {
                 .for_scope(*scope)
                 .get(&ironauth_hot::registry::JWKS, key)
                 .await
+                && let Ok(document) = String::from_utf8(bytes)
             {
-                if let Ok(document) = String::from_utf8(bytes) {
-                    // PARSED, NOT JUST UTF-8 CHECKED. The first version served any UTF-8 bytes
-                    // it found as the environment's JWK Set, with a 200, the JWK Set media
-                    // type, a strong ETag over the bytes and the full max-age. `ironcache.rs`
-                    // documents as an accepted condition that two deployments pointed at one
-                    // IronCache share a flat keyspace, so "any UTF-8 bytes under that key" is a
-                    // reachable state, not a hypothetical: a review overwrote the entry with
-                    // `this is not a jwk set at all` and the endpoint served exactly that.
-                    let is_jwk_set = serde_json::from_str::<serde_json::Value>(&document)
-                        .ok()
-                        .and_then(|value| value.get("keys").map(serde_json::Value::is_array))
-                        == Some(true);
-                    if is_jwk_set {
-                        return Some(Ok(document));
-                    }
+                // PARSED, NOT JUST UTF-8 CHECKED. The first version served any UTF-8 bytes
+                // it found as the environment's JWK Set, with a 200, the JWK Set media
+                // type, a strong ETag over the bytes and the full max-age. `ironcache.rs`
+                // documents as an accepted condition that two deployments pointed at one
+                // IronCache share a flat keyspace, so "any UTF-8 bytes under that key" is a
+                // reachable state, not a hypothetical: a review overwrote the entry with
+                // `this is not a jwk set at all` and the endpoint served exactly that.
+                let is_jwk_set = serde_json::from_str::<serde_json::Value>(&document)
+                    .ok()
+                    .and_then(|value| value.get("keys").map(serde_json::Value::is_array))
+                    == Some(true);
+                if is_jwk_set {
+                    return Some(Ok(document));
                 }
             }
         }

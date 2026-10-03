@@ -376,10 +376,10 @@ fn default_views<'a>(sources: &ClaimSources<'a>) -> Vec<&'a Map<String, Value>> 
 fn resolve_rule(rule: &ClaimRule, views: &[&Map<String, Value>]) -> Option<Value> {
     for path in &rule.source {
         for view in views {
-            if let Some(value) = resolve_path(view, path) {
-                if !value.is_null() {
-                    return Some(value.clone());
-                }
+            if let Some(value) = resolve_path(view, path)
+                && !value.is_null()
+            {
+                return Some(value.clone());
             }
         }
     }

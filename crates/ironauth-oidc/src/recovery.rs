@@ -247,16 +247,16 @@ pub fn factor_change_decision(
     }
     // A downgrade. A FRESH re-verification of an equal-or-stronger factor satisfies the
     // invariant immediately.
-    if let Some(reverify) = reverify_acr {
-        if step_up::acr_satisfies(reverify, target_factor_acr, order) {
-            return FactorChangeDecision::AllowedByReverify;
-        }
+    if let Some(reverify) = reverify_acr
+        && step_up::acr_satisfies(reverify, target_factor_acr, order)
+    {
+        return FactorChangeDecision::AllowedByReverify;
     }
     // Otherwise only the elapsed delay window (with its notifications) permits it.
-    if let Some(hold_until) = hold_until_unix_micros {
-        if now_unix_micros >= hold_until {
-            return FactorChangeDecision::AllowedByDelay;
-        }
+    if let Some(hold_until) = hold_until_unix_micros
+        && now_unix_micros >= hold_until
+    {
+        return FactorChangeDecision::AllowedByDelay;
     }
     FactorChangeDecision::Blocked
 }

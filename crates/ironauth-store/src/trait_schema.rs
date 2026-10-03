@@ -728,14 +728,14 @@ fn check_scalar_keywords(
         pointer.truncate(restore);
         err
     };
-    if let Some(enum_values) = map.get("enum") {
-        if enum_values.as_array().is_none_or(Vec::is_empty) {
-            return Err(fail_at(
-                pointer,
-                "enum",
-                "\"enum\" must be a non-empty array".to_string(),
-            ));
-        }
+    if let Some(enum_values) = map.get("enum")
+        && enum_values.as_array().is_none_or(Vec::is_empty)
+    {
+        return Err(fail_at(
+            pointer,
+            "enum",
+            "\"enum\" must be a non-empty array".to_string(),
+        ));
     }
     for keyword in ["minLength", "maxLength", "minItems", "maxItems"] {
         match map.get(keyword) {

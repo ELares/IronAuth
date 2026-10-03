@@ -940,15 +940,15 @@ async fn resolve_issuer_keys(
     if let Some(inline) = &record.jwks {
         return ironauth_jose::trusted_keys_from_jwks(inline.as_bytes());
     }
-    if let Some(uri) = &record.jwks_uri {
-        if let Some(resolver) = state.client_key_resolver() {
-            // The assertion's UNVERIFIED `kid` is passed so a rotation is discovered without
-            // waiting out the cache TTL (issue #126 criterion 4). Passing it introduces no
-            // trust: it selects nothing and authorises nothing, it only tells the resolver
-            // that the cached set may be stale, and the refetch it can trigger is rate
-            // limited per URI precisely because the value is attacker-chosen.
-            return resolver.resolve_for_kid(state.now(), uri, kid).await;
-        }
+    if let Some(uri) = &record.jwks_uri
+        && let Some(resolver) = state.client_key_resolver()
+    {
+        // The assertion's UNVERIFIED `kid` is passed so a rotation is discovered without
+        // waiting out the cache TTL (issue #126 criterion 4). Passing it introduces no
+        // trust: it selects nothing and authorises nothing, it only tells the resolver
+        // that the cached set may be stale, and the refetch it can trigger is rate
+        // limited per URI precisely because the value is attacker-chosen.
+        return resolver.resolve_for_kid(state.now(), uri, kid).await;
     }
     Vec::new()
 }

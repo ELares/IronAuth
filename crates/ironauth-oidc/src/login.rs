@@ -742,10 +742,10 @@ async fn login_post_inner(
     // routed identifier (by user, app, or domain, in that precedence) is redirected to
     // its organization's upstream provider BEFORE any local password work. No match
     // falls through to the ordinary local login below (fail-safe to local).
-    if !identifier.is_empty() {
-        if let Some(redirect) = federation_route_redirect(&state, &resume, identifier).await {
-            return redirect;
-        }
+    if !identifier.is_empty()
+        && let Some(redirect) = federation_route_redirect(&state, &resume, identifier).await
+    {
+        return redirect;
     }
 
     // The environment-kind chrome (issue #42) for a re-rendered failure page.
@@ -951,25 +951,23 @@ async fn login_post_inner(
         // produces, including the comparable Argon2id time spend, so the hook's existence
         // is not observable to an attacker.
         Ok(None) => {
-            if let Some(hook) = state.migration_hook() {
-                if let HookOutcome::Verified(profile) = hook.attempt(identifier, password).await {
-                    if let Some(response) = complete_lazy_migration(
-                        &state,
-                        resume.scope,
-                        identifier,
-                        password,
-                        &resume.return_to,
-                        &headers,
-                        profile,
-                    )
-                    .await
-                    {
-                        // A verified lazy migration is a successful first login: relax this
-                        // path's identifier/IP failure counters (issue #64 LOW-6).
-                        state.reset_after_success(&ctx).await;
-                        return response;
-                    }
-                }
+            if let Some(hook) = state.migration_hook()
+                && let HookOutcome::Verified(profile) = hook.attempt(identifier, password).await
+                && let Some(response) = complete_lazy_migration(
+                    &state,
+                    resume.scope,
+                    identifier,
+                    password,
+                    &resume.return_to,
+                    &headers,
+                    profile,
+                )
+                .await
+            {
+                // A verified lazy migration is a successful first login: relax this
+                // path's identifier/IP failure counters (issue #64 LOW-6).
+                state.reset_after_success(&ctx).await;
+                return response;
             }
             // No hook, a non-success verdict, or a refused/failed create: spend comparable
             // Argon2id time (through the admission-controlled pool, issue #62), then the
@@ -1198,36 +1196,36 @@ async fn complete_lazy_migration(
     // other user; the hook never writes `claims_json`.
     let mut traits_json: Option<String> = None;
     let mut traits_schema_version: Option<i32> = None;
-    if let Some(profile) = &profile {
-        if let Some(traits) = &profile.traits {
-            match state.store().scoped(scope).trait_schemas().active().await {
-                // An active schema is the validation contract: an invalid profile is
-                // refused and nothing is persisted.
-                Ok(Some(active)) => {
-                    let schema = TraitSchema::compile(&active.schema_json).ok()?;
-                    if !schema.validate(traits).is_empty() {
-                        return None;
-                    }
-                    // The admin-only refusal is NOT re-spelled here. The SAME argument the
-                    // note above makes about claims applies to this channel (a legacy store
-                    // is exactly the "hostile or compromised" source it names, and an
-                    // admin-only trait is metadata the operator's own plane writes), but it
-                    // is enforced by the create's SELF-SERVICE visibility class on the store
-                    // seam below, not by a check at this caller. A hand-rolled copy here is
-                    // what "the class is the only enforcement" would be untrue about: it
-                    // would leave the rule enforced on the path someone remembered and
-                    // absent on the next one. The refusal still refuses the WHOLE migration
-                    // (the create errors and the caller falls through to the uniform
-                    // failure), so a misconfigured hook is loud, not half applied.
-                    traits_json = serde_json::to_string(traits).ok();
-                    traits_schema_version = Some(active.version);
+    if let Some(profile) = &profile
+        && let Some(traits) = &profile.traits
+    {
+        match state.store().scoped(scope).trait_schemas().active().await {
+            // An active schema is the validation contract: an invalid profile is
+            // refused and nothing is persisted.
+            Ok(Some(active)) => {
+                let schema = TraitSchema::compile(&active.schema_json).ok()?;
+                if !schema.validate(traits).is_empty() {
+                    return None;
                 }
-                // No active schema to validate against: drop the traits rather than
-                // persist an unvalidated document. The user still migrates.
-                Ok(None) => {}
-                // Fail closed on a store fault rather than persist unvalidated traits.
-                Err(_) => return None,
+                // The admin-only refusal is NOT re-spelled here. The SAME argument the
+                // note above makes about claims applies to this channel (a legacy store
+                // is exactly the "hostile or compromised" source it names, and an
+                // admin-only trait is metadata the operator's own plane writes), but it
+                // is enforced by the create's SELF-SERVICE visibility class on the store
+                // seam below, not by a check at this caller. A hand-rolled copy here is
+                // what "the class is the only enforcement" would be untrue about: it
+                // would leave the rule enforced on the path someone remembered and
+                // absent on the next one. The refusal still refuses the WHOLE migration
+                // (the create errors and the caller falls through to the uniform
+                // failure), so a misconfigured hook is loud, not half applied.
+                traits_json = serde_json::to_string(traits).ok();
+                traits_schema_version = Some(active.version);
             }
+            // No active schema to validate against: drop the traits rather than
+            // persist an unvalidated document. The user still migrates.
+            Ok(None) => {}
+            // Fail closed on a store fault rather than persist unvalidated traits.
+            Err(_) => return None,
         }
     }
 

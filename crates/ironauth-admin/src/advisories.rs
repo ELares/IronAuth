@@ -3,8 +3,8 @@
 //! The security-advisory management surface (issue #163): the banner projection
 //! and the offline bundle import.
 //!
-//! The banner surface (`GET /security/advisories`) lists the ACCEPTED advisories
-//! - every row was verified before insertion, so the surface never renders an
+//! The banner surface (`GET /security/advisories`) lists the ACCEPTED advisories.
+//! Every row was verified before insertion, so the surface never renders an
 //! unverified advisory. The offline import (`POST /security/advisories/import`)
 //! takes the SAME signed bundle the online poll consumes: the single verification
 //! path runs, a bundle that fails verification is rejected ENTIRELY and the

@@ -268,12 +268,12 @@ pub fn validate_against_schema(
                 pointer: field.trait_pointer.clone(),
             });
         }
-        if let Some(top) = top_level_field(&field.trait_pointer) {
-            if annotations.is_admin_only(&top) {
-                return Err(SignupFormError::AdminOnlyTrait {
-                    pointer: field.trait_pointer.clone(),
-                });
-            }
+        if let Some(top) = top_level_field(&field.trait_pointer)
+            && annotations.is_admin_only(&top)
+        {
+            return Err(SignupFormError::AdminOnlyTrait {
+                pointer: field.trait_pointer.clone(),
+            });
         }
         let name = leaf_field_name(&field.trait_pointer);
         if is_reserved_field_name(&name) {

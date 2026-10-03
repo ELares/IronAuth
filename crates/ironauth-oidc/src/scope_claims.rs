@@ -175,19 +175,18 @@ pub fn assemble_claims(
     //    verified_claims surface needs nothing more when it lands). Released
     //    BEFORE the scope loop so a scope that names it can never widen it
     //    beyond the request's subset.
-    if let Some(envelope) = bag.get(crate::verified_claims::VERIFIED_CLAIMS_CLAIM) {
-        if let Some(spec) = requested.get(crate::verified_claims::VERIFIED_CLAIMS_CLAIM) {
-            if let Some(released_envelope) = crate::verified_claims::release_subset(envelope, spec)
-            {
-                released.insert(
-                    crate::verified_claims::VERIFIED_CLAIMS_CLAIM.to_owned(),
-                    released_envelope,
-                );
-            } else if spec.has_value_filter() {
-                // Present but failing the request's subset: omit it, the same
-                // omission rule the per-claim path applies.
-                released.remove(crate::verified_claims::VERIFIED_CLAIMS_CLAIM);
-            }
+    if let Some(envelope) = bag.get(crate::verified_claims::VERIFIED_CLAIMS_CLAIM)
+        && let Some(spec) = requested.get(crate::verified_claims::VERIFIED_CLAIMS_CLAIM)
+    {
+        if let Some(released_envelope) = crate::verified_claims::release_subset(envelope, spec) {
+            released.insert(
+                crate::verified_claims::VERIFIED_CLAIMS_CLAIM.to_owned(),
+                released_envelope,
+            );
+        } else if spec.has_value_filter() {
+            // Present but failing the request's subset: omit it, the same
+            // omission rule the per-claim path applies.
+            released.remove(crate::verified_claims::VERIFIED_CLAIMS_CLAIM);
         }
     }
 

@@ -837,10 +837,10 @@ fn path_to<'a>(
         return true;
     }
     for child in &element.children {
-        if let RichNode::Element(nested) = child {
-            if path_to(nested, target, path) {
-                return true;
-            }
+        if let RichNode::Element(nested) = child
+            && path_to(nested, target, path)
+        {
+            return true;
         }
     }
     path.pop();

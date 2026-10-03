@@ -362,13 +362,13 @@ fn render(outcome: &ForwardAuthOutcome, must_delete: &[String]) -> Response {
         }
     }
 
-    if !must_delete.is_empty() {
-        if let Ok(value) = axum::http::HeaderValue::from_str(&must_delete.join(", ")) {
-            response.headers_mut().insert(
-                axum::http::HeaderName::from_static(MUST_DELETE_HEADER),
-                value,
-            );
-        }
+    if !must_delete.is_empty()
+        && let Ok(value) = axum::http::HeaderValue::from_str(&must_delete.join(", "))
+    {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static(MUST_DELETE_HEADER),
+            value,
+        );
     }
 
     response

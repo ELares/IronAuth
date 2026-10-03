@@ -857,12 +857,12 @@ async fn issue_code(
     //     runs in another, which is a cross-tenant read dressed up as a routing detail.
     //     The refusal is the SAME opaque page as an unknown client, so this does not
     //     become an oracle for which (tenant, environment) pairs exist.
-    if let Some(path_scope) = path_scope {
-        if path_scope != scope {
-            return Err(AuthorizeError::page(
-                "the client_id is malformed or unknown",
-            ));
-        }
+    if let Some(path_scope) = path_scope
+        && path_scope != scope
+    {
+        return Err(AuthorizeError::page(
+            "the client_id is malformed or unknown",
+        ));
     }
 
     // 2. A REGISTERED client must exist in its declared scope. This lookup is BEFORE any
@@ -1216,12 +1216,12 @@ async fn issue_code(
     //     sign-before-consume discipline the code redeem uses), so a login or consent
     //     round-trip never burns the pending request; the consume's audit row is
     //     written on the winning branch only.
-    if let Some(context) = pushed {
-        if !consume_pushed_request(state, scope, stored, context).await? {
-            return Err(AuthorizeError::page(
-                "the request_uri is invalid, expired, or already used",
-            ));
-        }
+    if let Some(context) = pushed
+        && !consume_pushed_request(state, scope, stored, context).await?
+    {
+        return Err(AuthorizeError::page(
+            "the request_uri is invalid, expired, or already used",
+        ));
     }
 
     // 8. Dispatch by response type, consuming the SAME success parameter list
@@ -2018,10 +2018,10 @@ fn resolve_pkce(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if let Some(method) = named_method {
-        if PkceMethod::parse(method).is_none() {
-            return Err("code_challenge_method must be S256");
-        }
+    if let Some(method) = named_method
+        && PkceMethod::parse(method).is_none()
+    {
+        return Err("code_challenge_method must be S256");
     }
     let code_challenge = match params.code_challenge.as_deref() {
         Some(challenge) if !challenge.is_empty() => {
@@ -2208,27 +2208,27 @@ async fn evaluate_step_up(
     // other source through `merge_stronger`, so a stronger explicit floor still wins, and a
     // session that already achieved MFA is Satisfied. Inert when the engine is off or the
     // threshold is `off`, so this adds nothing on the default posture.
-    if state.risk_enabled() {
-        if let Ok(risk_subject) = UserId::parse_in_scope(&session.subject, &scope) {
-            let risk_ip = crate::abuse::resolved_client_ip(headers);
-            let risk_ua = headers
-                .get(axum::http::header::USER_AGENT)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("unknown");
-            let risk_ctx = crate::risk::RiskContext {
-                ip: risk_ip.as_deref(),
-                user_agent: risk_ua,
-                headers,
-            };
-            if crate::risk::forces_step_up(state, scope, &risk_subject, &risk_ctx).await {
-                requirement.merge_stronger(
-                    &step_up::AuthnRequirement {
-                        min_acr: Some(authn::acr_for_mfa().to_owned()),
-                        max_auth_age_secs: None,
-                    },
-                    &order,
-                );
-            }
+    if state.risk_enabled()
+        && let Ok(risk_subject) = UserId::parse_in_scope(&session.subject, &scope)
+    {
+        let risk_ip = crate::abuse::resolved_client_ip(headers);
+        let risk_ua = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("unknown");
+        let risk_ctx = crate::risk::RiskContext {
+            ip: risk_ip.as_deref(),
+            user_agent: risk_ua,
+            headers,
+        };
+        if crate::risk::forces_step_up(state, scope, &risk_subject, &risk_ctx).await {
+            requirement.merge_stronger(
+                &step_up::AuthnRequirement {
+                    min_acr: Some(authn::acr_for_mfa().to_owned()),
+                    max_auth_age_secs: None,
+                },
+                &order,
+            );
         }
     }
 
@@ -2256,20 +2256,20 @@ async fn evaluate_step_up(
     // wrong here twice over: the merge below composes this with four other sources, and it is
     // that merged requirement `evaluate` judges -- including the `max_age` half, which the
     // rules engine cannot express at all.
-    if let Some(rules) = state.access_rules() {
-        if let Some(floor) = rules.step_up_floor(&crate::rules::RequestFacts {
+    if let Some(rules) = state.access_rules()
+        && let Some(floor) = rules.step_up_floor(&crate::rules::RequestFacts {
             subject: Some(session.subject.clone()),
             acr: Some(crate::tokens::issued_acr(&session.auth_methods)),
             ..crate::rules::RequestFacts::default()
-        }) {
-            requirement.merge_stronger(
-                &step_up::AuthnRequirement {
-                    min_acr: Some(floor),
-                    max_auth_age_secs: None,
-                },
-                &order,
-            );
-        }
+        })
+    {
+        requirement.merge_stronger(
+            &step_up::AuthnRequirement {
+                min_acr: Some(floor),
+                max_auth_age_secs: None,
+            },
+            &order,
+        );
     }
 
     // The subject the overlay lookup, the factor probe, and the trusted-device validation

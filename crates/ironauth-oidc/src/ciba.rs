@@ -231,12 +231,12 @@ fn grant_types_allow_ciba(grant_types: &str) -> bool {
 /// Returns the single hint on success.
 fn validate_shape(params: &BackchannelAuthParams) -> Result<&str, CibaError> {
     let hint = single_hint(params)?;
-    if let Some(message) = params.binding_message.as_deref() {
-        if message.chars().count() > MAX_BINDING_MESSAGE {
-            return Err(CibaError::InvalidRequest(
-                "binding_message is too long to render on an authentication device",
-            ));
-        }
+    if let Some(message) = params.binding_message.as_deref()
+        && message.chars().count() > MAX_BINDING_MESSAGE
+    {
+        return Err(CibaError::InvalidRequest(
+            "binding_message is too long to render on an authentication device",
+        ));
     }
     Ok(hint)
 }

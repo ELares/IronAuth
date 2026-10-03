@@ -30,12 +30,11 @@ fn find_binary(name: &str) -> Option<PathBuf> {
         .arg("-c")
         .arg(format!("command -v {name}"))
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if !path.is_empty() {
-                return Some(PathBuf::from(path));
-            }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
         }
     }
     let home = std::env::var("HOME").ok()?;

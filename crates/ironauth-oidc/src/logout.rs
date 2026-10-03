@@ -227,13 +227,12 @@ async fn finish_logout(
     scope: Scope,
     session_id: Option<&SessionId>,
 ) -> Response {
-    if state.frontchannel_logout_enabled() {
-        if let Some(session_id) = session_id {
-            if let Some(mut response) = frontchannel_logout_page(state, scope, session_id).await {
-                set_clear_cookie(state, &mut response);
-                return response;
-            }
-        }
+    if state.frontchannel_logout_enabled()
+        && let Some(session_id) = session_id
+        && let Some(mut response) = frontchannel_logout_page(state, scope, session_id).await
+    {
+        set_clear_cookie(state, &mut response);
+        return response;
     }
     logged_out(state)
 }

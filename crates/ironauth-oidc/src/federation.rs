@@ -126,10 +126,10 @@ pub fn resolve_alg_allowlist(advertised: Option<&[String]>) -> Vec<JwsAlgorithm>
     };
     let mut algs: Vec<JwsAlgorithm> = Vec::new();
     for name in names {
-        if let Some(alg) = JwsAlgorithm::from_jose_name(name) {
-            if !algs.contains(&alg) {
-                algs.push(alg);
-            }
+        if let Some(alg) = JwsAlgorithm::from_jose_name(name)
+            && !algs.contains(&alg)
+        {
+            algs.push(alg);
         }
     }
     algs
@@ -1385,11 +1385,11 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
     // declarative claim-mapping pipeline as every other trait (verified-but-unroutable is data,
     // not a code branch). A returning login that omits the email reuses the stored flag.
     let mut claims = identity.claims.clone();
-    if let Some(relay_domain) = definition.quirks.relay_email_domain.as_deref() {
-        if let Some(email) = identity.email.as_deref() {
-            let relay = is_relay_email(email, Some(relay_domain));
-            claims.insert(EMAIL_RELAY_TRAIT.to_owned(), serde_json::Value::Bool(relay));
-        }
+    if let Some(relay_domain) = definition.quirks.relay_email_domain.as_deref()
+        && let Some(email) = identity.email.as_deref()
+    {
+        let relay = is_relay_email(email, Some(relay_domain));
+        claims.insert(EMAIL_RELAY_TRAIT.to_owned(), serde_json::Value::Bool(relay));
     }
 
     // Compile the active schema into the store-free view and evaluate the declarative claim

@@ -65,10 +65,10 @@ pub(crate) fn source_key_from_value(
     fallback: String,
 ) -> String {
     for field in fields {
-        if let Some(text) = value.get(field).and_then(serde_json::Value::as_str) {
-            if !text.is_empty() {
-                return text.to_owned();
-            }
+        if let Some(text) = value.get(field).and_then(serde_json::Value::as_str)
+            && !text.is_empty()
+        {
+            return text.to_owned();
         }
     }
     fallback

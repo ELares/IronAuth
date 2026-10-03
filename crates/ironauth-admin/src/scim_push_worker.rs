@@ -538,11 +538,11 @@ async fn apply_one<T: ScimTransport, S: SubjectSource>(
     // Only events whose schema NAMES an organization can be filtered here. The plain `user.*`
     // lifecycle events carry none, and those are decided by the connection's scope filter below,
     // which is the mechanism criterion 4 describes.
-    if let Some(named) = &organization_id {
-        if named != &pass.organization_id {
-            progress.out_of_scope += 1;
-            return Ok(());
-        }
+    if let Some(named) = &organization_id
+        && named != &pass.organization_id
+    {
+        progress.out_of_scope += 1;
+        return Ok(());
     }
 
     let resource_type = match collection {

@@ -1593,10 +1593,10 @@ async fn complete_via_table(
     .await?;
     // A post-mint counter reset runs only on a GENUINE completion (never on the rare central-fence
     // re-render), exactly as the built-in recovery driver relaxes its counters after a real mint.
-    if let Some(ctx) = post_reset {
-        if matches!(continuation, Continuation::Complete { .. }) {
-            state.reset_after_success(&ctx).await;
-        }
+    if let Some(ctx) = post_reset
+        && matches!(continuation, Continuation::Complete { .. })
+    {
+        state.reset_after_success(&ctx).await;
     }
     Ok(continuation)
 }

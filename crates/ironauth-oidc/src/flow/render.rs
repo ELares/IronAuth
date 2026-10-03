@@ -348,16 +348,14 @@ fn render_node(body: &mut String, node: &Node, locale: &ResolvedLocale, index: u
         } => {
             let labelled = node.label.is_some()
                 && !matches!(input_type, InputType::Hidden | InputType::Submit);
-            if labelled {
-                if let Some(label) = &node.label {
-                    body.push_str("<label>");
-                    body.push_str(&pages::escape_html(&localize(
-                        label.id,
-                        &label.context,
-                        locale,
-                    )));
-                    body.push(' ');
-                }
+            if labelled && let Some(label) = &node.label {
+                body.push_str("<label>");
+                body.push_str(&pages::escape_html(&localize(
+                    label.id,
+                    &label.context,
+                    locale,
+                )));
+                body.push(' ');
             }
             // Attribute order is deliberate: `type` then `name` then `value` are kept
             // ADJACENT (no attribute between `name` and `value`) so the hidden flow field

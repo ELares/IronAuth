@@ -58,10 +58,10 @@ pub fn locate_bin_dir(pg_bin_env: Option<&str>) -> Option<PathBuf> {
         .output()
     {
         let found = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if !found.is_empty() {
-            if let Some(parent) = Path::new(&found).parent() {
-                candidates.push(parent.to_path_buf());
-            }
+        if !found.is_empty()
+            && let Some(parent) = Path::new(&found).parent()
+        {
+            candidates.push(parent.to_path_buf());
         }
     }
     // The versioned install roots, EXACTLY the ones `with-test-db.sh` globs. The

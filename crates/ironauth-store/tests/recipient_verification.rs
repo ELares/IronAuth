@@ -794,7 +794,10 @@ async fn unreadable_legacy_identifier_rolls_back_batch_and_audit_and_runtime_can
         .await;
     match denied {
         Err(StoreError::Database(error)) => assert_eq!(
-            error.as_database_error().and_then(|e| e.code()).as_deref(),
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
             Some("42501")
         ),
         other => panic!("runtime role must receive SQL permission denial: {other:?}"),

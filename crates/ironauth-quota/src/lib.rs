@@ -769,10 +769,10 @@ impl QuotaEnforcer {
         // scan per idle window, and it runs BEFORE this scope's buckets are
         // resolved, so a stale bucket for THIS scope is simply reaped and then
         // re-created full below (identical to a never-seen scope).
-        if let Some(ttl) = self.idle_ttl {
-            if now.saturating_duration_since(state.last_reap) >= ttl {
-                reap_idle_locked(&mut state, ttl, now);
-            }
+        if let Some(ttl) = self.idle_ttl
+            && now.saturating_duration_since(state.last_reap) >= ttl
+        {
+            reap_idle_locked(&mut state, ttl, now);
         }
 
         // Resolve and refill every bucket on this scope's path.
@@ -780,12 +780,11 @@ impl QuotaEnforcer {
         if let Some(eval) = self.eval_tenant(&mut state, scope.tenant(), dimension, cost, now) {
             evals.push(eval);
         }
-        if let Scope::Environment(tenant, environment) = scope {
-            if let Some(eval) =
+        if let Scope::Environment(tenant, environment) = scope
+            && let Some(eval) =
                 self.eval_environment(&mut state, tenant, environment, dimension, cost, now)
-            {
-                evals.push(eval);
-            }
+        {
+            evals.push(eval);
         }
 
         // Unlimited on every touched bucket: always admit, nothing to charge.

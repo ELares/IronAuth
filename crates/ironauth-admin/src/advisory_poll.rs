@@ -116,6 +116,17 @@ impl From<crate::advisory_feed::FeedError> for PollError {
         }
     }
 }
+impl std::fmt::Display for PollError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PollError::Fetch => formatter.write_str("the feed could not be fetched"),
+            PollError::Tampered => {
+                formatter.write_str("the feed failed signature verification (rejected entirely)")
+            }
+            PollError::Store => formatter.write_str("the verified feed could not be persisted"),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -144,16 +155,5 @@ mod tests {
         let signed = crate::advisory_feed::sign_feed(&feed, &key);
         let trusted = key.verifying_key().expect("the trusted key");
         assert!(crate::advisory_feed::verify_feed(&signed, &trusted).is_ok());
-    }
-}
-impl std::fmt::Display for PollError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PollError::Fetch => formatter.write_str("the feed could not be fetched"),
-            PollError::Tampered => {
-                formatter.write_str("the feed failed signature verification (rejected entirely)")
-            }
-            PollError::Store => formatter.write_str("the verified feed could not be persisted"),
-        }
     }
 }

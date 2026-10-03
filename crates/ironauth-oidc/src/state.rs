@@ -2753,15 +2753,13 @@ impl OidcState {
         }
         // 2b. Per-IP (L1), fail OPEN: RECORD the attempt and escalate from the new count; a
         //     counter-store error is ignored (availability-biased).
-        if let Some(ip) = &ctx.ip {
-            if let Ok(count) =
+        if let Some(ip) = &ctx.ip
+            && let Ok(count) =
                 self.abuse_counters
                     .incr(&ip_counter_key(ctx.path, ip), settings.window_secs(), now)
-            {
-                if let Some(delay) = escalating_delay(&settings, count) {
-                    worst = Some(max_escalation(worst, count, delay));
-                }
-            }
+            && let Some(delay) = escalating_delay(&settings, count)
+        {
+            worst = Some(max_escalation(worst, count, delay));
         }
         // 2c. Per-client and per-(tenant, environment) request counters (L1): recorded for
         //     the future edge/tenant-fairness layers (M5/M15), never a throttle input here.

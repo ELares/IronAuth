@@ -881,10 +881,9 @@ pub async fn drive(
     if let TransportAuth::Api {
         presented_submit_token,
     } = &auth
+        && !constant_time_eq(presented_submit_token, &record.submit_token)
     {
-        if !constant_time_eq(presented_submit_token, &record.submit_token) {
-            return Err(FlowError::InvalidSubmission);
-        }
+        return Err(FlowError::InvalidSubmission);
     }
 
     let journey = Journey::parse(&record.journey).ok_or(FlowError::NotFound)?;

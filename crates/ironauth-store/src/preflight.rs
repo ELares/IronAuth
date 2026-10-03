@@ -348,22 +348,22 @@ pub fn split_statements(sql: &str) -> Vec<String> {
         }
 
         // A dollar-quoted body: $tag$ ... $tag$, where tag may be empty.
-        if c == '$' {
-            if let Some(tag) = dollar_tag(&chars, i) {
-                current.push_str(&tag);
-                i += tag.chars().count();
-                let tag_chars: Vec<char> = tag.chars().collect();
-                while i < chars.len() {
-                    if chars[i] == '$' && chars[i..].starts_with(tag_chars.as_slice()) {
-                        current.push_str(&tag);
-                        i += tag_chars.len();
-                        break;
-                    }
-                    current.push(chars[i]);
-                    i += 1;
+        if c == '$'
+            && let Some(tag) = dollar_tag(&chars, i)
+        {
+            current.push_str(&tag);
+            i += tag.chars().count();
+            let tag_chars: Vec<char> = tag.chars().collect();
+            while i < chars.len() {
+                if chars[i] == '$' && chars[i..].starts_with(tag_chars.as_slice()) {
+                    current.push_str(&tag);
+                    i += tag_chars.len();
+                    break;
                 }
-                continue;
+                current.push(chars[i]);
+                i += 1;
             }
+            continue;
         }
 
         if c == ';' {

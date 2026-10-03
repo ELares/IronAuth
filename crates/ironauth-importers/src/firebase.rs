@@ -94,12 +94,12 @@ impl FirebaseHashParams {
             mem_cost: Option<u32>,
         }
         let config: HashConfig = serde_json::from_str(json).map_err(ParseError::from_serde)?;
-        if let Some(algorithm) = &config.algorithm {
-            if !algorithm.eq_ignore_ascii_case("SCRYPT") {
-                return Err(ParseError::new(format!(
-                    "hash_config algorithm is '{algorithm}', not Firebase SCRYPT"
-                )));
-            }
+        if let Some(algorithm) = &config.algorithm
+            && !algorithm.eq_ignore_ascii_case("SCRYPT")
+        {
+            return Err(ParseError::new(format!(
+                "hash_config algorithm is '{algorithm}', not Firebase SCRYPT"
+            )));
         }
         let signer_key_b64 = config
             .base64_signer_key

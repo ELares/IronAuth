@@ -186,10 +186,10 @@ fn workspace_sources() -> Vec<String> {
                 if !skip && !name.starts_with('.') {
                     walk(&path, out);
                 }
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    out.push(text);
-                }
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                out.push(text);
             }
         }
     }

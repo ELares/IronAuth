@@ -928,10 +928,10 @@ fn collect_descriptions(node: &Value, path: &str, out: &mut Vec<(String, String)
     match node {
         Value::Object(map) => {
             for (key, value) in map {
-                if key == "description" {
-                    if let Some(text) = value.as_str() {
-                        out.push((format!("{path}/description"), text.to_owned()));
-                    }
+                if key == "description"
+                    && let Some(text) = value.as_str()
+                {
+                    out.push((format!("{path}/description"), text.to_owned()));
                 }
                 collect_descriptions(value, &format!("{path}/{key}"), out);
             }

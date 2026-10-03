@@ -50,11 +50,11 @@ fn parsers_never_panic_on_arbitrary_bytes() {
         if let Ok(auth_data) = extract_auth_data(&raw) {
             assert!(auth_data.len() <= raw.len());
         }
-        if let Ok(parsed) = parse_authenticator_data(&raw) {
-            if let Some(attested) = parsed.attested_credential {
-                assert!(attested.credential_id.len() <= raw.len());
-                assert!(attested.cose_public_key.len() <= raw.len());
-            }
+        if let Ok(parsed) = parse_authenticator_data(&raw)
+            && let Some(attested) = parsed.attested_credential
+        {
+            assert!(attested.credential_id.len() <= raw.len());
+            assert!(attested.cose_public_key.len() <= raw.len());
         }
         let _ = parse_cose_key(&raw);
     }

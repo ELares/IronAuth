@@ -603,14 +603,14 @@ async fn resume_challenge(
     // Client binding (defense in depth): a resume presenting a DIFFERENT client_id is a uniform
     // `invalid_client`, so a stolen handle cannot even be replayed under another client (and the
     // code binds the stored client regardless). An absent client_id defers to the stored one.
-    if let Some(request_client_id) = request_client_id {
-        if request_client_id != params.client_id {
-            return error(
-                StatusCode::UNAUTHORIZED,
-                "invalid_client",
-                "the client_id is malformed or unknown",
-            );
-        }
+    if let Some(request_client_id) = request_client_id
+        && request_client_id != params.client_id
+    {
+        return error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "the client_id is malformed or unknown",
+        );
     }
     let client = match state.store().scoped(scope).clients().get(&client_id).await {
         Ok(record) => record,

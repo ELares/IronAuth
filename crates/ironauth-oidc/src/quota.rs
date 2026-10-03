@@ -145,10 +145,10 @@ fn too_many_requests(outcome: &QuotaOutcome) -> Response {
             headers.insert(name, value);
         }
     }
-    if let Some(cookie) = outcome.snapshot.block_set_cookie() {
-        if let Ok(value) = HeaderValue::from_str(&cookie) {
-            headers.append(axum::http::header::SET_COOKIE, value);
-        }
+    if let Some(cookie) = outcome.snapshot.block_set_cookie()
+        && let Ok(value) = HeaderValue::from_str(&cookie)
+    {
+        headers.append(axum::http::header::SET_COOKIE, value);
     }
     response
 }

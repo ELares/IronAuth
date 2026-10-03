@@ -254,12 +254,11 @@ fn picker_option_values(flow: &Value) -> Vec<String> {
 /// headers, so the minted session can be presented to `/authorize`.
 fn session_cookie_from_headers(headers: &HeaderMap) -> String {
     for value in headers.get_all(header::SET_COOKIE) {
-        if let Ok(raw) = value.to_str() {
-            if let Some(pair) = raw.split(';').next() {
-                if pair.starts_with(SESSION_COOKIE) {
-                    return pair.to_owned();
-                }
-            }
+        if let Ok(raw) = value.to_str()
+            && let Some(pair) = raw.split(';').next()
+            && pair.starts_with(SESSION_COOKIE)
+        {
+            return pair.to_owned();
         }
     }
     panic!("the login completion set no session cookie: {headers:?}");

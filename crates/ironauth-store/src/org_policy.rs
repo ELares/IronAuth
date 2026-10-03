@@ -920,10 +920,10 @@ pub fn validate(
     // Row-local only: an organization may state ONE of the pair and inherit the
     // other, which no single-document check (and no CHECK constraint) can see. The
     // resolved pair is where that case is caught.
-    if let (Some(absolute), Some(idle)) = (policy.session_ttl_secs, policy.session_idle_ttl_secs) {
-        if idle > absolute {
-            errors.push(AuthPolicyError::IdleExceedsAbsolute);
-        }
+    if let (Some(absolute), Some(idle)) = (policy.session_ttl_secs, policy.session_idle_ttl_secs)
+        && idle > absolute
+    {
+        errors.push(AuthPolicyError::IdleExceedsAbsolute);
     }
 
     if errors.is_empty() {

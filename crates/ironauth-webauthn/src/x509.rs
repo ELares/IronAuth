@@ -545,15 +545,15 @@ fn require_issuer_constraints(
     if !issuer.is_ca {
         return Err(X509Error::ConstraintViolation);
     }
-    if let Some(bits) = issuer.key_usage {
-        if bits & KEY_USAGE_KEY_CERT_SIGN == 0 {
-            return Err(X509Error::ConstraintViolation);
-        }
+    if let Some(bits) = issuer.key_usage
+        && bits & KEY_USAGE_KEY_CERT_SIGN == 0
+    {
+        return Err(X509Error::ConstraintViolation);
     }
-    if let Some(max) = issuer.path_len {
-        if intermediate_cas_below as u64 > max {
-            return Err(X509Error::ConstraintViolation);
-        }
+    if let Some(max) = issuer.path_len
+        && intermediate_cas_below as u64 > max
+    {
+        return Err(X509Error::ConstraintViolation);
     }
     Ok(())
 }

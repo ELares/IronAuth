@@ -531,14 +531,13 @@ impl IntoResponse for TokenError {
             acr_values,
             max_age,
         } = &self
+            && let Some(map) = object.as_object_mut()
         {
-            if let Some(map) = object.as_object_mut() {
-                if let Some(acr) = acr_values {
-                    map.insert("acr_values".to_owned(), serde_json::json!(acr));
-                }
-                if let Some(age) = max_age {
-                    map.insert("max_age".to_owned(), serde_json::json!(age));
-                }
+            if let Some(acr) = acr_values {
+                map.insert("acr_values".to_owned(), serde_json::json!(acr));
+            }
+            if let Some(age) = max_age {
+                map.insert("max_age".to_owned(), serde_json::json!(age));
             }
         }
         let body = object.to_string();
@@ -576,10 +575,10 @@ impl IntoResponse for TokenError {
         // is still built with the fallible constructor: a header value that would not
         // encode must drop the header rather than panic serving a request, and the
         // client then retries into a fresh challenge.
-        if let TokenError::UseDpopNonce { nonce } = &self {
-            if let Ok(value) = header::HeaderValue::from_str(nonce) {
-                response.headers_mut().insert(DPOP_NONCE_HEADER, value);
-            }
+        if let TokenError::UseDpopNonce { nonce } = &self
+            && let Ok(value) = header::HeaderValue::from_str(nonce)
+        {
+            response.headers_mut().insert(DPOP_NONCE_HEADER, value);
         }
         response
     }

@@ -1640,13 +1640,13 @@ fn validate_resource(
             // brand with no host / client selection omits them (export skips a None), and a
             // present value must be a string.
             for field in ["host_pattern", "client_id"] {
-                if let Some(value) = object.get(field) {
-                    if !value.is_string() {
-                        violations.push(SnapshotViolation::new(
-                            format!("{path}/{field}"),
-                            "must be a JSON string",
-                        ));
-                    }
+                if let Some(value) = object.get(field)
+                    && !value.is_string()
+                {
+                    violations.push(SnapshotViolation::new(
+                        format!("{path}/{field}"),
+                        "must be a JSON string",
+                    ));
                 }
             }
             // The by-reference asset metadata (issue #86, PR 3) is an OPTIONAL array; each element
@@ -1665,13 +1665,13 @@ fn validate_resource(
             // The default marker is a bool; a hand authored or future apply document that
             // supplies a non bool here is a fault (export always emits a real bool, so a genuine
             // round trip never trips this).
-            if let Some(value) = object.get("is_env_default") {
-                if !value.is_boolean() {
-                    violations.push(SnapshotViolation::new(
-                        format!("{path}/is_env_default"),
-                        "must be a boolean",
-                    ));
-                }
+            if let Some(value) = object.get("is_env_default")
+                && !value.is_boolean()
+            {
+                violations.push(SnapshotViolation::new(
+                    format!("{path}/is_env_default"),
+                    "must be a boolean",
+                ));
             }
             match object.get("entries") {
                 Some(serde_json::Value::Object(_)) => {}
@@ -1776,13 +1776,13 @@ fn validate_resource(
             }
             // The pin flag is a bool; export always emits a real bool, so a genuine round trip
             // never trips this (a hand-authored document that supplies a non-bool is a fault).
-            if let Some(value) = object.get("pinned") {
-                if !value.is_boolean() {
-                    violations.push(SnapshotViolation::new(
-                        format!("{path}/pinned"),
-                        "must be a boolean",
-                    ));
-                }
+            if let Some(value) = object.get("pinned")
+                && !value.is_boolean()
+            {
+                violations.push(SnapshotViolation::new(
+                    format!("{path}/pinned"),
+                    "must be a boolean",
+                ));
             }
             // The artifact must be a JSON object that is a LOAD-VALID journey: a snapshotted
             // journey must parse AND compile, so a promotion never carries a broken journey. The
@@ -1819,13 +1819,13 @@ fn validate_resource(
             require_nonempty_string(object, "locale", path, violations);
             require_nonempty_string(object, "subject", path, violations);
             require_nonempty_string(object, "body_text", path, violations);
-            if let Some(value) = object.get("locked") {
-                if !value.is_boolean() {
-                    violations.push(SnapshotViolation::new(
-                        format!("{path}/locked"),
-                        "must be a boolean",
-                    ));
-                }
+            if let Some(value) = object.get("locked")
+                && !value.is_boolean()
+            {
+                violations.push(SnapshotViolation::new(
+                    format!("{path}/locked"),
+                    "must be a boolean",
+                ));
             }
             // Every body must be SAFE-TEMPLATING VALID, the same gate the flow-version arm
             // applies to a journey artifact and for the same reason: a promotion that accepted
@@ -1845,13 +1845,13 @@ fn validate_resource(
             for field in ["subject", "body_text", "body_html"] {
                 // `body_html` may be absent or null; the required-string check above already
                 // reported a missing or non-string subject or text body.
-                if let Some(serde_json::Value::String(text)) = object.get(field) {
-                    if let Err(error) = crate::message_render::validate_syntax(text) {
-                        violations.push(SnapshotViolation::new(
-                            format!("{path}/{field}"),
-                            error.as_str(),
-                        ));
-                    }
+                if let Some(serde_json::Value::String(text)) = object.get(field)
+                    && let Err(error) = crate::message_render::validate_syntax(text)
+                {
+                    violations.push(SnapshotViolation::new(
+                        format!("{path}/{field}"),
+                        error.as_str(),
+                    ));
                 }
             }
         }

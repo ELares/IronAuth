@@ -4210,10 +4210,10 @@ pub fn location_param(headers: &HeaderMap, name: &str) -> Option<String> {
     let location = headers.get(header::LOCATION)?.to_str().ok()?;
     let query = location.split_once('?').map_or("", |(_, q)| q);
     for pair in query.split('&') {
-        if let Some((key, value)) = pair.split_once('=') {
-            if key == name {
-                return Some(percent_decode(value));
-            }
+        if let Some((key, value)) = pair.split_once('=')
+            && key == name
+        {
+            return Some(percent_decode(value));
         }
     }
     None
@@ -4227,10 +4227,10 @@ pub fn location_fragment_param(headers: &HeaderMap, name: &str) -> Option<String
     let location = headers.get(header::LOCATION)?.to_str().ok()?;
     let fragment = location.split_once('#').map_or("", |(_, f)| f);
     for pair in fragment.split('&') {
-        if let Some((key, value)) = pair.split_once('=') {
-            if key == name {
-                return Some(percent_decode(value));
-            }
+        if let Some((key, value)) = pair.split_once('=')
+            && key == name
+        {
+            return Some(percent_decode(value));
         }
     }
     None
@@ -4314,10 +4314,11 @@ pub fn named_cookie_pair(headers: &HeaderMap, name: &str) -> Option<String> {
             continue;
         };
         let pair = value.split(';').next().unwrap_or("").trim();
-        if let Some((cookie_name, cookie_value)) = pair.split_once('=') {
-            if cookie_name == name && !cookie_value.is_empty() {
-                return Some(pair.to_owned());
-            }
+        if let Some((cookie_name, cookie_value)) = pair.split_once('=')
+            && cookie_name == name
+            && !cookie_value.is_empty()
+        {
+            return Some(pair.to_owned());
         }
     }
     None

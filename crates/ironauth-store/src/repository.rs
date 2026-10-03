@@ -5738,10 +5738,10 @@ impl ActingClientRepo<'_> {
         // front-channel logout page. A value with whitespace or a `;` in its authority
         // would smuggle extra CSP sources or directives into that header, so a plaintext
         // scheme or a malformed authority is refused before anything is written.
-        if let Some(uri) = uri {
-            if !is_well_formed_https_uri(uri) {
-                return Err(StoreError::InvalidRedirectUri);
-            }
+        if let Some(uri) = uri
+            && !is_well_formed_https_uri(uri)
+        {
+            return Err(StoreError::InvalidRedirectUri);
         }
         let owned_uri: Option<String> = uri.map(str::to_owned);
         let scope = self.scope;
@@ -5808,10 +5808,10 @@ impl ActingClientRepo<'_> {
         // registration (defense in depth; the fetcher still blocks a private resolved
         // address at delivery). An empty string is treated as absent.
         let uri = uri.filter(|value| !value.is_empty());
-        if let Some(value) = uri {
-            if !value.starts_with("https://") {
-                return Err(StoreError::InvalidRedirectUri);
-            }
+        if let Some(value) = uri
+            && !value.starts_with("https://")
+        {
+            return Err(StoreError::InvalidRedirectUri);
         }
         let owned = uri.map(str::to_owned);
         let scope = self.scope;
@@ -12010,13 +12010,13 @@ impl EnvironmentGuardrailRepo<'_> {
                      which a hardened (FAPI 2.0) environment does not permit"
                 ));
             }
-            if let Some(alg) = signing_alg {
-                if !crate::fapi_hardened_permits_signing_alg(&alg) {
-                    violations.push(format!(
-                        "client {display_name} ({id}) registers signing algorithm {alg}, \
+            if let Some(alg) = signing_alg
+                && !crate::fapi_hardened_permits_signing_alg(&alg)
+            {
+                violations.push(format!(
+                    "client {display_name} ({id}) registers signing algorithm {alg}, \
                          which a hardened (FAPI 2.0) environment does not permit"
-                    ));
-                }
+                ));
             }
         }
         Ok(violations)
@@ -18801,11 +18801,10 @@ impl ActingUserRepo<'_> {
                 // registration path already validated against the ACTIVE schema, so the
                 // annotations it validated under are the ones to index by, and the version it
                 // carries is that schema's.
-                if let Some(carried) = traits {
-                    if let Ok(value) =
+                if let Some(carried) = traits
+                    && let Ok(value) =
                         serde_json::from_str::<serde_json::Value>(carried.traits_json)
-                    {
-                        if let Some(active) = active_trait_schema_in_tx(tx, scope).await? {
+                        && let Some(active) = active_trait_schema_in_tx(tx, scope).await? {
                             let schema = TraitSchema::compile(&active.schema_json)?;
                             rewrite_trait_login_index(
                                 tx,
@@ -18818,8 +18817,6 @@ impl ActingUserRepo<'_> {
                             )
                             .await?;
                         }
-                    }
-                }
                 // A quarantined signup (issue #82, PR 2) opens its review-queue case in the
                 // SAME transaction as the account INSERT and its `user.register` audit row,
                 // so a committed quarantined account always has an open case and neither can
@@ -21419,10 +21416,10 @@ impl ActingUserIdentifierRepo<'_> {
                 // Only when the mode actually USES `org`. Environment-wide mode ignores it,
                 // so requiring membership there would reject callers that pass an org
                 // harmlessly and change behaviour that has nothing to do with this fix.
-                if matches!(mode, UniquenessMode::OrgScoped) {
-                    if let Some(org_id) = org {
-                        require_live_membership(tx, scope, org_id, user_id).await?;
-                    }
+                if matches!(mode, UniquenessMode::OrgScoped)
+                    && let Some(org_id) = org
+                {
+                    require_live_membership(tx, scope, org_id, user_id).await?;
                 }
                 let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
                 let raw_sealed = dek.seal(
@@ -22647,13 +22644,13 @@ impl ActingSessionRepo<'_> {
         idempotency: Option<IdempotencyWrite<'_>>,
         events: Option<&[DomainEvent<'_>]>,
     ) -> Result<u64, StoreError> {
-        if let Some(events) = events {
-            if events.len() != ids.len() {
-                // Refused rather than truncated or zipped: a length mismatch means the
-                // caller's envelopes and the sessions they describe are not aligned, and
-                // enqueuing any of them would attribute the wrong session to the wrong event.
-                return Err(StoreError::InvalidName);
-            }
+        if let Some(events) = events
+            && events.len() != ids.len()
+        {
+            // Refused rather than truncated or zipped: a length mismatch means the
+            // caller's envelopes and the sessions they describe are not aligned, and
+            // enqueuing any of them would attribute the wrong session to the wrong event.
+            return Err(StoreError::InvalidName);
         }
         let scope = self.scope;
         let now_micros = epoch_micros(env.clock().now_utc());
@@ -24639,16 +24636,17 @@ async fn enqueue_outbox_in_tx_at_inner(
     // are tested (`abuse.rs`), so a third insert added without the assertion would be a
     // third place the claim is wrong rather than a place it is quietly true.
     #[cfg(feature = "testing")]
-    if validate && message.consumer == WEBHOOK_EVENT_CONSUMER {
-        if let Err(error) = crate::event_catalog::validate_event(&message.payload) {
-            panic!(
-                "a producer emitted an event that does not validate against the registry: \
+    if validate
+        && message.consumer == WEBHOOK_EVENT_CONSUMER
+        && let Err(error) = crate::event_catalog::validate_event(&message.payload)
+    {
+        panic!(
+            "a producer emitted an event that does not validate against the registry: \
                  {error:?}\n\nenvelope: {}\n\nThe fan-out refuses this permanently, so \
                  shipping it would announce nothing while the write succeeded. Register the \
                  type, or fix the payload to match the schema it declares.",
-                message.payload
-            );
-        }
+            message.payload
+        );
     }
     // BEFORE the insert, so the sequence this row is handed cannot be handed out until the
     // previous event producer in this scope has committed. See `take_event_append_lock`.
@@ -24733,16 +24731,16 @@ async fn enqueue_outbox_in_tx_ignoring_conflict(
     // `WEBHOOK_DELIVERY_CONSUMER` and `BACKCHANNEL_LOGOUT_CONSUMER`; but `enqueue_all` is
     // the shape a fan-out producer is documented to use, so the next one would have found it.
     #[cfg(feature = "testing")]
-    if message.consumer == WEBHOOK_EVENT_CONSUMER {
-        if let Err(error) = crate::event_catalog::validate_event(&message.payload) {
-            panic!(
-                "a producer emitted an event that does not validate against the registry: \
+    if message.consumer == WEBHOOK_EVENT_CONSUMER
+        && let Err(error) = crate::event_catalog::validate_event(&message.payload)
+    {
+        panic!(
+            "a producer emitted an event that does not validate against the registry: \
                  {error:?}\n\nenvelope: {}\n\nThe fan-out refuses this permanently, so \
                  shipping it would announce nothing while the write succeeded. Register the \
                  type, or fix the payload to match the schema it declares.",
-                message.payload
-            );
-        }
+            message.payload
+        );
     }
     // THE SECOND insert into `outbox_messages`, and so the second place this lock has to be
     // taken. The emit-time assertion above was missed here once for exactly this reason: a
@@ -26687,10 +26685,11 @@ impl OutboxRepo<'_> {
         //
         // Making either exact needs a per-scope pruned-through watermark, which is a schema
         // change and its own issue.
-        if let Some(oldest_retained) = oldest {
-            if after_sequence > 0 && oldest_retained > after_sequence.saturating_add(1) {
-                return Ok(EventPage::Gone { oldest_retained });
-            }
+        if let Some(oldest_retained) = oldest
+            && after_sequence > 0
+            && oldest_retained > after_sequence.saturating_add(1)
+        {
+            return Ok(EventPage::Gone { oldest_retained });
         }
         Ok(EventPage::Page(
             self.events_after(after_sequence, limit).await?,
@@ -32406,14 +32405,13 @@ impl WebhookEndpointRepo<'_> {
         // every part or on none; a half-set rotation cannot reach here.
         if let (Some(sealed), Some(version), Some(expires)) =
             (previous_sealed, previous_version, previous_expires)
+            && expires > now_unix_micros
         {
-            if expires > now_unix_micros {
-                let previous_dek = fetch_dek_by_version(&mut tx, scope, master, version).await?;
-                secrets.push(previous_dek.open(
-                    &secret_seal_aad(scope, &purpose, version),
-                    &Sealed::from_bytes(sealed)?,
-                )?);
-            }
+            let previous_dek = fetch_dek_by_version(&mut tx, scope, master, version).await?;
+            secrets.push(previous_dek.open(
+                &secret_seal_aad(scope, &purpose, version),
+                &Sealed::from_bytes(sealed)?,
+            )?);
         }
         tx.commit().await?;
         Ok(DeliveryTargetLookup::Deliverable(WebhookDeliveryTarget {
@@ -42041,10 +42039,10 @@ impl ActingRiskSignalRepo<'_> {
     /// path fails closed rather than store a plaintext external subject);
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn ingest(&self, env: &Env, signal: NewRiskSignal<'_>) -> Result<bool, StoreError> {
-        if let Some(subject) = signal.resolved_subject {
-            if subject.scope() != self.scope {
-                return Err(StoreError::NotFound);
-            }
+        if let Some(subject) = signal.resolved_subject
+            && subject.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
         }
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let scope = self.scope;
@@ -50630,10 +50628,10 @@ pub fn verify_chain_entries(
         //
         // Written as a nested `if` rather than a let-chain: let-chains need Rust 1.88
         // and this crate's MSRV is 1.85.
-        if let Some(previous) = expected_prev {
-            if entry.prev_hash != previous {
-                return Err(ChainFault::Link { seq: entry.seq });
-            }
+        if let Some(previous) = expected_prev
+            && entry.prev_hash != previous
+        {
+            return Err(ChainFault::Link { seq: entry.seq });
         }
         let Some(row) = rows.get(&entry.audit_id) else {
             return Err(ChainFault::MissingRow {
@@ -75051,10 +75049,10 @@ impl ApiKeyRepo<'_> {
         if row.get::<Option<i64>, _>("revoked_us").is_some() {
             return Ok(None);
         }
-        if let Some(expires) = row.get::<Option<i64>, _>("expires_us") {
-            if expires <= now_micros {
-                return Ok(None);
-            }
+        if let Some(expires) = row.get::<Option<i64>, _>("expires_us")
+            && expires <= now_micros
+        {
+            return Ok(None);
         }
 
         let owner_kind: String = row.get("owner_kind");
@@ -76372,39 +76370,37 @@ impl BackchannelAuthRepo<'_> {
         // If the decision below then matches no row (wrong subject, already decided, expired)
         // the transaction is dropped WITHOUT committing, so the grant never lands. That
         // ordering is the reason this is one transaction and not two.
-        if approved {
-            if let Some(grant_id) = linkage.grant_id {
-                let Some(request) = sqlx::query(
-                    "SELECT client_id, subject FROM backchannel_authentication_requests \
+        if approved && let Some(grant_id) = linkage.grant_id {
+            let Some(request) = sqlx::query(
+                "SELECT client_id, subject FROM backchannel_authentication_requests \
                      WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 FOR UPDATE",
-                )
-                .bind(id.to_string())
-                .bind(self.scope.tenant().to_string())
-                .bind(self.scope.environment().to_string())
-                .fetch_optional(&mut *tx)
-                .await?
-                else {
-                    return Ok(false);
-                };
-                let request_client: String = request.get("client_id");
-                let request_subject: String = request.get("subject");
-                sqlx::query(
-                    "INSERT INTO grants \
+            )
+            .bind(id.to_string())
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            else {
+                return Ok(false);
+            };
+            let request_client: String = request.get("client_id");
+            let request_subject: String = request.get("subject");
+            sqlx::query(
+                "INSERT INTO grants \
                      (id, tenant_id, environment_id, client_id, subject, session_ref, \
                       consent_ref, claims_request, created_at) \
                      VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, \
                              TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
-                )
-                .bind(grant_id.to_string())
-                .bind(self.scope.tenant().to_string())
-                .bind(self.scope.environment().to_string())
-                .bind(&request_client)
-                .bind(&request_subject)
-                .bind(linkage.consent_ref)
-                .bind(now_micros)
-                .execute(&mut *tx)
-                .await?;
-            }
+            )
+            .bind(grant_id.to_string())
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(&request_client)
+            .bind(&request_subject)
+            .bind(linkage.consent_ref)
+            .bind(now_micros)
+            .execute(&mut *tx)
+            .await?;
         }
 
         let decided = sqlx::query(
@@ -77959,8 +77955,8 @@ impl ActingAgentRepo<'_> {
                 //
                 // An UNBOUND agent has no door, so no grants; a client with no service
                 // account has never minted a machine token, so the subquery matches nothing.
-                if state == "revoked" {
-                    if let Some(client_id) = agent.client_id.as_deref() {
+                if state == "revoked"
+                    && let Some(client_id) = agent.client_id.as_deref() {
                         sqlx::query(
                             "UPDATE grants \
                              SET revoked_at = TIMESTAMPTZ 'epoch' \
@@ -77980,7 +77976,6 @@ impl ActingAgentRepo<'_> {
                         .execute(&mut **tx)
                         .await?;
                     }
-                }
                 record = Some(agent);
                 enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
@@ -88683,10 +88678,10 @@ impl ScimActivationRepo<'_> {
         // twin of the phantom audit row `revoke_membership_attachments_audited` documents, and
         // here it is worse: the audit row is read by an operator, the event is ACTED ON by a
         // downstream system that would terminate somebody twice.
-        if let Some((env, event)) = emit {
-            if changed > 0 {
-                enqueue_domain_event(&mut tx, env, self.scope, Some(event)).await?;
-            }
+        if let Some((env, event)) = emit
+            && changed > 0
+        {
+            enqueue_domain_event(&mut tx, env, self.scope, Some(event)).await?;
         }
         tx.commit().await?;
         Ok(())

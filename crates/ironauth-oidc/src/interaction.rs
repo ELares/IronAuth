@@ -249,10 +249,10 @@ pub fn same_origin_ok(headers: &HeaderMap, expected_origin: Option<&str>) -> boo
         .get(SEC_FETCH_SITE)
         .and_then(|value| value.to_str().ok());
     // Positive cross-site signal from fetch metadata: reject.
-    if let Some(site) = fetch_site {
-        if site.eq_ignore_ascii_case("cross-site") {
-            return false;
-        }
+    if let Some(site) = fetch_site
+        && site.eq_ignore_ascii_case("cross-site")
+    {
+        return false;
     }
     // Positive SAME-ORIGIN evidence from fetch metadata (unforgeable by page script).
     // This is the only thing that can rescue an opaque `Origin`, and it must be
@@ -1179,10 +1179,10 @@ pub(crate) async fn verified_email_domains(
         if !record.verified || record.identifier_type != ironauth_store::IdentifierType::Email {
             continue;
         }
-        if let Some((_, domain)) = record.raw.rsplit_once('@') {
-            if let Some(normalized) = ironauth_store::normalize_routing_domain(domain) {
-                domains.insert(normalized);
-            }
+        if let Some((_, domain)) = record.raw.rsplit_once('@')
+            && let Some(normalized) = ironauth_store::normalize_routing_domain(domain)
+        {
+            domains.insert(normalized);
         }
     }
     domains

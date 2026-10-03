@@ -216,10 +216,10 @@ fn verify_packed(
 
         // If the certificate carries the FIDO AAGUID extension it MUST match the
         // authenticator data AAGUID: this is the AAGUID-spoof defence.
-        if let Some(cert_aaguid) = leaf.aaguid {
-            if &cert_aaguid != aaguid {
-                return Err(CeremonyError::AttestationAaguidMismatch);
-            }
+        if let Some(cert_aaguid) = leaf.aaguid
+            && &cert_aaguid != aaguid
+        {
+            return Err(CeremonyError::AttestationAaguidMismatch);
         }
 
         // Chain the leaf to a trusted MDS3 attestation root for this AAGUID.

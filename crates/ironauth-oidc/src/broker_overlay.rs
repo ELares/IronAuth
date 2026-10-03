@@ -81,28 +81,28 @@ pub(crate) fn overlay_requirement(
         );
     }
 
-    if let Some(token) = record.overlay_min_class.as_deref() {
-        if let Some(class) = CredentialClass::from_token(token) {
-            requirement.merge_stronger(
-                &AuthnRequirement {
-                    min_acr: Some(authn::acr_for_class(class).to_owned()),
-                    max_auth_age_secs: None,
-                },
-                order,
-            );
-        }
+    if let Some(token) = record.overlay_min_class.as_deref()
+        && let Some(class) = CredentialClass::from_token(token)
+    {
+        requirement.merge_stronger(
+            &AuthnRequirement {
+                min_acr: Some(authn::acr_for_class(class).to_owned()),
+                max_auth_age_secs: None,
+            },
+            order,
+        );
     }
 
-    if let Some(secs) = record.max_age_secs {
-        if let Ok(secs) = u64::try_from(secs) {
-            requirement.merge_stronger(
-                &AuthnRequirement {
-                    min_acr: None,
-                    max_auth_age_secs: Some(secs),
-                },
-                order,
-            );
-        }
+    if let Some(secs) = record.max_age_secs
+        && let Ok(secs) = u64::try_from(secs)
+    {
+        requirement.merge_stronger(
+            &AuthnRequirement {
+                min_acr: None,
+                max_auth_age_secs: Some(secs),
+            },
+            order,
+        );
     }
 
     // A pwd-level floor (the `any` credential class, or an explicit `pwd` acr) is the
@@ -244,30 +244,29 @@ pub(crate) async fn enforce_on_callback(ctx: CallbackContext<'_>) -> CallbackOve
     // reusing the ONE requirement assembler, so the callback never routes to a ceremony
     // WEAKER than the client already requires. Best-effort here (a fault is not fatal): the
     // authorization gate re-composes and re-enforces the client floor on resume.
-    if let Some(resume) = interaction::parse_resume(Some(ctx.return_to)) {
-        if let Ok(client) = ctx
+    if let Some(resume) = interaction::parse_resume(Some(ctx.return_to))
+        && let Ok(client) = ctx
             .state
             .store()
             .scoped(ctx.scope)
             .clients()
             .get(&resume.client_id)
             .await
-        {
-            let query = ctx.return_to.split_once('?').map_or("", |(_, q)| q);
-            let acr_values = crate::util::query_get(query, "acr_values");
-            let max_age = crate::util::query_get(query, "max_age")
-                .and_then(|value| value.parse::<u64>().ok());
-            let assembled = step_up::requirement_for_request(
-                ctx.state,
-                ctx.scope,
-                &crate::authorize::ResolvedClient::Registered(&client),
-                resume.oauth_scope.as_deref(),
-                acr_values.as_deref(),
-                max_age,
-            )
-            .await;
-            requirement.merge_stronger(&assembled.requirement, &order);
-        }
+    {
+        let query = ctx.return_to.split_once('?').map_or("", |(_, q)| q);
+        let acr_values = crate::util::query_get(query, "acr_values");
+        let max_age =
+            crate::util::query_get(query, "max_age").and_then(|value| value.parse::<u64>().ok());
+        let assembled = step_up::requirement_for_request(
+            ctx.state,
+            ctx.scope,
+            &crate::authorize::ResolvedClient::Registered(&client),
+            resume.oauth_scope.as_deref(),
+            acr_values.as_deref(),
+            max_age,
+        )
+        .await;
+        requirement.merge_stronger(&assembled.requirement, &order);
     }
 
     let (acr_unmet, age_lapsed) = match step_up::evaluate(

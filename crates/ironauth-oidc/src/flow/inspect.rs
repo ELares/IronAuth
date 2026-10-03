@@ -166,10 +166,10 @@ pub fn project_plan(journey: Journey, compiled: &CompiledJourney) -> Vec<FlowSta
 
     while let Some(step_id) = queue.pop_front() {
         if let Some(step) = compiled.step(&step_id) {
-            if let Some(tag) = projected_state(journey, &step.kind) {
-                if !plan.contains(&tag) {
-                    plan.push(tag);
-                }
+            if let Some(tag) = projected_state(journey, &step.kind)
+                && !plan.contains(&tag)
+            {
+                plan.push(tag);
             }
             // A step may also emit a render-override wire state BEFORE routing (issue #92, PR 8c):
             // a non-terminal acknowledgment the executor renders while the flow stays OPEN

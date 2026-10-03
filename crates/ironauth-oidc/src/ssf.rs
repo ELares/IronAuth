@@ -280,12 +280,12 @@ fn validate(
             "aud must name at least one audience",
         )));
     }
-    if let Some(description) = request.description.as_deref() {
-        if description.trim().is_empty() || description.len() > MAX_TEXT_BYTES {
-            return Err(Box::new(invalid_request(
-                "description must be non-empty and at most 252 bytes",
-            )));
-        }
+    if let Some(description) = request.description.as_deref()
+        && (description.trim().is_empty() || description.len() > MAX_TEXT_BYTES)
+    {
+        return Err(Box::new(invalid_request(
+            "description must be non-empty and at most 252 bytes",
+        )));
     }
     Ok((delivery, format))
 }
@@ -720,39 +720,38 @@ fn read_only_mismatch(
     // Rust 1.88, and this workspace promises 1.85: the `msrv` lane compiles the shipped
     // graph at that version and these six were failing it. The nesting is uglier and it is
     // what the promised floor costs.
-    if let Some(aud) = &request.aud {
-        if *aud != current.audience {
-            return mismatched("aud");
-        }
+    if let Some(aud) = &request.aud
+        && *aud != current.audience
+    {
+        return mismatched("aud");
     }
-    if let Some(format) = &request.format {
-        if format.as_str() != current.subject_format.as_str() {
-            return mismatched("format");
-        }
+    if let Some(format) = &request.format
+        && format.as_str() != current.subject_format.as_str()
+    {
+        return mismatched("format");
     }
-    if let Some(supported) = &request.events_supported {
-        if supported
+    if let Some(supported) = &request.events_supported
+        && supported
             .iter()
             .map(String::as_str)
             .ne(EVENTS_SUPPORTED.iter().copied())
-        {
-            return mismatched("events_supported");
-        }
+    {
+        return mismatched("events_supported");
     }
-    if let Some(delivered) = &request.events_delivered {
-        if *delivered != current.events_delivered {
-            return mismatched("events_delivered");
-        }
+    if let Some(delivered) = &request.events_delivered
+        && *delivered != current.events_delivered
+    {
+        return mismatched("events_delivered");
     }
-    if let Some(iss) = &request.iss {
-        if iss.as_str() != state.issuers().issuer_for(&scope) {
-            return mismatched("iss");
-        }
+    if let Some(iss) = &request.iss
+        && iss.as_str() != state.issuers().issuer_for(&scope)
+    {
+        return mismatched("iss");
     }
-    if let Some(interval) = request.min_verification_interval {
-        if interval != state.ssf_min_verification_interval_secs() {
-            return mismatched("min_verification_interval");
-        }
+    if let Some(interval) = request.min_verification_interval
+        && interval != state.ssf_min_verification_interval_secs()
+    {
+        return mismatched("min_verification_interval");
     }
     None
 }

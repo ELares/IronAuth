@@ -57,22 +57,14 @@ pub(crate) async fn page(
             "The application link is invalid. Open your invitation again.",
         );
     }
-    let subject = match crate::account::recipient_page_subject(
-        &state,
-        &tenant,
-        &environment,
-        &headers,
-    )
-    .await
-    {
-        Ok((_, subject)) => subject,
-        Err(_) => {
-            let return_to = pages::escape_html(&query.return_to);
-            let body = format!(
-                "<h1>Sign in again to verify your email</h1><p>For your account's protection, verification requires a recent sign-in. Return to the application, sign in, then reopen email verification.</p><p><a href=\"{return_to}\">Return to application</a></p>"
-            );
-            return pages::secure_html(StatusCode::UNAUTHORIZED, shell(&body));
-        }
+    let Ok((_, subject)) =
+        crate::account::recipient_page_subject(&state, &tenant, &environment, &headers).await
+    else {
+        let return_to = pages::escape_html(&query.return_to);
+        let body = format!(
+            "<h1>Sign in again to verify your email</h1><p>For your account's protection, verification requires a recent sign-in. Return to the application, sign in, then reopen email verification.</p><p><a href=\"{return_to}\">Return to application</a></p>"
+        );
+        return pages::secure_html(StatusCode::UNAUTHORIZED, shell(&body));
     };
     let Ok(user) = state.store().scoped(scope).users().get(&subject).await else {
         return notice(

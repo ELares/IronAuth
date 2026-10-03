@@ -229,12 +229,12 @@ fn validate(
                 .to_owned(),
         ));
     }
-    if let Some(timeout) = request.timeout_ms {
-        if timeout <= 0 {
-            return Err(ApiError::BadRequest(
-                "timeout_ms must be greater than zero".to_owned(),
-            ));
-        }
+    if let Some(timeout) = request.timeout_ms
+        && timeout <= 0
+    {
+        return Err(ApiError::BadRequest(
+            "timeout_ms must be greater than zero".to_owned(),
+        ));
     }
     // An ASYNC target must not carry a per-call timeout. The delivery consumer bounds every
     // POST with `flow_targets.delivery_timeout_secs` and never reads `timeout_ms`, so a value
@@ -272,13 +272,13 @@ fn validate(
     }
     // A secret must be NAMED, never inlined. Refusing here keeps the one rule this table
     // rests on at the boundary: it never holds a secret value.
-    if let Some(config) = &request.config {
-        if let Some(key) = secret_shaped_key(config) {
-            return Err(ApiError::BadRequest(format!(
-                "config must not carry a secret (found `{key}`); name an environment secret \
+    if let Some(config) = &request.config
+        && let Some(key) = secret_shaped_key(config)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "config must not carry a secret (found `{key}`); name an environment secret \
                  with signing_secret_name"
-            )));
-        }
+        )));
     }
     Ok(())
 }

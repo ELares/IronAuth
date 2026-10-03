@@ -614,10 +614,10 @@ pub(crate) async fn decide_remediation(
     let floor = requirement.min_acr.as_deref();
 
     // A floor no authentication method can EVER reach is unsatisfiable outright.
-    if let Some(floor) = floor {
-        if !floor_is_achievable(floor, &order) {
-            return Remediation::Fail;
-        }
+    if let Some(floor) = floor
+        && !floor_is_achievable(floor, &order)
+    {
+        return Remediation::Fail;
     }
 
     // Probe the subject's enrolled factors once.

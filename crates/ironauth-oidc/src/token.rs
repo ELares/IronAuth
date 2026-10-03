@@ -2774,10 +2774,10 @@ async fn refresh_token_grant(
     // session, offline families are designed to outlive theirs, and an RFC 8693 exchange will
     // be in the same position. The bound was copied from the session when the family was
     // minted, so it cannot be pushed out afterwards.
-    if let Some(impersonation) = resolution.impersonation.as_ref() {
-        if epoch_micros(state.now()) >= impersonation.expires_at_unix_micros {
-            return Err(TokenError::InvalidGrant);
-        }
+    if let Some(impersonation) = resolution.impersonation.as_ref()
+        && epoch_micros(state.now()) >= impersonation.expires_at_unix_micros
+    {
+        return Err(TokenError::InvalidGrant);
     }
 
     // 4b. Re-check the token subject's USER LIFECYCLE state (issue #52) before minting

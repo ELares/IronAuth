@@ -260,24 +260,24 @@ impl<'a> RotationStateMachine<'a> {
                 .iter()
                 .filter(|key| key.retire_at_micros.is_none() && key.id != head.id)
                 .max_by_key(|key| key.activate_at_micros);
-            if let Some(outgoing) = outgoing {
-                if outgoing.activate_at_micros < head.activate_at_micros {
-                    let expire_micros = now_micros
-                        .saturating_add(micros(max_token_lifetime_secs))
-                        .saturating_add(micros(policy.retirement_buffer_secs));
-                    self.store
-                        .scoped(self.scope)
-                        .acting(self.acting.actor(), self.acting.correlation())
-                        .signing_keys()
-                        .promote(env, &head.id, &outgoing.id, now_micros, expire_micros)
-                        .await?;
-                    report
-                        .promoted
-                        .push((algorithm.to_owned(), head.id.to_string()));
-                    report
-                        .retiring
-                        .push((algorithm.to_owned(), outgoing.id.to_string()));
-                }
+            if let Some(outgoing) = outgoing
+                && outgoing.activate_at_micros < head.activate_at_micros
+            {
+                let expire_micros = now_micros
+                    .saturating_add(micros(max_token_lifetime_secs))
+                    .saturating_add(micros(policy.retirement_buffer_secs));
+                self.store
+                    .scoped(self.scope)
+                    .acting(self.acting.actor(), self.acting.correlation())
+                    .signing_keys()
+                    .promote(env, &head.id, &outgoing.id, now_micros, expire_micros)
+                    .await?;
+                report
+                    .promoted
+                    .push((algorithm.to_owned(), head.id.to_string()));
+                report
+                    .retiring
+                    .push((algorithm.to_owned(), outgoing.id.to_string()));
             }
 
             // 3. WITHDRAW: the serving filter handles the JWKS side; record the keys

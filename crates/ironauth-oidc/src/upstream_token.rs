@@ -292,12 +292,10 @@ fn json_error(
         body,
     )
         .into_response();
-    if via_basic {
-        if let Ok(value) = header::HeaderValue::from_str("Basic") {
-            response
-                .headers_mut()
-                .insert(header::WWW_AUTHENTICATE, value);
-        }
+    if via_basic && let Ok(value) = header::HeaderValue::from_str("Basic") {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
     }
     response
 }
