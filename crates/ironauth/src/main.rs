@@ -337,11 +337,11 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // The verdict is the SAME pure ladder question the carrier resolves it from,
         // asked of the same unmutated config, so the two cannot disagree; it is asked
         // here because this refusal must happen before any store is opened.
-        if features.is_enabled(&config, ADVANCED_RECOVERY_FEATURE) {
-            if let Err(error) = validate_idv_provider_jwks(&config.oidc.advanced_recovery) {
-                tracing::error!(%error, "advanced-recovery IDV provider JWKS is invalid");
-                return ExitCode::FAILURE;
-            }
+        if features.is_enabled(&config, ADVANCED_RECOVERY_FEATURE)
+            && let Err(error) = validate_idv_provider_jwks(&config.oidc.advanced_recovery)
+        {
+            tracing::error!(%error, "advanced-recovery IDV provider JWKS is invalid");
+            return ExitCode::FAILURE;
         }
 
         // Deterministic entropy in dev mode, a REAL clock in both. See `DEV_ENTROPY_SEED`.
@@ -620,19 +620,19 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // The security-advisory poll (issue #163): the online path, NEVER
         // load-bearing (a failure only logs; the offline import keeps working).
         // Disabled unless both the feed URL and the verification key are set.
-        if let Some((url, interval_secs, trusted)) = advisory_poll {
-            if let Some(store) = planes.readiness_store.clone() {
-                ironauth_admin::advisory_poll::spawn_advisory_poll(
-                    store,
-                    url.clone(),
-                    interval_secs,
-                    trusted,
-                );
-                tracing::info!(
-                    %url,
-                    "security-advisory feed poll enabled (never load-bearing)"
-                );
-            }
+        if let Some((url, interval_secs, trusted)) = advisory_poll
+            && let Some(store) = planes.readiness_store.clone()
+        {
+            ironauth_admin::advisory_poll::spawn_advisory_poll(
+                store,
+                url.clone(),
+                interval_secs,
+                trusted,
+            );
+            tracing::info!(
+                %url,
+                "security-advisory feed poll enabled (never load-bearing)"
+            );
         }
         // The async flow-target delivery worker (issue #112 criterion 2), behind its OWN
         // switch for the same reason webhook delivery is: a deployment that registers flow
@@ -1807,6 +1807,15 @@ async fn build_oidc_plane(
     forward_auth: Option<std::sync::Arc<ironauth_oidc::forward_auth_rules::ForwardAuthRuntime>>,
     access_rules: std::sync::Arc<ironauth_oidc::rules::RuleSet>,
 ) -> Option<OidcPlane> {
+    let Ok(recipient_transport) = ironauth_oidc::recipient_smtp::RecipientSmtpTransport::configured(
+        &config.oidc.recipient_verification,
+        env.clone(),
+    ) else {
+        tracing::error!(
+            "recipient verification SMTP configuration is unavailable; refusing startup"
+        );
+        std::process::exit(1);
+    };
     let oidc_config = &config.oidc;
     let policy_config = &config.password_policy;
     let hashing_config = &config.password_hashing;
@@ -2209,6 +2218,11 @@ async fn build_oidc_plane(
         },
         |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::SmsSender>,
     ));
+    let state = if let Some(transport) = recipient_transport {
+        state.with_recipient_verification_smtp(transport)
+    } else {
+        state
+    };
     // Installed after the chain because it is CONDITIONAL: a disabled hook, or one whose
     // allowlist is empty, resolves to `None` and issuance is byte-for-byte unchanged.
     let state = match &claims_enrichment_hook {
@@ -6791,14 +6805,14 @@ async fn set_step_up_policy(
     // one write path, rather than by a database CHECK: this column has held operator-set
     // values since #72 and a CHECK would fail the migration on boot for a deployment that
     // already carries one.
-    if let Some(value) = parsed.acr.as_deref() {
-        if !is_known_step_up_acr(value) {
-            eprintln!(
-                "ironauth step-up-policy set: unknown --acr '{value}'; expected one of {}",
-                known_step_up_acrs().join(", ")
-            );
-            return ExitCode::FAILURE;
-        }
+    if let Some(value) = parsed.acr.as_deref()
+        && !is_known_step_up_acr(value)
+    {
+        eprintln!(
+            "ironauth step-up-policy set: unknown --acr '{value}'; expected one of {}",
+            known_step_up_acrs().join(", ")
+        );
+        return ExitCode::FAILURE;
     }
     let acr = parsed.acr.as_deref().map(canonical_step_up_acr);
     let acr_ref = acr.as_deref();

@@ -65,21 +65,21 @@ pub fn select_brand(
     client_id: Option<&str>,
 ) -> Option<usize> {
     // Tier 1: per-CLIENT. A brand whose client_id equals the request's client_id.
-    if let Some(cid) = client_id {
-        if let Some(index) = candidates.iter().position(|c| c.client_id == Some(cid)) {
-            return Some(index);
-        }
+    if let Some(cid) = client_id
+        && let Some(index) = candidates.iter().position(|c| c.client_id == Some(cid))
+    {
+        return Some(index);
     }
     // Tier 2: per-DOMAIN. A brand whose normalized host_pattern equals the normalized request
     // Host. Both sides are normalized identically, so the match is exact and case-insensitive.
-    if let Some(request_host) = host.and_then(normalize_host) {
-        if let Some(index) = candidates.iter().position(|c| {
+    if let Some(request_host) = host.and_then(normalize_host)
+        && let Some(index) = candidates.iter().position(|c| {
             c.host_pattern
                 .and_then(normalize_host)
                 .is_some_and(|pattern| pattern == request_host)
-        }) {
-            return Some(index);
-        }
+        })
+    {
+        return Some(index);
     }
     // Tier 3: the environment DEFAULT brand.
     if let Some(index) = candidates.iter().position(|c| c.is_default) {

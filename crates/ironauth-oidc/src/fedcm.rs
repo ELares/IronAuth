@@ -423,19 +423,17 @@ async fn fedcm_consent_satisfied(
     // signup-quarantine flag, so when the feature is off the read never runs and behavior is
     // byte-identical. A subject that fails to parse is treated as not quarantined; a store
     // fault fails CLOSED (`Err(())`), the same posture as the recorded-consent read below.
-    if state.signup_quarantine_enabled() {
-        if let Ok(subject_id) = UserId::parse_in_scope(subject, &scope) {
-            if state
-                .store()
-                .scoped(scope)
-                .users()
-                .is_quarantined(&subject_id)
-                .await
-                .map_err(|_| ())?
-            {
-                return Ok(false);
-            }
-        }
+    if state.signup_quarantine_enabled()
+        && let Ok(subject_id) = UserId::parse_in_scope(subject, &scope)
+        && state
+            .store()
+            .scoped(scope)
+            .users()
+            .is_quarantined(&subject_id)
+            .await
+            .map_err(|_| ())?
+    {
+        return Ok(false);
     }
     // The first-party carve-out, byte-for-byte the redirect flow's rule (issue #21,
     // #31): implicit/skip_consent is auto-granted (the client is not quarantined here,
@@ -769,16 +767,16 @@ fn assertion_success(token: &str, request_origin: Option<&str>) -> Response {
     // The RP origin was validated against the client's registered origins above, so
     // echoing it here is a known-good value, not a reflected one. It is always present
     // on a success path (the origin match already required it).
-    if let Some(origin) = request_origin {
-        if let Ok(value) = header::HeaderValue::from_str(origin) {
-            let headers = response.headers_mut();
-            headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
-            headers.insert(
-                header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
-                header::HeaderValue::from_static("true"),
-            );
-            headers.insert(header::VARY, header::HeaderValue::from_static("Origin"));
-        }
+    if let Some(origin) = request_origin
+        && let Ok(value) = header::HeaderValue::from_str(origin)
+    {
+        let headers = response.headers_mut();
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            header::HeaderValue::from_static("true"),
+        );
+        headers.insert(header::VARY, header::HeaderValue::from_static("Origin"));
     }
     response
 }

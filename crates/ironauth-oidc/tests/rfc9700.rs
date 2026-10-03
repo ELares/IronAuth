@@ -83,10 +83,10 @@ mod checks {
         let fragment = location.split_once('#').map_or("", |(_, f)| f);
         for section in [after, fragment] {
             for pair in section.split('&') {
-                if let Some((key, value)) = pair.split_once('=') {
-                    if key == name {
-                        return Some(crate::common::percent_decode(value));
-                    }
+                if let Some((key, value)) = pair.split_once('=')
+                    && key == name
+                {
+                    return Some(crate::common::percent_decode(value));
                 }
             }
         }

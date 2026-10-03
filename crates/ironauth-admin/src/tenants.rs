@@ -94,13 +94,13 @@ fn validated_home_region(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
-    if let Some(region) = home_region.as_deref() {
-        if !state.home_region_is_allowed(region) {
-            return Err(ApiError::BadRequest(format!(
-                "home_region {region:?} is not one of the operator's configured data-residency \
+    if let Some(region) = home_region.as_deref()
+        && !state.home_region_is_allowed(region)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "home_region {region:?} is not one of the operator's configured data-residency \
                  regions"
-            )));
-        }
+        )));
     }
     Ok(home_region)
 }

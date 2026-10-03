@@ -452,11 +452,11 @@ async fn consult_target(
     // worse still: it would render as an active unquarantined account, indistinguishable from
     // a real one.
     let mut envelope = envelope;
-    if let Some(outcome) = signup_outcome {
-        if let Some(map) = envelope.as_object_mut() {
-            map.insert("state".to_owned(), outcome.state.as_str().into());
-            map.insert("quarantined".to_owned(), outcome.quarantined.into());
-        }
+    if let Some(outcome) = signup_outcome
+        && let Some(map) = envelope.as_object_mut()
+    {
+        map.insert("state".to_owned(), outcome.state.as_str().into());
+        map.insert("quarantined".to_owned(), outcome.quarantined.into());
     }
     let Ok(body) = serde_json::to_vec(&envelope) else {
         return Outcome::Unavailable;

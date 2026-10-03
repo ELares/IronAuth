@@ -168,9 +168,25 @@ struct Case {
 #[allow(clippy::too_many_lines)]
 fn cases() -> Vec<Case> {
     vec![
-        // Recipient verification has no production transport. These valid requests pin
-        // the uniform readiness refusal. The enabled anonymous boundary is exercised
-        // with an owned transport in recipient_verification.rs as well.
+        // This default harness has no configured recipient transport. These valid
+        // requests pin the uniform readiness refusal, not the enabled boundary.
+        // recipient_verification.rs separately drives enabled anonymous requests.
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/account/email-verification",
+            query: "return_to=%2Fauthorize",
+            method: "GET",
+            content_type: "text/plain",
+            body: "",
+            live_status: StatusCode::SERVICE_UNAVAILABLE,
+        },
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/account/email-verification/cancel",
+            query: "",
+            method: "POST",
+            content_type: "application/json",
+            body: "{}",
+            live_status: StatusCode::SERVICE_UNAVAILABLE,
+        },
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/account/email-verification/start",
             query: "",

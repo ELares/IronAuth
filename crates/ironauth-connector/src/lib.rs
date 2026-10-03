@@ -1125,10 +1125,10 @@ fn validate_https_url(url: &str, shape: UrlShape) -> Result<(), String> {
     if authority.contains('@') {
         return Err("must not contain userinfo credentials (user:pass@host)".to_owned());
     }
-    if let UrlShape::IssuerNoQueryFragment = shape {
-        if url.contains('?') || url.contains('#') {
-            return Err("an issuer must not contain a query or fragment".to_owned());
-        }
+    if let UrlShape::IssuerNoQueryFragment = shape
+        && (url.contains('?') || url.contains('#'))
+    {
+        return Err("an issuer must not contain a query or fragment".to_owned());
     }
     Ok(())
 }

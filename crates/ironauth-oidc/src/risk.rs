@@ -210,10 +210,10 @@ pub fn dispatch(
     if hard_deny && block_on_high {
         return RiskAction::Block;
     }
-    if let Some(floor) = threshold {
-        if level.rank() >= floor.rank() {
-            return RiskAction::Challenge;
-        }
+    if let Some(floor) = threshold
+        && level.rank() >= floor.rank()
+    {
+        return RiskAction::Challenge;
     }
     if new_device_fired && notify_on_new_device {
         return RiskAction::Notify;
@@ -491,10 +491,10 @@ pub(crate) fn record_attempt(state: &OidcState, subject: Option<&UserId>, ip: Op
     }
     if let Some(ip) = ip {
         let _ = counters.incr(&ip_velocity_key(ip), window, now);
-        if let Some(location) = state.geoip_provider().locate(ip) {
-            if let Some(asn) = location.asn {
-                let _ = counters.incr(&asn_velocity_key(asn), window, now);
-            }
+        if let Some(location) = state.geoip_provider().locate(ip)
+            && let Some(asn) = location.asn
+        {
+            let _ = counters.incr(&asn_velocity_key(asn), window, now);
         }
     }
 }
@@ -917,10 +917,10 @@ pub(crate) async fn evaluate(
     }
 
     // Impossible-travel signal (inert without a `GeoIP` provider).
-    if cfg.impossible_travel_enabled {
-        if let Some(outcome) = impossible_travel_outcome(state, scope, subject, location).await {
-            outcomes.push(outcome);
-        }
+    if cfg.impossible_travel_enabled
+        && let Some(outcome) = impossible_travel_outcome(state, scope, subject, location).await
+    {
+        outcomes.push(outcome);
     }
 
     // IP-reputation signal (allow/deny lists plus the provider seam).
@@ -1148,21 +1148,18 @@ pub(crate) async fn after_successful_login(
     if decision.new_device_fired
         && state.risk_config().notify_on_new_device
         && !notify_suppressed(state, subject, ctx.user_agent)
-    {
-        if let Some(token) =
+        && let Some(token) =
             mint_disavowal_token(state, scope, subject, &[], decision_id.as_deref()).await
-        {
-            let link = disavowal_link(state, &token);
-            let hint =
-                crate::account::coarse_location(ctx.ip).unwrap_or_else(|| "unknown".to_owned());
-            state.deliver_new_device_notice(&crate::verification::NewDeviceNotice {
-                scope,
-                recipient,
-                user_agent: ctx.user_agent,
-                location_hint: &hint,
-                disavowal_link: &link,
-            });
-        }
+    {
+        let link = disavowal_link(state, &token);
+        let hint = crate::account::coarse_location(ctx.ip).unwrap_or_else(|| "unknown".to_owned());
+        state.deliver_new_device_notice(&crate::verification::NewDeviceNotice {
+            scope,
+            recipient,
+            user_agent: ctx.user_agent,
+            location_hint: &hint,
+            disavowal_link: &link,
+        });
     }
     record_login_geo(state, scope, subject, ctx).await;
 }

@@ -12,7 +12,7 @@ configuration, and the current post-quantum position.
   the build everyone runs by default.
 - **The FIPS build variant** (the build seam, in progress) signs, verifies,
   and keys through **aws-lc-rs**, the AWS libcrypto fork that holds a
-  **FIPS 140-3 validated** module — and notably includes **EdDSA**, which is
+  **FIPS 140-3 validated** module - and notably includes **EdDSA**, which is
   why the seam is viable for this product rather than a downgrade.
 
 IronAuth itself does not pursue its own CMVP certificate: the validated module
@@ -29,14 +29,14 @@ A genuine subtlety the posture must carry:
 
 - Server-side, a validated module (aws-lc-rs) **includes** EdDSA, so the
   server can sign Ed25519 under a validated module.
-- Client-side, validated-module coverage for **EdDSA verification is thin** —
+- Client-side, validated-module coverage for **EdDSA verification is thin** -
   most validated client modules do not include it.
 - **CNSA 2.0 excludes EdDSA entirely.**
 
 So a FIPS-constrained tenant should run **ES256** (or RS256) defaults today.
 The per-tenant algorithm policy makes this a **configuration stance rather
 than a code fork**: a tenant whose environments carry the FIPS profile signs
-ES256 by default, keeps RS256 available, and makes EdDSA unavailable — the
+ES256 by default, keeps RS256 available, and makes EdDSA unavailable - the
 policy refuses it even though the environment's keys include it, so the key
 material's presence never leaks an algorithm the tenant's assurance posture
 excludes.

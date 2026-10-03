@@ -7470,7 +7470,7 @@ async fn a_request_for_somebody_who_is_not_a_member_is_refused() {
 }
 
 #[tokio::test]
-async fn advisory_routes_require_their_specific_read_and_config_permissions() {
+async fn advisory_routes_require_read_permission_and_operator_import() {
     let h = Harness::start(50).await;
     let (tenant, environment) = h.create_tenant("advisory-permissions", "k-tenant").await;
     let (key_id, secret) = mint_key(&h, &tenant, &environment, "k-mint").await;
@@ -7487,7 +7487,7 @@ async fn advisory_routes_require_their_specific_read_and_config_permissions() {
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert!(body.contains("management.write_config"), "{body}");
+    assert!(body.contains("plane=operator"), "{body}");
     restrict(
         &h,
         &tenant,
@@ -7503,10 +7503,263 @@ async fn advisory_routes_require_their_specific_read_and_config_permissions() {
         .post_as(
             &format!("{base}/import"),
             &secret,
-            "advisory-config-admitted",
+            "advisory-config-refused",
             r#"{"feed":"{}"}"#,
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains("advisory feed is disabled"), "{body}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("plane=operator"), "{body}");
+}
+
+fn advisory_import_router(h: &Harness, key: &ironauth_jose::SigningKey) -> axum::Router {
+    use ironauth_config::{AdminConfig, Secret, SecretString};
+    let config = AdminConfig {
+        bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+        ..AdminConfig::default()
+    };
+    let state = ironauth_admin::AdminState::new(
+        h.control_store().clone(),
+        ironauth_env::Env::system(),
+        &config,
+    )
+    .expect("fixture state")
+    .with_advisory_feed(Some(key.verifying_key().expect("fixture public key")), 3600);
+    ironauth_admin::management_router(state)
+}
+
+async fn import_advisory_bundle(router: &axum::Router, path: &str, feed: &str) -> StatusCode {
+    import_advisory_bundle_as(router, path, feed, OPERATOR_TOKEN).await
+}
+
+async fn import_advisory_bundle_as(
+    router: &axum::Router,
+    path: &str,
+    feed: &str,
+    credential: &str,
+) -> StatusCode {
+    use tower::ServiceExt as _;
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("authorization", common::bearer(credential))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({"feed": feed}).to_string(),
+        ))
+        .expect("fixture request");
+    router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("HTTP response")
+        .status()
+}
+
+async fn advisory_import_events(h: &Harness) -> Vec<Value> {
+    sqlx::query_scalar(
+        "SELECT payload FROM outbox_messages WHERE payload->>'type' = 'security_advisory.imported'",
+    )
+    .fetch_all(h.db().owner_pool())
+    .await
+    .expect("import events")
+}
+
+async fn accepted_advisory_count(h: &Harness) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM security_advisories")
+        .fetch_one(h.db().owner_pool())
+        .await
+        .expect("accepted projection count")
+}
+
+async fn assert_scoped_advisory_import_refused(
+    h: &Harness,
+    router: &axum::Router,
+    tenant: &str,
+    environment: &str,
+    path: &str,
+    feed: &str,
+) {
+    let (key_id, secret) = mint_key(h, tenant, environment, "scoped-import-key").await;
+    // Even unrestricted environment credentials cannot replace deployment-wide data.
+    assert_eq!(
+        import_advisory_bundle_as(router, path, feed, &secret).await,
+        StatusCode::FORBIDDEN
+    );
+    restrict(
+        h,
+        tenant,
+        environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    assert_eq!(
+        import_advisory_bundle_as(router, path, feed, &secret).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(accepted_advisory_count(h).await, 0);
+    assert!(advisory_import_events(h).await.is_empty());
+}
+
+#[tokio::test]
+async fn advisory_import_announces_only_verified_committed_projection_replacements() {
+    let h = Harness::start(50).await;
+    assert_advisory_projection_grants(&h).await;
+    let (tenant, environment) = h.create_tenant("synthetic-feed-events", "tenant").await;
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/security/advisories/import");
+    let key =
+        ironauth_jose::SigningKey::ed25519_from_seed(Some("synthetic-feed".to_owned()), &[41; 32])
+            .expect("synthetic signing key");
+    let router = advisory_import_router(&h, &key);
+    let feed = ironauth_admin::advisory_feed::sign_feed(
+        &serde_json::json!([{
+            "id":"SYNTHETIC-ONLY-001", "title":"synthetic fixture", "severity":"low",
+            "affected_versions":[], "summary":"synthetic fixture only", "published_at":1
+        }]),
+        &key,
+    );
+    assert_scoped_advisory_import_refused(&h, &router, &tenant, &environment, &path, &feed).await;
+    let tampered = feed.replace("SYNTHETIC-ONLY-001", "SYNTHETIC-ONLY-002");
+    assert_eq!(
+        import_advisory_bundle(&router, &path, &tampered).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(accepted_advisory_count(&h).await, 0);
+    assert!(advisory_import_events(&h).await.is_empty());
+    assert_eq!(
+        import_advisory_bundle(&router, &path, &feed).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(accepted_advisory_count(&h).await, 1);
+    let events = advisory_import_events(&h).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["tenant_id"], tenant);
+    assert_eq!(events[0]["environment_id"], environment);
+    assert_eq!(
+        events[0]["payload"],
+        serde_json::json!({"advisory_count":1,"deployment_global":true})
+    );
+    ironauth_store::event_catalog::validate_event(&events[0]).expect("registered aggregate event");
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_synthetic_import_event() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.payload->>'type' = 'security_advisory.imported' THEN \
+         RAISE EXCEPTION 'synthetic event failure'; END IF; RETURN NEW; END $$; \
+         CREATE TRIGGER reject_synthetic_import_event BEFORE INSERT ON outbox_messages \
+         FOR EACH ROW EXECUTE FUNCTION reject_synthetic_import_event();",
+    )
+    .execute(h.db().owner_pool())
+    .await
+    .expect("event failure fixture");
+    let empty = ironauth_admin::advisory_feed::sign_feed(&serde_json::json!([]), &key);
+    assert_eq!(
+        import_advisory_bundle(&router, &path, &empty).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        accepted_advisory_count(&h).await,
+        1,
+        "failed event must preserve the previous projection"
+    );
+    assert_eq!(advisory_import_events(&h).await.len(), 1);
+    sqlx::raw_sql("DROP TRIGGER reject_synthetic_import_event ON outbox_messages; DROP FUNCTION reject_synthetic_import_event();")
+        .execute(h.db().owner_pool()).await.expect("restore fixture");
+    assert_eq!(
+        import_advisory_bundle(&router, &path, &empty).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(accepted_advisory_count(&h).await, 0);
+    let events = advisory_import_events(&h).await;
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .iter()
+            .any(|event| event["payload"]["advisory_count"] == 0)
+    );
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_synthetic_projection() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'synthetic projection failure'; END $$; \
+         CREATE TRIGGER reject_synthetic_projection BEFORE INSERT ON security_advisories \
+         FOR EACH ROW EXECUTE FUNCTION reject_synthetic_projection();",
+    )
+    .execute(h.db().owner_pool())
+    .await
+    .expect("projection failure fixture");
+    assert_eq!(
+        import_advisory_bundle(&router, &path, &feed).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(accepted_advisory_count(&h).await, 0);
+    assert_eq!(
+        advisory_import_events(&h).await.len(),
+        2,
+        "failed projection cannot emit an event"
+    );
+}
+
+async fn assert_advisory_projection_grants(h: &Harness) {
+    let control_delete: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege('ironauth_control', 'security_advisories', 'DELETE')",
+    )
+    .fetch_one(h.db().owner_pool())
+    .await
+    .expect("control grant");
+    let serving_delete: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege('ironauth_app', 'security_advisories', 'DELETE')",
+    )
+    .fetch_one(h.db().owner_pool())
+    .await
+    .expect("serving grant");
+    assert!(control_delete);
+    assert!(!serving_delete);
+}
+
+#[tokio::test]
+async fn advisory_concurrent_imports_leave_one_complete_global_projection() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("synthetic-feed-race", "tenant").await;
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/security/advisories/import");
+    let key = ironauth_jose::SigningKey::ed25519_from_seed(None, &[42; 32]).expect("fixture key");
+    let router = advisory_import_router(&h, &key);
+    let feeds: Vec<String> = ["left", "right"].iter().map(|prefix| {
+        let rows: Vec<Value> = (0..4).map(|n| serde_json::json!({
+            "id":format!("SYNTHETIC-{prefix}-{n}"), "title":"synthetic race fixture", "severity":"low",
+            "affected_versions":[], "summary":"synthetic only", "published_at":1
+        })).collect();
+        ironauth_admin::advisory_feed::sign_feed(&serde_json::json!(rows), &key)
+    }).collect();
+    // The delay widens the overlap after each delete and exercises replacements
+    // even when the initial projection is empty. Only this disposable table is slowed.
+    sqlx::raw_sql(
+        "CREATE FUNCTION slow_synthetic_projection() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN PERFORM pg_sleep(0.01); RETURN NEW; END $$; \
+         CREATE TRIGGER slow_synthetic_projection BEFORE INSERT ON security_advisories \
+         FOR EACH ROW EXECUTE FUNCTION slow_synthetic_projection();",
+    )
+    .execute(h.db().owner_pool())
+    .await
+    .expect("overlap fixture");
+    for _ in 0..3 {
+        let (left, right) = tokio::join!(
+            import_advisory_bundle(&router, &path, &feeds[0]),
+            import_advisory_bundle(&router, &path, &feeds[1]),
+        );
+        assert_eq!(left, StatusCode::NO_CONTENT);
+        assert_eq!(right, StatusCode::NO_CONTENT);
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM security_advisories")
+            .fetch_all(h.db().owner_pool())
+            .await
+            .expect("accepted projection");
+        assert_eq!(
+            ids.len(),
+            4,
+            "concurrent replacements cannot leave a union of feeds"
+        );
+        assert!(
+            ids.iter().all(|id| id.starts_with("SYNTHETIC-left-"))
+                || ids.iter().all(|id| id.starts_with("SYNTHETIC-right-"))
+        );
+    }
+    assert_eq!(advisory_import_events(&h).await.len(), 6);
 }

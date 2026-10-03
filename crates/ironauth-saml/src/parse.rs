@@ -462,10 +462,10 @@ pub(crate) fn check_document_event(
             // AND MUST NOT NAME ANOTHER ENCODING. The bytes are already required to be UTF-8, so
             // a document declaring `UTF-16` is telling a conforming peer to read it differently
             // from how this reads it.
-            if let Some(Ok(encoding)) = decl.encoding() {
-                if !encoding.eq_ignore_ascii_case(b"utf-8") {
-                    return Err(SamlError::EncodingNotUtf8);
-                }
+            if let Some(Ok(encoding)) = decl.encoding()
+                && !encoding.eq_ignore_ascii_case(b"utf-8")
+            {
+                return Err(SamlError::EncodingNotUtf8);
             }
             Ok(())
         }
@@ -581,10 +581,10 @@ pub(crate) fn check_name(raw: &[u8]) -> Result<(), SamlError> {
     if colons > 1 {
         return Err(SamlError::Malformed);
     }
-    if let Some((prefix, local)) = name.split_once(':') {
-        if prefix.is_empty() || local.is_empty() {
-            return Err(SamlError::Malformed);
-        }
+    if let Some((prefix, local)) = name.split_once(':')
+        && (prefix.is_empty() || local.is_empty())
+    {
+        return Err(SamlError::Malformed);
     }
     let mut characters = name.chars();
     let Some(first) = characters.next() else {

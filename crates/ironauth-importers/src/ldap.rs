@@ -170,10 +170,10 @@ fn map_password(raw: &str, gaps: &mut Vec<Gap>) -> Option<String> {
 /// The non-secret scheme label of an LDAP password value, for gap reporting (never
 /// the hash bytes).
 fn scheme_label(raw: &str) -> String {
-    if let Some(end) = raw.find('}') {
-        if raw.starts_with('{') {
-            return format!("{} credential", &raw[..=end]);
-        }
+    if let Some(end) = raw.find('}')
+        && raw.starts_with('{')
+    {
+        return format!("{} credential", &raw[..=end]);
     }
     "modular-crypt credential".to_owned()
 }

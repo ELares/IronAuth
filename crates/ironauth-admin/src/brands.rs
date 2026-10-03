@@ -250,11 +250,10 @@ pub(crate) fn promoted_brand_faults(snapshot: &ironauth_store::Snapshot) -> Vec<
         {
             note(message);
         }
-        if let Some(dark) = brand.tokens_dark.as_ref() {
-            if let Err(ApiError::BadRequest(message)) = validated_tokens(Some(dark), "tokens_dark")
-            {
-                note(message);
-            }
+        if let Some(dark) = brand.tokens_dark.as_ref()
+            && let Err(ApiError::BadRequest(message)) = validated_tokens(Some(dark), "tokens_dark")
+        {
+            note(message);
         }
 
         match serde_json::from_value::<BTreeMap<String, String>>(brand.slots.clone()) {
@@ -286,14 +285,13 @@ pub(crate) fn promoted_brand_faults(snapshot: &ironauth_store::Snapshot) -> Vec<
             .host_pattern
             .as_deref()
             .and_then(ironauth_store::canonicalize_host)
+            && let Some(other) = hosts.insert(host.clone(), slug.to_owned())
         {
-            if let Some(other) = hosts.insert(host.clone(), slug.to_owned()) {
-                faults.push(format!(
-                    "brands {other} and {slug} both claim the host {host}; within an environment \
+            faults.push(format!(
+                "brands {other} and {slug} both claim the host {host}; within an environment \
                      a host selects at most one brand, so a promotion of this document could \
                      never converge"
-                ));
-            }
+            ));
         }
         if brand.is_default {
             if let Some(other) = default_slug {

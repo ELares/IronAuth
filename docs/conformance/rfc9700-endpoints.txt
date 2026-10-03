@@ -35,6 +35,8 @@
 /t/{tenant_id}/e/{environment_id}/account/consents/revoke
 /t/{tenant_id}/e/{environment_id}/account/credentials
 /t/{tenant_id}/e/{environment_id}/account/credentials/remove
+/t/{tenant_id}/e/{environment_id}/account/email-verification
+/t/{tenant_id}/e/{environment_id}/account/email-verification/cancel
 /t/{tenant_id}/e/{environment_id}/account/email-verification/start
 /t/{tenant_id}/e/{environment_id}/account/email-verification/verify
 /t/{tenant_id}/e/{environment_id}/account/linked-identities

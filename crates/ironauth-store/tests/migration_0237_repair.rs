@@ -117,7 +117,7 @@ async fn exact_old_checksum_upgrades_without_rewriting_ledger_data_view_grants_o
         .run()
         .await
         .expect("known old checksum repair");
-    assert_eq!(report.newly_applied(), [243, 244, 245, 246]);
+    assert_eq!(report.newly_applied(), [243, 244, 245, 246, 247, 248]);
     assert_eq!(before_view, view_identity(&db).await);
     assert_eq!(before_data, data(&db).await);
     let after_ledger: Vec<String> = sqlx::query_scalar("SELECT row_to_json(m)::text FROM _schema_migrations m WHERE version < 243 ORDER BY version")
@@ -290,7 +290,7 @@ async fn historical_237_without_fips_upgrades_through_corrected_242() {
         .run()
         .await
         .expect("FIPS upgrade");
-    assert_eq!(report.newly_applied(), [242, 243, 244, 245, 246]);
+    assert_eq!(report.newly_applied(), [242, 243, 244, 245, 246, 247, 248]);
     assert_eq!(identity, view_identity(&db).await);
     let names: Vec<String> = sqlx::query_scalar("SELECT attname::text FROM pg_attribute WHERE attrelid = 'environment_guardrails'::regclass AND attnum > 0 ORDER BY attnum")
         .fetch_all(db.owner_pool()).await.expect("retained view order");

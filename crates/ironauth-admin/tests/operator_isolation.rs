@@ -142,6 +142,7 @@ async fn nothing_under_another_operators_environment_is_reachable() {
     for path in [
         format!("{base}/organizations"),
         format!("{base}/users"),
+        format!("{base}/recipient-verification/index"),
         format!("{base}/keys"),
     ] {
         let (status, _, body) = h.get_as(&path, OPERATOR_TOKEN).await;

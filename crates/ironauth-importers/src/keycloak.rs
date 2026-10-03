@@ -417,14 +417,14 @@ fn record_membership_gaps(user: &KcUser, gaps: &mut Vec<Gap>) {
             "IronAuth has no representable realm-role target",
         ));
     }
-    if let Some(Value::Object(roles)) = &user.client_roles {
-        if !roles.is_empty() {
-            gaps.push(Gap::new(
-                "clientRoles",
-                format!("client roles for {} client(s)", roles.len()),
-                "IronAuth has no representable client-role target",
-            ));
-        }
+    if let Some(Value::Object(roles)) = &user.client_roles
+        && !roles.is_empty()
+    {
+        gaps.push(Gap::new(
+            "clientRoles",
+            format!("client roles for {} client(s)", roles.len()),
+            "IronAuth has no representable client-role target",
+        ));
     }
     if !user.groups.is_empty() {
         gaps.push(Gap::new(

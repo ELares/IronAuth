@@ -2082,6 +2082,19 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0246_fapi_hardened_control_grant.sql"),
         },
+        // EXPAND (issue #1475): controlled preparation of retained primary indices.
+        Migration {
+            version: 247,
+            name: "recipient_index_backfill",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0247_recipient_index_backfill.sql"),
+        },
+        Migration {
+            version: 248,
+            name: "security_advisory_replace_grant",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0248_security_advisory_replace_grant.sql"),
+        },
     ]
 }
 

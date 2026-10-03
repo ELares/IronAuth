@@ -284,12 +284,11 @@ fn detect_subflow_cycles(
 fn called_keys(steps: &[Step], all_keys: &BTreeSet<&str>) -> Vec<String> {
     let mut keys = Vec::new();
     for step in steps {
-        if matches!(step.kind, StepKind::SubflowCall) {
-            if let Some(key) = &step.subflow {
-                if all_keys.contains(key.as_str()) {
-                    keys.push(key.clone());
-                }
-            }
+        if matches!(step.kind, StepKind::SubflowCall)
+            && let Some(key) = &step.subflow
+            && all_keys.contains(key.as_str())
+        {
+            keys.push(key.clone());
         }
     }
     keys
@@ -386,12 +385,11 @@ pub(crate) fn compose_inner(
     // subflow_call in the working document (journey-level and, once inlined, nested) resolves the
     // same way.
     for step in &mut flat.steps {
-        if matches!(step.kind, StepKind::SubflowCall) {
-            if let Some(alias) = &step.subflow {
-                if let Some(key) = alias_to_key.get(alias) {
-                    step.subflow = Some(key.clone());
-                }
-            }
+        if matches!(step.kind, StepKind::SubflowCall)
+            && let Some(alias) = &step.subflow
+            && let Some(key) = alias_to_key.get(alias)
+        {
+            step.subflow = Some(key.clone());
         }
     }
 

@@ -302,13 +302,13 @@ pub async fn set_auto_link_posture(
     require_live_environment(&state, &scope).await?;
 
     let request: SetAutoLinkPostureRequest = parse_json(&body)?;
-    if let Some(posture) = request.posture.as_deref() {
-        if !AUTO_LINK_POSTURES.contains(&posture) {
-            return Err(ApiError::BadRequest(format!(
-                "posture must be one of {} (or null to inherit the deployment default)",
-                AUTO_LINK_POSTURES.join(" | ")
-            )));
-        }
+    if let Some(posture) = request.posture.as_deref()
+        && !AUTO_LINK_POSTURES.contains(&posture)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "posture must be one of {} (or null to inherit the deployment default)",
+            AUTO_LINK_POSTURES.join(" | ")
+        )));
     }
 
     let pending = auto_link_posture_event(&state, scope, request.posture.as_deref());

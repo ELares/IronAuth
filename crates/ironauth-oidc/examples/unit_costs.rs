@@ -242,12 +242,11 @@ fn main() {
     if let Ok(key) = SigningKey::ed25519_from_seed(Some("ed".to_owned()), &[7_u8; 32]) {
         signing_keys.push(("EdDSA", key));
     }
-    if let Ok(der) = generate_rsa_pkcs1_der(env.entropy()) {
-        if let Ok(key) =
+    if let Ok(der) = generate_rsa_pkcs1_der(env.entropy())
+        && let Ok(key) =
             SigningKey::rsa_from_pkcs1_der(Some("rs".to_owned()), JwsAlgorithm::Rs256, &der)
-        {
-            signing_keys.push(("RS256 (published day one)", key));
-        }
+    {
+        signing_keys.push(("RS256 (published day one)", key));
     }
     for (label, key) in &signing_keys {
         for _ in 0..SIGN_WARMUP {

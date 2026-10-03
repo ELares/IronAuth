@@ -470,13 +470,13 @@ fn validate_registration(request: &RegisterExternalIssuerRequest) -> Result<(), 
                 // URL; it just declines to register an anchor whose keys can never be fetched.
                 // A hostname that RESOLVES to a blocked address genuinely cannot be checked
                 // here and is deliberately left to the fetcher.
-                if let Some(ip) = target.literal_ip {
-                    if let Some(class) = ironauth_fetch::classify(ip) {
-                        return Err(ApiError::BadRequest(format!(
-                            "jwks_uri points at {ip}, which the SSRF-hardened fetcher refuses \
+                if let Some(ip) = target.literal_ip
+                    && let Some(class) = ironauth_fetch::classify(ip)
+                {
+                    return Err(ApiError::BadRequest(format!(
+                        "jwks_uri points at {ip}, which the SSRF-hardened fetcher refuses \
                              ({class:?}), so the issuer could never obtain a key"
-                        )));
-                    }
+                    )));
                 }
             }
             Ok(_) => {

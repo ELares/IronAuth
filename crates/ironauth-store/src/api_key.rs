@@ -188,7 +188,8 @@ mod tests {
     fn the_published_scanner_regex_matches_every_generated_key_kind() {
         let env = Env::system();
         let scope = scope(&env);
-        let secret_chars = API_KEY_SECRET_BYTES * 4 / 3 + usize::from(API_KEY_SECRET_BYTES % 3 > 0);
+        let secret_chars =
+            API_KEY_SECRET_BYTES * 4 / 3 + usize::from(!API_KEY_SECRET_BYTES.is_multiple_of(3));
 
         for (kind, prefix) in [
             (ApiKeyKindTag::ApiKey, API_KEY_PREFIX),

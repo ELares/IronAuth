@@ -2338,9 +2338,22 @@ impl OidcState {
         self
     }
 
-    /// Install an owned LOCAL fixture transport for the disabled recipient core.
-    /// Production enablement requires the remaining delivery/UI/index-readiness
-    /// work in issue #1436; there is deliberately no production builder or flag.
+    /// Install the concrete TLS SMTP adapter for the hosted recipient ceremony.
+    /// Logging/no-op senders cannot use this production entry point. The caller
+    /// must resolve validated operator configuration; scoped ownership readiness
+    /// remains enforced by the store on every challenge and current proof.
+    #[must_use]
+    pub fn with_recipient_verification_smtp(
+        mut self,
+        transport: crate::recipient_smtp::RecipientSmtpTransport,
+    ) -> Self {
+        self.recipient_verification_transport = Some(Arc::new(transport));
+        self
+    }
+
+    /// Install an owned LOCAL fixture transport for recipient-core qualification.
+    /// Arbitrary adapters remain testing-only; production uses the concrete TLS
+    /// SMTP installer and validated operator configuration.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn with_recipient_verification_test_transport(
@@ -2740,15 +2753,13 @@ impl OidcState {
         }
         // 2b. Per-IP (L1), fail OPEN: RECORD the attempt and escalate from the new count; a
         //     counter-store error is ignored (availability-biased).
-        if let Some(ip) = &ctx.ip {
-            if let Ok(count) =
+        if let Some(ip) = &ctx.ip
+            && let Ok(count) =
                 self.abuse_counters
                     .incr(&ip_counter_key(ctx.path, ip), settings.window_secs(), now)
-            {
-                if let Some(delay) = escalating_delay(&settings, count) {
-                    worst = Some(max_escalation(worst, count, delay));
-                }
-            }
+            && let Some(delay) = escalating_delay(&settings, count)
+        {
+            worst = Some(max_escalation(worst, count, delay));
         }
         // 2c. Per-client and per-(tenant, environment) request counters (L1): recorded for
         //     the future edge/tenant-fairness layers (M5/M15), never a throttle input here.

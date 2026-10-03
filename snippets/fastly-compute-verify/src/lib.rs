@@ -260,10 +260,10 @@ fn select_key(jwks: &[u8], kid: Option<&str>, alg: Alg) -> Result<TrustedKey, Ve
         .ok_or(VerifyError::UnknownKey)?;
     let mut matched = false;
     for key in keys {
-        if let Some(wanted) = kid {
-            if key.get("kid").and_then(Value::as_str) != Some(wanted) {
-                continue;
-            }
+        if let Some(wanted) = kid
+            && key.get("kid").and_then(Value::as_str) != Some(wanted)
+        {
+            continue;
         }
         matched = true;
         if let Some(decoded) = decode_jwk(key, alg)? {
@@ -402,10 +402,10 @@ fn check_claims(claims: &Value, policy: &Policy<'_>) -> Result<(), VerifyError> 
     if policy.now_unix_seconds > exp.saturating_add(policy.leeway_seconds) {
         return Err(VerifyError::Expired);
     }
-    if let Some(nbf) = claims.get("nbf").and_then(Value::as_i64) {
-        if policy.now_unix_seconds < nbf.saturating_sub(policy.leeway_seconds) {
-            return Err(VerifyError::NotYetValid);
-        }
+    if let Some(nbf) = claims.get("nbf").and_then(Value::as_i64)
+        && policy.now_unix_seconds < nbf.saturating_sub(policy.leeway_seconds)
+    {
+        return Err(VerifyError::NotYetValid);
     }
     Ok(())
 }

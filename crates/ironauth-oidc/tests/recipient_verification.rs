@@ -642,6 +642,7 @@ async fn enabled_anonymous_routes_refuse_live_and_absent_scopes_without_effects(
     );
     let before = recipient_rows(&h).await;
     for (operation, body) in [
+        ("email-verification/cancel", json!({})),
         (
             "email-verification/start",
             json!({"email": "owner@example.test"}),
@@ -691,5 +692,227 @@ async fn enabled_anonymous_routes_refuse_live_and_absent_scopes_without_effects(
             .lock()
             .expect("fixture mailbox")
             .is_empty()
+    );
+}
+
+fn hosted_resume(h: &Harness) -> String {
+    format!(
+        "/authorize?response_type=code&client_id={}&redirect_uri={}&scope=openid%20email&code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
+        h.client_id(),
+        enc(REDIRECT_URI)
+    )
+}
+
+async fn hosted_page(
+    h: &Harness,
+    router: &Router,
+    cookie: Option<&str>,
+    resume: &str,
+) -> (StatusCode, HeaderMap, String) {
+    let mut request = Request::builder().uri(format!(
+        "{}?return_to={}",
+        route(h, "email-verification"),
+        enc(resume)
+    ));
+    if let Some(cookie) = cookie {
+        request = request.header(header::COOKIE, cookie);
+    }
+    send_through(router.clone(), request.body(Body::empty()).unwrap()).await
+}
+
+#[tokio::test]
+async fn hosted_verification_requires_a_recent_account_and_registered_in_scope_continuation() {
+    let h = Harness::start().await;
+    let user = h.seed_user(EMAIL, SEED_PASSWORD).await;
+    let cookie = h.session_cookie_at(&user, "pwd", now(&h)).await;
+    let transport = Arc::new(OwnedTransport::default());
+    let router = enabled_router(&h, transport.clone());
+    let resume = hosted_resume(&h);
+    let (status, headers, body) = hosted_page(&h, &router, Some(&cookie), &resume).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("value=\"Owner@Example.test\" readonly"));
+    assert!(body.contains("data-verified=\"false\""));
+    assert!(body.contains("autocomplete=\"one-time-code\""));
+    // Optional render artifact for actual Chrome UI qualification. It contains
+    // only this synthetic fixture page, never a cookie, code or token.
+    if let Some(path) = std::env::var_os("IRONAUTH_RECIPIENT_PAGE_FIXTURE") {
+        let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        std::fs::write(
+            path,
+            serde_json::to_vec(&json!({"html":body, "csp":csp})).unwrap(),
+        )
+        .unwrap();
+    }
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+    assert!(csp.contains("script-src 'nonce-"));
+    assert!(csp.contains("connect-src 'self'"));
+    assert!(!csp.contains("unsafe-inline"));
+    assert!(!headers.contains_key(header::SET_COOKIE));
+    assert_eq!(recipient_rows(&h).await, (0, 0));
+    assert!(transport.messages.lock().unwrap().is_empty());
+    assert_eq!(
+        hosted_page(&h, &router, None, &resume).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    for bad in [
+        "https://evil.test/".to_owned(),
+        "//evil.test/".to_owned(),
+        resume.replace(&enc(REDIRECT_URI), &enc("https://evil.test/callback")),
+        format!("{resume}&client_id=duplicate"),
+    ] {
+        let (status, _, body) = hosted_page(&h, &router, Some(&cookie), &bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(!body.contains("href=\"https://evil.test"));
+    }
+    h.clock().advance(Duration::from_secs(301));
+    assert_eq!(
+        hosted_page(&h, &router, Some(&cookie), &resume).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn hosted_reload_observes_current_verified_ownership() {
+    let h = Harness::start().await;
+    let user = h.seed_user(EMAIL, SEED_PASSWORD).await;
+    let cookie = h.session_cookie_at(&user, "pwd", now(&h)).await;
+    let transport = Arc::new(OwnedTransport::default());
+    let router = enabled_router(&h, transport.clone());
+    finish(&h, &router, &transport, &cookie).await;
+    let (status, _, body) = hosted_page(&h, &router, Some(&cookie), &hosted_resume(&h)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("data-verified=\"true\""));
+    assert_eq!(recipient_rows(&h).await, (1, 1));
+}
+
+#[tokio::test]
+async fn cancellation_is_subject_bound_repeatable_and_invalidates_the_pending_code() {
+    let h = Harness::start().await;
+    let user = h.seed_user(EMAIL, SEED_PASSWORD).await;
+    let cookie = h.session_cookie_at(&user, "pwd", now(&h)).await;
+    let other = h.seed_user("other@example.test", SEED_PASSWORD).await;
+    let other_cookie = h.session_cookie_at(&other, "pwd", now(&h)).await;
+    let transport = Arc::new(OwnedTransport::default());
+    let router = enabled_router(&h, transport.clone());
+    let pending = start(&h, &router, &cookie).await;
+    let code = transport.messages.lock().unwrap()[0].1.clone();
+    let cancel = route(&h, "email-verification/cancel");
+    for origin in [None, Some("https://evil.test")] {
+        assert_eq!(
+            post(&router, &cancel, Some(&cookie), None, origin, &json!({}))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    // Other accounts can cancel their own state, never the requested subject's.
+    assert_eq!(
+        post(
+            &router,
+            &cancel,
+            Some(&other_cookie),
+            None,
+            Some(ISSUER_BASE),
+            &json!({"subject":user})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        post(
+            &router,
+            &cancel,
+            Some(&other_cookie),
+            None,
+            Some(ISSUER_BASE),
+            &json!({})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let subject = UserId::parse_in_scope(&user, &h.scope()).unwrap();
+    let id = ironauth_store::RecipientChallengeId::parse_in_scope(
+        pending["challenge_id"].as_str().unwrap(),
+        &h.scope(),
+    )
+    .unwrap();
+    assert!(
+        h.store()
+            .scoped(h.scope())
+            .recipient_verification()
+            .challenge(h.env(), &subject, &id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    for _ in 0..2 {
+        let (status, headers, body) = post(
+            &router,
+            &cancel,
+            Some(&cookie),
+            None,
+            Some(ISSUER_BASE),
+            &json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["cancelled"], true);
+        assert!(!headers.contains_key(header::SET_COOKIE));
+    }
+    assert!(
+        h.store()
+            .scoped(h.scope())
+            .recipient_verification()
+            .challenge(h.env(), &subject, &id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        post(
+            &router,
+            &route(&h, "email-verification/verify"),
+            Some(&cookie),
+            None,
+            Some(ISSUER_BASE),
+            &json!({"challenge_id":id.to_string(),"code":code})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(recipient_rows(&h).await, (1, 0));
+}
+
+#[tokio::test]
+async fn cancellation_does_not_revoke_a_completed_mailbox_proof() {
+    let h = Harness::start().await;
+    let user = h.seed_user(EMAIL, SEED_PASSWORD).await;
+    let cookie = h.session_cookie_at(&user, "pwd", now(&h)).await;
+    let transport = Arc::new(OwnedTransport::default());
+    let router = enabled_router(&h, transport.clone());
+    finish(&h, &router, &transport, &cookie).await;
+    assert_eq!(
+        post(
+            &router,
+            &route(&h, "email-verification/cancel"),
+            Some(&cookie),
+            None,
+            Some(ISSUER_BASE),
+            &json!({})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(recipient_rows(&h).await, (1, 1));
+    assert!(
+        hosted_page(&h, &router, Some(&cookie), &hosted_resume(&h))
+            .await
+            .2
+            .contains("data-verified=\"true\"")
     );
 }

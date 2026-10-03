@@ -70,10 +70,10 @@ pub(crate) fn parse(
     if let Some(p2c) = object.get("p2c") {
         // Any p2c means PBES2. If it is a number above the cap, that is the
         // cheap oversized-iteration rejection; either way PBES2 is excluded.
-        if let Some(count) = p2c.as_u64() {
-            if count > u64::from(caps.max_pbes2_count) {
-                return Err(RejectReason::Pbes2Present);
-            }
+        if let Some(count) = p2c.as_u64()
+            && count > u64::from(caps.max_pbes2_count)
+        {
+            return Err(RejectReason::Pbes2Present);
         }
         return Err(RejectReason::Pbes2Present);
     }

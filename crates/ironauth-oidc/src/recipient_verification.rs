@@ -2,11 +2,10 @@
 
 //! Gated subject-bound recipient verification (issue #1436).
 //!
-//! This core is deliberately unavailable in a production build. A testing-only
-//! transport installer exercises the real HTTP/store boundaries; no runtime flag,
-//! default sender, logger or ordinary message outbox can enable it. Delivery,
-//! hosted recovery UI and controlled indexing of existing scopes must land before
-//! a production installer is added. Nothing here creates or upgrades a session.
+//! Off by default. Explicit validated SMTP configuration installs the concrete
+//! transport and enables the authenticated hosted page; logging and no-op senders
+//! cannot enable it. Current scoped ownership checks refuse incompletely indexed
+//! legacy accounts. Nothing here creates or upgrades a session.
 
 use std::time::Duration;
 
@@ -27,6 +26,8 @@ use crate::util::epoch_micros;
 /// A transient secret handed only to an explicit transport. No `Debug`, no
 /// serialization and no plaintext persistence in the provider's ordinary outbox.
 pub struct RecipientVerificationMessage<'a> {
+    /// Persisted challenge identity; also identifies this one delivery attempt.
+    pub challenge_id: &'a RecipientChallengeId,
     /// Exact isolated provider scope.
     pub scope: Scope,
     /// The account's stored primary delivery address, never the submitted alias.
@@ -45,8 +46,9 @@ pub enum RecipientDeliveryFailure {
 }
 
 /// Purpose-specific secret transport. It must acknowledge actual acceptance,
-/// never a no-op, and must not persist or log the plaintext code. No implementation
-/// or production installer ships with the gated core.
+/// never a no-op, and must not persist or log the plaintext code. The SMTP adapter
+/// is installed explicitly by validated operator configuration. Arbitrary fixture
+/// installers remain testing-only.
 #[async_trait::async_trait]
 pub trait RecipientVerificationTransport: Send + Sync {
     /// Deliver through a bounded, secret-safe transport. The provider also imposes
@@ -211,6 +213,7 @@ pub(crate) async fn start(
     let delivery = tokio::time::timeout(
         Duration::from_secs(5),
         transport.deliver(RecipientVerificationMessage {
+            challenge_id: &id,
             scope,
             recipient: &email,
             code: &code,
@@ -378,4 +381,50 @@ pub(crate) async fn proof(
             "checked_at_unix_micros": now, "expires_at_unix_micros": expires,
         }),
     )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CancelBody {}
+
+/// Cancel only the currently authenticated subject's pending challenge. An empty
+/// body also works after a lost send response; no browser-supplied subject exists.
+pub(crate) async fn cancel(
+    State(state): State<OidcState>,
+    Path((tenant, environment)): Path<(String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Result<Json<CancelBody>, JsonRejection>,
+) -> Response {
+    if state.recipient_verification_transport().is_none() {
+        return unavailable();
+    }
+    if uri.query().is_some() || body.is_err() {
+        return invalid();
+    }
+    let (scope, subject) =
+        match crate::account::recipient_subject(&state, &tenant, &environment, &headers).await {
+            Ok(context) => context,
+            Err(error) => return error,
+        };
+    if let Some(error) = state
+        .enforce_request_quota(&scope, &headers, None, None)
+        .await
+    {
+        return error;
+    }
+    match state
+        .store()
+        .scoped(scope)
+        .acting(
+            crate::interaction::user_actor(&subject),
+            CorrelationId::generate(state.env()),
+        )
+        .recipient_verification()
+        .cancel(state.env(), &subject)
+        .await
+    {
+        Ok(()) => response(StatusCode::OK, json!({"cancelled":true})),
+        Err(error) => store_error(&error),
+    }
 }

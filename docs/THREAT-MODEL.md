@@ -481,10 +481,10 @@ not broaden the recipient-proof profile.
 
 ## Surface: gated subject-bound recipient verification (issue #1436)
 
-Three bounded JSON POSTs live under the scoped account path: challenge start,
-challenge verify and online relying-party recipient proof. Production has no
-installer or enable flag; it returns 503 until delivery, hosted recovery and
-legacy-index readiness are qualified. The only installer is testing-only.
+Bounded JSON POSTs live under the scoped account path: challenge start, verify,
+cancel and online relying-party recipient proof. They return 503 by default.
+Issue #1475 adds explicit TLS SMTP configuration and a hosted page; arbitrary
+fixture adapters remain testing-only. Scoped index readiness stays mandatory.
 See [the contract and remaining acceptance](design/RECIPIENT-VERIFICATION.md).
 
 | STRIDE | Threat | Control / residual |
@@ -496,8 +496,8 @@ See [the contract and remaining acceptance](design/RECIPIENT-VERIFICATION.md).
 | Denial of service | Flooded sends, concurrent guesses, unbounded slow transport or expensive hashing | Existing regulation/quota and bounded hash pool; durable one-minute send cooldown and five-attempt ceiling; one current challenge per subject; five-minute expiry and five-second transport deadline |
 | Elevation | Possession creates a stronger session, a token exchange hides impersonation, or a stale proof is reused | No session/token mint or strength change; direct live non-impersonated authorization-code provenance in addition to signed JWT/DPoP checks; issuer/client/public-subject/nonce/expected-recipient binding and at most 30-second online proof lifetime |
 
-Residuals are explicit: this core has no real delivery/hosted UI/legacy index
-backfill and must stay unavailable until those are qualified. Additional mailbox
+Residuals are explicit: actual mailbox delivery, hosted end-to-end deployment and
+controlled legacy index backfill must be qualified before rollout. Additional mailbox
 enrollment and opaque-token direct-actor provenance are not supported. A proof
 reports current provider-recorded ownership, not a new inbox-possession ceremony
 on every read. Relying-party acceptance must recheck its own current authority
@@ -525,3 +525,55 @@ and incompatible key operations cannot select the encryption recipient. The
 current implementation does not fetch encryption keys from `jwks_uri`; such
 registrations are rejected. If configured encryption cannot be performed at
 issuance, the request fails instead of returning a plaintext signed ID token.
+
+
+## Surface: recipient verification SMTP adapter and hosted ceremony (issue #1475)
+
+The adapter sends the authenticated core's stored mailbox address and transient
+challenge code to one operator-configured relay. It does not enable a production
+ceremony by itself or accept relay configuration from the browser. Explicit default-off
+operator configuration installs the concrete SMTP adapter and enables the hosted
+page; current scoped ownership checks still enforce index readiness.
+
+| STRIDE | Threat | Control |
+| --- | --- | --- |
+| Spoofing | Relay impersonation or plaintext downgrade | Certificate and hostname verification; implicit TLS or mandatory STARTTLS only |
+| Tampering | Header injection, scope confusion or arbitrary message bodies | Bare bounded ASCII mailbox parsing; typed challenge scope check; eight numeric digits; fixed subject and text/HTML bodies |
+| Repudiation | Lost final reply reported as accepted or automatically resent | Explicit SMTP negative responses are refused; disconnect and timeout are uncertain; one attempt and no retry/failover; challenge-bound Message-ID is correlation, not a relay deduplication guarantee |
+| Information disclosure | Codes, credentials, addresses or server replies leak through diagnostics | No message/config serialization or Debug; redacted transport Debug and value-free errors; no logging; no plaintext outbox or file transport |
+| Denial of service | Slow relay or send burst retains unlimited secrets | Four-second whole-attempt deadline, three-second command timeout, bounded simultaneous attempts and no waiting queue; existing subject challenge cooldown and attempt budget stay authoritative |
+| Elevation | Configuration or a page request bypasses current account ownership | Default off; only concrete TLS SMTP can be installed in production; typed configuration and secret resolution precede startup; current scoped indexing/ambiguity checks remain mandatory |
+
+Local TLS SMTP fixtures establish protocol behavior, not external inbox delivery.
+Real permitted-mailbox and hosted-flow evidence remains required by #1475.
+
+
+The hosted GET reads only the current direct recently authenticated account. Its
+continuation is a local authorization request for an in-scope client and an exact
+registered callback; GET never sends a code. The shared page builder provides
+no-store, strict nonce CSP, same-origin fetch, framing denial and escaping. The
+page stores only non-secret subject-bound challenge handles and UX deadlines,
+never codes or tokens. POST start/verify/cancel require the exact Origin and a
+fresh direct session. Cancellation takes the ownership lock and audits challenge
+consumption atomically, without modifying established verification or sessions.
+Unknown request outcomes remain unknown in the UI; no automatic resend occurs.
+
+
+## Surface: existing-account recipient index management (issue #1475)
+
+Management GET previews and POST prepares at most 100 retained primary
+identifiers in the credential's exact environment, including soft-deleted users.
+It returns aggregate counts and never asserts that metadata is mailbox proof.
+
+| STRIDE | Threat | Control |
+| --- | --- | --- |
+| Spoofing | A foreign operator or scoped key prepares another environment | Operator-owned tenant/environment resolution, unconfined credential scope fence, read/write-users permissions; configured sudo freshness for writes |
+| Tampering | Supplied email, stale preview or mixed writers assigns ownership | No caller-supplied identity; decrypt stored current primary data under the shared ownership lock; same canonicalization as ordinary writers; unindexed or ambiguous current ownership blocks proof |
+| Repudiation | A lost reply advances twice or indices commit without audit | Required credential-scoped Idempotency-Key; atomic index, resolved response and audit transaction; concurrent duplicate rolls back before replay |
+| Information disclosure | Migration diagnostics reveal mailbox or sealed content | Aggregate response only; no raw identifier, blind index, code or key returned; persistence errors use normal redacted error handling |
+| Denial of service | Unbounded batch or lock wait blocks identity writes | Validated batch of 1 through 100; five-second per-statement timeout; partial batches roll back on failure; existing management headers are placeholders, not an enforced rate limit |
+| Elevation | Index completion grants verification or a replay bypasses revoked authority | Changes restricted to two control-role index columns; no verification, password, session or identity mutation; permissions, configured fresh privilege and live environment checked before replay |
+
+`all_writers_upgraded` is an explicit operator acknowledgement, not a server
+attestation of running versions. Ambiguity counts cover indexed rows only;
+completion does not repair conflicting owners or establish mailbox possession.

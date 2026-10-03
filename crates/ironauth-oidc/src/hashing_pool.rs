@@ -154,10 +154,10 @@ impl HashRejection {
                         headers.insert(name, value);
                     }
                 }
-                if let Some(cookie) = snapshot.block_set_cookie() {
-                    if let Ok(value) = HeaderValue::from_str(&cookie) {
-                        headers.append(header::SET_COOKIE, value);
-                    }
+                if let Some(cookie) = snapshot.block_set_cookie()
+                    && let Ok(value) = HeaderValue::from_str(&cookie)
+                {
+                    headers.append(header::SET_COOKIE, value);
                 }
                 response
             }

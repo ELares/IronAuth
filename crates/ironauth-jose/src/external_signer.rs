@@ -105,13 +105,13 @@ pub fn guard_signing_input_size(
     input: &[u8],
     backend_ceiling: Option<usize>,
 ) -> Result<(), ExternalSignerError> {
-    if let Some(limit) = backend_ceiling {
-        if input.len() > limit {
-            return Err(ExternalSignerError::InputTooLarge {
-                limit,
-                size: input.len(),
-            });
-        }
+    if let Some(limit) = backend_ceiling
+        && input.len() > limit
+    {
+        return Err(ExternalSignerError::InputTooLarge {
+            limit,
+            size: input.len(),
+        });
     }
     Ok(())
 }

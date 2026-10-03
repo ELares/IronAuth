@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Wire explicitly configured recipient verification to the concrete TLS SMTP adapter; unreadable relay credentials refuse startup, and the default remains disabled (#1475).
+
 - Capture advisory verification and poll settings before moving configuration
   into the server, restoring compilation of the management and worker wiring.
 

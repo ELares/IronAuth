@@ -255,10 +255,10 @@ pub fn resolve_locale(
             let Some(tag) = LanguageTag::parse(token) else {
                 continue;
             };
-            if let Some(bundle) = lookup(&tag, installed) {
-                if seen.insert(bundle.tag.clone()) {
-                    chain.push(bundle.clone());
-                }
+            if let Some(bundle) = lookup(&tag, installed)
+                && seen.insert(bundle.tag.clone())
+            {
+                chain.push(bundle.clone());
             }
         }
     }
@@ -267,10 +267,10 @@ pub fn resolve_locale(
         .map_or_else(|| env_default.clone(), |bundle| bundle.tag.clone());
     // The environment default bundle is the final bundle-level fallback before the compiled
     // registry, so a partial requested bundle still resolves the default's strings before English.
-    if let Some(default_bundle) = installed.get(env_default) {
-        if seen.insert(default_bundle.tag.clone()) {
-            chain.push(default_bundle.clone());
-        }
+    if let Some(default_bundle) = installed.get(env_default)
+        && seen.insert(default_bundle.tag.clone())
+    {
+        chain.push(default_bundle.clone());
     }
     let direction = primary.direction();
     ResolvedLocale {

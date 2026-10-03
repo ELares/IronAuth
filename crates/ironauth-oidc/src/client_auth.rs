@@ -908,10 +908,10 @@ pub fn parse_presented(
             return Err(ClientAuthParseError::MultipleMethods);
         }
         // A body client_id alongside Basic is allowed only if it agrees.
-        if let Some(body_id) = body_id {
-            if body_id != basic_id {
-                return Err(ClientAuthParseError::ClientIdMismatch);
-            }
+        if let Some(body_id) = body_id
+            && body_id != basic_id
+        {
+            return Err(ClientAuthParseError::ClientIdMismatch);
         }
         return Ok(PresentedClientAuth::Secret {
             client_id: basic_id,
@@ -1421,10 +1421,10 @@ pub(crate) async fn resolve_client_keys(
     if let Some(inline) = &record.jwks {
         return ironauth_jose::trusted_keys_from_jwks(inline.as_bytes());
     }
-    if let Some(uri) = &record.jwks_uri {
-        if let Some(resolver) = state.client_key_resolver() {
-            return resolver.resolve(state.now(), uri).await;
-        }
+    if let Some(uri) = &record.jwks_uri
+        && let Some(resolver) = state.client_key_resolver()
+    {
+        return resolver.resolve(state.now(), uri).await;
     }
     Vec::new()
 }
@@ -1520,12 +1520,11 @@ fn best_effort_client_id(inputs: &ClientAuthInputs<'_>) -> Option<String> {
     if let Some(id) = trimmed(inputs.client_id) {
         return Some(id.to_owned());
     }
-    if let Some(auth) = inputs.authorization {
-        if is_basic(auth) {
-            if let Some((id, _)) = parse_basic(auth) {
-                return Some(id);
-            }
-        }
+    if let Some(auth) = inputs.authorization
+        && is_basic(auth)
+        && let Some((id, _)) = parse_basic(auth)
+    {
+        return Some(id);
     }
     inputs.client_assertion.and_then(assertion_subject)
 }

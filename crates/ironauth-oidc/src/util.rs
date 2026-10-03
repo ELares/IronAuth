@@ -96,10 +96,10 @@ pub fn percent_decode(value: &str) -> String {
 #[must_use]
 pub fn query_get(query: &str, name: &str) -> Option<String> {
     for pair in query.split('&') {
-        if let Some((key, value)) = pair.split_once('=') {
-            if key == name {
-                return Some(percent_decode(value));
-            }
+        if let Some((key, value)) = pair.split_once('=')
+            && key == name
+        {
+            return Some(percent_decode(value));
         }
     }
     None

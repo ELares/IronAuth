@@ -1018,14 +1018,12 @@ async fn validate_metadata(
     let authorization_signed_response_alg = validate_authorization_signing_alg(metadata)?;
     let id_token_encrypted_response_alg = validate_id_token_encrypted_alg(metadata)?;
     let id_token_encrypted_response_enc = validate_id_token_encrypted_enc(metadata)?;
-    if hardened {
-        if let Some(alg) = token_endpoint_auth_signing_alg.as_ref() {
-            let parsed = ironauth_jose::JwsAlgorithm::from_jose_name(alg);
-            if !parsed.is_some_and(crate::fapi_hardened::hardened_permits_algorithm) {
-                return Err(RegistrationError::metadata_owned(format!(
-                    "a hardened (FAPI 2.0) environment permits only PS256, ES256, or                          EdDSA as the token-endpoint signing algorithm, not {alg}"
-                )));
-            }
+    if hardened && let Some(alg) = token_endpoint_auth_signing_alg.as_ref() {
+        let parsed = ironauth_jose::JwsAlgorithm::from_jose_name(alg);
+        if !parsed.is_some_and(crate::fapi_hardened::hardened_permits_algorithm) {
+            return Err(RegistrationError::metadata_owned(format!(
+                "a hardened (FAPI 2.0) environment permits only PS256, ES256, or                          EdDSA as the token-endpoint signing algorithm, not {alg}"
+            )));
         }
     }
     let (jwks, jwks_uri) = validate_client_keys(
@@ -1643,10 +1641,10 @@ fn metadata_object(
     if let Some(jwks_uri) = jwks_uri {
         object.insert("jwks_uri".to_owned(), json!(jwks_uri));
     }
-    if let Some(jwks) = jwks {
-        if let Ok(value) = serde_json::from_str::<Value>(jwks) {
-            object.insert("jwks".to_owned(), value);
-        }
+    if let Some(jwks) = jwks
+        && let Ok(value) = serde_json::from_str::<Value>(jwks)
+    {
+        object.insert("jwks".to_owned(), value);
     }
     if let Some(signing_alg) = token_endpoint_auth_signing_alg {
         object.insert(

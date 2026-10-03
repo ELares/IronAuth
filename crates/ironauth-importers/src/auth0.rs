@@ -267,15 +267,15 @@ fn build_claims(user: &Auth0User) -> Option<Value> {
 /// the user carries neither.
 fn build_traits(user: &Auth0User) -> Option<Value> {
     let mut traits = Map::new();
-    if let Some(Value::Object(app)) = &user.app_metadata {
-        if !app.is_empty() {
-            traits.insert("app_metadata".to_owned(), Value::Object(app.clone()));
-        }
+    if let Some(Value::Object(app)) = &user.app_metadata
+        && !app.is_empty()
+    {
+        traits.insert("app_metadata".to_owned(), Value::Object(app.clone()));
     }
-    if let Some(Value::Object(meta)) = &user.user_metadata {
-        if !meta.is_empty() {
-            traits.insert("user_metadata".to_owned(), Value::Object(meta.clone()));
-        }
+    if let Some(Value::Object(meta)) = &user.user_metadata
+        && !meta.is_empty()
+    {
+        traits.insert("user_metadata".to_owned(), Value::Object(meta.clone()));
     }
     if traits.is_empty() {
         None

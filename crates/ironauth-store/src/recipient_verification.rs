@@ -9,6 +9,29 @@
 
 use crate::{RecipientChallengeId, UserId, UserIdentifierId};
 
+/// A bounded inspection or backfill report. Counts describe the scoped snapshot;
+/// no address, blind index, password, verification code or ownership proof leaves
+/// the repository through this type.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RecipientIndexReport {
+    /// Whether this call committed the inspected batch's index metadata.
+    pub applied: bool,
+    /// Retained users decoded in this batch, at most the requested bound.
+    pub batch_users: u32,
+    /// Batch users with a nonempty canonical mailbox ownership reservation.
+    pub batch_mailbox_users: u32,
+    /// Retained users in the exact tenant/environment, including deleted users.
+    pub total_users: i64,
+    /// Users whose primary-identifier index has not been established yet.
+    pub unindexed_users: i64,
+    /// Conflicting canonical ownership groups among currently indexed primary
+    /// and typed identifiers. Incomplete indexing can still reveal more groups.
+    pub ambiguous_indexed_mailboxes: i64,
+    /// True only when every retained primary identifier has been indexed.
+    /// This does not assert that every user has a deliverable or verified email.
+    pub index_complete: bool,
+}
+
 /// A challenge issued to an already authenticated subject.
 pub struct NewRecipientChallenge<'a> {
     /// Fresh scope-bound challenge handle.

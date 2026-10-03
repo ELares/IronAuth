@@ -22,7 +22,9 @@
 
 mod dsn;
 mod features;
+mod recipient;
 mod secret;
+pub use recipient::{RecipientSmtpSecurity, RecipientSmtpSettings, RecipientVerificationConfig};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -4059,6 +4061,9 @@ pub struct OidcConfig {
     /// overrides ride the M5 promotion pipeline.
     pub registration_enabled: bool,
 
+    /// Subject-bound mailbox verification for relying-party invitations.
+    pub recipient_verification: RecipientVerificationConfig,
+
     /// The Dynamic Client Registration exposure switch (issue #31): `closed`
     /// (management API only), `token_gated` (a valid initial access token is
     /// required), or `open` (anonymous registration allowed, but the resulting
@@ -4771,6 +4776,7 @@ impl Default for OidcConfig {
             introspection_signed_ttl_secs: None,
             par_ttl_secs: 60,
             registration_enabled: false,
+            recipient_verification: RecipientVerificationConfig::default(),
             registration_mode: RegistrationMode::TokenGated,
             regulation: RegulationConfig::default(),
             risk: RiskConfig::default(),
@@ -6793,6 +6799,14 @@ impl Config {
     /// added by later issues must register their secret fields here so the
     /// literal-form lint keeps covering the whole tree.
     fn for_each_secret(&self, mut visit: impl FnMut(&str, &Secret)) {
+        if let Some(smtp) = &self.oidc.recipient_verification.smtp {
+            if let Some(secret) = &smtp.username {
+                visit("oidc.recipient_verification.smtp.username", secret);
+            }
+            if let Some(secret) = &smtp.password {
+                visit("oidc.recipient_verification.smtp.password", secret);
+            }
+        }
         if let Some(password) = &self.database.password {
             visit("database.password", password);
         }
@@ -6818,6 +6832,9 @@ impl Config {
     /// exceeds its ceiling (a bound an operator can raise without limit is not
     /// one), or for any of the other per-section rules below.
     fn validate(&self) -> Result<(), ConfigError> {
+        self.oidc
+            .recipient_verification
+            .validate(self.oidc.enabled, self.server.public_url.as_deref())?;
         check_byok_unconsumed(&self.byok)?;
         validate_admin(&self.admin)?;
         validate_scim(&self.scim)?;
@@ -6850,16 +6867,7 @@ impl Config {
             });
         }
         validate_session_lifetimes(&self.oidc)?;
-        // The JWKS cache window must stay in the operational-discipline range.
-        let cache = self.oidc.jwks_cache_max_age_secs;
-        if !(OIDC_JWKS_CACHE_MIN_SECS..=OIDC_JWKS_CACHE_MAX_SECS).contains(&cache) {
-            return Err(ConfigError::Invalid {
-                message: format!(
-                    "oidc.jwks_cache_max_age_secs ({cache}) must be between \
-                     {OIDC_JWKS_CACHE_MIN_SECS} and {OIDC_JWKS_CACHE_MAX_SECS} seconds"
-                ),
-            });
-        }
+        validate_jwks_cache_window(&self.oidc)?;
         validate_client_credential_bounds(&self.oidc)?;
         validate_refresh_and_consent(&self.oidc)?;
         // The PAR request_uri lifetime is bounded like the other credential
@@ -6931,6 +6939,21 @@ impl Config {
         validate_flow_target_delivery_lease(&self.flow_targets, &self.outbox)?;
         Ok(())
     }
+}
+
+/// Keep the public JWKS cache window within its operational bounds.
+fn validate_jwks_cache_window(oidc: &OidcConfig) -> Result<(), ConfigError> {
+    // The JWKS cache window must stay in the operational-discipline range.
+    let cache = oidc.jwks_cache_max_age_secs;
+    if !(OIDC_JWKS_CACHE_MIN_SECS..=OIDC_JWKS_CACHE_MAX_SECS).contains(&cache) {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "oidc.jwks_cache_max_age_secs ({cache}) must be between \
+                 {OIDC_JWKS_CACHE_MIN_SECS} and {OIDC_JWKS_CACHE_MAX_SECS} seconds"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Validate the token claim budget (issue #98). Each maximum has a hard ceiling
@@ -7170,14 +7193,14 @@ fn validate_backup(backup: &BackupConfig) -> Result<(), ConfigError> {
                 .to_string(),
         });
     }
-    if let Some(endpoint) = &backup.s3_endpoint {
-        if !endpoint.starts_with("https://") {
-            return Err(ConfigError::Invalid {
-                message: format!(
-                    "backup.s3_endpoint ({endpoint}) must be an https URL: the push rides                      the SSRF-hardened outbound path, and a plaintext endpoint is refused"
-                ),
-            });
-        }
+    if let Some(endpoint) = &backup.s3_endpoint
+        && !endpoint.starts_with("https://")
+    {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "backup.s3_endpoint ({endpoint}) must be an https URL: the push rides                      the SSRF-hardened outbound path, and a plaintext endpoint is refused"
+            ),
+        });
     }
     if backup.s3_credential.is_none() {
         return Err(ConfigError::Invalid {
@@ -7266,13 +7289,13 @@ fn validate_access_rule(at: &str, rule: &AccessRuleConfig) -> Result<(), ConfigE
     //
     // Whether the value NAMES a rung is checked where the rule is built, because the rungs
     // come from the authentication registry and this crate sits below it.
-    if let Some(floor) = &rule.acr_at_least {
-        if floor.trim().is_empty() {
-            return Err(invalid(format!(
-                "{at}.acr_at_least is empty: no authentication reaches an unnamed floor, so \
+    if let Some(floor) = &rule.acr_at_least
+        && floor.trim().is_empty()
+    {
+        return Err(invalid(format!(
+            "{at}.acr_at_least is empty: no authentication reaches an unnamed floor, so \
                  the rule it constrains can never fire"
-            )));
-        }
+        )));
     }
 
     // A PREFIX THAT MATCHES NOTHING, OR EVERYTHING, IS NOT A CONSTRAINT.
@@ -8401,16 +8424,15 @@ fn validate_acr_order(oidc: &OidcConfig) -> Result<(), ConfigError> {
         let rank = |value: &str| oidc.acr_order.iter().position(|acr| acr == value);
         if let (Some(remembered_rank), Some(mfa_rank)) =
             (rank(OIDC_ACR_MFA_REMEMBERED), rank(OIDC_ACR_MFA))
+            && remembered_rank >= mfa_rank
         {
-            if remembered_rank >= mfa_rank {
-                return Err(ConfigError::Invalid {
-                    message: format!(
-                        "oidc.acr_order must rank '{OIDC_ACR_MFA_REMEMBERED}' strictly below \
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "oidc.acr_order must rank '{OIDC_ACR_MFA_REMEMBERED}' strictly below \
                          '{OIDC_ACR_MFA}': a remembered device attests only a prior second \
                          factor and must never satisfy a genuine mfa step-up floor"
-                    ),
-                });
-            }
+                ),
+            });
         }
         // The single-primary-factor floor (issue #267): `pwd` MUST rank strictly BELOW
         // every genuinely stronger rung. `pwd` is the rung a WEAK possession proof sits
@@ -8426,17 +8448,17 @@ fn validate_acr_order(oidc: &OidcConfig) -> Result<(), ConfigError> {
         // misordered rung set is worth refusing at boot regardless of who reads it.
         let pwd_rank = rank(OIDC_ACR_PWD);
         for stronger in [OIDC_ACR_MFA, OIDC_ACR_PHR, OIDC_ACR_PHRH, OIDC_ACR_ATTESTED] {
-            if let (Some(weak_rank), Some(strong_rank)) = (pwd_rank, rank(stronger)) {
-                if weak_rank >= strong_rank {
-                    return Err(ConfigError::Invalid {
-                        message: format!(
-                            "oidc.acr_order must rank '{OIDC_ACR_PWD}' strictly below \
+            if let (Some(weak_rank), Some(strong_rank)) = (pwd_rank, rank(stronger))
+                && weak_rank >= strong_rank
+            {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "oidc.acr_order must rank '{OIDC_ACR_PWD}' strictly below \
                              '{stronger}': a single primary factor (including a weak \
                              possession proof such as an email or SMS one-time code) must \
                              never satisfy a stronger floor"
-                        ),
-                    });
-                }
+                    ),
+                });
             }
         }
     }
@@ -8751,12 +8773,12 @@ fn validate_password_policy(policy: &PasswordPolicyConfig) -> Result<(), ConfigE
             ),
         });
     }
-    if let Some(base) = &policy.hibp_base_url {
-        if !base.starts_with("https://") {
-            return Err(ConfigError::Invalid {
-                message: format!("password_policy.hibp_base_url ({base}) must be an https URL"),
-            });
-        }
+    if let Some(base) = &policy.hibp_base_url
+        && !base.starts_with("https://")
+    {
+        return Err(ConfigError::Invalid {
+            message: format!("password_policy.hibp_base_url ({base}) must be an https URL"),
+        });
     }
     // The offline provider needs a corpus; screening enabled with the offline provider
     // and no dataset would silently screen NOTHING, so fail fast at config load.
@@ -8797,12 +8819,12 @@ fn validate_webauthn(oidc: &OidcConfig, server: &ServerConfig) -> Result<(), Con
     // fetch path, so a plaintext override is refused at load, mirroring the HIBP base-URL
     // rule. Validated regardless of webauthn_enabled so a misconfiguration is caught even
     // when the surface is off.
-    if let Some(base) = &oidc.mds3_base_url {
-        if !base.starts_with("https://") {
-            return Err(ConfigError::Invalid {
-                message: format!("oidc.mds3_base_url ({base}) must be an https URL"),
-            });
-        }
+    if let Some(base) = &oidc.mds3_base_url
+        && !base.starts_with("https://")
+    {
+        return Err(ConfigError::Invalid {
+            message: format!("oidc.mds3_base_url ({base}) must be an https URL"),
+        });
     }
     if !oidc.webauthn_enabled {
         return Ok(());

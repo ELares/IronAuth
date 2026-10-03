@@ -1612,10 +1612,10 @@ pub fn verify_batch(
     }
     // Ordering, checked AFTER the signature. Checking it first would answer a question
     // about the stream's position to a caller who has not proven they hold the secret.
-    if let Some(last) = last_accepted {
-        if batch.sequence.as_str() <= last {
-            return Err(VerifyFailure::OutOfOrder);
-        }
+    if let Some(last) = last_accepted
+        && batch.sequence.as_str() <= last
+    {
+        return Err(VerifyFailure::OutOfOrder);
     }
     Ok(())
 }

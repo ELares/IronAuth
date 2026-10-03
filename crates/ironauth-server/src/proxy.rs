@@ -330,10 +330,11 @@ fn parse_forwarded_node(raw: &str) -> Option<IpAddr> {
         return Some(ip);
     }
     // Bare ipv4:port (a bare IPv6 has multiple colons and parsed above).
-    if let Some((host, port)) = s.rsplit_once(':') {
-        if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
-            return host.parse::<IpAddr>().ok();
-        }
+    if let Some((host, port)) = s.rsplit_once(':')
+        && !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+    {
+        return host.parse::<IpAddr>().ok();
     }
     None
 }

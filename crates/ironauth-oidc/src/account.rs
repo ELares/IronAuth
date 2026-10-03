@@ -126,6 +126,17 @@ pub(crate) async fn recipient_subject(
             json!({"error": "origin_required"}),
         ));
     }
+    recipient_page_subject(state, tenant, environment, headers).await
+}
+
+/// Read-only hosted-page authentication. Mutation callers additionally require
+/// the exact Origin check in `recipient_subject`.
+pub(crate) async fn recipient_page_subject(
+    state: &OidcState,
+    tenant: &str,
+    environment: &str,
+    headers: &HeaderMap,
+) -> Result<(Scope, UserId), Response> {
     let account = authenticate(state, tenant, environment, headers).await?;
     let age = epoch_micros(state.now()).saturating_sub(account.auth_time_unix_micros);
     if !(0..=300_000_000).contains(&age) {

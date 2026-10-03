@@ -3,8 +3,8 @@
 //! The security-advisory management surface (issue #163): the banner projection
 //! and the offline bundle import.
 //!
-//! The banner surface (`GET /security/advisories`) lists the ACCEPTED advisories
-//! - every row was verified before insertion, so the surface never renders an
+//! The banner surface (`GET /security/advisories`) lists the ACCEPTED advisories.
+//! Every row was verified before insertion, so the surface never renders an
 //! unverified advisory. The offline import (`POST /security/advisories/import`)
 //! takes the SAME signed bundle the online poll consumes: the single verification
 //! path runs, a bundle that fails verification is rejected ENTIRELY and the
@@ -133,7 +133,8 @@ pub async fn import_security_advisories(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
-    principal.require_permission(ManagementPermission::WriteConfig)?;
+    // The projection is deployment-wide, even though this route carries a scope.
+    principal.require_operator()?;
     require_live_environment(&state, &scope).await?;
     let request: AdvisoryImportRequest = parse_json(&body)?;
 
@@ -188,11 +189,43 @@ pub async fn import_security_advisories(
             published_at: advisory.published_at,
         })
         .collect();
+    let event = advisory_imported_event(&state, scope, records.len())?;
     state
         .store()
         .security_advisories()
-        .replace_all(&records, "offline-import")
+        .replace_all_with_event(
+            state.env(),
+            scope,
+            &records,
+            "offline-import",
+            &event.domain_event(),
+        )
         .await
         .map_err(ApiError::from)?;
     Ok(no_content())
+}
+
+fn advisory_imported_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    count: usize,
+) -> Result<crate::events::PendingEvent, ApiError> {
+    let id = format!(
+        "evt_{}",
+        ironauth_store::CorrelationId::generate(state.env())
+    );
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "security_advisory.imported",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({"advisory_count": count, "deployment_global": true}),
+    )
+    .ok_or(ApiError::Internal)?;
+    Ok(crate::events::PendingEvent {
+        id,
+        subject: "security-advisory-projection".to_owned(),
+        envelope,
+    })
 }

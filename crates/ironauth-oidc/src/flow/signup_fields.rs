@@ -426,15 +426,15 @@ fn node_accepts(node: &Value, value: &Value) -> bool {
 /// to an invalid format, so the value is never silently accepted.
 fn classify_failure(subschema: &Value, rules: &Value, value: &Value) -> MessageId {
     let effective = effective_constraints(subschema, rules);
-    if let Some(type_name) = &effective.value_type {
-        if !type_name_matches(type_name, value) {
-            return message::SIGNUP_FIELD_INVALID_FORMAT;
-        }
+    if let Some(type_name) = &effective.value_type
+        && !type_name_matches(type_name, value)
+    {
+        return message::SIGNUP_FIELD_INVALID_FORMAT;
     }
-    if let Some(allowed) = &effective.allowed {
-        if !allowed.iter().any(|candidate| candidate == value) {
-            return message::SIGNUP_FIELD_NOT_ALLOWED;
-        }
+    if let Some(allowed) = &effective.allowed
+        && !allowed.iter().any(|candidate| candidate == value)
+    {
+        return message::SIGNUP_FIELD_NOT_ALLOWED;
     }
     if below_lower_bound(&effective, value) {
         return message::SIGNUP_FIELD_TOO_SHORT;
@@ -447,15 +447,15 @@ fn classify_failure(subschema: &Value, rules: &Value, value: &Value) -> MessageI
 
 /// Whether a value falls below any effective lower bound (min length, min items, or minimum).
 fn below_lower_bound(effective: &FieldConstraints, value: &Value) -> bool {
-    if let (Some(min), Value::String(text)) = (effective.min_length, value) {
-        if (text.chars().count() as u64) < min {
-            return true;
-        }
+    if let (Some(min), Value::String(text)) = (effective.min_length, value)
+        && (text.chars().count() as u64) < min
+    {
+        return true;
     }
-    if let (Some(min), Value::Array(items)) = (effective.min_items, value) {
-        if (items.len() as u64) < min {
-            return true;
-        }
+    if let (Some(min), Value::Array(items)) = (effective.min_items, value)
+        && (items.len() as u64) < min
+    {
+        return true;
     }
     match (&effective.minimum, value.as_f64()) {
         (Some(min), Some(actual)) => min.as_f64().is_some_and(|bound| actual < bound),
@@ -465,15 +465,15 @@ fn below_lower_bound(effective: &FieldConstraints, value: &Value) -> bool {
 
 /// Whether a value rises above any effective upper bound (max length, max items, or maximum).
 fn above_upper_bound(effective: &FieldConstraints, value: &Value) -> bool {
-    if let (Some(max), Value::String(text)) = (effective.max_length, value) {
-        if (text.chars().count() as u64) > max {
-            return true;
-        }
+    if let (Some(max), Value::String(text)) = (effective.max_length, value)
+        && (text.chars().count() as u64) > max
+    {
+        return true;
     }
-    if let (Some(max), Value::Array(items)) = (effective.max_items, value) {
-        if (items.len() as u64) > max {
-            return true;
-        }
+    if let (Some(max), Value::Array(items)) = (effective.max_items, value)
+        && (items.len() as u64) > max
+    {
+        return true;
     }
     match (&effective.maximum, value.as_f64()) {
         (Some(max), Some(actual)) => max.as_f64().is_some_and(|bound| actual > bound),

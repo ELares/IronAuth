@@ -94,10 +94,8 @@ pub fn body_addressed_operations() -> BTreeSet<String> {
                 .into_iter()
                 .flatten()
                 .any(|(_media_type, body)| carries_organization(&body["schema"], schemas, 0));
-            if carries {
-                if let Some(id) = operation["operationId"].as_str() {
-                    found.insert(id.to_owned());
-                }
+            if carries && let Some(id) = operation["operationId"].as_str() {
+                found.insert(id.to_owned());
             }
         }
     }

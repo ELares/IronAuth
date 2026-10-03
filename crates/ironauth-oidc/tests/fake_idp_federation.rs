@@ -174,10 +174,10 @@ fn encode(value: &str) -> String {
 fn param(location: &str, name: &str) -> String {
     let query = location.split_once('?').expect("a query").1;
     for pair in query.split('&') {
-        if let Some((key, value)) = pair.split_once('=') {
-            if key == name {
-                return value.to_owned();
-            }
+        if let Some((key, value)) = pair.split_once('=')
+            && key == name
+        {
+            return value.to_owned();
         }
     }
     panic!("missing {name} in {location}");

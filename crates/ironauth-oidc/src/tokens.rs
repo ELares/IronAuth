@@ -942,10 +942,10 @@ pub(crate) fn build_access_token_claims(
     // key when a valid proof accompanied issuance. `cnf` is issuer-reserved (it is in
     // PROTECTED_ACCESS_TOKEN_CLAIMS), so embedding it HERE is the only way it can be
     // set: a client cannot self-assert a binding. Absent for a plain bearer token.
-    if let Some(confirmation) = request.confirmation {
-        if let serde_json::Value::Object(object) = &mut claims {
-            confirmation.embed_in_claims(object);
-        }
+    if let Some(confirmation) = request.confirmation
+        && let serde_json::Value::Object(object) = &mut claims
+    {
+        confirmation.embed_in_claims(object);
     }
 
     // Extra claims (issue #113): the pre-token hook's accepted access-token claims. Fenced
@@ -1328,10 +1328,10 @@ pub async fn mint_client_credentials_access_token(
                 &jti.to_string(),
                 &target.aud_claim(),
             );
-            if let Some(confirmation) = request.confirmation {
-                if let serde_json::Value::Object(object) = &mut claims {
-                    confirmation.embed_in_claims(object);
-                }
+            if let Some(confirmation) = request.confirmation
+                && let serde_json::Value::Object(object) = &mut claims
+            {
+                confirmation.embed_in_claims(object);
             }
             let claims_bytes = serde_json::to_vec(&claims).map_err(|_| ())?;
             let token = if let Some(backend) = state.signer_backend() {
@@ -1478,7 +1478,7 @@ pub async fn mint(
     // Apply the registered encryption exactly once after signing for every
     // back-channel ID-token grant, matching the front-channel emission path.
     let id_token =
-        match encrypt_id_token_for_client(state, request.scope, &request.client_id, &id_token)
+        match encrypt_id_token_for_client(state, request.scope, request.client_id, &id_token)
             .await?
         {
             Some(encrypted) => encrypted,

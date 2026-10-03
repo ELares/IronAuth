@@ -21373,6 +21373,234 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/recipient-verification/index": {
+      "get": {
+        "tags": [
+          "users"
+        ],
+        "summary": "Preview a bounded batch by decrypting its retained primary identifiers.\nLike other management reads, this remains available for a soft-deleted environment.",
+        "operationId": "previewRecipientIndex",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum retained users to inspect, from 1 through 100 (default 100).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Aggregate preview; no indices or verification state changed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecipientIndexView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid batch bound or query",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient permission or wrong scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unreadable stored identifier or persistence failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "users"
+        ],
+        "summary": "Prepare the next bounded batch. Retry a lost response with the same key;\nuse a new key to advance. No account is merged or marked email-verified.",
+        "operationId": "prepareRecipientIndex",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replay returns the original batch response without advancing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrepareRecipientIndexRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Index metadata, audit and response committed atomically",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecipientIndexView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid batch, missing acknowledgement or Idempotency-Key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential; writes can require fresh privilege",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient permission or wrong scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found or not live",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unreadable identifier or persistence failure; batch rolled back",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/recovery-approvals": {
       "get": {
         "tags": [
@@ -37074,6 +37302,27 @@
           }
         }
       },
+      "PrepareRecipientIndexRequest": {
+        "type": "object",
+        "required": [
+          "all_writers_upgraded"
+        ],
+        "properties": {
+          "all_writers_upgraded": {
+            "type": "boolean",
+            "description": "Required acknowledgement that all identity writers support recipient indexing.\nThe server does not attest binary versions. Older writers can make the\nenvironment incomplete again, which blocks recipient proof until repaired."
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum retained users to index, from 1 through 100 (default 100).",
+            "default": 100,
+            "maximum": 100,
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
       "ProjectGrantListView": {
         "type": "object",
         "description": "A page of project grants.",
@@ -37253,6 +37502,55 @@
             "type": "string",
             "description": "Who would receive the access (`usr_...`). Not necessarily the caller: a manager may\nask on behalf of somebody else.\n\nMust be a user id of this scope AND a live member of this organization, both checked\nat raise: a grant to a non-member confers nothing, so it would be approved and change\nnothing. Either failure answers 422 naming which one it was.",
             "example": "usr_..."
+          }
+        }
+      },
+      "RecipientIndexView": {
+        "type": "object",
+        "required": [
+          "applied",
+          "batch_users",
+          "batch_mailbox_users",
+          "total_users",
+          "unindexed_users",
+          "ambiguous_indexed_mailboxes",
+          "index_complete"
+        ],
+        "properties": {
+          "ambiguous_indexed_mailboxes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ambiguous mailbox groups among already indexed primary and typed emails.\nFurther batches can reveal more ambiguity. No accounts are merged."
+          },
+          "applied": {
+            "type": "boolean",
+            "description": "Whether this response describes a committed write rather than a preview."
+          },
+          "batch_mailbox_users": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Examined primary identifiers reserving a canonical email ownership index.\nThis does not mean those addresses are deliverable or verified.",
+            "minimum": 0
+          },
+          "batch_users": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Retained users examined in this batch.",
+            "minimum": 0
+          },
+          "index_complete": {
+            "type": "boolean",
+            "description": "Every retained user has index metadata. This does not establish mailbox\nverification, delivery readiness, or the absence of ambiguous ownership."
+          },
+          "total_users": {
+            "type": "integer",
+            "format": "int64",
+            "description": "All retained users, including soft-deleted accounts, in this environment."
+          },
+          "unindexed_users": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Retained users still lacking index metadata at the time of the transaction."
           }
         }
       },

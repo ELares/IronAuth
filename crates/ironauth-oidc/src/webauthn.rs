@@ -1254,12 +1254,12 @@ pub async fn signal_manage_page(
     let mut response = crate::pages::login_html(StatusCode::OK, body, &nonce);
     // Stamp the frequency-cap marker when an offer was emitted, so the next visit
     // inside the window suppresses a repeat offer.
-    if offer_conditional_create {
-        if let Ok(value) = header::HeaderValue::from_str(&format!(
+    if offer_conditional_create
+        && let Ok(value) = header::HeaderValue::from_str(&format!(
             "{CONDITIONAL_CREATE_COOKIE}={now}; Path=/; HttpOnly; SameSite=Lax"
-        )) {
-            response.headers_mut().append(header::SET_COOKIE, value);
-        }
+        ))
+    {
+        response.headers_mut().append(header::SET_COOKIE, value);
     }
     response
 }
@@ -1296,10 +1296,10 @@ fn read_offer_marker(headers: &HeaderMap) -> Option<i64> {
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
     for pair in cookies.split(';') {
         let pair = pair.trim();
-        if let Some(value) = pair.strip_prefix(CONDITIONAL_CREATE_COOKIE) {
-            if let Some(value) = value.strip_prefix('=') {
-                return value.trim().parse::<i64>().ok();
-            }
+        if let Some(value) = pair.strip_prefix(CONDITIONAL_CREATE_COOKIE)
+            && let Some(value) = value.strip_prefix('=')
+        {
+            return value.trim().parse::<i64>().ok();
         }
     }
     None

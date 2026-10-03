@@ -380,10 +380,10 @@ pub(crate) async fn create_user(
     // discarded it: a re-created person came back ENABLED however the request asked, which is
     // the one thing this branch exists to prevent. A re-admit also has to clear the `false`
     // activation row its own deactivation left behind, so it writes even when active is true.
-    if readmitted || !parsed.active {
-        if let Err(response) = set_active(&state, &auth, &user_id, parsed.active).await {
-            return response;
-        }
+    if (readmitted || !parsed.active)
+        && let Err(response) = set_active(&state, &auth, &user_id, parsed.active).await
+    {
+        return response;
     }
     // A create REPLACES, and only when the body carried an extension.
     //
@@ -393,8 +393,8 @@ pub(crate) async fn create_user(
     // not merely wasteful, it made the upsert's INSERT branch UNREACHABLE, so the remove-key
     // expression in that branch was covered by nothing. A review found the branch untested, and
     // the test I first wrote for it did not reach it either, for exactly this reason.
-    if !enterprise.is_empty() {
-        if let Err(response) = store_enterprise_attributes(
+    if !enterprise.is_empty()
+        && let Err(response) = store_enterprise_attributes(
             &state,
             &auth,
             &user_id,
@@ -402,9 +402,8 @@ pub(crate) async fn create_user(
             EnterpriseWrite::Replace,
         )
         .await
-        {
-            return response;
-        }
+    {
+        return response;
     }
     match rendered_user(&state, &auth, &user_id).await {
         Ok(body) => created(&user_id, &body),
@@ -1942,10 +1941,10 @@ async fn scan_members(
         // omitted extension would make a legitimate filter match nothing.
         let enterprise = enterprise_of(state, auth, &membership.user_id).await;
         let resource = user_resource(&record, external_id.as_deref(), active, &enterprise);
-        if let Some(filter) = filter {
-            if !crate::filter_matches(filter, &resource) {
-                continue;
-            }
+        if let Some(filter) = filter
+            && !crate::filter_matches(filter, &resource)
+        {
+            continue;
         }
         matched.push(resource);
     }

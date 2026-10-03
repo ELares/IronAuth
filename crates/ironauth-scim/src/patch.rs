@@ -155,10 +155,10 @@ pub fn parse_patch_path(raw: &str) -> Result<PatchPath, PatchPathError> {
     // half. The filter parser never had this hole: it constrains its scan alphabet before
     // splitting, so the two parsers for one grammar disagreed exactly where this module's own
     // header argues they must not.
-    if let Some(urn) = urn {
-        if !is_legal_urn(urn) {
-            return Err(PatchPathError::IllegalAttribute);
-        }
+    if let Some(urn) = urn
+        && !is_legal_urn(urn)
+    {
+        return Err(PatchPathError::IllegalAttribute);
     }
 
     match bracketed {

@@ -1109,26 +1109,26 @@ async fn loaded_hook(
             // rather than another 33 ms compile of something that cannot run. Every other
             // failure -- a compile that ran out of memory, a declined join -- can succeed on
             // the next attempt, and a cached one would refuse a healthy hook forever.
-            if error.abort_kind() == Some(ironauth_hooks::AbortKind::Unlinkable) {
-                if let Ok(mut map) = cache.lock() {
-                    // A SEPARATE budget from the compiled components. A refusal is a `Copy`
-                    // enum and a short string, not the tens of megabytes `MAX_CACHED_HOOKS` was
-                    // sized for, and counting them together lets a client that redeploys broken
-                    // bytes 256 times deny the cache to every WORKING hook in the process --
-                    // measured, at a lowered bound, as a working hook never being admitted.
-                    let refusals = map
-                        .values()
-                        .filter(|entry| matches!(entry, Cached::Refused { .. }))
-                        .count();
-                    if refusals < MAX_CACHED_REFUSALS {
-                        map.insert(
-                            key,
-                            Cached::Refused {
-                                kind: ironauth_hooks::AbortKind::Unlinkable,
-                                reason: error.to_string(),
-                            },
-                        );
-                    }
+            if error.abort_kind() == Some(ironauth_hooks::AbortKind::Unlinkable)
+                && let Ok(mut map) = cache.lock()
+            {
+                // A SEPARATE budget from the compiled components. A refusal is a `Copy`
+                // enum and a short string, not the tens of megabytes `MAX_CACHED_HOOKS` was
+                // sized for, and counting them together lets a client that redeploys broken
+                // bytes 256 times deny the cache to every WORKING hook in the process --
+                // measured, at a lowered bound, as a working hook never being admitted.
+                let refusals = map
+                    .values()
+                    .filter(|entry| matches!(entry, Cached::Refused { .. }))
+                    .count();
+                if refusals < MAX_CACHED_REFUSALS {
+                    map.insert(
+                        key,
+                        Cached::Refused {
+                            kind: ironauth_hooks::AbortKind::Unlinkable,
+                            reason: error.to_string(),
+                        },
+                    );
                 }
             }
             return Err(error);

@@ -910,12 +910,12 @@ impl IntoResponse for UserInfoError {
             UserInfoError::ServerError => (StatusCode::INTERNAL_SERVER_ERROR, None),
         };
         let mut response = status.into_response();
-        if let Some(challenge) = challenge {
-            if let Ok(value) = HeaderValue::from_str(&challenge) {
-                response
-                    .headers_mut()
-                    .insert(header::WWW_AUTHENTICATE, value);
-            }
+        if let Some(challenge) = challenge
+            && let Ok(value) = HeaderValue::from_str(&challenge)
+        {
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, value);
         }
         // RFC 9449 section 8: the challenge is useless without the nonce, so this
         // header is the substance of the response rather than a decoration. The value
@@ -923,12 +923,12 @@ impl IntoResponse for UserInfoError {
         // through the fallible constructor: a value that would not encode must drop
         // the header rather than panic serving a request, and the client then retries
         // into a fresh challenge.
-        if let UserInfoError::UseDpopNonce { nonce } = &self {
-            if let Ok(value) = HeaderValue::from_str(nonce) {
-                response
-                    .headers_mut()
-                    .insert(crate::dpop::DPOP_NONCE_HEADER, value);
-            }
+        if let UserInfoError::UseDpopNonce { nonce } = &self
+            && let Ok(value) = HeaderValue::from_str(nonce)
+        {
+            response
+                .headers_mut()
+                .insert(crate::dpop::DPOP_NONCE_HEADER, value);
         }
         response
     }

@@ -130,12 +130,12 @@ pub async fn create_environment(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
-    if let Some(region) = region.as_deref() {
-        if !state.region_is_allowed(region) {
-            return Err(ApiError::BadRequest(format!(
-                "region {region:?} is not one of the operator's configured data-residency regions"
-            )));
-        }
+    if let Some(region) = region.as_deref()
+        && !state.region_is_allowed(region)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "region {region:?} is not one of the operator's configured data-residency regions"
+        )));
     }
 
     let created_at_micros = state.now_unix_micros();

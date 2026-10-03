@@ -5,10 +5,12 @@ This is the gated prerequisite for recipient-bound invitations, tracked by
 [Civio #456](https://github.com/encryptixio/civio/issues/456).
 The testing-only delivery is tracked separately by
 [child #1437](https://github.com/ELares/IronAuth/issues/1437).
-It does not complete either invited-user journey. Production has no installer or
-configuration switch for this flow. All routes return `503
-recipient_verification_unavailable` by default. The only installer is behind the
-`testing` feature and accepts an owned local transport fixture.
+It does not complete either invited-user journey. All mutation/proof routes return
+`503 recipient_verification_unavailable` by default. [Integration #1475](https://github.com/ELares/IronAuth/issues/1475)
+adds the concrete TLS SMTP installer, explicit default-off configuration and a
+hosted page. Arbitrary transport fixtures remain behind `testing`. See the
+[operator and hosted-flow guide](../RECIPIENT-VERIFICATION.md); remaining rollout
+qualification and existing-scope indexing requirements below are unchanged.
 
 ## Supported identity and authority
 
@@ -52,6 +54,7 @@ error is returned. GET does not issue or consume a challenge.
 | --- | --- | --- |
 | `email-verification/start` | `{"email":"owner@example.test"}` | 202 with `challenge_id`, `delivery:"accepted"`, `expires_in:300`, `retry_after_seconds:60` |
 | `email-verification/verify` | `{"challenge_id":"rcp_...","code":"12345678"}` | 200 with `verified:true` and `verification_revision`; no Set-Cookie |
+| `email-verification/cancel` | `{}` | 200 with `cancelled:true`; invalidates the current subject's pending challenge without changing verified ownership |
 | `recipient-proof` | `{"email":"expected@example.test","nonce":"<32-128 base64url characters>"}` | 200 online match bound as described below; no Set-Cookie |
 
 Start hands an eight-digit code to a purpose-specific transport through a
@@ -176,3 +179,16 @@ SQL checksum are accepted as a compatibility pair, without rewriting existing
 ledger rows. Forward repair 0243 validates the full guardrail view and retains
 its FIPS column, grants, owner and existing column positions. Every other changed
 checksum or unexpected view definition still refuses startup.
+
+
+### Controlled existing-scope index preparation (issue #1475)
+
+Migration 0247 and the documented management GET/POST
+`/v1/tenants/{tenant}/environments/{environment}/recipient-verification/index`
+provide the bounded preparation path. See [the operator workflow](../RECIPIENT-VERIFICATION.md#preparing-an-existing-environment).
+The store reuses current identifier decryption and canonicalization under the
+ownership lock and updates only primary-index metadata. An aggregate preview is
+not a durable authorization to mutate later; each apply reads current rows.
+Idempotent replay preserves the original batch result, and authorization/liveness
+are rechecked before returning it. Index completeness, unambiguous ownership,
+deliverability and verified mailbox possession remain separate requirements.

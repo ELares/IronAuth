@@ -98,6 +98,66 @@ pub fn envelope_schema() -> Value {
 /// event cannot reach the wire uncatalogued: the enforcement is the delivery path itself.
 const REGISTERED: &[(&str, u32, &str)] = &[
     (
+        "security_advisory.imported",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "advisory_count": {"type": "integer", "minimum": 0},
+                "deployment_global": {"type": "boolean", "enum": [true]}
+            },
+            "required": ["advisory_count", "deployment_global"]
+        }"#,
+    ),
+    (
+        "recipient_index.prepared",
+        1,
+        r#"{
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+        "applied": {
+            "type": "boolean"
+        },
+        "batch_users": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+        },
+        "batch_mailbox_users": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+        },
+        "total_users": {
+            "type": "integer",
+            "minimum": 0
+        },
+        "unindexed_users": {
+            "type": "integer",
+            "minimum": 0
+        },
+        "ambiguous_indexed_mailboxes": {
+            "type": "integer",
+            "minimum": 0
+        },
+        "index_complete": {
+            "type": "boolean"
+        }
+    },
+    "required": [
+        "applied",
+        "batch_users",
+        "batch_mailbox_users",
+        "total_users",
+        "unindexed_users",
+        "ambiguous_indexed_mailboxes",
+        "index_complete"
+    ]
+}"#,
+    ),
+    (
         "user.created",
         1,
         r#"{

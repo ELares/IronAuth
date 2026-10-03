@@ -2752,6 +2752,54 @@
       "type": "quota.limit_changed"
     },
     {
+      "domain": "recipient_index",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "ambiguous_indexed_mailboxes": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "applied": {
+            "type": "boolean"
+          },
+          "batch_mailbox_users": {
+            "maximum": 100,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "batch_users": {
+            "maximum": 100,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "index_complete": {
+            "type": "boolean"
+          },
+          "total_users": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unindexed_users": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "applied",
+          "batch_users",
+          "batch_mailbox_users",
+          "total_users",
+          "unindexed_users",
+          "ambiguous_indexed_mailboxes",
+          "index_complete"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "recipient_index.prepared"
+    },
+    {
       "domain": "recovery_approval",
       "payload_schema": {
         "additionalProperties": false,
@@ -3066,6 +3114,31 @@
       },
       "payload_schema_version": 1,
       "type": "scim_push_connection.deleted"
+    },
+    {
+      "domain": "security_advisory",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "advisory_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "deployment_global": {
+            "enum": [
+              true
+            ],
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "advisory_count",
+          "deployment_global"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "security_advisory.imported"
     },
     {
       "domain": "session",

@@ -30,15 +30,15 @@ pub const MIN_PLAUSIBLE_SINCE_UNIX_MS: i64 = 1_000_000_000_000;
 ///
 /// [`ApiError::BadRequest`] when `since` is below [`MIN_PLAUSIBLE_SINCE_UNIX_MS`].
 pub fn require_plausible_since_unix_ms(since: Option<i64>, what: &str) -> Result<(), ApiError> {
-    if let Some(since) = since {
-        if since < MIN_PLAUSIBLE_SINCE_UNIX_MS {
-            return Err(ApiError::BadRequest(format!(
-                "since_unix_ms must be MILLISECONDS since the Unix epoch and at or after \
+    if let Some(since) = since
+        && since < MIN_PLAUSIBLE_SINCE_UNIX_MS
+    {
+        return Err(ApiError::BadRequest(format!(
+            "since_unix_ms must be MILLISECONDS since the Unix epoch and at or after \
                  {MIN_PLAUSIBLE_SINCE_UNIX_MS}: {since} looks like seconds, which would \
                  replay every dead letter this {what} has. Omit the field to ask for that \
                  deliberately."
-            )));
-        }
+        )));
     }
     Ok(())
 }

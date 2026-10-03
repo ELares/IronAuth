@@ -262,15 +262,15 @@ fn es256_issuance_policy_preserves_the_independent_client_verification_matrix() 
         {
             continue;
         }
-        if key.ends_with("_supported") {
-            if let Some(items) = value.as_array() {
-                for item in items {
-                    assert_ne!(
-                        item.as_str(),
-                        Some("EdDSA"),
-                        "{key} must not advertise EdDSA under an ES256-only policy"
-                    );
-                }
+        if key.ends_with("_supported")
+            && let Some(items) = value.as_array()
+        {
+            for item in items {
+                assert_ne!(
+                    item.as_str(),
+                    Some("EdDSA"),
+                    "{key} must not advertise EdDSA under an ES256-only policy"
+                );
             }
         }
     }

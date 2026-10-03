@@ -370,10 +370,8 @@ fn every_id_jag_grant_test_is_reachable_by_the_lane_filter() {
             .strip_prefix("async fn ")
             .or_else(|| line.strip_prefix("fn "))
         {
-            if attributed {
-                if let Some(name) = rest.split('(').next() {
-                    names.push(name);
-                }
+            if attributed && let Some(name) = rest.split('(').next() {
+                names.push(name);
             }
             attributed = false;
         } else if !line.is_empty() && !line.starts_with("//") && !line.starts_with('#') {

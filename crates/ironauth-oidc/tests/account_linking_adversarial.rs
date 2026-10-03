@@ -433,10 +433,10 @@ fn encode(value: &str) -> String {
 fn param(location: &str, name: &str) -> Option<String> {
     let query = location.split_once('?')?.1;
     for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == name {
-                return Some(v.to_owned());
-            }
+        if let Some((k, v)) = pair.split_once('=')
+            && k == name
+        {
+            return Some(v.to_owned());
         }
     }
     None

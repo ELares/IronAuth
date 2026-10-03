@@ -143,10 +143,10 @@ fn write_element(
         // AN UNPREFIXED ATTRIBUTE IS IN NO NAMESPACE, so it does not make the default
         // declaration visibly utilised. Getting this wrong in either direction changes the
         // digest.
-        if let Some(prefix) = prefix_of(&attribute.name) {
-            if !used.contains(&prefix) {
-                used.push(prefix);
-            }
+        if let Some(prefix) = prefix_of(&attribute.name)
+            && !used.contains(&prefix)
+        {
+            used.push(prefix);
         }
     }
 

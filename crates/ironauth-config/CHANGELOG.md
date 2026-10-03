@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add default-off subject-bound recipient verification settings with strict TLS relay validation and redacted username/password secret references (#1475).
+
 - Keep the programmatic root configuration default consistent with the documented
   24-hour advisory poll interval; preserve the defaults of every other field.
 

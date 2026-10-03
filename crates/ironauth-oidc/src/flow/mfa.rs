@@ -712,10 +712,9 @@ mod tests {
                 disabled,
                 ..
             } = &node.attributes
+                && codes.iter().any(|code| code == value)
             {
-                if codes.iter().any(|code| code == value) {
-                    assert!(*disabled, "{name} carrying a code is disabled");
-                }
+                assert!(*disabled, "{name} carrying a code is disabled");
             }
         }
         // The count rides the structured context, the flow's parity with the direct account API's

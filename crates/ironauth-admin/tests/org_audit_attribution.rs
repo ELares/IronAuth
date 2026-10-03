@@ -76,10 +76,11 @@ fn handler_body_and_callees(source: &str, operation: &str) -> Option<String> {
         {
             continue;
         }
-        if callee != name && body.contains(&format!("{callee}(")) {
-            if let Some(callee_body) = body_of(source, callee) {
-                reachable.push_str(callee_body);
-            }
+        if callee != name
+            && body.contains(&format!("{callee}("))
+            && let Some(callee_body) = body_of(source, callee)
+        {
+            reachable.push_str(callee_body);
         }
     }
     Some(reachable)

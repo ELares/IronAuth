@@ -115,10 +115,10 @@ pub fn id_token(
 pub fn query_param(target: &str, name: &str) -> Option<String> {
     let query = target.split_once('?').map(|(_, query)| query)?;
     for pair in query.split('&') {
-        if let Some((key, value)) = pair.split_once('=') {
-            if key == name {
-                return Some(crate::util::percent_decode(value));
-            }
+        if let Some((key, value)) = pair.split_once('=')
+            && key == name
+        {
+            return Some(crate::util::percent_decode(value));
         }
     }
     None
@@ -183,10 +183,10 @@ pub fn authorize_redirect(target: &str) -> String {
 #[must_use]
 pub fn form_field(body: &str, name: &str) -> Option<String> {
     for pair in body.split('&') {
-        if let Some((key, value)) = pair.split_once('=') {
-            if key == name {
-                return Some(crate::util::percent_decode(value));
-            }
+        if let Some((key, value)) = pair.split_once('=')
+            && key == name
+        {
+            return Some(crate::util::percent_decode(value));
         }
     }
     None
@@ -275,10 +275,10 @@ pub fn serve(listener: TcpListener, key: SigningKey, issuer: String, clock: Arc<
                 if trimmed.is_empty() {
                     break;
                 }
-                if let Some((name, value)) = trimmed.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        content_length = value.trim().parse().unwrap_or(0);
-                    }
+                if let Some((name, value)) = trimmed.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse().unwrap_or(0);
                 }
             }
             // Capped, because `content_length` is a number the CLIENT chose and the buffer is

@@ -478,10 +478,10 @@ fn location(response: &axum::response::Response) -> String {
 fn param(location: &str, name: &str) -> String {
     let query = location.split_once('?').expect("query").1;
     for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == name {
-                return v.to_owned();
-            }
+        if let Some((k, v)) = pair.split_once('=')
+            && k == name
+        {
+            return v.to_owned();
         }
     }
     panic!("missing param {name} in {location}");
@@ -1392,15 +1392,15 @@ fn now_secs(harness: &Harness) -> u64 {
 /// The `__Host-ironauth_session=<value>` cookie pair from a response's `Set-Cookie`s.
 fn session_cookie_from_headers(headers: &axum::http::HeaderMap) -> String {
     for value in headers.get_all(header::SET_COOKIE) {
-        if let Ok(text) = value.to_str() {
-            if text.starts_with("__Host-ironauth_session=") {
-                return text
-                    .split(';')
-                    .next()
-                    .expect("cookie value")
-                    .trim()
-                    .to_owned();
-            }
+        if let Ok(text) = value.to_str()
+            && text.starts_with("__Host-ironauth_session=")
+        {
+            return text
+                .split(';')
+                .next()
+                .expect("cookie value")
+                .trim()
+                .to_owned();
         }
     }
     panic!("no session cookie in the response");

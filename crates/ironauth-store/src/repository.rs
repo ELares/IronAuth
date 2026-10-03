@@ -5738,10 +5738,10 @@ impl ActingClientRepo<'_> {
         // front-channel logout page. A value with whitespace or a `;` in its authority
         // would smuggle extra CSP sources or directives into that header, so a plaintext
         // scheme or a malformed authority is refused before anything is written.
-        if let Some(uri) = uri {
-            if !is_well_formed_https_uri(uri) {
-                return Err(StoreError::InvalidRedirectUri);
-            }
+        if let Some(uri) = uri
+            && !is_well_formed_https_uri(uri)
+        {
+            return Err(StoreError::InvalidRedirectUri);
         }
         let owned_uri: Option<String> = uri.map(str::to_owned);
         let scope = self.scope;
@@ -5808,10 +5808,10 @@ impl ActingClientRepo<'_> {
         // registration (defense in depth; the fetcher still blocks a private resolved
         // address at delivery). An empty string is treated as absent.
         let uri = uri.filter(|value| !value.is_empty());
-        if let Some(value) = uri {
-            if !value.starts_with("https://") {
-                return Err(StoreError::InvalidRedirectUri);
-            }
+        if let Some(value) = uri
+            && !value.starts_with("https://")
+        {
+            return Err(StoreError::InvalidRedirectUri);
         }
         let owned = uri.map(str::to_owned);
         let scope = self.scope;
@@ -12010,13 +12010,13 @@ impl EnvironmentGuardrailRepo<'_> {
                      which a hardened (FAPI 2.0) environment does not permit"
                 ));
             }
-            if let Some(alg) = signing_alg {
-                if !crate::fapi_hardened_permits_signing_alg(&alg) {
-                    violations.push(format!(
-                        "client {display_name} ({id}) registers signing algorithm {alg}, \
+            if let Some(alg) = signing_alg
+                && !crate::fapi_hardened_permits_signing_alg(&alg)
+            {
+                violations.push(format!(
+                    "client {display_name} ({id}) registers signing algorithm {alg}, \
                          which a hardened (FAPI 2.0) environment does not permit"
-                    ));
-                }
+                ));
             }
         }
         Ok(violations)
@@ -13482,28 +13482,28 @@ impl SecurityAdvisoryRepo<'_> {
         source: &str,
     ) -> Result<(), StoreError> {
         let mut tx = self.store.pool().begin().await?;
-        sqlx::query("DELETE FROM security_advisories")
-            .execute(&mut *tx)
-            .await?;
-        for advisory in advisories {
-            sqlx::query(
-                "INSERT INTO security_advisories \
-                 (id, title, severity, affected_versions, summary, published_at, source) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            )
-            .bind(&advisory.id)
-            .bind(&advisory.title)
-            .bind(advisory.severity.as_str())
-            .bind(
-                &serde_json::to_string(&advisory.affected_versions)
-                    .map_err(|_| StoreError::Encryption)?,
-            )
-            .bind(&advisory.summary)
-            .bind(advisory.published_at)
-            .bind(source)
-            .execute(&mut *tx)
-            .await?;
-        }
+        replace_security_advisories_in_tx(&mut tx, advisories, source).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Replace the deployment-wide verified projection and announce the import
+    /// in the requesting management scope's event stream, atomically. The event
+    /// records that import, not a tenant-local advisory set or cross-scope fan-out.
+    ///
+    /// # Errors
+    /// Persistence or event append failure rolls back both the projection and event.
+    pub async fn replace_all_with_event(
+        &self,
+        env: &Env,
+        scope: Scope,
+        advisories: &[crate::advisory::AdvisoryRecord],
+        source: &str,
+        event: &DomainEvent<'_>,
+    ) -> Result<(), StoreError> {
+        let mut tx = begin_scoped(self.store, scope).await?;
+        replace_security_advisories_in_tx(&mut tx, advisories, source).await?;
+        enqueue_domain_event(&mut tx, env, scope, Some(event)).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -13537,6 +13537,42 @@ impl SecurityAdvisoryRepo<'_> {
         }
         Ok(out)
     }
+}
+
+async fn replace_security_advisories_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    advisories: &[crate::advisory::AdvisoryRecord],
+    source: &str,
+) -> Result<(), StoreError> {
+    // Both the poll and offline import replace one deployment-wide set. Serialize
+    // writers before DELETE so concurrent replacements cannot leave a union of
+    // two separately verified feeds. Ordinary banner readers remain unblocked.
+    sqlx::query("LOCK TABLE security_advisories IN EXCLUSIVE MODE")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM security_advisories")
+        .execute(&mut **tx)
+        .await?;
+    for advisory in advisories {
+        sqlx::query(
+            "INSERT INTO security_advisories \
+                 (id, title, severity, affected_versions, summary, published_at, source) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(&advisory.id)
+        .bind(&advisory.title)
+        .bind(advisory.severity.as_str())
+        .bind(
+            &serde_json::to_string(&advisory.affected_versions)
+                .map_err(|_| StoreError::Encryption)?,
+        )
+        .bind(&advisory.summary)
+        .bind(advisory.published_at)
+        .bind(source)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 /// Scoped client-authentication diagnostic records.
@@ -18801,11 +18837,10 @@ impl ActingUserRepo<'_> {
                 // registration path already validated against the ACTIVE schema, so the
                 // annotations it validated under are the ones to index by, and the version it
                 // carries is that schema's.
-                if let Some(carried) = traits {
-                    if let Ok(value) =
+                if let Some(carried) = traits
+                    && let Ok(value) =
                         serde_json::from_str::<serde_json::Value>(carried.traits_json)
-                    {
-                        if let Some(active) = active_trait_schema_in_tx(tx, scope).await? {
+                        && let Some(active) = active_trait_schema_in_tx(tx, scope).await? {
                             let schema = TraitSchema::compile(&active.schema_json)?;
                             rewrite_trait_login_index(
                                 tx,
@@ -18818,8 +18853,6 @@ impl ActingUserRepo<'_> {
                             )
                             .await?;
                         }
-                    }
-                }
                 // A quarantined signup (issue #82, PR 2) opens its review-queue case in the
                 // SAME transaction as the account INSERT and its `user.register` audit row,
                 // so a committed quarantined account always has an open case and neither can
@@ -20517,6 +20550,94 @@ async fn recipient_ownership_lock(
     Ok(())
 }
 
+// Index preparation is shared by preview/apply so a dry run decrypts the same
+// retained data that a write will examine. Never expose this secret-bearing type.
+struct RecipientIndexEntry {
+    id: String,
+    bidx: Option<Vec<u8>>,
+}
+
+async fn recipient_index_batch(
+    tx: &mut Transaction<'_, Postgres>,
+    master: &MasterKey,
+    scope: Scope,
+    limit: u32,
+) -> Result<Vec<RecipientIndexEntry>, StoreError> {
+    if !(1..=100).contains(&limit) {
+        return Err(StoreError::Invalid);
+    }
+    sqlx::query("SELECT set_config('statement_timeout', '5s', true)")
+        .execute(&mut **tx)
+        .await?;
+    recipient_ownership_lock(tx, scope).await?;
+    let rows = sqlx::query(
+        "SELECT id, identifier_sealed, pii_dek_version FROM users \
+         WHERE tenant_id = $1 AND environment_id = $2 AND NOT recipient_email_indexed \
+         ORDER BY id LIMIT $3 FOR UPDATE",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(i64::from(limit))
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut batch = Vec::with_capacity(rows.len());
+    for row in rows {
+        let version: i32 = row.get("pii_dek_version");
+        let dek = fetch_dek_by_version(tx, scope, master, version).await?;
+        let sealed: Vec<u8> = row.get("identifier_sealed");
+        let raw = String::from_utf8(dek.open(
+            &user_pii_seal_aad(scope, USER_IDENTIFIER_PURPOSE, version),
+            &Sealed::from_bytes(sealed)?,
+        )?)
+        .map_err(|_| StoreError::Encryption)?;
+        batch.push(RecipientIndexEntry {
+            id: row.get("id"),
+            bidx: primary_recipient_index(master, scope, &raw),
+        });
+    }
+    Ok(batch)
+}
+
+async fn recipient_index_report(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    batch: &[RecipientIndexEntry],
+    applied: bool,
+) -> Result<crate::RecipientIndexReport, StoreError> {
+    let row = sqlx::query(
+        "SELECT count(*) AS total, count(*) FILTER (WHERE NOT recipient_email_indexed) AS remaining \
+         FROM users WHERE tenant_id = $1 AND environment_id = $2",
+    ).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+    .fetch_one(&mut **tx).await?;
+    let remaining: i64 = row.get("remaining");
+    let ambiguous: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ( \
+           SELECT bidx FROM ( \
+             SELECT recipient_email_bidx AS bidx, id AS subject, true AS is_primary FROM users \
+               WHERE tenant_id = $1 AND environment_id = $2 AND recipient_email_indexed \
+               AND recipient_email_bidx IS NOT NULL \
+             UNION ALL \
+             SELECT canonical_bidx AS bidx, user_id AS subject, false AS is_primary FROM user_identifiers \
+               WHERE tenant_id = $1 AND environment_id = $2 AND identifier_type = 'email' \
+           ) owners GROUP BY bidx HAVING count(DISTINCT subject) > 1 \
+             OR count(*) FILTER (WHERE is_primary) > 1 OR count(*) FILTER (WHERE NOT is_primary) > 1 \
+         ) conflicts",
+    ).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+    .fetch_one(&mut **tx).await?;
+    Ok(crate::RecipientIndexReport {
+        applied,
+        batch_users: u32::try_from(batch.len()).map_err(|_| StoreError::Invalid)?,
+        batch_mailbox_users: u32::try_from(
+            batch.iter().filter(|entry| entry.bidx.is_some()).count(),
+        )
+        .map_err(|_| StoreError::Invalid)?,
+        total_users: row.get("total"),
+        unindexed_users: remaining,
+        ambiguous_indexed_mailboxes: ambiguous,
+        index_complete: remaining == 0,
+    })
+}
+
 struct RecipientOwner {
     bidx: Vec<u8>,
     email: String,
@@ -20606,6 +20727,23 @@ pub struct RecipientVerificationRepo<'a> {
 }
 
 impl RecipientVerificationRepo<'_> {
+    /// Inspect the next bounded legacy batch without changing indices or ownership.
+    /// Includes all retained users; ambiguous ownership is reported, never selected.
+    ///
+    /// # Errors
+    /// Invalid batch bound (1..=100), unreadable primary ciphertext, or a store failure.
+    pub async fn index_preview(
+        &self,
+        limit: u32,
+    ) -> Result<crate::RecipientIndexReport, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let batch = recipient_index_batch(&mut tx, master, self.scope, limit).await?;
+        let report = recipient_index_report(&mut tx, self.scope, &batch, false).await?;
+        tx.commit().await?;
+        Ok(report)
+    }
+
     /// Require an access token issued on a direct interactive authorization-code
     /// grant and a currently live, non-impersonated session. Exchange and machine
     /// grants cannot be mistaken for an invited person's own sign-in.
@@ -20748,6 +20886,106 @@ pub struct ActingRecipientVerificationRepo<'a> {
 }
 
 impl ActingRecipientVerificationRepo<'_> {
+    /// Index the next bounded legacy batch under the control-plane database grant.
+    /// Re-reads the current sealed identifiers under the ownership lock. Only the
+    /// two index columns change; verified flags, identities and credentials do not.
+    /// The response receipt and audit commit with the batch or all roll back.
+    ///
+    /// # Errors
+    /// Invalid bound, unreadable primary ciphertext, runtime role denial, store
+    /// failure or an idempotency race (the HTTP caller then replays the winner).
+    pub async fn index_backfill(
+        &self,
+        env: &Env,
+        limit: u32,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, crate::RecipientIndexReport>>,
+    ) -> Result<crate::RecipientIndexReport, StoreError> {
+        self.index_backfill_with_event(env, limit, idempotency, None)
+            .await
+    }
+
+    /// Prepare index metadata and emit the resolved batch outcome atomically.
+    /// The event shares the batch, audit and idempotency transaction. A failed
+    /// write or concurrent replay cannot publish a second batch outcome.
+    ///
+    /// # Errors
+    /// As [`Self::index_backfill`], including event persistence failure.
+    pub async fn index_backfill_with_event(
+        &self,
+        env: &Env,
+        limit: u32,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, crate::RecipientIndexReport>>,
+        event: Option<ResolvedEventBuilder<'_, crate::RecipientIndexReport>>,
+    ) -> Result<crate::RecipientIndexReport, StoreError> {
+        let scope = self.scope;
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let target = scope.environment();
+        write_audited(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env,
+                action: Action::RecipientIndexBackfill, target: &target },
+            async move |tx| {
+                let batch = recipient_index_batch(tx, master, scope, limit).await?;
+                for entry in &batch {
+                    let updated = sqlx::query(
+                        "UPDATE users SET recipient_email_bidx = $4, recipient_email_indexed = true \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                         AND NOT recipient_email_indexed",
+                    ).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+                    .bind(&entry.id).bind(&entry.bidx).execute(&mut **tx).await?;
+                    if updated.rows_affected() != 1 { return Err(StoreError::Conflict); }
+                }
+                let report = recipient_index_report(tx, scope, &batch, true).await?;
+                insert_resolved_idempotency(tx, idempotency, &report).await?;
+                let resolved = event.and_then(|build| build(&report));
+                let borrowed = resolved.as_ref().map(OwnedDomainEvent::borrowed);
+                enqueue_domain_event(tx, env, scope, borrowed.as_ref()).await?;
+                Ok(report)
+            }, false,
+        ).await
+    }
+
+    /// Cancel this authenticated subject's current challenge, including one whose
+    /// send response was lost. Serializes with issue/verify and never clears an
+    /// already established ownership proof. Repeating cancellation is harmless.
+    ///
+    /// # Errors
+    /// Scope mismatch or a persistence/audit failure. No writes commit on failure.
+    pub async fn cancel(&self, env: &Env, subject: &UserId) -> Result<(), StoreError> {
+        let scope = self.scope;
+        if subject.scope() != scope {
+            return Err(StoreError::NotFound);
+        }
+        let now = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::RecipientVerificationCancel,
+                target: subject,
+            },
+            async move |tx| {
+                recipient_ownership_lock(tx, scope).await?;
+                sqlx::query(
+                    "UPDATE recipient_verification_challenges SET consumed_at = \
+                     TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+                     AND consumed_at IS NULL",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(subject.to_string())
+                .bind(now)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
     /// Issue a challenge for this subject's own primary mailbox. Return the stored
     /// delivery address, not the request spelling. Reissue invalidates the old code.
     /// A durable one-minute cooldown bounds sends even across provider instances.
@@ -21234,10 +21472,10 @@ impl ActingUserIdentifierRepo<'_> {
                 // Only when the mode actually USES `org`. Environment-wide mode ignores it,
                 // so requiring membership there would reject callers that pass an org
                 // harmlessly and change behaviour that has nothing to do with this fix.
-                if matches!(mode, UniquenessMode::OrgScoped) {
-                    if let Some(org_id) = org {
-                        require_live_membership(tx, scope, org_id, user_id).await?;
-                    }
+                if matches!(mode, UniquenessMode::OrgScoped)
+                    && let Some(org_id) = org
+                {
+                    require_live_membership(tx, scope, org_id, user_id).await?;
                 }
                 let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
                 let raw_sealed = dek.seal(
@@ -21761,8 +21999,6 @@ impl SessionRepo<'_> {
         // A pre-#32 row (no idle window) and a non-positive configured window never
         // slide.
         let idle_us: Option<i64> = row.get("idle_us");
-        // A let chain (if let ... && cond) would raise the MSRV above 1.85 (let chains
-        // stabilized in 1.88), so the boolean guards stay nested inside the if let.
         let should_slide = matches!(idle_us, Some(idle_us)
             if idle_ttl_micros > 0
                 && idle_us.saturating_sub(now_micros) < idle_ttl_micros / 2);
@@ -22462,13 +22698,13 @@ impl ActingSessionRepo<'_> {
         idempotency: Option<IdempotencyWrite<'_>>,
         events: Option<&[DomainEvent<'_>]>,
     ) -> Result<u64, StoreError> {
-        if let Some(events) = events {
-            if events.len() != ids.len() {
-                // Refused rather than truncated or zipped: a length mismatch means the
-                // caller's envelopes and the sessions they describe are not aligned, and
-                // enqueuing any of them would attribute the wrong session to the wrong event.
-                return Err(StoreError::InvalidName);
-            }
+        if let Some(events) = events
+            && events.len() != ids.len()
+        {
+            // Refused rather than truncated or zipped: a length mismatch means the
+            // caller's envelopes and the sessions they describe are not aligned, and
+            // enqueuing any of them would attribute the wrong session to the wrong event.
+            return Err(StoreError::InvalidName);
         }
         let scope = self.scope;
         let now_micros = epoch_micros(env.clock().now_utc());
@@ -24454,16 +24690,17 @@ async fn enqueue_outbox_in_tx_at_inner(
     // are tested (`abuse.rs`), so a third insert added without the assertion would be a
     // third place the claim is wrong rather than a place it is quietly true.
     #[cfg(feature = "testing")]
-    if validate && message.consumer == WEBHOOK_EVENT_CONSUMER {
-        if let Err(error) = crate::event_catalog::validate_event(&message.payload) {
-            panic!(
-                "a producer emitted an event that does not validate against the registry: \
+    if validate
+        && message.consumer == WEBHOOK_EVENT_CONSUMER
+        && let Err(error) = crate::event_catalog::validate_event(&message.payload)
+    {
+        panic!(
+            "a producer emitted an event that does not validate against the registry: \
                  {error:?}\n\nenvelope: {}\n\nThe fan-out refuses this permanently, so \
                  shipping it would announce nothing while the write succeeded. Register the \
                  type, or fix the payload to match the schema it declares.",
-                message.payload
-            );
-        }
+            message.payload
+        );
     }
     // BEFORE the insert, so the sequence this row is handed cannot be handed out until the
     // previous event producer in this scope has committed. See `take_event_append_lock`.
@@ -24548,16 +24785,16 @@ async fn enqueue_outbox_in_tx_ignoring_conflict(
     // `WEBHOOK_DELIVERY_CONSUMER` and `BACKCHANNEL_LOGOUT_CONSUMER`; but `enqueue_all` is
     // the shape a fan-out producer is documented to use, so the next one would have found it.
     #[cfg(feature = "testing")]
-    if message.consumer == WEBHOOK_EVENT_CONSUMER {
-        if let Err(error) = crate::event_catalog::validate_event(&message.payload) {
-            panic!(
-                "a producer emitted an event that does not validate against the registry: \
+    if message.consumer == WEBHOOK_EVENT_CONSUMER
+        && let Err(error) = crate::event_catalog::validate_event(&message.payload)
+    {
+        panic!(
+            "a producer emitted an event that does not validate against the registry: \
                  {error:?}\n\nenvelope: {}\n\nThe fan-out refuses this permanently, so \
                  shipping it would announce nothing while the write succeeded. Register the \
                  type, or fix the payload to match the schema it declares.",
-                message.payload
-            );
-        }
+            message.payload
+        );
     }
     // THE SECOND insert into `outbox_messages`, and so the second place this lock has to be
     // taken. The emit-time assertion above was missed here once for exactly this reason: a
@@ -26502,10 +26739,11 @@ impl OutboxRepo<'_> {
         //
         // Making either exact needs a per-scope pruned-through watermark, which is a schema
         // change and its own issue.
-        if let Some(oldest_retained) = oldest {
-            if after_sequence > 0 && oldest_retained > after_sequence.saturating_add(1) {
-                return Ok(EventPage::Gone { oldest_retained });
-            }
+        if let Some(oldest_retained) = oldest
+            && after_sequence > 0
+            && oldest_retained > after_sequence.saturating_add(1)
+        {
+            return Ok(EventPage::Gone { oldest_retained });
         }
         Ok(EventPage::Page(
             self.events_after(after_sequence, limit).await?,
@@ -32221,14 +32459,13 @@ impl WebhookEndpointRepo<'_> {
         // every part or on none; a half-set rotation cannot reach here.
         if let (Some(sealed), Some(version), Some(expires)) =
             (previous_sealed, previous_version, previous_expires)
+            && expires > now_unix_micros
         {
-            if expires > now_unix_micros {
-                let previous_dek = fetch_dek_by_version(&mut tx, scope, master, version).await?;
-                secrets.push(previous_dek.open(
-                    &secret_seal_aad(scope, &purpose, version),
-                    &Sealed::from_bytes(sealed)?,
-                )?);
-            }
+            let previous_dek = fetch_dek_by_version(&mut tx, scope, master, version).await?;
+            secrets.push(previous_dek.open(
+                &secret_seal_aad(scope, &purpose, version),
+                &Sealed::from_bytes(sealed)?,
+            )?);
         }
         tx.commit().await?;
         Ok(DeliveryTargetLookup::Deliverable(WebhookDeliveryTarget {
@@ -41856,10 +42093,10 @@ impl ActingRiskSignalRepo<'_> {
     /// path fails closed rather than store a plaintext external subject);
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn ingest(&self, env: &Env, signal: NewRiskSignal<'_>) -> Result<bool, StoreError> {
-        if let Some(subject) = signal.resolved_subject {
-            if subject.scope() != self.scope {
-                return Err(StoreError::NotFound);
-            }
+        if let Some(subject) = signal.resolved_subject
+            && subject.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
         }
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let scope = self.scope;
@@ -50442,13 +50679,10 @@ pub fn verify_chain_entries(
         // The first entry examined may be mid-chain after a retention prune, so its
         // `prev_hash` commits to an entry that is legitimately gone. Continuity is
         // checked from the second entry onward.
-        //
-        // Written as a nested `if` rather than a let-chain: let-chains need Rust 1.88
-        // and this crate's MSRV is 1.85.
-        if let Some(previous) = expected_prev {
-            if entry.prev_hash != previous {
-                return Err(ChainFault::Link { seq: entry.seq });
-            }
+        if let Some(previous) = expected_prev
+            && entry.prev_hash != previous
+        {
+            return Err(ChainFault::Link { seq: entry.seq });
         }
         let Some(row) = rows.get(&entry.audit_id) else {
             return Err(ChainFault::MissingRow {
@@ -74866,10 +75100,10 @@ impl ApiKeyRepo<'_> {
         if row.get::<Option<i64>, _>("revoked_us").is_some() {
             return Ok(None);
         }
-        if let Some(expires) = row.get::<Option<i64>, _>("expires_us") {
-            if expires <= now_micros {
-                return Ok(None);
-            }
+        if let Some(expires) = row.get::<Option<i64>, _>("expires_us")
+            && expires <= now_micros
+        {
+            return Ok(None);
         }
 
         let owner_kind: String = row.get("owner_kind");
@@ -76187,39 +76421,37 @@ impl BackchannelAuthRepo<'_> {
         // If the decision below then matches no row (wrong subject, already decided, expired)
         // the transaction is dropped WITHOUT committing, so the grant never lands. That
         // ordering is the reason this is one transaction and not two.
-        if approved {
-            if let Some(grant_id) = linkage.grant_id {
-                let Some(request) = sqlx::query(
-                    "SELECT client_id, subject FROM backchannel_authentication_requests \
+        if approved && let Some(grant_id) = linkage.grant_id {
+            let Some(request) = sqlx::query(
+                "SELECT client_id, subject FROM backchannel_authentication_requests \
                      WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 FOR UPDATE",
-                )
-                .bind(id.to_string())
-                .bind(self.scope.tenant().to_string())
-                .bind(self.scope.environment().to_string())
-                .fetch_optional(&mut *tx)
-                .await?
-                else {
-                    return Ok(false);
-                };
-                let request_client: String = request.get("client_id");
-                let request_subject: String = request.get("subject");
-                sqlx::query(
-                    "INSERT INTO grants \
+            )
+            .bind(id.to_string())
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            else {
+                return Ok(false);
+            };
+            let request_client: String = request.get("client_id");
+            let request_subject: String = request.get("subject");
+            sqlx::query(
+                "INSERT INTO grants \
                      (id, tenant_id, environment_id, client_id, subject, session_ref, \
                       consent_ref, claims_request, created_at) \
                      VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, \
                              TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
-                )
-                .bind(grant_id.to_string())
-                .bind(self.scope.tenant().to_string())
-                .bind(self.scope.environment().to_string())
-                .bind(&request_client)
-                .bind(&request_subject)
-                .bind(linkage.consent_ref)
-                .bind(now_micros)
-                .execute(&mut *tx)
-                .await?;
-            }
+            )
+            .bind(grant_id.to_string())
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(&request_client)
+            .bind(&request_subject)
+            .bind(linkage.consent_ref)
+            .bind(now_micros)
+            .execute(&mut *tx)
+            .await?;
         }
 
         let decided = sqlx::query(
@@ -77774,8 +78006,8 @@ impl ActingAgentRepo<'_> {
                 //
                 // An UNBOUND agent has no door, so no grants; a client with no service
                 // account has never minted a machine token, so the subquery matches nothing.
-                if state == "revoked" {
-                    if let Some(client_id) = agent.client_id.as_deref() {
+                if state == "revoked"
+                    && let Some(client_id) = agent.client_id.as_deref() {
                         sqlx::query(
                             "UPDATE grants \
                              SET revoked_at = TIMESTAMPTZ 'epoch' \
@@ -77795,7 +78027,6 @@ impl ActingAgentRepo<'_> {
                         .execute(&mut **tx)
                         .await?;
                     }
-                }
                 record = Some(agent);
                 enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
@@ -88498,10 +88729,10 @@ impl ScimActivationRepo<'_> {
         // twin of the phantom audit row `revoke_membership_attachments_audited` documents, and
         // here it is worse: the audit row is read by an operator, the event is ACTED ON by a
         // downstream system that would terminate somebody twice.
-        if let Some((env, event)) = emit {
-            if changed > 0 {
-                enqueue_domain_event(&mut tx, env, self.scope, Some(event)).await?;
-            }
+        if let Some((env, event)) = emit
+            && changed > 0
+        {
+            enqueue_domain_event(&mut tx, env, self.scope, Some(event)).await?;
         }
         tx.commit().await?;
         Ok(())

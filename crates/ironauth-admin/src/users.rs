@@ -74,7 +74,7 @@ pub struct HardKillQuery {
 /// operator passes; a management key must be scoped to exactly this environment
 /// (otherwise the LOUD wrong-scope error). A malformed tenant or environment id is
 /// the uniform not-found.
-async fn resolve_scope(
+pub(crate) async fn resolve_scope(
     state: &AdminState,
     principal: &Principal,
     tenant_id: &str,

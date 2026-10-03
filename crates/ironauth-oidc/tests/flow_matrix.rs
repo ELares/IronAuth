@@ -765,16 +765,16 @@ fn schema_validate(schema: &Value, defs: &Value, instance: &Value) -> Result<(),
         return Ok(());
     }
     // `const`: exact equality.
-    if let Some(constant) = schema.get("const") {
-        if instance != constant {
-            return Err(format!("expected const {constant}, found {instance}"));
-        }
+    if let Some(constant) = schema.get("const")
+        && instance != constant
+    {
+        return Err(format!("expected const {constant}, found {instance}"));
     }
     // `enum`: membership.
-    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-        if !values.iter().any(|v| v == instance) {
-            return Err(format!("{instance} is not in enum"));
-        }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array)
+        && !values.iter().any(|v| v == instance)
+    {
+        return Err(format!("{instance} is not in enum"));
     }
     // `type`: JSON type check (schemars may emit a single type or an array of types).
     if let Some(type_field) = schema.get("type") {
