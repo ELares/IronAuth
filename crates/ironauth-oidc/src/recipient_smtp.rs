@@ -189,7 +189,6 @@ impl RecipientSmtpTransport {
         message: &RecipientVerificationMessage<'_>,
     ) -> Result<(lettre::address::Envelope, String), RecipientDeliveryFailure> {
         let refused = RecipientDeliveryFailure::Refused;
-        let recipient = mailbox(message.recipient).map_err(|_| refused)?;
         if message.code.len() != 8 || !message.code.bytes().all(|b| b.is_ascii_digit()) {
             return Err(refused);
         }
@@ -198,12 +197,6 @@ impl RecipientSmtpTransport {
         let id = message.challenge_id.to_string();
         ironauth_store::RecipientChallengeId::parse_in_scope(&id, &message.scope)
             .map_err(|_| refused)?;
-        let message_id =
-            message_mime::message_id(&id, &self.message_id_domain).map_err(|_| refused)?;
-        let boundary = format!(
-            "ironauth-{}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(id.as_bytes()))
-        );
         let text = format!(
             "Your IronAuth email verification code is {}.\r\n\
              Enter it in the verification page you opened. It expires in five minutes.\r\n\
@@ -216,12 +209,40 @@ impl RecipientSmtpTransport {
              <p>If you did not request this code, ignore this message.</p>",
             message.code
         );
+        self.render_parts(
+            &id,
+            message.recipient,
+            "Verify your IronAuth email address",
+            &text,
+            &html,
+        )
+    }
+
+    pub(crate) fn render_parts(
+        &self,
+        id: &str,
+        recipient: &str,
+        subject: &str,
+        text: &str,
+        html: &str,
+    ) -> Result<(lettre::address::Envelope, String), RecipientDeliveryFailure> {
+        let refused = RecipientDeliveryFailure::Refused;
+        let recipient = mailbox(recipient).map_err(|_| refused)?;
+        if subject.len() > 200 || subject.chars().any(char::is_control) {
+            return Err(refused);
+        }
+        let message_id =
+            message_mime::message_id(id, &self.message_id_domain).map_err(|_| refused)?;
+        let boundary = format!(
+            "ironauth-{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(id.as_bytes()))
+        );
         let body =
-            message_mime::multipart_alternative(&text, &html, &boundary).map_err(|_| refused)?;
+            message_mime::multipart_alternative(text, html, &boundary).map_err(|_| refused)?;
         let date = httpdate::fmt_http_date(self.env.clock().now_utc());
         let raw = format!(
             "From: {}\r\nTo: {recipient}\r\nDate: {date}\r\n\
-             Message-ID: {message_id}\r\nSubject: Verify your IronAuth email address\r\n\
+             Message-ID: {message_id}\r\nSubject: {subject}\r\n\
              MIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n{body}",
             self.sender
         );
@@ -237,13 +258,23 @@ impl RecipientVerificationTransport for RecipientSmtpTransport {
         &self,
         message: RecipientVerificationMessage<'_>,
     ) -> Result<(), RecipientDeliveryFailure> {
+        let (envelope, raw) = self.render(&message)?;
+        self.send_rendered(envelope, raw).await
+    }
+}
+
+impl RecipientSmtpTransport {
+    pub(crate) async fn send_rendered(
+        &self,
+        envelope: lettre::address::Envelope,
+        raw: String,
+    ) -> Result<(), RecipientDeliveryFailure> {
         // Saturation is a known refusal before any network action. No unbounded
         // queue can retain secret material or outlive challenge expiry.
         let _permit = self
             .permits
             .try_acquire()
             .map_err(|_| RecipientDeliveryFailure::Refused)?;
-        let (envelope, raw) = self.render(&message)?;
         match tokio::time::timeout(
             Duration::from_secs(4),
             self.client.send_raw(&envelope, raw.as_bytes()),
@@ -262,4 +293,4 @@ impl RecipientVerificationTransport for RecipientSmtpTransport {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

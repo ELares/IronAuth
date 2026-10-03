@@ -148,6 +148,8 @@ pub mod native_sso;
 mod pages;
 mod par;
 mod password;
+/// Bounded SMTP delivery for subject-bound verification; activation remains gated.
+pub mod password_reset_smtp;
 /// The pure permission-claim budget (issue #98). LIVE: `tokens::mint_at_jwt` calls
 /// it on every `at+jwt` access token that carries a resolved permission set, on both
 /// the code exchange and the refresh grant.
@@ -173,7 +175,6 @@ mod quota;
 #[cfg(feature = "ironcache")]
 pub mod rate_store;
 mod recipient_page;
-/// Bounded SMTP delivery for subject-bound verification; activation remains gated.
 pub mod recipient_smtp;
 /// Gated subject-bound recipient verification and secret-safe transport contract.
 pub mod recipient_verification;

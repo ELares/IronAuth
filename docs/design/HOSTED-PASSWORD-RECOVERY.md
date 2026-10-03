@@ -176,3 +176,15 @@ completion/cancellation and completion/password-change checks assert the committ
 winner and current credential, with a deadline to catch lock hangs. These checks
 exercise isolated database fixtures; they do not establish delivered recovery mail,
 Internet delivery, or a completed hosted browser journey.
+
+
+Purpose-specific reset SMTP now renders a code with its exact expiry and a
+provider-origin cancellation link, or a separate completion notice without a code.
+Both reuse the existing bounded certificate-verified relay mechanics, while keeping
+reset types and message identities separate from mailbox verification. Constructor
+validation currently requires the root HTTPS public provider URL, not a scoped
+issuer path. Actual TLS fixture tests cover accepted/refused/uncertain outcomes and
+certificate refusal; they do not establish Internet delivery. Operator configuration,
+state installation and hosted orchestration are still unwired. The caller must
+supply the actual recovery case's cancellation capability and send a completion
+notice only after the credential transaction commits.

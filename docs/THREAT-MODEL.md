@@ -577,3 +577,19 @@ It returns aggregate counts and never asserts that metadata is mailbox proof.
 `all_writers_upgraded` is an explicit operator acknowledgement, not a server
 attestation of running versions. Ambiguity counts cover indexed rows only;
 completion does not repair conflicting owners or establish mailbox possession.
+
+
+## Hosted password-reset SMTP content boundary (#1479, implementation in progress)
+
+This transport is not yet installed by configuration or a hosted handler. It adds
+purpose-specific reset messages over the bounded TLS SMTP mechanics. Browser and
+operator enablement must be documented with the hosted surface before release.
+
+| STRIDE | Threat | Control |
+| --- | --- | --- |
+| Spoofing | Verification/login codes are represented as reset proof | Separate reset message and challenge types; exact scope check; constructor alone enables no ceremony |
+| Tampering | Mail carries a foreign cancellation action or injected headers | HTTPS configured provider origin; exact cancellation route and single token query; no userinfo, fragment or controls; escaped HTML; validated SMTP mailbox and message identity |
+| Repudiation | Missing acknowledgement is reported as delivered or triggers retry | Separate accepted, refused and uncertain outcomes; one bounded attempt, no automatic retry; different code/completion message identities |
+| Information disclosure | Codes, cancellation capabilities or SMTP secrets enter logs | No Debug/serialization on secret-bearing message/config; value-free errors; redacted transport Debug; no plaintext notice outbox |
+| Denial of service | Secret-bearing messages wait indefinitely | Shared no-wait concurrency admission and bounded socket/overall send deadlines; eight-digit code, bounded cancellation URL and expiry |
+| Elevation | Email delivery itself resets a password or grants a session | Transport cannot mutate credentials; separate atomic store completion still requires browser-bound proof and current authority; real handler obligations remain unwired |

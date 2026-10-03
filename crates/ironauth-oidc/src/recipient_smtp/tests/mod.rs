@@ -88,14 +88,14 @@ fn malformed_addresses_and_configuration_are_refused_without_network() {
 }
 
 #[derive(Clone, Copy)]
-enum Reply {
+pub(crate) enum Reply {
     Accepted,
     Refused,
     Disconnect,
     Stall,
 }
 
-async fn fixture(
+pub(crate) async fn fixture(
     reply: Reply,
     trust: bool,
 ) -> (
