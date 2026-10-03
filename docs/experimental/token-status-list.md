@@ -8,7 +8,7 @@
 
 ## The bet
 
-- A status list is a compact signed artifact encoding token statuses (revoked, suspended, etc.) for offline-ish validation — the revocation surface's scalable arm.
+- A status list is a compact signed artifact encoding token statuses (revoked, suspended, etc.) for offline-ish validation - the revocation surface's scalable arm.
 - The design constraint that makes it cheap: the token store already records revocation state per token; a status-list publication reads that state and composes the signed list. The store's revocation rows are the single source; publication is a projection.
 - The jose crate's JWT assembly + the signing policy govern the list's signature exactly as they govern a token's.
 

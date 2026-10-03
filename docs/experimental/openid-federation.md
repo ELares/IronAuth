@@ -1,10 +1,10 @@
 # OpenID Federation 1.1 (DESIGN NOTE)
 
 **Status:** design note only. No prototype ships.
-**Pinned revision:** OpenID Federation 1.1 Final (May 2026) — the corrected final text, not the 2024 drafts.
+**Pinned revision:** OpenID Federation 1.1 Final (May 2026) - the corrected final text, not the 2024 drafts.
 **Feature flag:** none (no prototype).
-**Trigger condition:** a concrete ecosystem engagement — a federation operator (the Italy SPID/CIE class, or a comparable national-scale program) naming IronAuth as a participant or relying party. 3-6 engineer-months budget, milestone-class.
-**Graduation criteria:** leaf entity + automatic client registration shipping behind the experimental ack gate: entity statements at `/.well-known/openid-federation`, trust-chain resolution, metadata policy merge — all pinned to the 1.1 Final text, with the conformance suite's federation tests green.
+**Trigger condition:** a concrete ecosystem engagement - a federation operator (the Italy SPID/CIE class, or a comparable national-scale program) naming IronAuth as a participant or relying party. 3-6 engineer-months budget, milestone-class.
+**Graduation criteria:** leaf entity + automatic client registration shipping behind the experimental ack gate: entity statements at `/.well-known/openid-federation`, trust-chain resolution, metadata policy merge - all pinned to the 1.1 Final text, with the conformance suite's federation tests green.
 
 ## The bet
 

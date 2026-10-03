@@ -314,15 +314,15 @@ pub fn validate_dpop_proof(
         return Err(DpopError::MissingJti);
     }
 
-    if let Some(expected_ath) = expected.ath {
-        if claims.get("ath").and_then(Value::as_str) != Some(expected_ath) {
-            return Err(DpopError::AthMismatch);
-        }
+    if let Some(expected_ath) = expected.ath
+        && claims.get("ath").and_then(Value::as_str) != Some(expected_ath)
+    {
+        return Err(DpopError::AthMismatch);
     }
-    if let Some(expected_nonce) = expected.nonce {
-        if claims.get("nonce").and_then(Value::as_str) != Some(expected_nonce) {
-            return Err(DpopError::NonceMismatch);
-        }
+    if let Some(expected_nonce) = expected.nonce
+        && claims.get("nonce").and_then(Value::as_str) != Some(expected_nonce)
+    {
+        return Err(DpopError::NonceMismatch);
     }
 
     Ok(DpopProof {

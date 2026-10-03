@@ -682,9 +682,9 @@ Source: docs/AIR-GAP.md
 This page is the written guarantee. It is a **maintained guarantee, not an
 accident**: the no-egress CI lane ([`scripts/dev-no-egress.sh`](../scripts/dev-no-egress.sh)
 plus [`scripts/dev-core-flows.sh`](../scripts/dev-core-flows.sh)) boots the
-server with egress blocked and drives the core-flow battery — discovery, JWKS
+server with egress blocked and drives the core-flow battery - discovery, JWKS
 fetch, email-OTP login, the code+PKCE authorization, token issuance, and an
-admin API call — on every run. A feature that needs a reachable third party to
+admin API call - on every run. A feature that needs a reachable third party to
 function breaks that lane, and the lane fails.
 
 ## The property, stated precisely
@@ -696,12 +696,12 @@ IronCache and IronBus remain strictly optional and are documented for offline
 use where deployed.
 
 The guarantee explicitly covers the environments the public-sector procurement
-vocabulary calls **DDIL** — denied, disrupted, intermittent, and limited
+vocabulary calls **DDIL** - denied, disrupted, intermittent, and limited
 communications environments. A deployment that can reach nothing still issues,
 validates, and manages credentials.
 
 What the guarantee does **not** cover: integrations whose entire purpose is a
-reachable third party — social IdP federation, external email/SMS providers,
+reachable third party - social IdP federation, external email/SMS providers,
 online breach databases (the offline HIBP corpus covers that path), and
 remote-signing backends you choose to reach over a network. Those are
 documented where they are configured.
@@ -723,13 +723,13 @@ Disconnected deployments are exactly the ones that miss security advisories.
 The signed advisory feed ([`[security]` config](./CONFIG.md)) works in both
 worlds with one verification path:
 
-- **Online**: the server polls the feed (opt-out, never load-bearing — a fetch
+- **Online**: the server polls the feed (opt-out, never load-bearing - a fetch
   or verification failure only logs).
 - **Air-gapped**: the same signed bundle is imported through the management API
   (`POST .../security/advisories/import`).
 
 A feed that fails signature verification is rejected **entirely** in both paths
-— a tampered bundle cannot inject one advisory while the rest fails — and the
+- a tampered bundle cannot inject one advisory while the rest fails - and the
 rejection is logged as a security event. The banner surface
 (`GET .../security/advisories`) renders only accepted advisories.
 
@@ -1384,6 +1384,9 @@ at the top of the file, or map it in `.taplo.toml`).
 | `oidc.par_ttl_secs` | integer | `60` | The pushed-authorization-request `request_uri` lifetime in seconds (RFC 9126 section 2.2, issue #27). A pushed request is short-lived and single-use; the default (60) is one minute, following the RFC's guidance that a `request_uri` expires soon after it is pushed. Must be at least 1 and at most `OIDC_MAX_PAR_TTL_SECS` (600). This is a promotable per-environment setting in spirit, like the token lifetimes; the process value is the deployment default until per-environment overrides ride the M5 promotion pipeline. |
 | `oidc.quarantine` | table | see fields | The signup-quarantine sensitive-scope policy (issue #82, PR 2): which scopes a quarantined account may never receive, so the shared authorize path strips them from its grant. Consulted only when the `signup-quarantine` experimental feature is enabled AND acknowledged; the conservative default already strips offline access and admin/management scopes. See [`QuarantineConfig`]. |
 | `oidc.quarantine.sensitive_scopes` | array | `["offline_access", "admin", "management"]` | The sensitive-scope denylist a quarantined account is never granted. A requested scope token is sensitive when it EQUALS a denylist entry or is a NAMESPACED child of one (the entry followed by `:`, `.`, or `/`, so `admin` also covers `admin:read` and `admin.users`). The conservative default is `offline_access` (no refresh token for a quarantined account), `admin`, and `management` (no admin/management scope). Add more (for example a payment-class scope) per environment; over-stripping is the safe direction, since a quarantined account is meant to be powerless. |
+| `oidc.recipient_verification` | table | see fields | Subject-bound mailbox verification for relying-party invitations. |
+| `oidc.recipient_verification.enabled` | boolean | `false` | Enable the authenticated hosted mailbox ceremony and current recipient proof. Requires OIDC, an HTTPS public URL and a configured TLS SMTP relay. Existing accounts still require controlled recipient-index backfill. |
+| `oidc.recipient_verification.smtp` | table or unset | unset | Deployment-owned SMTP settings. The browser cannot choose a relay or sender. |
 | `oidc.recovery_cooldown_secs` | integer | `300` | The cooldown between two account-recovery initiations for the SAME account, in seconds (issue #81): a repeated recovery request inside this window is refused, so recovery-request spam against one account is rate-limited on the recovery path independently of the login path. Must be at least 1. The default (300) is five minutes. |
 | `oidc.recovery_delay_secs` | integer | `259200` | The delay window a security-REDUCING account recovery is HELD for before it can complete, in seconds (issue #81): a recovery that would remove or bypass a factor STRONGER than the one used to recover is held for this long, notified on every registered channel and cancellable throughout, so an attacker-initiated recovery can never silently downgrade an account inside the window. Must be between 1 and 2592000 (30 days). The default (259200) is 72 hours, matching the platform-level recovery-delay patterns Apple and Google ship. |
 | `oidc.refresh_idle_ttl_secs` | integer | `1209600` | The IDLE timeout in seconds of a SESSION-bound refresh token (issue #21): one issued without `offline_access`. A refresh token unused for longer than this expires. The default (1209600) is fourteen days. Must be at least 1 and at most `OIDC_MAX_REFRESH_IDLE_TTL_SECS`. |
@@ -8895,7 +8898,7 @@ configuration, and the current post-quantum position.
   the build everyone runs by default.
 - **The FIPS build variant** (the build seam, in progress) signs, verifies,
   and keys through **aws-lc-rs**, the AWS libcrypto fork that holds a
-  **FIPS 140-3 validated** module — and notably includes **EdDSA**, which is
+  **FIPS 140-3 validated** module - and notably includes **EdDSA**, which is
   why the seam is viable for this product rather than a downgrade.
 
 IronAuth itself does not pursue its own CMVP certificate: the validated module
@@ -8912,14 +8915,14 @@ A genuine subtlety the posture must carry:
 
 - Server-side, a validated module (aws-lc-rs) **includes** EdDSA, so the
   server can sign Ed25519 under a validated module.
-- Client-side, validated-module coverage for **EdDSA verification is thin** —
+- Client-side, validated-module coverage for **EdDSA verification is thin** -
   most validated client modules do not include it.
 - **CNSA 2.0 excludes EdDSA entirely.**
 
 So a FIPS-constrained tenant should run **ES256** (or RS256) defaults today.
 The per-tenant algorithm policy makes this a **configuration stance rather
 than a code fork**: a tenant whose environments carry the FIPS profile signs
-ES256 by default, keeps RS256 available, and makes EdDSA unavailable — the
+ES256 by default, keeps RS256 available, and makes EdDSA unavailable - the
 policy refuses it even though the environment's keys include it, so the key
 material's presence never leaks an algorithm the tenant's assurance posture
 excludes.
@@ -10191,6 +10194,160 @@ Their proposals are not a promise that a runtime feature exists; use the
 
 ---
 
+# Recipient mailbox verification
+
+Source: docs/RECIPIENT-VERIFICATION.md
+
+# Recipient mailbox verification
+
+The subject-bound mailbox ceremony is separate from email OTP login. It proves
+ownership for the signed-in account without creating a session, bypassing a
+stronger factor or changing workspace/project access. Integration is under
+qualification in #1475; external mailbox delivery and the complete Civio
+invitation journey have not yet been established.
+
+## Operator configuration
+
+The default is disabled. Opt-in configuration requires OIDC, an HTTPS public URL
+and a fixed SMTP relay with verified TLS:
+
+```toml
+[server]
+public_url = "https://auth.example.test"
+
+[oidc]
+enabled = true
+
+[oidc.recipient_verification]
+enabled = true
+
+[oidc.recipient_verification.smtp]
+host = "smtp.example.test"
+port = 587
+security = "start_tls"
+sender = "verification@example.test"
+message_id_domain = "auth.example.test"
+username = { env = "RECIPIENT_SMTP_USER" }
+password = { file = "/run/secrets/recipient-smtp-password" }
+max_in_flight = 4
+```
+
+Use `implicit` for TLS from connection establishment, normally on port 465.
+There is no plaintext or certificate-verification bypass. Username and password
+are optional together for a relay that does not require client authentication.
+Unreadable credentials refuse startup; secrets are redacted from configuration
+serialization and transport errors. Relay host, sender and credentials are
+operator configuration, never request inputs.
+
+The relay and its certificate chain must be trusted by the operating system.
+Each delivery has a four-second overall deadline, a three-second SMTP command
+timeout, and a concurrency limit from 1 through 32 with no waiting queue.
+Saturation refuses before network activity. The adapter makes one attempt and
+does not automatically retry or fail over. Its challenge-bound Message-ID is a
+correlation key, not a promise of relay-side deduplication.
+
+## Hosted flow and continuation
+
+Open `/t/{tenant}/e/{environment}/account/email-verification?return_to=...` with
+an encoded local `/authorize?...` request. Its client must belong to the same
+scope and its callback must exactly match a registered HTTP(S) redirect. External
+URLs, duplicate authorization fields and indirect PAR/JAR resumes are refused.
+The normal authorization endpoint validates the resumed request again.
+
+The page requires a direct session authenticated within five minutes. It displays
+that account's stored primary mailbox, sends a code only after an explicit user
+action, and accepts an eight-digit code. A stale or absent session asks the user
+to return to the application, sign in and reopen verification. All mutation
+requests require the exact same Origin; the request cannot select a subject.
+
+Delivery states are literal:
+
+- `accepted`: the SMTP relay accepted the message; this does not prove inbox receipt.
+- `refused`: the attempt was explicitly refused, including local saturation.
+- `uncertain`: acceptance could not be established, such as a lost SMTP reply.
+
+The page retains only a non-secret challenge handle and display deadlines in
+session storage. It never stores a code, email address, token or application
+continuation there. A lost send response does not trigger an automatic retry.
+The user can explicitly request another code after the durable one-minute
+cooldown; a new challenge invalidates its predecessor. A lost verification
+response is recovered by reloading and reading current server-owned verification.
+
+Cancellation consumes only the authenticated subject's pending challenge under
+the same ownership lock used by issue/verify, with a same-transaction audit row.
+It works after a lost send response without requiring the challenge handle.
+Repeating cancellation is harmless. Cancellation does not revoke an already
+verified identifier or change application access.
+
+## Current ownership and relying parties
+
+Existing accounts are not presumed verified or indexed. The scoped store refuses
+recipient operations if primary-identifier indexing is incomplete or ownership
+is ambiguous. Prepare existing scopes through the management API below; direct
+edits to verified flags or arbitrary OIDC claims are not substitutes.
+
+After verification, the relying party must obtain a fresh online result from
+`POST /t/{tenant}/e/{environment}/account/recipient-proof` using the current direct
+end-user access token, expected email and a fresh nonce. Validate issuer, client
+audience, public subject, nonce, purpose, ownership revision and the short expiry.
+The proof checks current identifier ownership and direct live-session provenance;
+profile labels and arbitrary stored OIDC claim documents do not establish it.
+Recheck for a new invitation acceptance rather than treating a retained email
+claim as an indefinitely current assertion.
+
+The application still owns atomic invitation acceptance, permitted grants, audits
+and the saved destination. Mailbox verification alone grants none of those.
+
+## Preparing an existing environment
+
+Upgrade every identity-writing process before preparation. Apply migration 0247
+through the normal migration workflow. It grants only the control-plane role
+permission to update the two primary-recipient index columns; the serving role
+cannot rewrite them. Retained deleted users are included because their canonical
+identifiers still reserve ownership.
+
+1. Read `GET /v1/tenants/{tenant}/environments/{environment}/recipient-verification/index?limit=100`
+   with an unconfined environment-authorized credential carrying `management.read`. The
+   preview decrypts the next bounded batch without changing index or verification
+   data, and remains readable in a soft-deleted environment. It returns counts, never identifiers, hashes or mailbox addresses.
+2. Apply `POST` to the same path with `management.write_users`, fresh privilege
+   when sudo is configured, an `Idempotency-Key`, and the JSON body
+   `{"limit":100,"all_writers_upgraded":true}`. The acknowledgement records the
+   caller's rollout prerequisite; it is not server attestation of deployed binary
+   versions. The allowed batch size is 1 through 100, default 100.
+3. Retry a lost response using exactly the same key and body. A replay returns
+   the original batch result without advancing. Use a new key for each subsequent
+   batch until `unindexed_users` is zero. Each batch's index updates, audit entry
+   (`recipient_verification.index_backfill`) and replay receipt commit together.
+4. Inspect `ambiguous_indexed_mailboxes`. This covers currently indexed primary
+   and typed-email ownership; later batches can reveal further conflicts. The
+   operation never merges accounts, chooses an owner, rewrites credentials, or
+   marks a mailbox verified. `index_complete=true` means metadata coverage only.
+   Affected ambiguous accounts remain unable to obtain recipient proof.
+5. Complete the hosted mailbox ceremony and test a fresh relying-party proof.
+   A pre-existing verified flag alone does not satisfy that ceremony.
+
+Unreadable ciphertext aborts the entire batch, preserving all account data and
+its existing indexes. Repair its underlying key/data problem through the normal
+recovery process before retrying. A five-second per-statement timeout bounds
+queries and lock waits; failed requests do not commit partial batches. The
+preview/apply and normal identity writers share the scoped ownership lock.
+An older writer can introduce another unindexed user after preparation; current
+proof checks then fail closed again. A completed report is not a permanent
+readiness certificate. Credentials, permissions, unconfined scope, current environment
+liveness and configured privilege freshness are checked before a POST replay.
+
+## Qualification boundaries
+
+Local TLS SMTP tests prove acceptance/refusal/timeout handling, certificate and
+STARTTLS checks, formatting and concurrency bounds. Scoped PostgreSQL/HTTP tests
+prove the challenge, cancellation, current-proof and hosted-page authentication
+boundaries. Rendered-page Chrome fixtures prove UI behavior only. None substitutes
+for actual permitted-mailbox delivery, source/build/schema-matched deployment,
+representative users or the completed Civio invitation journey.
+
+---
+
 # Releasing
 
 Source: docs/RELEASING.md
@@ -11212,10 +11369,10 @@ not broaden the recipient-proof profile.
 
 ## Surface: gated subject-bound recipient verification (issue #1436)
 
-Three bounded JSON POSTs live under the scoped account path: challenge start,
-challenge verify and online relying-party recipient proof. Production has no
-installer or enable flag; it returns 503 until delivery, hosted recovery and
-legacy-index readiness are qualified. The only installer is testing-only.
+Bounded JSON POSTs live under the scoped account path: challenge start, verify,
+cancel and online relying-party recipient proof. They return 503 by default.
+Issue #1475 adds explicit TLS SMTP configuration and a hosted page; arbitrary
+fixture adapters remain testing-only. Scoped index readiness stays mandatory.
 See [the contract and remaining acceptance](design/RECIPIENT-VERIFICATION.md).
 
 | STRIDE | Threat | Control / residual |
@@ -11227,8 +11384,8 @@ See [the contract and remaining acceptance](design/RECIPIENT-VERIFICATION.md).
 | Denial of service | Flooded sends, concurrent guesses, unbounded slow transport or expensive hashing | Existing regulation/quota and bounded hash pool; durable one-minute send cooldown and five-attempt ceiling; one current challenge per subject; five-minute expiry and five-second transport deadline |
 | Elevation | Possession creates a stronger session, a token exchange hides impersonation, or a stale proof is reused | No session/token mint or strength change; direct live non-impersonated authorization-code provenance in addition to signed JWT/DPoP checks; issuer/client/public-subject/nonce/expected-recipient binding and at most 30-second online proof lifetime |
 
-Residuals are explicit: this core has no real delivery/hosted UI/legacy index
-backfill and must stay unavailable until those are qualified. Additional mailbox
+Residuals are explicit: actual mailbox delivery, hosted end-to-end deployment and
+controlled legacy index backfill must be qualified before rollout. Additional mailbox
 enrollment and opaque-token direct-actor provenance are not supported. A proof
 reports current provider-recorded ownership, not a new inbox-possession ceremony
 on every read. Relying-party acceptance must recheck its own current authority
@@ -11256,6 +11413,58 @@ and incompatible key operations cannot select the encryption recipient. The
 current implementation does not fetch encryption keys from `jwks_uri`; such
 registrations are rejected. If configured encryption cannot be performed at
 issuance, the request fails instead of returning a plaintext signed ID token.
+
+
+## Surface: recipient verification SMTP adapter and hosted ceremony (issue #1475)
+
+The adapter sends the authenticated core's stored mailbox address and transient
+challenge code to one operator-configured relay. It does not enable a production
+ceremony by itself or accept relay configuration from the browser. Explicit default-off
+operator configuration installs the concrete SMTP adapter and enables the hosted
+page; current scoped ownership checks still enforce index readiness.
+
+| STRIDE | Threat | Control |
+| --- | --- | --- |
+| Spoofing | Relay impersonation or plaintext downgrade | Certificate and hostname verification; implicit TLS or mandatory STARTTLS only |
+| Tampering | Header injection, scope confusion or arbitrary message bodies | Bare bounded ASCII mailbox parsing; typed challenge scope check; eight numeric digits; fixed subject and text/HTML bodies |
+| Repudiation | Lost final reply reported as accepted or automatically resent | Explicit SMTP negative responses are refused; disconnect and timeout are uncertain; one attempt and no retry/failover; challenge-bound Message-ID is correlation, not a relay deduplication guarantee |
+| Information disclosure | Codes, credentials, addresses or server replies leak through diagnostics | No message/config serialization or Debug; redacted transport Debug and value-free errors; no logging; no plaintext outbox or file transport |
+| Denial of service | Slow relay or send burst retains unlimited secrets | Four-second whole-attempt deadline, three-second command timeout, bounded simultaneous attempts and no waiting queue; existing subject challenge cooldown and attempt budget stay authoritative |
+| Elevation | Configuration or a page request bypasses current account ownership | Default off; only concrete TLS SMTP can be installed in production; typed configuration and secret resolution precede startup; current scoped indexing/ambiguity checks remain mandatory |
+
+Local TLS SMTP fixtures establish protocol behavior, not external inbox delivery.
+Real permitted-mailbox and hosted-flow evidence remains required by #1475.
+
+
+The hosted GET reads only the current direct recently authenticated account. Its
+continuation is a local authorization request for an in-scope client and an exact
+registered callback; GET never sends a code. The shared page builder provides
+no-store, strict nonce CSP, same-origin fetch, framing denial and escaping. The
+page stores only non-secret subject-bound challenge handles and UX deadlines,
+never codes or tokens. POST start/verify/cancel require the exact Origin and a
+fresh direct session. Cancellation takes the ownership lock and audits challenge
+consumption atomically, without modifying established verification or sessions.
+Unknown request outcomes remain unknown in the UI; no automatic resend occurs.
+
+
+## Surface: existing-account recipient index management (issue #1475)
+
+Management GET previews and POST prepares at most 100 retained primary
+identifiers in the credential's exact environment, including soft-deleted users.
+It returns aggregate counts and never asserts that metadata is mailbox proof.
+
+| STRIDE | Threat | Control |
+| --- | --- | --- |
+| Spoofing | A foreign operator or scoped key prepares another environment | Operator-owned tenant/environment resolution, unconfined credential scope fence, read/write-users permissions; configured sudo freshness for writes |
+| Tampering | Supplied email, stale preview or mixed writers assigns ownership | No caller-supplied identity; decrypt stored current primary data under the shared ownership lock; same canonicalization as ordinary writers; unindexed or ambiguous current ownership blocks proof |
+| Repudiation | A lost reply advances twice or indices commit without audit | Required credential-scoped Idempotency-Key; atomic index, resolved response and audit transaction; concurrent duplicate rolls back before replay |
+| Information disclosure | Migration diagnostics reveal mailbox or sealed content | Aggregate response only; no raw identifier, blind index, code or key returned; persistence errors use normal redacted error handling |
+| Denial of service | Unbounded batch or lock wait blocks identity writes | Validated batch of 1 through 100; five-second per-statement timeout; partial batches roll back on failure; existing management headers are placeholders, not an enforced rate limit |
+| Elevation | Index completion grants verification or a replay bypasses revoked authority | Changes restricted to two control-role index columns; no verification, password, session or identity mutation; permissions, configured fresh privilege and live environment checked before replay |
+
+`all_writers_upgraded` is an explicit operator acknowledgement, not a server
+attestation of running versions. Ambiguity counts cover indexed rows only;
+completion does not repair conflicting owners or establish mailbox possession.
 
 ---
 
@@ -12994,7 +13203,7 @@ Source: docs/experimental/ida-schema-readiness.md
 **Pinned revision:** the IDA verified_claims shape as it stands (trust framework, evidence, assurance).
 **Feature flag:** none (the carrier is inert until a claim document stores an envelope and a request names it).
 **Trigger condition for the full surface:** a regulated customer demanding IDA verified_claims request syntax and response assembly (4-8 weeks as an additive feature, by design).
-**Graduation criteria for the seam:** the acceptance criterion's end-to-end demonstration — a claim carrying verification metadata stored, requested, and emitted — in the test suite (landed).
+**Graduation criteria for the seam:** the acceptance criterion's end-to-end demonstration - a claim carrying verification metadata stored, requested, and emitted - in the test suite (landed).
 
 ## The shipped seam
 
@@ -13002,11 +13211,11 @@ The claims pipeline now carries per-claim verification metadata end to end:
 
 - **Stored:** the user's claim document (migration 0009, verbatim JSON) carries the `verified_claims` envelope.
 - **Requested:** the `claims` parameter names `verified_claims`, optionally pinning the verification subset (trust frameworks, assurance levels).
-- **Emitted:** the ONE shared assembler (`scope_claims::assemble_claims`) releases the filtered envelope; an envelope outside the pinned subset is omitted entirely — never partially released, because the claims half without the assurance context would present unverifiable identity data as verified.
+- **Emitted:** the ONE shared assembler (`scope_claims::assemble_claims`) releases the filtered envelope; an envelope outside the pinned subset is omitted entirely - never partially released, because the claims half without the assurance context would present unverifiable identity data as verified.
 
 ## The additive surface
 
-When the trigger fires: verified_claims request syntax and response assembly land ON TOP of the seam — the envelope model, the subset release, and the assembler wiring are already there. The seam deliberately does not verify anything about the metadata's truth; trust-framework believability is the framework's own question.
+When the trigger fires: verified_claims request syntax and response assembly land ON TOP of the seam - the envelope model, the subset release, and the assembler wiring are already there. The seam deliberately does not verify anything about the metadata's truth; trust-framework believability is the framework's own question.
 
 ---
 
@@ -13237,15 +13446,15 @@ Source: docs/experimental/oid4vc.md
 # OID4VC (DESIGN NOTE)
 
 **Status:** design note only. No prototype ships.
-**Pinned revision:** OID4VCI / OID4VP as published, with HAIP conformance targeted (HAIP 1.1 planned for December 2026 — the profile-version-sensitive code is isolated because of it).
+**Pinned revision:** OID4VCI / OID4VP as published, with HAIP conformance targeted (HAIP 1.1 planned for December 2026 - the profile-version-sensitive code is isolated because of it).
 **Feature flag:** none (no prototype).
-**Trigger condition:** a regulated-sector demand signal — the eIDAS 2.0 December 2026 member-state deadline passing with a concrete wallet-integration request, or an EUDI-login-style engagement (Keycloak's EUDI-login request is its second most-reacted open issue).
+**Trigger condition:** a regulated-sector demand signal - the eIDAS 2.0 December 2026 member-state deadline passing with a concrete wallet-integration request, or an EUDI-login-style engagement (Keycloak's EUDI-login request is its second most-reacted open issue).
 **Graduation criteria:** an OID4VCI issuer (SD-JWT VC, pre-authorized code and authorization code flows, issuer metadata) followed by an OID4VP verifier ("log in with EUDI wallet" via DCQL and direct_post), both targeting HAIP conformance.
 
 ## The bet
 
 - The wallet ecosystem consolidated on OID4VP + the browser Digital Credentials API (SIOPv2 refused).
-- HAIP centers on ES256 — already in the algorithm matrix — so the crypto surface is a config stance, not a new stack.
+- HAIP centers on ES256 - already in the algorithm matrix - so the crypto surface is a config stance, not a new stack.
 - SD-JWT VC is the credential format the EUDI ecosystem actually uses; the jose crate's JWT assembly is the seam it slots into.
 
 ## What must NOT happen
@@ -13262,10 +13471,10 @@ Source: docs/experimental/openid-federation.md
 # OpenID Federation 1.1 (DESIGN NOTE)
 
 **Status:** design note only. No prototype ships.
-**Pinned revision:** OpenID Federation 1.1 Final (May 2026) — the corrected final text, not the 2024 drafts.
+**Pinned revision:** OpenID Federation 1.1 Final (May 2026) - the corrected final text, not the 2024 drafts.
 **Feature flag:** none (no prototype).
-**Trigger condition:** a concrete ecosystem engagement — a federation operator (the Italy SPID/CIE class, or a comparable national-scale program) naming IronAuth as a participant or relying party. 3-6 engineer-months budget, milestone-class.
-**Graduation criteria:** leaf entity + automatic client registration shipping behind the experimental ack gate: entity statements at `/.well-known/openid-federation`, trust-chain resolution, metadata policy merge — all pinned to the 1.1 Final text, with the conformance suite's federation tests green.
+**Trigger condition:** a concrete ecosystem engagement - a federation operator (the Italy SPID/CIE class, or a comparable national-scale program) naming IronAuth as a participant or relying party. 3-6 engineer-months budget, milestone-class.
+**Graduation criteria:** leaf entity + automatic client registration shipping behind the experimental ack gate: entity statements at `/.well-known/openid-federation`, trust-chain resolution, metadata policy merge - all pinned to the 1.1 Final text, with the conformance suite's federation tests green.
 
 ## The bet
 
@@ -13289,7 +13498,7 @@ Source: docs/experimental/post-quantum-readiness.md
 **Status:** design note only. No prototype ships.
 **Pinned revision:** RFC 9964 (ML-DSA for JOSE and COSE, May 2026); FIPS 204 (final).
 **Feature flag:** none (no prototype).
-**Trigger condition:** ecosystem verifier support for ML-DSA JOSE broadens to the point where a tenant can actually consume an ML-DSA-issued token — OR the JOSE hybrid composite (`draft-ietf-jose-pq-composite-sigs`) reaches a stable revision and a KMS partner carries it.
+**Trigger condition:** ecosystem verifier support for ML-DSA JOSE broadens to the point where a tenant can actually consume an ML-DSA-issued token - OR the JOSE hybrid composite (`draft-ietf-jose-pq-composite-sigs`) reaches a stable revision and a KMS partner carries it.
 **Graduation criteria:** an ML-DSA-44 signer behind the experimental ack gate, signed under a pinned RFC 9964 revision, passing the workspace's JOSE test-vector battery; then ecosystem evidence (two independent verifiers consuming the tokens) before anything leaves experimental.
 
 ## The bet
@@ -13297,7 +13506,7 @@ Source: docs/experimental/post-quantum-readiness.md
 - **Priority ordering:** JWE key agreement and long-lived trust material over access-token signing. Access tokens are short-lived and rotating; trust anchors are what outlive a Shor-capable adversary.
 - **The seam:** the key store stays fully polymorphic over alg/kid/key-type so RFC 9964's AKP kty (seed-only private keys) slots in as just another signer. The external-signer seam (issue #161) already keeps the backend abstract; the AKP kty is a key-shape, not a backend, and the jose crate's key material enum is the single widening point.
 - **The hedge:** JOSE hybrid composites (ML-DSA plus Ed25519) tracked as the likely transition shape; nothing ships until both halves of the hybrid are verifiable in the ecosystem.
-- **Cost today:** roughly 5 KB tokens break cookie limits — the constraint that makes signing readiness, not shipping, the right stance.
+- **Cost today:** roughly 5 KB tokens break cookie limits - the constraint that makes signing readiness, not shipping, the right stance.
 
 ## What must NOT happen
 
@@ -13319,7 +13528,7 @@ Source: docs/experimental/token-status-list.md
 
 ## The bet
 
-- A status list is a compact signed artifact encoding token statuses (revoked, suspended, etc.) for offline-ish validation — the revocation surface's scalable arm.
+- A status list is a compact signed artifact encoding token statuses (revoked, suspended, etc.) for offline-ish validation - the revocation surface's scalable arm.
 - The design constraint that makes it cheap: the token store already records revocation state per token; a status-list publication reads that state and composes the signed list. The store's revocation rows are the single source; publication is a projection.
 - The jose crate's JWT assembly + the signing policy govern the list's signature exactly as they govern a token's.
 

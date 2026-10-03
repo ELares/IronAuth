@@ -3,9 +3,9 @@
 This page is the written guarantee. It is a **maintained guarantee, not an
 accident**: the no-egress CI lane ([`scripts/dev-no-egress.sh`](../scripts/dev-no-egress.sh)
 plus [`scripts/dev-core-flows.sh`](../scripts/dev-core-flows.sh)) boots the
-server with egress blocked and drives the core-flow battery — discovery, JWKS
+server with egress blocked and drives the core-flow battery - discovery, JWKS
 fetch, email-OTP login, the code+PKCE authorization, token issuance, and an
-admin API call — on every run. A feature that needs a reachable third party to
+admin API call - on every run. A feature that needs a reachable third party to
 function breaks that lane, and the lane fails.
 
 ## The property, stated precisely
@@ -17,12 +17,12 @@ IronCache and IronBus remain strictly optional and are documented for offline
 use where deployed.
 
 The guarantee explicitly covers the environments the public-sector procurement
-vocabulary calls **DDIL** — denied, disrupted, intermittent, and limited
+vocabulary calls **DDIL** - denied, disrupted, intermittent, and limited
 communications environments. A deployment that can reach nothing still issues,
 validates, and manages credentials.
 
 What the guarantee does **not** cover: integrations whose entire purpose is a
-reachable third party — social IdP federation, external email/SMS providers,
+reachable third party - social IdP federation, external email/SMS providers,
 online breach databases (the offline HIBP corpus covers that path), and
 remote-signing backends you choose to reach over a network. Those are
 documented where they are configured.
@@ -44,13 +44,13 @@ Disconnected deployments are exactly the ones that miss security advisories.
 The signed advisory feed ([`[security]` config](./CONFIG.md)) works in both
 worlds with one verification path:
 
-- **Online**: the server polls the feed (opt-out, never load-bearing — a fetch
+- **Online**: the server polls the feed (opt-out, never load-bearing - a fetch
   or verification failure only logs).
 - **Air-gapped**: the same signed bundle is imported through the management API
   (`POST .../security/advisories/import`).
 
 A feed that fails signature verification is rejected **entirely** in both paths
-— a tampered bundle cannot inject one advisory while the rest fails — and the
+- a tampered bundle cannot inject one advisory while the rest fails - and the
 rejection is logged as a security event. The banner surface
 (`GET .../security/advisories`) renders only accepted advisories.
 
