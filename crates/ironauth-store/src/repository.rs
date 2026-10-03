@@ -20872,7 +20872,8 @@ impl ActingPasswordResetRepo<'_> {
         {
             return Err(StoreError::NotFound);
         }
-        if spec.expires_at_unix_micros <= now
+        if spec.account.is_some() != spec.cancellation_token_digest.is_some()
+            || spec.expires_at_unix_micros <= now
             || spec.expires_at_unix_micros > now.saturating_add(600_000_000)
             || !spec.code_hash.starts_with("$argon2id$")
             || spec.code_hash.len() > 512
@@ -21329,16 +21330,16 @@ async fn insert_password_reset(
     sqlx::query(
         "INSERT INTO password_reset_challenges \
          (id,tenant_id,environment_id,client_id,browser_binding_hash,authorization_return_to, \
-          subject,identifier_id,recipient_revision,recovery_id,credential_digest,code_hash,created_at,expires_at) \
+          subject,identifier_id,recipient_revision,recovery_id,credential_digest,code_hash,created_at,expires_at,cancellation_token_digest) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, \
           TIMESTAMPTZ 'epoch' + ($13::text || ' microseconds')::interval, \
-          TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval)",
+          TIMESTAMPTZ 'epoch' + ($14::text || ' microseconds')::interval,$15)",
     ).bind(spec.id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
     .bind(spec.client.to_string()).bind(spec.browser_binding_hash.as_slice()).bind(spec.authorization_return_to)
     .bind(binding.map(|b| &b.subject)).bind(binding.map(|b| &b.identifier))
     .bind(binding.map(|b| &b.revision)).bind(binding.map(|b| &b.recovery))
     .bind(binding.map(|b| &b.credential_digest)).bind(spec.code_hash).bind(now)
-    .bind(spec.expires_at_unix_micros).execute(&mut **tx).await?;
+    .bind(spec.expires_at_unix_micros).bind(spec.cancellation_token_digest.map(<[u8; 32]>::as_slice)).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -30545,6 +30546,9 @@ impl RecoveryFlowRepo<'_> {
     /// `digest` (issue #81): the cancellation-from-notification-link path. The
     /// high-entropy token IS the authorization, so no subject is required; a forged
     /// or stale token whose digest matches no row is the uniform not-found.
+    /// Hosted reset reissues retain separate cancellation digests for the same
+    /// case: code expiry/replacement does not revoke an earlier owner notice.
+    /// The caller must still require a pending case before cancellation.
     ///
     /// # Errors
     ///
@@ -30559,7 +30563,11 @@ impl RecoveryFlowRepo<'_> {
              (EXTRACT(EPOCH FROM initiated_at) * 1000000)::bigint AS initiated_us, \
              (EXTRACT(EPOCH FROM hold_until) * 1000000)::bigint AS hold_us \
              FROM recovery_flows \
-             WHERE tenant_id = $1 AND environment_id = $2 AND cancel_token_digest = $3",
+             WHERE tenant_id = $1 AND environment_id = $2 AND (cancel_token_digest = $3 \
+             OR (method='standard' AND entry_point='lost_password' AND EXISTS ( \
+               SELECT 1 FROM password_reset_challenges p WHERE p.tenant_id=$1 \
+               AND p.environment_id=$2 AND p.recovery_id=recovery_flows.id \
+               AND p.subject=recovery_flows.subject AND p.cancellation_token_digest=$3)))",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())

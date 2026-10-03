@@ -18,10 +18,10 @@ async fn insert_fixture(
     sqlx::query(
         "INSERT INTO password_reset_challenges \
          (id,tenant_id,environment_id,client_id,browser_binding_hash,authorization_return_to,\
-          subject,identifier_id,recipient_revision,recovery_id,credential_digest,code_hash,created_at,expires_at) \
+          subject,identifier_id,recipient_revision,recovery_id,credential_digest,code_hash,created_at,expires_at,cancellation_token_digest) \
          VALUES ($1,$2,$3,'fixture-client',decode(repeat('ab',32),'hex'),'/authorize?fixture=1',\
           $4,$5,$6,$7,$8,'fixture-hash',TIMESTAMPTZ '2026-10-03 00:00:00Z',\
-          TIMESTAMPTZ '2026-10-03 00:05:00Z')",
+          TIMESTAMPTZ '2026-10-03 00:05:00Z',$9)",
     )
     .bind(id.to_string())
     .bind(scope.tenant().to_string())
@@ -31,6 +31,7 @@ async fn insert_fixture(
     .bind(bound.then_some("fixture-revision"))
     .bind(bound.then_some("fixture-recovery"))
     .bind(bound.then_some(vec![1_u8; 32]))
+    .bind(bound.then(|| { use sha2::{Digest, Sha256}; Sha256::digest(id.to_string()).to_vec() }))
     .execute(db.owner_pool())
     .await?;
     Ok(())
@@ -94,6 +95,7 @@ async fn reset_schema_forces_scope_and_refuses_authority_rewrites() {
         "recipient_revision",
         "recovery_id",
         "credential_digest",
+        "cancellation_token_digest",
         "browser_binding_hash",
         "authorization_return_to",
         "client_id",
@@ -145,6 +147,8 @@ async fn reset_schema_rejects_partial_completion_and_unbounded_attempts() {
         "expires_at=created_at+interval '11 minutes'",
         "browser_binding_hash=decode('ab','hex')",
         "identifier_id=NULL",
+        "cancellation_token_digest=NULL",
+        "cancellation_token_digest=decode('ab','hex')",
         "state='completed'",
         "finished_at=created_at+interval '1 minute'",
         "state='completed',attempt_count=1,finished_at=created_at+interval '1 minute',completion_request_hash=decode(repeat('ab',32),'hex')",
@@ -281,6 +285,10 @@ async fn start_reset(
     account: Option<ironauth_store::PasswordResetAccount<'_>>,
 ) -> Result<Option<String>, ironauth_store::StoreError> {
     use ironauth_store::{ClientId, CorrelationId, NewPasswordReset};
+    use sha2::{Digest, Sha256};
+    // Deterministic test digest only. Production must hash a secret cancellation token.
+    let cancellation_digest: [u8; 32] = Sha256::digest(id.to_string()).into();
+    let cancellation_token_digest = account.as_ref().map(|_| &cancellation_digest);
     db.store()
         .scoped(id.scope())
         .acting(db.test_actor(env), CorrelationId::generate(env))
@@ -293,6 +301,7 @@ async fn start_reset(
                 browser_binding_hash: &[3; 32],
                 authorization_return_to: "/authorize?client_id=fixture",
                 account,
+                cancellation_token_digest,
                 code_hash: HASH,
                 expires_at_unix_micros: now_micros(env) + 300_000_000,
             },
@@ -1779,4 +1788,125 @@ async fn reset_delivery_audit_failure_rolls_back_acceptance_and_retry_commits_on
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn reset_reissue_preserves_case_delay_and_expired_code_cancellation_links() {
+    use ironauth_store::{
+        CorrelationId, PasswordResetAccount, PasswordResetDelivery, PasswordResetOutcome,
+        RecoveryCancelReason,
+    };
+    use sha2::{Digest, Sha256};
+    use std::time::{Duration, SystemTime};
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH + Duration::from_secs(1000), 1485);
+    for cancel in [true, false] {
+        let scope = db.seed_scope(&env).await;
+        let other = db.seed_scope(&env).await;
+        let (subject, case, old) = reset_fixture(&db, &env, scope).await;
+        let hold = now_micros(&env) + 3_600_000_000;
+        sqlx::query("UPDATE recovery_flows SET state='held',hold_until=TIMESTAMPTZ 'epoch'+($2::text||' microseconds')::interval WHERE id=$1")
+            .bind(case.to_string()).bind(hold).execute(db.owner_pool()).await.unwrap();
+        assert_eq!(
+            complete_reset(&db, &env, &old, true, 9).await.unwrap(),
+            PasswordResetOutcome::Held {
+                until_unix_micros: hold
+            }
+        );
+        clock.advance(Duration::from_secs(3601));
+        let next = PasswordResetChallengeId::generate(&env, &scope);
+        start_reset(
+            &db,
+            &env,
+            &next,
+            Some(PasswordResetAccount {
+                subject: &subject,
+                recovery: &case,
+            }),
+        )
+        .await
+        .unwrap();
+        record_reset_delivery(&db, &env, &next, PasswordResetDelivery::Accepted, 1)
+            .await
+            .unwrap();
+        let store = db.store();
+        let scoped = store.scoped(scope);
+        let challenge = scoped
+            .password_reset()
+            .challenge(&env, &next, &[3; 32])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            scoped
+                .password_reset()
+                .challenge(&env, &old.id, &[3; 32])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let old_digest = Sha256::digest(old.id.to_string());
+        let new_digest = Sha256::digest(next.to_string());
+        for digest in [old_digest.as_slice(), new_digest.as_slice(), &[7; 32]] {
+            let record = scoped
+                .recovery_flows()
+                .by_cancel_digest(digest)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.id, case);
+            assert_eq!(record.hold_until_unix_micros, Some(hold));
+            assert!(record.state.is_pending());
+            assert!(
+                store
+                    .scoped(other)
+                    .recovery_flows()
+                    .by_cancel_digest(digest)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        if cancel {
+            let record = scoped
+                .recovery_flows()
+                .by_cancel_digest(&old_digest)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                scoped
+                    .acting(db.test_actor(&env), CorrelationId::generate(&env))
+                    .recovery_flows()
+                    .cancel(&env, &record.id, RecoveryCancelReason::UserNotification)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                complete_reset(&db, &env, &challenge, true, 9)
+                    .await
+                    .unwrap(),
+                PasswordResetOutcome::Refused
+            );
+        } else {
+            assert!(matches!(
+                complete_reset(&db, &env, &challenge, true, 9)
+                    .await
+                    .unwrap(),
+                PasswordResetOutcome::Completed { .. }
+            ));
+        }
+        for digest in [old_digest.as_slice(), new_digest.as_slice()] {
+            assert!(
+                !scoped
+                    .recovery_flows()
+                    .by_cancel_digest(digest)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    .is_pending()
+            );
+        }
+    }
 }

@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Retain a separate hashed cancellation capability for each real reset challenge (#1479). Fresh codes can share the original delayed recovery case; old notification links still resolve after code expiry or reissue, and cannot cancel across scopes. Plaintext cancellation secrets are not retained.
+
 - Require a durable accepted delivery result before hosted password reset completion or receipt replay (#1479). Pending, refused and uncertain delivery cannot authorize a reset; terminal delivery records are audited and cannot be relabelled through the repository. Hosted transport orchestration remains pending.
 
 - Add atomic hosted reset completion with current mailbox/credential/case revalidation, bounded attempts, delay enforcement and exact-request receipts (#1479). Password, recovery state, session and offline-family/grant revocation, trusted-device invalidation and audit commit together; no session or stronger-factor removal is granted. Hosted transport and UI remain pending.

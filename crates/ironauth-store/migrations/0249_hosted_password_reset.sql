@@ -15,6 +15,7 @@ CREATE TABLE password_reset_challenges (
     recipient_revision text,
     recovery_id text,
     credential_digest bytea,
+    cancellation_token_digest bytea,
     code_hash text NOT NULL CHECK (octet_length(code_hash) BETWEEN 1 AND 1024),
     attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 5),
     -- Actual acceptance of the code and every required owner notification, never
@@ -45,13 +46,14 @@ CREATE TABLE password_reset_challenges (
         CHECK (expires_at > created_at AND expires_at <= created_at + interval '10 minutes'),
     CONSTRAINT password_reset_binding CHECK (
         (subject IS NULL AND identifier_id IS NULL AND recipient_revision IS NULL
-         AND recovery_id IS NULL AND credential_digest IS NULL)
+         AND recovery_id IS NULL AND credential_digest IS NULL AND cancellation_token_digest IS NULL)
         OR
         (subject IS NOT NULL AND subject <> ''
          AND identifier_id IS NOT NULL AND identifier_id <> ''
          AND recipient_revision IS NOT NULL AND recipient_revision <> ''
          AND recovery_id IS NOT NULL AND recovery_id <> ''
-         AND credential_digest IS NOT NULL AND octet_length(credential_digest) = 32)
+         AND credential_digest IS NOT NULL AND octet_length(credential_digest) = 32
+         AND cancellation_token_digest IS NOT NULL AND octet_length(cancellation_token_digest) = 32)
     ),
     CONSTRAINT password_reset_completion CHECK (
         (state = 'pending' AND finished_at IS NULL
@@ -73,6 +75,11 @@ CREATE TABLE password_reset_challenges (
 CREATE UNIQUE INDEX password_reset_active_subject_idx
     ON password_reset_challenges (tenant_id, environment_id, subject)
     WHERE state = 'pending' AND subject IS NOT NULL;
+-- Retain these immutable digests while the associated recovery is pending, even
+-- when its short-lived code has expired or been replaced. No plaintext capability.
+CREATE UNIQUE INDEX password_reset_cancellation_idx
+    ON password_reset_challenges (tenant_id, environment_id, cancellation_token_digest)
+    WHERE cancellation_token_digest IS NOT NULL;
 CREATE INDEX password_reset_expiry_idx
     ON password_reset_challenges (tenant_id, environment_id, expires_at);
 ALTER TABLE password_reset_challenges ENABLE ROW LEVEL SECURITY;

@@ -210,3 +210,18 @@ transport acknowledgements for the code and every required owner notice; the
 existing recovery logging sender cannot establish this result. Store tests simulate
 adapter outcomes and do not establish actual notification delivery. Hosted wiring
 and delayed-case reissue with a usable cancellation action remain outstanding.
+
+
+Fresh-code cancellation is stored as a separate immutable SHA-256 token digest on
+each real reset challenge. The hosted caller must generate a fresh high-entropy
+cancellation token naming the existing case for every reissue; a digest of a public
+handle is not acceptable production input. Decoys have no cancellation digest.
+Resolution accepts both the original case token and retained reset-token digests,
+with matching scope, subject, standard method and lost-password entry point.
+The case remains the owner of delay and terminal status. Expiring or replacing a
+code does not revoke its cancellation link, reset the delay or create a new case.
+Terminal cases cannot be cancelled again or authorize a new password change.
+Challenge cleanup must retain these digests while the associated case is pending.
+This avoids storing recoverable cancellation secrets or requiring another operator
+key. The repository tests exercise reissue after the original code expires and
+both cancellation and completion outcomes; hosted orchestration remains pending.

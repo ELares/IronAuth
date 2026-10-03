@@ -25,6 +25,10 @@ pub struct NewPasswordReset<'a> {
     pub authorization_return_to: &'a str,
     /// None for the existence-uniform unknown/ineligible ceremony.
     pub account: Option<PasswordResetAccount<'a>>,
+    /// Digest of a fresh high-entropy cancellation token for this account case.
+    /// Required for a real account, absent for a decoy. Earlier links stay usable
+    /// after code reissue or expiry while the recovery case remains pending.
+    pub cancellation_token_digest: Option<&'a [u8; 32]>,
     /// Argon2id verifier computed through the admitted hashing pool.
     pub code_hash: &'a str,
     /// Expiry from Env, at most ten minutes after issuance.
