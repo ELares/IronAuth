@@ -478,3 +478,26 @@ replay, concurrent single-winner claims, terminal-result immutability and rollba
 of password/case/audit changes when the completion queue insert fails. This is
 store evidence only. Worker boot/shutdown wiring, actual completion SMTP delivery,
 stale-claim restart behavior and mailbox-reassignment qualification remain pending.
+
+
+The server now starts the completion consumer when password recovery is enabled,
+using the same OIDC state and concrete transport as the serving plane. Enabled
+recovery refuses boot without that state or a working control-plane connection
+that can enumerate scopes. The worker uses shared outbox settings and optional
+IronBus wakeups; it is retained through serving and included in graceful shutdown.
+Main-router activation remains separate and has not been enabled yet.
+
+The boot helper qualification uses an isolated database and the actual registered
+consumer to drain malformed internal work to a dead letter, without contacting
+SMTP. It checks default-off behavior, missing serving state, absent production
+control DSN and an insufficient data-plane role. This is helper-level evidence,
+not a full binary process restart or signal/shutdown qualification.
+
+
+The request HTTP/TLS fixture now drains the actual persisted completion job through
+`OutboxWorker`, receives a code-free completion email and confirms a second drain
+has no work. Refused SMTP and disconnect-after-DATA fixtures retain the committed
+password change and exact receipt, record refusal or uncertainty, and do not resend.
+These are isolated TLS/PostgreSQL tests, not Internet delivery or a headed browser.
+Crash/restart classification, mailbox reassignment, full binary lifecycle and main
+route activation remain outstanding before release.

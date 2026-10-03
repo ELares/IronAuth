@@ -357,6 +357,15 @@ async fn hosted_request_delivers_real_code_and_completes_without_enumerating_ine
         .unwrap()
         .unwrap();
     complete_from_mail(&state, &db, &subject, &browser, &raw).await;
+    deliver_completion_from_queue(
+        &state,
+        &db,
+        scope,
+        &browser,
+        Reply::Accepted,
+        ironauth_store::PasswordResetDelivery::Accepted,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -418,4 +427,103 @@ async fn disabled_recovery_and_invalid_origin_never_issue_challenges() {
         .await
         .unwrap();
     assert_eq!(count, 0);
+}
+
+async fn deliver_completion_from_queue(
+    state: &OidcState,
+    db: &TestDatabase,
+    scope: Scope,
+    browser: &str,
+    reply: Reply,
+    expected: ironauth_store::PasswordResetDelivery,
+) {
+    use crate::password_reset_delivery::PasswordResetCompletionConsumer;
+    use ironauth_store::outbox::{OutboxWorker, WorkerSettings};
+    let (smtp, mail) = fixture(reply, true).await;
+    let delivery_state = state
+        .clone()
+        .with_password_reset_smtp(PasswordResetSmtpTransport {
+            smtp,
+            issuer: Url::parse("https://auth.example.test").unwrap(),
+            env: state.env().clone(),
+        });
+    let worker = OutboxWorker::new(
+        db.store().clone(),
+        state.env().clone(),
+        Arc::new(PasswordResetCompletionConsumer::new(delivery_state)),
+        WorkerSettings::default(),
+    );
+    let drained = worker.run_once(scope).await.unwrap();
+    assert_eq!(drained.claimed, 1);
+    assert_eq!(
+        drained.completed,
+        u64::from(expected == ironauth_store::PasswordResetDelivery::Accepted)
+    );
+    assert_eq!(
+        drained.dead_lettered,
+        u64::from(expected != ironauth_store::PasswordResetDelivery::Accepted)
+    );
+    let raw = tokio::time::timeout(Duration::from_secs(5), mail)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(raw.contains("Your IronAuth password was reset"));
+    assert!(!raw.contains(OLD) && !raw.contains(NEW));
+    assert!(!raw.contains("reset code is") && !raw.contains("ira_rcv_"));
+    assert_eq!(worker.run_once(scope).await.unwrap().claimed, 0);
+    let mut headers = HeaderMap::new();
+    headers.insert(header::COOKIE, browser.parse().unwrap());
+    let binding = ResetBrowserBinding::from_headers(&headers).unwrap();
+    let result = db
+        .store()
+        .scoped(scope)
+        .password_reset()
+        .completion_notice_status(binding.challenge())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.result, Some(expected));
+}
+
+#[tokio::test]
+async fn completion_mail_failure_keeps_reset_committed_and_does_not_resend() {
+    for (reply, expected) in [
+        (
+            Reply::Refused,
+            ironauth_store::PasswordResetDelivery::Refused,
+        ),
+        (
+            Reply::Disconnect,
+            ironauth_store::PasswordResetDelivery::Uncertain,
+        ),
+    ] {
+        let db = TestDatabase::start().await;
+        let env = env();
+        let scope = db.seed_scope(&env).await;
+        let (smtp, mail) = fixture(Reply::Accepted, true).await;
+        let state = state(
+            &db,
+            &env,
+            scope,
+            Some(PasswordResetSmtpTransport {
+                smtp,
+                issuer: Url::parse("https://auth.example.test").unwrap(),
+                env: env.clone(),
+            }),
+        );
+        let (subject, client) = seed(&db, &state, scope).await;
+        let (status, headers, _) = request(&state, &resume(&client), OWNER, None).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let browser = cookie(&headers);
+        let raw = tokio::time::timeout(Duration::from_secs(5), mail)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        complete_from_mail(&state, &db, &subject, &browser, &raw).await;
+        deliver_completion_from_queue(&state, &db, scope, &browser, reply, expected).await;
+        // Exact receipt replay stays successful after refused or uncertain notice delivery.
+        complete_from_mail(&state, &db, &subject, &browser, &raw).await;
+    }
 }
