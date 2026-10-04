@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Recheck hosted reset expiry after acquiring the authority locks (#1479), so a request waiting for database contention cannot extend its code lifetime.
+
 - Add a thirty-minute, client/scope-bound PAR navigation read for hosted recovery error returns (#1479). The live authorization read and atomic consume retain their original expiry and single-use checks.
 
 - Remove unused data-plane DELETE authority from hosted password-reset challenges with forward migration 0250 (#1479). Preserve retained receipts, cancellation aliases and the checksum of already-applied migration 0249.

@@ -1152,6 +1152,73 @@ async fn reset_completion_obeys_held_case_and_never_accepts_expired_proof() {
     );
 }
 
+#[tokio::test]
+async fn reset_completion_rechecks_expiry_after_waiting_for_ownership_lock() {
+    use ironauth_store::PasswordResetOutcome;
+    use std::time::{Duration, SystemTime};
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH + Duration::from_secs(1000), 1501);
+    let scope = db.seed_scope(&env).await;
+    let (subject, _, challenge) = reset_fixture(&db, &env, scope).await;
+    let mut held = db.owner_pool().begin().await.unwrap();
+    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *held)
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "recipient-ownership:{}:{}",
+            scope.tenant(),
+            scope.environment()
+        ))
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let completion = complete_reset(&db, &env, &challenge, true, 9);
+    let release = async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)))",
+                ).bind(blocker).fetch_one(db.owner_pool()).await.unwrap();
+                if waiting { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("completion reached the held ownership lock");
+        clock.advance(Duration::from_secs(300));
+        held.commit().await.unwrap();
+    };
+    let (result, ()) = tokio::join!(completion, release);
+    assert_eq!(result.unwrap(), PasswordResetOutcome::Refused);
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .password_hash_for_subject(&subject)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(HASH)
+    );
+    let row = sqlx::query("SELECT state,attempt_count FROM password_reset_challenges WHERE id=$1")
+        .bind(challenge.id.to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "pending");
+    assert_eq!(row.get::<i32, _>("attempt_count"), 0);
+    assert!(
+        !db.store()
+            .scoped(scope)
+            .audit()
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.action == "password_reset.complete")
+    );
+}
+
 async fn reset_offline_grant(
     db: &TestDatabase,
     env: &Env,

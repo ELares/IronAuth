@@ -226,7 +226,9 @@ async fn uniform_and_repeat(state: &OidcState, target: &str, real_cookie: &str) 
     headers.insert(header::COOKIE, real_cookie.parse().unwrap());
     let binding = ResetBrowserBinding::from_headers(&headers).unwrap();
     let original = original.replace(&binding.csrf_token(), "[csrf]");
-    for identifier in ["unknown@example.test", "unverified@example.test"] {
+    // A new browser during the account cooldown gets the same decoy ceremony;
+    // the original browser's code remains usable for completion below.
+    for identifier in [OWNER, "unknown@example.test", "unverified@example.test"] {
         let (status, headers, _) = request(state, target, identifier, None).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
         assert_eq!(

@@ -21505,7 +21505,6 @@ impl ActingPasswordResetRepo<'_> {
         if !spec.new_password_hash.starts_with("$argon2id$") || spec.new_password_hash.len() > 512 {
             return Err(StoreError::Invalid);
         }
-        let now = epoch_micros(env.clock().now_utc());
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let proof = PasswordResetReceipt {
             challenge: spec.challenge,
@@ -21518,6 +21517,9 @@ impl ActingPasswordResetRepo<'_> {
         else {
             return Ok(PasswordResetOutcome::Refused);
         };
+        // Lock acquisition can outlive the code. Decide against the clock after
+        // acquiring current authority, never the request's pre-wait timestamp.
+        let now = epoch_micros(env.clock().now_utc());
         match password_reset_decision(&row, binding.as_ref(), &proof, now) {
             ResetDecision::Refused => Ok(PasswordResetOutcome::Refused),
             ResetDecision::Replay => Ok(PasswordResetOutcome::Replayed {

@@ -395,7 +395,7 @@ async fn persist(
                     recipient,
                 }));
             }
-            Err(StoreError::NotFound | StoreError::Conflict) => {}
+            Err(StoreError::NotFound | StoreError::Conflict | StoreError::QuotaExceeded) => {}
             Err(error) => return Err(error),
             Ok(None) => return Err(StoreError::Invalid),
         }

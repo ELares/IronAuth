@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Keep hosted recovery responses uniform during the account cooldown, including requests from another browser (#1479). Preserve the original code and avoid sending another message.
+
 - Offer an application restart from hosted recovery when a pushed authorization request expires (#1479). Revalidate the registered callback and return only an OAuth error with the original state; never revive authorization or issue a session.
 
 - Keep a validated sign-in and fresh-code path after the recovery cookie expires (#1479). A continuation carried in the reset URL is presentation-only and is revalidated against the registered client before rendering links; it never supplies reset authority.
