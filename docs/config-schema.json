@@ -1695,6 +1695,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "password_recovery": {
+          "$ref": "#/$defs/PasswordRecoveryConfig",
+          "default": {
+            "enabled": false,
+            "smtp": null
+          },
+          "description": "Explicit TLS delivery for hosted lost-password recovery, default disabled."
+        },
         "quarantine": {
           "$ref": "#/$defs/QuarantineConfig",
           "default": {
@@ -2420,6 +2428,30 @@
           "$ref": "#/$defs/ScreeningProvider",
           "default": "hibp",
           "description": "Which screening provider to use (issue #63): `hibp` (the online k-anonymity range\nAPI, the default) or `offline` (an operator-supplied corpus, fully offline)."
+        }
+      },
+      "type": "object"
+    },
+    "PasswordRecoveryConfig": {
+      "additionalProperties": false,
+      "description": "Explicit password-recovery delivery, independent of mailbox verification.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Install actual TLS delivery and the durable completion-notice worker.\nRequires a mounted OIDC plane and a working control-plane connection for\ndelivery scope enumeration (`admin.control_database_url`, or the database\nfallback in dev mode). Startup refuses activation if those prerequisites\nfail. The default is disabled.",
+          "type": "boolean"
+        },
+        "smtp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecipientSmtpSettings"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Deployment-owned relay and secret references."
         }
       },
       "type": "object"
@@ -4128,6 +4160,10 @@
         "offline_idle_ttl_secs": 2592000,
         "offline_max_lifetime_secs": 7776000,
         "par_ttl_secs": 60,
+        "password_recovery": {
+          "enabled": false,
+          "smtp": null
+        },
         "quarantine": {
           "sensitive_scopes": [
             "offline_access",

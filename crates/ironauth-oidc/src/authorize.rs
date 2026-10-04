@@ -673,6 +673,129 @@ async fn resolve_pushed_request(
     Ok((stored, Some(context)))
 }
 
+/// Revalidate a hosted recovery continuation before any account lookup or send.
+/// This is a read-only check of the registered client and its exact authorization
+/// parameters. PAR is peeked, never consumed. Direct request objects must first
+/// pass through authorize's normal resolution into a hosted continuation.
+pub(crate) async fn recovery_resume(
+    state: &OidcState,
+    raw: Option<&str>,
+) -> Option<crate::interaction::ResumeTarget> {
+    let raw = raw.filter(|value| value.len() <= 16384 && !value.contains('#'))?;
+    let resume = crate::interaction::parse_resume(Some(raw))?;
+    let query = raw.strip_prefix("/authorize?")?;
+    let mut params: AuthorizeParams = serde_urlencoded::from_str(query).ok()?;
+    params.resources = resource::resources_from_encoded(query);
+    if params.request.is_some() {
+        return None;
+    }
+    let (params, pushed) = resolve_pushed_request(state, params).await.ok()?;
+    if params.request.is_some()
+        || ClientId::parse_declared_scope(params.client_id.as_deref()?).ok()? != resume.client_id
+    {
+        return None;
+    }
+    state.issuer_entry(&resume.scope).await?;
+    let record = state
+        .store()
+        .scoped(resume.scope)
+        .clients()
+        .get(&resume.client_id)
+        .await
+        .ok()?;
+    let client = ResolvedClient::Registered(&record);
+    if pushed.is_none()
+        && (state.require_pushed_authorization_requests()
+            || client.require_pushed_authorization_requests())
+    {
+        return None;
+    }
+    let hardened = crate::fapi_hardened::is_hardened(state, resume.scope)
+        .await
+        .ok()?;
+    validate_request(state, &client, &params, hardened, pushed.is_some()).ok()?;
+    validate_authorize_resources(
+        state,
+        resume.scope,
+        StoredClientId::Registered(&resume.client_id),
+        &params.resources,
+    )
+    .await
+    .ok()?;
+    Some(resume)
+}
+
+/// Resolve only an error return for an abandoned hosted recovery interaction.
+/// Never pass these parameters to authorization issuance: the PAR can be expired.
+/// Stored parameters win over every inline field and the callback must still be
+/// registered now. This offers navigation without extending authorization life.
+pub(crate) async fn recovery_application_return(
+    state: &OidcState,
+    raw: Option<&str>,
+) -> Option<(interaction::ResumeTarget, AuthorizeError)> {
+    let raw = raw.filter(|value| value.len() <= 16384 && !value.contains('#'))?;
+    let resume = interaction::parse_resume(Some(raw))?;
+    let params: AuthorizeParams =
+        serde_urlencoded::from_str(raw.strip_prefix("/authorize?")?).ok()?;
+    if params.request.is_some() {
+        return None;
+    }
+    let id = PushedRequestId::parse_declared_scope(
+        params
+            .request_uri
+            .as_deref()?
+            .strip_prefix(PAR_REQUEST_URI_PREFIX)?,
+    )
+    .ok()?;
+    if id.scope() != resume.scope {
+        return None;
+    }
+    let stored = state
+        .store()
+        .scoped(resume.scope)
+        .pushed_authorization_requests()
+        .read_for_recovery_navigation(state.env(), &id, &resume.client_id.to_string())
+        .await
+        .ok()??;
+    let params: AuthorizeParams = serde_json::from_str(&stored).ok()?;
+    if params.request.is_some()
+        || params.request_uri.is_some()
+        || params.client_id.as_deref() != Some(resume.client_id.to_string().as_str())
+    {
+        return None;
+    }
+    state.issuer_entry(&resume.scope).await?;
+    let record = state
+        .store()
+        .scoped(resume.scope)
+        .clients()
+        .get(&resume.client_id)
+        .await
+        .ok()?;
+    let client = ResolvedClient::Registered(&record);
+    let hardened = crate::fapi_hardened::is_hardened(state, resume.scope)
+        .await
+        .ok()?;
+    let validated = validate_request(state, &client, &params, hardened, true).ok()?;
+    validate_authorize_resources(
+        state,
+        resume.scope,
+        StoredClientId::Registered(&resume.client_id),
+        &params.resources,
+    )
+    .await
+    .ok()?;
+    let error = AuthorizeError::Redirect {
+        redirect_uri: validated.redirect_uri.to_owned(),
+        error: AuthzErrorCode::AccessDenied,
+        description: "Start a fresh sign-in from the application to continue recovery.".to_owned(),
+        state: params.state.clone(),
+        iss: state.issuer_for(&resume.scope),
+        mode: validated.mode,
+    };
+    Some((resume, error))
+}
+
 /// Atomically consume the pushed request behind `context` at the moment of code
 /// issuance (RFC 9126, issue #27), returning whether this call WON the single-use
 /// race. The `client_id` filter is inside the atomic consume, so the binding holds and

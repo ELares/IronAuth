@@ -57,8 +57,10 @@ impl Drop for TelemetryGuard {
 pub fn init(telemetry: &TelemetryConfig) -> TelemetryGuard {
     let (writer, appender_guard) = crate::logwriter::stdout();
 
-    let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = Vec::new();
-    layers.push(fmt_layer(telemetry.log_format, writer, level_from_env()));
+    let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> =
+        vec![fmt_layer(telemetry.log_format, writer, level_from_env())];
+    #[cfg(feature = "otlp")]
+    let mut layers = layers;
 
     #[cfg(feature = "otlp")]
     let otel = {

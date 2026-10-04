@@ -6,6 +6,40 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Recheck hosted reset expiry after acquiring the authority locks (#1479), so a request waiting for database contention cannot extend its code lifetime.
+
+- Add a thirty-minute, client/scope-bound PAR navigation read for hosted recovery error returns (#1479). The live authorization read and atomic consume retain their original expiry and single-use checks.
+
+- Remove unused data-plane DELETE authority from hosted password-reset challenges with forward migration 0250 (#1479). Preserve retained receipts, cancellation aliases and the checksum of already-applied migration 0249.
+
+- Queue one code-free owner warning atomically when a hosted recovery case is cancelled (#1479). Select one latest case-bound challenge across reissues, preserve current mailbox validation, and never allow cancellation-notice eligibility to authorize password completion.
+
+- Queue code-free password-reset completion notices in the credential transaction, with audited single-attempt claims and immutable terminal delivery outcomes (#1479). Queue failure rolls back completion; receipt retries do not enqueue duplicates.
+
+- Include original issuance time in browser-bound reset context so hosted resend admission can preserve an existing code independently of account eligibility (#1479).
+
+- Prepare or reuse hosted lost-password cases atomically under account locks (#1479). Preserve cancellation and notified delay across resends, retain a monotonic policy duration, and roll back ineligible or unauditable preparation.
+
+- Add an independent read-only exact reset receipt check (#1479), sharing completion's current-owner/credential/case validation. Receipt confirmation needs no new password hash or screening result and cannot spend attempts or mutate credentials.
+
+- Add browser-bound reset presentation context with the stored client, continuation and exact code expiry (#1479). Navigation can survive code expiry within the original ten-minute browser window without extending proof or completion authority; account presence remains internal.
+
+- Add audited, subject-bound reset delivery admission before external mail (#1479). Only one concurrent caller can claim a challenge; an interrupted claimed attempt cannot be automatically resent after restart.
+
+- Anchor a held reset case's full waiting period to its first durable accepted notification (#1479). Failed initial delivery cannot silently consume the delay; subsequent code deliveries preserve the established horizon. The horizon update and delivery audit roll back together.
+
+- Retain a separate hashed cancellation capability for each real reset challenge (#1479). Fresh codes can share the original delayed recovery case; old notification links still resolve after code expiry or reissue, and cannot cancel across scopes. Plaintext cancellation secrets are not retained.
+
+- Require a durable accepted delivery result before hosted password reset completion or receipt replay (#1479). Pending, refused and uncertain delivery cannot authorize a reset; terminal delivery records are audited and cannot be relabelled through the repository.
+
+- Add atomic hosted reset completion with current mailbox/credential/case revalidation, bounded attempts, delay enforcement and exact-request receipts (#1479). Password, recovery state, session and offline-family/grant revocation, trusted-device invalidation and audit commit together; no session or stronger-factor removal is granted.
+
+- Add audited browser-bound reset challenge issuance and reads, deriving verified ownership and credential generation from current store rows and enforcing a durable account resend cooldown (#1479). Issuance does not claim delivery or enable credential reset.
+
+- Factor password verifier mutation and session revocation into a private transaction-owned primitive for atomic recovery composition (#1479); preserve ordinary account-change behavior and verify rollback on an audit failure.
+
+- Add the scoped password-reset challenge schema and redacted typed identifiers, with bounded lifetime/attempts, immutable binding grants and completion-receipt constraints (#1479).
+
 - Repair the missing control-role DELETE grant required by verified advisory projection replacement, through forward migration 0248; serving roles remain read-only.
 
 - Publish `security_advisory.imported` atomically with an offline verified projection replacement. The importing scope receives aggregate counts with explicit deployment-wide projection semantics; no advisory content enters the event (#1475 gate repair).

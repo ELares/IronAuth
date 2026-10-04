@@ -43,6 +43,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::hints::InteractionHints;
 
+/// Purpose-specific hosted reset forms and recovery guidance.
+pub mod password_reset;
+
 /// The strict Content-Security-Policy every bootstrap page carries. `default-src
 /// 'none'` denies everything not explicitly re-permitted; [`page_csp`] permits
 /// only the exact embedded stylesheet by its content hash. `form-action 'self'`
@@ -860,9 +863,17 @@ pub fn register_page(
     )
 }
 
+/// Browser-owned built-in verification UI; all values are server generated.
+pub struct RecoveryVerificationUi<'a> {
+    /// CSP nonce from the environment entropy source.
+    pub nonce: &'a str,
+    /// Same-origin challenge endpoint for the validated recovery scope.
+    pub challenge_url: &'a str,
+}
+
 /// The minimal account-recovery request page (issue #64): a single identifier field
 /// posting to `/recover`. The identifier and `return_to` are escaped. Whatever a user
-/// submits, the response is the SAME uniform acknowledgment (an existing account is never
+/// submits, admitted requests share the same code-entry shape (an existing account is never
 /// distinguishable from an unknown one).
 #[must_use]
 pub fn recover_page(
@@ -871,14 +882,19 @@ pub fn recover_page(
     error: Option<&str>,
     hints: &InteractionHints,
     environment_banner: Option<&str>,
+    verification: Option<&RecoveryVerificationUi<'_>>,
 ) -> String {
+    let verification = verification.map_or_else(String::new, |ui| format!(
+        "<p id=\"recovery-verification\" role=\"status\" aria-live=\"polite\" data-challenge-url=\"{}\">A quick browser check will run when you submit.</p><noscript>JavaScript is required for this browser check.</noscript><script nonce=\"{}\">{}</script>",
+        escape_html(ui.challenge_url), escape_html(ui.nonce), include_str!("recovery_pow.js"),
+    ));
     let body = format!(
-        "<h1>Recover account</h1><p class=\"page-description\">Enter your account identifier and we will send recovery instructions if an account exists.</p>{error}\
+        "<h1>Recover account</h1><p class=\"page-description\">Enter your account identifier. If your account is eligible for email recovery, instructions will arrive at its verified email address.</p>{error}\
          <form method=\"post\" action=\"/recover\">{return_to}\
          <p><label>Account identifier <input type=\"text\" name=\"identifier\" value=\"{identifier}\" \
          autocomplete=\"username\" required></label></p>\
          <p><button type=\"submit\">Send recovery instructions</button></p></form>\
-         <div class=\"auth-links\"><a href=\"{login_href}\">Back to sign in</a></div>",
+         {verification}<div class=\"auth-links\"><a href=\"{login_href}\">Back to sign in</a></div>",
         error = error_banner(error),
         return_to = return_to_field(return_to),
         identifier = escape_html(identifier),
@@ -1759,7 +1775,14 @@ mod tests {
                 None,
             ),
             register_page("", return_to, None, &InteractionHints::default(), None),
-            recover_page("", return_to, None, &InteractionHints::default(), None),
+            recover_page(
+                "",
+                return_to,
+                None,
+                &InteractionHints::default(),
+                None,
+                None,
+            ),
         ] {
             assert!(
                 page.contains("?return_to=%2Fauthorize%3Fstate%3D%22quoted%22%26scope%3Dopenid")
@@ -2737,7 +2760,7 @@ mod tests {
             ),
             (
                 "recover/identifier",
-                recover_page(xss, "/a", None, &hints, None),
+                recover_page(xss, "/a", None, &hints, None, None),
             ),
             (
                 "consent/client_name",

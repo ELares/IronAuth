@@ -186,6 +186,41 @@ async fn recovery_audit(harness: &Harness) -> Vec<(String, String)> {
 // ===========================================================================
 
 #[tokio::test]
+async fn disabled_webauthn_login_preserves_enrolled_factor_recovery_delay() {
+    for synced in [true, false] {
+        let config = ironauth_config::OidcConfig {
+            webauthn_enabled: false,
+            ..Default::default()
+        };
+        let mut harness = Harness::start_store_backed_with(config).await;
+        harness.install_verification_sender(Arc::new(RecordingSender::default()));
+        let subject = harness
+            .seed_user(
+                "disabled-passkey@example.test",
+                "correct horse battery staple",
+            )
+            .await;
+        let subject = subject_id(&harness, &subject);
+        harness.seed_passkey(&subject.to_string(), synced).await;
+        assert!(!harness.state().webauthn_enabled());
+        let outcome = initiate_recovery(
+            harness.state(),
+            &proof(&harness, &subject, RecoveryFactor::EmailOtp),
+            RecoveryEntryPoint::LostPassword,
+            "disabled-passkey@example.test",
+            None,
+            RecoveryMethod::Standard,
+        )
+        .await;
+        assert!(
+            matches!(outcome, RecoveryInitiation::Created { held: true, .. }),
+            "disabling passkey login must not remove the enrolled-factor recovery delay"
+        );
+        assert_eq!(passkey_ids(&harness, &subject).await.len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn email_recovery_against_a_passkey_account_cannot_remove_the_passkey_without_delay_or_reverify()
  {
     let mut harness = Harness::start_store_backed().await;

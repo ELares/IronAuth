@@ -148,6 +148,13 @@ pub mod native_sso;
 mod pages;
 mod par;
 mod password;
+/// Hosted password-reset presentation; rendering grants no recovery authority.
+pub use pages::password_reset as password_reset_pages;
+pub mod password_reset_browser;
+pub mod password_reset_delivery;
+pub mod password_reset_hosted;
+pub mod password_reset_request;
+pub mod password_reset_smtp;
 /// The pure permission-claim budget (issue #98). LIVE: `tokens::mint_at_jwt` calls
 /// it on every `at+jwt` access token that carries a resolved permission set, on both
 /// the code exchange and the refresh grant.
@@ -737,12 +744,9 @@ pub fn oidc_router(state: OidcState) -> Router {
             "/register",
             get(register::register_get).post(register::register_post),
         )
-        // HUMAN account recovery (issue #64): the anti-enumeration-uniform recovery
-        // request surface, governed on the INDEPENDENT recovery path.
-        .route(
-            "/recover",
-            get(recover::recover_get).post(recover::recover_post),
-        )
+        // Hosted recovery serves an honest unavailable response when delivery is
+        // disabled; it never falls back to the legacy logging-only acknowledgment.
+        .merge(password_reset_request::routes())
         // The recovery cancellation-from-notification-link surface (issue #81): the
         // "this was not me" path that revokes a pending recovery in its delay window.
         .route(

@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Start and gracefully stop the password-recovery completion-notice consumer when recovery is enabled (#1479). Reuse the serving OIDC transport/store, require working control-plane scope enumeration before serving, and retain the shared outbox/IronBus worker settings.
+
+- Install separately configured TLS password-recovery transport at startup; unreadable enabled relay credentials refuse startup, while disabled recovery reads no secrets (#1479). Hosted reset forms remain pending.
+
 - Wire explicitly configured recipient verification to the concrete TLS SMTP adapter; unreadable relay credentials refuse startup, and the default remains disabled (#1475).
 
 - Capture advisory verification and poll settings before moving configuration

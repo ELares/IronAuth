@@ -19,6 +19,8 @@ autotests = false
 # SMTP only; no HTTP client, pooling, tracing, or implicit message clock/entropy.
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "tokio1-rustls", "ring", "rustls-native-certs"] }
 httpdate = "1"
+# Already locked transitively; parse provider-bound recovery cancellation URLs.
+url = "2.5.8"
 # The delivery seam (`VerificationSender`) is held as `Arc<dyn ...>`, so it must stay
 # dyn-safe, and native `async fn` in traits is not. One method needs to await a
 # transactional write (issue #111); this is what makes that possible without giving up the
@@ -134,6 +136,7 @@ base64.workspace = true
 # SHA-256 for the PKCE S256 code_challenge derivation. Pure Rust, permissive,
 # already in the tree via ironauth-store; no new crate.
 sha2.workspace = true
+hmac.workspace = true
 tracing.workspace = true
 # The metrics facade (already in the tree; the server installs the Prometheus
 # recorder). Meters authorization-code reuse and redeem faults so a dropped

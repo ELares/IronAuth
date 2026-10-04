@@ -192,6 +192,8 @@ const ACCOUNT_CHANGE_DOMAINS: &[&str] = &[
     "account",
     // Mailbox possession changes identity evidence, never session strength.
     "recipient_verification",
+    // Purpose-bound recovery challenges concern the account, not a new session.
+    "password_reset",
     // An AGENT is a principal with a lifecycle -- registered, suspended, revoked -- exactly
     // the shape `service_account` already has below, so it shares that stream (issue #130).
     // Deliberately NOT entity management: registering an agent creates something that can

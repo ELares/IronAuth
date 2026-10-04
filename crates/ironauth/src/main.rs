@@ -101,6 +101,8 @@ mod readiness_wiring_tests;
 /// `testing` feature exactly as the boot-wiring harness does.
 #[cfg(all(test, feature = "testing"))]
 mod outbox_wiring_tests;
+#[cfg(all(test, feature = "testing"))]
+mod password_reset_worker_tests;
 
 /// Semantic version of this build, injected by Cargo.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -371,6 +373,22 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                 // the same arm: the refusal's whole value is that it names the rule, and the
                 // first line an operator reads would have pointed at the wrong section.
                 tracing::error!(%error, "refusing to boot: a plane input could not be resolved");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let password_reset_pools = match start_password_reset_completion_pools(
+            &config,
+            planes.oidc.as_ref().map(|plane| &plane.state),
+        )
+        .await
+        {
+            Ok(pools) => pools,
+            Err(reason) => {
+                tracing::error!(
+                    reason,
+                    "refusing to boot: password recovery completion delivery is unavailable"
+                );
                 return ExitCode::FAILURE;
             }
         };
@@ -816,6 +834,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // it, which is the same path a crash takes.
         for pool in logout_pools
             .into_iter()
+            .chain(password_reset_pools)
             .chain(webhook_pools)
             .chain(flow_target_pools)
             .chain(ssf_push_pools)
@@ -1807,6 +1826,16 @@ async fn build_oidc_plane(
     forward_auth: Option<std::sync::Arc<ironauth_oidc::forward_auth_rules::ForwardAuthRuntime>>,
     access_rules: std::sync::Arc<ironauth_oidc::rules::RuleSet>,
 ) -> Option<OidcPlane> {
+    let Ok(reset_transport) =
+        ironauth_oidc::password_reset_smtp::PasswordResetSmtpTransport::configured(
+            &config.oidc.password_recovery,
+            config.server.public_url.as_deref(),
+            env.clone(),
+        )
+    else {
+        tracing::error!("password recovery SMTP configuration is unavailable; refusing startup");
+        std::process::exit(1);
+    };
     let Ok(recipient_transport) = ironauth_oidc::recipient_smtp::RecipientSmtpTransport::configured(
         &config.oidc.recipient_verification,
         env.clone(),
@@ -2218,6 +2247,11 @@ async fn build_oidc_plane(
         },
         |sink| std::sync::Arc::clone(sink) as std::sync::Arc<dyn ironauth_oidc::SmsSender>,
     ));
+    let state = if let Some(transport) = reset_transport {
+        state.with_password_reset_smtp(transport)
+    } else {
+        state
+    };
     let state = if let Some(transport) = recipient_transport {
         state.with_recipient_verification_smtp(transport)
     } else {
@@ -4289,6 +4323,53 @@ async fn spawn_backchannel_logout_pools(
         "back-channel logout delivery started on the outbox consumer pools"
     );
     pools
+}
+
+// Recovery is explicitly enabled as a complete service: do not accept credential
+// changes with a permanently undrainable completion queue. Reuse the actual OIDC
+// state, including its master key and concrete SMTP transport, and validate control
+// scope enumeration before serving. Runtime outages leave durable work for retry.
+async fn start_password_reset_completion_pools(
+    config: &Config,
+    state: Option<&OidcState>,
+) -> Result<Vec<OutboxWorkerPool>, &'static str> {
+    if !config.oidc.password_recovery.enabled {
+        return Ok(Vec::new());
+    }
+    let state = state
+        .filter(|state| state.password_recovery_delivery_available())
+        .ok_or("password recovery requires a mounted OIDC plane and SMTP transport")?;
+    let control_dsn = select_control_dsn(config)
+        .ok_or("password recovery requires admin.control_database_url outside dev_mode")?;
+    let control = Store::connect(&control_dsn)
+        .await
+        .map_err(|_| "password recovery control-plane connection failed")?;
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control));
+    scopes
+        .scopes()
+        .await
+        .map_err(|_| "password recovery cannot enumerate delivery scopes")?;
+    let mut consumers = ConsumerRegistry::new();
+    consumers
+        .register(Arc::new(
+            ironauth_oidc::password_reset_delivery::PasswordResetCompletionConsumer::new(
+                state.clone(),
+            ),
+        ))
+        .map_err(|_| "password recovery completion consumer registration failed")?;
+    let pools = spawn_consumer_pools(
+        &consumers,
+        state.store(),
+        state.env(),
+        &config.outbox,
+        &scopes,
+        &outbox_observer(),
+    );
+    tracing::info!(
+        pools = pools.len(),
+        "password recovery completion delivery started"
+    );
+    Ok(pools)
 }
 
 /// What the message delivery worker needs from config (issue #111).

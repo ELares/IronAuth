@@ -149,6 +149,128 @@ async fn password_change_writes_the_new_hash_and_revokes_other_sessions_keeping_
     assert_eq!(changes, 1, "exactly one password-change audit row");
 }
 
+async fn install_password_audit_failure(db: &TestDatabase) {
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_password_change_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF NEW.action = 'account.password.change' THEN
+             RAISE EXCEPTION 'injected password change audit failure';
+           END IF;
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER reject_password_change_audit BEFORE INSERT ON audit_log
+         FOR EACH ROW EXECUTE FUNCTION reject_password_change_audit();",
+    )
+    .execute(db.owner_pool())
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn password_change_without_kept_session_rolls_back_on_audit_failure_then_revokes_all() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.store();
+    let scoped = store.scoped(scope);
+    let subject = register_user(&db, &env, scope, "reset-primitive@example.test").await;
+    let sessions = [
+        create_session(&db, &env, scope, &subject.to_string(), None).await,
+        create_session(&db, &env, scope, &subject.to_string(), None).await,
+    ];
+    let before = scoped
+        .users()
+        .password_hash_for_subject(&subject)
+        .await
+        .unwrap()
+        .unwrap();
+    let audit_before = scoped.audit().list().await.unwrap().len();
+    // Fail after the password and session writes, at the same-transaction audit.
+    // An actual database exception must undo every earlier write.
+    install_password_audit_failure(&db).await;
+    let new_hash = "$argon2id$v=19$m=19456,t=2,p=1$bmV3c2FsdG5ldw$bmV3aGFzaG5ldw";
+    let result = scoped
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .change_password(&env, &subject, new_hash, None, "fixture_atomicity")
+        .await;
+    assert!(matches!(
+        result,
+        Err(ironauth_store::StoreError::Database(_))
+    ));
+    assert_eq!(
+        scoped
+            .users()
+            .password_hash_for_subject(&subject)
+            .await
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    for session in &sessions {
+        assert!(
+            scoped
+                .sessions()
+                .get(session, 0, 0)
+                .await
+                .unwrap()
+                .is_some(),
+            "audit failure restored the live session"
+        );
+    }
+    assert_eq!(scoped.audit().list().await.unwrap().len(), audit_before);
+    sqlx::raw_sql(
+        "DROP TRIGGER reject_password_change_audit ON audit_log;
+                    DROP FUNCTION reject_password_change_audit();",
+    )
+    .execute(db.owner_pool())
+    .await
+    .unwrap();
+    let outcome = scoped
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .change_password(&env, &subject, new_hash, None, "fixture_atomicity")
+        .await
+        .unwrap();
+    assert_eq!(outcome.sessions_revoked, 2);
+    assert_eq!(outcome.revoked_session_ids.len(), 2);
+    for session in &sessions {
+        assert!(
+            scoped
+                .sessions()
+                .get(session, 0, 0)
+                .await
+                .unwrap()
+                .is_none(),
+            "no session is retained when keep is absent"
+        );
+    }
+    assert_eq!(
+        scoped
+            .users()
+            .password_hash_for_subject(&subject)
+            .await
+            .unwrap()
+            .unwrap(),
+        new_hash
+    );
+    let changes = scoped
+        .audit()
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| {
+            row.action == Action::AccountPasswordChange.as_str()
+                && row.target_id == subject.to_string()
+        })
+        .count();
+    assert_eq!(
+        changes, 1,
+        "failed transaction emitted no password-change audit"
+    );
+}
+
 #[tokio::test]
 async fn credential_enroll_list_remove_round_trips_with_the_friendly_name_sealed() {
     let db = TestDatabase::start().await;

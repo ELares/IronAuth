@@ -543,10 +543,11 @@ pub struct OidcState {
     // Default: the no-op NullVerificationSender (no transport wired yet), so the
     // closed-registration acknowledgment is identical whether or not a send goes out.
     verification_sender: Arc<dyn crate::verification::VerificationSender>,
-    // No production installer in the gated core. Logging/null OTP senders cannot
-    // accidentally enable recipient verification (issue #1436).
+    // Separate concrete TLS installers gate these purposes. Logging/null OTP
+    // senders cannot accidentally enable either ceremony.
     recipient_verification_transport:
         Option<Arc<dyn crate::recipient_verification::RecipientVerificationTransport>>,
+    password_reset_transport: Option<Arc<dyn crate::password_reset_smtp::PasswordResetTransport>>,
     // The SMS delivery seam (issue #70). Kept OUTSIDE `Inner` so the real provider
     // adapter (M11 messaging) installs its sender here later without a wire change.
     // Default: the no-op NullSmsSender (no transport wired yet), so the guarded
@@ -1175,6 +1176,7 @@ impl OidcState {
             challenge_provider: Arc::new(crate::pow::BuiltinPowProvider),
             verification_sender: Arc::new(crate::verification::NullVerificationSender),
             recipient_verification_transport: None,
+            password_reset_transport: None,
             sms_sender: Arc::new(crate::verification::NullSmsSender),
             risk_evaluator: Arc::new(crate::recovery::NullRiskEvaluator),
             password_policy: ironauth_screening::PasswordPolicy::default(),
@@ -2336,6 +2338,30 @@ impl OidcState {
     ) -> Self {
         self.verification_sender = sender;
         self
+    }
+
+    /// Install explicitly configured, concrete TLS password-reset delivery.
+    /// This does not mount a hosted route or prove that any mail was accepted.
+    #[must_use]
+    pub fn with_password_reset_smtp(
+        mut self,
+        transport: crate::password_reset_smtp::PasswordResetSmtpTransport,
+    ) -> Self {
+        self.password_reset_transport = Some(Arc::new(transport));
+        self
+    }
+
+    /// Whether actual recovery delivery is configured, independently of OTP and
+    /// recipient-verification senders. Not an assertion of relay reachability.
+    #[must_use]
+    pub fn password_recovery_delivery_available(&self) -> bool {
+        self.password_reset_transport.is_some()
+    }
+
+    pub(crate) fn password_reset_transport(
+        &self,
+    ) -> Option<&dyn crate::password_reset_smtp::PasswordResetTransport> {
+        self.password_reset_transport.as_deref()
     }
 
     /// Install the concrete TLS SMTP adapter for the hosted recipient ceremony.

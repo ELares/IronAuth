@@ -654,3 +654,61 @@ async fn a_bearer_token_exemption_change_announces_the_client_and_the_direction(
         }
     }
 }
+
+#[tokio::test]
+async fn recovery_navigation_never_revives_expired_or_consumed_authorization() {
+    use std::time::{Duration, SystemTime};
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH + Duration::from_secs(5), 1479);
+    let scope = db.seed_scope(&env).await;
+    let client = create_client(&db, &env, scope).await.to_string();
+    let id = push(&db, &env, scope, &client, "navigation context", 10_000_000).await;
+    let used = push(&db, &env, scope, &client, "consumed context", 10_000_000).await;
+    assert!(matches!(
+        consume(&db, &env, scope, &used, &client).await.unwrap(),
+        ConsumePushedRequest::Consumed { .. }
+    ));
+    let scoped = db.store().scoped(scope);
+    let repo = scoped.pushed_authorization_requests();
+    assert!(
+        repo.read_for_recovery_navigation(&env, &used, &client)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repo.read_for_recovery_navigation(&env, &id, "different client")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    clock.advance(Duration::from_secs(6));
+    assert!(repo.read(&env, &id, &client).await.unwrap().is_none());
+    assert!(matches!(
+        consume(&db, &env, scope, &id, &client).await.unwrap(),
+        ConsumePushedRequest::Invalid
+    ));
+    assert_eq!(
+        repo.read_for_recovery_navigation(&env, &id, &client)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("navigation context")
+    );
+    let foreign = db.seed_scope(&env).await;
+    assert!(matches!(
+        db.store()
+            .scoped(foreign)
+            .pushed_authorization_requests()
+            .read_for_recovery_navigation(&env, &id, &client)
+            .await,
+        Err(StoreError::NotFound)
+    ));
+    clock.advance(Duration::from_secs(1789));
+    assert!(
+        repo.read_for_recovery_navigation(&env, &id, &client)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

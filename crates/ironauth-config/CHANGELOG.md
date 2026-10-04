@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add independent default-off password-recovery SMTP settings, shared strict TLS relay validation and complete secret-reference lint coverage (#1479).
+
 - Add default-off subject-bound recipient verification settings with strict TLS relay validation and redacted username/password secret references (#1475).
 
 - Keep the programmatic root configuration default consistent with the documented

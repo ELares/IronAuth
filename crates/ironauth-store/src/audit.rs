@@ -1563,6 +1563,22 @@ pub enum Action {
     EmailOtpSend,
     /// An authenticated recipient challenge was issued, without a session change.
     RecipientVerificationStart,
+    /// A browser-bound password-reset challenge was stored, without claiming delivery.
+    PasswordResetStart,
+    /// Prepare or strengthen a lost-password case without sending mail.
+    PasswordResetCasePrepare,
+    /// A terminal delivery outcome was recorded without message content.
+    PasswordResetDelivery,
+    /// Claim one hosted reset delivery attempt before any external send.
+    PasswordResetDeliveryStarted,
+    /// A reset attempt consumed its bounded budget without changing a credential.
+    PasswordResetAttempt,
+    /// Reset proof, credential and completion receipt committed together.
+    PasswordResetComplete,
+    /// One code-free completion-notice attempt was durably admitted.
+    PasswordResetNoticeStarted,
+    /// Actual completion-notice delivery outcome, without message content.
+    PasswordResetNoticeDelivery,
     /// A control-plane batch indexed existing primary identifiers without verification.
     RecipientIndexBackfill,
     /// The authenticated subject cancelled its pending mailbox challenge.
@@ -2074,6 +2090,14 @@ impl Action {
             Action::AaguidRuleSet => "aaguid.rule.set",
             Action::AaguidRuleRemove => "aaguid.rule.remove",
             Action::EmailOtpSend => "email_otp.send",
+            Action::PasswordResetAttempt => "password_reset.attempt",
+            Action::PasswordResetComplete => "password_reset.complete",
+            Action::PasswordResetNoticeStarted => "password_reset.notice_started",
+            Action::PasswordResetNoticeDelivery => "password_reset.notice_delivery",
+            Action::PasswordResetDelivery => "password_reset.delivery",
+            Action::PasswordResetDeliveryStarted => "password_reset.delivery_started",
+            Action::PasswordResetStart => "password_reset.start",
+            Action::PasswordResetCasePrepare => "password_reset.case_prepare",
             Action::RecipientVerificationStart => "recipient_verification.start",
             Action::RecipientIndexBackfill => "recipient_verification.index_backfill",
             Action::RecipientVerificationCancel => "recipient_verification.cancel",

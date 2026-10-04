@@ -1395,6 +1395,9 @@ at the top of the file, or map it in `.taplo.toml`).
 | `oidc.offline_idle_ttl_secs` | integer | `2592000` | The IDLE timeout in seconds of an OFFLINE refresh token (issue #21): one issued WITH the `offline_access` scope, which survives RP logout (OIDC Back-Channel Logout 2.7). The default (2592000) is thirty days. There is NO never-expires option: an offline token still expires when unused this long. Must be at least 1 and at most `OIDC_MAX_REFRESH_IDLE_TTL_SECS`. |
 | `oidc.offline_max_lifetime_secs` | integer | `7776000` | The hard cap in seconds on the total lifetime of an OFFLINE refresh token FAMILY (issue #21), measured from the original grant. Once the family passes this age no rotation renews it. There is NO never-expires option. The default (7776000) is ninety days. Must be at least 1, at most `OIDC_MAX_REFRESH_MAX_LIFETIME_SECS`, and at least `offline_idle_ttl_secs`. |
 | `oidc.par_ttl_secs` | integer | `60` | The pushed-authorization-request `request_uri` lifetime in seconds (RFC 9126 section 2.2, issue #27). A pushed request is short-lived and single-use; the default (60) is one minute, following the RFC's guidance that a `request_uri` expires soon after it is pushed. Must be at least 1 and at most `OIDC_MAX_PAR_TTL_SECS` (600). This is a promotable per-environment setting in spirit, like the token lifetimes; the process value is the deployment default until per-environment overrides ride the M5 promotion pipeline. |
+| `oidc.password_recovery` | table | see fields | Explicit TLS delivery for hosted lost-password recovery, default disabled. |
+| `oidc.password_recovery.enabled` | boolean | `false` | Install actual TLS delivery and the durable completion-notice worker. Requires a mounted OIDC plane and a working control-plane connection for delivery scope enumeration (`admin.control_database_url`, or the database fallback in dev mode). Startup refuses activation if those prerequisites fail. The default is disabled. |
+| `oidc.password_recovery.smtp` | table or unset | unset | Deployment-owned relay and secret references. |
 | `oidc.quarantine` | table | see fields | The signup-quarantine sensitive-scope policy (issue #82, PR 2): which scopes a quarantined account may never receive, so the shared authorize path strips them from its grant. Consulted only when the `signup-quarantine` experimental feature is enabled AND acknowledged; the conservative default already strips offline access and admin/management scopes. See [`QuarantineConfig`]. |
 | `oidc.quarantine.sensitive_scopes` | array | `["offline_access", "admin", "management"]` | The sensitive-scope denylist a quarantined account is never granted. A requested scope token is sensitive when it EQUALS a denylist entry or is a NAMESPACED child of one (the entry followed by `:`, `.`, or `/`, so `admin` also covers `admin:read` and `admin.users`). The conservative default is `offline_access` (no refresh token for a quarantined account), `admin`, and `management` (no admin/management scope). Add more (for example a payment-class scope) per environment; over-stripping is the safe direction, since a quarantined account is meant to be powerless. |
 | `oidc.recipient_verification` | table | see fields | Subject-bound mailbox verification for relying-party invitations. |
@@ -11606,6 +11609,99 @@ It returns aggregate counts and never asserts that metadata is mailbox proof.
 `all_writers_upgraded` is an explicit operator acknowledgement, not a server
 attestation of running versions. Ambiguity counts cover indexed rows only;
 completion does not repair conflicting owners or establish mailbox possession.
+
+
+## Hosted password-reset SMTP content boundary (#1479)
+
+Explicit default-off `oidc.password_recovery` settings now install the concrete
+TLS transport at startup, independently of mailbox verification and logging OTP
+senders. Enabled unreadable credentials refuse startup; disabled recovery never
+resolves secrets. Only a root HTTPS public provider URL is accepted. Hosted reset
+handlers now mount through the bounded route factory; disabled delivery reports
+unavailability and never falls back to the legacy acknowledgement.
+
+| STRIDE | Threat | Control |
+| --- | --- | --- |
+| Elevation | Disabling a login endpoint causes recovery to ignore an enrolled stronger factor | Recovery strength always probes persisted passkeys, independently of WebAuthn login availability; read faults retain the strongest posture; synced and device-bound regression fixtures remain held |
+| Tampering | An expired reset URL supplies replacement authority or an external navigation target | Query continuation is used only for expired-attempt guidance after full registered authorization validation; cookie, CSRF, challenge and code requirements remain independent; missing binding never issues a code or changes credentials |
+| Spoofing | A forged application continuation initiates a reset | Registered client and exact callback, duplicate-parameter rejection, shared PKCE/request/resource validation, live issuer and read-only PAR resolution before identifier lookup; no direct unresolved request object |
+| Information disclosure | Request response reveals whether SMTP was attempted | Real and decoy challenges share redirect/cookie/form shape; actual SMTP runs after persistence in a transient bounded task; existing unknown-account decoy work retained; response-shape tests do not prove every database timing path equivalent |
+| Tampering | A solved browser challenge is reused with another account or continuation | Recompute context from exact submitted inputs before built-in proof verification; stored scope, endpoint, expiry and single-use checks remain required; main-router tests cover substitution and expiry |
+| Tampering | Repeat clicks replace a usable browser cookie during account cooldown | Independent browser resend check uses immutable stored creation time before account lookup; original cookie and code-entry link retained for both real and decoy attempts |
+| Spoofing | Verification/login codes are represented as reset proof | Separate reset message and challenge types; exact scope check; constructor alone enables no ceremony |
+| Tampering | Mail carries a foreign cancellation action or injected headers | HTTPS configured provider origin; exact cancellation route and single token query; no userinfo, fragment or controls; escaped HTML; validated SMTP mailbox and message identity |
+| Repudiation | Cancellation falsely reports success or queues repeated warnings | Queue one latest case-bound notice in the successful cancellation transaction; failure rolls back and returns retryable unavailability; repeat/terminal cases enqueue nothing; content uses the committed terminal kind |
+| Repudiation | Password completion commits without durable notice work | Completion queue insert shares the credential transaction; queue failure rolls back completion; exact receipt retry never enqueues again |
+| Tampering | Outbox replay duplicates a completion warning | Audited single-winner notice claim precedes SMTP; terminal outcomes cannot be relabelled; stale claims become uncertain instead of being resent |
+| Denial of service | Enabled recovery accepts resets with no completion drain | Startup requires the actual mounted OIDC transport and working control-plane scope enumeration; worker uses shared outbox settings and graceful shutdown; runtime outages retain durable work |
+| Tampering | Repeated or restarted requests resend the same reset secret | Audited subject-bound single-winner delivery claim before sends; claimed attempts cannot be re-claimed, even without a terminal result; explicit fresh challenge required |
+| Elevation | An unsupported required channel is silently skipped | Preflight the whole verified schema-permitted set, require primary, deduplicate through canonical identifier policy, refuse unsupported phone delivery, require every secondary notice acknowledgement before code |
+| Repudiation | Missing acknowledgement is reported as delivered or triggers retry | Separate accepted, refused and uncertain outcomes; audited terminal challenge delivery result cannot be relabelled through the repository; credential completion and replay require accepted delivery; one bounded attempt, no automatic retry; different code/completion message identities |
+| Tampering | Fresh-code reissue invalidates an earlier owner cancellation link or restarts its waiting period | Immutable per-challenge cancellation digest resolves the same scoped, subject-bound standard lost-password case; old digests remain usable after code expiry/reissue; the case retains delay and terminal status |
+| Tampering | Concurrent resends create new cases or shorten the waiting period | Shared ownership/account locks serialize hosted case preparation; reuse preserves case and cancellation identity; separate monotonic policy duration and first accepted notification anchor; preparation, eligibility and audit commit together |
+| Information disclosure | Codes, cancellation capabilities or SMTP secrets enter logs | No Debug/serialization on secret-bearing message/config; value-free errors; redacted transport Debug; no plaintext notice outbox |
+| Denial of service | Secret-bearing messages wait indefinitely | Shared no-wait concurrency admission and bounded socket/overall send deadlines; aggregate 16-second batch and 32-channel cap; eight-digit code, bounded cancellation URL and expiry |
+| Elevation | An undelivered initial request consumes a security waiting period | First accepted required notification anchors the full case delay under lock; later resends preserve it; horizon and delivery audit roll back together |
+| Information disclosure | Secondary owner warnings distribute the primary reset code | Separate requested-owner content carries cancellation only, with a distinct message identity and the same provider-origin validation |
+| Elevation | Email delivery itself resets a password or grants a session | Transport cannot mutate credentials; separate atomic store completion still requires browser-bound proof and current authority; mounted handlers enforce browser/code proof and ordinary login remains separate |
+
+
+## Hosted reset browser binding (#1479)
+
+The mounted hosted reset handlers use this purpose-specific cookie parser and
+form-proof helper. A parsed binding never grants a login session.
+
+| STRIDE | Threat | Control |
+| --- | --- | --- |
+| Tampering | Expired-code navigation is interpreted as live reset authority | Separate browser-bound context read preserves only immutable client/continuation/expiry within ten minutes; code verifier and completion enforce their own shorter lifetime; optional audit subject is internal and never changes public form shape |
+| Spoofing | Another browser or challenge borrows a reset form | Independent 256-bit Env secret; stored binding digest; challenge-bound HMAC form proof; exact scoped row resolution still required |
+| Tampering | Ambiguous cookies or edited retry fields alter authority | Reject duplicate/malformed reset cookies; separate MAC domains and length-prefixed fields; exact normalized password/code receipt; constant-time CSRF verification |
+| Repudiation | A lost response applies another password change | Cookie reconstructs the same keyed request digest across restart; existing atomic store receipt refuses changed requests; bounded database lifetime remains authoritative |
+| Information disclosure | Error pages echo passwords/codes or send recovery context in referrers | Renderers accept no submitted code/password values; escape context and guidance; response helper uses no-store, same-origin referrers and shared strict CSP; only CSRF proof is hidden authority input |
+| Information disclosure | Browser secret becomes a session token or appears in debug logs | Separate host-only Secure/HttpOnly cookie with sensitive header flag; no Debug/Clone/serialization on binding; best-effort secret wipe on drop; handler must use no-store and referrer protections |
+| Denial of service | Cookie parsing or retry has unbounded input/lifetime | Aggregate 8192-byte cookie budget; fixed 32-byte secret; at most ten-minute cookie; handler must additionally bound body and admit hashing |
+| Elevation | Possessing the binding substitutes for recovery proof | Binding alone never mutates credentials; code, accepted notifications, current authority and case delay/cancellation remain store requirements; same-origin checks still required at handler |
+
+
+## Hosted reset completion handlers (#1479)
+
+The provider router mounts the bounded request and completion route factory.
+Enabled delivery uses durable terminal notices; deployment remains default off.
+
+| STRIDE | Threat | Control |
+| --- | --- | --- |
+| Repudiation | An unproved request or delivery worker is attributed to the account owner or an invented human | Hosted issuance and delivery use a stable provider service actor; code-proved credential completion retains the subject-derived human actor; integrated audit assertions cover both |
+| Information disclosure | A request from another browser exposes an account through its resend cooldown | Expected store cooldown refusal creates the same decoy response as unknown/ineligible accounts; it preserves the original code and sends no additional mail |
+| Elevation | Waiting for database locks extends a reset code's lifetime | Completion samples Env time after acquiring the authority locks and checks expiry before the credential transaction; a real PostgreSQL lock-wait regression crosses the deadline |
+| Spoofing | A posted account or client selects another reset | Strict form schema; browser-bound store context; stored client/continuation scope consistency; separate form CSRF and same-origin checks |
+| Tampering | Edited confirmation or code changes an interrupted request | NFKC normalization on both password fields; eight ASCII digits; exact keyed completion receipt; store revalidation of authority and expiry |
+| Repudiation | A failed response is represented as a new successful mutation or cannot be confirmed during a screening outage | Read-only exact receipt check before current policy/screening; shared locked current-authority validation; no new hash or mutation on a match; new changes still require screening; ambiguous failures offer exact retry or sign-in; terminal owner notices are queued atomically |
+| Information disclosure | Rejected secret values or internal failures enter HTML | No secret renderer inputs, generic store/hash errors, escaped policy guidance, shared CSP/no-store and browser-compatible same-origin referrers |
+| Denial of service | Enabled browser verification leaves users unable to submit or runs indefinitely | Built-in solver on the actual form, same-origin challenge fetch with a ten-second timeout, sixty-second solve budget, bounded challenge parsing, duplicate-submit guard and input-change rejection; accessible retry status; no external scripts |
+| Tampering | Browser proof script weakens the hosted page policy | Env-generated CSP nonce through the existing login response helper; same-origin connect/form destinations; server still enforces endpoint/context/scope/expiry and single-use proof |
+| Denial of service | Unbounded forms or unregulated password hashing | 16 KiB route body limit; independent recovery counters; policy/strength/screening before admitted hashing; retain retry and rate-limit headers |
+| Elevation | Reset signs in or bypasses stronger factors | Store completion only; no session cookie or role grant; held cases remain held; ordinary login still required |
+
+
+### Hosted recovery application restart after PAR expiry (#1479)
+
+- Spoofing: the opaque PAR reference and declared client must resolve together in
+  the same scope. No account lookup, session creation or recovery authority comes
+  from the navigation query or its optional restart marker.
+- Tampering: callback, state and response mode come from the pushed record; the
+  current client registration and shared request validator are checked again.
+  Inline replacements, foreign references and removed callback registrations
+  cannot select a return target.
+- Repudiation: navigation reads do not claim a password change, PAR consumption,
+  sign-in or application grant. Existing audited mutation owners remain unchanged.
+- Information disclosure: the link is same-origin and pages use existing no-store
+  and CSP headers. The error response contains no recovery code, password, token
+  or session; it uses the existing OAuth error encoder and issuer binding.
+- Denial of service: this read is bounded to one scoped row, thirty minutes from
+  push, and an unconsumed reference. It sends no mail and never renews a deadline.
+- Elevation of privilege: navigation context cannot be used by the normal live
+  PAR read or atomic consume. Only an error can be returned; a fresh application
+  authorization is required. Missing/old/consumed context fails closed.
 
 ---
 

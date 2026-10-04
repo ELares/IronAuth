@@ -2095,6 +2095,21 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0248_security_advisory_replace_grant.sql"),
         },
+        // EXPAND (issue #1479): isolated hosted password-reset authority and receipt.
+        Migration {
+            version: 249,
+            name: "hosted_password_reset",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0249_hosted_password_reset.sql"),
+        },
+        Migration {
+            version: 250,
+            name: "password_reset_no_delete",
+            // No old or new repository operation deletes reset challenges.
+            // Removing unused authority preserves every supported operation.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0250_password_reset_no_delete.sql"),
+        },
     ]
 }
 

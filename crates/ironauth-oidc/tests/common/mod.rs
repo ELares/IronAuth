@@ -645,7 +645,8 @@ impl Harness {
     /// `Cache-Control` can be asserted against the configured window). Provisions an
     /// Ed25519 environment key.
     pub async fn start_store_backed_with(config: OidcConfig) -> Self {
-        Self::build_store_backed(config, HarnessKey::Ed25519).await
+        // Keep database bootstrap off the stack of every enclosing test fixture.
+        Box::pin(Self::build_store_backed(config, HarnessKey::Ed25519)).await
     }
 
     /// Like [`Harness::start_store_backed`] but the environment is provisioned with
