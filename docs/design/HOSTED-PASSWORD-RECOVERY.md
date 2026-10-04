@@ -5,7 +5,62 @@ cancellation handlers in the provider router, with local HTTP/TLS qualification.
 This document does not describe a shipped password-reset capability. Civio onboarding issue encryptixio/civio#455 depends
 on the complete browser journey, not merely the recovery acknowledgement.
 
-## Observed gap
+## Current branch behavior
+
+The provider router mounts the request, reset and cancellation handlers. Recovery
+is disabled by default. Enable `oidc.password_recovery.enabled` with its own
+`oidc.password_recovery.smtp` relay settings, OIDC and a root HTTPS
+`server.public_url`. SMTP uses the shared relay configuration fields and secret
+references described in [CONFIG.md](../CONFIG.md). Production also needs a working
+`admin.control_database_url` for the durable notice worker's scope enumeration;
+dev mode permits the documented database fallback. Startup rejects missing
+prerequisites. Configured delivery does not establish relay reachability or inbox
+arrival; deployment qualification must exercise the actual relay.
+
+Requests validate the application's registered authorization context before
+account lookup. Eligible accounts receive an eight-digit code through bounded,
+certificate-verified TLS delivery; unknown, ineligible and account-cooldown
+requests get the same public form. A recent request in the same browser retains
+its original code-entry page. A request from another browser during cooldown
+creates a decoy without replacing the first browser's code or sending more mail.
+Uniform response shape does not establish equal account-dependent database timing.
+
+Codes last five minutes with at most five wrong attempts. The separate browser
+binding lasts ten minutes and supplies no credential authority on its own.
+Completion rechecks expiry after acquiring the authority locks, current verified
+mailbox ownership, credential generation, delivery acceptance, cancellation and
+any notified delay. It atomically changes the password, consumes the proof,
+records the exact-request receipt and audit, revokes subject sessions/offline
+refresh families/grants/trusted devices, and queues a code-free completion notice.
+Unproved issuance and background delivery use a stable provider service actor;
+proved credential completion retains the account owner in its audit. Recovery
+retains other authentication factors and creates no sign-in session or Civio
+membership. An identical retry can confirm a committed change within the original
+proof lifetime; it cannot change the password again.
+
+Owner cancellation requires an explicit POST; scanner GETs do not cancel. Initial
+reset secrets have one delivery claim and no automatic resend or plaintext queue.
+Completion and cancellation warnings use the durable outbox with one delivery
+claim. An unresolved old claim becomes uncertain rather than being resent.
+Accepted, refused and uncertain SMTP outcomes remain distinct from a completed
+credential transaction. Users explicitly request a fresh code after an interrupted
+initial delivery; administrators must not report uncertain delivery as success.
+
+Expired code and cookie pages retain validated navigation. For pushed authorization,
+an explicit application restart reads only unconsumed, scoped navigation context
+within thirty minutes and revalidates the callback. It returns an OAuth error with
+the original state; it never renews authorization or issues a code/session. Direct
+authorization retains sign-in and fresh-code links. Missing or invalid context
+cannot supply a callback. The application starts a fresh authorization as needed.
+
+Local PostgreSQL/TLS tests and retained headed Chrome observations qualify the
+implemented flows at their recorded commits. Review repairs require their own
+qualification; earlier passing results are not evidence for a later build. The
+release review and PR retain exact source/build/test references. These observations
+do not establish Internet mail delivery, external challenge-widget integration,
+representative-user studies or manual assistive-technology/device testing.
+
+## Original observed gap
 
 At main `903be846e86370c61e94706a183b1172f4e6ee4a`, the hosted login page links to
 `/recover`. Its POST initiates the existing recovery subsystem and returns a
@@ -117,7 +172,14 @@ Civio destination, with no implicit Civio membership or project grant. Retain th
 actual build, store, fixture and failures. An isolated inbox is not internet
 mail delivery; automated browser observations are not the required human study.
 
-## Storage implementation progress
+## Implementation history (chronological)
+
+The following notes record intermediate implementation and qualification stages.
+Statements that work is pending, unwired or not deployed describe that stage and
+may be superseded by later entries. Use Current branch behavior above for the
+implemented contract and the release review for current qualification status.
+
+### Storage boundary
 
 Migration 0249 and `PasswordResetChallengeId` introduce only the storage boundary.
 The table separates pending, completed, cancelled and refused metadata, requires

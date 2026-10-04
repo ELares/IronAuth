@@ -390,6 +390,46 @@ async fn hosted_request_delivers_real_code_and_completes_without_enumerating_ine
     )
     .await;
     sign_in_after_reset(&state, &target).await;
+    assert_recovery_audit_actors(&db, &subject).await;
+}
+
+async fn assert_recovery_audit_actors(db: &TestDatabase, subject: &UserId) {
+    let audit = db
+        .store()
+        .scoped(subject.scope())
+        .audit()
+        .list()
+        .await
+        .unwrap();
+    let mut service = None;
+    for action in [
+        "password_reset.case_prepare",
+        "password_reset.start",
+        "password_reset.delivery_started",
+        "password_reset.delivery",
+        "password_reset.notice_started",
+        "password_reset.notice_delivery",
+    ] {
+        let records: Vec<_> = audit.iter().filter(|row| row.action == action).collect();
+        assert!(!records.is_empty(), "missing audit action {action}");
+        for row in records {
+            assert!(
+                matches!(row.actor, ironauth_store::ActorRef::Service(_)),
+                "{action} is service work, not an account-owner action"
+            );
+            assert_eq!(
+                *service.get_or_insert(row.actor),
+                row.actor,
+                "recovery service identity must remain stable across requests and worker claims"
+            );
+        }
+    }
+    let completed: Vec<_> = audit
+        .iter()
+        .filter(|row| row.action == "password_reset.complete")
+        .collect();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].actor, crate::interaction::user_actor(subject));
 }
 
 #[tokio::test]

@@ -398,7 +398,7 @@ async fn complete(state: &OidcState, attempt: &Attempt, form: &ResetForm) -> Res
         .as_ref()
         .filter(|_| matched)
         .map_or_else(
-            || ironauth_store::ActorRef::human(ironauth_store::HumanId::generate(state.env())),
+            crate::password_reset_delivery::service_actor,
             interaction::user_actor,
         );
     let outcome = state

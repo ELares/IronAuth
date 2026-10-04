@@ -7,8 +7,8 @@ use axum::extract::{DefaultBodyLimit, Form, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use ironauth_store::{
-    ActorRef, CorrelationId, HumanId, NewPasswordReset, PasswordResetAccount,
-    PasswordResetChallengeId, StoreError, UserId,
+    CorrelationId, NewPasswordReset, PasswordResetAccount, PasswordResetChallengeId, StoreError,
+    UserId,
 };
 
 use crate::interaction::{self, ResumeTarget};
@@ -366,7 +366,7 @@ async fn persist(
         None
     };
     let acting = state.store().scoped(scope).acting(
-        ActorRef::human(HumanId::generate(state.env())),
+        crate::password_reset_delivery::service_actor(),
         CorrelationId::generate(state.env()),
     );
     let binding_hash = binding.binding_hash();

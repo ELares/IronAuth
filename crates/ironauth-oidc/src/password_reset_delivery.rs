@@ -17,6 +17,14 @@ use crate::password_reset_smtp::{
 use crate::recovery::{RecoveryChannels, annotated_recovery_channels};
 use crate::state::OidcState;
 
+/// Stable provider principal for unproved recovery requests and delivery work.
+/// Selecting an account as a mail target does not make its owner the actor.
+pub(crate) fn service_actor() -> ironauth_store::ActorRef {
+    ironauth_store::ActorRef::service(ironauth_store::ServiceId::from_seed_bytes(
+        *b"ironauth-recover",
+    ))
+}
+
 const MAX_CHANNELS: usize = 32;
 const DELIVERY_BUDGET: Duration = Duration::from_secs(16);
 
@@ -58,10 +66,7 @@ pub async fn send_reset_request(
     state
         .store()
         .scoped(scope)
-        .acting(
-            crate::interaction::user_actor(request.subject),
-            CorrelationId::generate(state.env()),
-        )
+        .acting(service_actor(), CorrelationId::generate(state.env()))
         .password_reset()
         .claim_delivery(state.env(), request.challenge, request.subject)
         .await?;
@@ -92,10 +97,7 @@ pub async fn send_reset_request(
     state
         .store()
         .scoped(scope)
-        .acting(
-            crate::interaction::user_actor(request.subject),
-            CorrelationId::generate(state.env()),
-        )
+        .acting(service_actor(), CorrelationId::generate(state.env()))
         .password_reset()
         .record_delivery(state.env(), request.challenge, outcome, accepted)
         .await?;
@@ -288,10 +290,10 @@ async fn deliver_completion_notice(
         ));
     }
     let scope = id.scope();
-    let acting = state.store().scoped(scope).acting(
-        ironauth_store::ActorRef::human(ironauth_store::HumanId::generate(env)),
-        CorrelationId::generate(env),
-    );
+    let acting = state
+        .store()
+        .scoped(scope)
+        .acting(service_actor(), CorrelationId::generate(env));
     let claim = acting
         .password_reset()
         .claim_completion_notice(env, id)
@@ -381,10 +383,7 @@ async fn resume_completion_notice(
         return Err(ConsumerError::retryable("reset_notice_in_progress"));
     }
     scoped
-        .acting(
-            ironauth_store::ActorRef::human(ironauth_store::HumanId::generate(env)),
-            CorrelationId::generate(env),
-        )
+        .acting(service_actor(), CorrelationId::generate(env))
         .password_reset()
         .record_completion_notice(env, id, PasswordResetDelivery::Uncertain, 0)
         .await

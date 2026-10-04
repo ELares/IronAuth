@@ -873,7 +873,7 @@ pub struct RecoveryVerificationUi<'a> {
 
 /// The minimal account-recovery request page (issue #64): a single identifier field
 /// posting to `/recover`. The identifier and `return_to` are escaped. Whatever a user
-/// submits, the response is the SAME uniform acknowledgment (an existing account is never
+/// submits, admitted requests share the same code-entry shape (an existing account is never
 /// distinguishable from an unknown one).
 #[must_use]
 pub fn recover_page(
@@ -889,7 +889,7 @@ pub fn recover_page(
         escape_html(ui.challenge_url), escape_html(ui.nonce), include_str!("recovery_pow.js"),
     ));
     let body = format!(
-        "<h1>Recover account</h1><p class=\"page-description\">Enter your account identifier and we will send recovery instructions if an account exists.</p>{error}\
+        "<h1>Recover account</h1><p class=\"page-description\">Enter your account identifier. If your account is eligible for email recovery, instructions will arrive at its verified email address.</p>{error}\
          <form method=\"post\" action=\"/recover\">{return_to}\
          <p><label>Account identifier <input type=\"text\" name=\"identifier\" value=\"{identifier}\" \
          autocomplete=\"username\" required></label></p>\

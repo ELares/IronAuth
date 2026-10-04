@@ -148,7 +148,7 @@ pub mod native_sso;
 mod pages;
 mod par;
 mod password;
-/// Bounded SMTP delivery for subject-bound verification; activation remains gated.
+/// Hosted password-reset presentation; rendering grants no recovery authority.
 pub use pages::password_reset as password_reset_pages;
 pub mod password_reset_browser;
 pub mod password_reset_delivery;
@@ -180,6 +180,7 @@ mod quota;
 #[cfg(feature = "ironcache")]
 pub mod rate_store;
 mod recipient_page;
+/// Bounded SMTP delivery for subject-bound verification; activation remains gated.
 pub mod recipient_smtp;
 /// Gated subject-bound recipient verification and secret-safe transport contract.
 pub mod recipient_verification;

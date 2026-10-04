@@ -768,7 +768,7 @@ pub async fn prepare_password_reset_case(
         .store()
         .scoped(scope)
         .acting(
-            ironauth_store::ActorRef::human(ironauth_store::HumanId::generate(state.env())),
+            crate::password_reset_delivery::service_actor(),
             CorrelationId::generate(state.env()),
         )
         .password_reset()

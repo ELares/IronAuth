@@ -579,7 +579,7 @@ attestation of running versions. Ambiguity counts cover indexed rows only;
 completion does not repair conflicting owners or establish mailbox possession.
 
 
-## Hosted password-reset SMTP content boundary (#1479, implementation in progress)
+## Hosted password-reset SMTP content boundary (#1479)
 
 Explicit default-off `oidc.password_recovery` settings now install the concrete
 TLS transport at startup, independently of mailbox verification and logging OTP
@@ -611,13 +611,13 @@ unavailability and never falls back to the legacy acknowledgement.
 | Denial of service | Secret-bearing messages wait indefinitely | Shared no-wait concurrency admission and bounded socket/overall send deadlines; aggregate 16-second batch and 32-channel cap; eight-digit code, bounded cancellation URL and expiry |
 | Elevation | An undelivered initial request consumes a security waiting period | First accepted required notification anchors the full case delay under lock; later resends preserve it; horizon and delivery audit roll back together |
 | Information disclosure | Secondary owner warnings distribute the primary reset code | Separate requested-owner content carries cancellation only, with a distinct message identity and the same provider-origin validation |
-| Elevation | Email delivery itself resets a password or grants a session | Transport cannot mutate credentials; separate atomic store completion still requires browser-bound proof and current authority; real handler obligations remain unwired |
+| Elevation | Email delivery itself resets a password or grants a session | Transport cannot mutate credentials; separate atomic store completion still requires browser-bound proof and current authority; mounted handlers enforce browser/code proof and ordinary login remains separate |
 
 
-## Hosted reset browser binding (#1479, implementation in progress)
+## Hosted reset browser binding (#1479)
 
-This purpose-specific cookie parser and form-proof helper is implemented; hosted
-reset handlers remain pending. A parsed binding never grants a login session.
+The mounted hosted reset handlers use this purpose-specific cookie parser and
+form-proof helper. A parsed binding never grants a login session.
 
 | STRIDE | Threat | Control |
 | --- | --- | --- |
@@ -631,13 +631,16 @@ reset handlers remain pending. A parsed binding never grants a login session.
 | Elevation | Possessing the binding substitutes for recovery proof | Binding alone never mutates credentials; code, accepted notifications, current authority and case delay/cancellation remain store requirements; same-origin checks still required at handler |
 
 
-## Hosted reset completion handlers (#1479, integration in progress)
+## Hosted reset completion handlers (#1479)
 
 The provider router mounts the bounded request and completion route factory.
 Enabled delivery uses durable terminal notices; deployment remains default off.
 
 | STRIDE | Threat | Control |
 | --- | --- | --- |
+| Repudiation | An unproved request or delivery worker is attributed to the account owner or an invented human | Hosted issuance and delivery use a stable provider service actor; code-proved credential completion retains the subject-derived human actor; integrated audit assertions cover both |
+| Information disclosure | A request from another browser exposes an account through its resend cooldown | Expected store cooldown refusal creates the same decoy response as unknown/ineligible accounts; it preserves the original code and sends no additional mail |
+| Elevation | Waiting for database locks extends a reset code's lifetime | Completion samples Env time after acquiring the authority locks and checks expiry before the credential transaction; a real PostgreSQL lock-wait regression crosses the deadline |
 | Spoofing | A posted account or client selects another reset | Strict form schema; browser-bound store context; stored client/continuation scope consistency; separate form CSRF and same-origin checks |
 | Tampering | Edited confirmation or code changes an interrupted request | NFKC normalization on both password fields; eight ASCII digits; exact keyed completion receipt; store revalidation of authority and expiry |
 | Repudiation | A failed response is represented as a new successful mutation or cannot be confirmed during a screening outage | Read-only exact receipt check before current policy/screening; shared locked current-authority validation; no new hash or mutation on a match; new changes still require screening; ambiguous failures offer exact retry or sign-in; terminal owner notices are queued atomically |

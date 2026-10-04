@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Attribute hosted recovery issuance and mail delivery to a stable provider service actor (#1479). Keep proved credential completion attributed to the account owner; unproved requests and background jobs do not impersonate that owner or invent human identities. Clarify that recovery instructions require an eligible account with a verified email address.
+
 - Keep hosted recovery responses uniform during the account cooldown, including requests from another browser (#1479). Preserve the original code and avoid sending another message.
 
 - Offer an application restart from hosted recovery when a pushed authorization request expires (#1479). Revalidate the registered callback and return only an OAuth error with the original state; never revive authorization or issue a session.
