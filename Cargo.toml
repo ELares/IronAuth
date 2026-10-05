@@ -393,7 +393,7 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # feature so the default build and the musl static lane stay lean and
 # protoc-free (grpc-tonic ships pre-generated protobuf code).
 opentelemetry = "0.33"
-opentelemetry_sdk = "0.32"
+opentelemetry_sdk = "0.33"
 opentelemetry-otlp = { version = "0.32", default-features = false }
 tracing-opentelemetry = "0.34"
 
