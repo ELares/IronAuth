@@ -756,17 +756,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@688313b0823df1393bcebb1b4add0438a6d36884 # 1.88
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      # ONE crate is excluded, under this rule: a workspace member whose DEPENDENCY declares
-      # an MSRV above the workspace promise, and which nothing in the shipped binary's graph
-      # depends on, is checked at its own MSRV instead of blocking this lane.
-      #
-      #   ironauth-hooks -- wasmtime/cranelift 48 declare rust-version 1.95
-      #
-      # It is not reachable from `ironauth`, so the SHIPPED binary's MSRV is 1.88 and the
-      # promise in docs/COMPATIBILITY.md is intact. This is not a way to make the number look
-      # good: the moment that crate is wired into the binary, the product MSRV becomes its
-      # dependency's, and raising a published compatibility promise is an owner decision rather
-      # than a side effect. The exclusion is what has to come out at that point.
+      # The optional WASM hook runtime requires Rust 1.96. Default builds
+      # retain the workspace Rust 1.88 minimum; the all-features lane below
+      # checks the graph with hooks enabled at the higher declared minimum.
+      # ironauth-hooks itself is excluded only from the default-MSRV check.
       #
       # IRONAUTH-CEL WAS THE SECOND, AND IT CAME OUT (issue #113 criterion 2), which is what
       # that sentence looks like when it is honoured. Wiring the CEL cost budget into issuance
@@ -791,7 +784,7 @@ jobs:
       # members still being checked DEPEND on. So the moment issue #114 gave `ironauth-oidc` an
       # optional `wasm-hooks` feature, `--all-features` turned it on, `ironauth-oidc` pulled
       # wasmtime, and this lane compiled the very crate the two `--exclude` flags above were
-      # written to keep out -- under 1.85, against wasmtime's declared 1.95.
+      # written to keep out -- under 1.85, against wasmtime's declared 1.96.
       #
       # The MSRV is a promise about what a CONSUMER compiles, so this lane now checks that:
       # default features, libraries and binaries. `--all-targets` came off with it, because a
@@ -799,11 +792,11 @@ jobs:
       # dev-depend on `ironauth-hooks` for its guest fixtures. `scripts/msrv-audit.sh` enforces
       # the same two boundaries against `cargo metadata` and explains them at length.
       # Installed here rather than lower down because the all-features check below runs under
-      # 1.95, not only the two per-crate checks that used to be the sole users.
+      # 1.96, not only the two per-crate checks that used to be the sole users.
       - name: Install the toolchains the excluded crates declare
-        run: rustup toolchain install 1.95 --profile minimal
-      - name: Install the WASM target for 1.95
-        run: rustup target add wasm32-wasip2 --toolchain 1.95
+        run: rustup toolchain install 1.96 --profile minimal
+      - name: Install the WASM target for 1.96
+        run: rustup target add wasm32-wasip2 --toolchain 1.96
       - name: The shipped graph, at the promised MSRV
         run: cargo check --workspace --exclude ironauth-hooks
       # Everything the default graph does not reach is still checked, at the toolchain the
@@ -812,15 +805,15 @@ jobs:
       # could have shipped broken while every check stayed green.
       - name: Everything else, at the highest MSRV any member declares
         env:
-          RUSTUP_TOOLCHAIN: "1.95"
+          RUSTUP_TOOLCHAIN: "1.96"
         run: cargo check --workspace --all-features --all-targets
       # The excluded crate is checked AT ITS OWN declared MSRV, so the numbers
       # docs/COMPATIBILITY.md publishes for them are compiled rather than asserted. Without this
       # the exclusion above is the only thing anyone checks, and a crate could quietly need a
       # newer compiler than its manifest claims while every lane stayed green.
-      - name: ironauth-hooks at its declared 1.95
+      - name: ironauth-hooks at its declared 1.96
         env:
-          RUSTUP_TOOLCHAIN: "1.95"
+          RUSTUP_TOOLCHAIN: "1.96"
         run: cargo check -p ironauth-hooks --all-features --all-targets
 
   musl:
@@ -2320,7 +2313,7 @@ jobs:
           IRONAUTH_LDAP_LOAD_ENTRIES=20000 bash scripts/ldap-load-test.sh
       - name: Record the load-test figures
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ldap-load-report
           path: target/ldap-load-report.txt
@@ -2520,7 +2513,7 @@ jobs:
         with:
           packages: platform-tools
       - name: gradle
-        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6
       - name: build the sample and run the documented flow
         env:
           GRADLE_BIN: gradle

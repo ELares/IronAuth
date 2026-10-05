@@ -18,7 +18,7 @@ categories = ["authentication", "cryptography"]
 # published on its own. Adding an ironauth-* dependency here would silently revoke that,
 # so the absence of a `[dependencies]` entry naming one is load-bearing.
 [dependencies]
-# HELD BELOW 0.9.3, which declares rustc 1.89 while this workspace promises 1.85.
+# HELD BELOW 0.9.3, which declares rustc 1.89 while this workspace promises 1.88.
 #
 # A caret `0.9` resolved forward to 0.9.3 in the #1155 group bump. `cargo test` and clippy are
 # blind to it, because the pinned toolchain is 1.97 and neither evaluates a declared
