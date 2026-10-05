@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Upgrade Wasmtime, WASI, and WASI I/O together to 49.0.2, update the compiled-artifact cache version, and declare Rust 1.96 for optional WASM hooks. Use the patched 49.0.2 release to address the published runtime and WASI security advisories.
+
 - Pin Wasmtime and WASI to 48.0.5 to pick up published runtime and WASI security fixes detected by the local dependency gate. Bind the compiled-artifact cache key to the exact compiler version (#1475).
 
 - Build the TypeScript hook test component from checked-in source and locked

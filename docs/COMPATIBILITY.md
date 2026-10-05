@@ -18,7 +18,7 @@ table is the authoritative list of artifacts and their versions at HEAD.
 | ironauth-fastly-verify | 0.1.0 | library | 1.88 |
 | ironauth-fetch | 0.1.0 | library | 1.88 |
 | ironauth-hash-scheme | 0.2.0 | library | 1.88 |
-| ironauth-hooks | 0.1.0 | library | 1.95 |
+| ironauth-hooks | 0.1.0 | library | 1.96 |
 | ironauth-hot | 0.1.0 | library | 1.88 |
 | ironauth-import | 0.1.0 | library | 1.88 |
 | ironauth-importers | 0.1.0 | library | 1.88 |
