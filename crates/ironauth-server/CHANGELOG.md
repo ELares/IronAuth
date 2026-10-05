@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Upgrade the optional OTLP exporter and OpenTelemetry API/SDK together to 0.33 with tracing-opentelemetry 0.34.
+
 - Wait for the exact readiness body during cache failure and recovery tests;
   both ready and degraded states return HTTP 200.
 
