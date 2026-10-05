@@ -39,7 +39,7 @@ use wasmtime::{Config, Engine, Store};
 /// this is declared here and pinned by a test that reads `Cargo.toml` -- a literal that drifts
 /// from the dependency it names would make every artifact key wrong in the direction that
 /// LOADS one it should not.
-const WASMTIME_VERSION: &str = "49.0.1";
+const WASMTIME_VERSION: &str = "49.0.2";
 
 use crate::sandbox::HasSandbox;
 use crate::{HookError, Limits, Sandbox};
