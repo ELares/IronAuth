@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Refresh the embedded admin console for Preact 11, signals 2.11.3, and Vite 8.3.2.
+
 - Start and gracefully stop the password-recovery completion-notice consumer when recovery is enabled (#1479). Reuse the serving OIDC transport/store, require working control-plane scope enumeration before serving, and retain the shared outbox/IronBus worker settings.
 
 - Install separately configured TLS password-recovery transport at startup; unreadable enabled relay credentials refuse startup, while disabled recovery reads no secrets (#1479). Hosted reset forms remain pending.
