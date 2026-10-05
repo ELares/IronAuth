@@ -32,7 +32,7 @@ categories = ["authentication", "cryptography"]
 # `scripts/msrv-audit.sh` names the same failure locally, before CI does, which is why it is
 # worth running after any bump touching this crate. 0.9.2 and 0.9.1 both declare 1.85, so the
 # range keeps a patch available without an exact pin.
-aes = ">=0.9.1, <0.9.3"
+aes = ">=0.9.1, <0.9.4"
 argon2.workspace = true
 base64.workspace = true
 bcrypt = "0.19"
