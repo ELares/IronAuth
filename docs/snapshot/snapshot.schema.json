@@ -146,6 +146,10 @@
         },
         "secret": {
           "$ref": "#/$defs/secret_reference"
+        },
+        "subject_policy": {
+          "$ref": "#/$defs/client_subject_policy",
+          "description": "Offline identity configuration; absence in older snapshots means public. No salt, binding or revision is exported. Clients are not promoted."
         }
       }
     },
@@ -214,6 +218,48 @@
           "type": "string"
         }
       }
+    },
+    "client_subject_policy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "subject_type"
+          ],
+          "properties": {
+            "subject_type": {
+              "const": "public"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "subject_type",
+            "sector_identifier"
+          ],
+          "properties": {
+            "subject_type": {
+              "const": "pairwise"
+            },
+            "sector_identifier": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "pattern": "^[!-~]+$"
+            },
+            "sector_identifier_uri": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^https://"
+            }
+          }
+        }
+      ]
     }
   }
 }

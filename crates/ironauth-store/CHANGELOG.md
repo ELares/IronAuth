@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Export client identity policy with a coherent redirect set in configuration snapshots (#19). Accept legacy snapshots as public policy, reject malformed policy fields, and exclude salts, user bindings and revision counters. Keep clients excluded from promotion so target identity remains intact.
+
 - Persist dynamic-client subject policy and validated redirects in the same audited write (#19). Guard replacement updates with the policy revision and authenticating registration-token hash; concurrent edits and failed audits cannot partially rotate identity policy or credentials.
 
 - Add revision-guarded client subject policy and immutable scoped identity bindings (#19). Redirect validation is pinned atomically; stale first derivations and failed audits do not commit. This persistence work still requires complete protocol and registration integration before pairwise rollout.

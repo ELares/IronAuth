@@ -91365,15 +91365,18 @@ impl ActingEnvelopeRepo<'_> {
 
 /// Client-facing identity policy. The protocol layer validates sector documents
 /// before writing this value; the store binds that validation to a revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "subject_type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientSubjectPolicy {
     /// The local account identifier, retained for existing registrations.
+    #[default]
     Public,
     /// A stable salted identifier shared only within a validated sector.
     Pairwise {
         /// Canonical hostname resolved by the protocol's hardened validator.
         sector_identifier: String,
         /// Validated HTTPS sector document, if explicitly supplied.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         sector_identifier_uri: Option<String>,
     },
 }
@@ -91390,6 +91393,14 @@ pub struct ClientSubjectPolicySnapshot {
     pub revision: i64,
     /// Exact redirects against which a sector document must be checked.
     pub redirect_uris: Vec<String>,
+}
+
+impl ClientSubjectPolicy {
+    /// Check stored/snapshot shape only. Activating this policy still requires
+    /// protocol validation of the sector document against the redirect set.
+    pub(crate) fn has_valid_shape(&self) -> bool {
+        client_subject_policy_columns(self, &[]).is_ok()
+    }
 }
 
 struct ClientSubjectPolicyColumns<'a> {

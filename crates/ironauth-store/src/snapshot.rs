@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::classification::{ResourceClassification, ResourceType, classify};
 use crate::error::StoreError;
-use crate::repository::ScopedStore;
+use crate::repository::{ClientSubjectPolicy, ScopedStore};
 
 /// The snapshot format version embedded in every document ([`Snapshot::schema_version`]).
 ///
@@ -135,6 +135,10 @@ pub struct ClientSnapshot {
     pub token_endpoint_auth_method: String,
     /// The registered redirect URIs, sorted for a canonical order.
     pub redirect_uris: Vec<String>,
+    /// Identity configuration read atomically with redirects. Legacy snapshots
+    /// lacking this field use public policy. Salts and user bindings are excluded.
+    #[serde(default)]
+    pub subject_policy: ClientSubjectPolicy,
     /// The registered post-logout redirect URIs, sorted for a canonical order.
     pub post_logout_redirect_uris: Vec<String>,
     /// The registered OIDC Front-Channel Logout URI, if the client opted in.
@@ -730,7 +734,10 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
         // PRESENCE (never the hash itself, which stays in `secret_hash` and is
         // read only to decide whether a reference is emitted).
         let auth = scoped.clients().auth_record(&record.id).await?;
-        let mut redirect_uris = record.redirect_uris;
+        // Read policy and its validated redirect set together. Combining a second
+        // policy read with the earlier list's redirects could export a mixed revision.
+        let identity = scoped.clients().subject_policy(&record.id).await?;
+        let mut redirect_uris = identity.redirect_uris;
         redirect_uris.sort();
         let mut post_logout_redirect_uris = record.post_logout_redirect_uris;
         post_logout_redirect_uris.sort();
@@ -739,6 +746,7 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             display_name: record.display_name,
             token_endpoint_auth_method: record.auth_method,
             redirect_uris,
+            subject_policy: identity.policy,
             post_logout_redirect_uris,
             frontchannel_logout_uri: record.frontchannel_logout_uri,
             frontchannel_logout_session_required: record.frontchannel_logout_session_required,
@@ -1200,11 +1208,12 @@ const RESOURCE_SERVER_FORMATS: [&str; 2] = ["at_jwt", "opaque"];
 
 /// Every key a snapshot `client` element may carry. THIS list is the contract:
 /// `reject_unknown_keys` refuses anything else, so any other key is rejected.
-const CLIENT_KEYS: [&str; 16] = [
+const CLIENT_KEYS: [&str; 17] = [
     "client_id",
     "display_name",
     "token_endpoint_auth_method",
     "redirect_uris",
+    "subject_policy",
     "post_logout_redirect_uris",
     "frontchannel_logout_uri",
     "frontchannel_logout_session_required",
@@ -1481,6 +1490,31 @@ fn validate_value(value: &serde_json::Value, violations: &mut Vec<SnapshotViolat
     }
 }
 
+/// Snapshot validation is offline and cannot prove sector-document ownership.
+/// It rejects malformed/unknown policy fields; clients remain excluded from
+/// promotion, and any future activation must use the hardened protocol validator.
+fn validate_client_subject_policy(
+    object: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    violations: &mut Vec<SnapshotViolation>,
+) {
+    let Some(value) = object.get("subject_policy") else {
+        return; // Snapshots predating explicit policy used public subjects.
+    };
+    if !serde_json::from_value::<ClientSubjectPolicy>(value.clone()).is_ok_and(|policy| {
+        // Serde's internally tagged UNIT variant accepts unused fields even with
+        // deny_unknown_fields. Public policy must carry only its discriminator.
+        policy.has_valid_shape()
+            && (policy != ClientSubjectPolicy::Public
+                || value.as_object().is_some_and(|fields| fields.len() == 1))
+    }) {
+        violations.push(SnapshotViolation::new(
+            format!("{path}/subject_policy"),
+            "must be public policy or pairwise policy with a bounded ASCII sector and optional HTTPS document URI; unknown fields are refused",
+        ));
+    }
+}
+
 /// Validate a single resource element of `resource_type` at `path`.
 // One flat per-resource-type match (one arm per promotable type); splitting it would
 // scatter the field-by-field validation the reviewer reads in one place.
@@ -1519,6 +1553,7 @@ fn validate_resource(
                 violations,
             );
             validate_secret_field(object, path, violations);
+            validate_client_subject_policy(object, path, violations);
         }
         ResourceType::ResourceServer => {
             reject_unknown_keys(object, &RESOURCE_SERVER_KEYS, None, path, violations);
@@ -2394,6 +2429,50 @@ mod tests {
                 parsed.to_canonical_string().expect("reserialize"),
                 "validate then re-serialize must be byte-identical"
             );
+        }
+    }
+
+    #[test]
+    fn published_client_schema_includes_identity_policy_without_runtime_fields() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/snapshot/snapshot.schema.json"))
+                .unwrap();
+        let client = &schema["$defs"]["client"];
+        let mut published: Vec<&str> = client["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut expected = super::CLIENT_KEYS.to_vec();
+        expected.push(super::CLIENT_SECRET_KEY);
+        published.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(published, expected);
+        assert_eq!(client["additionalProperties"], false);
+        assert_eq!(
+            client["properties"]["subject_policy"]["$ref"],
+            "#/$defs/client_subject_policy"
+        );
+        for (index, kind, keys) in [
+            (0, "public", vec!["subject_type"]),
+            (
+                1,
+                "pairwise",
+                vec!["sector_identifier", "sector_identifier_uri", "subject_type"],
+            ),
+        ] {
+            let variant = &schema["$defs"]["client_subject_policy"]["oneOf"][index];
+            assert_eq!(variant["additionalProperties"], false);
+            assert_eq!(variant["properties"]["subject_type"]["const"], kind);
+            let mut actual: Vec<&str> = variant["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            actual.sort_unstable();
+            assert_eq!(actual, keys);
         }
     }
 

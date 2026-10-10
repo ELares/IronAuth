@@ -3295,3 +3295,79 @@ async fn a_promoted_delete_can_be_followed_by_a_promoted_re_create() {
         "a soft-deleted row frees its slot, so the same (kind, locale) can come back"
     );
 }
+
+#[tokio::test]
+async fn promotion_preserves_target_subject_policy_salt_and_user_bindings() {
+    use ironauth_store::{ClientId, ClientSubjectPolicy};
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let source = db.seed_scope(&env).await;
+    let target = Scope::new(
+        source.tenant(),
+        db.seed_environment(&env, source.tenant()).await,
+    );
+    create_client(&db, &env, source, "source public app").await;
+    create_client(&db, &env, target, "target pairwise app").await;
+    let client = ClientId::parse_in_scope(&only_client_id(&db, target).await, &target).unwrap();
+    let reader = db.store().scoped(target);
+    let initial = reader.clients().subject_policy(&client).await.unwrap();
+    let acting = reader.acting(db.test_actor(&env), CorrelationId::generate(&env));
+    acting
+        .clients()
+        .set_subject_policy(
+            &env,
+            &initial,
+            &ClientSubjectPolicy::Pairwise {
+                sector_identifier: "target.example.test".to_owned(),
+                sector_identifier_uri: None,
+            },
+            &["https://target.example.test/cb".to_owned()],
+        )
+        .await
+        .unwrap();
+    let identity = reader.clients().subject_policy(&client).await.unwrap();
+    let user = acting
+        .users()
+        .register(&env, "promotion@example.test", "test-hash", None)
+        .await
+        .unwrap();
+    let bound = "c".repeat(43);
+    acting
+        .clients()
+        .bind_subject(&env, &identity, &user, &bound)
+        .await
+        .unwrap();
+    let salt = acting.envelope().ensure_pairwise_salt(&env).await.unwrap();
+    let target_clients = export(&db, target).await.resources.client;
+    set_var(&db, &env, source, "feature", "enabled").await;
+    let source_snapshot = export(&db, source).await;
+    let plan = plan_promotion(&control(&db).scoped(target), &source_snapshot)
+        .await
+        .unwrap()
+        .unwrap();
+    control(&db)
+        .scoped(target)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .apply_promotion(&env, &source_snapshot, plan.base_revision(), false)
+        .await
+        .unwrap();
+    assert_eq!(export(&db, target).await.resources.client, target_clients);
+    assert_eq!(
+        reader.clients().subject_policy(&client).await.unwrap(),
+        identity
+    );
+    assert_eq!(
+        reader
+            .clients()
+            .subject_binding(&client, &user)
+            .await
+            .unwrap(),
+        Some(bound)
+    );
+    assert_eq!(
+        reader.envelope().pairwise_salt().await.unwrap().as_bytes(),
+        salt.as_bytes()
+    );
+    assert!(diff_snapshots(&source_snapshot, &export(&db, target).await).is_empty());
+    assert_eq!(apply_audit_count(&db, target).await, 1);
+}

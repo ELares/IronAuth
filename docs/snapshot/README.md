@@ -95,6 +95,27 @@ three levels can share a `(kind, locale)`: a level-blind writer would overwrite 
 target's own tenant default with a promoted environment body, and the only
 symptom would be mail quietly falling back to the built-in template.
 
+### Client identity policy
+
+Each exported client includes `subject_policy`, read in the same database
+statement as its redirect set. The public form is `{"subject_type":"public"}`.
+The pairwise form adds a canonical `sector_identifier` and, when configured,
+`sector_identifier_uri`. Redirects retain the snapshot's canonical sorted order.
+Older snapshots with no `subject_policy` deserialize as public policy.
+
+Offline import checks the policy's discriminator, field types, bounded ASCII
+sector and HTTPS URI prefix, and refuses unknown fields. It does not fetch the
+sector document or prove that it lists the redirects. An export is not permission
+to activate a policy: any future client-configuration apply path must validate
+sector ownership through the hardened protocol validator before committing.
+The existing promotion engine continues to exclude clients entirely.
+
+Environment salts, per-user issued identity bindings, policy revisions and the
+internal validated-redirect copy never appear in configuration exports. A config
+snapshot is not an identity backup; restoring identity requires the database and
+its envelope-encryption material. Creating a salt or binding a user leaves the
+configuration document byte-identical.
+
 ### Exported is not the same as promoted
 
 Every type above is EXPORTED. A strict subset of them is also applied by the

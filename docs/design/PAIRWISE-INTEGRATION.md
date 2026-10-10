@@ -141,8 +141,11 @@ The documented management API remains required before rollout.
 A bound public identifier survives a later pairwise switch as a documented legacy
 privacy exception. Historical identities issued before binding persistence are
 not reconstructed by these methods. Explicit rollout/migration semantics remain
-required; no live client has been switched. Configuration snapshots must carry
-validated client policy while excluding salts and runtime bindings. The existing
-promotion engine deliberately excludes all OAuth clients because their IDs are
-scoped; pairwise policy must not introduce partial client promotion or silently
-reset a target client. Algorithm policy remains promotable as required by #19.
+required; no live client has been switched. Configuration snapshots now carry
+stored policy and redirects from one coherent read, excluding salts, runtime
+bindings and revisions. Offline validation checks policy shape without fetching;
+it cannot certify current sector-document ownership. Older snapshots default to
+public policy. The promotion engine still excludes all OAuth clients because
+their IDs are scoped. Database qualification checks that a real promotion retains
+the target's identity policy, salt and existing user binding without a reset.
+Algorithm policy remains promotable as required by #19.
