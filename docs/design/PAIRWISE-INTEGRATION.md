@@ -2,9 +2,10 @@
 
 The original #19 and hosted-profile #1385 criteria remain open. This branch
 integrates durable client identity policy with issuance, credential consumers,
-dynamic registration and the management API. It has not been deployed. Legacy
-identity reconciliation, operational cutover and live relying-party qualification
-remain required; generic hashing tests alone do not qualify those behaviors.
+dynamic registration and the management API. The candidate has been deployed
+and qualified with Civio in an isolated local Kubernetes environment. Production
+identity reconciliation and cutover remain required; the qualification below
+is evidence for that copied environment, not a production rollout certificate.
 
 ## Durable salt prerequisite
 
@@ -20,8 +21,9 @@ of silently replacing identity. Debug output redacts the 256-bit value.
 Real PostgreSQL tests cover eight independent concurrent pools, read/retry and
 pool restart, KEK/DEK rotation, ciphertext replay across scopes, corruption,
 crypto-shredding, rollback on audit failure, and byte-identical configuration
-exports before and after provisioning. Backup/restore qualification and live
-token integration are still required. No network endpoint exposes this salt.
+exports before and after provisioning. The encrypted backup/restore and live
+token qualification below provide additional evidence. No network endpoint
+exposes this salt.
 
 ## Sector selection
 
@@ -51,9 +53,10 @@ and [Registration section 5](https://openid.net/specs/openid-connect-registratio
 3. Preserve already-issued identity bindings and define policy-transition
    semantics explicitly. Public-to-pairwise conversion changes the external
    identifier by definition; preserving a previously public value for an old
-   user is a legacy exception to full pairwise privacy. Historical migration and
-   operational cutover remain incomplete. Do not claim an immutable public policy has
-   fulfilled the issue's requested switching behavior.
+   user is a legacy exception to full pairwise privacy. The reconciliation and
+   switching workflow below is qualified locally; production history and cutover
+   still need their own evidence. An immutable public-only policy does not
+   fulfill the requested switching behavior.
 4. Keep local user IDs as all authorization/store keys. Client-aware derivation
    belongs only at the external identity boundary. Direct public-resolver sites
    include authorize, code/refresh, UserInfo (JWT and opaque), introspection
@@ -178,7 +181,8 @@ unchanged. The response counts examined users separately from inserted bindings
 and returns an exclusive user cursor when another page exists. Retrying a page
 is safe and records another attributed backfill attempt. Failed audits roll back
 the entire page. The page limit bounds output and writes, not total source scan
-cost; production-size query qualification remains required.
+cost; the grant-heavy scale qualification below does not bound arbitrary
+source mixes or every client size.
 
 The management workflow below exposes this primitive. It is not rollout
 certification or automatic migration.
@@ -194,8 +198,8 @@ external exchanged actor chains can lack a durable receiving-client/user edge.
 Owner-level history removal and tenant purges are not repaired by this primitive.
 Do not infer completeness from reaching the last page. An explicit strategy for
 these gaps, operational cutover, and live relying-party qualification remain
-prerequisites to enabling pairwise on existing clients. No live client has been
-switched by this work.
+prerequisites to enabling pairwise on existing clients. Only the isolated
+qualification copy has been switched by this work.
 
 ### Legacy activation guard
 
@@ -224,7 +228,7 @@ rewriting its identity. Existing supported deployments have public policy. Do
 not manually flip readiness to bypass reconciliation. Use the audited workflow
 below. Readiness and its receipt are runtime migration state, excluded from
 configuration snapshots and promotion. The workflow is locally qualified; a
-live cutover has not yet been performed.
+production cutover has not yet been performed.
 
 
 ### Operator reconciliation workflow
@@ -306,7 +310,7 @@ This is local database/identity-resolver evidence, not browser or HTTP token
 issuance against a restored deployment. Follow the separate role/key recovery
 requirements in [operations](../OPERATIONS.md#upgrade-back-up-and-recover).
 
-The grant-heavy source workload below provides local scale evidence. A live
+The grant-heavy source workload below provides local scale evidence. Production
 relying-party cutover still needs separate evidence. The scan limit bounds
 output and inserts, not total
 query work. This API must not be treated as proof that all original #19 or Civio
@@ -347,3 +351,40 @@ grant-heavy; it does not establish equivalent timings for every source mix.
 Each page can still scan the selected client's history to deduplicate users.
 Neither the row limit nor this index bounds total work for an arbitrarily large
 client, and the externally reconciled history requirement remains unchanged.
+
+### Civio browser qualification
+
+Candidate `0c64075b` was built on Linux and deployed into an isolated local
+Kubernetes namespace with a copied provider database migrated from 250 to 255.
+Civio `718a5c36` used copied workspace data, a separate PostgreSQL instance and
+an independent IronCache instance. The copied membership issuer was explicitly
+relocated to the candidate origin; this is fixture preparation, not a supported
+production issuer-migration procedure. Artifact and messaging workers were
+omitted from this authentication fixture. The active website/provider stayed on
+their existing versions and the website readiness check remained successful.
+
+Headed Chrome followed actual HTTPS authorization and Civio callback routes,
+without response interception. A copied legacy client started public and pending.
+The audited API recovered nine retained users and imported the six Civio
+membership subjects, recorded an evidence receipt and activated pairwise policy.
+A fresh browser login preserved the existing account's exact Civio user, provider
+subject and administrator role. A newly registered account received a stored
+pairwise subject different from its local user ID; Civio denied it membership
+with `access_denied` instead of granting access by matching email.
+
+Separate browser authorization-code/PKCE exchanges verified EdDSA signatures
+against the served JWKS, exact issuer/audience/nonce and expiration, and equal
+subjects in ID tokens, UserInfo and introspection for both legacy-public and new
+pairwise identities. After replacement of the provider pod, a new exchange kept
+the pairwise subject stable and the existing Civio session still resolved to the
+same user, role and subject. The history receipt and readiness survived. The
+extra callback used for token inspection was removed afterwards. Existing-user
+screens at desktop width and 390 pixels had no horizontal overflow.
+
+This evidence covers an isolated real relying-party flow and process replacement,
+not a production cutover, cluster-node reschedule, arbitrary external history,
+all browser/device combinations or all original #19/Civio milestone criteria.
+The browser accepted the local self-signed certificate; token inspection and
+Civio's provider connection used the configured certificate trust. Stored
+bindings preserving a subject after restart alone do not prove salt recovery;
+the separate envelope and encrypted-backup tests cover that boundary.
