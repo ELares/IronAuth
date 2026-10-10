@@ -839,8 +839,9 @@ pub struct SigningRotationConfig {
     /// the seam where it enters the machine.
     pub max_token_lifetime_secs: u64,
 
-    /// Seconds between timer passes. A pass is idempotent, so an over-long interval
-    /// only delays a scheduled rotation by the interval; it never skips one.
+    /// Seconds between timer passes. A late pass delays activation until a newly
+    /// prepared successor has its full configured pre-publication window; it does
+    /// not backdate publication to recover a missed schedule.
     pub interval_secs: u64,
 }
 

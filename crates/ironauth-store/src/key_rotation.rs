@@ -245,7 +245,14 @@ impl<'a> RotationStateMachine<'a> {
             // 1. SEED THE SUCCESSOR when the pre-publication point is due.
             if seed_due && !has_pending {
                 let key = self
-                    .seed_successor(env, algorithm, material_kind, rotation_micros, policy)
+                    .seed_successor(
+                        env,
+                        algorithm,
+                        material_kind,
+                        rotation_micros,
+                        policy,
+                        Some(now_micros),
+                    )
                     .await?;
                 report
                     .provisioned
@@ -305,7 +312,10 @@ impl<'a> RotationStateMachine<'a> {
     }
 
     /// Provision a pending successor: published `pre_publication` before the rotation
-    /// instant, active at the rotation instant. The material is minted off the entropy
+    /// instant. A late tick or slow material preparation delays activation so that
+    /// publication never starts before preparation finishes. Break-glass explicitly
+    /// omits that floor and retains its immediate, zero-window behavior.
+    /// The material is minted off the entropy
     /// seam, the same generation the day-one set uses. Audited (`signing_key.provision`)
     /// in the same transaction.
     async fn seed_successor(
@@ -315,6 +325,7 @@ impl<'a> RotationStateMachine<'a> {
         material_kind: SigningKeyMaterialKind,
         rotation_micros: i64,
         policy: RotationPolicy,
+        publication_floor_micros: Option<i64>,
     ) -> Result<SigningKeyId, StoreError> {
         let id = SigningKeyId::generate(env, &self.scope);
         let (material_kind, material): (SigningKeyMaterialKind, Vec<u8>) = match self.seed_mode {
@@ -356,13 +367,27 @@ impl<'a> RotationStateMachine<'a> {
                 (material_kind, material)
             }
         };
+        // A planned timestamp is not evidence that an absent key was published.
+        // Read the clock AFTER local/remote preparation, so a slow backend cannot
+        // consume the advertised waiting window either. The supplied tick remains
+        // a lower bound for deterministic callers and backward wall-clock steps.
+        let activation = if let Some(tick) = publication_floor_micros {
+            let prepared = tick.max(crate::repository::epoch_micros(env.clock().now_utc()));
+            rotation_micros.max(
+                prepared
+                    .checked_add(micros(policy.pre_publication_secs))
+                    .ok_or(StoreError::Invalid)?,
+            )
+        } else {
+            rotation_micros
+        };
         let key = NewSigningKey {
             id: &id,
             algorithm,
             material_kind,
             material: &material,
-            publish_at_micros: rotation_micros.saturating_sub(micros(policy.pre_publication_secs)),
-            activate_at_micros: rotation_micros,
+            publish_at_micros: activation.saturating_sub(micros(policy.pre_publication_secs)),
+            activate_at_micros: activation,
             retire_at_micros: None,
             expire_at_micros: None,
         };
@@ -426,6 +451,7 @@ impl<'a> RotationStateMachine<'a> {
                         pre_publication_secs: 0,
                         retirement_buffer_secs: 0,
                     },
+                    None,
                 )
                 .await?;
             self.store
