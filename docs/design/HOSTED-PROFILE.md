@@ -77,8 +77,27 @@ Civio PRs #882 and #883 preserve up to 320 UTF-8 bytes, covering the provider's
 a compact account-settings entry behind `CIVIO_IRONAUTH_HOSTED_PROFILE`. It
 rechecks the same signed-in account before editing and before refreshing the
 existing session label. The update cannot recreate a concurrently revoked
-session. These changes are merged and deployed; the capability remains off
-until the provider and connected browser journey are qualified.
+session. These changes are merged and deployed. The capability is enabled in the two
+local qualification workspaces with the connected checks recorded below.
+
+## Deployed connected browser evidence
+
+An October 10, 2026 Chrome run used the actual TLS provider and Civio settings
+entry, without route interception. Editing, an 80-character non-ASCII name
+(320 UTF-8 bytes), removing the name and returning all refreshed the same Civio
+account subject. Clearing only the provider cookie produced a real refused
+save; reloading offered the registered return, signing in returned to Civio,
+and reopening settings recovered the unconfirmed draft. Explicit reload
+reconciled the saved name. The original qualification account name was restored.
+The 390px layout had no horizontal overflow. Artifacts are retained privately
+under `hosted-profile-201/civio-profile-connected-004`.
+
+This evidence does not establish fresh registration on the deployed provider,
+pairwise subjects, physical-device accessibility or the original cohort goals.
+The provider's supported default remains light. The API response's session
+expiry changed during the browser journey; only the same user, subject and
+CSRF value were asserted there. Session-update invariants have separate backend
+checks and are not inferred from that browser expiry comparison.
 
 ## Required before integrated completion
 
