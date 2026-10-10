@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Show saving/loading state on the hosted profile return link and explain attempts to continue while a request is pending (#1385). Keep the same unsaved-input confirmation and uncertain-save recovery guards.
+
 - Preserve stored signing-key publication, activation, retirement and expiry times in the issuer loader (#19). A PostgreSQL/router/clock regression exercises delayed rotation, cached JWKS, signatures across handoff and eventual withdrawal.
 
 - Reject dynamic-registration updates that enable pairwise for a legacy client with unresolved identity history (#19). Refuse before sector fetching or credential rotation, after applying the saved registration policy chain. New pairwise registrations and legacy public updates remain supported.
