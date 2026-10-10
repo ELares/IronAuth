@@ -10049,8 +10049,12 @@ async fn sealed_backup_dump(
                 .to_string(),
         );
     };
+    // Preserve schema/table/column ACLs: the restored migration ledger means
+    // startup will not replay the GRANTs. Dropping privileges produces a valid
+    // dump that only the restore owner can use. Provision the named roles on
+    // the destination cluster before restoring; role credentials stay external.
     let dump = match std::process::Command::new(&pg_dump)
-        .args(["--no-owner", "--no-privileges", "--dbname", url])
+        .args(["--no-owner", "--dbname", url])
         .output()
     {
         Ok(output) if output.status.success() => output.stdout,

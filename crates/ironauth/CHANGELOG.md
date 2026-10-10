@@ -6,6 +6,14 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Preserve database grants in encrypted logical backups (#19, #153). Restored
+  application and control roles retain table and column permissions; previously
+  the dump omitted grants while preserving the migration ledger, leaving runtime
+  connections unable to use the recovered database. Qualify encrypted recovery
+  after envelope-key rotation across three scopes, including stable public and
+  pairwise identities, policy/reconciliation receipts, missing or wrong envelope
+  keys, forced RLS, and atomic refusal/retry when a destination role is missing.
+
 - Install the hardened sector-document fetcher on the management plane (#19). TLS setup failure leaves explicit sector validation unavailable rather than accepting unchecked policy.
 
 - Refresh the embedded admin console for Preact 11, signals 2.11.3, and Vite 8.3.2.

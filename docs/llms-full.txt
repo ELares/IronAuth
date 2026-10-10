@@ -10065,6 +10065,32 @@ outside it. Test restoration of both in an isolated environment. Config
 snapshots are secret-free exports of promotable environment settings, not
 database or credential backups; see [snapshot format](snapshot/README.md).
 
+`ironauth storage backup --url "$BACKUP_DSN" --out backup.bin --master-key
+backup:file:/path/to/backup.key` creates an encrypted logical dump. Use a
+superuser or authorized `BYPASSRLS` connection. Restore to an isolated, empty
+database with `ironauth storage restore --url "$RESTORE_DSN" --in backup.bin
+--master-key backup:file:/path/to/backup.key` before redirecting serving traffic.
+The restore connection must be authorized to create the dumped objects and
+apply their grants. Ownership is assigned to the restore connection; grants,
+column restrictions and row-level-security policies are preserved.
+
+Provision the database roles named by the source grants and policies on the
+destination cluster first, including `ironauth_app`, `ironauth_control` and
+`ironauth_audit_retention`. Provision any custom roles and required memberships
+separately. Logical backups do not contain cluster roles, passwords or role
+memberships. A missing role aborts the entire restore transaction; provision it
+and retry against the still-empty database. Recover the original platform
+envelope master key separately: the backup encryption key opens the dump but
+does not replace the key that decrypts identity salts and other stored secrets.
+
+Validate with the restricted application and control connections, not only the
+restore owner. Check an existing session, policy/history receipts, an existing
+identity and a previously unbound account's pairwise derivation. Backups made
+before grant preservation omitted ACLs; their restored migration ledger does
+not replay the missing grants. Reconstruct and verify the exact schema-version
+grants from the source or migrations before using such a recovery. Do not grant
+broad table access or delete the migration ledger to work around this condition.
+
 Run the new binary's preflight against a superuser or a separately authorized
 `BYPASSRLS` connection. The command refuses a restricted runtime or schema-owner
 connection because forced row-level security could hide the rows it must inspect:

@@ -294,7 +294,19 @@ Local qualification covers real control-role HTTP requests, rejected permission
 and scope combinations, fresh-privilege requirements, opaque cursor context,
 retries, missing/conflicting history, audit rollback, concurrent finalization,
 and a reconciled legacy client issuing stable verified token/UserInfo identities.
-Production-size source scans, backup restore and a live relying-party cutover
-still need separate evidence. The scan limit bounds output and inserts, not total
+The encrypted CLI backup/restore harness additionally recovers three scopes
+(two environments in one tenant and an environment in another tenant) after
+DEK rotation, salt re-encryption and KEK rotation. Fresh restricted-role pools
+and OIDC identity resolvers retain the exact salt, policy, history receipt and
+existing public/pairwise bindings. A previously unbound account derives the
+expected identity from restored material; a second pool reads that binding.
+Missing or wrong envelope master keys refuse derivation without creating a
+binding or replacing the salt. Database grants and forced RLS survive recovery.
+This is local database/identity-resolver evidence, not browser or HTTP token
+issuance against a restored deployment. Follow the separate role/key recovery
+requirements in [operations](../OPERATIONS.md#upgrade-back-up-and-recover).
+
+Production-size source scans and a live relying-party cutover still need
+separate evidence. The scan limit bounds output and inserts, not total
 query work. This API must not be treated as proof that all original #19 or Civio
 milestone requirements have been completed.
