@@ -92,8 +92,11 @@ reconciled the saved name. The original qualification account name was restored.
 The 390px layout had no horizontal overflow. Artifacts are retained privately
 under `hosted-profile-201/civio-profile-connected-004`.
 
-This evidence does not establish fresh registration on the deployed provider,
-pairwise subjects, physical-device accessibility or the original cohort goals.
+A separate fresh browser context registered through the deployed provider,
+saved an optional name and returned to Civio. Civio refused workspace sign-in
+for that uninvited account; the form does not grant application access. This is
+not an invitation or first-value qualification. Pairwise subjects, physical-device
+accessibility and the original cohort goals remain unqualified.
 The provider's supported default remains light. The API response's session
 expiry changed during the browser journey; only the same user, subject and
 CSRF value were asserted there. Session-update invariants have separate backend
