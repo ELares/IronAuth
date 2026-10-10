@@ -6,6 +6,8 @@
   const save = document.getElementById('profile-save');
   const reload = document.getElementById('profile-reload');
   const status = document.getElementById('profile-status');
+  const back = document.getElementById('profile-return');
+  const backLabel = back ? back.textContent : '';
   let saved = input.value, expected = saved, pending = false, reading = false, leaveApproved = false, uncertain = null;
   const key = root.dataset.key;
   const dirty = () => input.value !== saved || uncertain !== null;
@@ -22,6 +24,11 @@
     reload.disabled = pending;
     save.textContent = pending && !reading ? 'Saving...' : uncertain !== null ? 'Retry same save' : 'Save name';
     reload.textContent = reading ? 'Loading...' : 'Reload saved name';
+    if (back) {
+      back.setAttribute('aria-disabled', String(pending));
+      back.setAttribute('aria-busy', String(pending));
+      back.textContent = pending ? (reading ? 'Loading saved name...' : 'Saving display name...') : backLabel;
+    }
   }
   try {
     const draft = JSON.parse(sessionStorage.getItem(key) || 'null');
@@ -36,9 +43,12 @@
   window.addEventListener('beforeunload', event => {
     if (!leaveApproved && (dirty() || pending)) { event.preventDefault(); event.returnValue = ''; }
   });
-  const back = document.getElementById('profile-return');
   if (back) back.addEventListener('click', event => {
-    if (pending || (dirty() && !window.confirm('Leave without confirming your display name? Your recovery copy stays in this browser tab.'))) event.preventDefault();
+    if (pending) {
+      event.preventDefault();
+      announce(reading ? 'Wait for your saved name to load before continuing.' : 'Your display name is still saving. Continue when the save is confirmed.');
+      status.focus();
+    } else if (dirty() && !window.confirm('Leave without confirming your display name? Your recovery copy stays in this browser tab.')) event.preventDefault();
     else leaveApproved = true;
   });
   async function request(method, body) {
