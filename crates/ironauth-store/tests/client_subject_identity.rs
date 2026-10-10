@@ -44,6 +44,358 @@ async fn audits(db: &TestDatabase, action: &str) -> i64 {
         .unwrap()
 }
 
+// Owner SQL models rows written before immutable bindings existed. These
+// fixtures intentionally include expired/revoked records, not fresh issuance.
+async fn historical_grant(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    client: ClientId,
+    subject: &str,
+    session: Option<ironauth_store::SessionId>,
+) -> ironauth_store::GrantId {
+    let id = ironauth_store::GrantId::generate(env, &scope);
+    sqlx::query("INSERT INTO grants (id,tenant_id,environment_id,client_id,subject,session_ref,revoked_at) VALUES ($1,$2,$3,$4,$5,$6,'2020-01-01Z')")
+        .bind(id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+        .bind(client.to_string()).bind(subject).bind(session.map(|s| s.to_string()))
+        .execute(db.owner_pool()).await.unwrap();
+    id
+}
+
+async fn historical_session(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    subject: &str,
+    actor: &str,
+) -> ironauth_store::SessionId {
+    let id = ironauth_store::SessionId::generate(env, &scope);
+    sqlx::query("INSERT INTO sessions (id,tenant_id,environment_id,subject,auth_methods,auth_time,expires_at,revoked_at,impersonator,impersonation_reason_code,impersonation_reason_text,impersonation_started_at,impersonation_expires_at) VALUES ($1,$2,$3,$4,'pwd','2020-01-01Z','2020-01-01Z','2020-01-01Z',$5,'support_ticket','historical fixture','2020-01-01Z','2020-01-01 00:30Z')")
+        .bind(id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+        .bind(subject).bind(actor).execute(db.owner_pool()).await.unwrap();
+    id
+}
+
+async fn historical_sources(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    client: ClientId,
+    users: &[UserId],
+) {
+    let grant = historical_grant(db, env, scope, client, &users[0].to_string(), None).await;
+    // A refresh-only subject and actor exercise their own branches.
+    sqlx::query("INSERT INTO refresh_families (id,tenant_id,environment_id,grant_id,subject,client_id,created_at,absolute_expires_at,revoked_at,impersonator,impersonation_reason_code,impersonation_expires_at) VALUES ($1,$2,$3,$4,$5,$6,'2020-01-01Z','2020-01-01Z','2020-01-01Z',$7,'support_ticket','2020-01-01Z')")
+        .bind(ironauth_store::RefreshFamilyId::generate(env, &scope).to_string())
+        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(grant.to_string())
+        .bind(users[1].to_string()).bind(client.to_string()).bind(users[2].to_string())
+        .execute(db.owner_pool()).await.unwrap();
+    let session =
+        historical_session(db, env, scope, &users[3].to_string(), &users[4].to_string()).await;
+    sqlx::query("INSERT INTO client_sessions (id,tenant_id,environment_id,session_id,client_id,sid,revoked_at) VALUES ($1,$2,$3,$4,$5,'historical-sid','2020-01-01Z')")
+        .bind(ironauth_store::ClientSessionId::generate(env, &scope).to_string())
+        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(session.to_string())
+        .bind(client.to_string()).execute(db.owner_pool()).await.unwrap();
+    let session =
+        historical_session(db, env, scope, &users[0].to_string(), &users[5].to_string()).await;
+    historical_grant(db, env, scope, client, &users[0].to_string(), Some(session)).await;
+    let acting = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env));
+    // Other-client, no-history, and foreign-scope history must not enroll users.
+    let other = acting.clients().create(env, "other history").await.unwrap();
+    historical_grant(db, env, scope, other, &users[6].to_string(), None).await;
+    let (foreign_scope, foreign_client, foreign_user) = fixture(db, env).await;
+    historical_grant(
+        db,
+        env,
+        foreign_scope,
+        foreign_client,
+        &users[8].to_string(),
+        None,
+    )
+    .await;
+    historical_grant(db, env, scope, client, &foreign_user.to_string(), None).await;
+    historical_grant(db, env, scope, client, "service-principal", None).await;
+    // A deleted account keeps identity history without gaining login eligibility.
+    sqlx::query("UPDATE users SET deleted_at='2020-01-01Z' WHERE id=$1")
+        .bind(users[5].to_string())
+        .execute(db.owner_pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn history_backfill_pages_retained_edges_without_enrolling_unrelated_users() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (scope, client, first) = fixture(&db, &env).await;
+    let acting = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let read = db.store().scoped(scope).clients();
+    let policy = read.subject_policy(&client).await.unwrap();
+    let mut users = vec![first];
+    for i in 1..9 {
+        users.push(
+            acting
+                .users()
+                .register(&env, &format!("history-{i}@example.test"), "hash", None)
+                .await
+                .unwrap(),
+        );
+    }
+    historical_sources(&db, &env, scope, client, &users).await;
+    let mut cursor = None;
+    let mut scanned = 0;
+    let mut inserted = 0;
+    let mut pages = 0;
+    loop {
+        let page = acting
+            .clients()
+            .backfill_public_subject_history(&env, &policy, cursor.as_ref(), 2)
+            .await
+            .unwrap();
+        assert_eq!(page.scanned, 2);
+        let retry = acting
+            .clients()
+            .backfill_public_subject_history(&env, &policy, cursor.as_ref(), 2)
+            .await
+            .unwrap();
+        assert_eq!(retry.scanned, page.scanned);
+        assert_eq!(retry.next_user, page.next_user);
+        assert_eq!(retry.inserted, 0);
+        pages += 1;
+        assert!(pages <= 3, "cursor must make progress");
+        scanned += page.scanned;
+        inserted += page.inserted;
+        cursor = page.next_user;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!((scanned, inserted, pages), (6, 6, 3));
+    for (i, user) in users.iter().enumerate() {
+        assert_eq!(
+            read.subject_binding(&client, user).await.unwrap(),
+            (i < 6).then(|| user.to_string())
+        );
+    }
+    assert_eq!(audits(&db, "client.subject_history.backfill").await, 6);
+    acting
+        .clients()
+        .set_subject_policy(&env, &policy, &pairwise(), &[])
+        .await
+        .unwrap();
+    let current = read.subject_policy(&client).await.unwrap();
+    let candidate = URL_SAFE_NO_PAD.encode([9; 32]);
+    assert_eq!(
+        acting
+            .clients()
+            .bind_subject(&env, &current, &users[0], &candidate)
+            .await
+            .unwrap(),
+        users[0].to_string()
+    );
+    assert_eq!(
+        acting
+            .clients()
+            .bind_subject(&env, &current, &users[7], &candidate)
+            .await
+            .unwrap(),
+        candidate
+    );
+    // Binding lookup preserves history; it is not an authorization decision.
+    assert!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .by_identifier("history-5@example.test")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn history_backfill_refuses_stale_nonpublic_and_foreign_inputs_and_rolls_back_failed_audit() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (scope, client, user) = fixture(&db, &env).await;
+    let acting = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let read = db.store().scoped(scope).clients();
+    let initial = read.subject_policy(&client).await.unwrap();
+    historical_grant(&db, &env, scope, client, &user.to_string(), None).await;
+    for limit in [0, 501] {
+        assert!(matches!(
+            acting
+                .clients()
+                .backfill_public_subject_history(&env, &initial, None, limit)
+                .await,
+            Err(StoreError::Invalid)
+        ));
+    }
+    let (foreign_scope, foreign_client, foreign_user) = fixture(&db, &env).await;
+    let foreign = db
+        .store()
+        .scoped(foreign_scope)
+        .clients()
+        .subject_policy(&foreign_client)
+        .await
+        .unwrap();
+    assert!(matches!(
+        acting
+            .clients()
+            .backfill_public_subject_history(&env, &foreign, None, 10)
+            .await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        acting
+            .clients()
+            .backfill_public_subject_history(&env, &initial, Some(&foreign_user), 10)
+            .await,
+        Err(StoreError::NotFound)
+    ));
+    acting
+        .clients()
+        .set_subject_policy(&env, &initial, &pairwise(), &[])
+        .await
+        .unwrap();
+    let current = read.subject_policy(&client).await.unwrap();
+    for policy in [&initial, &current] {
+        assert!(matches!(
+            acting
+                .clients()
+                .backfill_public_subject_history(&env, policy, None, 10)
+                .await,
+            Err(StoreError::Conflict)
+        ));
+    }
+    acting
+        .clients()
+        .set_subject_policy(&env, &current, &ClientSubjectPolicy::Public, &[])
+        .await
+        .unwrap();
+    let current = read.subject_policy(&client).await.unwrap();
+    assert!(matches!(
+        acting
+            .clients()
+            .backfill_public_subject_history(&env, &initial, None, 10)
+            .await,
+        Err(StoreError::Conflict)
+    ));
+    sqlx::raw_sql("CREATE FUNCTION reject_history_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action='client.subject_history.backfill' THEN RAISE EXCEPTION 'injected history audit failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_history_audit BEFORE INSERT ON audit_log FOR EACH ROW EXECUTE FUNCTION reject_history_audit();")
+        .execute(db.owner_pool()).await.unwrap();
+    assert!(
+        acting
+            .clients()
+            .backfill_public_subject_history(&env, &current, None, 10)
+            .await
+            .is_err()
+    );
+    assert_eq!(read.subject_binding(&client, &user).await.unwrap(), None);
+    assert_eq!(audits(&db, "client.subject_history.backfill").await, 0);
+    sqlx::query("DROP TRIGGER reject_history_audit ON audit_log")
+        .execute(db.owner_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        acting
+            .clients()
+            .backfill_public_subject_history(&env, &current, None, 10)
+            .await
+            .unwrap()
+            .inserted,
+        1
+    );
+}
+
+#[tokio::test]
+async fn history_backfill_concurrent_retries_preserve_an_existing_pairwise_binding() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (scope, client, user) = fixture(&db, &env).await;
+    let acting = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let read = db.store().scoped(scope).clients();
+    let initial = read.subject_policy(&client).await.unwrap();
+    acting
+        .clients()
+        .set_subject_policy(&env, &initial, &pairwise(), &[])
+        .await
+        .unwrap();
+    let current = read.subject_policy(&client).await.unwrap();
+    let candidate = URL_SAFE_NO_PAD.encode([3; 32]);
+    acting
+        .clients()
+        .bind_subject(&env, &current, &user, &candidate)
+        .await
+        .unwrap();
+    acting
+        .clients()
+        .set_subject_policy(&env, &current, &ClientSubjectPolicy::Public, &[])
+        .await
+        .unwrap();
+    let current = read.subject_policy(&client).await.unwrap();
+    historical_grant(&db, &env, scope, client, &user.to_string(), None).await;
+    let second = acting
+        .users()
+        .register(&env, "concurrent-history@example.test", "hash", None)
+        .await
+        .unwrap();
+    historical_grant(&db, &env, scope, client, &second.to_string(), None).await;
+    let clients = acting.clients();
+    let (a, b) = tokio::join!(
+        clients.backfill_public_subject_history(&env, &current, None, 500),
+        clients.backfill_public_subject_history(&env, &current, None, 500)
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!((a.scanned, b.scanned), (2, 2));
+    assert_eq!(a.inserted + b.inserted, 1);
+    assert_eq!(
+        read.subject_binding(&client, &user).await.unwrap(),
+        Some(candidate)
+    );
+    let restarted = db.restart_app_store().await;
+    assert_eq!(
+        restarted
+            .scoped(scope)
+            .clients()
+            .subject_binding(&client, &second)
+            .await
+            .unwrap(),
+        Some(second.to_string())
+    );
+    assert_eq!(audits(&db, "client.subject_history.backfill").await, 2);
+    let empty = acting
+        .clients()
+        .backfill_public_subject_history(
+            &env,
+            &current,
+            Some(
+                &[user, second]
+                    .into_iter()
+                    .max_by_key(ToString::to_string)
+                    .unwrap(),
+            ),
+            500,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (empty.scanned, empty.inserted, empty.next_user),
+        (0, 0, None)
+    );
+}
+
 #[tokio::test]
 async fn policy_and_redirects_persist_atomically_and_stale_aba_validation_is_refused() {
     let db = TestDatabase::start().await;

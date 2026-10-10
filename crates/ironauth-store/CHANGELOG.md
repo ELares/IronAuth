@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add an audited, paginated public-identity history backfill primitive (#19). Recover scoped users and human impersonators from retained grants, refresh families and client sessions, including revoked history. Preserve existing bindings, reject stale policy, and roll back failed audits. This does not certify complete historical recovery or expose a migration endpoint.
+
 - Add a narrow control-plane client identity-policy repository and forward migration 0252 (#19). Grant only four policy columns, recheck live environment and policy/redirect revision under locks, and return the committed audited state without redirect, secret or binding write authority.
 
 - Export client identity policy with a coherent redirect set in configuration snapshots (#19). Accept legacy snapshots as public policy, reject malformed policy fields, and exclude salts, user bindings and revision counters. Keep clients excluded from promotion so target identity remains intact.

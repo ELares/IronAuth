@@ -247,6 +247,77 @@ async fn opaque_machine_introspection_retains_the_service_account_subject() {
     );
 }
 
+#[tokio::test]
+async fn backfilled_legacy_identity_survives_cutover_without_bypassing_account_lifecycle() {
+    let h = Harness::start_store_backed().await;
+    let (client, secret) = h.create_confidential_client(ClientAuthMethod::Basic).await;
+    let auth = format!("Basic {}", STANDARD.encode(format!("{client}:{secret}")));
+    let user = h.seed_unique_user().await;
+    let local = ironauth_store::UserId::parse_in_scope(&user, &h.scope()).unwrap();
+    let read = h.store().scoped(h.scope()).clients();
+    assert_eq!(read.subject_binding(&client, &local).await.unwrap(), None);
+    // Model a pre-binding binary's retained grant without minting through the
+    // new resolver, which would already create the binding under test.
+    sqlx::query("INSERT INTO grants (id,tenant_id,environment_id,client_id,subject,revoked_at) VALUES ($1,$2,$3,$4,$5,'2020-01-01Z')")
+        .bind(ironauth_store::GrantId::generate(h.env(), &h.scope()).to_string())
+        .bind(h.scope().tenant().to_string()).bind(h.scope().environment().to_string())
+        .bind(client.to_string()).bind(&user).execute(h.pool()).await.unwrap();
+    let initial = read.subject_policy(&client).await.unwrap();
+    let (actor, corr) = h.seeding_actor();
+    let page = h
+        .store()
+        .scoped(h.scope())
+        .acting(actor, corr)
+        .clients()
+        .backfill_public_subject_history(h.env(), &initial, None, 500)
+        .await
+        .unwrap();
+    assert_eq!((page.scanned, page.inserted, page.next_user), (1, 1, None));
+    set_policy(&h, &client, &policy("legacy.example.test")).await;
+    let issued = tokens(&h, &client, &auth, &user).await;
+    assert_eq!(
+        id_subject(&h, &client, issued["id_token"].as_str().unwrap()),
+        user
+    );
+    assert_consumers(&h, issued["access_token"].as_str().unwrap(), &auth, &user).await;
+    let newcomer = h.seed_unique_user().await;
+    let fresh = tokens(&h, &client, &auth, &newcomer).await;
+    let fresh_sub = id_subject(&h, &client, fresh["id_token"].as_str().unwrap());
+    assert_ne!(fresh_sub, newcomer);
+    assert_ne!(fresh_sub, user);
+    assert_consumers(
+        &h,
+        fresh["access_token"].as_str().unwrap(),
+        &auth,
+        &fresh_sub,
+    )
+    .await;
+    // An immutable historical binding cannot authorize an inactive local user.
+    let code = h
+        .issue_code_for_subject(&client.to_string(), &user, "openid")
+        .await;
+    h.delete_user(&user).await;
+    for body in [
+        form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT_URI),
+        ]),
+        form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", issued["refresh_token"].as_str().unwrap()),
+        ]),
+    ] {
+        let (status, _, body) = h.token_with_auth(&body, Some(&auth)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json(&body)["error"], "invalid_grant");
+    }
+    assert_eq!(
+        read.subject_binding(&client, &local).await.unwrap(),
+        Some(user)
+    );
+}
+
 async fn exchange_across_sectors(opaque: bool) {
     use ironauth_oidc::GrantType;
     const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";

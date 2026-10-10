@@ -51,8 +51,8 @@ and [Registration section 5](https://openid.net/specs/openid-connect-registratio
 3. Preserve already-issued identity bindings and define policy-transition
    semantics explicitly. Public-to-pairwise conversion changes the external
    identifier by definition; preserving a previously public value for an old
-   user is a legacy exception to full pairwise privacy. No migration choice has
-   been approved or implemented. Do not claim an immutable public policy has
+   user is a legacy exception to full pairwise privacy. Historical migration and
+   operational cutover remain incomplete. Do not claim an immutable public policy has
    fulfilled the issue's requested switching behavior.
 4. Keep local user IDs as all authorization/store keys. Client-aware derivation
    belongs only at the external identity boundary. Direct public-resolver sites
@@ -160,3 +160,38 @@ public policy. The promotion engine still excludes all OAuth clients because
 their IDs are scoped. Database qualification checks that a real promotion retains
 the target's identity policy, salt and existing user binding without a reset.
 Algorithm policy remains promotable as required by #19.
+
+### Retained public history backfill primitive
+
+The store now exposes `backfill_public_subject_history` for one client's retained
+history while its policy is still public. It unions grant subjects, refresh-family
+subjects and impersonators, client-session subjects and impersonators, and
+impersonators on sessions referenced by grants. Every edge is scope constrained
+and joined to a registered user in that scope. Service principals and foreign
+subjects do not become user bindings. Revocation, expiry and soft deletion do not
+erase history; recovering a binding does not restore login eligibility.
+
+Each audited transaction locks and compares the expected public policy revision
+and redirects, then inserts at most 500 immutable bindings. Existing bindings,
+including pairwise bindings on a client later changed back to public, remain
+unchanged. The response counts examined users separately from inserted bindings
+and returns an exclusive user cursor when another page exists. Retrying a page
+is safe and records another attributed backfill attempt. Failed audits roll back
+the entire page. The page limit bounds output and writes, not total source scan
+cost; production-size query qualification remains required.
+
+This is not yet an operator API, rollout certification, or automatic migration.
+Quiesce old issuers before the final pass and policy cutover: an old binary can
+write new public history without consulting immutable bindings. The retained
+edges can also include authorization attempts that never returned a token, so
+their public bindings conservatively preserve recorded relationships rather
+than prove token receipt.
+
+Retained history is incomplete for some legacy paths. The transaction-token
+prototype records issuance only in the audit log, which retention can prune;
+external exchanged actor chains can lack a durable receiving-client/user edge.
+Owner-level history removal and tenant purges are not repaired by this primitive.
+Do not infer completeness from reaching the last page. An explicit strategy for
+these gaps, operational cutover, and live relying-party qualification remain
+prerequisites to enabling pairwise on existing clients. No live client has been
+switched by this work.

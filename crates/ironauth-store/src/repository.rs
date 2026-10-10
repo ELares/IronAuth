@@ -91801,3 +91801,95 @@ impl ActingClientSubjectPolicyRepo<'_> {
         ).await
     }
 }
+
+/// One audited page of retained public-identity history. This is not a claim
+/// that audit-only credential history or an external relying-party roster is complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicSubjectHistoryPage {
+    /// Distinct recorded users examined, including already bound identities.
+    pub scanned: usize,
+    /// New immutable public bindings inserted; existing bindings never change.
+    pub inserted: u64,
+    /// Exclusive cursor for another page, if more retained users were found.
+    pub next_user: Option<UserId>,
+}
+
+impl ActingClientRepo<'_> {
+    /// Backfill one bounded page from retained grants, refresh families and client
+    /// sessions, including scoped human impersonators. Revocation/expiry does not
+    /// erase an issued identity, so historical rows are intentionally included.
+    ///
+    /// Run while the client is still public and legacy issuers are quiesced.
+    /// This primitive cannot reconstruct pruned audit-only transaction tokens or
+    /// external actor chains and does not certify migration completeness.
+    /// It never grants login eligibility to a blocked or deleted account.
+    /// The limit bounds returned users and writes, not the history scan cost.
+    ///
+    /// # Errors
+    /// `NotFound` for foreign identifiers, `Invalid` for a limit outside 1..=500,
+    /// `Conflict` for non-public or stale policy. Persistence/audit failures roll
+    /// back every insertion in the page.
+    pub async fn backfill_public_subject_history(
+        &self,
+        env: &Env,
+        expected: &ClientSubjectPolicySnapshot,
+        after: Option<&UserId>,
+        limit: u32,
+    ) -> Result<PublicSubjectHistoryPage, StoreError> {
+        if expected.client_id.scope() != self.scope
+            || after.is_some_and(|id| id.scope() != self.scope)
+        {
+            return Err(StoreError::NotFound);
+        }
+        if !(1..=500).contains(&limit) {
+            return Err(StoreError::Invalid);
+        }
+        if expected.policy != ClientSubjectPolicy::Public {
+            return Err(StoreError::Conflict);
+        }
+        let scope = self.scope;
+        let id = expected.client_id;
+        let now = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env,
+                action: Action::ClientSubjectHistoryBackfill, target: &id },
+            async move |tx| {
+                let current = sqlx::query("SELECT subject_type, subject_policy_revision, redirect_uris FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR UPDATE")
+                    .bind(id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+                    .fetch_optional(&mut **tx).await?.ok_or(StoreError::NotFound)?;
+                if current.try_get::<String, _>("subject_type")? != "public"
+                    || current.try_get::<i64, _>("subject_policy_revision")? != expected.revision
+                    || current.try_get::<Vec<String>, _>("redirect_uris")? != expected.redirect_uris {
+                    return Err(StoreError::Conflict);
+                }
+                // Match every edge by scope. A service principal, CIMD client or
+                // foreign subject cannot become a local registered-user binding.
+                let rows: Vec<String> = sqlx::query_scalar(
+                    "WITH history(subject) AS ( \
+                     SELECT subject FROM grants WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 \
+                     UNION SELECT subject FROM refresh_families WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 \
+                     UNION SELECT impersonator FROM refresh_families WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 \
+                     UNION SELECT s.subject FROM client_sessions cs JOIN sessions s ON s.id=cs.session_id AND s.tenant_id=cs.tenant_id AND s.environment_id=cs.environment_id WHERE cs.tenant_id=$1 AND cs.environment_id=$2 AND cs.client_id=$3 \
+                     UNION SELECT s.impersonator FROM client_sessions cs JOIN sessions s ON s.id=cs.session_id AND s.tenant_id=cs.tenant_id AND s.environment_id=cs.environment_id WHERE cs.tenant_id=$1 AND cs.environment_id=$2 AND cs.client_id=$3 \
+                     UNION SELECT s.impersonator FROM grants g JOIN sessions s ON s.id=g.session_ref AND s.tenant_id=g.tenant_id AND s.environment_id=g.environment_id WHERE g.tenant_id=$1 AND g.environment_id=$2 AND g.client_id=$3) \
+                     SELECT u.id FROM users u JOIN history h ON h.subject=u.id \
+                     WHERE u.tenant_id=$1 AND u.environment_id=$2 AND ($4::text IS NULL OR u.id COLLATE \"C\" > $4 COLLATE \"C\") \
+                     ORDER BY u.id COLLATE \"C\" LIMIT $5"
+                ).bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
+                    .bind(after.map(ToString::to_string)).bind(i64::from(limit) + 1).fetch_all(&mut **tx).await?;
+                let more = rows.len() > limit as usize;
+                let rows = &rows[..rows.len().min(limit as usize)];
+                let mut inserted = 0;
+                let mut last = None;
+                for raw in rows {
+                    let user = UserId::parse_in_scope(raw, &scope)?;
+                    inserted += sqlx::query("INSERT INTO client_subject_bindings (tenant_id,environment_id,client_id,user_id,external_subject,policy_revision,created_at) VALUES ($1,$2,$3,$4,$4,$5,TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) ON CONFLICT (tenant_id,environment_id,client_id,user_id) DO NOTHING")
+                        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
+                        .bind(raw).bind(expected.revision).bind(now).execute(&mut **tx).await?.rows_affected();
+                    last = Some(user);
+                }
+                Ok(PublicSubjectHistoryPage { scanned: rows.len(), inserted, next_user: if more { last } else { None } })
+            }, false,
+        ).await
+    }
+}

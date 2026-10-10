@@ -199,6 +199,8 @@ pub enum Action {
     ClientSubjectPolicyUpdate,
     /// The first stable external identity binding for a client and user was stored.
     ClientSubjectBind,
+    /// Retained public grant/session history was copied into immutable bindings.
+    ClientSubjectHistoryBackfill,
     /// A tenant was created (management plane, issue #11).
     TenantCreate,
     /// A tenant was offboarded into the GRACE stage (management plane, issue
@@ -1823,6 +1825,7 @@ impl Action {
             Action::ClientUpdated => "client.updated",
             Action::ClientSubjectPolicyUpdate => "client.subject_policy.update",
             Action::ClientSubjectBind => "client.subject.bind",
+            Action::ClientSubjectHistoryBackfill => "client.subject_history.backfill",
             Action::TenantCreate => "tenant.create",
             Action::TenantDelete => "tenant.delete",
             Action::TenantRestore => "tenant.restore",
