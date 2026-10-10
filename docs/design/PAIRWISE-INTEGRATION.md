@@ -6,6 +6,23 @@ persisted subject policy. Generic hashing tests do not qualify token/UserInfo
 parity. The sector resolver changes in this branch are prerequisites, not a
 production pairwise implementation.
 
+## Durable salt prerequisite
+
+The store now provides `EnvelopeRepo::pairwise_salt` and the audited
+`ActingEnvelopeRepo::ensure_pairwise_salt`. They use the existing forced-RLS
+`encrypted_secrets` table and envelope keys, with the reserved purpose
+`oidc.pairwise.subject-salt.v1`. The unique scope/purpose key settles concurrent
+creation; only the winner commits the secret-creation audit. Ordinary
+`put_secret` refuses the reserved purpose. Re-encryption changes ciphertext,
+never salt bytes. Reads and retries refuse corrupt or shredded material instead
+of silently replacing identity. Debug output redacts the 256-bit value.
+
+Real PostgreSQL tests cover eight independent concurrent pools, read/retry and
+pool restart, KEK/DEK rotation, ciphertext replay across scopes, corruption,
+crypto-shredding, rollback on audit failure, and byte-identical configuration
+exports before and after provisioning. Backup/restore qualification and live
+token integration are still required. No network endpoint exposes this salt.
+
 ## Sector selection
 
 Core 8.1 uses the hostname, not the HTTP Host header or its port. The shared

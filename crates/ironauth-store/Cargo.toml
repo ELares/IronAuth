@@ -1192,3 +1192,8 @@ required-features = ["testing"]
 name = "password_reset"
 path = "tests/password_reset.rs"
 required-features = ["testing"]
+
+[[test]]
+name = "pairwise_salt"
+path = "tests/pairwise_salt.rs"
+required-features = ["testing"]
