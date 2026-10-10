@@ -696,15 +696,25 @@ async fn mint_assertion(
     // The impersonation this session was started under (issue #101). A FedCM assertion is an
     // ID token going straight to a relying party, so omitting `act` here would be the same
     // audit hole as omitting it at the token endpoint.
-    let actor = tokens::session_actor(state, scope, &session.session_id, now_micros).await;
+    let impersonation = tokens::session_actor(state, scope, &session.session_id, now_micros)
+        .await
+        .ok()?;
+    let actor = tokens::client_token_actor(
+        state,
+        scope,
+        &client_id_str,
+        impersonation.as_ref().map(|imp| tokens::TokenActor {
+            subject: &imp.impersonator,
+            reason_code: &imp.reason_code,
+        }),
+    )
+    .await
+    .ok()?;
     let request = MintRequest {
         // No RFC 9396 details on this door (issue #131 criterion 4): only the CIBA grant
         // carries an approved document today.
         authorization_details: None,
-        actor: actor.as_ref().map(|imp| tokens::TokenActor {
-            subject: &imp.impersonator,
-            reason_code: &imp.reason_code,
-        }),
+        actor: actor.as_ref().map(tokens::ClientTokenActor::as_token_actor),
         scope,
         issuer: &issuer,
         local_subject: &session.subject,

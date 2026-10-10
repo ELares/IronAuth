@@ -102,14 +102,29 @@ chains remain the verified history. Access rules and audit/storage attribution
 use local principals, including transaction tokens. Mint request types now carry
 local and client-facing subjects separately.
 
-Session impersonation actors and session-template identity boundaries still
-need qualification. Logout hints and backchannel delivery select sessions by
-`sid`, independently of pairwise subjects; regression coverage remains required.
+Session impersonation resolves scoped user actors under the receiving client
+policy for code/refresh, device, implicit/hybrid and FedCM. The original local
+actor and written justification remain in session/family storage; only the
+structured reason accompanies the client-facing actor. Non-user operator and
+workload identifiers retain their existing representation. A missing or unreadable
+session at the actor lookup refuses issuance instead of silently dropping `act`.
+Local user actors must still be eligible to authenticate even when they already
+have a stable client identity binding.
+
+Session templates are an independent credential profile with dedicated keys,
+audiences and token type, not registered OIDC clients. Their subject remains the
+local account; a template audience does not select an OIDC client identity policy.
+Logout hints and backchannel delivery select sessions by `sid`, independently of
+pairwise subjects. Protocol regressions cover cross-browser hint targeting and
+per-client backchannel delivery without a local-subject claim.
 No pairwise registration is exposed. Store-level policy fixtures do not prove
 management API or DCR support.
 
 A bound public identifier survives a later pairwise switch as a documented legacy
 privacy exception. Historical identities issued before binding persistence are
 not reconstructed by these methods. Explicit rollout/migration semantics remain
-required; no live client has been switched. Configuration snapshots/promotion must
-also carry the validated client policy while excluding salts and runtime bindings.
+required; no live client has been switched. Configuration snapshots must carry
+validated client policy while excluding salts and runtime bindings. The existing
+promotion engine deliberately excludes all OAuth clients because their IDs are
+scoped; pairwise policy must not introduce partial client promotion or silently
+reset a target client. Algorithm policy remains promotable as required by #19.

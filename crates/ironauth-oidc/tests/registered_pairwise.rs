@@ -40,14 +40,23 @@ fn policy(sector: &str) -> ClientSubjectPolicy {
 }
 
 async fn tokens(h: &Harness, client: &ClientId, auth: &str, user: &str) -> Value {
+    tokens_for_scope(h, client, auth, user, "openid profile offline_access").await
+}
+
+async fn tokens_for_scope(
+    h: &Harness,
+    client: &ClientId,
+    auth: &str,
+    user: &str,
+    oauth_scope: &str,
+) -> Value {
     let cid = client.to_string();
-    h.grant_consent_scoped(user, &cid, Some("openid profile offline_access"))
-        .await;
+    h.grant_consent_scoped(user, &cid, Some(oauth_scope)).await;
     let cookie = h.session_cookie(user).await;
     let query = format!(
         "response_type=code&client_id={cid}&redirect_uri={}&scope={}&code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256",
         enc(REDIRECT_URI),
-        enc("openid profile offline_access")
+        enc(oauth_scope)
     );
     let (status, headers, _) = h.authorize_with_cookie(&query, &cookie).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
@@ -476,4 +485,55 @@ async fn pairwise_delegation_rebinds_subject_and_actor_to_receiver() {
 #[tokio::test]
 async fn pairwise_transaction_delegation_rebinds_subject_and_actor_to_receiver() {
     delegated_pairwise_identity(true).await;
+}
+
+#[tokio::test]
+async fn pairwise_profile_release_reads_local_account_and_honors_granted_scopes() {
+    for format in [TokenFormat::AtJwt, TokenFormat::Opaque] {
+        let h = Harness::start_store_backed_with(OidcConfig {
+            default_access_token_format: format,
+            ..OidcConfig::default()
+        })
+        .await;
+        let (client, secret) = h.create_confidential_client(ClientAuthMethod::Basic).await;
+        let auth = format!("Basic {}", STANDARD.encode(format!("{client}:{secret}")));
+        set_policy(&h, &client, &policy("profile.example.test")).await;
+        let user = h
+            .seed_user_with_claims(
+                "pairwise-profile@example.test",
+                common::SEED_PASSWORD,
+                r#"{"name":"Ada Lovelace","email":"private@example.test"}"#,
+            )
+            .await;
+        let mut bound_subject = None;
+        for (scope, name) in [
+            ("openid profile offline_access", Some("Ada Lovelace")),
+            ("openid offline_access", None),
+        ] {
+            let issued = tokens_for_scope(&h, &client, &auth, &user, scope).await;
+            let subject = id_subject(&h, &client, issued["id_token"].as_str().unwrap());
+            assert_ne!(subject, user);
+            if let Some(expected) = bound_subject.as_ref() {
+                assert_eq!(&subject, expected);
+            }
+            bound_subject = Some(subject.clone());
+            let request = Request::builder()
+                .uri("/userinfo")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", issued["access_token"].as_str().unwrap()),
+                )
+                .body(Body::empty())
+                .unwrap();
+            let (status, _, body) = h.send(request).await;
+            assert_eq!(status, StatusCode::OK);
+            let claims = json(&body);
+            assert_eq!(claims["sub"], subject);
+            assert_eq!(claims["name"].as_str(), name);
+            assert!(
+                claims.get("email").is_none(),
+                "profile scope cannot release email"
+            );
+        }
+    }
 }

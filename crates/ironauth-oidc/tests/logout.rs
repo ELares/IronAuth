@@ -1069,3 +1069,29 @@ async fn create_foreign_session(harness: &Harness, scope: Scope) -> SessionId {
         .expect("create foreign session");
     session_id
 }
+
+#[tokio::test]
+async fn pairwise_logout_hint_ends_its_own_session_with_another_browser_present() {
+    let h = Harness::start_store_backed().await;
+    common::pairwise::configure(&h, h.client_id(), "logout.example.test").await;
+    let (_, owner_cookie) = seeded_session(&h).await;
+    let (_, other_cookie) = seeded_session(&h).await;
+    let client = h.client_id().to_string();
+    h.register_post_logout_redirects(h.client_id(), &["https://client.test/after"])
+        .await;
+    let hint = mint_id_token(&h, &client, &owner_cookie).await;
+    let verified =
+        ironauth_jose::verify(&hint, &h.id_token_policy(&client), &common::verify_clock()).unwrap();
+    assert_eq!(verified.claims().subject().unwrap().len(), 43);
+    assert!(session_still_authenticates(&h, &owner_cookie).await);
+    assert!(session_still_authenticates(&h, &other_cookie).await);
+    let query = format!(
+        "id_token_hint={}&post_logout_redirect_uri={}",
+        enc(&hint),
+        enc("https://client.test/after")
+    );
+    let (_, headers, _) = get_end_session(&h, &query, &other_cookie).await;
+    assert!(!session_still_authenticates(&h, &owner_cookie).await);
+    assert!(session_still_authenticates(&h, &other_cookie).await);
+    assert!(!headers.contains_key(header::SET_COOKIE));
+}

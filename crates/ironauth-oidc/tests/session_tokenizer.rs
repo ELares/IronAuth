@@ -994,3 +994,26 @@ async fn an_empty_published_set_is_an_error_rather_than_a_document() {
          rejects every token for the window, which is worse than an error it retries: {body}"
     );
 }
+
+#[tokio::test]
+async fn pairwise_client_policy_does_not_redefine_the_independent_session_template() {
+    let h = Harness::start_store_backed().await;
+    common::pairwise::configure(&h, h.client_id(), "oidc.example.test").await;
+    h.install_session_token_template("internal", AUDIENCE, 60, "[]")
+        .await;
+    let user = h.seed_unique_user().await;
+    let external = h
+        .state()
+        .resolve_registered_subject(h.scope(), &h.client_id().to_string(), &user)
+        .await
+        .unwrap();
+    assert_ne!(external, user);
+    let cookie = h.session_cookie(&user).await;
+    let (status, body) = tokenize(&h, "internal", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, jwks) = fetch(&h, &template_jwks_path(&h, "internal")).await;
+    let verified =
+        verify_from_jwks_alone(body["token"].as_str().unwrap(), &jwks, h.issuer(), AUDIENCE)
+            .unwrap();
+    assert_eq!(verified.claims().subject(), Some(user.as_str()));
+}

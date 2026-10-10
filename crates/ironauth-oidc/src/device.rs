@@ -593,7 +593,9 @@ async fn resolve_device_sid(
             // The impersonation this session was started under (issue #101). A device-flow
             // ID token is minted from the SSO session of the human who approved the flow, so
             // it names an impersonator exactly when that approval was made under one.
-            impersonation: tokens::session_actor(state, scope, &session_id, now_micros).await,
+            impersonation: tokens::session_actor(state, scope, &session_id, now_micros)
+                .await
+                .map_err(crate::token::map_store_error)?,
         }),
         // The store's live-session guard found no live SSO session to bind to.
         Err(StoreError::NotFound) => Err(TokenError::InvalidGrant),
@@ -614,6 +616,10 @@ async fn mint_device_tokens(
     let entry = crate::token::grant_issuer_entry(state, scope).await?;
     let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
     let issuer = state.issuer_for(&scope);
+    // Check the approving session (or local account for legacy grants) before
+    // deriving an identity. A fenced account must be invalid_grant, not a binding
+    // failure reported as a retryable server error. This also resolves its RP sid.
+    let session = resolve_device_sid(state, scope, grant).await?;
     let subject = state
         .resolve_registered_subject(scope, &grant.client_id, &grant.subject)
         .await
@@ -643,16 +649,21 @@ async fn mint_device_tokens(
     )
     .await
     .map_err(|_| TokenError::ServerError)?;
-    // The per-client `sid` (issue #32), resolved from the SSO session of the human who
-    // APPROVED this flow at the verification page, through the same (client, session)
-    // row the code flow uses. So a device-flow ID token carries the SAME sid the code
-    // flow would issue for that pair, and discovery's
-    // backchannel_logout_session_supported is true for the device flow too.
-    //
-    // Fails CLOSED: a store error is a server_error, never a silently session-less ID
-    // token that no back-channel logout could target.
-    let session = resolve_device_sid(state, scope, grant).await?;
     let sid = session.sid;
+    let actor = tokens::client_token_actor(
+        state,
+        scope,
+        &grant.client_id,
+        session
+            .impersonation
+            .as_ref()
+            .map(|imp| tokens::TokenActor {
+                subject: &imp.impersonator,
+                reason_code: &imp.reason_code,
+            }),
+    )
+    .await
+    .map_err(crate::token::map_store_error)?;
     tokens::mint(
         state,
         signer,
@@ -661,13 +672,7 @@ async fn mint_device_tokens(
             // No RFC 9396 details on this door (issue #131 criterion 4): only the CIBA grant
             // carries an approved document today.
             authorization_details: None,
-            actor: session
-                .impersonation
-                .as_ref()
-                .map(|imp| tokens::TokenActor {
-                    subject: &imp.impersonator,
-                    reason_code: &imp.reason_code,
-                }),
+            actor: actor.as_ref().map(tokens::ClientTokenActor::as_token_actor),
             scope,
             issuer: &issuer,
             local_subject: &grant.subject,

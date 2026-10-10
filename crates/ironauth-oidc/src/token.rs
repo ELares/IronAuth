@@ -1924,6 +1924,20 @@ async fn mint_tokens(
     // the RFC 8707 resource indicators by the caller (issue #28/#29). No resource
     // resolves to the environment default (the client id as audience), keeping the
     // existing at+jwt/UserInfo behavior intact.
+    let actor = tokens::client_token_actor(
+        state,
+        scope,
+        &bindings.client_id,
+        session
+            .impersonation
+            .as_ref()
+            .map(|imp| tokens::TokenActor {
+                subject: &imp.impersonator,
+                reason_code: &imp.reason_code,
+            }),
+    )
+    .await
+    .map_err(map_store_error)?;
     let minted = tokens::mint(
         state,
         signer,
@@ -1935,13 +1949,7 @@ async fn mint_tokens(
             // The `act` claim comes from the SESSION, never from the request (issue #101).
             // It rides the same read that proved the session live, so a token cannot claim
             // an impersonation the liveness check did not agree with.
-            actor: session
-                .impersonation
-                .as_ref()
-                .map(|imp| tokens::TokenActor {
-                    subject: &imp.impersonator,
-                    reason_code: &imp.reason_code,
-                }),
+            actor: actor.as_ref().map(tokens::ClientTokenActor::as_token_actor),
             scope,
             issuer: &issuer,
             local_subject: &bindings.subject,
@@ -3101,6 +3109,20 @@ async fn mint_refresh_access(
         &mut extra_claims,
     )
     .await?;
+    let actor = tokens::client_token_actor(
+        state,
+        scope,
+        &resolution.client_id,
+        resolution
+            .impersonation
+            .as_ref()
+            .map(|imp| tokens::TokenActor {
+                subject: &imp.impersonator,
+                reason_code: &imp.reason_code,
+            }),
+    )
+    .await
+    .map_err(map_store_error)?;
     let minted = tokens::mint_access_token(
         state,
         signer,
@@ -3113,13 +3135,7 @@ async fn mint_refresh_access(
             // the family was minted. The bound checked earlier means a family past its cap
             // never reaches here, so a token carrying this claim is one the impersonation
             // still authorizes.
-            actor: resolution
-                .impersonation
-                .as_ref()
-                .map(|imp| tokens::TokenActor {
-                    subject: &imp.impersonator,
-                    reason_code: &imp.reason_code,
-                }),
+            actor: actor.as_ref().map(tokens::ClientTokenActor::as_token_actor),
             scope,
             issuer: &issuer,
             local_subject: &resolution.subject,

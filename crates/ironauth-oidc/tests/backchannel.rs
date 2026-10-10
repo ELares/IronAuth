@@ -987,3 +987,48 @@ async fn a_worker_in_tenant_a_never_sends_tenant_b_logout_tokens() {
         "B has no deliveries: the A workers never touched B"
     );
 }
+
+#[tokio::test]
+async fn pairwise_clients_receive_only_their_own_logout_session_reference() {
+    let h = Harness::start_store_backed().await;
+    let scope = h.scope();
+    let user = h.seed_unique_user().await;
+    let (session, _) = h.session_with_id(&user, "pwd", 0).await;
+    let (a, sid_a) = participant(h.store(), h.env(), scope, &session, "https://a.example/bc").await;
+    let (b, sid_b) = participant(h.store(), h.env(), scope, &session, "https://b.example/bc").await;
+    common::pairwise::configure(&h, &a, "a.example").await;
+    common::pairwise::configure(&h, &b, "b.example").await;
+    let subject_a = h
+        .state()
+        .resolve_registered_subject(scope, &a.to_string(), &user)
+        .await
+        .unwrap();
+    let subject_b = h
+        .state()
+        .resolve_registered_subject(scope, &b.to_string(), &user)
+        .await
+        .unwrap();
+    assert_ne!(subject_a, subject_b);
+    end_session(h.store(), h.env(), scope, &session).await;
+    let sender = MockSender::default();
+    let (_, delivered) = drain_both(&h, scope, &sender, 5).await;
+    assert_eq!(delivered.completed, 2);
+    for (uri, token) in sender.sent() {
+        let (client, sid) = if uri == "https://a.example/bc" {
+            (&a, &sid_a)
+        } else {
+            (&b, &sid_b)
+        };
+        let verified = verify(
+            &token,
+            &h.logout_token_policy(&client.to_string()),
+            &common::verify_clock(),
+        )
+        .unwrap();
+        assert_eq!(
+            verified.claims().get("sid").and_then(Value::as_str),
+            Some(sid.as_str())
+        );
+        assert!(verified.claims().subject().is_none());
+    }
+}
