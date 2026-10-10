@@ -3020,6 +3020,26 @@ impl OidcState {
         )
     }
 
+    /// Derive a client-facing identifier for a trusted stored grant principal.
+    /// User identities follow client policy; existing workload mappings retain
+    /// their principal. Callers must separately enforce lifecycle/authorization.
+    ///
+    /// # Errors
+    /// Refuses foreign user IDs and any failure to resolve a user's binding.
+    pub(crate) async fn resolve_grant_subject(
+        &self,
+        scope: Scope,
+        client_id: &str,
+        local_subject: &str,
+    ) -> Result<String, ironauth_store::StoreError> {
+        if ironauth_store::UserId::parse_declared_scope(local_subject).is_ok() {
+            self.resolve_registered_subject(scope, client_id, local_subject)
+                .await
+        } else {
+            Ok(local_subject.to_owned())
+        }
+    }
+
     /// Resolve a registered user's client-facing identity from durable policy,
     /// salt and immutable bindings. Local IDs remain the authorization keys.
     /// This does not authorize a grant or replace user lifecycle validation.

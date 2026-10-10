@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod fapi;
+pub mod pairwise;
 
 use std::sync::Arc;
 use std::time::SystemTime;

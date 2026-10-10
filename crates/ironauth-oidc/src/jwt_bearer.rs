@@ -959,6 +959,10 @@ async fn resolve_issuer_keys(
 /// `resolve_access_token_target` seam with no resource, an empty resource set), so
 /// its `aud` is the client and it stays revocable/introspectable by the #22
 /// endpoints. There is NO ID token and NO refresh token (RFC 7521 4.1).
+#[allow(
+    clippy::too_many_lines,
+    reason = "ordered mint and persistence steps keep local and external identity boundaries visible"
+)]
 async fn mint_and_persist(
     state: &OidcState,
     scope: Scope,
@@ -1016,6 +1020,10 @@ async fn mint_and_persist(
     // path to the very token the declared tool set exists to bound.
     let agent =
         crate::token::gate_agent_issuance(state, scope, client_id_str, requested_scope).await?;
+    let external_subject = state
+        .resolve_grant_subject(scope, client_id_str, principal)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
     let (minted, expires_in) = tokens::mint_client_credentials_access_token(
         state,
         signer,
@@ -1023,7 +1031,8 @@ async fn mint_and_persist(
         &ClientCredentialsMintRequest {
             scope,
             issuer: &issuer,
-            subject: principal,
+            local_subject: principal,
+            subject: &external_subject,
             // The machine identity's organization and roles (issue #126), resolved through the
             // ONE shared helper so all three doors that mint under a service-account principal
             // answer alike. `(None, None)` for a subject that is not one.

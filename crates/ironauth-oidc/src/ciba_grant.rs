@@ -277,7 +277,10 @@ async fn mint_ciba_tokens(
     let entry = crate::token::grant_issuer_entry(state, scope).await?;
     let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
     let issuer = state.issuer_for(&scope);
-    let subject = state.resolve_public_subject(&approved.subject);
+    let subject = state
+        .resolve_registered_subject(scope, client_id, &approved.subject)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
     let client_id = client_id.to_owned();
     let target = state
         .resolve_access_token_target(&scope, &[], &client_id)
@@ -386,6 +389,7 @@ async fn mint_ciba_tokens(
             actor: None,
             scope,
             issuer: &issuer,
+            local_subject: &approved.subject,
             subject: &subject,
             client_id: &client_id,
             nonce: None,

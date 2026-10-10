@@ -614,7 +614,10 @@ async fn mint_device_tokens(
     let entry = crate::token::grant_issuer_entry(state, scope).await?;
     let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
     let issuer = state.issuer_for(&scope);
-    let subject = state.resolve_public_subject(&grant.subject);
+    let subject = state
+        .resolve_registered_subject(scope, &grant.client_id, &grant.subject)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
     let target = state
         .resolve_access_token_target(&scope, &[], &grant.client_id)
         .await
@@ -667,6 +670,7 @@ async fn mint_device_tokens(
                 }),
             scope,
             issuer: &issuer,
+            local_subject: &grant.subject,
             subject: &subject,
             client_id: &grant.client_id,
             nonce: None,

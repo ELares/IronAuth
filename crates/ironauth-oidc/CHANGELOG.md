@@ -6,7 +6,7 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
-- Begin wiring durable client-aware subject derivation into code/refresh issuance, UserInfo and introspection (#19). Remaining grant/consumer paths and registration surfaces are not yet integrated; pairwise registration must remain disabled until they are complete.
+- Apply persisted client identities to code/refresh, UserInfo/introspection, device/CIBA, implicit/FedCM, native SSO, recipient proof, mapped user assertions and token exchange (#19). Keep local account IDs for access rules, lifecycle checks and stored grants; exchanges emit the receiving client's subject and actor identifiers. Registration remains disabled pending the remaining integration and rollout work.
 
 - Resolve pairwise sector hostnames independently of network ports and DNS case (#19). Require an explicit sector document for mixed hosts, hostless native redirects or an empty redirect set; validate supplied documents through the hardened fetcher even for single-host clients. Registration/token wiring remains pending.
 

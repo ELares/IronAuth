@@ -1035,3 +1035,36 @@ async fn proof_enforces_verified_client_and_subject_request_budgets() {
         );
     }
 }
+
+#[tokio::test]
+async fn pairwise_recipient_proof_matches_the_verified_client_identity() {
+    let h = Harness::start_store_backed().await;
+    common::pairwise::configure(&h, h.client_id(), "recipient.example.test").await;
+    let user = h
+        .seed_user_with_claims(EMAIL, SEED_PASSWORD, r#"{"email":"owner@example.test"}"#)
+        .await;
+    let cookie = h.session_cookie_at(&user, "pwd", now(&h)).await;
+    let access = token_for(&h, &user).await;
+    let transport = Arc::new(OwnedTransport::default());
+    let router = enabled_router(&h, transport.clone());
+    finish(&h, &router, &transport, &cookie).await;
+    let (status, _, proof) = post(
+        &router,
+        &route(&h, "recipient-proof"),
+        None,
+        Some(&access),
+        None,
+        &json!({"email": "owner@example.test", "nonce": NONCE}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let verified = ironauth_jose::verify(
+        &access,
+        &h.access_token_policy(&h.client_id().to_string()),
+        &common::verify_clock(),
+    )
+    .unwrap();
+    assert_ne!(verified.claims().subject(), Some(user.as_str()));
+    assert_eq!(proof["sub"].as_str(), verified.claims().subject());
+    assert_eq!(proof["aud"], h.client_id().to_string());
+}

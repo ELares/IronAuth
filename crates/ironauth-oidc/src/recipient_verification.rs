@@ -382,11 +382,18 @@ pub(crate) async fn proof(
     if expires <= now {
         return refused();
     }
+    let subject = match state
+        .resolve_registered_subject(scope, &principal.client_id, &principal.subject.to_string())
+        .await
+    {
+        Ok(subject) => subject,
+        Err(error) => return store_error(&error),
+    };
     response(
         StatusCode::OK,
         json!({
             "purpose": "invitation_recipient", "iss": issuer, "aud": principal.client_id,
-            "sub": state.resolve_public_subject(&principal.subject.to_string()), "nonce": body.nonce,
+            "sub": subject, "nonce": body.nonce,
             "recipient_matches": true, "verification_revision": current.revision.to_string(),
             "verified_at_unix_micros": current.verified_at_unix_micros,
             "checked_at_unix_micros": now, "expires_at_unix_micros": expires,

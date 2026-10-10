@@ -1524,8 +1524,11 @@ async fn mint_front_channel_id_token(
     // The `sub` is resolved through the ONE shared derivation, so a front-channel
     // ID token's subject can never diverge from what the token endpoint or UserInfo
     // returns for the same client and user.
-    let subject = state.resolve_public_subject(resolved.subject);
     let client_id_str = client_id.to_string();
+    let subject = state
+        .resolve_registered_subject(scope, &client_id_str, resolved.subject)
+        .await
+        .map_err(|_| ())?;
     // The per-client `sid` (issue #32), resolved from the SAME authenticating SSO
     // session and through the SAME (client, session) row the token endpoint uses, so an
     // implicit/hybrid ID token carries the SAME sid the code flow would issue for this
@@ -1587,6 +1590,7 @@ async fn mint_front_channel_id_token(
             }),
         scope,
         issuer: iss,
+        local_subject: resolved.subject,
         subject: &subject,
         client_id: &client_id_str,
         nonce: resolved.nonce,

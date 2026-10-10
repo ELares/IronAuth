@@ -89,10 +89,24 @@ back both policy revisions and binding inserts. Bindings carry composite scoped
 foreign keys and no direct UPDATE/DELETE grants.
 
 The OIDC adapter reads durable policy/salt and binds through the shared derivation.
-Code/refresh issuance, UserInfo and opaque/refresh introspection are being wired.
-Machine opaque-token introspection retains its service-account identity. The
-remaining production paths still need conversion before any pairwise registration
-is exposed. Store-level policy fixtures do not prove management API or DCR support.
+Code/refresh issuance, UserInfo, opaque/refresh introspection, front-channel ID
+tokens, device and CIBA grants, FedCM assertions, recipient proofs, mapped JWT
+bearer users and native SSO now use registered-client identities. FedCM account
+selection remains a provider-scoped browser handle. Workload mappings retain
+their existing principal identifiers.
+
+Token exchange recovers the local principal from the verified token's scoped
+stored grant and checks its original client binding before authorizing it. New
+subject/actor identifiers follow the receiving client policy; historical actor
+chains remain the verified history. Access rules and audit/storage attribution
+use local principals, including transaction tokens. Mint request types now carry
+local and client-facing subjects separately.
+
+Session impersonation actors and session-template identity boundaries still
+need qualification. Logout hints and backchannel delivery select sessions by
+`sid`, independently of pairwise subjects; regression coverage remains required.
+No pairwise registration is exposed. Store-level policy fixtures do not prove
+management API or DCR support.
 
 A bound public identifier survives a later pairwise switch as a documented legacy
 privacy exception. Historical identities issued before binding persistence are

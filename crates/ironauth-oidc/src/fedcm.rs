@@ -33,7 +33,7 @@
 //! | RP identity binding | `validate_registered_redirect` (exact string) | request `Origin` must EXACT-match an origin derived from the client's registered `https` `redirect_uris` ([`crate::state::origin_of`], Fork B1) -- the SAME registration data |
 //! | consent honored | [`ironauth_store::ConsentRepo::granted_ref`] + [`crate::authorize::consent_covers_scope`]/[`crate::authorize::consent_expired`] | SAME `(subject, client_id)` consent read and the SAME first-party carve-out / quarantine rule; unmet -> FedCM error, never a token |
 //! | audience binding | `MintRequest.client_id` | identical `aud = client_id` |
-//! | subject derivation | [`OidcState::resolve_public_subject`] | identical (the ONE subject function) |
+//! | subject derivation | [`OidcState::resolve_registered_subject`] | same durable client policy and binding |
 //! | signing / issuer | `sign_jws_with_policy` + per-env issuer registry | identical, via [`crate::tokens::mint_id_token`] -- NEVER a parallel/looser mint |
 //! | replay defense | (redirect: single-use code) | single-use `(scope, client_id, nonce)` latch, reserve-then-consume (migration 0063) |
 //!
@@ -54,8 +54,9 @@
 //!   is the sole authenticator; no client-supplied origin or account is ever trusted)
 //!   and **uncacheable** (`Cache-Control: no-store`), so a stale populated body can
 //!   never be replayed to a logged-out browser.
-//! - The account `id` is the per-ENV PUBLIC subject (through the ONE subject function,
-//!   [`OidcState::resolve_public_subject`]), never the raw local user id.
+//! - The account `id` is a provider-scoped selection handle, currently the public
+//!   local user ID. Only the assertion is client-specific; the accounts response is
+//!   intended for the browser and must not be exposed to relying-party scripts.
 
 use axum::extract::{Form, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -227,9 +228,8 @@ pub(crate) async fn accounts(
         return uncacheable_json(StatusCode::OK, r#"{"accounts":[]}"#.to_owned());
     };
 
-    // The account id is the per-ENV PUBLIC subject through the ONE subject function
-    // (pairwise if configured), so it matches what UserInfo / the redirect flow emit
-    // for this env and never discloses the raw local user id.
+    // Account selection happens before an RP client is validated. This browser-only
+    // handle stays provider-scoped; assertion issuance applies the RP identity policy.
     let public_subject = state.resolve_public_subject(&session.subject);
 
     // Open the sealed PII server-side through the exact UserInfo seam. An absent or
@@ -486,7 +486,7 @@ async fn fedcm_consent_satisfied(
 ///     so a refused request never BURNS a fresh nonce: a nonce is consumed only for a
 ///     request that goes on to mint;
 /// 11. the ID token is minted through [`tokens::mint_id_token`] (`aud = client_id`,
-///     `sub = resolve_public_subject(session.subject)`, `iss` = the per-env issuer,
+///     `sub` = the registered client identity, `iss` = the per-env issuer,
 ///     `nonce` echoed, the per-env signing policy) and the issuance is audited.
 ///
 /// On success the response is `{"token": "<jwt>"}` with `Cache-Control: no-store` and
@@ -602,9 +602,16 @@ pub(crate) async fn assertion(
         return assertion_refused();
     }
 
+    // The browser's account-selection handle is provider-scoped. The assertion
+    // goes to a validated RP and must instead carry that client's stable identity.
+    let Ok(subject) = state
+        .resolve_registered_subject(scope, &client_id.to_string(), &session.subject)
+        .await
+    else {
+        return assertion_server_error();
+    };
     // 11. Mint the ID token through the EXACT redirect-flow minting core, and audit.
-    let Some(token) =
-        mint_assertion(&state, scope, &client, &session, &public_subject, nonce).await
+    let Some(token) = mint_assertion(&state, scope, &client, &session, &subject, nonce).await
     else {
         return assertion_server_error();
     };
@@ -643,7 +650,7 @@ async fn mint_assertion(
     scope: ironauth_store::Scope,
     client: &ClientRecord,
     session: &AuthenticatedSession,
-    public_subject: &str,
+    external_subject: &str,
     nonce: &str,
 ) -> Option<String> {
     let entry = state.issuer_entry(&scope).await?;
@@ -681,7 +688,7 @@ async fn mint_assertion(
         scope,
         &client_id_str,
         "urn:ietf:params:oauth:grant-type:fedcm",
-        Some(public_subject),
+        Some(&session.subject),
         &mut extra_claims,
     )
     .await
@@ -700,7 +707,8 @@ async fn mint_assertion(
         }),
         scope,
         issuer: &issuer,
-        subject: public_subject,
+        local_subject: &session.subject,
+        subject: external_subject,
         client_id: &client_id_str,
         nonce: Some(nonce),
         // FedCM issues no access token, so there is no granted OAuth scope to echo.

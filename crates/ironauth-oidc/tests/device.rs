@@ -1515,3 +1515,42 @@ async fn a_device_redemption_meters_every_token_it_mints() {
         );
     }
 }
+
+#[tokio::test]
+async fn pairwise_device_approval_issues_the_registered_client_identity() {
+    let h = Harness::start_store_backed().await;
+    let client = *h.client_id();
+    h.enable_device_grant(&client, DEVICE_GRANTS, None).await;
+    common::pairwise::configure(&h, &client, "device.example.test").await;
+    let user = h.seed_unique_user().await;
+    let cookie = h.session_cookie(&user).await;
+    h.grant_consent(&user, &client.to_string()).await;
+    let flow = start_flow(&h, &client.to_string(), Some("openid")).await;
+    approve_as(&h, flow["user_code"].as_str().unwrap(), &cookie).await;
+    h.clock().advance(Duration::from_secs(INTERVAL_SECS + 1));
+    let (status, body) = poll(
+        &h,
+        flow["device_code"].as_str().unwrap(),
+        &client.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let expected = h
+        .state()
+        .resolve_registered_subject(h.scope(), &client.to_string(), &user)
+        .await
+        .unwrap();
+    assert_ne!(expected, user);
+    for (field, policy) in [
+        ("id_token", h.id_token_policy(&client.to_string())),
+        ("access_token", h.access_token_policy(&client.to_string())),
+    ] {
+        let verified = verify(
+            body[field].as_str().unwrap(),
+            &policy,
+            &common::verify_clock(),
+        )
+        .unwrap();
+        assert_eq!(verified.claims().subject(), Some(expected.as_str()));
+    }
+}

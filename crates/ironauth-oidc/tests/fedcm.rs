@@ -1147,3 +1147,32 @@ async fn a_fenced_user_gets_no_fedcm_assertion() {
         "and no token in the body: {body}"
     );
 }
+
+#[tokio::test]
+async fn pairwise_assertion_uses_rp_identity_and_keeps_browser_account_selection() {
+    let (h, client, user, account, cookie) = armed_assertion_harness().await;
+    common::pairwise::configure(&h, h.client_id(), "fedcm.example.test").await;
+    let expected = h
+        .state()
+        .resolve_registered_subject(h.scope(), &client, &user)
+        .await
+        .unwrap();
+    assert_ne!(expected, account);
+    let (status, _, body) = assertion_post(
+        &h,
+        &assertion_form(&client, &account, "pairwise-assertion"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result = json(&body);
+    let verified = verify(
+        result["token"].as_str().unwrap(),
+        &h.id_token_policy(&client),
+        &common::verify_clock(),
+    )
+    .unwrap();
+    assert_eq!(verified.claims().subject(), Some(expected.as_str()));
+}

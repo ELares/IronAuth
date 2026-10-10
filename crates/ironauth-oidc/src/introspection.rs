@@ -651,17 +651,11 @@ async fn resolve_opaque(
         .resolve_opaque_access_token(token, epoch_micros(state))
         .await
         .ok()??;
-    // Machine principals are not human pairwise identities. The opaque row is
-    // already resolved through its live grant; retain its scoped service-account ID.
-    let external_subject =
-        if ironauth_store::ServiceAccountId::parse_in_scope(&active.subject, &scope).is_ok() {
-            active.subject.clone()
-        } else {
-            state
-                .resolve_registered_subject(scope, &active.client_id, &active.subject)
-                .await
-                .ok()?
-        };
+    // The resolved row contains the local grant principal, not a wire identifier.
+    let external_subject = state
+        .resolve_grant_subject(scope, &active.client_id, &active.subject)
+        .await
+        .ok()?;
     Some(IntrospectionClaims {
         active: true,
         // An opaque token carries no claims, so no chain is observable; an exchange from

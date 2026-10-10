@@ -403,6 +403,7 @@ async fn mint_and_persist(
         &ClientCredentialsMintRequest {
             scope,
             issuer: &issuer,
+            local_subject: &subject,
             subject: &subject,
             // The machine identity's organization and roles (issue #126), resolved through the
             // ONE shared helper so all three doors that mint under a service-account principal

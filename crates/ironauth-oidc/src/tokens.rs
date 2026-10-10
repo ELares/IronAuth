@@ -444,7 +444,9 @@ pub struct MintRequest<'a> {
     pub scope: Scope,
     /// The per-environment issuer.
     pub issuer: &'a str,
-    /// The authenticated end-user subject.
+    /// The local account used by authorization rules.
+    pub local_subject: &'a str,
+    /// The client-facing end-user identifier emitted in tokens.
     pub subject: &'a str,
     /// The client the tokens are for (the ID token audience and the access
     /// token's `client_id`).
@@ -986,8 +988,10 @@ pub struct ClientCredentialsMintRequest<'a> {
     pub scope: Scope,
     /// The per-environment issuer.
     pub issuer: &'a str,
-    /// The STABLE service-account principal id (a `sva_` id): the token's `sub`,
-    /// DISTINCT from `client_id` and consistent across issuances.
+    /// The local principal used by authorization rules.
+    pub local_subject: &'a str,
+    /// The client-facing subject. For machine identities this remains the stable
+    /// service-account principal; exchanged user identities follow client policy.
     pub subject: &'a str,
     /// The authenticated OAuth client (the token's `client_id`).
     pub client_id: &'a str,
@@ -1311,7 +1315,7 @@ pub async fn mint_client_credentials_access_token(
     // rule reading `acr_at_least = "pwd"` would then admit a token that authenticated nobody.
     // `None` satisfies no floor, so such a rule simply does not select a machine token, which
     // is the honest answer.
-    if let Some(rule) = issuance_refusal(state, request.subject, None, request.roles) {
+    if let Some(rule) = issuance_refusal(state, request.local_subject, None, request.roles) {
         tracing::info!(rule = %rule, "an access rule refused a machine token issuance");
         return Err(MintRefusal::Policy { rule });
     }
@@ -1565,7 +1569,7 @@ async fn mint_access(
     // calling the same mint.
     if let Some(rule) = issuance_refusal(
         state,
-        request.subject,
+        request.local_subject,
         Some(issued_acr(request.auth_methods)),
         request.roles,
     ) {
@@ -1918,7 +1922,7 @@ pub fn mint_id_token(
     // refused subject receiving an identity receipt.
     if let Some(rule) = issuance_refusal(
         state,
-        request.subject,
+        request.local_subject,
         Some(issued_acr(request.auth_methods)),
         request.roles,
     ) {
@@ -2554,6 +2558,7 @@ mod tests {
             actor: None,
             scope,
             issuer: "https://issuer.test/t/x/e/y",
+            local_subject: subject,
             subject,
             client_id: "cli_example",
             nonce: None,
@@ -3184,6 +3189,7 @@ mod tests {
             roles: None,
             scope: req.scope,
             issuer: "https://issuer.test/t/x/e/y",
+            local_subject: "sva_machine",
             subject: "sva_machine",
             client_id: "cli_example",
             oauth_scope: None,
@@ -3260,6 +3266,7 @@ mod tests {
                 Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env))
             },
             issuer: "https://issuer.test/t/x/e/y",
+            local_subject: "sva_machine",
             subject: "sva_machine",
             client_id: "cli_example",
             oauth_scope: Some("api"),
@@ -3449,6 +3456,7 @@ mod tests {
             roles: None,
             scope,
             issuer: "https://issuer.test/t/x/e/y",
+            local_subject: subject,
             subject,
             client_id: "cli_example",
             oauth_scope: None,

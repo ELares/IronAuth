@@ -82,7 +82,7 @@
 //!   is that the FIRST hop mints and later hops REQUEST A REPLACEMENT carrying the same `txn`;
 //!   the replacement flow is not implemented.
 //! - **No `sub_id`.** The draft allows a structured subject identifier (RFC 9493); this carries
-//!   the plain `sub` the subject token carried.
+//!   the receiving client's subject identifier, derived from the verified local grant.
 //! - **One trust domain per PROCESS, shared by every tenant.** The domain is a single
 //!   `OidcConfig` field read once at boot, while the issuer is per (tenant, environment) -- so
 //!   every tenant this process serves mints with the SAME `aud`. For a multi-tenant deployment
@@ -236,8 +236,10 @@ pub struct ExchangeInputs<'a> {
     pub client_id: &'a ironauth_store::ClientId,
     /// The workload asking, as a string for the token's `rctx`.
     pub requester: &'a str,
-    /// The person, from the revalidated subject token.
+    /// The local principal from the revalidated token's grant, for rules/audit.
     pub subject: &'a str,
+    /// The receiving client's identifier emitted in the transaction token.
+    pub external_subject: &'a str,
     /// What this exchange was DECIDED to authorize: the narrowed scope, not the subject token's
     /// full set. A caller that asked for less must not receive a token asserting more.
     pub authorization_context: &'a std::collections::BTreeSet<String>,
@@ -315,7 +317,7 @@ pub async fn issue_transaction_token(
         &TransactionTokenRequest {
             issuer: &state.issuer_for(&scope),
             trust_domain,
-            subject: inputs.subject,
+            subject: inputs.external_subject,
             requester: inputs.requester,
             authorization_context: &context,
             // NO `purp`. The draft defines the claim and defines no request parameter that

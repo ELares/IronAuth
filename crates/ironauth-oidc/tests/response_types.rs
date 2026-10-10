@@ -674,3 +674,27 @@ async fn a_fenced_user_mints_no_front_channel_id_token() {
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn pairwise_implicit_id_token_uses_the_registered_client_identity() {
+    let h = Harness::start_store_backed_with(legacy_enabled()).await;
+    common::pairwise::configure(&h, h.client_id(), "implicit.example.test").await;
+    let client = h.client_id().to_string();
+    let (user, cookie) = consenting_subject(&h, &client).await;
+    let (status, headers, _) = h
+        .authorize_with_cookie(
+            &front_channel_query("id_token", &client, "pairwise-implicit"),
+            &cookie,
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let token = location_fragment_param(&headers, "id_token").expect("implicit token");
+    let claims = verified_claims(&h, &client, &token);
+    let expected = h
+        .state()
+        .resolve_registered_subject(h.scope(), &client, &user)
+        .await
+        .unwrap();
+    assert_ne!(expected, user);
+    assert_eq!(claims["sub"], expected);
+}
