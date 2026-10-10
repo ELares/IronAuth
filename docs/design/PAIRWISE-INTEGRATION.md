@@ -81,7 +81,7 @@ live provider configuration is changed by this branch yet. The complete original
 Civio U01/U02/U04/U07 objective is unchanged.
 
 
-## Integration work in progress after PR #1492
+## Integration after PR #1492
 
 Migration 0251 and the scoped client repository now persist identity policy,
 a revision shared with redirect edits, and immutable client/user bindings. The
@@ -137,8 +137,8 @@ user bindings survive either policy transition; only previously unbound users
 receive an identity from the replacement policy. Protocol tests exercise actual
 ID tokens and UserInfo before and after updates and a pool/registry restart,
 real TLS sector validation, private/link-local refusal and the update fetch budget.
-Store tests exercise concurrent updates and audit-failure rollback. These are
-local integration checks, not evidence of a live rollout or a real browser flow.
+Store tests exercise concurrent updates and audit-failure rollback. These
+checks are supplemented by the isolated browser qualification below.
 Management now exposes GET/PUT
 `/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-policy`.
 The response includes policy, sector, redirects and revision. PUT requires
@@ -149,13 +149,13 @@ same hardened resolver as DCR; missing fetcher configuration returns 503.
 Migration 0252 grants the control role only the four policy columns, with no
 redirect, secret or runtime-binding authority. The writer locks and rechecks a
 live environment and the original policy/redirect revision before its audited
-update. Historical identity migration and full rollout qualification are still
-required before deployment.
+update. Historical identity reconciliation remains required before activating pairwise
+on a legacy client. Deploying this binary preserves its existing public policy.
 
 A bound public identifier survives a later pairwise switch as a documented legacy
-privacy exception. Historical identities issued before binding persistence are
-not reconstructed by these methods. Explicit rollout/migration semantics remain
-required; no live client has been switched. Configuration snapshots now carry
+privacy exception. Historical identities issued before binding persistence require the recovery
+and reconciliation workflow below. Only the isolated qualification client has
+been switched; the original Civio client retains public policy. Configuration snapshots now carry
 stored policy and redirects from one coherent read, excluding salts, runtime
 bindings and revisions. Offline validation checks policy shape without fetching;
 it cannot certify current sector-document ownership. Older snapshots default to
@@ -388,3 +388,25 @@ The browser accepted the local self-signed certificate; token inspection and
 Civio's provider connection used the configured certificate trust. Stored
 bindings preserving a subject after restart alone do not prove salt recovery;
 the separate envelope and encrypted-backup tests cover that boundary.
+
+## Integration review and deployment boundary
+
+The final review at `8fb305a5` covered scoped persistence and immutable binding
+races, policy/redirect revision checks, issuer and consumer identity boundaries,
+local authorization and impersonation, registration and management authority,
+retained-history reconciliation, snapshots, and encrypted restore privileges.
+No additional code blocker was found. Earlier database, protocol, scale, backup
+and browser evidence above remains the validation basis; this review is not a
+claim that the complete original issue or Civio milestones are finished.
+
+The history report is a public-history recovery report. Its
+`conflicting_bindings` count means retained users bound to non-public identifiers.
+Before legacy reconciliation these block activation. After successful activation,
+new pairwise users can legitimately increase that count; it does not revoke the
+receipt or mean their identities are corrupt.
+
+Deploy migrations 0251 through 0255 with a database/role backup and a brief
+provider maintenance window: migration 0255 builds its grant index transactionally.
+Stop the old issuer, migrate, and start the qualified binary. Existing clients
+remain public and pending reconciliation. Do not activate pairwise or attest
+external history merely because the deployment and sign-in checks pass.
