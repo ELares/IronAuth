@@ -11761,10 +11761,32 @@ a pairwise switch is an explicit legacy privacy exception.
 | Repudiation | Policy or identity changes survive without audit attribution | DCR registration/update and first identity binding use scoped audited transactions; an audit failure rolls back policy, redirects and token rotation together. |
 | Tampering | Historical backfill overwrites an issued identity or crosses client/environment boundaries | The public-history primitive checks the expected policy revision and redirects under a client lock. All retained edges and user joins are scoped. Inserts preserve existing bindings; page writes and attributed audit commit together. Deleted users retain history without restored login eligibility. |
 | Information disclosure | An incomplete historical scan is mistaken for full pairwise privacy | Retained grant/session edges conservatively preserve public identifiers and can include uncompleted issuance. Audit-only transaction tokens and external actor chains are not fully reconstructed. The primitive does not certify completeness or switch policy. Quiescing legacy issuers, resolving historical gaps and production-size scan qualification remain rollout prerequisites. |
-| Tampering | A legacy client changes an unrecorded public identity by enabling pairwise before reconciliation | Migration 0253 defaults existing/old-writer clients to pending and enforces readiness with a database CHECK. Policy repositories recheck it under lock; management and DCR refuse before sector fetches. Readiness changes invalidate policy revisions, and neither runtime role has UPDATE authority for it. Backfill pages and ordinary metadata cannot certify history. New clients opt in on creation only; upgrading all serving issuers remains an operational prerequisite. The audited legacy reconciliation workflow is still pending. |
+| Tampering | A legacy client changes an unrecorded public identity by enabling pairwise before reconciliation | Migration 0253 defaults existing/old-writer clients to pending and enforces readiness with a database CHECK. Policy repositories recheck it under lock; management and DCR refuse before sector fetches. Readiness changes invalidate policy revisions, and the data plane has no UPDATE authority for it. Backfill pages and ordinary metadata cannot certify history. New clients opt in on creation only; upgrading all serving issuers remains an operational prerequisite. |
 | Information disclosure | Sector documents reach private hosts or errors disclose network details | Explicit sectors require HTTPS and the shared address-pinned hardened fetcher, bounded JSON and exact inclusion of every redirect. Private/link-local targets are refused. Metadata errors do not echo network diagnostics. Salts remain envelope-encrypted environment identity, outside configuration exports. |
 | Denial of service | Repeated sector/JWKS updates generate unlimited fetch work within a window | Authenticated PUT consumes the existing registration rate/window budget before parsing or fetching, keyed by scoped client independently of registration-token rotation. A configured zero disables this limit. Individual fetch deadlines and body caps still apply; no lifetime cache-size bound is claimed. |
 | Elevation | Cross-environment policy writes or outward identity replaces authorization keys | Typed scoped client/user identifiers and forced RLS guard persistence; local account keys remain the source for lifecycle checks, access rules and stored grants. Registration credentials remain client-specific and rotate atomically. |
+
+
+### Legacy client identity reconciliation (#19)
+
+The management history API reads scoped coverage and exposes bounded PUT recovery,
+roster import and explicit reconciliation. It does not fetch evidence URLs or
+claim to verify unavailable relying-party history. The caller is an authorized
+configuration administrator; completion requires configured fresh privilege.
+
+| STRIDE | Threat | Control |
+|---|---|---|
+| Spoofing | A fabricated roster binds another environment or arbitrary external subject | Parse scoped user/client IDs, join retained edges within scope, require existing local accounts and derive the public value from the local ID. Unknown or conflicting batch entries roll back every insertion. No update/delete binding methods or grants. |
+| Tampering | Skipped pages or stale validation unlock incomplete history | Completion independently checks the full retained union under the same client lock and policy revision. Missing or conflicting bindings refuse readiness. Cursors are scoped to client/revision and carry no completion authority. |
+| Repudiation | Readiness commits without attribution or a recoverable receipt | Readiness, evidence SHA-256, application-clock timestamp and operator audit commit atomically. Audit failure rolls everything back. The recovery repository refuses replacing a completed receipt, and concurrent completions choose one winner. |
+| Information disclosure | Recovery exposes user IDs or claims universal pairwise privacy | Read responses expose counts, not rosters. Import audit stores canonical roster digest/count. Recovered public identifiers remain an explicit privacy exception. External completeness is an operator attestation with a retained artifact, not a server-verified fact. |
+| Elevation | Ordinary authentication or policy update certifies migration | Separate narrow recovery repository and scoped management config permission with sudo. Migration 0254 adds binding SELECT/INSERT and readiness/receipt column UPDATE to control only; it adds no binding UPDATE/DELETE. Live environment and policy are locked before mutations. |
+| Denial of service | Large recovery requests or repeated source scans consume resources | Body limits, management rate limits, configured backfill page cap, 500-row hard caps and cursor paging bound incoming work/output. Source scans can still read more history than a page; production-size query qualification remains required. |
+
+Legacy issuers must be stopped before final reconciliation. A declaration cannot
+prove process quiescence or the completeness of an external roster; unresolved
+historical gaps must leave the existing client pending. The workflow preserves
+scope and binding integrity without substituting an automatic completeness claim.
 
 ---
 

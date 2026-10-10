@@ -116,9 +116,10 @@ async fn legacy_history_guard_blocks_policy_activation_without_blocking_public_i
         .fetch_one(db.owner_pool())
         .await
         .unwrap();
-        assert!(
-            !permitted,
-            "ordinary role cannot certify legacy history: {role}"
+        assert_eq!(
+            permitted,
+            role == "ironauth_control",
+            "only reconciliation control role can update readiness"
         );
     }
     assert_eq!(read.subject_policy(&legacy).await.unwrap(), expected);
@@ -1024,7 +1025,7 @@ async fn control_policy_writer_is_narrow_audited_and_revision_guarded() {
         .fetch_one(db.owner_pool())
         .await
         .unwrap();
-        assert!(!permitted);
+        assert_eq!(permitted, matches!(operation, "SELECT" | "INSERT"));
     }
     let (foreign, foreign_client, _) = fixture(&db, &env).await;
     assert!(matches!(
@@ -1079,4 +1080,419 @@ async fn control_policy_writer_refuses_an_environment_deleted_after_validation()
         Err(StoreError::NotFound)
     ));
     assert_eq!(audits(&db, "client.subject_policy.update").await, 0);
+}
+
+fn reconciliation_evidence() -> ironauth_store::ClientSubjectHistoryAttestation {
+    ironauth_store::ClientSubjectHistoryAttestation {
+        evidence_sha256: "a".repeat(64),
+        legacy_issuers_stopped: true,
+        external_history_reconciled: true,
+        public_identifiers_retained: true,
+    }
+}
+
+async fn legacy_policy(
+    db: &TestDatabase,
+    scope: Scope,
+    client: ClientId,
+) -> ironauth_store::ClientSubjectPolicySnapshot {
+    sqlx::query("UPDATE clients SET subject_history_ready=false WHERE id=$1")
+        .bind(client.to_string())
+        .execute(db.owner_pool())
+        .await
+        .unwrap();
+    db.store()
+        .scoped(scope)
+        .clients()
+        .subject_policy(&client)
+        .await
+        .unwrap()
+}
+
+// One linear transition from pending history through recovery, receipt and policy activation.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn reconciliation_covers_all_retained_history_and_explicit_roster_before_unlocking_policy() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (scope, client, user) = fixture(&db, &env).await;
+    let expected = legacy_policy(&db, scope, client).await;
+    let actor = db.test_actor(&env);
+    let data = db
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(&env));
+    let external = data
+        .users()
+        .register(&env, "external-history@example.test", "hash", None)
+        .await
+        .unwrap();
+    historical_grant(&db, &env, scope, client, &user.to_string(), None).await;
+    let control = db
+        .control_store()
+        .management()
+        .acting(actor, CorrelationId::generate(&env));
+    let history = control.client_subject_history(scope);
+    let read = db
+        .control_store()
+        .management()
+        .client_subject_history(scope);
+    assert_eq!(read.get(&client).await.unwrap().missing_bindings, 1);
+    let evidence = reconciliation_evidence();
+    assert!(matches!(
+        history.reconcile(&env, &expected, &evidence).await,
+        Err(StoreError::Conflict)
+    ));
+    // A skipped cursor can return a final empty page but cannot certify readiness.
+    let skipped = history
+        .backfill(&env, &expected, Some(&user), 1)
+        .await
+        .unwrap();
+    assert_eq!(skipped.next_user, None);
+    assert!(matches!(
+        history.reconcile(&env, &expected, &evidence).await,
+        Err(StoreError::Conflict)
+    ));
+    assert_eq!(
+        history
+            .import_public(&env, &expected, &[external, external])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        history
+            .import_public(&env, &expected, &[external])
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        history
+            .backfill(&env, &expected, None, 1)
+            .await
+            .unwrap()
+            .inserted,
+        1
+    );
+    let complete = history.reconcile(&env, &expected, &evidence).await.unwrap();
+    assert!(complete.ready);
+    assert_eq!(
+        (
+            complete.retained_users,
+            complete.missing_bindings,
+            complete.conflicting_bindings
+        ),
+        (1, 0, 0)
+    );
+    assert_eq!(complete.revision, expected.revision + 1);
+    assert_eq!(
+        complete.evidence_sha256.as_deref(),
+        Some(evidence.evidence_sha256.as_str())
+    );
+    assert!(complete.reconciled_at_unix_micros.is_some());
+    assert_eq!(read.get(&client).await.unwrap(), complete);
+    assert!(matches!(
+        history.reconcile(&env, &expected, &evidence).await,
+        Err(StoreError::Conflict)
+    ));
+    let current = db
+        .store()
+        .scoped(scope)
+        .clients()
+        .subject_policy(&client)
+        .await
+        .unwrap();
+    control
+        .client_subject_policies(scope)
+        .set(&env, &current, &pairwise())
+        .await
+        .unwrap();
+    for account in [user, external] {
+        assert_eq!(
+            db.store()
+                .scoped(scope)
+                .clients()
+                .subject_binding(&client, &account)
+                .await
+                .unwrap(),
+            Some(account.to_string())
+        );
+    }
+    let restarted = db.restart_app_store().await;
+    assert_eq!(
+        restarted
+            .management()
+            .client_subject_history(scope)
+            .get(&client)
+            .await
+            .unwrap()
+            .evidence_sha256,
+        complete.evidence_sha256
+    );
+    assert_eq!(audits(&db, "client.subject_history.reconcile").await, 1);
+}
+
+#[tokio::test]
+async fn reconciliation_and_roster_import_rollback_on_audit_failure_and_reject_unattested_claims() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (scope, client, user) = fixture(&db, &env).await;
+    let expected = legacy_policy(&db, scope, client).await;
+    let control = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let history = control.client_subject_history(scope);
+    let valid = reconciliation_evidence();
+    for evidence in [
+        ironauth_store::ClientSubjectHistoryAttestation {
+            legacy_issuers_stopped: false,
+            ..valid.clone()
+        },
+        ironauth_store::ClientSubjectHistoryAttestation {
+            external_history_reconciled: false,
+            ..valid.clone()
+        },
+        ironauth_store::ClientSubjectHistoryAttestation {
+            public_identifiers_retained: false,
+            ..valid.clone()
+        },
+        ironauth_store::ClientSubjectHistoryAttestation {
+            evidence_sha256: "A".repeat(64),
+            ..valid.clone()
+        },
+    ] {
+        assert!(matches!(
+            history.reconcile(&env, &expected, &evidence).await,
+            Err(StoreError::Invalid)
+        ));
+    }
+    sqlx::raw_sql("CREATE FUNCTION reject_reconciliation_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action IN ('client.subject_history.import','client.subject_history.reconcile') THEN RAISE EXCEPTION 'injected reconciliation audit failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_reconciliation_audit BEFORE INSERT ON audit_log FOR EACH ROW EXECUTE FUNCTION reject_reconciliation_audit();")
+        .execute(db.owner_pool()).await.unwrap();
+    assert!(
+        history
+            .import_public(&env, &expected, &[user])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .clients()
+            .subject_binding(&client, &user)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(history.reconcile(&env, &expected, &valid).await.is_err());
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .clients()
+            .subject_policy(&client)
+            .await
+            .unwrap(),
+        expected
+    );
+    let report = db
+        .control_store()
+        .management()
+        .client_subject_history(scope)
+        .get(&client)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            report.ready,
+            report.evidence_sha256,
+            report.reconciled_at_unix_micros
+        ),
+        (false, None, None)
+    );
+    assert_eq!(audits(&db, "client.subject_history.import").await, 0);
+    assert_eq!(audits(&db, "client.subject_history.reconcile").await, 0);
+    sqlx::query("DROP TRIGGER reject_reconciliation_audit ON audit_log")
+        .execute(db.owner_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        history
+            .import_public(&env, &expected, &[user])
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        history
+            .reconcile(&env, &expected, &valid)
+            .await
+            .unwrap()
+            .ready
+    );
+}
+
+// A shared corrupted-history fixture verifies refusal across every recovery operation.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn reconciliation_refuses_conflicting_unknown_foreign_and_deleted_scope_inputs() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (scope, client, user) = fixture(&db, &env).await;
+    let expected = legacy_policy(&db, scope, client).await;
+    let (foreign_scope, foreign_client, foreign_user) = fixture(&db, &env).await;
+    let foreign = db
+        .store()
+        .scoped(foreign_scope)
+        .clients()
+        .subject_policy(&foreign_client)
+        .await
+        .unwrap();
+    let control = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let history = control.client_subject_history(scope);
+    let evidence = reconciliation_evidence();
+    assert!(matches!(
+        history
+            .import_public(&env, &expected, &[foreign_user])
+            .await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        history.reconcile(&env, &foreign, &evidence).await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        db.control_store()
+            .management()
+            .client_subject_history(scope)
+            .get(&foreign_client)
+            .await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        history.import_public(&env, &expected, &[]).await,
+        Err(StoreError::Invalid)
+    ));
+    assert!(matches!(
+        history
+            .import_public(&env, &expected, &vec![user; 501])
+            .await,
+        Err(StoreError::Invalid)
+    ));
+    let missing = UserId::generate(&env, &scope);
+    assert!(matches!(
+        history
+            .import_public(&env, &expected, &[user, missing])
+            .await,
+        Err(StoreError::NotFound)
+    ));
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .clients()
+            .subject_binding(&client, &user)
+            .await
+            .unwrap(),
+        None
+    );
+    historical_grant(&db, &env, scope, client, &user.to_string(), None).await;
+    sqlx::query("INSERT INTO client_subject_bindings (tenant_id,environment_id,client_id,user_id,external_subject,policy_revision,created_at) VALUES ($1,$2,$3,$4,$5,0,'2020-01-01Z')")
+        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(client.to_string())
+        .bind(user.to_string()).bind(URL_SAFE_NO_PAD.encode([8;32])).execute(db.owner_pool()).await.unwrap();
+    assert!(matches!(
+        history.import_public(&env, &expected, &[user]).await,
+        Err(StoreError::Conflict)
+    ));
+    assert_eq!(
+        history
+            .backfill(&env, &expected, None, 500)
+            .await
+            .unwrap()
+            .inserted,
+        0
+    );
+    assert_eq!(
+        db.control_store()
+            .management()
+            .client_subject_history(scope)
+            .get(&client)
+            .await
+            .unwrap()
+            .conflicting_bindings,
+        1
+    );
+    assert!(matches!(
+        history.reconcile(&env, &expected, &evidence).await,
+        Err(StoreError::Conflict)
+    ));
+    sqlx::query("UPDATE environments SET deleted_at='2020-01-01Z' WHERE id=$1")
+        .bind(scope.environment().to_string())
+        .execute(db.owner_pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        history.import_public(&env, &expected, &[user]).await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        history.backfill(&env, &expected, None, 500).await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        history.reconcile(&env, &expected, &evidence).await,
+        Err(StoreError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn concurrent_reconciliation_commits_one_receipt_and_does_not_rewrite_it() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (scope, client, _) = fixture(&db, &env).await;
+    let expected = legacy_policy(&db, scope, client).await;
+    let control = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let repo = control.client_subject_history(scope);
+    let a = reconciliation_evidence();
+    let b = ironauth_store::ClientSubjectHistoryAttestation {
+        evidence_sha256: "b".repeat(64),
+        ..a.clone()
+    };
+    let (first, second) = tokio::join!(
+        repo.reconcile(&env, &expected, &a),
+        repo.reconcile(&env, &expected, &b)
+    );
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    let (winner, loser) = if first.is_ok() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert!(matches!(loser, Err(StoreError::Conflict)));
+    let current = db
+        .store()
+        .scoped(scope)
+        .clients()
+        .subject_policy(&client)
+        .await
+        .unwrap();
+    assert!(matches!(
+        repo.reconcile(&env, &current, &a).await,
+        Err(StoreError::Conflict)
+    ));
+    assert_eq!(
+        db.control_store()
+            .management()
+            .client_subject_history(scope)
+            .get(&client)
+            .await
+            .unwrap(),
+        winner.unwrap()
+    );
+    assert_eq!(audits(&db, "client.subject_history.reconcile").await, 1);
 }

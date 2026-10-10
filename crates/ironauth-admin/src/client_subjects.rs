@@ -88,7 +88,7 @@ pub struct SetClientSubjectPolicyRequest {
     pub sector_identifier_uri: Option<String>,
 }
 
-async fn current(
+pub(crate) async fn current(
     state: &AdminState,
     scope: Scope,
     raw: &str,

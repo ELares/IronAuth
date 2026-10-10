@@ -53,6 +53,7 @@ mod brand_assets;
 mod brands;
 mod client_admin_grants;
 mod client_scopes;
+mod client_subject_history;
 mod client_subjects;
 mod config;
 mod connectors;
@@ -1029,6 +1030,22 @@ pub fn management_router(state: AdminState) -> Router {
         // no organization, because a `clients` row carries none. The PUT writes
         // exactly one column and is sudo gated; the GET is not, matching every other
         // read on this surface.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-history",
+            get(client_subject_history::get_client_subject_history),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-history/backfill",
+            put(client_subject_history::backfill_client_subject_history),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-history/bindings",
+            put(client_subject_history::import_client_subject_history),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-history/reconciliation",
+            put(client_subject_history::reconcile_client_subject_history),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-policy",
             get(client_subjects::get_client_subject_policy).put(client_subjects::set_client_subject_policy),

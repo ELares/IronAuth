@@ -180,7 +180,8 @@ is safe and records another attributed backfill attempt. Failed audits roll back
 the entire page. The page limit bounds output and writes, not total source scan
 cost; production-size query qualification remains required.
 
-This is not yet an operator API, rollout certification, or automatic migration.
+The management workflow below exposes this primitive. It is not rollout
+certification or automatic migration.
 Quiesce old issuers before the final pass and policy cutover: an old binary can
 write new public history without consulting immutable bindings. The retained
 edges can also include authorization attempts that never returned a token, so
@@ -207,7 +208,9 @@ readiness is not a claim that old binaries understand the new policy.
 The database refuses pairwise policy while readiness is false. Both policy
 repositories recheck readiness under their client lock, and readiness changes
 advance the shared policy revision to invalidate outstanding validation.
-Neither ordinary runtime role receives UPDATE authority for the new field.
+The data plane receives no UPDATE authority for the new field. Migration 0254
+adds that authority only to the control plane for the audited reconciliation
+workflow below.
 The management policy view reports `history_ready`; a pending pairwise PUT
 returns 409 before sector fetching. DCR checks the effective metadata after its
 saved policy chain and refuses pending pairwise activation before fetching or
@@ -218,8 +221,80 @@ policy request, and finishing the last history page never sets it implicitly.
 The migration intentionally refuses a pre-existing pairwise row from an
 unsupported partial deployment rather than declaring its history complete or
 rewriting its identity. Existing supported deployments have public policy. Do
-not manually flip readiness to bypass reconciliation: the audited operator
-workflow to import relying-party evidence, cover retained history and finalize
-cutover is still to be implemented. This guard is an intermediate rollout
-protection, not completion of existing-client pairwise support. Readiness is
-runtime migration state and is not a configuration snapshot or promotion field.
+not manually flip readiness to bypass reconciliation. Use the audited workflow
+below. Readiness and its receipt are runtime migration state, excluded from
+configuration snapshots and promotion. The workflow is locally qualified; a
+live cutover has not yet been performed.
+
+
+### Operator reconciliation workflow
+
+All paths below are relative to
+`/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}`.
+GET requires `management.read`. Each PUT requires `management.write_config`,
+configured fresh privilege, a live environment, and the current policy revision.
+Every successful PUT writes an attributed audit in the same transaction.
+
+1. Stop every legacy issuer before the final recovery pass. Deploy only binaries
+   that persist client bindings, and retain a restorable database/key backup.
+   Neither an API checkbox nor a database scan can prove that an old process has
+   stopped. Do not activate pairwise while an old issuer can serve this client.
+2. Read `GET /subject-policy` and `GET /subject-history`. A legacy client starts
+   public with `history_ready=false`. History reports retained users, missing
+   bindings, non-public conflicts and any existing receipt. These counts are not
+   a complete relying-party roster. New clients are ready without a legacy receipt.
+3. Recover retained history using `PUT /subject-history/backfill` with
+   `{"expected_revision":N,"limit":100}`. Use the returned opaque `next_cursor`
+   in the next request until it is null. The configured page maximum and a hard
+   cap of 500 bound each page. Cursors bind the client, scope and revision, not
+   completion authority. Retrying a page is safe and reports zero newly inserted
+   bindings where rows already exist. Each successful retry records an attempt.
+4. Reconcile the relying party's historical public account/actor identifiers with
+   retained grants, sessions and available audit evidence. Cover audit-only
+   transaction tokens and external exchanged actors explicitly. Where necessary,
+   call `PUT /subject-history/bindings` with
+   `{"expected_revision":N,"user_ids":["<scoped account ID>"]}` in batches of
+   1..500 rows. Duplicates collapse. Only existing users in the client's scope
+   are accepted, including soft-deleted accounts without reactivating them. An
+   unknown account or conflicting binding refuses the whole batch. This API
+   accepts only local IDs whose historical public value is that same ID; it
+   cannot assign an arbitrary external subject. The audit records a SHA-256 of
+   the sorted, unique IDs joined by newline, plus the count, rather than the roster.
+5. Retain an evidence artifact describing the client/scope, relying-party sources,
+   recovered public IDs, excluded non-user actors, any historical limitations,
+   and confirmation that old issuers are stopped. Compute its SHA-256. If missing
+   history cannot be reconciled, keep the client pending; use a new pairwise client
+   for a new integration rather than claiming the old client is fully recovered.
+6. Call `PUT /subject-history/reconciliation` with the current revision, lowercase
+   `evidence_sha256`, and explicit true values for `legacy_issuers_stopped`,
+   `external_history_reconciled`, and `public_identifiers_retained`. The server
+   independently rescans all retained edges under the client lock; skipped pages,
+   a forged cursor or an earlier zero count cannot bypass missing/conflicting
+   bindings. It checks digest syntax, not the artifact's contents: external
+   completeness is the authorized operator's attestation, never an automatic
+   server guarantee. Readiness, evidence digest, application-clock time and audit
+   commit together. Failure leaves all of them unchanged.
+7. Read the returned new revision and receipt. Reconciliation leaves the client
+   public. Use the ordinary `PUT /subject-policy` to activate the validated pairwise
+   policy. Existing public bindings remain unchanged; previously unbound users
+   receive pairwise identifiers. Verify ID tokens, UserInfo, token consumers and
+   relying-party account continuity before exposing the change to users.
+
+A repeated successful reconciliation cannot replace its receipt. A stale repeat
+returns 409; GET reports committed status after an ambiguous response. Import
+and reconciliation refuse an already-ready client. History import is a union of
+public bindings, never a replacement roster. No endpoint updates or deletes an
+existing binding. Mutation failures roll back their audit and writes together.
+Migration 0254 grants the control role SELECT/INSERT on bindings and UPDATE on
+only the readiness/receipt columns; it grants no binding UPDATE/DELETE and no
+readiness mutation to the authentication data plane. The policy repository stays
+separate from the recovery repository.
+
+Local qualification covers real control-role HTTP requests, rejected permission
+and scope combinations, fresh-privilege requirements, opaque cursor context,
+retries, missing/conflicting history, audit rollback, concurrent finalization,
+and a reconciled legacy client issuing stable verified token/UserInfo identities.
+Production-size source scans, backup restore and a live relying-party cutover
+still need separate evidence. The scan limit bounds output and inserts, not total
+query work. This API must not be treated as proof that all original #19 or Civio
+milestone requirements have been completed.

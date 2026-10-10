@@ -482,3 +482,8 @@ pub use repository::{
     ActingClientSubjectPolicyRepo, ClientSubjectPolicy, ClientSubjectPolicyRepo,
     ClientSubjectPolicySnapshot, PublicSubjectHistoryPage,
 };
+
+pub use repository::{
+    ActingClientSubjectHistoryRepo, ClientSubjectHistoryAttestation, ClientSubjectHistoryRepo,
+    ClientSubjectHistoryReport,
+};

@@ -100,6 +100,7 @@ fn operation_ids_are_the_stable_set() {
             "authorizeUserImpersonation",
             "authzenEvaluation",
             "authzenEvaluations",
+            "backfillClientSubjectHistory",
             "breakGlassSigningKeyRotation",
             "bulkRevokeSessions",
             "clearOrgDefaultRole",
@@ -192,6 +193,7 @@ fn operation_ids_are_the_stable_set() {
             "getClientAllowedScopes",
             "getClientAuthDiagnostics",
             "getClientServiceAccount",
+            "getClientSubjectHistory",
             "getClientSubjectPolicy",
             "getConnector",
             "getConnectorCapabilities",
@@ -236,6 +238,7 @@ fn operation_ids_are_the_stable_set() {
             "getVariable",
             "grantChallengeComponentSecret",
             "grantTokenHookSecret",
+            "importClientSubjectHistory",
             "importSecurityAdvisories",
             "liftBan",
             "linkUserExternalId",
@@ -320,6 +323,7 @@ fn operation_ids_are_the_stable_set() {
             "readAuditRetention",
             "readEventFeed",
             "readLogStreamAttestation",
+            "reconcileClientSubjectHistory",
             "registerAgent",
             "registerExternalIssuer",
             "rejectRecoveryApproval",
@@ -652,6 +656,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/allowed-scopes",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/service-account",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-history",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-policy",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/config/snapshot",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/connectors",
@@ -875,6 +880,9 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/bearer-tokens",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/par-requirement",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/signing-algorithm",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-history/backfill",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-history/bindings",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-history/reconciliation",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-policy",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/connectors/{connector_id}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
@@ -985,7 +993,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        317,
+        321,
         "the documented route count is pinned"
     );
 

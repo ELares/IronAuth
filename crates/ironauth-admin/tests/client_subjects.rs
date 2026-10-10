@@ -305,3 +305,287 @@ async fn management_policy_requires_fresh_privilege_and_refuses_deleted_scope() 
         .unwrap();
     assert_eq!(h.get(&path).await.0, StatusCode::NOT_FOUND);
 }
+
+async fn history_fixture(h: &Harness) -> (Scope, ClientId, String, Vec<ironauth_store::UserId>) {
+    let (scope, client, policy_path) = fixture(h, "history workflow").await;
+    sqlx::query("UPDATE clients SET subject_history_ready=false WHERE id=$1")
+        .bind(client.to_string())
+        .execute(h.db().owner_pool())
+        .await
+        .unwrap();
+    let env = Env::system();
+    let acting = h.store().scoped(scope).acting(
+        ironauth_admin::bootstrap_operator_actor(),
+        CorrelationId::generate(&env),
+    );
+    let mut users = Vec::new();
+    for i in 0..3 {
+        let user = acting
+            .users()
+            .register(&env, &format!("history-{i}@example.test"), "hash", None)
+            .await
+            .unwrap();
+        if i < 2 {
+            sqlx::query("INSERT INTO grants (id,tenant_id,environment_id,client_id,subject,revoked_at) VALUES ($1,$2,$3,$4,$5,'2020-01-01Z')")
+                .bind(ironauth_store::GrantId::generate(&env,&scope).to_string()).bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string()).bind(client.to_string()).bind(user.to_string())
+                .execute(h.db().owner_pool()).await.unwrap();
+        }
+        users.push(user);
+    }
+    (
+        scope,
+        client,
+        policy_path.replace("/subject-policy", "/subject-history"),
+        users,
+    )
+}
+
+fn reconciliation_request(revision: &Value) -> Value {
+    json!({"expected_revision":revision, "evidence_sha256":"a".repeat(64),
+        "legacy_issuers_stopped":true,"external_history_reconciled":true,"public_identifiers_retained":true})
+}
+
+// One ordered operator journey: every request consumes the state from the previous step.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn history_api_recovers_pages_and_roster_then_unlocks_a_separate_policy_change() {
+    let h = Harness::start(20).await;
+    let (scope, client, path, users) = history_fixture(&h).await;
+    let initial = read(&h, &path).await;
+    assert_eq!(initial["missing_bindings"], 2);
+    assert_eq!(initial["history_ready"], false);
+    let revision = &initial["revision"];
+    let complete = reconciliation_request(revision).to_string();
+    assert_eq!(
+        h.put(&format!("{path}/reconciliation"), &complete).await.0,
+        StatusCode::CONFLICT
+    );
+    let request = json!({"expected_revision":revision,"limit":1}).to_string();
+    let (status, headers, body) = h.put(&format!("{path}/backfill"), &request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    common::assert_rate_limit_headers(&headers);
+    let page: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(page["scanned"], 1);
+    assert_eq!(page["inserted"], 1);
+    let cursor = page["next_cursor"].as_str().unwrap();
+    let retry: Value =
+        serde_json::from_str(&h.put(&format!("{path}/backfill"), &request).await.2).unwrap();
+    assert_eq!(retry["inserted"], 0);
+    assert_eq!(retry["next_cursor"], cursor);
+    assert_eq!(
+        h.put(&format!("{path}/reconciliation"), &complete).await.0,
+        StatusCode::CONFLICT
+    );
+    let (_, _, other) = fixture(&h, "cursor target").await;
+    let other_revision = read(&h, &other).await["revision"].clone();
+    assert_eq!(
+        h.put(
+            &other.replace("/subject-policy", "/subject-history/backfill"),
+            &json!({"expected_revision":other_revision,"cursor":cursor}).to_string()
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let request = json!({"expected_revision":revision,"limit":1,"cursor":cursor}).to_string();
+    let (status, _, body) = h.put(&format!("{path}/backfill"), &request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(serde_json::from_str::<Value>(&body).unwrap()["next_cursor"].is_null());
+    let roster=json!({"expected_revision":revision,"user_ids":[users[2].to_string(),users[2].to_string()]}).to_string();
+    for inserted in [1, 0] {
+        let (status, _, body) = h.put(&format!("{path}/bindings"), &roster).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["inserted"],
+            inserted
+        );
+    }
+    let covered = read(&h, &path).await;
+    assert_eq!(covered["missing_bindings"], 0);
+    assert_eq!(
+        covered["history_ready"], false,
+        "coverage never replaces attestation"
+    );
+    let mut incomplete = reconciliation_request(revision);
+    incomplete["external_history_reconciled"] = json!(false);
+    assert_eq!(
+        h.put(&format!("{path}/reconciliation"), &incomplete.to_string())
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (status, _, body) = h.put(&format!("{path}/reconciliation"), &complete).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let receipt: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(receipt["history_ready"], true);
+    assert_eq!(receipt["evidence_sha256"], "a".repeat(64));
+    assert!(!receipt["reconciled_at_unix_micros"].is_null());
+    assert_eq!(read(&h, &path).await, receipt);
+    assert_eq!(
+        h.put(&format!("{path}/reconciliation"), &complete).await.0,
+        StatusCode::CONFLICT
+    );
+    let policy_path = path.replace("/subject-history", "/subject-policy");
+    assert_eq!(read(&h, &policy_path).await["subject_type"], "public");
+    assert_eq!(
+        h.put(
+            &policy_path,
+            &json!({"expected_revision":receipt["revision"],"subject_type":"pairwise"}).to_string()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for user in users {
+        assert_eq!(
+            h.store()
+                .scoped(scope)
+                .clients()
+                .subject_binding(&client, &user)
+                .await
+                .unwrap(),
+            Some(user.to_string())
+        );
+    }
+    assert_eq!(
+        h.control_store()
+            .scoped(scope)
+            .audit()
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|a| a.action == "client.subject_history.reconcile")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn history_api_enforces_permissions_scope_and_sudo_before_reading_bodies() {
+    let h = Harness::start(20).await;
+    let (scope, _, path, _) = history_fixture(&h).await;
+    let (_, _, foreign) = fixture(&h, "other history scope").await;
+    let foreign = foreign.replace("/subject-policy", "/subject-history");
+    let token = h
+        .create_key(
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            "history reader",
+            "history key",
+        )
+        .await;
+    sqlx::query(
+        "UPDATE management_credentials SET permissions=$1 WHERE tenant_id=$2 AND environment_id=$3",
+    )
+    .bind(vec!["management.read"])
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(h.db().owner_pool())
+    .await
+    .unwrap();
+    assert_eq!(h.get_as(&path, &token).await.0, StatusCode::OK);
+    assert_eq!(h.get_as(&foreign, &token).await.0, StatusCode::FORBIDDEN);
+    for suffix in ["backfill", "bindings", "reconciliation"] {
+        assert_eq!(
+            h.put_as(&format!("{path}/{suffix}"), &token, "not-json")
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            h.put_as(&format!("{foreign}/{suffix}"), &token, "not-json")
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            h.put_as(&format!("{path}/{suffix}"), "invalid", "not-json")
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    sqlx::query("UPDATE environments SET deleted_at='2020-01-01Z' WHERE id=$1")
+        .bind(scope.environment().to_string())
+        .execute(h.db().owner_pool())
+        .await
+        .unwrap();
+    for suffix in ["backfill", "bindings", "reconciliation"] {
+        assert_eq!(
+            h.put(&format!("{path}/{suffix}"), "not-json").await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let (sudo, _) = Harness::start_with_sudo(600).await;
+    let (scope, _, path, _) = history_fixture(&sudo).await;
+    for suffix in ["backfill", "bindings", "reconciliation"] {
+        let (status, headers, _) = sudo.put(&format!("{path}/{suffix}"), "not-json").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(headers.contains_key("www-authenticate"));
+    }
+    sqlx::query("UPDATE environments SET deleted_at='2020-01-01Z' WHERE id=$1")
+        .bind(scope.environment().to_string())
+        .execute(sudo.db().owner_pool())
+        .await
+        .unwrap();
+    assert_eq!(sudo.get(&path).await.0, StatusCode::NOT_FOUND);
+    for suffix in ["backfill", "bindings", "reconciliation"] {
+        assert_eq!(
+            sudo.put(&format!("{path}/{suffix}"), "not-json").await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}
+
+#[tokio::test]
+async fn history_api_refuses_invalid_batches_cursors_and_stale_revision_without_partial_import() {
+    let h = Harness::start(20).await;
+    let (scope, client, path, users) = history_fixture(&h).await;
+    let revision = read(&h, &path).await["revision"].clone();
+    for request in [
+        json!({"expected_revision":revision,"limit":0}),
+        json!({"expected_revision":revision,"cursor":"bad"}),
+        json!({"expected_revision":-1}),
+    ] {
+        let status = h
+            .put(&format!("{path}/backfill"), &request.to_string())
+            .await
+            .0;
+        assert!(matches!(
+            status,
+            StatusCode::BAD_REQUEST | StatusCode::CONFLICT
+        ));
+    }
+    for ids in [vec![], vec![users[0].to_string(); 501]] {
+        assert_eq!(
+            h.put(
+                &format!("{path}/bindings"),
+                &json!({"expected_revision":revision,"user_ids":ids}).to_string()
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let unknown = ironauth_store::UserId::generate(&Env::system(), &scope);
+    assert_eq!(h.put(&format!("{path}/bindings"),&json!({"expected_revision":revision,"user_ids":[users[0].to_string(),unknown.to_string()]}).to_string()).await.0,StatusCode::NOT_FOUND);
+    assert_eq!(
+        h.store()
+            .scoped(scope)
+            .clients()
+            .subject_binding(&client, &users[0])
+            .await
+            .unwrap(),
+        None
+    );
+    let mut request = reconciliation_request(&revision);
+    request["evidence_sha256"] = json!("not-a-digest");
+    assert_eq!(
+        h.put(&format!("{path}/reconciliation"), &request.to_string())
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+}

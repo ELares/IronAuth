@@ -53582,6 +53582,15 @@ impl<'a> ManagementStore<'a> {
         }
     }
 
+    /// Read retained identity coverage and a reconciliation receipt.
+    #[must_use]
+    pub fn client_subject_history(&self, scope: Scope) -> ClientSubjectHistoryRepo<'a> {
+        ClientSubjectHistoryRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
     /// Read client identity policy through the control plane's narrow repository.
     #[must_use]
     pub fn client_subject_policies(&self, scope: Scope) -> ClientSubjectPolicyRepo<'a> {
@@ -54184,6 +54193,16 @@ impl<'a> ActingManagementStore<'a> {
             store: self.store,
             acting: self.acting,
             scope,
+        }
+    }
+
+    /// Append recovered public identities and finalize an audited reconciliation.
+    #[must_use]
+    pub fn client_subject_history(&self, scope: Scope) -> ActingClientSubjectHistoryRepo<'a> {
+        ActingClientSubjectHistoryRepo {
+            store: self.store,
+            scope,
+            acting: self.acting,
         }
     }
 
@@ -91844,6 +91863,18 @@ impl ActingClientRepo<'_> {
         after: Option<&UserId>,
         limit: u32,
     ) -> Result<PublicSubjectHistoryPage, StoreError> {
+        self.backfill_public_subject_history_with_scope_guard(env, expected, after, limit, false)
+            .await
+    }
+
+    async fn backfill_public_subject_history_with_scope_guard(
+        &self,
+        env: &Env,
+        expected: &ClientSubjectPolicySnapshot,
+        after: Option<&UserId>,
+        limit: u32,
+        guard_scope: bool,
+    ) -> Result<PublicSubjectHistoryPage, StoreError> {
         if expected.client_id.scope() != self.scope
             || after.is_some_and(|id| id.scope() != self.scope)
         {
@@ -91862,27 +91893,14 @@ impl ActingClientRepo<'_> {
             AuditedWrite { store: self.store, scope, acting: &self.acting, env,
                 action: Action::ClientSubjectHistoryBackfill, target: &id },
             async move |tx| {
-                let current = sqlx::query("SELECT subject_type, subject_policy_revision, subject_history_ready, redirect_uris FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR UPDATE")
-                    .bind(id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
-                    .fetch_optional(&mut **tx).await?.ok_or(StoreError::NotFound)?;
-                if current.try_get::<String, _>("subject_type")? != "public"
-                    || current.try_get::<i64, _>("subject_policy_revision")? != expected.revision
-                    || current.try_get::<Vec<String>, _>("redirect_uris")? != expected.redirect_uris {
-                    return Err(StoreError::Conflict);
-                }
+                if guard_scope { lock_subject_history_environment(tx, scope).await?; }
+                lock_public_subject_history(tx, scope, expected, false).await?;
                 // Match every edge by scope. A service principal, CIMD client or
                 // foreign subject cannot become a local registered-user binding.
                 let rows: Vec<String> = sqlx::query_scalar(
-                    "WITH history(subject) AS ( \
-                     SELECT subject FROM grants WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 \
-                     UNION SELECT subject FROM refresh_families WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 \
-                     UNION SELECT impersonator FROM refresh_families WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 \
-                     UNION SELECT s.subject FROM client_sessions cs JOIN sessions s ON s.id=cs.session_id AND s.tenant_id=cs.tenant_id AND s.environment_id=cs.environment_id WHERE cs.tenant_id=$1 AND cs.environment_id=$2 AND cs.client_id=$3 \
-                     UNION SELECT s.impersonator FROM client_sessions cs JOIN sessions s ON s.id=cs.session_id AND s.tenant_id=cs.tenant_id AND s.environment_id=cs.environment_id WHERE cs.tenant_id=$1 AND cs.environment_id=$2 AND cs.client_id=$3 \
-                     UNION SELECT s.impersonator FROM grants g JOIN sessions s ON s.id=g.session_ref AND s.tenant_id=g.tenant_id AND s.environment_id=g.environment_id WHERE g.tenant_id=$1 AND g.environment_id=$2 AND g.client_id=$3) \
-                     SELECT u.id FROM users u JOIN history h ON h.subject=u.id \
+                    &format!("{PUBLIC_SUBJECT_HISTORY_CTE} SELECT u.id FROM users u JOIN history h ON h.subject=u.id \
                      WHERE u.tenant_id=$1 AND u.environment_id=$2 AND ($4::text IS NULL OR u.id COLLATE \"C\" > $4 COLLATE \"C\") \
-                     ORDER BY u.id COLLATE \"C\" LIMIT $5"
+                     ORDER BY u.id COLLATE \"C\" LIMIT $5")
                 ).bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
                     .bind(after.map(ToString::to_string)).bind(i64::from(limit) + 1).fetch_all(&mut **tx).await?;
                 let more = rows.len() > limit as usize;
@@ -91898,6 +91916,269 @@ impl ActingClientRepo<'_> {
                 }
                 Ok(PublicSubjectHistoryPage { scanned: rows.len(), inserted, next_user: if more { last } else { None } })
             }, false,
+        ).await
+    }
+}
+
+const PUBLIC_SUBJECT_HISTORY_CTE: &str = "WITH history(subject) AS ( \
+                     SELECT subject FROM grants WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 \
+                     UNION SELECT subject FROM refresh_families WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 \
+                     UNION SELECT impersonator FROM refresh_families WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 \
+                     UNION SELECT s.subject FROM client_sessions cs JOIN sessions s ON s.id=cs.session_id AND s.tenant_id=cs.tenant_id AND s.environment_id=cs.environment_id WHERE cs.tenant_id=$1 AND cs.environment_id=$2 AND cs.client_id=$3 \
+                     UNION SELECT s.impersonator FROM client_sessions cs JOIN sessions s ON s.id=cs.session_id AND s.tenant_id=cs.tenant_id AND s.environment_id=cs.environment_id WHERE cs.tenant_id=$1 AND cs.environment_id=$2 AND cs.client_id=$3 \
+                     UNION SELECT s.impersonator FROM grants g JOIN sessions s ON s.id=g.session_ref AND s.tenant_id=g.tenant_id AND s.environment_id=g.environment_id WHERE g.tenant_id=$1 AND g.environment_id=$2 AND g.client_id=$3) ";
+
+/// Current retained-history coverage. Counts do not certify external history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientSubjectHistoryReport {
+    /// Policy revision shared with identity configuration.
+    pub revision: i64,
+    /// Whether pairwise activation is permitted.
+    pub ready: bool,
+    /// Unique local users found in retained client history.
+    pub retained_users: i64,
+    /// Retained users with no immutable binding yet.
+    pub missing_bindings: i64,
+    /// Retained users bound to a non-public value; never overwritten by recovery.
+    pub conflicting_bindings: i64,
+    /// Operator-supplied digest of externally retained reconciliation evidence.
+    pub evidence_sha256: Option<String>,
+    /// Reconciliation time from the application clock; absent for new clients.
+    pub reconciled_at_unix_micros: Option<i64>,
+}
+
+/// Explicit operator attestation, not a server claim about unavailable history.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClientSubjectHistoryAttestation {
+    /// SHA-256 of the operator's retained evidence artifact, lowercase hex.
+    pub evidence_sha256: String,
+    /// Every legacy issuer has stopped before the final pass and cutover.
+    pub legacy_issuers_stopped: bool,
+    /// Audit-only and external actor identities have been reconciled with the RP.
+    pub external_history_reconciled: bool,
+    /// Recovered public values remain a documented exception to pairwise privacy.
+    pub public_identifiers_retained: bool,
+}
+
+/// Narrow control-plane historical identity reads.
+pub struct ClientSubjectHistoryRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+/// Narrow control-plane recovery; never accepts an arbitrary external subject.
+pub struct ActingClientSubjectHistoryRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+async fn lock_subject_history_environment(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+) -> Result<(), StoreError> {
+    let live = sqlx::query(
+        "SELECT 1 FROM environments WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL FOR SHARE",
+    )
+    .bind(scope.environment().to_string())
+    .bind(scope.tenant().to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if live.is_none() {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+async fn lock_public_subject_history(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    expected: &ClientSubjectPolicySnapshot,
+    pending: bool,
+) -> Result<(), StoreError> {
+    if expected.client_id.scope() != scope {
+        return Err(StoreError::NotFound);
+    }
+    if pending {
+        lock_subject_history_environment(tx, scope).await?;
+    }
+    let row = sqlx::query("SELECT subject_type, subject_policy_revision, subject_history_ready, redirect_uris FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR UPDATE")
+        .bind(expected.client_id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+        .fetch_optional(&mut **tx).await?.ok_or(StoreError::NotFound)?;
+    if row.try_get::<String, _>("subject_type")? != "public"
+        || expected.policy != ClientSubjectPolicy::Public
+        || row.try_get::<i64, _>("subject_policy_revision")? != expected.revision
+        || row.try_get::<Vec<String>, _>("redirect_uris")? != expected.redirect_uris
+        || (pending && row.try_get::<bool, _>("subject_history_ready")?)
+    {
+        return Err(StoreError::Conflict);
+    }
+    Ok(())
+}
+
+async fn read_subject_history(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    client: ClientId,
+) -> Result<ClientSubjectHistoryReport, StoreError> {
+    let row = sqlx::query("SELECT subject_policy_revision, subject_history_ready, subject_history_evidence_sha256, (EXTRACT(EPOCH FROM subject_history_reconciled_at)*1000000)::bigint AS reconciled_us FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR SHARE")
+        .bind(client.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+        .fetch_optional(&mut **tx).await?.ok_or(StoreError::NotFound)?;
+    let coverage = sqlx::query(&format!("{PUBLIC_SUBJECT_HISTORY_CTE}
+        SELECT count(*) AS retained,
+            count(*) FILTER (WHERE b.user_id IS NULL) AS missing,
+            count(*) FILTER (WHERE b.user_id IS NOT NULL AND b.external_subject <> u.id) AS conflicting
+        FROM history h JOIN users u ON u.id=h.subject AND u.tenant_id=$1 AND u.environment_id=$2
+        LEFT JOIN client_subject_bindings b ON b.user_id=u.id AND b.tenant_id=$1 AND b.environment_id=$2 AND b.client_id=$3"))
+        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(client.to_string())
+        .fetch_one(&mut **tx).await?;
+    Ok(ClientSubjectHistoryReport {
+        revision: row.try_get("subject_policy_revision")?,
+        ready: row.try_get("subject_history_ready")?,
+        retained_users: coverage.try_get("retained")?,
+        missing_bindings: coverage.try_get("missing")?,
+        conflicting_bindings: coverage.try_get("conflicting")?,
+        evidence_sha256: row.try_get("subject_history_evidence_sha256")?,
+        reconciled_at_unix_micros: row.try_get("reconciled_us")?,
+    })
+}
+
+impl ClientSubjectHistoryRepo<'_> {
+    /// Read retained coverage under a client lock, including deleted users.
+    /// # Errors
+    /// `NotFound` for absent/foreign clients, persistence errors otherwise.
+    pub async fn get(&self, client: &ClientId) -> Result<ClientSubjectHistoryReport, StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let result = read_subject_history(&mut tx, self.scope, *client).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+}
+
+impl ActingClientSubjectHistoryRepo<'_> {
+    /// Recover a page of retained history with the same primitive used by the issuer.
+    /// # Errors
+    /// Scoped/not-found, stale/public-policy conflicts, invalid page size and database failures.
+    pub async fn backfill(
+        &self,
+        env: &Env,
+        expected: &ClientSubjectPolicySnapshot,
+        after: Option<&UserId>,
+        limit: u32,
+    ) -> Result<PublicSubjectHistoryPage, StoreError> {
+        ActingClientRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+        .backfill_public_subject_history_with_scope_guard(env, expected, after, limit, true)
+        .await
+    }
+
+    /// Recover an explicit roster of public identities (1..=500 input rows).
+    /// Duplicate IDs are collapsed. Deleted users retain history, not login access.
+    /// A conflicting existing identity refuses the entire batch, never overwrites it.
+    /// Audit detail contains the canonical roster digest and count, not the user IDs.
+    /// # Errors
+    /// `Invalid` for size, `NotFound` for foreign/absent users or deleted scope,
+    /// `Conflict` for stale/non-public/ready client or conflicting identity.
+    pub async fn import_public(
+        &self,
+        env: &Env,
+        expected: &ClientSubjectPolicySnapshot,
+        users: &[UserId],
+    ) -> Result<u64, StoreError> {
+        if users.is_empty() || users.len() > 500 {
+            return Err(StoreError::Invalid);
+        }
+        if expected.client_id.scope() != self.scope || users.iter().any(|u| u.scope() != self.scope)
+        {
+            return Err(StoreError::NotFound);
+        }
+        let users: BTreeSet<String> = users.iter().map(ToString::to_string).collect();
+        let canonical = users.iter().cloned().collect::<Vec<_>>().join("\n");
+        let detail = format!(
+            "roster_sha256={} users={}",
+            sha256_hex(&canonical),
+            users.len()
+        );
+        let scope = self.scope;
+        let id = expected.client_id;
+        let now = epoch_micros(env.clock().now_utc());
+        write_audited_detailed(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env, action: Action::ClientSubjectHistoryImport, target: &id },
+            async move |tx| {
+                lock_public_subject_history(tx, scope, expected, true).await?;
+                let mut inserted = 0;
+                for raw in users {
+                    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND tenant_id=$2 AND environment_id=$3)")
+                        .bind(&raw).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+                        .fetch_one(&mut **tx).await?;
+                    if !exists { return Err(StoreError::NotFound); }
+                    let bound: Option<String> = sqlx::query_scalar("SELECT external_subject FROM client_subject_bindings WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 AND user_id=$4")
+                        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string()).bind(&raw)
+                        .fetch_optional(&mut **tx).await?;
+                    if let Some(bound) = bound {
+                        if bound != raw { return Err(StoreError::Conflict); }
+                        continue;
+                    }
+                    inserted += sqlx::query("INSERT INTO client_subject_bindings (tenant_id,environment_id,client_id,user_id,external_subject,policy_revision,created_at) VALUES ($1,$2,$3,$4,$4,$5,TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)")
+                        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
+                        .bind(raw).bind(expected.revision).bind(now).execute(&mut **tx).await?.rows_affected();
+                }
+                Ok(inserted)
+            }, false, Some(&detail),
+        ).await
+    }
+
+    /// Finish reconciliation only after independently checking every retained edge.
+    /// The attestation covers evidence the database cannot reconstruct; its digest
+    /// references an operator-held artifact, not a server-verified external roster.
+    /// This does not change subject policy or any existing binding.
+    /// # Errors
+    /// `Invalid` for missing attestations or malformed digest; `Conflict` for
+    /// incomplete/conflicting history, stale policy or already-ready clients.
+    /// Persistence or audit failure rolls back readiness and its durable receipt.
+    pub async fn reconcile(
+        &self,
+        env: &Env,
+        expected: &ClientSubjectPolicySnapshot,
+        attestation: &ClientSubjectHistoryAttestation,
+    ) -> Result<ClientSubjectHistoryReport, StoreError> {
+        if expected.client_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        if !attestation.legacy_issuers_stopped
+            || !attestation.external_history_reconciled
+            || !attestation.public_identifiers_retained
+            || attestation.evidence_sha256.len() != 64
+            || !attestation
+                .evidence_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(StoreError::Invalid);
+        }
+        let detail = serde_json::to_string(attestation).map_err(|_| StoreError::Invalid)?;
+        let scope = self.scope;
+        let id = expected.client_id;
+        let now = epoch_micros(env.clock().now_utc());
+        write_audited_detailed(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env, action: Action::ClientSubjectHistoryReconcile, target: &id },
+            async move |tx| {
+                lock_public_subject_history(tx, scope, expected, true).await?;
+                let coverage = read_subject_history(tx, scope, id).await?;
+                if coverage.missing_bindings != 0 || coverage.conflicting_bindings != 0 {
+                    return Err(StoreError::Conflict);
+                }
+                sqlx::query("UPDATE clients SET subject_history_ready=true, subject_history_evidence_sha256=$1, subject_history_reconciled_at=TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval WHERE id=$3 AND tenant_id=$4 AND environment_id=$5")
+                    .bind(&attestation.evidence_sha256).bind(now).bind(id.to_string()).bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string()).execute(&mut **tx).await?;
+                read_subject_history(tx, scope, id).await
+            }, false, Some(&detail),
         ).await
     }
 }

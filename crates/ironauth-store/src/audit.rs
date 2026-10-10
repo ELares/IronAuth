@@ -201,6 +201,10 @@ pub enum Action {
     ClientSubjectBind,
     /// Retained public grant/session history was copied into immutable bindings.
     ClientSubjectHistoryBackfill,
+    /// An explicit relying-party roster was recovered as public bindings.
+    ClientSubjectHistoryImport,
+    /// An operator attested reconciliation after all retained edges were covered.
+    ClientSubjectHistoryReconcile,
     /// A tenant was created (management plane, issue #11).
     TenantCreate,
     /// A tenant was offboarded into the GRACE stage (management plane, issue
@@ -1826,6 +1830,8 @@ impl Action {
             Action::ClientSubjectPolicyUpdate => "client.subject_policy.update",
             Action::ClientSubjectBind => "client.subject.bind",
             Action::ClientSubjectHistoryBackfill => "client.subject_history.backfill",
+            Action::ClientSubjectHistoryImport => "client.subject_history.import",
+            Action::ClientSubjectHistoryReconcile => "client.subject_history.reconcile",
             Action::TenantCreate => "tenant.create",
             Action::TenantDelete => "tenant.delete",
             Action::TenantRestore => "tenant.restore",

@@ -262,17 +262,34 @@ async fn backfilled_legacy_identity_survives_cutover_without_bypassing_account_l
         .bind(ironauth_store::GrantId::generate(h.env(), &h.scope()).to_string())
         .bind(h.scope().tenant().to_string()).bind(h.scope().environment().to_string())
         .bind(client.to_string()).bind(&user).execute(h.pool()).await.unwrap();
+    sqlx::query("UPDATE clients SET subject_history_ready=false WHERE id=$1")
+        .bind(client.to_string())
+        .execute(h.pool())
+        .await
+        .unwrap();
     let initial = read.subject_policy(&client).await.unwrap();
+    assert!(!initial.history_ready);
     let (actor, corr) = h.seeding_actor();
-    let page = h
-        .store()
-        .scoped(h.scope())
-        .acting(actor, corr)
-        .clients()
-        .backfill_public_subject_history(h.env(), &initial, None, 500)
+    let control = h.db().control_store().management().acting(actor, corr);
+    let history = control.client_subject_history(h.scope());
+    let page = history
+        .backfill(h.env(), &initial, None, 500)
         .await
         .unwrap();
     assert_eq!((page.scanned, page.inserted, page.next_user), (1, 1, None));
+    let evidence = ironauth_store::ClientSubjectHistoryAttestation {
+        evidence_sha256: "a".repeat(64),
+        legacy_issuers_stopped: true,
+        external_history_reconciled: true,
+        public_identifiers_retained: true,
+    };
+    assert!(
+        history
+            .reconcile(h.env(), &initial, &evidence)
+            .await
+            .unwrap()
+            .ready
+    );
     set_policy(&h, &client, &policy("legacy.example.test")).await;
     let issued = tokens(&h, &client, &auth, &user).await;
     assert_eq!(

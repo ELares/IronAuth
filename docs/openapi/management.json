@@ -5850,6 +5850,424 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-history": {
+      "get": {
+        "tags": [
+          "client-subjects"
+        ],
+        "summary": "Inspect retained identity coverage and the reconciliation receipt.",
+        "operationId": "getClientSubjectHistory",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Retained coverage; not proof of complete external history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientSubjectHistoryView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong scope or permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Absent, foreign or deleted resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-history/backfill": {
+      "put": {
+        "tags": [
+          "client-subjects"
+        ],
+        "summary": "Recover one bounded page. Repeating a page preserves bindings and records an attempt.",
+        "operationId": "backfillClientSubjectHistory",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackfillClientSubjectHistoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Bounded recovery page; readiness is unchanged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientSubjectHistoryPageView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid cursor or page size",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credential or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong scope or permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Absent, foreign or deleted resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stale revision or non-public policy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-history/bindings": {
+      "put": {
+        "tags": [
+          "client-subjects"
+        ],
+        "summary": "Add public bindings from an explicit relying-party roster. Repeated rows are safe.",
+        "operationId": "importClientSubjectHistory",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportClientSubjectHistoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Recovered public bindings; retries do not overwrite identities",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientSubjectHistoryImportView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body or batch size",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credential or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong scope or permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Absent, foreign or deleted scope, client or unknown user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stale/non-public/ready client or conflicting identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-history/reconciliation": {
+      "put": {
+        "tags": [
+          "client-subjects"
+        ],
+        "summary": "Commit an explicit reconciliation receipt. This enables a later policy change,\nnot an automatic switch. All retained history is rechecked, independent of cursors.",
+        "operationId": "reconcileClientSubjectHistory",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReconcileClientSubjectHistoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Durable receipt and new policy revision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientSubjectHistoryView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing attestations or invalid evidence digest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credential or fresh privilege required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong scope or permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Absent, foreign or deleted resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Incomplete/conflicting history, stale policy or already reconciled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-policy": {
       "get": {
         "tags": [
@@ -32046,6 +32464,35 @@
           }
         }
       },
+      "BackfillClientSubjectHistoryRequest": {
+        "type": "object",
+        "required": [
+          "expected_revision"
+        ],
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque `next_cursor` from the previous page; absent for the first page."
+          },
+          "expected_revision": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Positive page size, capped by management configuration and 500.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "BackupRequestAccepted": {
         "type": "object",
         "description": "The accepted response: the request is queued, not performed.",
@@ -32623,6 +33070,89 @@
             "type": "string",
             "description": "The algorithm now recorded for this client's ID tokens.",
             "example": "RS256"
+          }
+        }
+      },
+      "ClientSubjectHistoryImportView": {
+        "type": "object",
+        "required": [
+          "inserted"
+        ],
+        "properties": {
+          "inserted": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ClientSubjectHistoryPageView": {
+        "type": "object",
+        "required": [
+          "scanned",
+          "inserted"
+        ],
+        "properties": {
+          "inserted": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scanned": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ClientSubjectHistoryView": {
+        "type": "object",
+        "description": "Retained coverage and any durable reconciliation receipt. Zero missing rows\ndoes not prove complete external history or full pairwise privacy.",
+        "required": [
+          "revision",
+          "history_ready",
+          "retained_users",
+          "missing_bindings",
+          "conflicting_bindings"
+        ],
+        "properties": {
+          "conflicting_bindings": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "evidence_sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Operator-supplied SHA-256 of retained external evidence, not server verification."
+          },
+          "history_ready": {
+            "type": "boolean"
+          },
+          "missing_bindings": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "reconciled_at_unix_micros": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "retained_users": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -35263,6 +35793,27 @@
           }
         }
       },
+      "ImportClientSubjectHistoryRequest": {
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "user_ids"
+        ],
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "user_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "1..=500 scoped account IDs from relying-party evidence, including deleted\naccounts if they still exist. Duplicates collapse; external values cannot be supplied."
+          }
+        },
+        "additionalProperties": false
+      },
       "ImportJobView": {
         "type": "object",
         "description": "The handle a bulk-import job answers with (issue #55).\n\nDeliberately counter free: progress belongs to the migration-run operator view (issue\n#59) and is read at `progress_path`. See this module's header for why that is also\nwhat lets the `Idempotency-Key` record share a transaction with the run creation.",
@@ -37806,6 +38357,39 @@
             "description": "Retained users still lacking index metadata at the time of the transaction."
           }
         }
+      },
+      "ReconcileClientSubjectHistoryRequest": {
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "evidence_sha256",
+          "legacy_issuers_stopped",
+          "external_history_reconciled",
+          "public_identifiers_retained"
+        ],
+        "properties": {
+          "evidence_sha256": {
+            "type": "string",
+            "description": "Lowercase hex SHA-256 of an operator-held evidence artifact. No URL is fetched."
+          },
+          "expected_revision": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "external_history_reconciled": {
+            "type": "boolean",
+            "description": "Must explicitly be true: audit-only and external actor identities are reconciled."
+          },
+          "legacy_issuers_stopped": {
+            "type": "boolean",
+            "description": "Must explicitly be true: every legacy issuer is stopped."
+          },
+          "public_identifiers_retained": {
+            "type": "boolean",
+            "description": "Must explicitly be true: recovered public IDs remain a privacy exception."
+          }
+        },
+        "additionalProperties": false
       },
       "RecordFailureView": {
         "type": "object",
