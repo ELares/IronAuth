@@ -1039,3 +1039,8 @@ required-features = ["testing"]
 name = "recipient_index"
 path = "tests/recipient_index.rs"
 required-features = ["testing"]
+
+[[test]]
+name = "client_subjects"
+path = "tests/client_subjects.rs"
+required-features = ["testing"]

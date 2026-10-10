@@ -478,4 +478,7 @@ pub use token_hook_store::{
 
 pub use repository::{PAIRWISE_SUBJECT_SALT_PURPOSE, PairwiseSaltMaterial};
 
-pub use repository::{ClientSubjectPolicy, ClientSubjectPolicySnapshot};
+pub use repository::{
+    ActingClientSubjectPolicyRepo, ClientSubjectPolicy, ClientSubjectPolicyRepo,
+    ClientSubjectPolicySnapshot,
+};

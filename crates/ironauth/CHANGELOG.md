@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Install the hardened sector-document fetcher on the management plane (#19). TLS setup failure leaves explicit sector validation unavailable rather than accepting unchecked policy.
+
 - Refresh the embedded admin console for Preact 11, signals 2.11.3, and Vite 8.3.2.
 
 - Start and gracefully stop the password-recovery completion-notice consumer when recovery is enabled (#1479). Reuse the serving OIDC transport/store, require working control-plane scope enumeration before serving, and retain the shared outbox/IronBus worker settings.

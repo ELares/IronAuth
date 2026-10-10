@@ -391,3 +391,103 @@ async fn failed_audits_roll_back_policy_revision_and_first_binding() {
     assert_eq!(audits(&db, "client.subject.bind").await, 0);
     assert_eq!(audits(&db, "client.subject_policy.update").await, 0);
 }
+
+#[tokio::test]
+async fn control_policy_writer_is_narrow_audited_and_revision_guarded() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (scope, client, _) = fixture(&db, &env).await;
+    let read = db
+        .control_store()
+        .management()
+        .client_subject_policies(scope);
+    let initial = read.get(&client).await.unwrap();
+    let writer = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .client_subject_policies(scope);
+    let committed = writer.set(&env, &initial, &pairwise()).await.unwrap();
+    assert_eq!(read.get(&client).await.unwrap(), committed);
+    assert_eq!(committed.redirect_uris, initial.redirect_uris);
+    assert!(matches!(
+        writer
+            .set(&env, &initial, &ClientSubjectPolicy::Public)
+            .await,
+        Err(StoreError::Conflict)
+    ));
+    assert_eq!(audits(&db, "client.subject_policy.update").await, 1);
+    for column in ["redirect_uris", "secret_hash", "subject_policy_revision"] {
+        let permitted: bool = sqlx::query_scalar(
+            "SELECT has_column_privilege('ironauth_control','clients',$1,'UPDATE')",
+        )
+        .bind(column)
+        .fetch_one(db.owner_pool())
+        .await
+        .unwrap();
+        assert!(!permitted, "control role cannot rewrite {column}");
+    }
+    for operation in ["SELECT", "INSERT", "UPDATE", "DELETE"] {
+        let permitted: bool = sqlx::query_scalar(
+            "SELECT has_table_privilege('ironauth_control','client_subject_bindings',$1)",
+        )
+        .bind(operation)
+        .fetch_one(db.owner_pool())
+        .await
+        .unwrap();
+        assert!(!permitted);
+    }
+    let (foreign, foreign_client, _) = fixture(&db, &env).await;
+    assert!(matches!(
+        read.get(&foreign_client).await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        db.control_store()
+            .management()
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .client_subject_policies(foreign)
+            .set(&env, &committed, &ClientSubjectPolicy::Public)
+            .await,
+        Err(StoreError::NotFound)
+    ));
+    sqlx::raw_sql("CREATE FUNCTION reject_control_subject_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action='client.subject_policy.update' THEN RAISE EXCEPTION 'injected audit failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_control_subject_audit BEFORE INSERT ON audit_log FOR EACH ROW EXECUTE FUNCTION reject_control_subject_audit();")
+        .execute(db.owner_pool()).await.unwrap();
+    assert!(
+        writer
+            .set(&env, &committed, &ClientSubjectPolicy::Public)
+            .await
+            .is_err()
+    );
+    assert_eq!(read.get(&client).await.unwrap(), committed);
+}
+
+#[tokio::test]
+async fn control_policy_writer_refuses_an_environment_deleted_after_validation() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (scope, client, _) = fixture(&db, &env).await;
+    let initial = db
+        .control_store()
+        .management()
+        .client_subject_policies(scope)
+        .get(&client)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE environments SET deleted_at=to_timestamp(1) WHERE id=$1 AND tenant_id=$2")
+        .bind(scope.environment().to_string())
+        .bind(scope.tenant().to_string())
+        .execute(db.owner_pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.control_store()
+            .management()
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .client_subject_policies(scope)
+            .set(&env, &initial, &pairwise())
+            .await,
+        Err(StoreError::NotFound)
+    ));
+    assert_eq!(audits(&db, "client.subject_policy.update").await, 0);
+}

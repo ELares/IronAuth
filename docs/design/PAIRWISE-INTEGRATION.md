@@ -136,7 +136,18 @@ ID tokens and UserInfo before and after updates and a pool/registry restart,
 real TLS sector validation, private/link-local refusal and the update fetch budget.
 Store tests exercise concurrent updates and audit-failure rollback. These are
 local integration checks, not evidence of a live rollout or a real browser flow.
-The documented management API remains required before rollout.
+Management now exposes GET/PUT
+`/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-policy`.
+The response includes policy, sector, redirects and revision. PUT requires
+`expected_revision` and explicit `subject_type`; it cannot edit redirects or
+issued bindings. Read/write management permissions, fresh privilege and live
+scope resolution run before metadata validation. Explicit sector URLs use the
+same hardened resolver as DCR; missing fetcher configuration returns 503.
+Migration 0252 grants the control role only the four policy columns, with no
+redirect, secret or runtime-binding authority. The writer locks and rechecks a
+live environment and the original policy/redirect revision before its audited
+update. Historical identity migration and full rollout qualification are still
+required before deployment.
 
 A bound public identifier survives a later pairwise switch as a documented legacy
 privacy exception. Historical identities issued before binding persistence are

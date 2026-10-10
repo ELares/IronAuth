@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add a narrow control-plane client identity-policy repository and forward migration 0252 (#19). Grant only four policy columns, recheck live environment and policy/redirect revision under locks, and return the committed audited state without redirect, secret or binding write authority.
+
 - Export client identity policy with a coherent redirect set in configuration snapshots (#19). Accept legacy snapshots as public policy, reject malformed policy fields, and exclude salts, user bindings and revision counters. Keep clients excluded from promotion so target identity remains intact.
 
 - Persist dynamic-client subject policy and validated redirects in the same audited write (#19). Guard replacement updates with the policy revision and authenticating registration-token hash; concurrent edits and failed audits cannot partially rotate identity policy or credentials.

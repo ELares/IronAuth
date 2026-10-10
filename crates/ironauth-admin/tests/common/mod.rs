@@ -119,6 +119,27 @@ impl Harness {
         }
     }
 
+    /// Start with a real hardened fetcher and injected transport seams for sector tests.
+    pub async fn start_with_sector_fetcher(
+        fetcher: std::sync::Arc<ironauth_fetch::Fetcher>,
+    ) -> Self {
+        let mut db = TestDatabase::start().await;
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds")
+            .with_sector_fetcher(fetcher);
+        Self {
+            db,
+            router: management_router(install_hook_runtime(state)),
+            outbound_scope: None,
+            txt: None,
+        }
+    }
+
     /// Start with an injected DNS TXT lookup (issue #96).
     ///
     /// `records` is what every domain "publishes"; `Err` is a resolver that could not

@@ -330,6 +330,7 @@ struct Inner {
     signing_registry: Option<Arc<IssuerRegistry>>,
     /// The DNS TXT lookup domain verification performs (issue #96).
     txt_lookup: Option<Arc<dyn TxtLookup>>,
+    sector_fetcher: Option<Arc<ironauth_fetch::Fetcher>>,
 }
 
 /// The ONE place the operator-visible uniqueness setting becomes the store's mode
@@ -460,6 +461,7 @@ impl AdminState {
                 admin_oidc_bridge: None,
                 signing_registry: None,
                 txt_lookup: None,
+                sector_fetcher: None,
             }),
         })
     }
@@ -494,6 +496,21 @@ impl AdminState {
             inner.signing_registry = Some(registry);
         }
         self
+    }
+
+    /// Install the hardened fetcher for client sector-document validation.
+    #[must_use]
+    pub fn with_sector_fetcher(mut self, fetcher: Arc<ironauth_fetch::Fetcher>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.sector_fetcher = Some(fetcher);
+        }
+        self
+    }
+
+    /// The hardened sector fetcher, absent when deployment validation is unavailable.
+    #[must_use]
+    pub fn sector_fetcher(&self) -> Option<&Arc<ironauth_fetch::Fetcher>> {
+        self.inner.sector_fetcher.as_ref()
     }
 
     /// Install the DNS TXT lookup domain verification performs (issue #96).

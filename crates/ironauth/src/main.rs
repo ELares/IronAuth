@@ -1326,6 +1326,14 @@ async fn build_admin_state(
     };
     match AdminState::new(store, env.clone(), &config.admin) {
         Ok(state) => {
+            let state = match shared_config::outbound_fetcher(ironauth_fetch::FetchLimits::default())
+            {
+                Ok(fetcher) => state.with_sector_fetcher(Arc::new(fetcher)),
+                Err(error) => {
+                    tracing::error!(%error, "client sector validation unavailable: TLS setup failed");
+                    state
+                }
+            };
             // The ONE data-plane issuer registry this plane reads signing keys through
             // (issue #414). Two installs need it, the compatibility wizard's
             // signable-algorithm resolution (issue #93) and the console credential

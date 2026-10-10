@@ -53579,6 +53579,15 @@ impl<'a> ManagementStore<'a> {
         }
     }
 
+    /// Read client identity policy through the control plane's narrow repository.
+    #[must_use]
+    pub fn client_subject_policies(&self, scope: Scope) -> ClientSubjectPolicyRepo<'a> {
+        ClientSubjectPolicyRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
     /// The read-only per-organization authentication policy repository for `scope`
     /// (issue #95). Policies are environment-scoped, so the repository is
     /// constructible only from a `(tenant, environment)` scope and binds row-level
@@ -54172,6 +54181,16 @@ impl<'a> ActingManagementStore<'a> {
             store: self.store,
             acting: self.acting,
             scope,
+        }
+    }
+
+    /// Audited policy-only changes; does not expose redirect or binding mutation.
+    #[must_use]
+    pub fn client_subject_policies(&self, scope: Scope) -> ActingClientSubjectPolicyRepo<'a> {
+        ActingClientSubjectPolicyRepo {
+            store: self.store,
+            scope,
+            acting: self.acting,
         }
     }
 
@@ -91697,5 +91716,88 @@ impl ActingClientRepo<'_> {
                 .ok_or(StoreError::Conflict),
             Err(error) => Err(error),
         }
+    }
+}
+
+/// Narrow control-plane read of a client's identity policy and redirect revision.
+pub struct ClientSubjectPolicyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ClientSubjectPolicyRepo<'_> {
+    /// Parse a scoped client identifier, with uniform not-found on mismatch.
+    ///
+    /// # Errors
+    /// `NotFound` for malformed or foreign identifiers.
+    pub fn parse_id(&self, raw: &str) -> Result<ClientId, StoreError> {
+        ClientId::parse_in_scope(raw, &self.scope).map_err(|_| StoreError::NotFound)
+    }
+
+    /// Read policy and redirects together without exposing runtime bindings.
+    ///
+    /// # Errors
+    /// `NotFound` for absent/foreign clients; persistence or decoding errors otherwise.
+    pub async fn get(&self, id: &ClientId) -> Result<ClientSubjectPolicySnapshot, StoreError> {
+        ClientRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+        .subject_policy(id)
+        .await
+    }
+}
+
+/// A control-plane policy writer with no redirect, secret or user-binding methods.
+pub struct ActingClientSubjectPolicyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingClientSubjectPolicyRepo<'_> {
+    /// Set identity policy validated against the expected snapshot's redirects.
+    /// The protocol must perform network validation before this transaction.
+    /// Recheck liveness and revision under locks, then return the committed policy.
+    ///
+    /// # Errors
+    /// `NotFound` for absent, foreign or deleted scope; `Conflict` for stale
+    /// validation; `Invalid` for bad shape. Failed writes/audits roll back together.
+    pub async fn set(
+        &self,
+        env: &Env,
+        expected: &ClientSubjectPolicySnapshot,
+        policy: &ClientSubjectPolicy,
+    ) -> Result<ClientSubjectPolicySnapshot, StoreError> {
+        if expected.client_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let columns = client_subject_policy_columns(policy, &expected.redirect_uris)?;
+        let scope = self.scope;
+        let id = expected.client_id;
+        write_audited(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env,
+                action: Action::ClientSubjectPolicyUpdate, target: &id },
+            async move |tx| {
+                // Recheck liveness after validation, then hold it until commit.
+                let live = sqlx::query("SELECT 1 FROM environments WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL FOR SHARE")
+                    .bind(scope.environment().to_string()).bind(scope.tenant().to_string())
+                    .fetch_optional(&mut **tx).await?;
+                if live.is_none() { return Err(StoreError::NotFound); }
+                let current = sqlx::query("SELECT subject_policy_revision, redirect_uris FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR UPDATE")
+                    .bind(id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+                    .fetch_optional(&mut **tx).await?.ok_or(StoreError::NotFound)?;
+                if current.try_get::<i64, _>("subject_policy_revision")? != expected.revision
+                    || current.try_get::<Vec<String>, _>("redirect_uris")? != expected.redirect_uris {
+                    return Err(StoreError::Conflict);
+                }
+                let row = sqlx::query("UPDATE clients SET subject_type=$1, pairwise_sector=$2, sector_identifier_uri=$3, subject_policy_redirect_uris=$4 WHERE id=$5 AND tenant_id=$6 AND environment_id=$7 RETURNING subject_type, pairwise_sector, sector_identifier_uri, subject_policy_revision, redirect_uris")
+                    .bind(columns.kind).bind(columns.sector).bind(columns.uri).bind(columns.redirects)
+                    .bind(id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+                    .fetch_one(&mut **tx).await?;
+                Ok(ClientSubjectPolicySnapshot { client_id: id, policy: decode_client_subject_policy(&row)?,
+                    revision: row.try_get("subject_policy_revision")?, redirect_uris: row.try_get("redirect_uris")? })
+            }, false,
+        ).await
     }
 }
