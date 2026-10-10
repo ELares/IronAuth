@@ -138,6 +138,18 @@ pub async fn page(
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<PageQuery>,
 ) -> Response {
+    let Some(scope) = crate::wellknown::parse_scope(&tenant, &environment) else {
+        return interaction::invalid_link_page();
+    };
+    if let Some(target) = &query.return_to {
+        let allowed = target.len() <= 8192
+            && interaction::registered_form_origin(&state, Some(target), Some(scope))
+                .await
+                .is_some();
+        if !allowed {
+            return interaction::invalid_link_page();
+        }
+    }
     let account = match authenticate(&state, &tenant, &environment, &headers).await {
         Ok(account) => account,
         Err(response) if response.status() == StatusCode::FORBIDDEN => {
@@ -152,22 +164,17 @@ pub async fn page(
         Err(_) => {
             return crate::pages::secure_html(
                 StatusCode::UNAUTHORIZED,
-                crate::pages::notice_page(
+                crate::pages::notice_page_with_link(
                     "Sign in to edit your name",
-                    "Return to your application and sign in, then reopen account settings. Your name has not changed.",
+                    "Your session has ended. Sign in again through your application, then reopen account settings.",
+                    query
+                        .return_to
+                        .as_deref()
+                        .map(|target| (target, "Continue to application")),
                 ),
             );
         }
     };
-    if let Some(target) = &query.return_to {
-        let allowed = target.len() <= 8192
-            && interaction::registered_form_origin(&state, Some(target), Some(account.scope))
-                .await
-                .is_some();
-        if !allowed {
-            return interaction::invalid_link_page();
-        }
-    }
     let Ok(name) = read_name(&state, &account).await else {
         return crate::pages::secure_html(
             StatusCode::SERVICE_UNAVAILABLE,

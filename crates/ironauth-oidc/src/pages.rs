@@ -1140,11 +1140,27 @@ pub fn recover_cancel_page(cancel_action: &str, token: &str) -> String {
 /// `message` is server text; it is escaped defensively regardless.
 #[must_use]
 pub fn notice_page(title: &str, message: &str) -> String {
-    let body = format!(
+    notice_page_with_link(title, message, None)
+}
+
+/// A notice with a caller-validated recovery destination. Escaping is not URL validation.
+pub(crate) fn notice_page_with_link(
+    title: &str,
+    message: &str,
+    link: Option<(&str, &str)>,
+) -> String {
+    let mut body = format!(
         "<h1>{title}</h1><p>{message}</p>",
         title = escape_html(title),
         message = escape_html(message),
     );
+    if let Some((href, label)) = link {
+        body.push_str(&format!(
+            "<p><a href=\"{}\">{}</a></p>",
+            escape_html(href),
+            escape_html(label),
+        ));
+    }
     notice_document(&escape_html(title), &body)
 }
 

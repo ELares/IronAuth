@@ -530,3 +530,68 @@ async fn equal_names_keep_distinct_subjects_and_independent_profiles() {
         h.scope().environment()
     )));
 }
+
+#[tokio::test]
+async fn expired_profile_page_offers_only_a_registered_same_scope_return() {
+    let h = Harness::start().await;
+    let page = format!(
+        "/t/{}/e/{}/profile",
+        h.scope().tenant(),
+        h.scope().environment()
+    );
+    let target = format!(
+        "/authorize?response_type=code&client_id={}&redirect_uri={}&scope=openid%20profile&code_challenge={}&code_challenge_method=S256&state=kept_state",
+        h.client_id(),
+        common::enc(common::REDIRECT_URI),
+        common::PKCE_CHALLENGE
+    );
+    let (status, headers, body) = h
+        .send(
+            Request::builder()
+                .uri(format!("{page}?return_to={}", common::enc(&target)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert!(headers.contains_key(header::CONTENT_SECURITY_POLICY));
+    assert!(body.contains("Continue to application"));
+    assert!(body.contains(&target.replace('&', "&amp;")));
+    assert!(!body.contains("id=\"profile-name\""));
+
+    let other_scope = h.second_scope().await;
+    let scoped = h.store().scoped(other_scope);
+    let acting = scoped.acting(
+        h.db().test_actor(h.env()),
+        ironauth_store::CorrelationId::generate(h.env()),
+    );
+    let other_client = acting
+        .clients()
+        .create(h.env(), "other scope client")
+        .await
+        .unwrap();
+    acting
+        .clients()
+        .register_redirect_uris(h.env(), &other_client, &[common::REDIRECT_URI])
+        .await
+        .unwrap();
+    assert_ne!(other_client.to_string(), h.client_id().to_string());
+    let cross_scope = target.replace(&h.client_id().to_string(), &other_client.to_string());
+    for bad in [
+        "https://untrusted.test/".to_owned(),
+        "/authorize?redirect_uri=https://untrusted.test".to_owned(),
+        cross_scope,
+    ] {
+        let (status, _, body) = h
+            .send(
+                Request::builder()
+                    .uri(format!("{page}?return_to={}", common::enc(&bad)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.contains("Continue to application"));
+    }
+}

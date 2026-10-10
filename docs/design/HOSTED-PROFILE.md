@@ -30,7 +30,9 @@ names do not merge accounts. Removing a name leaves a valid empty profile.
 - The form retains input after errors, freezes uncertain saves for exact retry,
   offers an explicit reload of current state, guards navigation, and keeps a
   sessionStorage recovery copy keyed by the scoped subject. Confirmed saves or
-  explicit reload clear the copy. Storage unavailability is visible.
+  explicit reload clear the copy. Storage unavailability is visible. An expired
+  page offers a continuation only after validating the registered in-scope
+  authorization request; it does not render the editable profile without a session.
 
 Existing UserInfo claim selection remains authoritative. The name becomes
 available on a fresh permitted profile read; a relying party may cache its own
@@ -68,9 +70,19 @@ overflow, 32px desktop buttons and 44px narrow actions. The shared provider
 default remains light under a dark system preference; no separate dark-theme
 implementation or physical-device check is claimed.
 
+## Civio integration status
+
+Civio PRs #882 and #883 preserve up to 320 UTF-8 bytes, covering the provider's
+80-character maximum without changing identity or grant lookup. PR #884 adds
+a compact account-settings entry behind `CIVIO_IRONAUTH_HOSTED_PROFILE`. It
+rechecks the same signed-in account before editing and before refreshing the
+existing session label. The update cannot recreate a concurrently revoked
+session. These changes are merged and deployed; the capability remains off
+until the provider and connected browser journey are qualified.
+
 ## Required before integrated completion
 
-1. Complete a discoverable Civio account-settings entry and interrupted/expired
+1. Qualify the implemented Civio account-settings entry and interrupted/expired
    sign-in recovery, including the validated relying-party return. Do not require
    users to assemble provider URLs or seed their profile through management APIs.
 2. Run fresh registration, name selection, later editing/removal and Civio return
@@ -78,9 +90,9 @@ implementation or physical-device check is claimed.
    styling variants as supported, retained input and lost-response reconciliation.
 3. Retain the authority, rollback, audit, event and scoped UserInfo checks when
    integrating the application entry and current-session recovery.
-4. Preserve names at the application boundary: Civio currently limits display
-   strings to 254 UTF-8 bytes while 80 Unicode characters can exceed that. Resolve
-   the mismatch explicitly, without changing account identity or grant lookup.
+4. Qualify the implemented 320-byte application boundary in the connected
+   browser journey, including non-ASCII names, without changing account identity
+   or grant lookup.
 5. Qualify the original pairwise requirement. Current production token and
    UserInfo code calls `resolve_public_subject`; the separate generic pairwise
    helper is not an integrated pairwise registration/token/UserInfo path. Do not

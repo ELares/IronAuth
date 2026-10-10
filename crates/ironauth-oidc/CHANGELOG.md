@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Keep a validated application return available when the hosted profile session expires (#1385).
+
 - Offer an optional name step after browser registration and a name-edit link when the hosted consent screen requests profile access (#1385). Keep the validated application return and headless registration behavior. Use compact actions without nesting another card.
 
 - Add an authenticated self-service display-name API and hosted settings page (#1385). Names are optional and bounded, changes retain unknown outcomes for retry, and profile labels never establish mailbox ownership or application access.
