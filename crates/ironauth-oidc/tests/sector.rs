@@ -225,3 +225,33 @@ async fn explicit_sector_uses_its_own_host_after_a_real_tls_document_check() {
         "each registration validates the document"
     );
 }
+
+#[tokio::test]
+async fn explicit_and_inferred_ipv6_hosts_have_identical_canonical_sectors() {
+    use ironauth_fetch::{TestTlsIdentity, TestTlsTarget};
+    let identity = TestTlsIdentity::generate("2001:4860::8888");
+    let redirects = vec!["https://[2001:4860::8888]/cb".to_owned()];
+    let target =
+        TestTlsTarget::start(&identity, 200, serde_json::to_vec(&redirects).unwrap()).await;
+    let fetcher = Fetcher::from_parts_trusting(
+        FetchLimits::default(),
+        Arc::new(StaticResolver::new(vec![
+            "2001:4860::8888".parse().unwrap(),
+        ])),
+        Arc::new(RecordingDialer::new(target.addr)),
+        &identity.root_der,
+    );
+    let inferred = resolve_pairwise_sector(&fetcher, None, &redirects)
+        .await
+        .unwrap();
+    let explicit = resolve_pairwise_sector(
+        &fetcher,
+        Some("https://[2001:4860:0:0:0:0:0:8888]:8443/uris.json"),
+        &redirects,
+    )
+    .await
+    .unwrap();
+    assert_eq!(explicit, inferred);
+    assert_eq!(explicit, "[2001:4860::8888]");
+    assert_eq!(target.received().len(), 1);
+}

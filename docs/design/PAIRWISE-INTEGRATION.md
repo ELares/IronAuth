@@ -30,7 +30,9 @@ resolver infers one host only if every redirect has that host. Empty or hostless
 native sets require an explicit sector document. A supplied HTTPS document is
 always fetched through the hardened fetcher and must contain every redirect
 exactly, even if the redirects already share a host. The document's host is the
-sector. Registration still owns web/native redirect validation.
+sector. Explicit and inferred sectors use the same canonical URL hostname,
+including IPv6 brackets/compression. Registration still owns web/native redirect
+validation.
 
 Sources: [Core 8.1](https://openid.net/specs/openid-connect-core-1_0.html#PairwiseAlg)
 and [Registration section 5](https://openid.net/specs/openid-connect-registration-1_0.html#SectorIdentifierValidation).

@@ -5,8 +5,8 @@
 //! A pairwise `sub` gives each sector a different, stable, opaque identifier for
 //! the same end user, so clients in different sectors cannot correlate a user
 //! by comparing `sub` values. The privacy guarantee only holds if the derivation is DETERMINISTIC
-//! and if every surface that returns a `sub` (the ID token, `UserInfo`, and any
-//! future introspection response) returns the SAME value. Half-implementations
+//! and if every surface that returns a `sub` (the ID token, `UserInfo`, and
+//! introspection) returns the SAME value. Half-implementations
 //! that return one `sub` from the ID token and another from `UserInfo` fail
 //! certification, so this module exposes exactly one derivation function,
 //! [`resolve_subject`]. Production currently selects public subjects through
@@ -62,7 +62,7 @@ pub enum SubjectType {
     /// The same `sub` for every client: the local account identifier verbatim.
     Public,
     /// A per-sector `sub`: a salted hash over the client's sector identifier, so
-    /// two clients cannot correlate the user by `sub`.
+    /// clients in different sectors cannot correlate the user by `sub`.
     Pairwise,
 }
 

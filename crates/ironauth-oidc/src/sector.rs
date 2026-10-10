@@ -53,11 +53,10 @@ pub async fn resolve_pairwise_sector(
 ) -> Result<String, SectorError> {
     if let Some(uri) = sector_uri {
         validate_sector_identifier(fetcher, uri, redirect_uris).await?;
-        // The hardened fetch parser already accepted this exact URL. Reuse its
-        // hostname representation and deliberately omit the network port.
-        return parse_target(uri)
-            .map(|target| target.host.to_ascii_lowercase())
-            .map_err(|_| SectorError::InvalidUrl);
+        // Fetch validation uses the hardened network parser; identity uses the
+        // SAME canonical host representation as redirect inference, including
+        // IPv6 brackets/compression. A transport host is not an identity key.
+        return redirect_host(uri).ok_or(SectorError::InvalidUrl);
     }
     inferred_sector(redirect_uris).ok_or(SectorError::SectorUriRequired)
 }
