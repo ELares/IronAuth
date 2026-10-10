@@ -2,17 +2,17 @@
 
 //! Pairwise subject derivation (OIDC Core 1.0 sections 8 and 8.1).
 //!
-//! A pairwise `sub` gives each client a different, stable, opaque identifier for
-//! the same end user, so two clients cannot correlate a user by comparing `sub`
-//! values. The privacy guarantee only holds if the derivation is DETERMINISTIC
+//! A pairwise `sub` gives each sector a different, stable, opaque identifier for
+//! the same end user, so clients in different sectors cannot correlate a user
+//! by comparing `sub` values. The privacy guarantee only holds if the derivation is DETERMINISTIC
 //! and if every surface that returns a `sub` (the ID token, `UserInfo`, and any
 //! future introspection response) returns the SAME value. Half-implementations
 //! that return one `sub` from the ID token and another from `UserInfo` fail
 //! certification, so this module exposes exactly one derivation function,
-//! [`resolve_subject`]. The ID token path routes through it today; the `UserInfo`
-//! and introspection surfaces arrive in later issues and must call the same
-//! function (a single shared derivation, held by convention until those surfaces
-//! exist).
+//! [`resolve_subject`]. Production currently selects public subjects through
+//! `OidcState::resolve_public_subject`; persisted pairwise registration and the
+//! client-aware token/UserInfo wiring remain required by issue #19. The generic
+//! function and cache here do not establish that production integration.
 //!
 //! Derivation, per OIDC Core 8.1, hashes the sector identifier, the local (per
 //! user) account identifier, and a per-environment salt:
@@ -61,16 +61,16 @@ pub fn subject_within_cap(sub: &str) -> bool {
 pub enum SubjectType {
     /// The same `sub` for every client: the local account identifier verbatim.
     Public,
-    /// A per-client `sub`: a salted hash over the client's sector identifier, so
+    /// A per-sector `sub`: a salted hash over the client's sector identifier, so
     /// two clients cannot correlate the user by `sub`.
     Pairwise,
 }
 
 impl SubjectType {
     /// Every subject type this build supports, in the order discovery advertises
-    /// them (issue #18 sources `subject_types_supported` from here). Both are
-    /// supported: pairwise derivation is in [`resolve_subject`], and public is the
-    /// local identifier verbatim.
+    /// them (issue #18 sources `subject_types_supported` from here). These are
+    /// derivation capabilities. Production registration/token support is a separate
+    /// integration requirement; advertising both alone does not establish it.
     pub const ALL: &'static [SubjectType] = &[SubjectType::Public, SubjectType::Pairwise];
 
     /// The OIDC metadata value (`public` or `pairwise`).

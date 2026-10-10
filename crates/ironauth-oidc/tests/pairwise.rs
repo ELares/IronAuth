@@ -2,13 +2,9 @@
 
 //! Pairwise subject derivation (issue #19), database-free.
 //!
-//! Acceptance criterion 5 requires the pairwise `sub` to be deterministic and
-//! IDENTICAL across the ID token and `UserInfo` through one shared derivation
-//! function, and stable once derived. There is no `UserInfo` surface yet (it lands
-//! with issue #15), so what these tests prove is the property that MAKES the
-//! cross-surface guarantee hold: the single shared derivation is deterministic and
-//! memoized per environment, so any two surfaces that call it necessarily agree.
-//! The cross-surface parity itself is exercised end to end once `UserInfo` exists.
+//! These are generic derivation/cache checks. They do not register a client,
+//! issue an ID token or call UserInfo. Issue #19 criterion 5 and #1385 still need
+//! actual configured-client parity, persistence and policy-transition evidence.
 
 use ironauth_env::FixedEntropy;
 use ironauth_oidc::{PairwiseSalt, SubjectCache, SubjectConfig, resolve_subject};
@@ -22,8 +18,8 @@ const SECTOR: &str = "client.example.test";
 fn one_shared_derivation_gives_every_surface_the_same_sub() {
     // Any two call sites that resolve through the SAME shared function and cache
     // (with the same environment salt) get the identical sub. This is the property
-    // that guarantees the ID token and a future UserInfo (#15) cannot diverge: they
-    // are not two independent derivations, they are two calls to one function.
+    // a production adapter must preserve. These calls are not ID-token or UserInfo
+    // requests and do not establish which configuration either surface selects.
     let salt = PairwiseSalt::generate(&FixedEntropy::new(0x5A));
     let cache = SubjectCache::new();
     let config = SubjectConfig::pairwise(SECTOR);
