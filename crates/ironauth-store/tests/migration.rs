@@ -110,7 +110,7 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      hot state, hot state invalidation cursors, hot state column scoped updates, per-tenant quota limits, \
      readiness can read the ledger, tenant quota limits scope key, replication cursors, \
      signing key rotation lifecycle grant, \
-     client tls client auth, cnf x5t s256, use mtls endpoint aliases, fapi hardened, userinfo signed response alg, authorization signed response alg, id token encrypted response, security advisories, fips profile, fapi guardrails view repair, userinfo metadata update grant, recipient verification, fapi hardened control grant, recipient index backfill, security advisory replace grant, hosted password reset, password reset no delete";
+     client tls client auth, cnf x5t s256, use mtls endpoint aliases, fapi hardened, userinfo signed response alg, authorization signed response alg, id token encrypted response, security advisories, fips profile, fapi guardrails view repair, userinfo metadata update grant, recipient verification, fapi hardened control grant, recipient index backfill, security advisory replace grant, hosted password reset, password reset no delete, client subject identity, client subject policy control, client subject history guard";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -741,7 +741,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        250,
+        253,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -786,7 +786,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210,
             211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227,
             228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244,
-            245, 246, 247, 248, 249, 250
+            245, 246, 247, 248, 249, 250, 251, 252, 253
         ]
     );
     let phase_of = |version: i64| async move {
@@ -797,6 +797,27 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             .expect("phase lookup")
             .get::<String, _>("phase")
     };
+    for version in [251, 252, 253] {
+        assert_eq!(phase_of(version).await, "expand");
+    }
+    assert!(rls_enabled_and_forced(pool, "client_subject_bindings").await);
+    assert!(
+        policy_exists(
+            pool,
+            "client_subject_bindings",
+            "client_subject_bindings_scope"
+        )
+        .await
+    );
+    assert!(
+        check_constraint_exists(
+            pool,
+            "client_subject_bindings",
+            "client_subject_bindings_scope_nonempty"
+        )
+        .await
+    );
+    assert!(check_constraint_exists(pool, "clients", "client_subject_history_ready").await);
     assert_eq!(phase_of(1).await, "expand");
     assert_eq!(phase_of(2).await, "expand");
     assert_eq!(phase_of(3).await, "expand");

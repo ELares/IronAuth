@@ -935,6 +935,94 @@ async fn pairwise_registration_metadata_round_trips_and_redirect_updates_are_ato
 }
 
 #[tokio::test]
+async fn legacy_dcr_client_cannot_activate_pairwise_or_rotate_credentials_on_refusal() {
+    let h = Harness::start_store_backed_with(dcr_config()).await;
+    let (status, initial) = post_json(
+        &h,
+        &register_path(&h),
+        json!({"redirect_uris":[REDIRECT_URI]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let client = ironauth_store::ClientId::parse_in_scope(
+        initial["client_id"].as_str().unwrap(),
+        &h.scope(),
+    )
+    .unwrap();
+    let path = to_path(initial["registration_client_uri"].as_str().unwrap());
+    let token = initial["registration_access_token"].as_str().unwrap();
+    sqlx::query("UPDATE clients SET subject_history_ready=false WHERE id=$1")
+        .bind(client.to_string())
+        .execute(h.pool())
+        .await
+        .unwrap();
+    h.verify_client(&client).await;
+    let before = h
+        .store()
+        .scoped(h.scope())
+        .clients()
+        .dynamic_registration(&client)
+        .await
+        .unwrap();
+    let user = h.seed_unique_user().await;
+    assert_eq!(registered_user_subject(&h, &initial, &user).await, user);
+    let (status, body) = send_json(
+        &h,
+        "PUT",
+        &path,
+        Some(token),
+        Some(json!({
+            "redirect_uris":[REDIRECT_URI], "subject_type":"pairwise",
+            "sector_identifier_uri":"https://sector.example.test/list", "history_ready":true
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_client_metadata");
+    assert!(
+        body["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("reconciliation")
+    );
+    assert_eq!(
+        h.store()
+            .scoped(h.scope())
+            .clients()
+            .dynamic_registration(&client)
+            .await
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        send_json(&h, "GET", &path, Some(token), None).await.0,
+        StatusCode::OK
+    );
+    let (status, _) = send_json(
+        &h,
+        "PUT",
+        &path,
+        Some(token),
+        Some(json!({"redirect_uris":[REDIRECT_URI]})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "legacy public metadata updates remain available"
+    );
+    assert!(
+        !h.store()
+            .scoped(h.scope())
+            .clients()
+            .subject_policy(&client)
+            .await
+            .unwrap()
+            .history_ready
+    );
+}
+
+#[tokio::test]
 async fn pairwise_registration_refuses_incoherent_or_hostless_metadata() {
     let h = Harness::start_store_backed_with(dcr_config()).await;
     for extra in [

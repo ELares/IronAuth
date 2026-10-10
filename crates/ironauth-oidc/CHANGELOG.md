@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Reject dynamic-registration updates that enable pairwise for a legacy client with unresolved identity history (#19). Refuse before sector fetching or credential rotation, after applying the saved registration policy chain. New pairwise registrations and legacy public updates remain supported.
+
 - Expose the shared pure sector-host inference helper for management configuration so DCR and management use the same hostname rule (#19).
 
 - Support public/pairwise subject metadata in dynamic registration and replacement updates (#19). Validate explicit sector documents through hardened HTTPS, preserve existing issued identities, reject stale concurrent edits, and rate-limit authenticated updates by scoped client before outbound fetches. This integration is not yet deployed; management and historical identity rollout remain pending.

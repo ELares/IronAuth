@@ -3322,6 +3322,8 @@ pub struct DynamicClientRecord {
     pub subject_policy: ClientSubjectPolicy,
     /// Identity/redirect revision used to reject stale validated updates.
     pub subject_policy_revision: i64,
+    /// Whether legacy public identity reconciliation is unnecessary or completed.
+    pub subject_history_ready: bool,
     /// The RFC 8252 `application_type` (`web` or `native`), or `None` for a client
     /// that predates DCR.
     pub application_type: Option<String>,
@@ -3849,7 +3851,7 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT id, display_name, token_endpoint_auth_method, redirect_uris, \
-             subject_type, pairwise_sector, sector_identifier_uri, subject_policy_revision, \
+             subject_type, pairwise_sector, sector_identifier_uri, subject_policy_revision, subject_history_ready, \
              application_type, id_token_signed_response_alg, userinfo_signed_response_alg, \
              authorization_signed_response_alg, id_token_encrypted_response_alg, \
              id_token_encrypted_response_enc, jwks, jwks_uri, \
@@ -3881,6 +3883,7 @@ impl ClientRepo<'_> {
             redirect_uris: row.get("redirect_uris"),
             subject_policy: decode_client_subject_policy(&row)?,
             subject_policy_revision: row.try_get("subject_policy_revision")?,
+            subject_history_ready: row.try_get("subject_history_ready")?,
             application_type: row.get("application_type"),
             id_token_signed_response_alg: row.get("id_token_signed_response_alg"),
             userinfo_signed_response_alg: row.get("userinfo_signed_response_alg"),
@@ -5319,8 +5322,8 @@ impl ActingClientRepo<'_> {
                 sqlx::query(
                     "INSERT INTO clients \
                      (id, tenant_id, environment_id, display_name, \
-                      token_endpoint_auth_method, secret_hash) \
-                     VALUES ($1, $2, $3, $4, $5, $6)",
+                      token_endpoint_auth_method, secret_hash, subject_history_ready) \
+                     VALUES ($1, $2, $3, $4, $5, $6, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -5444,8 +5447,8 @@ impl ActingClientRepo<'_> {
                      (id, tenant_id, environment_id, display_name, \
                       token_endpoint_auth_method, jwks, jwks_uri, \
                       token_endpoint_auth_signing_alg, tls_client_auth_cert, \
-                      tls_client_auth_subject_dn) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                      tls_client_auth_subject_dn, subject_history_ready) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -5569,8 +5572,8 @@ impl ActingClientRepo<'_> {
             async move |tx| {
                 sqlx::query(
                     "INSERT INTO clients \
-                     (id, tenant_id, environment_id, display_name, require_auth_time) \
-                     VALUES ($1, $2, $3, $4, true)",
+                     (id, tenant_id, environment_id, display_name, require_auth_time, subject_history_ready) \
+                     VALUES ($1, $2, $3, $4, true, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -6685,9 +6688,9 @@ impl ActingClientRepo<'_> {
                       registration_client_uri, \
                       registration_access_token_hash, quarantined, dcr_policy_chain, \
                       dcr_registered, subject_type, pairwise_sector, sector_identifier_uri, \
-                      subject_policy_redirect_uris) \
+                      subject_policy_redirect_uris, subject_history_ready) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                             $15, $16, $17, $18, $19, $20, $21, $22, $23, true, $24, $25, $26, $27)",
+                             $15, $16, $17, $18, $19, $20, $21, $22, $23, true, $24, $25, $26, $27, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -6977,8 +6980,8 @@ impl ActingClientRepo<'_> {
             },
             async move |tx| {
                 sqlx::query(
-                    "INSERT INTO clients (id, tenant_id, environment_id, display_name) \
-                     VALUES ($1, $2, $3, $4)",
+                    "INSERT INTO clients (id, tenant_id, environment_id, display_name, subject_history_ready) \
+                     VALUES ($1, $2, $3, $4, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -91410,6 +91413,8 @@ pub struct ClientSubjectPolicySnapshot {
     pub policy: ClientSubjectPolicy,
     /// Revision to compare after validation outside the transaction.
     pub revision: i64,
+    /// Whether legacy identity history permits pairwise activation.
+    pub history_ready: bool,
     /// Exact redirects against which a sector document must be checked.
     pub redirect_uris: Vec<String>,
 }
@@ -91499,7 +91504,7 @@ impl ClientRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT subject_type, pairwise_sector, sector_identifier_uri, subject_policy_revision, redirect_uris \
+            "SELECT subject_type, pairwise_sector, sector_identifier_uri, subject_policy_revision, subject_history_ready, redirect_uris \
              FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3"
         ).bind(id.to_string()).bind(self.scope.tenant().to_string())
             .bind(self.scope.environment().to_string()).fetch_optional(&mut *tx).await?
@@ -91508,6 +91513,7 @@ impl ClientRepo<'_> {
             client_id: *id,
             policy: decode_client_subject_policy(&row)?,
             revision: row.try_get("subject_policy_revision")?,
+            history_ready: row.try_get("subject_history_ready")?,
             redirect_uris: row.try_get("redirect_uris")?,
         };
         tx.commit().await?;
@@ -91597,7 +91603,7 @@ impl ActingClientRepo<'_> {
             },
             async move |tx| {
                 let row = sqlx::query(
-                    "SELECT subject_policy_revision, redirect_uris FROM clients \
+                    "SELECT subject_policy_revision, subject_history_ready, redirect_uris FROM clients \
                      WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR UPDATE",
                 )
                 .bind(id.to_string())
@@ -91608,6 +91614,7 @@ impl ActingClientRepo<'_> {
                 .ok_or(StoreError::NotFound)?;
                 if row.try_get::<i64, _>("subject_policy_revision")? != expected.revision
                     || row.try_get::<Vec<String>, _>("redirect_uris")? != expected.redirect_uris
+                    || (kind == "pairwise" && !row.try_get::<bool, _>("subject_history_ready")?)
                 {
                     return Err(StoreError::Conflict);
                 }
@@ -91784,19 +91791,20 @@ impl ActingClientSubjectPolicyRepo<'_> {
                     .bind(scope.environment().to_string()).bind(scope.tenant().to_string())
                     .fetch_optional(&mut **tx).await?;
                 if live.is_none() { return Err(StoreError::NotFound); }
-                let current = sqlx::query("SELECT subject_policy_revision, redirect_uris FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR UPDATE")
+                let current = sqlx::query("SELECT subject_policy_revision, subject_history_ready, redirect_uris FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR UPDATE")
                     .bind(id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
                     .fetch_optional(&mut **tx).await?.ok_or(StoreError::NotFound)?;
                 if current.try_get::<i64, _>("subject_policy_revision")? != expected.revision
-                    || current.try_get::<Vec<String>, _>("redirect_uris")? != expected.redirect_uris {
+                    || current.try_get::<Vec<String>, _>("redirect_uris")? != expected.redirect_uris
+                    || (columns.kind == "pairwise" && !current.try_get::<bool, _>("subject_history_ready")?) {
                     return Err(StoreError::Conflict);
                 }
-                let row = sqlx::query("UPDATE clients SET subject_type=$1, pairwise_sector=$2, sector_identifier_uri=$3, subject_policy_redirect_uris=$4 WHERE id=$5 AND tenant_id=$6 AND environment_id=$7 RETURNING subject_type, pairwise_sector, sector_identifier_uri, subject_policy_revision, redirect_uris")
+                let row = sqlx::query("UPDATE clients SET subject_type=$1, pairwise_sector=$2, sector_identifier_uri=$3, subject_policy_redirect_uris=$4 WHERE id=$5 AND tenant_id=$6 AND environment_id=$7 RETURNING subject_type, pairwise_sector, sector_identifier_uri, subject_policy_revision, subject_history_ready, redirect_uris")
                     .bind(columns.kind).bind(columns.sector).bind(columns.uri).bind(columns.redirects)
                     .bind(id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
                     .fetch_one(&mut **tx).await?;
                 Ok(ClientSubjectPolicySnapshot { client_id: id, policy: decode_client_subject_policy(&row)?,
-                    revision: row.try_get("subject_policy_revision")?, redirect_uris: row.try_get("redirect_uris")? })
+                    revision: row.try_get("subject_policy_revision")?, history_ready: row.try_get("subject_history_ready")?, redirect_uris: row.try_get("redirect_uris")? })
             }, false,
         ).await
     }
@@ -91854,7 +91862,7 @@ impl ActingClientRepo<'_> {
             AuditedWrite { store: self.store, scope, acting: &self.acting, env,
                 action: Action::ClientSubjectHistoryBackfill, target: &id },
             async move |tx| {
-                let current = sqlx::query("SELECT subject_type, subject_policy_revision, redirect_uris FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR UPDATE")
+                let current = sqlx::query("SELECT subject_type, subject_policy_revision, subject_history_ready, redirect_uris FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR UPDATE")
                     .bind(id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
                     .fetch_optional(&mut **tx).await?.ok_or(StoreError::NotFound)?;
                 if current.try_get::<String, _>("subject_type")? != "public"

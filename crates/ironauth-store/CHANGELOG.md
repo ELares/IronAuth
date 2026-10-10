@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Refuse pairwise activation for clients whose legacy public identity history is unresolved (#19). Migration 0253 marks existing and old-writer clients pending; new client creation records readiness explicitly. A database constraint and revision-aware repositories enforce the guard, with no ordinary role granted readiness updates. Backfill completion alone never certifies historical coverage.
+
 - Add an audited, paginated public-identity history backfill primitive (#19). Recover scoped users and human impersonators from retained grants, refresh families and client sessions, including revoked history. Preserve existing bindings, reject stale policy, and roll back failed audits. This does not certify complete historical recovery or expose a migration endpoint.
 
 - Add a narrow control-plane client identity-policy repository and forward migration 0252 (#19). Grant only four policy columns, recheck live environment and policy/redirect revision under locks, and return the committed audited state without redirect, secret or binding write authority.

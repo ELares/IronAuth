@@ -38,6 +38,48 @@ async fn read(h: &Harness, path: &str) -> Value {
 }
 
 #[tokio::test]
+async fn legacy_client_cannot_enable_pairwise_or_claim_readiness_through_policy_api() {
+    let h = Harness::start(20).await;
+    let (_scope, client, path) = fixture(&h, "legacy history").await;
+    assert_eq!(read(&h, &path).await["history_ready"], true);
+    sqlx::query("UPDATE clients SET subject_history_ready=false WHERE id=$1")
+        .bind(client.to_string())
+        .execute(h.db().owner_pool())
+        .await
+        .unwrap();
+    let initial = read(&h, &path).await;
+    assert_eq!(initial["history_ready"], false);
+    // Refuse before the absent fetcher could return 503 or contact this URL.
+    let (status, _, body) = h
+        .put(
+            &path,
+            &json!({
+                "expected_revision":initial["revision"], "subject_type":"pairwise",
+                "sector_identifier_uri":"https://sector.example.test/list"
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("reconcile legacy"));
+    let (status, _, _) = h.put(&path, &json!({
+        "expected_revision":initial["revision"], "subject_type":"public", "history_ready":true
+    }).to_string()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = h
+        .put(
+            &path,
+            &json!({
+                "expected_revision":initial["revision"], "subject_type":"public"
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(read(&h, &path).await, initial);
+}
+
+#[tokio::test]
 async fn management_policy_round_trip_preserves_bindings_and_rejects_stale_updates() {
     let h = Harness::start(20).await;
     let (scope, client, path) = fixture(&h, "policy roundtrip").await;

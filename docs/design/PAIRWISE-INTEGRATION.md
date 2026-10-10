@@ -1,10 +1,10 @@
 # Production pairwise subjects (#19)
 
-The original #19 and hosted-profile #1385 criteria remain open. At merged base
-`9d31109c`, production uses `resolve_public_subject` and `ClientRecord` has no
-persisted subject policy. Generic hashing tests do not qualify token/UserInfo
-parity. The sector resolver changes in this branch are prerequisites, not a
-production pairwise implementation.
+The original #19 and hosted-profile #1385 criteria remain open. This branch
+integrates durable client identity policy with issuance, credential consumers,
+dynamic registration and the management API. It has not been deployed. Legacy
+identity reconciliation, operational cutover and live relying-party qualification
+remain required; generic hashing tests alone do not qualify those behaviors.
 
 ## Durable salt prerequisite
 
@@ -195,3 +195,31 @@ Do not infer completeness from reaching the last page. An explicit strategy for
 these gaps, operational cutover, and live relying-party qualification remain
 prerequisites to enabling pairwise on existing clients. No live client has been
 switched by this work.
+
+### Legacy activation guard
+
+Migration 0253 gives every existing client `subject_history_ready=false` and
+keeps that default for old INSERT shapes. All five current creation paths set
+it true on INSERT because their clients begin with the binding-aware issuer.
+This requires every serving issuer to be upgraded before activation; creation
+readiness is not a claim that old binaries understand the new policy.
+
+The database refuses pairwise policy while readiness is false. Both policy
+repositories recheck readiness under their client lock, and readiness changes
+advance the shared policy revision to invalidate outstanding validation.
+Neither ordinary runtime role receives UPDATE authority for the new field.
+The management policy view reports `history_ready`; a pending pairwise PUT
+returns 409 before sector fetching. DCR checks the effective metadata after its
+saved policy chain and refuses pending pairwise activation before fetching or
+registration-token rotation. Public issuance, public metadata updates and
+history backfill remain available. A caller cannot set readiness through either
+policy request, and finishing the last history page never sets it implicitly.
+
+The migration intentionally refuses a pre-existing pairwise row from an
+unsupported partial deployment rather than declaring its history complete or
+rewriting its identity. Existing supported deployments have public policy. Do
+not manually flip readiness to bypass reconciliation: the audited operator
+workflow to import relying-party evidence, cover retained history and finalize
+cutover is still to be implemented. This guard is an intermediate rollout
+protection, not completion of existing-client pairwise support. Readiness is
+runtime migration state and is not a configuration snapshot or promotion field.

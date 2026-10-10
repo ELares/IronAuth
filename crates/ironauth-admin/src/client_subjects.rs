@@ -41,6 +41,9 @@ pub struct ClientSubjectPolicyView {
     pub sector_identifier_uri: Option<String>,
     /// Revision to send as `expected_revision` on a replacement request.
     pub revision: i64,
+    /// False for a legacy client whose issued identities still need reconciliation.
+    /// Such a client cannot activate pairwise policy.
+    pub history_ready: bool,
     /// Current redirects against which this policy is validated.
     pub redirect_uris: Vec<String>,
 }
@@ -64,6 +67,7 @@ impl From<ClientSubjectPolicySnapshot> for ClientSubjectPolicyView {
             sector_identifier,
             sector_identifier_uri,
             revision: snapshot.revision,
+            history_ready: snapshot.history_ready,
             redirect_uris: snapshot.redirect_uris,
         }
     }
@@ -137,7 +141,7 @@ pub async fn get_client_subject_policy(
         (status = 401, description = "Invalid credential or fresh privilege required", body = ErrorBody),
         (status = 403, description = "Wrong scope or permission", body = ErrorBody),
         (status = 404, description = "Absent, malformed, foreign or deleted resource", body = ErrorBody),
-        (status = 409, description = "Policy or redirects changed; read again before retrying", body = ErrorBody),
+        (status = 409, description = "Policy changed or legacy identity history needs reconciliation", body = ErrorBody),
         (status = 503, description = "Sector validation unavailable", body = ErrorBody)
     )
 )]
@@ -156,6 +160,11 @@ pub async fn set_client_subject_policy(
     if request.expected_revision != expected.revision {
         return Err(ApiError::Conflict(
             "client policy changed; read it again before retrying".to_owned(),
+        ));
+    }
+    if matches!(request.subject_type, SubjectType::Pairwise) && !expected.history_ready {
+        return Err(ApiError::Conflict(
+            "reconcile legacy public identity history before enabling pairwise".to_owned(),
         ));
     }
     let policy = validate_policy(&state, request, &expected.redirect_uris).await?;

@@ -6025,7 +6025,7 @@
             }
           },
           "409": {
-            "description": "Policy or redirects changed; read again before retrying",
+            "description": "Policy changed or legacy identity history needs reconciliation",
             "content": {
               "application/json": {
                 "schema": {
@@ -32633,12 +32633,17 @@
           "client_id",
           "subject_type",
           "revision",
+          "history_ready",
           "redirect_uris"
         ],
         "properties": {
           "client_id": {
             "type": "string",
             "description": "Scoped registered client identifier."
+          },
+          "history_ready": {
+            "type": "boolean",
+            "description": "False for a legacy client whose issued identities still need reconciliation.\nSuch a client cannot activate pairwise policy."
           },
           "redirect_uris": {
             "type": "array",

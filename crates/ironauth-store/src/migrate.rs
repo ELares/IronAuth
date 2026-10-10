@@ -2122,6 +2122,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0252_client_subject_policy_control.sql"),
         },
+        Migration {
+            version: 253,
+            name: "client_subject_history_guard",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0253_client_subject_history_guard.sql"),
+        },
     ]
 }
 

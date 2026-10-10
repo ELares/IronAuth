@@ -36,6 +36,243 @@ fn pairwise() -> ClientSubjectPolicy {
     }
 }
 
+#[tokio::test]
+async fn legacy_history_guard_blocks_policy_activation_without_blocking_public_issuance() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (scope, modern, user) = fixture(&db, &env).await;
+    let read = db.store().scoped(scope).clients();
+    assert!(read.subject_policy(&modern).await.unwrap().history_ready);
+    // The old INSERT shape omits the readiness column, even after schema expansion.
+    let legacy = ClientId::generate(&env, &scope);
+    sqlx::query(
+        "INSERT INTO clients (id,tenant_id,environment_id,display_name) VALUES ($1,$2,$3,'legacy')",
+    )
+    .bind(legacy.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(db.owner_pool())
+    .await
+    .unwrap();
+    let expected = read.subject_policy(&legacy).await.unwrap();
+    assert!(!expected.history_ready);
+    let acting = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    assert_eq!(
+        acting
+            .clients()
+            .bind_subject(&env, &expected, &user, &user.to_string())
+            .await
+            .unwrap(),
+        user.to_string()
+    );
+    historical_grant(&db, &env, scope, legacy, &user.to_string(), None).await;
+    let page = acting
+        .clients()
+        .backfill_public_subject_history(&env, &expected, None, 500)
+        .await
+        .unwrap();
+    assert_eq!((page.scanned, page.inserted, page.next_user), (1, 0, None));
+    assert!(
+        !read.subject_policy(&legacy).await.unwrap().history_ready,
+        "a final page cannot certify missing audit-only history"
+    );
+    assert!(matches!(
+        acting
+            .clients()
+            .set_subject_policy(&env, &expected, &pairwise(), &[])
+            .await,
+        Err(StoreError::Conflict)
+    ));
+    let control = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    assert!(matches!(
+        control
+            .client_subject_policies(scope)
+            .set(&env, &expected, &pairwise())
+            .await,
+        Err(StoreError::Conflict)
+    ));
+    control
+        .client_subject_policies(scope)
+        .set(&env, &expected, &ClientSubjectPolicy::Public)
+        .await
+        .unwrap();
+    let error = sqlx::query("UPDATE clients SET subject_type='pairwise', pairwise_sector='sector.example.test', subject_policy_redirect_uris=redirect_uris WHERE id=$1")
+        .bind(legacy.to_string()).execute(db.owner_pool()).await.unwrap_err();
+    assert_eq!(
+        error.as_database_error().unwrap().constraint(),
+        Some("client_subject_history_ready")
+    );
+    for role in ["ironauth_app", "ironauth_control"] {
+        let permitted: bool = sqlx::query_scalar(
+            "SELECT has_column_privilege($1,'clients','subject_history_ready','UPDATE')",
+        )
+        .bind(role)
+        .fetch_one(db.owner_pool())
+        .await
+        .unwrap();
+        assert!(
+            !permitted,
+            "ordinary role cannot certify legacy history: {role}"
+        );
+    }
+    assert_eq!(read.subject_policy(&legacy).await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn history_guard_expand_marks_existing_rows_pending_and_versions_readiness_changes() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (scope, client, _) = fixture(&db, &env).await;
+    // Reconstruct the pre-0253 column shape, retaining a real existing client.
+    sqlx::query("ALTER TABLE clients DROP COLUMN subject_history_ready CASCADE")
+        .execute(db.owner_pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../migrations/0253_client_subject_history_guard.sql"
+    ))
+    .execute(db.owner_pool())
+    .await
+    .unwrap();
+    let read = db.store().scoped(scope).clients();
+    let before = read.subject_policy(&client).await.unwrap();
+    assert!(!before.history_ready);
+    assert_eq!(before.policy, ClientSubjectPolicy::Public);
+    // Owner-only fixture operation exercises the revision trigger. This is not
+    // reconciliation implementation or a recommended manual workaround.
+    sqlx::query("UPDATE clients SET subject_history_ready=true WHERE id=$1")
+        .bind(client.to_string())
+        .execute(db.owner_pool())
+        .await
+        .unwrap();
+    let after = read.subject_policy(&client).await.unwrap();
+    assert!(after.history_ready);
+    assert_eq!(after.revision, before.revision + 1);
+    sqlx::query("UPDATE clients SET subject_history_ready=false WHERE id=$1")
+        .bind(client.to_string())
+        .execute(db.owner_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        read.subject_policy(&client).await.unwrap().revision,
+        before.revision + 2
+    );
+}
+
+#[tokio::test]
+async fn all_new_client_creation_paths_allow_pairwise_without_legacy_reconciliation() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (scope, public, _) = fixture(&db, &env).await;
+    let acting = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let confidential = acting
+        .clients()
+        .create_confidential(&env, "basic", "client_secret_basic", "hash")
+        .await
+        .unwrap();
+    let auth_time = acting
+        .clients()
+        .create_requiring_auth_time(&env, "auth time")
+        .await
+        .unwrap();
+    let jwt = acting
+        .clients()
+        .create_jwt_auth(
+            &env,
+            ironauth_store::NewJwtAuthClient {
+                display_name: "jwt",
+                auth_method: "private_key_jwt",
+                jwks: None,
+                jwks_uri: Some("https://client.example.test/jwks"),
+                signing_alg: None,
+                tls_client_auth_cert: None,
+                tls_client_auth_subject_dn: None,
+            },
+        )
+        .await
+        .unwrap();
+    for client in [public, confidential, auth_time, jwt] {
+        let expected = db
+            .store()
+            .scoped(scope)
+            .clients()
+            .subject_policy(&client)
+            .await
+            .unwrap();
+        assert!(expected.history_ready);
+        acting
+            .clients()
+            .set_subject_policy(&env, &expected, &pairwise(), &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            db.store()
+                .scoped(scope)
+                .clients()
+                .subject_policy(&client)
+                .await
+                .unwrap()
+                .policy,
+            pairwise()
+        );
+    }
+}
+
+#[tokio::test]
+async fn history_guard_expand_refuses_to_certify_an_unsupported_existing_pairwise_row() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (scope, client, _) = fixture(&db, &env).await;
+    let expected = db
+        .store()
+        .scoped(scope)
+        .clients()
+        .subject_policy(&client)
+        .await
+        .unwrap();
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .set_subject_policy(&env, &expected, &pairwise(), &[])
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE clients DROP COLUMN subject_history_ready CASCADE")
+        .execute(db.owner_pool())
+        .await
+        .unwrap();
+    let mut tx = db.owner_pool().begin().await.unwrap();
+    let error = sqlx::raw_sql(include_str!(
+        "../migrations/0253_client_subject_history_guard.sql"
+    ))
+    .execute(&mut *tx)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.as_database_error().unwrap().constraint(),
+        Some("client_subject_history_ready")
+    );
+    tx.rollback().await.unwrap();
+    let kind: String = sqlx::query_scalar("SELECT subject_type FROM clients WHERE id=$1")
+        .bind(client.to_string())
+        .fetch_one(db.owner_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        kind, "pairwise",
+        "failed upgrade must not rewrite existing identity policy"
+    );
+}
+
 async fn audits(db: &TestDatabase, action: &str) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action=$1")
         .bind(action)

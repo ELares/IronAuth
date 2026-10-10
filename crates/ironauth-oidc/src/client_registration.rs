@@ -438,6 +438,14 @@ pub async fn update(
         }
     }
 
+    if metadata.get("subject_type").and_then(Value::as_str) == Some("pairwise")
+        && !record.subject_history_ready
+    {
+        return metadata_error(
+            "legacy public identity history requires administrator reconciliation before enabling pairwise",
+        );
+    }
+
     let Some((signable, default_alg)) = env_signing_capability(&state, &scope).await else {
         return server_error();
     };
