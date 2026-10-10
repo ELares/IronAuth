@@ -535,6 +535,8 @@ fn excluded() -> BTreeMap<&'static str, &'static str> {
         "/t/{tenant_id}/e/{environment_id}/account/mfa/totp/verify-enrollment",
         "/t/{tenant_id}/e/{environment_id}/account/password",
         "/t/{tenant_id}/e/{environment_id}/account/password/remove",
+        "/t/{tenant_id}/e/{environment_id}/account/profile",
+        "/t/{tenant_id}/e/{environment_id}/profile",
         "/t/{tenant_id}/e/{environment_id}/account/sessions",
         "/t/{tenant_id}/e/{environment_id}/account/sessions/revoke",
         "/t/{tenant_id}/e/{environment_id}/account/sessions/revoke-others",

@@ -670,3 +670,39 @@ Enabled delivery uses durable terminal notices; deployment remains default off.
 - Elevation of privilege: navigation context cannot be used by the normal live
   PAR read or atomic consume. Only an error can be returned; a fresh application
   authorization is required. Missing/old/consumed context fails closed.
+
+## Surface: optional self-service display name (#1385)
+
+The scoped account profile API and hosted profile page operate on the current
+session's subject. A display label is optional presentation data, never a login
+identifier, authorization key, verified mailbox, or identity merge instruction.
+
+- Spoofing: both read and write resolve the caller's own live cookie and refuse
+  impersonated sessions. The store additionally requires the stable human actor
+  derived from the target user; no client-supplied subject or claim bag is accepted.
+- Tampering: POST requires a present same-origin Origin header. Unknown JSON
+  fields are refused. The new name is bounded to 80 characters, without control
+  characters or surrounding spaces. The row lock protects read/patch/seal of only
+  the name field and preserves the DEK version and every other claim. The expected
+  label prevents a different concurrent edit from being silently overwritten.
+- Repudiation: every accepted write has an atomic user.update audit attributed to
+  the account owner with the fixed self_service_display_name detail. Neither the
+  new nor old name is copied into that audit detail. Repeating the current desired
+  value is a harmless assignment and may produce another audit, not another user.
+- Information disclosure: HTML values are escaped and pages/API responses are
+  no-store. The self-service response contains only the name. UserInfo retains
+  its existing scope/claim-release policy; this surface cannot assert email
+  verification or change public/pairwise subject configuration. A sessionStorage
+  recovery copy contains only the own label and expected label, keyed by the
+  scoped subject and removed after confirmed save or explicit reload.
+- Denial of service: the existing router body limit bounds JSON and the label
+  has an independent store-side bound. Browser requests have a 15-second timeout;
+  uncertain writes freeze the exact input for deliberate retry or reconciliation.
+- Elevation of privilege: the write requires an active stored user and cannot
+  modify other claims, identifiers, credentials, membership or grants. Hosted
+  return links must be registered authorization requests within the same scope.
+
+Residual qualification: connected registration/settings entry points, actual
+hosted browser recovery and deployment evidence remain required by #1385. The
+current token path resolves public subjects; the generic pairwise helper alone
+is not evidence of an end-to-end pairwise UserInfo journey.

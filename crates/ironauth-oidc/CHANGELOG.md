@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add an authenticated self-service display-name API and hosted settings page (#1385). Names are optional and bounded, changes retain unknown outcomes for retry, and profile labels never establish mailbox ownership or application access.
+
 - Attribute hosted recovery issuance and mail delivery to a stable provider service actor (#1479). Keep proved credential completion attributed to the account owner; unproved requests and background jobs do not impersonate that owner or invent human identities. Clarify that recovery instructions require an eligible account with a verified email address.
 
 - Keep hosted recovery responses uniform during the account cooldown, including requests from another browser (#1479). Preserve the original code and avoid sending another message.
