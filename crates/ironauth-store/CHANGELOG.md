@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Delay normal signing-key activation after a late rotation tick or slow key preparation (#19). A newly provisioned successor receives the full configured publication window instead of backdated publication; the current key continues signing while it waits. Explicit break-glass retains its immediate behavior.
+
 - Add a scoped client index for retained grants and batch each identity-history
   page into one immutable insert (#19). Migration 0255 preserves revoked history
   and existing permissions. An opt-in real-role workload recovers 10,000 users

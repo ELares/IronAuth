@@ -1075,7 +1075,7 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> LoadOutcome {
     if records.is_empty() {
         return LoadOutcome::Empty;
     }
-    let mut keyset: Option<KeySet> = None;
+    let mut scheduled_keys = Vec::new();
     let mut algorithms: Vec<JwsAlgorithm> = Vec::new();
     for record in &records {
         // Degrade, do not fail the whole environment: a single unreconstructable
@@ -1098,22 +1098,27 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> LoadOutcome {
         if !algorithms.contains(&algorithm) {
             algorithms.push(algorithm);
         }
-        // The stored activation instant governs the key's lifecycle; a day-one
-        // key (the only kind this issue wires) is published and active together.
-        let activate_at = system_time_from_micros(record.activate_at_unix_micros);
-        match keyset.as_mut() {
-            None => keyset = Some(KeySet::bootstrap(key, activate_at)),
-            Some(set) => set.add(key, activate_at),
-        }
+        // A persisted successor is not a day-one key. Replacing its schedule
+        // with bootstrap/add would hide pre-publication and revive retired keys.
+        scheduled_keys.push((
+            key,
+            ironauth_jose::KeyLifecycle {
+                publish_at: system_time_from_micros(record.publish_at_unix_micros),
+                activate_at: system_time_from_micros(record.activate_at_unix_micros),
+                retire_at: record.retire_at_unix_micros.map(system_time_from_micros),
+                expire_at: record.expire_at_unix_micros.map(system_time_from_micros),
+            },
+        ));
     }
     // Fail closed if NO row yielded a key (an all-bad environment, or every row
     // unreconstructable): the empty key set is the same 404 as an unprovisioned
     // environment, so a token is never minted without a signing key. This is a
     // CONFIRMED absence (the store answered; the rows are just all bad), so it is
     // negative-cacheable.
-    let Some(keyset) = keyset else {
+    if scheduled_keys.is_empty() {
         return LoadOutcome::Empty;
-    };
+    }
+    let keyset = KeySet::from_lifecycles(scheduled_keys);
     // The policy is exactly the algorithms the loaded keys sign with, so an
     // ES256-only environment yields policy {ES256} and can emit nothing else
     // (AC #3): signing needs both a key of the algorithm and a policy that permits

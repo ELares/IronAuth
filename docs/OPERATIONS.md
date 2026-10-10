@@ -409,3 +409,21 @@ target. Supply `IRONAUTH_API_URL` and `IRONAUTH_TOKEN` or the documented flags;
 inspect `ironauth plan --help` before applying. For identity migrations and
 exports, see [the migration skill guide](skills/migrate-to-ironauth.md),
 [user lifecycle](design/USER-LIFECYCLE.md), and [the exit guide](exit-guide.md).
+
+## Delayed signing-key rotation
+
+A normal rotation tick that misses its planned publication time postpones the
+successor's activation. The configured publication window starts no earlier than
+key preparation completes; an outage or slow remote key backend cannot count
+time before the key existed as publication. The current key continues signing
+while clients learn the successor. Explicit confirmed break-glass is the separate
+immediate operation and intentionally has no waiting or retirement window.
+
+The issuer loader preserves all four persisted lifecycle times, including after
+a cold load or cache refresh. A retired key stays published only through its
+stored expiry and cannot become an active signer again.
+
+The delayed-publication change protects newly provisioned successors. It does not rewrite previously
+stored key schedules, certify arbitrary window/lifetime settings, or prove that
+every relying party refreshed its cache. Review those settings and the issuer
+cache behavior together before changing rotation policy.

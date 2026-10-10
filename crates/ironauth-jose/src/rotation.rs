@@ -85,16 +85,16 @@ impl RotationParams {
 // vocabulary here, not accidental repetition.
 #[allow(clippy::struct_field_names)]
 #[derive(Clone, Copy, Debug)]
-struct KeyLifecycle {
+pub struct KeyLifecycle {
     /// When the key first appears in the published JWKS (pre-publication).
-    publish_at: SystemTime,
+    pub publish_at: SystemTime,
     /// When the key becomes the active signer (first use).
-    activate_at: SystemTime,
+    pub activate_at: SystemTime,
     /// When the key stops being the active signer (a successor took over).
-    retire_at: Option<SystemTime>,
+    pub retire_at: Option<SystemTime>,
     /// When the last token this key signed has expired; after this the key is
     /// withdrawn from the published JWKS.
-    expire_at: Option<SystemTime>,
+    pub expire_at: Option<SystemTime>,
 }
 
 /// One signing key together with its lifecycle.
@@ -115,6 +115,18 @@ pub struct KeySet {
 }
 
 impl KeySet {
+    /// Restore trusted persisted key schedules without replacing them with day-one
+    /// activation defaults. The caller owns schedule validation and scoped loading;
+    /// this constructor preserves every publication, activation and retirement instant.
+    pub fn from_lifecycles(keys: impl IntoIterator<Item = (SigningKey, KeyLifecycle)>) -> Self {
+        Self {
+            keys: keys
+                .into_iter()
+                .map(|(key, lifecycle)| ManagedKey { key, lifecycle })
+                .collect(),
+        }
+    }
+
     /// Start a key set from its genesis key, which becomes active (and published)
     /// at `activate_at`.
     ///

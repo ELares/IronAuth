@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Restore complete trusted signing-key lifecycles without replacing persisted publication and retirement instants with day-one defaults (#19).
+
 - Validate encryption recipient key purpose, public material, curve and point
   consistently at registration and issuance. Signing-only keys cannot be selected
   for encrypted ID-token responses.

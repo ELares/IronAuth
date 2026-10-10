@@ -3551,7 +3551,7 @@
         },
         "interval_secs": {
           "default": 3600,
-          "description": "Seconds between timer passes. A pass is idempotent, so an over-long interval\nonly delays a scheduled rotation by the interval; it never skips one.",
+          "description": "Seconds between timer passes. A late pass delays activation until a newly\nprepared successor has its full configured pre-publication window; it does\nnot backdate publication to recover a missed schedule.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

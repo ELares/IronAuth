@@ -459,3 +459,108 @@ async fn a_full_rotation_is_idempotent_at_a_given_instant() {
     assert_eq!(again.promoted.len(), 0);
     assert_eq!(again.retired.len(), 0);
 }
+
+/// A stopped timer cannot count time before the successor existed as publication.
+#[tokio::test]
+async fn a_late_tick_gives_the_successor_a_full_publication_window() {
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x45);
+    let scope = db.seed_scope(&env).await;
+    provision_day_one_head(&db, &env, scope, 0).await;
+    let machine = RotationStateMachine::new(
+        db.store(),
+        scope,
+        db.test_actor(&env),
+        CorrelationId::generate(&env),
+    );
+    let policy = test_policy();
+    // The first pass occurs after both the planned publication and activation.
+    clock.advance(std::time::Duration::from_secs(10_050));
+    let now = 10_050_000_000;
+    let report = machine.advance(&env, policy, now, 1_000).await.unwrap();
+    assert_eq!(report.provisioned.len(), 1);
+    let keys = db
+        .store()
+        .scoped(scope)
+        .signing_keys()
+        .list()
+        .await
+        .unwrap();
+    let successor = keys
+        .iter()
+        .find(|k| k.id.to_string() == report.provisioned[0].1)
+        .unwrap();
+    assert_eq!(successor.publish_at_unix_micros, now);
+    assert_eq!(successor.activate_at_unix_micros, now + 100_000_000);
+    assert_eq!(published_kids(&db, scope, now).await.len(), 2);
+    // Repeated passes in the waiting window neither activate nor seed another key.
+    for instant in [now, now + 99_999_999] {
+        let retry = machine.advance(&env, policy, instant, 1_000).await.unwrap();
+        assert!(retry.provisioned.is_empty());
+        assert!(retry.promoted.is_empty());
+    }
+    let handoff = machine
+        .advance(&env, policy, now + 100_000_000, 1_000)
+        .await
+        .unwrap();
+    assert_eq!(handoff.promoted, report.provisioned);
+    assert_eq!(handoff.retiring.len(), 1);
+    let keys = db
+        .store()
+        .scoped(scope)
+        .signing_keys()
+        .list()
+        .await
+        .unwrap();
+    let old = keys
+        .iter()
+        .find(|k| k.id.to_string() == handoff.retiring[0].1)
+        .unwrap();
+    assert_eq!(old.expire_at_unix_micros, Some(now + 1_150_000_000));
+}
+
+/// Slow key generation or a remote backend does not consume the publication lead.
+#[tokio::test]
+async fn publication_starts_after_remote_key_preparation_finishes() {
+    struct SlowProvisioner(std::sync::Arc<ironauth_env::ManualClock>);
+    impl ironauth_store::key_rotation::RemoteKeyProvisioner for SlowProvisioner {
+        fn ensure_remote_key(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<(), ironauth_store::key_rotation::RemoteKeyProvisionError> {
+            self.0.advance(std::time::Duration::from_secs(150));
+            Ok(())
+        }
+    }
+    let db = TestDatabase::start().await;
+    let (env, clock) = Env::deterministic(SystemTime::UNIX_EPOCH, 0x46);
+    let scope = db.seed_scope(&env).await;
+    provision_day_one_head(&db, &env, scope, 0).await;
+    clock.advance(std::time::Duration::from_secs(9_900));
+    let provisioner = SlowProvisioner(clock);
+    let machine = RotationStateMachine::new(
+        db.store(),
+        scope,
+        db.test_actor(&env),
+        CorrelationId::generate(&env),
+    )
+    .with_remote_seeding(&provisioner);
+    let report = machine
+        .advance(&env, test_policy(), 9_900_000_000, 1_000)
+        .await
+        .unwrap();
+    let keys = db
+        .store()
+        .scoped(scope)
+        .signing_keys()
+        .list()
+        .await
+        .unwrap();
+    let successor = keys
+        .iter()
+        .find(|k| k.id.to_string() == report.provisioned[0].1)
+        .unwrap();
+    assert_eq!(successor.publish_at_unix_micros, 10_050_000_000);
+    assert_eq!(successor.activate_at_unix_micros, 10_150_000_000);
+}

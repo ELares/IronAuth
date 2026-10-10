@@ -1395,3 +1395,138 @@ async fn a_cached_value_that_is_not_a_jwk_set_is_ignored() {
          rendered, not served as the environment's key set"
     );
 }
+
+/// A late durable rotation must still give a caching RP time to learn the next key.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn late_rotation_preserves_published_lead_and_token_verification() {
+    use ironauth_jose::{EmissionOptions, ExpectedTyp, TokenTyp, VerificationPolicy};
+    use ironauth_store::key_rotation::{RotationPolicy, RotationStateMachine};
+    let h = Harness::start_store_backed().await;
+    let scope = h.scope();
+    let registry = std::sync::Arc::new(store_backed(&h));
+    let router = ironauth_oidc::issuer_router(ironauth_oidc::IssuerState::new(
+        registry.clone(),
+        h.env().clone(),
+    ));
+    let uri = format!("/t/{}/e/{}/jwks.json", scope.tenant(), scope.environment());
+    h.clock().advance(Duration::from_secs(10_049));
+    let (status, old_document) = get(&router, &uri).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(
+        ironauth_jose::trusted_keys_from_jwks(old_document.as_bytes()).len(),
+        1
+    );
+    let old_kid = registry
+        .entry_for(&scope, at(10_049))
+        .await
+        .unwrap()
+        .signer(at(10_049))
+        .unwrap()
+        .kid()
+        .unwrap()
+        .to_owned();
+
+    h.clock().advance(Duration::from_secs(1));
+    let machine = RotationStateMachine::new(
+        h.store(),
+        scope,
+        h.db().test_actor(h.env()),
+        ironauth_store::CorrelationId::generate(h.env()),
+    );
+    // 300 seconds RP cache + 900 seconds maximum token lifetime + 60 seconds buffer.
+    let policy = RotationPolicy {
+        cadence_secs: 10_000,
+        pre_publication_secs: 1_260,
+        retirement_buffer_secs: 60,
+    };
+    let report = machine
+        .advance(h.env(), policy, 10_050_000_000, 900)
+        .await
+        .unwrap();
+    assert_eq!(report.provisioned.len(), 1);
+    let next_kid = &report.provisioned[0].1;
+    let keys = h.store().scoped(scope).signing_keys().list().await.unwrap();
+    let next = keys.iter().find(|k| k.id.to_string() == *next_kid).unwrap();
+    assert_eq!(next.publish_at_unix_micros, 10_050_000_000);
+    assert_eq!(next.activate_at_unix_micros, 11_310_000_000);
+
+    // An RP that cached just before creation can refresh after its full HTTP TTL
+    // and find the successor while the old key still signs. The registry TTL
+    // has also elapsed, exercising the durable-store reload rather than a seed.
+    h.clock().advance(Duration::from_secs(300));
+    let (status, published) = get(&router, &uri).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(
+        ironauth_jose::trusted_keys_from_jwks(published.as_bytes()).len(),
+        2
+    );
+    let entry = registry.entry_for(&scope, at(10_350)).await.unwrap();
+    assert_eq!(
+        entry.signer(at(10_350)).unwrap().kid(),
+        Some(old_kid.as_str())
+    );
+    h.clock().advance(Duration::from_secs(959));
+    let entry = registry.entry_for(&scope, at(11_309)).await.unwrap();
+    assert_eq!(
+        entry.signer(at(11_309)).unwrap().kid(),
+        Some(old_kid.as_str())
+    );
+    let issuer = registry.issuer_for(&scope);
+    let payload = |issued: u64| {
+        serde_json::json!({"iss":issuer,"sub":"local-test-account","aud":"rotation-rp","iat":issued,"exp":issued+900}).to_string().into_bytes()
+    };
+    let options = EmissionOptions::new().with_token_typ(TokenTyp::IdToken);
+    let old_token = ironauth_jose::sign_jws(
+        entry.signer(at(11_309)).unwrap(),
+        &payload(11_309),
+        &options,
+    )
+    .unwrap();
+    let (_, cached_at_handoff) = get(&router, &uri).await;
+    let rp = VerificationPolicy::new(
+        vec![JwsAlgorithm::EdDsa],
+        ironauth_jose::trusted_keys_from_jwks(cached_at_handoff.as_bytes()),
+        &issuer,
+        "rotation-rp",
+        ExpectedTyp::Required(TokenTyp::IdToken),
+    )
+    .unwrap();
+
+    h.clock().advance(Duration::from_secs(1));
+    let handoff = machine
+        .advance(h.env(), policy, 11_310_000_000, 900)
+        .await
+        .unwrap();
+    assert_eq!(handoff.promoted, report.provisioned);
+    let entry = registry.entry_for(&scope, at(11_310)).await.unwrap();
+    assert_eq!(
+        entry.signer(at(11_310)).unwrap().kid(),
+        Some(next_kid.as_str())
+    );
+    let new_token = ironauth_jose::sign_jws(
+        entry.signer(at(11_310)).unwrap(),
+        &payload(11_310),
+        &options,
+    )
+    .unwrap();
+    assert!(ironauth_jose::verify(&old_token, &rp, h.clock().as_ref()).is_ok());
+    assert!(ironauth_jose::verify(&new_token, &rp, h.clock().as_ref()).is_ok());
+
+    h.clock().advance(Duration::from_secs(898));
+    let (_, retained) = get(&router, &uri).await;
+    let rp = VerificationPolicy::new(
+        vec![JwsAlgorithm::EdDsa],
+        ironauth_jose::trusted_keys_from_jwks(retained.as_bytes()),
+        &issuer,
+        "rotation-rp",
+        ExpectedTyp::Required(TokenTyp::IdToken),
+    )
+    .unwrap();
+    assert!(ironauth_jose::verify(&old_token, &rp, h.clock().as_ref()).is_ok());
+    h.clock().advance(Duration::from_secs(62));
+    let (_, retired) = get(&router, &uri).await;
+    let document: serde_json::Value = serde_json::from_str(&retired).unwrap();
+    assert_eq!(document["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(document["keys"][0]["kid"], *next_kid);
+}

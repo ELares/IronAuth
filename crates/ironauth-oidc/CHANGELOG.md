@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Preserve stored signing-key publication, activation, retirement and expiry times in the issuer loader (#19). A PostgreSQL/router/clock regression exercises delayed rotation, cached JWKS, signatures across handoff and eventual withdrawal.
+
 - Reject dynamic-registration updates that enable pairwise for a legacy client with unresolved identity history (#19). Refuse before sector fetching or credential rotation, after applying the saved registration policy chain. New pairwise registrations and legacy public updates remain supported.
 
 - Expose the shared pure sector-host inference helper for management configuration so DCR and management use the same hostname rule (#19).
