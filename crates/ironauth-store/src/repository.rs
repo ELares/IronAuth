@@ -68858,6 +68858,11 @@ impl ActingEnvelopeRepo<'_> {
         purpose: &str,
         plaintext: &[u8],
     ) -> Result<EncryptedSecretId, StoreError> {
+        // Pairwise identity material is created once through its own primitive.
+        // Replacing it would change every derived identity in this environment.
+        if purpose == PAIRWISE_SUBJECT_SALT_PURPOSE {
+            return Err(StoreError::Invalid);
+        }
         let scope = self.scope;
         // Reuse an existing row's id (a stable audit target across overwrites),
         // or mint a fresh one for a first write.
@@ -91216,5 +91221,109 @@ impl ActingUserRepo<'_> {
                 Ok(())
             }, false, Some("self_service_display_name"),
         ).await
+    }
+}
+
+/// Reserved envelope purpose for stable per-environment pairwise identity.
+/// Ordinary secret replacement refuses this purpose; DEK re-encryption preserves it.
+pub const PAIRWISE_SUBJECT_SALT_PURPOSE: &str = "oidc.pairwise.subject-salt.v1";
+
+/// Secret pairwise identity material. It is never included in Debug or serialized.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PairwiseSaltMaterial([u8; 32]);
+
+impl PairwiseSaltMaterial {
+    /// Bytes for the shared pairwise derivation, not for logging or management output.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PairwiseSaltMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PairwiseSaltMaterial(<redacted>)")
+    }
+}
+
+impl EnvelopeRepo<'_> {
+    /// Read the durable environment salt, without generating or repairing identity.
+    ///
+    /// # Errors
+    /// `NotFound` before provisioning; `Encryption` for absent keys, corruption,
+    /// shredding or an invalid stored length; ordinary store errors otherwise.
+    pub async fn pairwise_salt(&self) -> Result<PairwiseSaltMaterial, StoreError> {
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let bytes = self
+            .open_secret(master, PAIRWISE_SUBJECT_SALT_PURPOSE)
+            .await?;
+        let bytes: [u8; 32] = bytes.try_into().map_err(|_| StoreError::Encryption)?;
+        Ok(PairwiseSaltMaterial(bytes))
+    }
+}
+
+impl ActingEnvelopeRepo<'_> {
+    /// Create the environment's identity salt once, or return the durable winner.
+    ///
+    /// A first-writer race is settled by the existing (scope, purpose) unique key.
+    /// Only the insert winner commits an encrypted-secret audit. A retry or loser
+    /// reads the winner; no memory cache or process randomness becomes authoritative.
+    /// Corrupt or shredded material is never replaced with a different identity.
+    ///
+    /// # Errors
+    /// The read/decryption errors of `EnvelopeRepo::pairwise_salt`, key-provision
+    /// failures and ordinary audited-write failures. A failed audit rolls back the
+    /// salt insertion. Provisioned envelope keys may remain for a later retry.
+    pub async fn ensure_pairwise_salt(
+        &self,
+        env: &Env,
+    ) -> Result<PairwiseSaltMaterial, StoreError> {
+        let reader = EnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+        };
+        match reader.pairwise_salt().await {
+            Ok(salt) => return Ok(salt),
+            Err(StoreError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        match self.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match self.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        let scope = self.scope;
+        let id = EncryptedSecretId::generate(env, &scope);
+        let now = epoch_micros(env.clock().now_utc());
+        let mut salt = [0_u8; 32];
+        env.entropy().fill_bytes(&mut salt);
+        let outcome = write_audited_detailed(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env,
+                action: Action::EncryptedSecretPut, target: &id },
+            async move |tx| {
+                let (version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let sealed = dek.seal(env.entropy(),
+                    &secret_seal_aad(scope, PAIRWISE_SUBJECT_SALT_PURPOSE, version), &salt);
+                let inserted = sqlx::query(
+                    "INSERT INTO encrypted_secrets \
+                     (id, tenant_id, environment_id, purpose, dek_version, ciphertext, updated_at) \
+                     VALUES ($1,$2,$3,$4,$5,$6, TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, purpose) DO NOTHING"
+                ).bind(id.to_string()).bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string()).bind(PAIRWISE_SUBJECT_SALT_PURPOSE)
+                    .bind(version).bind(sealed.into_bytes()).bind(now)
+                    .execute(&mut **tx).await?;
+                if inserted.rows_affected() != 1 { return Err(StoreError::Conflict); }
+                Ok(())
+            }, false, Some("pairwise_subject_salt"),
+        ).await;
+        match outcome {
+            Ok(()) | Err(StoreError::Conflict) => reader.pairwise_salt().await,
+            Err(error) => Err(error),
+        }
     }
 }

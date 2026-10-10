@@ -475,3 +475,5 @@ pub use token_hook_store::{
     AotArtifact, ChallengeComponentMetadata, ChallengeComponentRecord, ChallengeDeployment,
     HookDeployment, HookFailurePolicy, HookPlacement, TokenHookMetadata, TokenHookVersion,
 };
+
+pub use repository::{PAIRWISE_SUBJECT_SALT_PURPOSE, PairwiseSaltMaterial};

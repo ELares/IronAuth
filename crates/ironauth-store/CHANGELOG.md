@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add durable, scoped, envelope-encrypted pairwise subject salt provisioning (#19). Concurrent creators share one audited value; retries, pool restarts and encryption-key rotation preserve it. Ordinary encrypted-secret replacement refuses its reserved purpose. Production client policy and token wiring remain pending.
+
 - Queue the canonical `user.updated` event atomically with a changed self-service display name, without including the label in event data. Same-value retries produce no duplicate change event (#1385).
 
 - Add an audited, subject-bound display-name update (#1385). Lock and patch only the standard name claim, preserving concurrent mailbox and other profile claims; reject conflicting names and inactive or different subjects.

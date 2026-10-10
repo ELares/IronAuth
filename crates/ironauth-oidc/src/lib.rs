@@ -469,7 +469,8 @@ pub use risk::{
 };
 pub use routing::{RouteCandidates, normalize_email_domain, resolve_route};
 pub use sector::{
-    SectorError, check_sector_document, sector_uri_required, validate_sector_identifier,
+    SectorError, check_sector_document, resolve_pairwise_sector, sector_uri_required,
+    validate_sector_identifier,
 };
 pub use session::{PEER_IP_HEADER, SESSION_COOKIE, clear_set_cookie};
 pub use ssf_fanout::{SsfLifecycleFanOutConsumer, SsfSessionFanOutConsumer};

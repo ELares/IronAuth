@@ -22,17 +22,43 @@
 
 use ironauth_fetch::{FetchError, FetchPurpose, FetchRequest, Fetcher, Scheme, parse_target};
 
-/// Whether a `sector_identifier_uri` is REQUIRED for `redirect_uris` under a
-/// pairwise subject type (Registration 5): it is required precisely when the
-/// redirect URIs span more than one host, so the provider cannot infer a single
-/// sector on its own.
+/// Whether pairwise registration needs an explicit sector document. Multiple
+/// hosts, no redirects, or a hostless native redirect cannot identify one host.
 #[must_use]
 pub fn sector_uri_required(redirect_uris: &[String]) -> bool {
-    let mut hosts = redirect_uris.iter().filter_map(|uri| redirect_host(uri));
-    let Some(first) = hosts.next() else {
-        return false;
-    };
-    hosts.any(|host| host != first)
+    inferred_sector(redirect_uris).is_none()
+}
+
+fn inferred_sector(redirect_uris: &[String]) -> Option<String> {
+    let first = redirect_host(redirect_uris.first()?)?;
+    redirect_uris
+        .iter()
+        .all(|uri| redirect_host(uri).as_deref() == Some(first.as_str()))
+        .then_some(first)
+}
+
+/// Resolve the sector to persist for a pairwise client. Redirect registration
+/// policy (web/native, fragments and loopback exceptions) remains the caller's
+/// responsibility. An explicit document is fetched and checked even when all
+/// redirects already share a host; its own host, never its port, is the sector.
+///
+/// # Errors
+/// Returns [`SectorError::SectorUriRequired`] when no single redirect host can
+/// be inferred, or the same URL/fetch/document errors as
+/// [`validate_sector_identifier`] for a supplied document.
+pub async fn resolve_pairwise_sector(
+    fetcher: &Fetcher,
+    sector_uri: Option<&str>,
+    redirect_uris: &[String],
+) -> Result<String, SectorError> {
+    if let Some(uri) = sector_uri {
+        validate_sector_identifier(fetcher, uri, redirect_uris).await?;
+        // Fetch validation uses the hardened network parser; identity uses the
+        // SAME canonical host representation as redirect inference, including
+        // IPv6 brackets/compression. A transport host is not an identity key.
+        return redirect_host(uri).ok_or(SectorError::InvalidUrl);
+    }
+    inferred_sector(redirect_uris).ok_or(SectorError::SectorUriRequired)
 }
 
 /// Validate a client's `sector_identifier_uri` against its registered redirect
@@ -106,13 +132,20 @@ pub fn check_sector_document(body: &[u8], redirect_uris: &[String]) -> Result<()
 /// The host of a redirect URI, if it parses. A redirect URI that does not parse
 /// contributes no host (it is caught by redirect-URI validation elsewhere).
 fn redirect_host(uri: &str) -> Option<String> {
-    parse_target(uri).ok().map(|target| target.host_header())
+    // Registration permits custom-scheme native redirects too. A hostless one
+    // needs an explicit sector; it must not disappear from a filter_map.
+    url::Url::parse(uri)
+        .ok()?
+        .host_str()
+        .map(str::to_ascii_lowercase)
 }
 
 /// Why a `sector_identifier_uri` failed validation.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum SectorError {
+    /// Redirects do not identify one host and no sector document was supplied.
+    SectorUriRequired,
     /// The `sector_identifier_uri` did not parse as a URL.
     InvalidUrl,
     /// The `sector_identifier_uri` was not `https`.
@@ -131,6 +164,9 @@ pub enum SectorError {
 impl std::fmt::Display for SectorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SectorError::SectorUriRequired => {
+                f.write_str("pairwise registration requires a sector_identifier_uri")
+            }
             SectorError::InvalidUrl => f.write_str("sector_identifier_uri is not a valid URL"),
             SectorError::NotHttps => f.write_str("sector_identifier_uri must be https"),
             SectorError::Fetch(err) => write!(f, "sector_identifier_uri fetch failed: {err}"),
