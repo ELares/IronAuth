@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Resolve pairwise sector hostnames independently of network ports and DNS case (#19). Require an explicit sector document for mixed hosts, hostless native redirects or an empty redirect set; validate supplied documents through the hardened fetcher even for single-host clients. Registration/token wiring remains pending.
+
 - Keep a validated application return available when the hosted profile session expires (#1385).
 
 - Offer an optional name step after browser registration and a name-edit link when the hosted consent screen requests profile access (#1385). Keep the validated application return and headless registration behavior. Use compact actions without nesting another card.

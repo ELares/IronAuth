@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use ironauth_fetch::{FetchError, FetchLimits, Fetcher, RecordingDialer, StaticResolver};
 use ironauth_oidc::{
-    SectorError, check_sector_document, sector_uri_required, validate_sector_identifier,
+    SectorError, check_sector_document, resolve_pairwise_sector, sector_uri_required,
+    validate_sector_identifier,
 };
 
 /// The client's registered redirect URIs.
@@ -103,4 +104,124 @@ fn sector_uri_is_required_only_when_redirect_hosts_differ() {
         "https://app.example.test/cb2".to_owned(),
     ]));
     assert!(sector_uri_required(&redirects()));
+}
+
+#[test]
+fn ports_and_dns_case_do_not_split_a_sector_host() {
+    assert!(
+        !sector_uri_required(&[
+            "https://APP.example.test/cb".to_owned(),
+            "https://app.example.test:8443/other".to_owned(),
+            "http://app.example.test:8080/local".to_owned(),
+        ]),
+        "Core 8.1 uses the host component, not the HTTP Host header"
+    );
+    assert!(sector_uri_required(&[
+        "https://app.example.test:8443/cb".to_owned(),
+        "https://other.example.test:8443/cb".to_owned(),
+    ]));
+}
+
+#[tokio::test]
+async fn inferred_sector_is_the_host_and_never_needs_network() {
+    let fetcher = fetcher_resolving_to("169.254.169.254");
+    let sector = resolve_pairwise_sector(
+        &fetcher,
+        None,
+        &[
+            "https://APP.example.test:8443/cb".to_owned(),
+            "https://app.example.test:9443/other".to_owned(),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(sector, "app.example.test");
+}
+
+#[tokio::test]
+async fn every_redirect_must_supply_the_same_host_for_inference() {
+    let fetcher = fetcher_resolving_to("169.254.169.254");
+    for uris in [
+        vec![],
+        vec!["com.example.app:/callback".to_owned()],
+        vec![
+            "https://a.example.test/cb".to_owned(),
+            "com.example.app:/callback".to_owned(),
+        ],
+        redirects(),
+    ] {
+        assert!(sector_uri_required(&uris));
+        assert!(matches!(
+            resolve_pairwise_sector(&fetcher, None, &uris).await,
+            Err(SectorError::SectorUriRequired)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn an_explicit_sector_is_validated_even_for_a_single_redirect_host() {
+    let fetcher = fetcher_resolving_to("169.254.169.254");
+    let redirects = vec!["https://app.example.test/cb".to_owned()];
+    assert!(matches!(
+        resolve_pairwise_sector(
+            &fetcher,
+            Some("http://sector.example.test/uris.json"),
+            &redirects
+        )
+        .await,
+        Err(SectorError::NotHttps)
+    ));
+    assert!(matches!(
+        resolve_pairwise_sector(
+            &fetcher,
+            Some("https://sector.example.test/uris.json"),
+            &redirects
+        )
+        .await,
+        Err(SectorError::Fetch(FetchError::Blocked))
+    ));
+}
+
+#[tokio::test]
+async fn explicit_sector_uses_its_own_host_after_a_real_tls_document_check() {
+    use ironauth_fetch::{TestTlsIdentity, TestTlsTarget};
+    let identity = TestTlsIdentity::generate("sector.example.test");
+    let target = TestTlsTarget::start(
+        &identity,
+        200,
+        br#"["https://a.example.test/cb","https://b.example.test/cb"]"#.to_vec(),
+    )
+    .await;
+    let fetcher = Fetcher::from_parts_trusting(
+        FetchLimits::default(),
+        Arc::new(StaticResolver::new(vec!["93.184.216.34".parse().unwrap()])),
+        Arc::new(RecordingDialer::new(target.addr)),
+        &identity.root_der,
+    );
+    assert_eq!(
+        resolve_pairwise_sector(
+            &fetcher,
+            Some("https://sector.example.test:8443/uris.json"),
+            &redirects()
+        )
+        .await
+        .unwrap(),
+        "sector.example.test"
+    );
+    let mut missing = redirects();
+    missing.push("https://unlisted.example.test/cb".to_owned());
+    assert!(matches!(
+        resolve_pairwise_sector(
+            &fetcher,
+            Some("https://sector.example.test:8443/uris.json"),
+            &missing
+        )
+        .await,
+        Err(SectorError::MissingRedirectUri)
+    ));
+    assert_eq!(
+        target.received().len(),
+        2,
+        "each registration validates the document"
+    );
 }
