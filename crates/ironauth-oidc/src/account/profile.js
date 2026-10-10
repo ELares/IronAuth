@@ -64,7 +64,7 @@
       const {response,value} = await request('POST', payload);
       if (response.ok && value.name === payload.name) {
         saved = value.name; expected = saved; input.value = saved; uncertain = null;
-        message = saved ? 'Display name saved. Continue to your application to use it.' : 'Display name removed.';
+        message = saved ? 'Display name saved.' : 'Display name removed.';
       } else if (response.status === 409) {
         uncertain = null; message = 'Your saved name changed in another session. Your input is kept. Reload the saved name before trying again.';
       } else if (response.status === 400 || response.status === 422) {

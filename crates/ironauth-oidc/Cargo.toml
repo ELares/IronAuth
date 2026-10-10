@@ -1760,3 +1760,9 @@ path = "tests/access_rules_three_consumers.rs"
 name = "recipient_verification"
 path = "tests/recipient_verification.rs"
 required-features = ["testing"]
+
+# Explicit headed-browser fixture with the real router and owned disposable DB.
+[[test]]
+name = "account_profile_preview"
+path = "tests/account_profile_preview.rs"
+required-features = ["testing"]

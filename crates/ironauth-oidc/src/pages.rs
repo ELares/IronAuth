@@ -914,6 +914,7 @@ pub fn recover_page(
 /// value (client name, each scope, `return_to`) is escaped. `hints` is the typed
 /// rendering context (issue #16).
 #[must_use]
+#[cfg(test)]
 pub fn consent_page(
     client_name: &str,
     scopes: &[&str],
@@ -921,6 +922,31 @@ pub fn consent_page(
     hints: &InteractionHints,
     environment_banner: Option<&str>,
 ) -> String {
+    consent_page_with_profile(
+        client_name,
+        scopes,
+        return_to,
+        hints,
+        environment_banner,
+        None,
+    )
+}
+
+/// Hosted consent may offer a validated, scoped name editor before profile sharing.
+pub(crate) fn consent_page_with_profile(
+    client_name: &str,
+    scopes: &[&str],
+    return_to: &str,
+    hints: &InteractionHints,
+    environment_banner: Option<&str>,
+    profile_href: Option<&str>,
+) -> String {
+    let profile = profile_href.map_or_else(String::new, |href| {
+        format!(
+            "<p><a href=\"{}\">Edit your display name</a></p>",
+            escape_html(href)
+        )
+    });
     let scope_items: String = if scopes.is_empty() {
         "<li>(no scopes requested)</li>".to_owned()
     } else {
@@ -935,7 +961,7 @@ pub fn consent_page(
          <p>Requested scopes:</p><ul>{scopes}</ul>\
          <form method=\"post\" action=\"/consent\">{return_to}\
          <p class=\"actions\"><button type=\"submit\" name=\"decision\" value=\"allow\">Allow</button> \
-         <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></p></form>",
+         <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></p></form>{profile}",
         client = escape_html(client_name),
         scopes = scope_items,
         return_to = return_to_field(return_to),

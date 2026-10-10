@@ -19,6 +19,9 @@ names do not merge accounts. Removing a name leaves a valid empty profile.
 - The store rechecks the active subject and stable human actor, locks the row,
   reads the current sealed claims and DEK version, compares the expected label,
   changes only `name`, reseals and writes the owner-attributed audit atomically.
+  A changed label also queues the canonical `user.updated` event in the same
+  transaction, with only the user ID and `fields: ["claims"]`; no label is copied
+  into the event. A retry of the same value does not queue another change event.
   A different current name returns a conflict. Repeating the desired current
   value is harmless and may append a further audit record.
 - GET `/t/{tenant}/e/{environment}/profile` hosts the own-name form. Its optional
@@ -33,18 +36,48 @@ Existing UserInfo claim selection remains authoritative. The name becomes
 available on a fresh permitted profile read; a relying party may cache its own
 label until reauthentication. This feature does not establish email ownership.
 
+## Connected hosted flow and local evidence
+
+Successful browser registration, through both the legacy handler and the flow
+engine, now offers the optional name step before the validated application
+return. API registration keeps its prior return behavior. The legacy consent
+screen offers "Edit your display name" when profile access is requested; the
+link reuses the same registered scope/authorization validation. The account
+form uses the shared shell without another card, compact desktop actions and
+44px narrow/touch actions.
+
+Local disposable-PostgreSQL checks cover wrong scope, inactive users, refused
+impersonation, canonical events, event-insertion rollback, concurrent changes,
+forged fields, claim preservation and public-subject UserInfo selection. These
+are not pairwise-client qualification.
+
+A headed Chrome run on October 10, 2026 used actual registration and the HTTP
+router backed by disposable PostgreSQL. It selected a name, dropped a committed
+save's response, retried the exact request after reload, recovered a draft,
+explicitly reloaded the saved name and continued through consent to the client
+callback. The actual token exchange and UserInfo read returned the selected
+name and matching public subject, with no page JavaScript errors. No user or
+profile was seeded for this journey. The fixture forwards browser requests to
+loopback and uses test signing keys; it is not evidence of the deployed provider,
+Civio's authenticated UI or a physical device. Artifacts are kept privately under
+`hosted-profile-201/browser-001`; credentials, callbacks and tokens are not
+committed. A second real-registration run (`browser-002`) checked the compact
+form at 1280px and 390px, followed the consent edit link, removed the name and
+returned through consent to the callback. The screenshots show no horizontal
+overflow, 32px desktop buttons and 44px narrow actions. The shared provider
+default remains light under a dark system preference; no separate dark-theme
+implementation or physical-device check is claimed.
+
 ## Required before integrated completion
 
-1. Connect a discoverable registration/account-settings entry and the validated
-   relying-party return, including interrupted/expired sign-in. Do not require
+1. Complete a discoverable Civio account-settings entry and interrupted/expired
+   sign-in recovery, including the validated relying-party return. Do not require
    users to assemble provider URLs or seed their profile through management APIs.
 2. Run fresh registration, name selection, later editing/removal and Civio return
    in a real browser. Inspect narrow layouts, keyboard/focus, both provider page
    styling variants as supported, retained input and lost-response reconciliation.
-3. Cover wrong scope, disabled user, impersonation and persisted rollback/audit
-   behavior as well as the existing positive, conflict, forged-field, same-origin,
-   concurrency, HTML escaping and scoped UserInfo tests. Decide and document the
-   canonical user.updated event behavior before merge.
+3. Retain the authority, rollback, audit, event and scoped UserInfo checks when
+   integrating the application entry and current-session recovery.
 4. Preserve names at the application boundary: Civio currently limits display
    strings to 254 UTF-8 bytes while 80 Unicode characters can exceed that. Resolve
    the mismatch explicitly, without changing account identity or grant lookup.

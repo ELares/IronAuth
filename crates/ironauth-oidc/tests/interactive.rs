@@ -152,11 +152,17 @@ async fn a_user_can_register_consent_and_receive_tokens_end_to_end() {
     assert_eq!(status, StatusCode::SEE_OTHER, "register post: {body}");
     let cookie = set_cookie_pair(&headers).expect("session cookie set on registration");
     assert!(cookie.starts_with("__Host-ironauth_session="), "{cookie}");
-    let resume = location(&headers).expect("resume location");
-    assert_eq!(
-        resume, return_to,
-        "registration resumes the authorization request"
+    let profile = location(&headers).expect("profile location");
+    assert!(
+        profile.contains("/profile?return_to="),
+        "optional profile: {profile}"
     );
+    let resume = location_param(&headers, "return_to").expect("original authorization request");
+    assert_eq!(resume, return_to);
+    let (status, _, page) = harness.get_with_cookie(&profile, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Your display name"));
+    assert!(page.contains("Continue to application"));
 
     // 4. Resume authorize (now authenticated) -> consent is required.
     let (status, headers, _) = harness.get_with_cookie(&resume, Some(&cookie)).await;

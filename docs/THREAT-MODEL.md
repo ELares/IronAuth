@@ -689,6 +689,8 @@ identifier, authorization key, verified mailbox, or identity merge instruction.
   the account owner with the fixed self_service_display_name detail. Neither the
   new nor old name is copied into that audit detail. Repeating the current desired
   value is a harmless assignment and may produce another audit, not another user.
+  Only a changed label queues the canonical user.updated event, in the same
+  transaction; its payload identifies the user and changed field, not the label.
 - Information disclosure: HTML values are escaped and pages/API responses are
   no-store. The self-service response contains only the name. UserInfo retains
   its existing scope/claim-release policy; this surface cannot assert email
@@ -702,7 +704,7 @@ identifier, authorization key, verified mailbox, or identity merge instruction.
   modify other claims, identifiers, credentials, membership or grants. Hosted
   return links must be registered authorization requests within the same scope.
 
-Residual qualification: connected registration/settings entry points, actual
-hosted browser recovery and deployment evidence remain required by #1385. The
+Residual qualification: the Civio account-settings entry, deployed connected
+browser recovery and relying-party evidence remain required by #1385. The
 current token path resolves public subjects; the generic pairwise helper alone
 is not evidence of an end-to-end pairwise UserInfo journey.

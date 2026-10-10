@@ -454,7 +454,16 @@ async fn register_post_inner(
             )
             .await
             {
-                Ok(cookie) => interaction::redirect_setting_cookie(&resume.return_to, &cookie),
+                Ok(cookie) => {
+                    let target = crate::account::profile::registration_destination(
+                        &state,
+                        resume.scope,
+                        Some(&resume.return_to),
+                    )
+                    .await
+                    .unwrap_or_else(|| resume.return_to.clone());
+                    interaction::redirect_setting_cookie(&target, &cookie)
+                }
                 // The central lifecycle fence refused the mint for an account that was
                 // JUST created (issue #279's shape on the registration path): the
                 // waitlist was switched on between the branch above and the mint, or a

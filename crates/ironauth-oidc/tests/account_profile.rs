@@ -101,6 +101,24 @@ async fn own_name_is_optional_persisted_and_conflict_aware_without_changing_othe
         StatusCode::OK
     );
     assert_eq!(get(&h, Some(&cookie)).await.1, json!({"name":""}));
+    let events: Vec<Value> = sqlx::query_scalar(
+        "SELECT payload FROM outbox_messages WHERE payload->>'type'='user.updated'",
+    )
+    .fetch_all(h.db().owner_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "one event for setting and one for clearing, none for replay or conflict"
+    );
+    for event in events {
+        ironauth_store::event_catalog::validate_event(&event).unwrap();
+        assert_eq!(
+            event["payload"],
+            json!({"user_id":subject,"fields":["claims"]})
+        );
+    }
     let rows = h.audit_rows_for_action("user.update").await;
     assert_eq!(
         rows.len(),
@@ -339,4 +357,176 @@ async fn edited_label_reaches_userinfo_only_with_profile_access_and_preserves_su
         assert!(info.get("email").is_none());
         assert!(info.get("email_verified").is_none());
     }
+}
+
+#[tokio::test]
+async fn failed_event_commit_rolls_back_name_and_audit() {
+    let h = Harness::start().await;
+    let subject = h
+        .seed_user("atomic-name@example.test", common::SEED_PASSWORD)
+        .await;
+    let cookie = h.session_cookie(&subject).await;
+    sqlx::raw_sql("CREATE FUNCTION reject_profile_event() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.payload->>'type'='user.updated' THEN RAISE EXCEPTION 'fixture'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_profile_event BEFORE INSERT ON outbox_messages FOR EACH ROW EXECUTE FUNCTION reject_profile_event();")
+        .execute(h.db().owner_pool()).await.unwrap();
+    assert_eq!(
+        post(
+            &h,
+            Some(&cookie),
+            Some(common::ISSUER_BASE),
+            json!({"expected_name":"","name":"Not committed"})
+        )
+        .await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(get(&h, Some(&cookie)).await.1, json!({"name":""}));
+    assert!(h.audit_rows_for_action("user.update").await.is_empty());
+    sqlx::raw_sql("DROP TRIGGER reject_profile_event ON outbox_messages; DROP FUNCTION reject_profile_event();").execute(h.db().owner_pool()).await.unwrap();
+    assert_eq!(
+        post(
+            &h,
+            Some(&cookie),
+            Some(common::ISSUER_BASE),
+            json!({"expected_name":"","name":"Not committed"})
+        )
+        .await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn removed_account_and_foreign_scope_cannot_read_or_change_the_label() {
+    let h = Harness::start().await;
+    let other = Harness::start().await;
+    let subject = h
+        .seed_user("disabled-name@example.test", common::SEED_PASSWORD)
+        .await;
+    let cookie = h.session_cookie(&subject).await;
+    assert_eq!(get(&other, Some(&cookie)).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        post(
+            &other,
+            Some(&cookie),
+            Some(common::ISSUER_BASE),
+            json!({"expected_name":"","name":"No"})
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    h.set_user_state(&subject, ironauth_store::UserState::Disabled)
+        .await;
+    assert_eq!(get(&h, Some(&cookie)).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        post(
+            &h,
+            Some(&cookie),
+            Some(common::ISSUER_BASE),
+            json!({"expected_name":"","name":"No"})
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(h.audit_rows_for_action("user.update").await.is_empty());
+}
+
+#[tokio::test]
+async fn impersonation_cannot_read_or_write_the_name_or_open_the_editor() {
+    let h = Harness::start().await;
+    let subject = h
+        .seed_user("profile-support@example.test", common::SEED_PASSWORD)
+        .await;
+    let (session, cookie) = h.session_with_id(&subject, "pwd", 0).await;
+    assert_eq!(get(&h, Some(&cookie)).await.0, StatusCode::OK);
+    let changed = sqlx::query(
+        "UPDATE sessions SET impersonator='adm_support_engineer', \
+         impersonation_reason_code='support_ticket', impersonation_reason_text='Profile test', \
+         impersonation_started_at=now(), impersonation_expires_at=now()+INTERVAL '30 minutes' \
+         WHERE id=$1",
+    )
+    .bind(session.to_string())
+    .execute(h.db().owner_pool())
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    assert_eq!(get(&h, Some(&cookie)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        post(
+            &h,
+            Some(&cookie),
+            Some(common::ISSUER_BASE),
+            json!({"expected_name":"","name":"Support edit"})
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    let (status, _, body) = h
+        .send(
+            Request::builder()
+                .uri(format!(
+                    "/t/{}/e/{}/profile",
+                    h.scope().tenant(),
+                    h.scope().environment()
+                ))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(!body.contains("id=\"profile-form\""));
+    assert!(h.audit_rows_for_action("user.update").await.is_empty());
+}
+
+#[tokio::test]
+async fn equal_names_keep_distinct_subjects_and_independent_profiles() {
+    let h = Harness::start().await;
+    let first = h
+        .seed_user("first-label@example.test", common::SEED_PASSWORD)
+        .await;
+    let second = h
+        .seed_user("second-label@example.test", common::SEED_PASSWORD)
+        .await;
+    assert_ne!(first, second);
+    let first_cookie = h.session_cookie(&first).await;
+    let second_cookie = h.session_cookie(&second).await;
+    let label = "\u{1f338}".repeat(80);
+    for cookie in [&first_cookie, &second_cookie] {
+        assert_eq!(
+            post(
+                &h,
+                Some(cookie),
+                Some(common::ISSUER_BASE),
+                json!({"expected_name":"","name":label})
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(get(&h, Some(cookie)).await.1, json!({"name":label}));
+    }
+    assert_eq!(
+        post(
+            &h,
+            Some(&first_cookie),
+            Some(common::ISSUER_BASE),
+            json!({"expected_name":label,"name":""})
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(get(&h, Some(&first_cookie)).await.1, json!({"name":""}));
+    assert_eq!(get(&h, Some(&second_cookie)).await.1, json!({"name":label}));
+    let query = format!(
+        "/authorize?response_type=code&client_id={}&redirect_uri={}&scope=openid%20profile&code_challenge={}&code_challenge_method=S256",
+        h.client_id(),
+        common::enc(common::REDIRECT_URI),
+        common::PKCE_CHALLENGE
+    );
+    let consent = format!("/consent?return_to={}", common::enc(&query));
+    let (status, _, body) = h.get_with_cookie(&consent, Some(&second_cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Edit your display name"));
+    assert!(body.contains(&format!(
+        "/t/{}/e/{}/profile?return_to=",
+        h.scope().tenant(),
+        h.scope().environment()
+    )));
 }

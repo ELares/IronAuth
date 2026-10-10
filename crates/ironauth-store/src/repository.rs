@@ -91196,6 +91196,7 @@ impl ActingUserRepo<'_> {
                     _ => return Err(StoreError::Encryption),
                 };
                 if current != expected && current != name { return Err(StoreError::Conflict); }
+                let changed = current != name;
                 if name.is_empty() { object.remove("name"); }
                 else { object.insert("name".to_owned(), serde_json::Value::String(name.to_owned())); }
                 let sealed = dek.seal(env.entropy(), &aad, claims.to_string().as_bytes());
@@ -91203,6 +91204,15 @@ impl ActingUserRepo<'_> {
                     .bind(sealed.into_bytes()).bind(now).bind(subject.to_string())
                     .bind(scope.tenant().to_string()).bind(scope.environment().to_string())
                     .execute(&mut **tx).await?;
+                if changed {
+                    let id = format!("evt_{}", CorrelationId::generate(env));
+                    let owner = subject.to_string();
+                    let envelope = crate::event_catalog::envelope(
+                        &id, "user.updated", &scope.tenant().to_string(), &scope.environment().to_string(), now / 1000,
+                        &serde_json::json!({"user_id": owner, "fields": ["claims"]}),
+                    ).ok_or(StoreError::Invalid)?;
+                    enqueue_domain_event(tx, env, scope, Some(&DomainEvent { id: &id, subject: &owner, envelope: &envelope })).await?;
+                }
                 Ok(())
             }, false, Some("self_service_display_name"),
         ).await
