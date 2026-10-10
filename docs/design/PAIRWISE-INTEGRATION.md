@@ -117,8 +117,26 @@ local account; a template audience does not select an OIDC client identity polic
 Logout hints and backchannel delivery select sessions by `sid`, independently of
 pairwise subjects. Protocol regressions cover cross-browser hint targeting and
 per-client backchannel delivery without a local-subject claim.
-No pairwise registration is exposed. Store-level policy fixtures do not prove
-management API or DCR support.
+Dynamic registration now accepts and returns `subject_type` and an optional
+`sector_identifier_uri`. Create and full-replacement update validate the sector
+through the shared hardened HTTPS fetcher, then commit policy, redirects and
+registration-token rotation in one audited transaction. Updates compare both the
+policy/redirect revision and the authenticating registration-token hash, so a
+concurrent policy edit or token rotation cannot be overwritten after validation.
+The existing registration rate/window settings also bound authenticated updates,
+using a scoped client key that survives token rotation. A zero limit retains its
+existing explicit opt-out meaning.
+
+Omitting `subject_type` in a registration update selects the public default;
+clients retaining pairwise policy must include it in replacement metadata.
+`sector_identifier_uri` is accepted only with explicit pairwise policy. Existing
+user bindings survive either policy transition; only previously unbound users
+receive an identity from the replacement policy. Protocol tests exercise actual
+ID tokens and UserInfo before and after updates and a pool/registry restart,
+real TLS sector validation, private/link-local refusal and the update fetch budget.
+Store tests exercise concurrent updates and audit-failure rollback. These are
+local integration checks, not evidence of a live rollout or a real browser flow.
+The documented management API remains required before rollout.
 
 A bound public identifier survives a later pairwise switch as a documented legacy
 privacy exception. Historical identities issued before binding persistence are

@@ -3318,6 +3318,10 @@ pub struct DynamicClientRecord {
     pub auth_method: String,
     /// The registered redirect URI set.
     pub redirect_uris: Vec<String>,
+    /// Persisted client identity policy, read with the redirect set.
+    pub subject_policy: ClientSubjectPolicy,
+    /// Identity/redirect revision used to reject stale validated updates.
+    pub subject_policy_revision: i64,
     /// The RFC 8252 `application_type` (`web` or `native`), or `None` for a client
     /// that predates DCR.
     pub application_type: Option<String>,
@@ -3415,6 +3419,8 @@ pub struct NewDynamicClient<'a> {
     /// The validated redirect URI set (already RFC 8252 / application-type
     /// checked by the OIDC layer; the repository re-checks registrability).
     pub redirect_uris: &'a [String],
+    /// Identity policy validated against exactly this redirect set.
+    pub subject_policy: &'a ClientSubjectPolicy,
     /// The RFC 8252 `application_type` (`web` or `native`).
     pub application_type: &'a str,
     /// The negotiated `id_token_signed_response_alg`.
@@ -3487,6 +3493,12 @@ pub struct DynamicClientUpdate<'a> {
     /// The replacement redirect URI set (already validated by the OIDC layer; the
     /// repository re-checks registrability).
     pub redirect_uris: &'a [String],
+    /// Identity policy validated against exactly this redirect set.
+    pub subject_policy: &'a ClientSubjectPolicy,
+    /// Revision read before external sector validation.
+    pub expected_subject_policy_revision: i64,
+    /// Registration token digest that authorized this update, rechecked at commit.
+    pub expected_registration_access_token_hash: Option<&'a str>,
     /// The replacement `application_type`.
     pub application_type: &'a str,
     /// The re-negotiated `id_token_signed_response_alg`.
@@ -3837,6 +3849,7 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT id, display_name, token_endpoint_auth_method, redirect_uris, \
+             subject_type, pairwise_sector, sector_identifier_uri, subject_policy_revision, \
              application_type, id_token_signed_response_alg, userinfo_signed_response_alg, \
              authorization_signed_response_alg, id_token_encrypted_response_alg, \
              id_token_encrypted_response_enc, jwks, jwks_uri, \
@@ -3866,6 +3879,8 @@ impl ClientRepo<'_> {
             display_name: row.get("display_name"),
             auth_method: row.get("token_endpoint_auth_method"),
             redirect_uris: row.get("redirect_uris"),
+            subject_policy: decode_client_subject_policy(&row)?,
+            subject_policy_revision: row.try_get("subject_policy_revision")?,
             application_type: row.get("application_type"),
             id_token_signed_response_alg: row.get("id_token_signed_response_alg"),
             userinfo_signed_response_alg: row.get("userinfo_signed_response_alg"),
@@ -6595,6 +6610,10 @@ impl ActingClientRepo<'_> {
     /// its registered-client cap (nothing is written); [`StoreError::Conflict`] if a
     /// `private_key_jwt` registration violates the key-source CHECK (both or neither
     /// of `jwks`/`jwks_uri`); [`StoreError::Database`] on a persistence failure.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one audited transaction binds all validated registration metadata and its identity policy"
+    )]
     pub async fn register_dynamic(
         &self,
         env: &Env,
@@ -6606,6 +6625,7 @@ impl ActingClientRepo<'_> {
                 return Err(StoreError::InvalidRedirectUri);
             }
         }
+        let identity = client_subject_policy_columns(params.subject_policy, params.redirect_uris)?;
         let id = ClientId::generate(env, &self.scope);
         let registration_client_uri = format!(
             "{}/{}",
@@ -6664,9 +6684,10 @@ impl ActingClientRepo<'_> {
                       tls_client_auth_subject_dn, use_mtls_endpoint_aliases, \
                       registration_client_uri, \
                       registration_access_token_hash, quarantined, dcr_policy_chain, \
-                      dcr_registered) \
+                      dcr_registered, subject_type, pairwise_sector, sector_identifier_uri, \
+                      subject_policy_redirect_uris) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                             $15, $16, $17, $18, $19, $20, $21, $22, $23, true)",
+                             $15, $16, $17, $18, $19, $20, $21, $22, $23, true, $24, $25, $26, $27)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -6691,6 +6712,10 @@ impl ActingClientRepo<'_> {
                 .bind(params.registration_access_token_hash)
                 .bind(params.quarantined)
                 .bind(params.dcr_policy_chain)
+                .bind(identity.kind)
+                .bind(identity.sector)
+                .bind(identity.uri)
+                .bind(identity.redirects)
                 .execute(&mut **tx)
                 .await;
                 match result {
@@ -6742,6 +6767,7 @@ impl ActingClientRepo<'_> {
                 return Err(StoreError::InvalidRedirectUri);
             }
         }
+        let identity = client_subject_policy_columns(update.subject_policy, update.redirect_uris)?;
         let scope = self.scope;
         let redirect_uris: Vec<String> = update.redirect_uris.to_vec();
         // When the update transitions the client to a method that carries no
@@ -6770,9 +6796,12 @@ impl ActingClientRepo<'_> {
                      id_token_signed_response_alg = $5, userinfo_signed_response_alg = $6, \
                      jwks = $7, jwks_uri = $8, \
                      token_endpoint_auth_signing_alg = $9, registration_access_token_hash = $10, \
-                     secret_hash = CASE WHEN $14 THEN secret_hash ELSE NULL END \
+                     secret_hash = CASE WHEN $14 THEN secret_hash ELSE NULL END, \
+                     subject_type=$15, pairwise_sector=$16, sector_identifier_uri=$17, \
+                     subject_policy_redirect_uris=$18 \
                      WHERE id = $11 AND tenant_id = $12 AND environment_id = $13 \
-                     AND dcr_registered = true",
+                     AND dcr_registered = true AND subject_policy_revision=$19 \
+                     AND registration_access_token_hash IS NOT DISTINCT FROM $20",
                 )
                 .bind(update.display_name)
                 .bind(update.auth_method)
@@ -6788,6 +6817,12 @@ impl ActingClientRepo<'_> {
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(keep_secret)
+                .bind(identity.kind)
+                .bind(identity.sector)
+                .bind(identity.uri)
+                .bind(identity.redirects)
+                .bind(update.expected_subject_policy_revision)
+                .bind(update.expected_registration_access_token_hash)
                 .execute(&mut **tx)
                 .await;
                 match result {
@@ -91357,6 +91392,51 @@ pub struct ClientSubjectPolicySnapshot {
     pub redirect_uris: Vec<String>,
 }
 
+struct ClientSubjectPolicyColumns<'a> {
+    kind: &'static str,
+    sector: Option<&'a str>,
+    uri: Option<&'a str>,
+    redirects: Option<&'a [String]>,
+}
+
+fn client_subject_policy_columns<'a>(
+    policy: &'a ClientSubjectPolicy,
+    validated_redirects: &'a [String],
+) -> Result<ClientSubjectPolicyColumns<'a>, StoreError> {
+    let (kind, sector, uri, redirects) = match policy {
+        ClientSubjectPolicy::Public => ("public", None, None, None),
+        ClientSubjectPolicy::Pairwise {
+            sector_identifier,
+            sector_identifier_uri,
+        } => {
+            if sector_identifier.is_empty()
+                || sector_identifier.len() > 255
+                || !sector_identifier.is_ascii()
+                || sector_identifier
+                    .bytes()
+                    .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+                || sector_identifier_uri
+                    .as_ref()
+                    .is_some_and(|u| !u.starts_with("https://"))
+            {
+                return Err(StoreError::Invalid);
+            }
+            (
+                "pairwise",
+                Some(sector_identifier.as_str()),
+                sector_identifier_uri.as_deref(),
+                Some(validated_redirects),
+            )
+        }
+    };
+    Ok(ClientSubjectPolicyColumns {
+        kind,
+        sector,
+        uri,
+        redirects,
+    })
+}
+
 fn decode_client_subject_policy(row: &PgRow) -> Result<ClientSubjectPolicy, StoreError> {
     let kind: String = row.try_get("subject_type")?;
     let sector: Option<String> = row.try_get("pairwise_sector")?;
@@ -91469,32 +91549,12 @@ impl ActingClientRepo<'_> {
                 .check_redirect_uri(redirect)
                 .map_err(StoreError::GuardrailViolation)?;
         }
-        let (kind, sector, uri, redirects) = match policy {
-            ClientSubjectPolicy::Public => ("public", None, None, None),
-            ClientSubjectPolicy::Pairwise {
-                sector_identifier,
-                sector_identifier_uri,
-            } => {
-                if sector_identifier.is_empty()
-                    || sector_identifier.len() > 255
-                    || !sector_identifier.is_ascii()
-                    || sector_identifier
-                        .bytes()
-                        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
-                    || sector_identifier_uri
-                        .as_ref()
-                        .is_some_and(|u| !u.starts_with("https://"))
-                {
-                    return Err(StoreError::Invalid);
-                }
-                (
-                    "pairwise",
-                    Some(sector_identifier.as_str()),
-                    sector_identifier_uri.as_deref(),
-                    Some(validated_redirects),
-                )
-            }
-        };
+        let ClientSubjectPolicyColumns {
+            kind,
+            sector,
+            uri,
+            redirects,
+        } = client_subject_policy_columns(policy, validated_redirects)?;
         let scope = self.scope;
         write_audited(
             AuditedWrite {

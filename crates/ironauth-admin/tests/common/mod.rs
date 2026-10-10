@@ -929,6 +929,7 @@ impl Harness {
             .register_dynamic(
                 &env,
                 NewDynamicClient {
+                    subject_policy: &ironauth_store::ClientSubjectPolicy::Public,
                     display_name: "seeded dcr client",
                     auth_method: "none",
                     secret_hash: None,

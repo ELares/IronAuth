@@ -3707,9 +3707,9 @@ impl OidcState {
         self.inner.registration_max_clients
     }
 
-    /// The endpoint-local registration rate limit (issue #31): the maximum number
-    /// of registration requests one source (or one initial access token) may make
-    /// within [`OidcState::registration_rate_window`]. 0 disables rate limiting.
+    /// The endpoint-local rate limit for registrations per source/initial token
+    /// and metadata updates per scoped client (issues #31, #19), within
+    /// [`OidcState::registration_rate_window`]. 0 disables these rate limits.
     #[must_use]
     pub fn registration_rate_limit(&self) -> u32 {
         self.inner.registration_rate_limit
