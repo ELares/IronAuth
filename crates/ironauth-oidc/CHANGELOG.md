@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Begin wiring durable client-aware subject derivation into code/refresh issuance, UserInfo and introspection (#19). Remaining grant/consumer paths and registration surfaces are not yet integrated; pairwise registration must remain disabled until they are complete.
+
 - Resolve pairwise sector hostnames independently of network ports and DNS case (#19). Require an explicit sector document for mixed hosts, hostless native redirects or an empty redirect set; validate supplied documents through the hardened fetcher even for single-host clients. Registration/token wiring remains pending.
 
 - Keep a validated application return available when the hosted profile session expires (#1385).

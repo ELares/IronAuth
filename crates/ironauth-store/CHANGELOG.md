@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add revision-guarded client subject policy and immutable scoped identity bindings (#19). Redirect validation is pinned atomically; stale first derivations and failed audits do not commit. This persistence work still requires complete protocol and registration integration before pairwise rollout.
+
 - Add durable, scoped, envelope-encrypted pairwise subject salt provisioning (#19). Concurrent creators share one audited value; retries, pool restarts and encryption-key rotation preserve it. Ordinary encrypted-secret replacement refuses its reserved purpose. Production client policy and token wiring remain pending.
 
 - Queue the canonical `user.updated` event atomically with a changed self-service display name, without including the label in event data. Same-value retries produce no duplicate change event (#1385).

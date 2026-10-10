@@ -9,10 +9,10 @@
 //! introspection) returns the SAME value. Half-implementations
 //! that return one `sub` from the ID token and another from `UserInfo` fail
 //! certification, so this module exposes exactly one derivation function,
-//! [`resolve_subject`]. Production currently selects public subjects through
-//! `OidcState::resolve_public_subject`; persisted pairwise registration and the
-//! client-aware token/UserInfo wiring remain required by issue #19. The generic
-//! function and cache here do not establish that production integration.
+//! [`resolve_subject`]. The registered-client adapter combines this primitive
+//! with persisted policy, salt and immutable identity bindings. Other protocol
+//! paths and registration surfaces still require integration before rollout.
+//! The generic function and cache alone do not establish production parity.
 //!
 //! Derivation, per OIDC Core 8.1, hashes the sector identifier, the local (per
 //! user) account identifier, and a per-environment salt:

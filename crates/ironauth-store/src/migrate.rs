@@ -2110,6 +2110,12 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0250_password_reset_no_delete.sql"),
         },
+        Migration {
+            version: 251,
+            name: "client_subject_identity",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0251_client_subject_identity.sql"),
+        },
     ]
 }
 

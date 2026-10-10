@@ -76,3 +76,26 @@ policy. Schema expansion alone does not make an old binary pairwise-capable;
 plan rollout and rollback around that fact. No current application identity or
 live provider configuration is changed by this branch yet. The complete original
 Civio U01/U02/U04/U07 objective is unchanged.
+
+
+## Integration work in progress after PR #1492
+
+Migration 0251 and the scoped client repository now persist identity policy,
+a revision shared with redirect edits, and immutable client/user bindings. The
+revision trigger also detects redirects changed and then restored (ABA). A
+pairwise row pins the exact validated redirect set; a legacy writer cannot edit
+that set without atomically updating its validated policy. Failed audits roll
+back both policy revisions and binding inserts. Bindings carry composite scoped
+foreign keys and no direct UPDATE/DELETE grants.
+
+The OIDC adapter reads durable policy/salt and binds through the shared derivation.
+Code/refresh issuance, UserInfo and opaque/refresh introspection are being wired.
+Machine opaque-token introspection retains its service-account identity. The
+remaining production paths still need conversion before any pairwise registration
+is exposed. Store-level policy fixtures do not prove management API or DCR support.
+
+A bound public identifier survives a later pairwise switch as a documented legacy
+privacy exception. Historical identities issued before binding persistence are
+not reconstructed by these methods. Explicit rollout/migration semantics remain
+required; no live client has been switched. Configuration snapshots/promotion must
+also carry the validated client policy while excluding salts and runtime bindings.

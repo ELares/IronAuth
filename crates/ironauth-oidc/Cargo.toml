@@ -313,6 +313,11 @@ path = "tests/pairwise.rs"
 name = "sector"
 path = "tests/sector.rs"
 
+[[test]]
+name = "registered_pairwise"
+path = "tests/registered_pairwise.rs"
+required-features = ["testing"]
+
 # Full authorization-code flow issuing tokens end to end, single-use, binding
 # re-checks, expiry, reuse revocation, and cross-scope denial, over a real
 # database (DATABASE_URL); see scripts/with-test-db.sh.

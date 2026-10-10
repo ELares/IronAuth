@@ -195,6 +195,10 @@ pub enum Action {
     /// ROTATES the client's registration access token in the same transaction, so
     /// this one action covers the metadata change and the token rotation together.
     ClientUpdated,
+    /// A validated client subject policy was changed, under its revision guard.
+    ClientSubjectPolicyUpdate,
+    /// The first stable external identity binding for a client and user was stored.
+    ClientSubjectBind,
     /// A tenant was created (management plane, issue #11).
     TenantCreate,
     /// A tenant was offboarded into the GRACE stage (management plane, issue
@@ -1817,6 +1821,8 @@ impl Action {
             Action::ClientConfigure => "client.configure",
             Action::ClientRegistered => "client.registered",
             Action::ClientUpdated => "client.updated",
+            Action::ClientSubjectPolicyUpdate => "client.subject_policy.update",
+            Action::ClientSubjectBind => "client.subject.bind",
             Action::TenantCreate => "tenant.create",
             Action::TenantDelete => "tenant.delete",
             Action::TenantRestore => "tenant.restore",
