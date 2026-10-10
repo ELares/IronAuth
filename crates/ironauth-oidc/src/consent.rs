@@ -107,14 +107,25 @@ async fn consent_get_inner(
     // The environment-kind chrome (issue #42): non-production marks the page
     // noindex and shows a banner; prod shows neither.
     let banner = state.environment_banner(&resume.scope).await;
+    let profile_href = if scopes.contains(&"profile") {
+        crate::account::profile::registration_destination(
+            &state,
+            resume.scope,
+            Some(&resume.return_to),
+        )
+        .await
+    } else {
+        None
+    };
     pages::secure_html(
         StatusCode::OK,
-        pages::consent_page(
+        pages::consent_page_with_profile(
             &client_name,
             &scopes,
             &resume.return_to,
             &resume.hints,
             banner,
+            profile_href.as_deref(),
         ),
     )
 }

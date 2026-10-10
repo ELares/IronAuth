@@ -35,6 +35,8 @@
 //! is ENFORCED end to end once M7's step-up issue lands. Until then the policy is
 //! recorded and auditable but not gated on, exactly as the issue specifies.
 
+pub(crate) mod profile;
+
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};

@@ -914,6 +914,7 @@ pub fn recover_page(
 /// value (client name, each scope, `return_to`) is escaped. `hints` is the typed
 /// rendering context (issue #16).
 #[must_use]
+#[cfg(test)]
 pub fn consent_page(
     client_name: &str,
     scopes: &[&str],
@@ -921,6 +922,31 @@ pub fn consent_page(
     hints: &InteractionHints,
     environment_banner: Option<&str>,
 ) -> String {
+    consent_page_with_profile(
+        client_name,
+        scopes,
+        return_to,
+        hints,
+        environment_banner,
+        None,
+    )
+}
+
+/// Hosted consent may offer a validated, scoped name editor before profile sharing.
+pub(crate) fn consent_page_with_profile(
+    client_name: &str,
+    scopes: &[&str],
+    return_to: &str,
+    hints: &InteractionHints,
+    environment_banner: Option<&str>,
+    profile_href: Option<&str>,
+) -> String {
+    let profile = profile_href.map_or_else(String::new, |href| {
+        format!(
+            "<p><a href=\"{}\">Edit your display name</a></p>",
+            escape_html(href)
+        )
+    });
     let scope_items: String = if scopes.is_empty() {
         "<li>(no scopes requested)</li>".to_owned()
     } else {
@@ -935,7 +961,7 @@ pub fn consent_page(
          <p>Requested scopes:</p><ul>{scopes}</ul>\
          <form method=\"post\" action=\"/consent\">{return_to}\
          <p class=\"actions\"><button type=\"submit\" name=\"decision\" value=\"allow\">Allow</button> \
-         <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></p></form>",
+         <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></p></form>{profile}",
         client = escape_html(client_name),
         scopes = scope_items,
         return_to = return_to_field(return_to),
@@ -1114,11 +1140,28 @@ pub fn recover_cancel_page(cancel_action: &str, token: &str) -> String {
 /// `message` is server text; it is escaped defensively regardless.
 #[must_use]
 pub fn notice_page(title: &str, message: &str) -> String {
-    let body = format!(
+    notice_page_with_link(title, message, None)
+}
+
+/// A notice with a caller-validated recovery destination. Escaping is not URL validation.
+pub(crate) fn notice_page_with_link(
+    title: &str,
+    message: &str,
+    link: Option<(&str, &str)>,
+) -> String {
+    let mut body = format!(
         "<h1>{title}</h1><p>{message}</p>",
         title = escape_html(title),
         message = escape_html(message),
     );
+    if let Some((href, label)) = link {
+        let _ = write!(
+            body,
+            "<p><a href=\"{}\">{}</a></p>",
+            escape_html(href),
+            escape_html(label),
+        );
+    }
     notice_document(&escape_html(title), &body)
 }
 

@@ -806,6 +806,14 @@ pub fn oidc_router(state: OidcState) -> Router {
             get(session_tokenizer::token_mode),
         )
         .route(
+            "/t/{tenant_id}/e/{environment_id}/profile",
+            get(account::profile::page),
+        )
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/account/profile",
+            get(account::profile::get).post(account::profile::post),
+        )
+        .route(
             "/t/{tenant_id}/e/{environment_id}/account/sessions",
             get(account::list_sessions),
         )

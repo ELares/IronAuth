@@ -258,7 +258,7 @@ pub enum Continuation {
     Complete {
         /// The session cookies from the ONE session mint.
         session: Box<SessionCookies>,
-        /// The `/authorize` resume target, or [`None`].
+        /// The authorization resume or optional hosted post-registration profile target.
         return_to: Option<String>,
     },
     /// The flow hands off to an EXTERNAL browser leg (issue #84, the federation launcher): the
@@ -1105,9 +1105,20 @@ async fn consume_and_complete(
                         .map_err(|_| FlowError::Store)?;
                 }
             }
+            let return_to = if transport == Transport::Browser && journey == Journey::Registration {
+                crate::account::profile::registration_destination(
+                    state,
+                    scope,
+                    record.return_to.as_deref(),
+                )
+                .await
+                .or_else(|| record.return_to.clone())
+            } else {
+                record.return_to.clone()
+            };
             Ok(Continuation::Complete {
                 session: Box::new(session),
-                return_to: record.return_to.clone(),
+                return_to,
             })
         }
         Err(interaction::EstablishSessionError::NotAuthenticatable) => {

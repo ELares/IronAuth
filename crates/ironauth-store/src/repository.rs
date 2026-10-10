@@ -91138,3 +91138,83 @@ impl ActingQuotaLimitsRepo<'_> {
         .await
     }
 }
+
+impl ActingUserRepo<'_> {
+    /// Set only the authenticated person's optional standard `name` claim.
+    ///
+    /// The expected label is checked under the row lock. Retrying an acknowledged
+    /// value is harmless; a different current value requires a fresh read. The
+    /// existing claim document and its DEK version are read and sealed under that
+    /// same lock, so concurrent email verification is never overwritten.
+    ///
+    /// # Errors
+    /// `NotFound` for another subject/scope or an inactive user, `Invalid` for a
+    /// label outside the bounds, `Conflict` for a changed label, and the ordinary
+    /// database/encryption errors without exposing claim contents.
+    pub async fn set_own_display_name(
+        &self,
+        env: &Env,
+        subject: &UserId,
+        expected: &str,
+        name: &str,
+    ) -> Result<(), StoreError> {
+        if subject.scope() != self.scope
+            || self.acting.actor()
+                != ActorRef::human(crate::HumanId::from_seed_bytes(subject.unique_bytes()))
+        {
+            return Err(StoreError::NotFound);
+        }
+        if name != name.trim() || name.chars().count() > 80 || name.chars().any(char::is_control) {
+            return Err(StoreError::Invalid);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        let now = epoch_micros(env.clock().now_utc());
+        write_audited_detailed(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env,
+                action: Action::UserUpdate, target: subject },
+            async move |tx| {
+                let row = sqlx::query(
+                    "SELECT claims_sealed, pii_dek_version FROM users \
+                     WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 \
+                     AND deleted_at IS NULL AND state='active' FOR UPDATE",
+                )
+                .bind(subject.to_string()).bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string()).fetch_optional(&mut **tx).await?
+                .ok_or(StoreError::NotFound)?;
+                let version: i32 = row.get("pii_dek_version");
+                let dek = fetch_dek_by_version(tx, scope, master, version).await?;
+                let bytes: Vec<u8> = row.get("claims_sealed");
+                let aad = user_pii_seal_aad(scope, USER_CLAIMS_PURPOSE, version);
+                let plaintext = dek.open(&aad, &Sealed::from_bytes(bytes)?)?;
+                let mut claims: serde_json::Value = serde_json::from_slice(&plaintext)
+                    .map_err(|_| StoreError::Encryption)?;
+                let object = claims.as_object_mut().ok_or(StoreError::Encryption)?;
+                let current = match object.get("name") {
+                    None | Some(serde_json::Value::Null) => "",
+                    Some(serde_json::Value::String(value)) => value.as_str(),
+                    _ => return Err(StoreError::Encryption),
+                };
+                if current != expected && current != name { return Err(StoreError::Conflict); }
+                let changed = current != name;
+                if name.is_empty() { object.remove("name"); }
+                else { object.insert("name".to_owned(), serde_json::Value::String(name.to_owned())); }
+                let sealed = dek.seal(env.entropy(), &aad, claims.to_string().as_bytes());
+                sqlx::query("UPDATE users SET claims_sealed=$1, updated_at=TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval WHERE id=$3 AND tenant_id=$4 AND environment_id=$5")
+                    .bind(sealed.into_bytes()).bind(now).bind(subject.to_string())
+                    .bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+                    .execute(&mut **tx).await?;
+                if changed {
+                    let id = format!("evt_{}", CorrelationId::generate(env));
+                    let owner = subject.to_string();
+                    let envelope = crate::event_catalog::envelope(
+                        &id, "user.updated", &scope.tenant().to_string(), &scope.environment().to_string(), now / 1000,
+                        &serde_json::json!({"user_id": owner, "fields": ["claims"]}),
+                    ).ok_or(StoreError::Invalid)?;
+                    enqueue_domain_event(tx, env, scope, Some(&DomainEvent { id: &id, subject: &owner, envelope: &envelope })).await?;
+                }
+                Ok(())
+            }, false, Some("self_service_display_name"),
+        ).await
+    }
+}

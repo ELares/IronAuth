@@ -570,6 +570,11 @@ name = "account"
 path = "tests/account.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "account_profile"
+path = "tests/account_profile.rs"
+required-features = ["testing"]
+
 # The self-service connected-apps (remembered-consent) surface (issue #88): a user lists
 # their own active grants (auto-grant clients excluded, display metadata enriched),
 # revokes one subject-bound (never touching another user's grant to the same client),
@@ -1754,4 +1759,10 @@ path = "tests/access_rules_three_consumers.rs"
 [[test]]
 name = "recipient_verification"
 path = "tests/recipient_verification.rs"
+required-features = ["testing"]
+
+# Explicit headed-browser fixture with the real router and owned disposable DB.
+[[test]]
+name = "account_profile_preview"
+path = "tests/account_profile_preview.rs"
 required-features = ["testing"]

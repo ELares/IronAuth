@@ -52,6 +52,7 @@
 /t/{tenant_id}/e/{environment_id}/account/mfa/totp/verify-enrollment
 /t/{tenant_id}/e/{environment_id}/account/password
 /t/{tenant_id}/e/{environment_id}/account/password/remove
+/t/{tenant_id}/e/{environment_id}/account/profile
 /t/{tenant_id}/e/{environment_id}/account/recipient-proof
 /t/{tenant_id}/e/{environment_id}/account/sessions
 /t/{tenant_id}/e/{environment_id}/account/sessions/revoke
@@ -101,6 +102,7 @@
 /t/{tenant_id}/e/{environment_id}/portal/w/sso
 /t/{tenant_id}/e/{environment_id}/portal/{link_id}
 /t/{tenant_id}/e/{environment_id}/pow/challenge
+/t/{tenant_id}/e/{environment_id}/profile
 /t/{tenant_id}/e/{environment_id}/recover/admin-approved/initiate
 /t/{tenant_id}/e/{environment_id}/recover/finalize
 /t/{tenant_id}/e/{environment_id}/recover/idv/callback

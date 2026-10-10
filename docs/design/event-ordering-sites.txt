@@ -121,6 +121,7 @@ crates/ironauth-store/src/repository.rs:set_default_with_event:1
 crates/ironauth-store/src/repository.rs:set_enabled_with_event:2
 crates/ironauth-store/src/repository.rs:set_event_types_with_event:1
 crates/ironauth-store/src/repository.rs:set_id_token_signed_response_alg_with_event:1
+crates/ironauth-store/src/repository.rs:set_own_display_name:1
 crates/ironauth-store/src/repository.rs:set_permission_claims_with_event:1
 crates/ironauth-store/src/repository.rs:set_require_pushed_authorization_requests_with_event:1
 crates/ironauth-store/src/repository.rs:set_state:1

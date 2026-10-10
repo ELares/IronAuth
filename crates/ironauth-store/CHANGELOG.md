@@ -6,6 +6,10 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Queue the canonical `user.updated` event atomically with a changed self-service display name, without including the label in event data. Same-value retries produce no duplicate change event (#1385).
+
+- Add an audited, subject-bound display-name update (#1385). Lock and patch only the standard name claim, preserving concurrent mailbox and other profile claims; reject conflicting names and inactive or different subjects.
+
 - Recheck hosted reset expiry after acquiring the authority locks (#1479), so a request waiting for database contention cannot extend its code lifetime.
 
 - Add a thirty-minute, client/scope-bound PAR navigation read for hosted recovery error returns (#1479). The live authorization read and atomic consume retain their original expiry and single-use checks.

@@ -140,6 +140,18 @@ button[value=deny], input[type=submit][name=deny], .secondary, #passkey-btn {
 button[value=deny]:hover, #passkey-btn:hover { background: var(--color-bg); }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; }
 .actions button { flex: 1; width: auto; }
+/* The single-field account form shares the shell without another inner card. */
+#account-profile form { margin-top: 18px; }
+#account-profile label { margin-bottom: 6px; }
+#account-profile .actions { gap: 8px; }
+#account-profile .actions button { flex: 0 1 auto; min-height: 32px; padding: 5px 10px; }
+#profile-status { font-size: 13px; margin-bottom: 12px; }
+#profile-status:empty { display: none; }
+#account-profile > p:last-of-type { margin: 14px 0 0; }
+#profile-return { display: inline-flex; align-items: center; min-height: 32px; }
+@media (pointer: coarse), (max-width: 600px) {
+  #account-profile .actions button, #profile-return { min-height: 44px; }
+}
 .auth-links { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin-top: 22px; font-size: 13px; }
 .auth-footer { width: 100%; max-width: 456px; margin: 22px 0 0; text-align: center; font-size: 12px; color: var(--color-fg); }
 .field-help, small { display: block; margin: 6px 0 16px; color: var(--color-fg); font-size: 12px; line-height: 1.5; }
