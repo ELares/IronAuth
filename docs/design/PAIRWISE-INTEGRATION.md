@@ -306,7 +306,44 @@ This is local database/identity-resolver evidence, not browser or HTTP token
 issuance against a restored deployment. Follow the separate role/key recovery
 requirements in [operations](../OPERATIONS.md#upgrade-back-up-and-recover).
 
-Production-size source scans and a live relying-party cutover still need
-separate evidence. The scan limit bounds output and inserts, not total
+The grant-heavy source workload below provides local scale evidence. A live
+relying-party cutover still needs separate evidence. The scan limit bounds
+output and inserts, not total
 query work. This API must not be treated as proof that all original #19 or Civio
 milestone requirements have been completed.
+
+### Retained-history scale qualification
+
+The opt-in `grant_heavy_history_scale_qualification` test registers 10,000
+accounts, seeds 100,000 revoked grants for the selected client, and adds up to
+one million revoked grants for another client in the same environment. It calls
+the actual control-role repositories, checks exact retained coverage, recovers
+all users in 20 pages of 500 and completes reconciliation with zero missing or
+conflicting bindings. A restricted-role `EXPLAIN (ANALYZE, BUFFERS)` records the
+grant access path with forced RLS. Run it explicitly:
+
+```sh
+scripts/with-test-db.sh cargo test -p ironauth-store --all-features \
+  --test client_subject_identity grant_heavy_history_scale_qualification \
+  -- --ignored --nocapture
+```
+
+Before migration 0255, the grant access path scanned all 1.1 million rows and
+discarded one million unrelated rows. With `grants_client_history_idx`, it uses
+the scoped client index; the observed grant access time changed from 97 ms to
+12 ms and shared blocks accessed fell from 45,834 to 4,256. In these local runs,
+the complete 20-page recovery changed from 2.88 seconds to 1.02 seconds with the
+index alone. These are individual local observations, not latency guarantees or
+a concurrent production-load qualification. The additional batched insert sends
+one statement per page instead of up to 500 individual insert statements;
+with both changes, the same complete recovery took 0.56 seconds locally.
+
+Migration 0255 builds a normal transactional index and blocks grant writes while
+building it. Apply it during the migration maintenance window and allow capacity
+for the index. It neither prunes history nor changes permissions. Refresh-family
+and client-session source edges already have scoped client indexes. Functional
+tests exercise all history edge types, but this large dataset is specifically
+grant-heavy; it does not establish equivalent timings for every source mix.
+Each page can still scan the selected client's history to deduplicate users.
+Neither the row limit nor this index bounds total work for an arbitrarily large
+client, and the externally reconciled history requirement remains unchanged.

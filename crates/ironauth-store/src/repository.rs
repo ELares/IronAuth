@@ -91905,16 +91905,16 @@ impl ActingClientRepo<'_> {
                     .bind(after.map(ToString::to_string)).bind(i64::from(limit) + 1).fetch_all(&mut **tx).await?;
                 let more = rows.len() > limit as usize;
                 let rows = &rows[..rows.len().min(limit as usize)];
-                let mut inserted = 0;
-                let mut last = None;
-                for raw in rows {
-                    let user = UserId::parse_in_scope(raw, &scope)?;
-                    inserted += sqlx::query("INSERT INTO client_subject_bindings (tenant_id,environment_id,client_id,user_id,external_subject,policy_revision,created_at) VALUES ($1,$2,$3,$4,$4,$5,TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) ON CONFLICT (tenant_id,environment_id,client_id,user_id) DO NOTHING")
-                        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
-                        .bind(raw).bind(expected.revision).bind(now).execute(&mut **tx).await?.rows_affected();
-                    last = Some(user);
-                }
-                Ok(PublicSubjectHistoryPage { scanned: rows.len(), inserted, next_user: if more { last } else { None } })
+                let users: Vec<UserId> = rows.iter()
+                    .map(|raw| UserId::parse_in_scope(raw, &scope))
+                    .collect::<Result<_, _>>()?;
+                // One bounded insert per page avoids a database round trip for
+                // every user. Validation, immutable conflicts and audit rollback
+                // retain the same transaction boundary as the individual writes.
+                let inserted = sqlx::query("INSERT INTO client_subject_bindings (tenant_id,environment_id,client_id,user_id,external_subject,policy_revision,created_at) SELECT $1,$2,$3,recovered.user_id,recovered.user_id,$5,TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval FROM unnest($4::text[]) AS recovered(user_id) ON CONFLICT (tenant_id,environment_id,client_id,user_id) DO NOTHING")
+                    .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
+                    .bind(rows).bind(expected.revision).bind(now).execute(&mut **tx).await?.rows_affected();
+                Ok(PublicSubjectHistoryPage { scanned: rows.len(), inserted, next_user: if more { users.last().copied() } else { None } })
             }, false,
         ).await
     }

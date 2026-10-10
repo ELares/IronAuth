@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add a scoped client index for retained grants and batch each identity-history
+  page into one immutable insert (#19). Migration 0255 preserves revoked history
+  and existing permissions. An opt-in real-role workload recovers 10,000 users
+  from 100,000 client grants alongside one million unrelated grants; verify
+  exact coverage, pagination and reconciliation rather than timing thresholds.
+
 - Add a narrow control-plane identity reconciliation repository and migration 0254 (#19). Recover retained pages and explicit public rosters; independently check all retained coverage before atomically committing readiness, evidence digest, timestamp and audit. Preserve existing bindings and require explicit operator attestations for external history.
 
 - Refuse pairwise activation for clients whose legacy public identity history is unresolved (#19). Migration 0253 marks existing and old-writer clients pending; new client creation records readiness explicitly. A database constraint and revision-aware repositories enforce the guard, with no ordinary role granted readiness updates. Backfill completion alone never certifies historical coverage.

@@ -1496,3 +1496,146 @@ async fn concurrent_reconciliation_commits_one_receipt_and_does_not_rewrite_it()
     );
     assert_eq!(audits(&db, "client.subject_history.reconcile").await, 1);
 }
+
+/// Opt-in, real-role scale qualification. Timings are observations, not flaky
+/// wall-clock pass/fail thresholds. Run with --ignored --nocapture.
+#[tokio::test]
+#[ignore = "large retained-history dataset; run explicitly for release qualification"]
+async fn grant_heavy_history_scale_qualification() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let (scope, client, _) = fixture(&db, &env).await;
+    let acting = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let other = acting
+        .clients()
+        .create(&env, "unrelated history load")
+        .await
+        .unwrap();
+    let users = seed_scale_users(&db, &env, scope).await;
+    sqlx::query("UPDATE clients SET subject_history_ready=false WHERE id=$1")
+        .bind(client.to_string())
+        .execute(db.owner_pool())
+        .await
+        .unwrap();
+    let expected = db
+        .store()
+        .scoped(scope)
+        .clients()
+        .subject_policy(&client)
+        .await
+        .unwrap();
+    // Repeated, revoked grant edges model retained history, not current sessions.
+    seed_scale_grants(&db, scope, client, &users, 100_000).await;
+    let control = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let history = control.client_subject_history(scope);
+    for unrelated in [0, 100_000, 900_000] {
+        if unrelated != 0 {
+            seed_scale_grants(&db, scope, other, &users, unrelated).await;
+        }
+        db.execute_owner_sql("ANALYZE grants, users, client_subject_bindings")
+            .await;
+        let start = env.clock().monotonic();
+        let report = db
+            .control_store()
+            .management()
+            .client_subject_history(scope)
+            .get(&client)
+            .await
+            .unwrap();
+        let report_ms = env.clock().monotonic().duration_since(start).as_secs_f64() * 1000.0;
+        assert_eq!(report.retained_users, 10_000);
+        let start = env.clock().monotonic();
+        let page = history.backfill(&env, &expected, None, 500).await.unwrap();
+        assert_eq!(page.scanned, 500);
+        eprintln!(
+            "history-scale {}",
+            serde_json::json!({"added_unrelated_grants": unrelated, "report_ms":report_ms, "first_page_ms":env.clock().monotonic().duration_since(start).as_secs_f64()*1000.0})
+        );
+    }
+    let start = env.clock().monotonic();
+    let mut cursor = None;
+    let mut scanned = 0;
+    let mut pages = 0;
+    loop {
+        let page = history
+            .backfill(&env, &expected, cursor.as_ref(), 500)
+            .await
+            .unwrap();
+        scanned += page.scanned;
+        pages += 1;
+        cursor = page.next_user;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!((scanned, pages), (10_000, 20));
+    let all_pages_ms = env.clock().monotonic().duration_since(start).as_secs_f64() * 1000.0;
+    let start = env.clock().monotonic();
+    let report = history
+        .reconcile(&env, &expected, &reconciliation_evidence())
+        .await
+        .unwrap();
+    assert!(report.ready);
+    assert_eq!(
+        (
+            report.retained_users,
+            report.missing_bindings,
+            report.conflicting_bindings
+        ),
+        (10_000, 0, 0)
+    );
+    eprintln!(
+        "history-scale {}",
+        serde_json::json!({"target_grants":100_000,"unrelated_grants":1_000_000,"users":10_000,"pages":pages,"all_pages_ms":all_pages_ms,"reconcile_ms":env.clock().monotonic().duration_since(start).as_secs_f64()*1000.0})
+    );
+    explain_scale_grants(&db, scope, client).await;
+}
+
+async fn seed_scale_grants(
+    db: &TestDatabase,
+    scope: Scope,
+    client: ClientId,
+    users: &[String],
+    count: i32,
+) {
+    // Scope/client are bound parameters; IDs are test-only unique historical edges.
+    sqlx::query("INSERT INTO grants (id,tenant_id,environment_id,client_id,subject,revoked_at) SELECT $3 || '-load-' || $5::text || '-' || n::text,$1,$2,$3,($4::text[])[1+((n-1)%array_length($4::text[],1))],'2020-01-01Z' FROM generate_series(1,$5::int) n")
+        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(client.to_string()).bind(users).bind(count)
+        .execute(db.owner_pool()).await.unwrap();
+}
+
+async fn explain_scale_grants(db: &TestDatabase, scope: Scope, client: ClientId) {
+    // Inspect the grant access path under the actual restricted control role/RLS.
+    let mut tx = db.control_pool().begin().await.unwrap();
+    sqlx::query("SELECT set_config('ironauth.tenant_id',$1,true),set_config('ironauth.environment_id',$2,true)")
+        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).execute(&mut *tx).await.unwrap();
+    let plan: serde_json::Value = sqlx::query_scalar("EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT subject,session_ref FROM grants WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3")
+        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(client.to_string()).fetch_one(&mut *tx).await.unwrap();
+    eprintln!("history-scale-grant-plan {plan}");
+    tx.rollback().await.unwrap();
+}
+
+async fn seed_scale_users(db: &TestDatabase, env: &Env, scope: Scope) -> Vec<String> {
+    let acting = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env));
+    let mut users = Vec::new();
+    for i in 0..10_000 {
+        users.push(
+            acting
+                .users()
+                .register(env, &format!("scale-{i}@example.test"), "hash", None)
+                .await
+                .unwrap()
+                .to_string(),
+        );
+    }
+    users
+}
