@@ -29,7 +29,10 @@ pub fn sector_uri_required(redirect_uris: &[String]) -> bool {
     inferred_sector(redirect_uris).is_none()
 }
 
-fn inferred_sector(redirect_uris: &[String]) -> Option<String> {
+/// Infer one canonical hostname when every redirect has that host.
+/// Returns `None` for empty, hostless or mixed-host sets.
+#[must_use]
+pub fn inferred_sector(redirect_uris: &[String]) -> Option<String> {
     let first = redirect_host(redirect_uris.first()?)?;
     redirect_uris
         .iter()

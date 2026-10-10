@@ -6,6 +6,26 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Add a scoped client index for retained grants and batch each identity-history
+  page into one immutable insert (#19). Migration 0255 preserves revoked history
+  and existing permissions. An opt-in real-role workload recovers 10,000 users
+  from 100,000 client grants alongside one million unrelated grants; verify
+  exact coverage, pagination and reconciliation rather than timing thresholds.
+
+- Add a narrow control-plane identity reconciliation repository and migration 0254 (#19). Recover retained pages and explicit public rosters; independently check all retained coverage before atomically committing readiness, evidence digest, timestamp and audit. Preserve existing bindings and require explicit operator attestations for external history.
+
+- Refuse pairwise activation for clients whose legacy public identity history is unresolved (#19). Migration 0253 marks existing and old-writer clients pending; new client creation records readiness explicitly. A database constraint and revision-aware repositories enforce the guard, with no ordinary role granted readiness updates. Backfill completion alone never certifies historical coverage.
+
+- Add an audited, paginated public-identity history backfill primitive (#19). Recover scoped users and human impersonators from retained grants, refresh families and client sessions, including revoked history. Preserve existing bindings, reject stale policy, and roll back failed audits. This does not certify complete historical recovery or expose a migration endpoint.
+
+- Add a narrow control-plane client identity-policy repository and forward migration 0252 (#19). Grant only four policy columns, recheck live environment and policy/redirect revision under locks, and return the committed audited state without redirect, secret or binding write authority.
+
+- Export client identity policy with a coherent redirect set in configuration snapshots (#19). Accept legacy snapshots as public policy, reject malformed policy fields, and exclude salts, user bindings and revision counters. Keep clients excluded from promotion so target identity remains intact.
+
+- Persist dynamic-client subject policy and validated redirects in the same audited write (#19). Guard replacement updates with the policy revision and authenticating registration-token hash; concurrent edits and failed audits cannot partially rotate identity policy or credentials.
+
+- Add revision-guarded client subject policy and immutable scoped identity bindings (#19). Redirect validation is pinned atomically; stale first derivations and failed audits do not commit. This persistence work still requires complete protocol and registration integration before pairwise rollout.
+
 - Add durable, scoped, envelope-encrypted pairwise subject salt provisioning (#19). Concurrent creators share one audited value; retries, pool restarts and encryption-key rotation preserve it. Ordinary encrypted-secret replacement refuses its reserved purpose. Production client policy and token wiring remain pending.
 
 - Queue the canonical `user.updated` event atomically with a changed self-service display name, without including the label in event data. Same-value retries produce no duplicate change event (#1385).

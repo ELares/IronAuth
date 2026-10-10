@@ -3318,6 +3318,12 @@ pub struct DynamicClientRecord {
     pub auth_method: String,
     /// The registered redirect URI set.
     pub redirect_uris: Vec<String>,
+    /// Persisted client identity policy, read with the redirect set.
+    pub subject_policy: ClientSubjectPolicy,
+    /// Identity/redirect revision used to reject stale validated updates.
+    pub subject_policy_revision: i64,
+    /// Whether legacy public identity reconciliation is unnecessary or completed.
+    pub subject_history_ready: bool,
     /// The RFC 8252 `application_type` (`web` or `native`), or `None` for a client
     /// that predates DCR.
     pub application_type: Option<String>,
@@ -3415,6 +3421,8 @@ pub struct NewDynamicClient<'a> {
     /// The validated redirect URI set (already RFC 8252 / application-type
     /// checked by the OIDC layer; the repository re-checks registrability).
     pub redirect_uris: &'a [String],
+    /// Identity policy validated against exactly this redirect set.
+    pub subject_policy: &'a ClientSubjectPolicy,
     /// The RFC 8252 `application_type` (`web` or `native`).
     pub application_type: &'a str,
     /// The negotiated `id_token_signed_response_alg`.
@@ -3487,6 +3495,12 @@ pub struct DynamicClientUpdate<'a> {
     /// The replacement redirect URI set (already validated by the OIDC layer; the
     /// repository re-checks registrability).
     pub redirect_uris: &'a [String],
+    /// Identity policy validated against exactly this redirect set.
+    pub subject_policy: &'a ClientSubjectPolicy,
+    /// Revision read before external sector validation.
+    pub expected_subject_policy_revision: i64,
+    /// Registration token digest that authorized this update, rechecked at commit.
+    pub expected_registration_access_token_hash: Option<&'a str>,
     /// The replacement `application_type`.
     pub application_type: &'a str,
     /// The re-negotiated `id_token_signed_response_alg`.
@@ -3837,6 +3851,7 @@ impl ClientRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT id, display_name, token_endpoint_auth_method, redirect_uris, \
+             subject_type, pairwise_sector, sector_identifier_uri, subject_policy_revision, subject_history_ready, \
              application_type, id_token_signed_response_alg, userinfo_signed_response_alg, \
              authorization_signed_response_alg, id_token_encrypted_response_alg, \
              id_token_encrypted_response_enc, jwks, jwks_uri, \
@@ -3866,6 +3881,9 @@ impl ClientRepo<'_> {
             display_name: row.get("display_name"),
             auth_method: row.get("token_endpoint_auth_method"),
             redirect_uris: row.get("redirect_uris"),
+            subject_policy: decode_client_subject_policy(&row)?,
+            subject_policy_revision: row.try_get("subject_policy_revision")?,
+            subject_history_ready: row.try_get("subject_history_ready")?,
             application_type: row.get("application_type"),
             id_token_signed_response_alg: row.get("id_token_signed_response_alg"),
             userinfo_signed_response_alg: row.get("userinfo_signed_response_alg"),
@@ -5304,8 +5322,8 @@ impl ActingClientRepo<'_> {
                 sqlx::query(
                     "INSERT INTO clients \
                      (id, tenant_id, environment_id, display_name, \
-                      token_endpoint_auth_method, secret_hash) \
-                     VALUES ($1, $2, $3, $4, $5, $6)",
+                      token_endpoint_auth_method, secret_hash, subject_history_ready) \
+                     VALUES ($1, $2, $3, $4, $5, $6, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -5429,8 +5447,8 @@ impl ActingClientRepo<'_> {
                      (id, tenant_id, environment_id, display_name, \
                       token_endpoint_auth_method, jwks, jwks_uri, \
                       token_endpoint_auth_signing_alg, tls_client_auth_cert, \
-                      tls_client_auth_subject_dn) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                      tls_client_auth_subject_dn, subject_history_ready) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -5554,8 +5572,8 @@ impl ActingClientRepo<'_> {
             async move |tx| {
                 sqlx::query(
                     "INSERT INTO clients \
-                     (id, tenant_id, environment_id, display_name, require_auth_time) \
-                     VALUES ($1, $2, $3, $4, true)",
+                     (id, tenant_id, environment_id, display_name, require_auth_time, subject_history_ready) \
+                     VALUES ($1, $2, $3, $4, true, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -6595,6 +6613,10 @@ impl ActingClientRepo<'_> {
     /// its registered-client cap (nothing is written); [`StoreError::Conflict`] if a
     /// `private_key_jwt` registration violates the key-source CHECK (both or neither
     /// of `jwks`/`jwks_uri`); [`StoreError::Database`] on a persistence failure.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one audited transaction binds all validated registration metadata and its identity policy"
+    )]
     pub async fn register_dynamic(
         &self,
         env: &Env,
@@ -6606,6 +6628,7 @@ impl ActingClientRepo<'_> {
                 return Err(StoreError::InvalidRedirectUri);
             }
         }
+        let identity = client_subject_policy_columns(params.subject_policy, params.redirect_uris)?;
         let id = ClientId::generate(env, &self.scope);
         let registration_client_uri = format!(
             "{}/{}",
@@ -6664,9 +6687,10 @@ impl ActingClientRepo<'_> {
                       tls_client_auth_subject_dn, use_mtls_endpoint_aliases, \
                       registration_client_uri, \
                       registration_access_token_hash, quarantined, dcr_policy_chain, \
-                      dcr_registered) \
+                      dcr_registered, subject_type, pairwise_sector, sector_identifier_uri, \
+                      subject_policy_redirect_uris, subject_history_ready) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                             $15, $16, $17, $18, $19, $20, $21, $22, $23, true)",
+                             $15, $16, $17, $18, $19, $20, $21, $22, $23, true, $24, $25, $26, $27, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -6691,6 +6715,10 @@ impl ActingClientRepo<'_> {
                 .bind(params.registration_access_token_hash)
                 .bind(params.quarantined)
                 .bind(params.dcr_policy_chain)
+                .bind(identity.kind)
+                .bind(identity.sector)
+                .bind(identity.uri)
+                .bind(identity.redirects)
                 .execute(&mut **tx)
                 .await;
                 match result {
@@ -6742,6 +6770,7 @@ impl ActingClientRepo<'_> {
                 return Err(StoreError::InvalidRedirectUri);
             }
         }
+        let identity = client_subject_policy_columns(update.subject_policy, update.redirect_uris)?;
         let scope = self.scope;
         let redirect_uris: Vec<String> = update.redirect_uris.to_vec();
         // When the update transitions the client to a method that carries no
@@ -6770,9 +6799,12 @@ impl ActingClientRepo<'_> {
                      id_token_signed_response_alg = $5, userinfo_signed_response_alg = $6, \
                      jwks = $7, jwks_uri = $8, \
                      token_endpoint_auth_signing_alg = $9, registration_access_token_hash = $10, \
-                     secret_hash = CASE WHEN $14 THEN secret_hash ELSE NULL END \
+                     secret_hash = CASE WHEN $14 THEN secret_hash ELSE NULL END, \
+                     subject_type=$15, pairwise_sector=$16, sector_identifier_uri=$17, \
+                     subject_policy_redirect_uris=$18 \
                      WHERE id = $11 AND tenant_id = $12 AND environment_id = $13 \
-                     AND dcr_registered = true",
+                     AND dcr_registered = true AND subject_policy_revision=$19 \
+                     AND registration_access_token_hash IS NOT DISTINCT FROM $20",
                 )
                 .bind(update.display_name)
                 .bind(update.auth_method)
@@ -6788,6 +6820,12 @@ impl ActingClientRepo<'_> {
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(keep_secret)
+                .bind(identity.kind)
+                .bind(identity.sector)
+                .bind(identity.uri)
+                .bind(identity.redirects)
+                .bind(update.expected_subject_policy_revision)
+                .bind(update.expected_registration_access_token_hash)
                 .execute(&mut **tx)
                 .await;
                 match result {
@@ -6942,8 +6980,8 @@ impl ActingClientRepo<'_> {
             },
             async move |tx| {
                 sqlx::query(
-                    "INSERT INTO clients (id, tenant_id, environment_id, display_name) \
-                     VALUES ($1, $2, $3, $4)",
+                    "INSERT INTO clients (id, tenant_id, environment_id, display_name, subject_history_ready) \
+                     VALUES ($1, $2, $3, $4, true)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -53544,6 +53582,24 @@ impl<'a> ManagementStore<'a> {
         }
     }
 
+    /// Read retained identity coverage and a reconciliation receipt.
+    #[must_use]
+    pub fn client_subject_history(&self, scope: Scope) -> ClientSubjectHistoryRepo<'a> {
+        ClientSubjectHistoryRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
+    /// Read client identity policy through the control plane's narrow repository.
+    #[must_use]
+    pub fn client_subject_policies(&self, scope: Scope) -> ClientSubjectPolicyRepo<'a> {
+        ClientSubjectPolicyRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
     /// The read-only per-organization authentication policy repository for `scope`
     /// (issue #95). Policies are environment-scoped, so the repository is
     /// constructible only from a `(tenant, environment)` scope and binds row-level
@@ -54137,6 +54193,26 @@ impl<'a> ActingManagementStore<'a> {
             store: self.store,
             acting: self.acting,
             scope,
+        }
+    }
+
+    /// Append recovered public identities and finalize an audited reconciliation.
+    #[must_use]
+    pub fn client_subject_history(&self, scope: Scope) -> ActingClientSubjectHistoryRepo<'a> {
+        ActingClientSubjectHistoryRepo {
+            store: self.store,
+            scope,
+            acting: self.acting,
+        }
+    }
+
+    /// Audited policy-only changes; does not expose redirect or binding mutation.
+    #[must_use]
+    pub fn client_subject_policies(&self, scope: Scope) -> ActingClientSubjectPolicyRepo<'a> {
+        ActingClientSubjectPolicyRepo {
+            store: self.store,
+            scope,
+            acting: self.acting,
         }
     }
 
@@ -91325,5 +91401,784 @@ impl ActingEnvelopeRepo<'_> {
             Ok(()) | Err(StoreError::Conflict) => reader.pairwise_salt().await,
             Err(error) => Err(error),
         }
+    }
+}
+
+/// Client-facing identity policy. The protocol layer validates sector documents
+/// before writing this value; the store binds that validation to a revision.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "subject_type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClientSubjectPolicy {
+    /// The local account identifier, retained for existing registrations.
+    #[default]
+    Public,
+    /// A stable salted identifier shared only within a validated sector.
+    Pairwise {
+        /// Canonical hostname resolved by the protocol's hardened validator.
+        sector_identifier: String,
+        /// Validated HTTPS sector document, if explicitly supplied.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sector_identifier_uri: Option<String>,
+    },
+}
+
+/// A coherent registration snapshot used by validation and first identity binding.
+/// The revision changes on every policy or redirect mutation, including ABA edits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientSubjectPolicySnapshot {
+    /// Client whose registration was read.
+    pub client_id: ClientId,
+    /// Persisted identity policy.
+    pub policy: ClientSubjectPolicy,
+    /// Revision to compare after validation outside the transaction.
+    pub revision: i64,
+    /// Whether legacy identity history permits pairwise activation.
+    pub history_ready: bool,
+    /// Exact redirects against which a sector document must be checked.
+    pub redirect_uris: Vec<String>,
+}
+
+impl ClientSubjectPolicy {
+    /// Check stored/snapshot shape only. Activating this policy still requires
+    /// protocol validation of the sector document against the redirect set.
+    pub(crate) fn has_valid_shape(&self) -> bool {
+        client_subject_policy_columns(self, &[]).is_ok()
+    }
+}
+
+struct ClientSubjectPolicyColumns<'a> {
+    kind: &'static str,
+    sector: Option<&'a str>,
+    uri: Option<&'a str>,
+    redirects: Option<&'a [String]>,
+}
+
+fn client_subject_policy_columns<'a>(
+    policy: &'a ClientSubjectPolicy,
+    validated_redirects: &'a [String],
+) -> Result<ClientSubjectPolicyColumns<'a>, StoreError> {
+    let (kind, sector, uri, redirects) = match policy {
+        ClientSubjectPolicy::Public => ("public", None, None, None),
+        ClientSubjectPolicy::Pairwise {
+            sector_identifier,
+            sector_identifier_uri,
+        } => {
+            if sector_identifier.is_empty()
+                || sector_identifier.len() > 255
+                || !sector_identifier.is_ascii()
+                || sector_identifier
+                    .bytes()
+                    .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+                || sector_identifier_uri
+                    .as_ref()
+                    .is_some_and(|u| !u.starts_with("https://"))
+            {
+                return Err(StoreError::Invalid);
+            }
+            (
+                "pairwise",
+                Some(sector_identifier.as_str()),
+                sector_identifier_uri.as_deref(),
+                Some(validated_redirects),
+            )
+        }
+    };
+    Ok(ClientSubjectPolicyColumns {
+        kind,
+        sector,
+        uri,
+        redirects,
+    })
+}
+
+fn decode_client_subject_policy(row: &PgRow) -> Result<ClientSubjectPolicy, StoreError> {
+    let kind: String = row.try_get("subject_type")?;
+    let sector: Option<String> = row.try_get("pairwise_sector")?;
+    let uri: Option<String> = row.try_get("sector_identifier_uri")?;
+    match (kind.as_str(), sector, uri) {
+        ("public", None, None) => Ok(ClientSubjectPolicy::Public),
+        ("pairwise", Some(sector_identifier), sector_identifier_uri)
+            if !sector_identifier.is_empty() =>
+        {
+            Ok(ClientSubjectPolicy::Pairwise {
+                sector_identifier,
+                sector_identifier_uri,
+            })
+        }
+        _ => Err(StoreError::Invalid),
+    }
+}
+
+impl ClientRepo<'_> {
+    /// Read identity policy and redirects in one scoped statement.
+    ///
+    /// # Errors
+    /// `NotFound` for an absent or foreign client; store errors otherwise.
+    pub async fn subject_policy(
+        &self,
+        id: &ClientId,
+    ) -> Result<ClientSubjectPolicySnapshot, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT subject_type, pairwise_sector, sector_identifier_uri, subject_policy_revision, subject_history_ready, redirect_uris \
+             FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3"
+        ).bind(id.to_string()).bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string()).fetch_optional(&mut *tx).await?
+            .ok_or(StoreError::NotFound)?;
+        let snapshot = ClientSubjectPolicySnapshot {
+            client_id: *id,
+            policy: decode_client_subject_policy(&row)?,
+            revision: row.try_get("subject_policy_revision")?,
+            history_ready: row.try_get("subject_history_ready")?,
+            redirect_uris: row.try_get("redirect_uris")?,
+        };
+        tx.commit().await?;
+        Ok(snapshot)
+    }
+
+    /// Read a previously bound external identifier. This does not authorize a
+    /// user or a grant; callers must still apply their normal lifecycle checks.
+    ///
+    /// # Errors
+    /// `NotFound` for foreign typed IDs; store errors otherwise.
+    pub async fn subject_binding(
+        &self,
+        id: &ClientId,
+        user: &UserId,
+    ) -> Result<Option<String>, StoreError> {
+        if id.scope() != self.scope || user.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let value = sqlx::query_scalar(
+            "SELECT external_subject FROM client_subject_bindings \
+             WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 AND user_id=$4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(user.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(value)
+    }
+}
+
+impl ActingClientRepo<'_> {
+    /// Persist a sector-validated policy only while the registration that was
+    /// validated is still current. No network work occurs inside the transaction.
+    /// Existing identity bindings are never rewritten by a policy change.
+    ///
+    /// This store primitive is not a registration endpoint. Protocol callers
+    /// must validate the sector document and enforce the rollout/migration policy.
+    ///
+    /// # Errors
+    /// `Conflict` for stale validation, `NotFound` for a foreign/missing client,
+    /// `Invalid` for malformed policy; audit/persistence failures roll back.
+    pub async fn set_subject_policy(
+        &self,
+        env: &Env,
+        expected: &ClientSubjectPolicySnapshot,
+        policy: &ClientSubjectPolicy,
+        validated_redirects: &[String],
+    ) -> Result<(), StoreError> {
+        let id = &expected.client_id;
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let guardrails = self
+            .store
+            .scoped(self.scope)
+            .environment_guardrails()
+            .guardrails()
+            .await?;
+        for redirect in validated_redirects {
+            if !crate::redirect::redirect_uri_is_registrable(redirect) {
+                return Err(StoreError::InvalidRedirectUri);
+            }
+            guardrails
+                .check_redirect_uri(redirect)
+                .map_err(StoreError::GuardrailViolation)?;
+        }
+        let ClientSubjectPolicyColumns {
+            kind,
+            sector,
+            uri,
+            redirects,
+        } = client_subject_policy_columns(policy, validated_redirects)?;
+        let scope = self.scope;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ClientSubjectPolicyUpdate,
+                target: id,
+            },
+            async move |tx| {
+                let row = sqlx::query(
+                    "SELECT subject_policy_revision, subject_history_ready, redirect_uris FROM clients \
+                     WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR UPDATE",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or(StoreError::NotFound)?;
+                if row.try_get::<i64, _>("subject_policy_revision")? != expected.revision
+                    || row.try_get::<Vec<String>, _>("redirect_uris")? != expected.redirect_uris
+                    || (kind == "pairwise" && !row.try_get::<bool, _>("subject_history_ready")?)
+                {
+                    return Err(StoreError::Conflict);
+                }
+                sqlx::query(
+                    "UPDATE clients SET subject_type=$1, pairwise_sector=$2, \
+                    sector_identifier_uri=$3, subject_policy_redirect_uris=$4, redirect_uris=$8 \
+                    WHERE id=$5 AND tenant_id=$6 AND environment_id=$7",
+                )
+                .bind(kind)
+                .bind(sector)
+                .bind(uri)
+                .bind(redirects)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(validated_redirects)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Bind the protocol's derived subject once, serializing first issuance with
+    /// policy changes. Retrying with a different candidate returns the immutable
+    /// winner. Public-to-pairwise changes retain any already bound public ID;
+    /// this legacy compatibility is not full pairwise privacy for those users.
+    /// Historical identities from before this primitive need an explicit rollout
+    /// migration; this method does not reconstruct those relationships.
+    ///
+    /// The candidate is generated internally by the protocol's shared derivation,
+    /// never accepted from a registration or token request.
+    ///
+    /// # Errors
+    /// `Conflict` for a stale first derivation, `NotFound` for foreign/missing IDs,
+    /// `Invalid` for a malformed candidate; audit/persistence errors roll back.
+    pub async fn bind_subject(
+        &self,
+        env: &Env,
+        expected: &ClientSubjectPolicySnapshot,
+        user: &UserId,
+        candidate: &str,
+    ) -> Result<String, StoreError> {
+        let id = &expected.client_id;
+        if id.scope() != self.scope || user.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let reader = ClientRepo {
+            store: self.store,
+            scope: self.scope,
+        };
+        if let Some(bound) = reader.subject_binding(id, user).await? {
+            return Ok(bound);
+        }
+        match &expected.policy {
+            ClientSubjectPolicy::Public if candidate != user.to_string() => {
+                return Err(StoreError::Invalid);
+            }
+            ClientSubjectPolicy::Pairwise { .. }
+                if URL_SAFE_NO_PAD
+                    .decode(candidate)
+                    .map_or(true, |bytes| bytes.len() != 32) =>
+            {
+                return Err(StoreError::Invalid);
+            }
+            _ => {}
+        }
+        let scope = self.scope;
+        let now = epoch_micros(env.clock().now_utc());
+        let result = write_audited(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env,
+                action: Action::ClientSubjectBind, target: id },
+            async move |tx| {
+                let row = sqlx::query(
+                    "SELECT subject_type, pairwise_sector, sector_identifier_uri, subject_policy_revision \
+                     FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR UPDATE"
+                ).bind(id.to_string()).bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string()).fetch_optional(&mut **tx).await?
+                    .ok_or(StoreError::NotFound)?;
+                if row.try_get::<i64, _>("subject_policy_revision")? != expected.revision
+                    || decode_client_subject_policy(&row)? != expected.policy {
+                    return Err(StoreError::Conflict);
+                }
+                let present: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users \
+                    WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 AND deleted_at IS NULL AND state='active')")
+                    .bind(user.to_string()).bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string()).fetch_one(&mut **tx).await?;
+                if !present { return Err(StoreError::NotFound); }
+                let inserted = sqlx::query("INSERT INTO client_subject_bindings \
+                    (tenant_id, environment_id, client_id, user_id, external_subject, policy_revision, created_at) \
+                    VALUES ($1,$2,$3,$4,$5,$6,TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval) \
+                    ON CONFLICT (tenant_id, environment_id, client_id, user_id) DO NOTHING")
+                    .bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+                    .bind(id.to_string()).bind(user.to_string()).bind(candidate)
+                    .bind(expected.revision).bind(now).execute(&mut **tx).await?;
+                if inserted.rows_affected() != 1 { return Err(StoreError::Conflict); }
+                Ok(())
+            }, false,
+        ).await;
+        match result {
+            Ok(()) | Err(StoreError::Conflict) => reader
+                .subject_binding(id, user)
+                .await?
+                .ok_or(StoreError::Conflict),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Narrow control-plane read of a client's identity policy and redirect revision.
+pub struct ClientSubjectPolicyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ClientSubjectPolicyRepo<'_> {
+    /// Parse a scoped client identifier, with uniform not-found on mismatch.
+    ///
+    /// # Errors
+    /// `NotFound` for malformed or foreign identifiers.
+    pub fn parse_id(&self, raw: &str) -> Result<ClientId, StoreError> {
+        ClientId::parse_in_scope(raw, &self.scope).map_err(|_| StoreError::NotFound)
+    }
+
+    /// Read policy and redirects together without exposing runtime bindings.
+    ///
+    /// # Errors
+    /// `NotFound` for absent/foreign clients; persistence or decoding errors otherwise.
+    pub async fn get(&self, id: &ClientId) -> Result<ClientSubjectPolicySnapshot, StoreError> {
+        ClientRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+        .subject_policy(id)
+        .await
+    }
+}
+
+/// A control-plane policy writer with no redirect, secret or user-binding methods.
+pub struct ActingClientSubjectPolicyRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingClientSubjectPolicyRepo<'_> {
+    /// Set identity policy validated against the expected snapshot's redirects.
+    /// The protocol must perform network validation before this transaction.
+    /// Recheck liveness and revision under locks, then return the committed policy.
+    ///
+    /// # Errors
+    /// `NotFound` for absent, foreign or deleted scope; `Conflict` for stale
+    /// validation; `Invalid` for bad shape. Failed writes/audits roll back together.
+    pub async fn set(
+        &self,
+        env: &Env,
+        expected: &ClientSubjectPolicySnapshot,
+        policy: &ClientSubjectPolicy,
+    ) -> Result<ClientSubjectPolicySnapshot, StoreError> {
+        if expected.client_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let columns = client_subject_policy_columns(policy, &expected.redirect_uris)?;
+        let scope = self.scope;
+        let id = expected.client_id;
+        write_audited(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env,
+                action: Action::ClientSubjectPolicyUpdate, target: &id },
+            async move |tx| {
+                // Recheck liveness after validation, then hold it until commit.
+                let live = sqlx::query("SELECT 1 FROM environments WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL FOR SHARE")
+                    .bind(scope.environment().to_string()).bind(scope.tenant().to_string())
+                    .fetch_optional(&mut **tx).await?;
+                if live.is_none() { return Err(StoreError::NotFound); }
+                let current = sqlx::query("SELECT subject_policy_revision, subject_history_ready, redirect_uris FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR UPDATE")
+                    .bind(id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+                    .fetch_optional(&mut **tx).await?.ok_or(StoreError::NotFound)?;
+                if current.try_get::<i64, _>("subject_policy_revision")? != expected.revision
+                    || current.try_get::<Vec<String>, _>("redirect_uris")? != expected.redirect_uris
+                    || (columns.kind == "pairwise" && !current.try_get::<bool, _>("subject_history_ready")?) {
+                    return Err(StoreError::Conflict);
+                }
+                let row = sqlx::query("UPDATE clients SET subject_type=$1, pairwise_sector=$2, sector_identifier_uri=$3, subject_policy_redirect_uris=$4 WHERE id=$5 AND tenant_id=$6 AND environment_id=$7 RETURNING subject_type, pairwise_sector, sector_identifier_uri, subject_policy_revision, subject_history_ready, redirect_uris")
+                    .bind(columns.kind).bind(columns.sector).bind(columns.uri).bind(columns.redirects)
+                    .bind(id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+                    .fetch_one(&mut **tx).await?;
+                Ok(ClientSubjectPolicySnapshot { client_id: id, policy: decode_client_subject_policy(&row)?,
+                    revision: row.try_get("subject_policy_revision")?, history_ready: row.try_get("subject_history_ready")?, redirect_uris: row.try_get("redirect_uris")? })
+            }, false,
+        ).await
+    }
+}
+
+/// One audited page of retained public-identity history. This is not a claim
+/// that audit-only credential history or an external relying-party roster is complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicSubjectHistoryPage {
+    /// Distinct recorded users examined, including already bound identities.
+    pub scanned: usize,
+    /// New immutable public bindings inserted; existing bindings never change.
+    pub inserted: u64,
+    /// Exclusive cursor for another page, if more retained users were found.
+    pub next_user: Option<UserId>,
+}
+
+impl ActingClientRepo<'_> {
+    /// Backfill one bounded page from retained grants, refresh families and client
+    /// sessions, including scoped human impersonators. Revocation/expiry does not
+    /// erase an issued identity, so historical rows are intentionally included.
+    ///
+    /// Run while the client is still public and legacy issuers are quiesced.
+    /// This primitive cannot reconstruct pruned audit-only transaction tokens or
+    /// external actor chains and does not certify migration completeness.
+    /// It never grants login eligibility to a blocked or deleted account.
+    /// The limit bounds returned users and writes, not the history scan cost.
+    ///
+    /// # Errors
+    /// `NotFound` for foreign identifiers, `Invalid` for a limit outside 1..=500,
+    /// `Conflict` for non-public or stale policy. Persistence/audit failures roll
+    /// back every insertion in the page.
+    pub async fn backfill_public_subject_history(
+        &self,
+        env: &Env,
+        expected: &ClientSubjectPolicySnapshot,
+        after: Option<&UserId>,
+        limit: u32,
+    ) -> Result<PublicSubjectHistoryPage, StoreError> {
+        self.backfill_public_subject_history_with_scope_guard(env, expected, after, limit, false)
+            .await
+    }
+
+    async fn backfill_public_subject_history_with_scope_guard(
+        &self,
+        env: &Env,
+        expected: &ClientSubjectPolicySnapshot,
+        after: Option<&UserId>,
+        limit: u32,
+        guard_scope: bool,
+    ) -> Result<PublicSubjectHistoryPage, StoreError> {
+        if expected.client_id.scope() != self.scope
+            || after.is_some_and(|id| id.scope() != self.scope)
+        {
+            return Err(StoreError::NotFound);
+        }
+        if !(1..=500).contains(&limit) {
+            return Err(StoreError::Invalid);
+        }
+        if expected.policy != ClientSubjectPolicy::Public {
+            return Err(StoreError::Conflict);
+        }
+        let scope = self.scope;
+        let id = expected.client_id;
+        let now = epoch_micros(env.clock().now_utc());
+        write_audited(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env,
+                action: Action::ClientSubjectHistoryBackfill, target: &id },
+            async move |tx| {
+                if guard_scope { lock_subject_history_environment(tx, scope).await?; }
+                lock_public_subject_history(tx, scope, expected, false).await?;
+                // Match every edge by scope. A service principal, CIMD client or
+                // foreign subject cannot become a local registered-user binding.
+                let rows: Vec<String> = sqlx::query_scalar(
+                    &format!("{PUBLIC_SUBJECT_HISTORY_CTE} SELECT u.id FROM users u JOIN history h ON h.subject=u.id \
+                     WHERE u.tenant_id=$1 AND u.environment_id=$2 AND ($4::text IS NULL OR u.id COLLATE \"C\" > $4 COLLATE \"C\") \
+                     ORDER BY u.id COLLATE \"C\" LIMIT $5")
+                ).bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
+                    .bind(after.map(ToString::to_string)).bind(i64::from(limit) + 1).fetch_all(&mut **tx).await?;
+                let more = rows.len() > limit as usize;
+                let rows = &rows[..rows.len().min(limit as usize)];
+                let users: Vec<UserId> = rows.iter()
+                    .map(|raw| UserId::parse_in_scope(raw, &scope))
+                    .collect::<Result<_, _>>()?;
+                // One bounded insert per page avoids a database round trip for
+                // every user. Validation, immutable conflicts and audit rollback
+                // retain the same transaction boundary as the individual writes.
+                let inserted = sqlx::query("INSERT INTO client_subject_bindings (tenant_id,environment_id,client_id,user_id,external_subject,policy_revision,created_at) SELECT $1,$2,$3,recovered.user_id,recovered.user_id,$5,TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval FROM unnest($4::text[]) AS recovered(user_id) ON CONFLICT (tenant_id,environment_id,client_id,user_id) DO NOTHING")
+                    .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
+                    .bind(rows).bind(expected.revision).bind(now).execute(&mut **tx).await?.rows_affected();
+                Ok(PublicSubjectHistoryPage { scanned: rows.len(), inserted, next_user: if more { users.last().copied() } else { None } })
+            }, false,
+        ).await
+    }
+}
+
+const PUBLIC_SUBJECT_HISTORY_CTE: &str = "WITH history(subject) AS ( \
+                     SELECT subject FROM grants WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 \
+                     UNION SELECT subject FROM refresh_families WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 \
+                     UNION SELECT impersonator FROM refresh_families WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 \
+                     UNION SELECT s.subject FROM client_sessions cs JOIN sessions s ON s.id=cs.session_id AND s.tenant_id=cs.tenant_id AND s.environment_id=cs.environment_id WHERE cs.tenant_id=$1 AND cs.environment_id=$2 AND cs.client_id=$3 \
+                     UNION SELECT s.impersonator FROM client_sessions cs JOIN sessions s ON s.id=cs.session_id AND s.tenant_id=cs.tenant_id AND s.environment_id=cs.environment_id WHERE cs.tenant_id=$1 AND cs.environment_id=$2 AND cs.client_id=$3 \
+                     UNION SELECT s.impersonator FROM grants g JOIN sessions s ON s.id=g.session_ref AND s.tenant_id=g.tenant_id AND s.environment_id=g.environment_id WHERE g.tenant_id=$1 AND g.environment_id=$2 AND g.client_id=$3) ";
+
+/// Current retained-history coverage. Counts do not certify external history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientSubjectHistoryReport {
+    /// Policy revision shared with identity configuration.
+    pub revision: i64,
+    /// Whether pairwise activation is permitted.
+    pub ready: bool,
+    /// Unique local users found in retained client history.
+    pub retained_users: i64,
+    /// Retained users with no immutable binding yet.
+    pub missing_bindings: i64,
+    /// Retained users bound to a non-public value; never overwritten by recovery.
+    pub conflicting_bindings: i64,
+    /// Operator-supplied digest of externally retained reconciliation evidence.
+    pub evidence_sha256: Option<String>,
+    /// Reconciliation time from the application clock; absent for new clients.
+    pub reconciled_at_unix_micros: Option<i64>,
+}
+
+/// Explicit operator attestation, not a server claim about unavailable history.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClientSubjectHistoryAttestation {
+    /// SHA-256 of the operator's retained evidence artifact, lowercase hex.
+    pub evidence_sha256: String,
+    /// Every legacy issuer has stopped before the final pass and cutover.
+    pub legacy_issuers_stopped: bool,
+    /// Audit-only and external actor identities have been reconciled with the RP.
+    pub external_history_reconciled: bool,
+    /// Recovered public values remain a documented exception to pairwise privacy.
+    pub public_identifiers_retained: bool,
+}
+
+/// Narrow control-plane historical identity reads.
+pub struct ClientSubjectHistoryRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+/// Narrow control-plane recovery; never accepts an arbitrary external subject.
+pub struct ActingClientSubjectHistoryRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+async fn lock_subject_history_environment(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+) -> Result<(), StoreError> {
+    let live = sqlx::query(
+        "SELECT 1 FROM environments WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL FOR SHARE",
+    )
+    .bind(scope.environment().to_string())
+    .bind(scope.tenant().to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if live.is_none() {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+async fn lock_public_subject_history(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    expected: &ClientSubjectPolicySnapshot,
+    pending: bool,
+) -> Result<(), StoreError> {
+    if expected.client_id.scope() != scope {
+        return Err(StoreError::NotFound);
+    }
+    if pending {
+        lock_subject_history_environment(tx, scope).await?;
+    }
+    let row = sqlx::query("SELECT subject_type, subject_policy_revision, subject_history_ready, redirect_uris FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR UPDATE")
+        .bind(expected.client_id.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+        .fetch_optional(&mut **tx).await?.ok_or(StoreError::NotFound)?;
+    if row.try_get::<String, _>("subject_type")? != "public"
+        || expected.policy != ClientSubjectPolicy::Public
+        || row.try_get::<i64, _>("subject_policy_revision")? != expected.revision
+        || row.try_get::<Vec<String>, _>("redirect_uris")? != expected.redirect_uris
+        || (pending && row.try_get::<bool, _>("subject_history_ready")?)
+    {
+        return Err(StoreError::Conflict);
+    }
+    Ok(())
+}
+
+async fn read_subject_history(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    client: ClientId,
+) -> Result<ClientSubjectHistoryReport, StoreError> {
+    let row = sqlx::query("SELECT subject_policy_revision, subject_history_ready, subject_history_evidence_sha256, (EXTRACT(EPOCH FROM subject_history_reconciled_at)*1000000)::bigint AS reconciled_us FROM clients WHERE id=$1 AND tenant_id=$2 AND environment_id=$3 FOR SHARE")
+        .bind(client.to_string()).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+        .fetch_optional(&mut **tx).await?.ok_or(StoreError::NotFound)?;
+    let coverage = sqlx::query(&format!("{PUBLIC_SUBJECT_HISTORY_CTE}
+        SELECT count(*) AS retained,
+            count(*) FILTER (WHERE b.user_id IS NULL) AS missing,
+            count(*) FILTER (WHERE b.user_id IS NOT NULL AND b.external_subject <> u.id) AS conflicting
+        FROM history h JOIN users u ON u.id=h.subject AND u.tenant_id=$1 AND u.environment_id=$2
+        LEFT JOIN client_subject_bindings b ON b.user_id=u.id AND b.tenant_id=$1 AND b.environment_id=$2 AND b.client_id=$3"))
+        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(client.to_string())
+        .fetch_one(&mut **tx).await?;
+    Ok(ClientSubjectHistoryReport {
+        revision: row.try_get("subject_policy_revision")?,
+        ready: row.try_get("subject_history_ready")?,
+        retained_users: coverage.try_get("retained")?,
+        missing_bindings: coverage.try_get("missing")?,
+        conflicting_bindings: coverage.try_get("conflicting")?,
+        evidence_sha256: row.try_get("subject_history_evidence_sha256")?,
+        reconciled_at_unix_micros: row.try_get("reconciled_us")?,
+    })
+}
+
+impl ClientSubjectHistoryRepo<'_> {
+    /// Read retained coverage under a client lock, including deleted users.
+    /// # Errors
+    /// `NotFound` for absent/foreign clients, persistence errors otherwise.
+    pub async fn get(&self, client: &ClientId) -> Result<ClientSubjectHistoryReport, StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let result = read_subject_history(&mut tx, self.scope, *client).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+}
+
+impl ActingClientSubjectHistoryRepo<'_> {
+    /// Recover a page of retained history with the same primitive used by the issuer.
+    /// # Errors
+    /// Scoped/not-found, stale/public-policy conflicts, invalid page size and database failures.
+    pub async fn backfill(
+        &self,
+        env: &Env,
+        expected: &ClientSubjectPolicySnapshot,
+        after: Option<&UserId>,
+        limit: u32,
+    ) -> Result<PublicSubjectHistoryPage, StoreError> {
+        ActingClientRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+        .backfill_public_subject_history_with_scope_guard(env, expected, after, limit, true)
+        .await
+    }
+
+    /// Recover an explicit roster of public identities (1..=500 input rows).
+    /// Duplicate IDs are collapsed. Deleted users retain history, not login access.
+    /// A conflicting existing identity refuses the entire batch, never overwrites it.
+    /// Audit detail contains the canonical roster digest and count, not the user IDs.
+    /// # Errors
+    /// `Invalid` for size, `NotFound` for foreign/absent users or deleted scope,
+    /// `Conflict` for stale/non-public/ready client or conflicting identity.
+    pub async fn import_public(
+        &self,
+        env: &Env,
+        expected: &ClientSubjectPolicySnapshot,
+        users: &[UserId],
+    ) -> Result<u64, StoreError> {
+        if users.is_empty() || users.len() > 500 {
+            return Err(StoreError::Invalid);
+        }
+        if expected.client_id.scope() != self.scope || users.iter().any(|u| u.scope() != self.scope)
+        {
+            return Err(StoreError::NotFound);
+        }
+        let users: BTreeSet<String> = users.iter().map(ToString::to_string).collect();
+        let canonical = users.iter().cloned().collect::<Vec<_>>().join("\n");
+        let detail = format!(
+            "roster_sha256={} users={}",
+            sha256_hex(&canonical),
+            users.len()
+        );
+        let scope = self.scope;
+        let id = expected.client_id;
+        let now = epoch_micros(env.clock().now_utc());
+        write_audited_detailed(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env, action: Action::ClientSubjectHistoryImport, target: &id },
+            async move |tx| {
+                lock_public_subject_history(tx, scope, expected, true).await?;
+                let mut inserted = 0;
+                for raw in users {
+                    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND tenant_id=$2 AND environment_id=$3)")
+                        .bind(&raw).bind(scope.tenant().to_string()).bind(scope.environment().to_string())
+                        .fetch_one(&mut **tx).await?;
+                    if !exists { return Err(StoreError::NotFound); }
+                    let bound: Option<String> = sqlx::query_scalar("SELECT external_subject FROM client_subject_bindings WHERE tenant_id=$1 AND environment_id=$2 AND client_id=$3 AND user_id=$4")
+                        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string()).bind(&raw)
+                        .fetch_optional(&mut **tx).await?;
+                    if let Some(bound) = bound {
+                        if bound != raw { return Err(StoreError::Conflict); }
+                        continue;
+                    }
+                    inserted += sqlx::query("INSERT INTO client_subject_bindings (tenant_id,environment_id,client_id,user_id,external_subject,policy_revision,created_at) VALUES ($1,$2,$3,$4,$4,$5,TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)")
+                        .bind(scope.tenant().to_string()).bind(scope.environment().to_string()).bind(id.to_string())
+                        .bind(raw).bind(expected.revision).bind(now).execute(&mut **tx).await?.rows_affected();
+                }
+                Ok(inserted)
+            }, false, Some(&detail),
+        ).await
+    }
+
+    /// Finish reconciliation only after independently checking every retained edge.
+    /// The attestation covers evidence the database cannot reconstruct; its digest
+    /// references an operator-held artifact, not a server-verified external roster.
+    /// This does not change subject policy or any existing binding.
+    /// # Errors
+    /// `Invalid` for missing attestations or malformed digest; `Conflict` for
+    /// incomplete/conflicting history, stale policy or already-ready clients.
+    /// Persistence or audit failure rolls back readiness and its durable receipt.
+    pub async fn reconcile(
+        &self,
+        env: &Env,
+        expected: &ClientSubjectPolicySnapshot,
+        attestation: &ClientSubjectHistoryAttestation,
+    ) -> Result<ClientSubjectHistoryReport, StoreError> {
+        if expected.client_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        if !attestation.legacy_issuers_stopped
+            || !attestation.external_history_reconciled
+            || !attestation.public_identifiers_retained
+            || attestation.evidence_sha256.len() != 64
+            || !attestation
+                .evidence_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(StoreError::Invalid);
+        }
+        let detail = serde_json::to_string(attestation).map_err(|_| StoreError::Invalid)?;
+        let scope = self.scope;
+        let id = expected.client_id;
+        let now = epoch_micros(env.clock().now_utc());
+        write_audited_detailed(
+            AuditedWrite { store: self.store, scope, acting: &self.acting, env, action: Action::ClientSubjectHistoryReconcile, target: &id },
+            async move |tx| {
+                lock_public_subject_history(tx, scope, expected, true).await?;
+                let coverage = read_subject_history(tx, scope, id).await?;
+                if coverage.missing_bindings != 0 || coverage.conflicting_bindings != 0 {
+                    return Err(StoreError::Conflict);
+                }
+                sqlx::query("UPDATE clients SET subject_history_ready=true, subject_history_evidence_sha256=$1, subject_history_reconciled_at=TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval WHERE id=$3 AND tenant_id=$4 AND environment_id=$5")
+                    .bind(&attestation.evidence_sha256).bind(now).bind(id.to_string()).bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string()).execute(&mut **tx).await?;
+                read_subject_history(tx, scope, id).await
+            }, false, Some(&detail),
+        ).await
     }
 }

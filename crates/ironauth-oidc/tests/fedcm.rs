@@ -1147,3 +1147,63 @@ async fn a_fenced_user_gets_no_fedcm_assertion() {
         "and no token in the body: {body}"
     );
 }
+
+#[tokio::test]
+async fn pairwise_assertion_uses_rp_identity_and_keeps_browser_account_selection() {
+    let (h, client, user, account, cookie) = armed_assertion_harness().await;
+    common::pairwise::configure(&h, h.client_id(), "fedcm.example.test").await;
+    let expected = h
+        .state()
+        .resolve_registered_subject(h.scope(), &client, &user)
+        .await
+        .unwrap();
+    assert_ne!(expected, account);
+    let (status, _, body) = assertion_post(
+        &h,
+        &assertion_form(&client, &account, "pairwise-assertion"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result = json(&body);
+    let verified = verify(
+        result["token"].as_str().unwrap(),
+        &h.id_token_policy(&client),
+        &common::verify_clock(),
+    )
+    .unwrap();
+    assert_eq!(verified.claims().subject(), Some(expected.as_str()));
+}
+
+#[tokio::test]
+async fn pairwise_fedcm_assertion_names_the_impersonator_for_this_client() {
+    let (h, client, user, account, _) = armed_assertion_harness().await;
+    common::pairwise::configure(&h, h.client_id(), "fedcm-actor.example.test").await;
+    let actor = h.seed_unique_user().await;
+    let (_, cookie) = common::pairwise::impersonated_session(&h, &user, &actor).await;
+    let (status, _, body) = assertion_post(
+        &h,
+        &assertion_form(&client, &account, "pairwise-actor"),
+        Some(RP_ORIGIN),
+        Some("webidentity"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    let verified = verify(
+        value["token"].as_str().unwrap(),
+        &h.id_token_policy(&client),
+        &common::verify_clock(),
+    )
+    .unwrap();
+    let expected = h
+        .state()
+        .resolve_registered_subject(h.scope(), &client, &actor)
+        .await
+        .unwrap();
+    assert_ne!(expected, actor);
+    assert_eq!(verified.claims().get("act").unwrap()["sub"], expected);
+}

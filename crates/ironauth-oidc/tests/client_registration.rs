@@ -834,3 +834,543 @@ async fn encrypted_id_tokens_require_usable_inline_recipient_keys() {
         assert_eq!(body["error"], "invalid_client_metadata");
     }
 }
+
+#[tokio::test]
+async fn pairwise_registration_metadata_round_trips_and_redirect_updates_are_atomic() {
+    let h = Harness::start_store_backed_with(dcr_config()).await;
+    let (status, initial) = post_json(
+        &h,
+        &register_path(&h),
+        json!({
+            "redirect_uris":[REDIRECT_URI], "subject_type":"pairwise"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(initial["subject_type"], "pairwise");
+    let token = initial["registration_access_token"].as_str().unwrap();
+    let path = to_path(initial["registration_client_uri"].as_str().unwrap());
+    let client = ironauth_store::ClientId::parse_in_scope(
+        initial["client_id"].as_str().unwrap(),
+        &h.scope(),
+    )
+    .unwrap();
+    let before = h
+        .store()
+        .scoped(h.scope())
+        .clients()
+        .subject_policy(&client)
+        .await
+        .unwrap();
+    let (status, read) = send_json(&h, "GET", &path, Some(token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(read["subject_type"], "pairwise");
+    let (status, _) = send_json(
+        &h,
+        "PUT",
+        &path,
+        Some(token),
+        Some(json!({
+            "redirect_uris":[REDIRECT_URI,"https://other.example.test/cb"],"subject_type":"pairwise"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        h.store()
+            .scoped(h.scope())
+            .clients()
+            .subject_policy(&client)
+            .await
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        send_json(&h, "GET", &path, Some(token), None).await.0,
+        StatusCode::OK
+    );
+    let (status, updated) = send_json(
+        &h,
+        "PUT",
+        &path,
+        Some(token),
+        Some(json!({
+            "redirect_uris":["https://next.example.test/cb"],"subject_type":"pairwise"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let after = h
+        .store()
+        .scoped(h.scope())
+        .clients()
+        .subject_policy(&client)
+        .await
+        .unwrap();
+    assert!(after.revision > before.revision);
+    assert_eq!(after.redirect_uris, vec!["https://next.example.test/cb"]);
+    assert_eq!(
+        after.policy,
+        ironauth_store::ClientSubjectPolicy::Pairwise {
+            sector_identifier: "next.example.test".to_owned(),
+            sector_identifier_uri: None
+        }
+    );
+    assert_eq!(
+        send_json(&h, "GET", &path, Some(token), None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send_json(
+            &h,
+            "GET",
+            &path,
+            updated["registration_access_token"].as_str(),
+            None
+        )
+        .await
+        .1["subject_type"],
+        "pairwise"
+    );
+}
+
+#[tokio::test]
+async fn legacy_dcr_client_cannot_activate_pairwise_or_rotate_credentials_on_refusal() {
+    let h = Harness::start_store_backed_with(dcr_config()).await;
+    let (status, initial) = post_json(
+        &h,
+        &register_path(&h),
+        json!({"redirect_uris":[REDIRECT_URI]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let client = ironauth_store::ClientId::parse_in_scope(
+        initial["client_id"].as_str().unwrap(),
+        &h.scope(),
+    )
+    .unwrap();
+    let path = to_path(initial["registration_client_uri"].as_str().unwrap());
+    let token = initial["registration_access_token"].as_str().unwrap();
+    sqlx::query("UPDATE clients SET subject_history_ready=false WHERE id=$1")
+        .bind(client.to_string())
+        .execute(h.pool())
+        .await
+        .unwrap();
+    h.verify_client(&client).await;
+    let before = h
+        .store()
+        .scoped(h.scope())
+        .clients()
+        .dynamic_registration(&client)
+        .await
+        .unwrap();
+    let user = h.seed_unique_user().await;
+    assert_eq!(registered_user_subject(&h, &initial, &user).await, user);
+    let (status, body) = send_json(
+        &h,
+        "PUT",
+        &path,
+        Some(token),
+        Some(json!({
+            "redirect_uris":[REDIRECT_URI], "subject_type":"pairwise",
+            "sector_identifier_uri":"https://sector.example.test/list", "history_ready":true
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_client_metadata");
+    assert!(
+        body["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("reconciliation")
+    );
+    assert_eq!(
+        h.store()
+            .scoped(h.scope())
+            .clients()
+            .dynamic_registration(&client)
+            .await
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        send_json(&h, "GET", &path, Some(token), None).await.0,
+        StatusCode::OK
+    );
+    let (status, _) = send_json(
+        &h,
+        "PUT",
+        &path,
+        Some(token),
+        Some(json!({"redirect_uris":[REDIRECT_URI]})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "legacy public metadata updates remain available"
+    );
+    assert!(
+        !h.store()
+            .scoped(h.scope())
+            .clients()
+            .subject_policy(&client)
+            .await
+            .unwrap()
+            .history_ready
+    );
+}
+
+#[tokio::test]
+async fn pairwise_registration_refuses_incoherent_or_hostless_metadata() {
+    let h = Harness::start_store_backed_with(dcr_config()).await;
+    for extra in [
+        json!({"subject_type":"unknown"}),
+        json!({"subject_type":false}),
+        json!({"subject_type":"pairwise","sector_identifier_uri":"http://sector.example.test/list"}),
+        json!({"subject_type":"pairwise","sector_identifier_uri":[]}),
+        json!({"subject_type":"public","sector_identifier_uri":"https://sector.example.test/list"}),
+        json!({"subject_type":"pairwise","redirect_uris":[REDIRECT_URI,"https://second.example.test/cb"]}),
+        json!({"subject_type":"pairwise","application_type":"native","redirect_uris":["com.example.app:/callback"]}),
+    ] {
+        let mut metadata = json!({"redirect_uris":[REDIRECT_URI]});
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (status, body) = post_json(&h, &register_path(&h), metadata).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_client_metadata");
+    }
+    assert_eq!(
+        h.store()
+            .scoped(h.scope())
+            .clients()
+            .count_dynamic()
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn pairwise_registration_uses_real_tls_sector_validation_on_create_and_update() {
+    use ironauth_fetch::{TestTlsIdentity, TestTlsTarget};
+    let identity = TestTlsIdentity::generate("sector.example.test");
+    let document = TestTlsTarget::start(
+        &identity,
+        200,
+        serde_json::to_vec(&vec![REDIRECT_URI, "https://second.example.test/cb"]).unwrap(),
+    )
+    .await;
+    let fetcher = Fetcher::from_parts_trusting(
+        FetchLimits::default(),
+        Arc::new(StaticResolver::new(vec!["93.184.216.34".parse().unwrap()])),
+        Arc::new(RecordingDialer::new(document.addr)),
+        &identity.root_der,
+    );
+    let h = Harness::start_with_resolver(
+        dcr_config(),
+        Arc::new(ClientKeyResolver::new(
+            Arc::new(fetcher),
+            Duration::from_secs(60),
+        )),
+    )
+    .await;
+    let metadata = json!({"redirect_uris":[REDIRECT_URI,"https://second.example.test/cb"],"subject_type":"pairwise","sector_identifier_uri":"https://sector.example.test:8443/list"});
+    let (status, registered) = post_json(&h, &register_path(&h), metadata.clone()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        registered["sector_identifier_uri"],
+        metadata["sector_identifier_uri"]
+    );
+    let token = registered["registration_access_token"].as_str().unwrap();
+    let path = to_path(registered["registration_client_uri"].as_str().unwrap());
+    let client = ironauth_store::ClientId::parse_in_scope(
+        registered["client_id"].as_str().unwrap(),
+        &h.scope(),
+    )
+    .unwrap();
+    let before = h
+        .store()
+        .scoped(h.scope())
+        .clients()
+        .subject_policy(&client)
+        .await
+        .unwrap();
+    let mut invalid = metadata.clone();
+    invalid["redirect_uris"] = json!(["https://unlisted.example.test/cb"]);
+    assert_eq!(
+        send_json(&h, "PUT", &path, Some(token), Some(invalid))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        h.store()
+            .scoped(h.scope())
+            .clients()
+            .subject_policy(&client)
+            .await
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        send_json(&h, "PUT", &path, Some(token), Some(metadata))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        document.received().len(),
+        3,
+        "each create/update checks the exact document"
+    );
+}
+
+#[tokio::test]
+async fn pairwise_registration_blocks_private_and_link_local_sector_targets() {
+    for ip in ["10.0.0.1", "169.254.169.254"] {
+        let dialer = Arc::new(RecordingDialer::new("127.0.0.1:9".parse().unwrap()));
+        let fetcher = Fetcher::from_parts(
+            FetchLimits::default(),
+            Arc::new(StaticResolver::new(vec![ip.parse().unwrap()])),
+            dialer,
+        );
+        let h = Harness::start_with_resolver(
+            dcr_config(),
+            Arc::new(ClientKeyResolver::new(
+                Arc::new(fetcher),
+                Duration::from_secs(60),
+            )),
+        )
+        .await;
+        let (status, body) = post_json(&h, &register_path(&h), json!({"redirect_uris":[REDIRECT_URI],"subject_type":"pairwise","sector_identifier_uri":"https://sector.example.test/list"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_client_metadata");
+        assert_eq!(
+            h.store()
+                .scoped(h.scope())
+                .clients()
+                .count_dynamic()
+                .await
+                .unwrap(),
+            0
+        );
+    }
+}
+
+async fn registered_user_subject(h: &Harness, registration: &Value, user: &str) -> String {
+    let client = registration["client_id"].as_str().unwrap();
+    let secret = registration["client_secret"].as_str().unwrap();
+    let code = h
+        .issue_code_for_subject(client, user, "openid profile")
+        .await;
+    let auth = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{client}:{secret}"))
+    );
+    let (status, _, body) = h
+        .token_with_auth(
+            &form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT_URI),
+            ]),
+            Some(&auth),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "registered client code exchange refused"
+    );
+    let issued = json_body(&body);
+    let verified = ironauth_jose::verify(
+        issued["id_token"].as_str().unwrap(),
+        &h.id_token_policy(client),
+        &common::verify_clock(),
+    )
+    .unwrap();
+    let subject = verified.claims().subject().unwrap().to_owned();
+    let (status, info) =
+        send_json(h, "GET", "/userinfo", issued["access_token"].as_str(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(info["sub"], subject);
+    subject
+}
+
+#[tokio::test]
+async fn pairwise_dcr_policy_drives_tokens_and_preserves_previously_issued_identity() {
+    for initial_pairwise in [false, true] {
+        let config = dcr_config();
+        let h = Harness::start_store_backed_with(config.clone()).await;
+        let kind = if initial_pairwise {
+            "pairwise"
+        } else {
+            "public"
+        };
+        let (status, registered) = post_json(
+            &h,
+            &register_path(&h),
+            json!({"redirect_uris":[REDIRECT_URI],"subject_type":kind}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let client = ironauth_store::ClientId::parse_in_scope(
+            registered["client_id"].as_str().unwrap(),
+            &h.scope(),
+        )
+        .unwrap();
+        h.verify_client(&client).await;
+        let user = h.seed_unique_user().await;
+        let before = registered_user_subject(&h, &registered, &user).await;
+        if initial_pairwise {
+            assert_ne!(before, user);
+        } else {
+            assert_eq!(before, user);
+        }
+        let path = to_path(registered["registration_client_uri"].as_str().unwrap());
+        let (status, _) = send_json(
+            &h,
+            "PUT",
+            &path,
+            registered["registration_access_token"].as_str(),
+            Some(json!({"redirect_uris":[REDIRECT_URI],"subject_type":"pairwise"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let restarted = h.restart(&config).await;
+        assert_eq!(
+            registered_user_subject(&restarted, &registered, &user).await,
+            before
+        );
+        let fresh_user = restarted.seed_unique_user().await;
+        let fresh_subject = registered_user_subject(&restarted, &registered, &fresh_user).await;
+        assert_ne!(fresh_subject, fresh_user);
+        assert_eq!(fresh_subject.len(), 43);
+    }
+}
+
+#[tokio::test]
+async fn pairwise_update_fetch_budget_survives_registration_token_rotation() {
+    use ironauth_fetch::{TestTlsIdentity, TestTlsTarget};
+    let identity = TestTlsIdentity::generate("sector.example.test");
+    let document = TestTlsTarget::start(
+        &identity,
+        200,
+        serde_json::to_vec(&vec![REDIRECT_URI]).unwrap(),
+    )
+    .await;
+    let fetcher = Fetcher::from_parts_trusting(
+        FetchLimits::default(),
+        Arc::new(StaticResolver::new(vec!["93.184.216.34".parse().unwrap()])),
+        Arc::new(RecordingDialer::new(document.addr)),
+        &identity.root_der,
+    );
+    let config = OidcConfig {
+        registration_rate_limit: 1,
+        ..dcr_config()
+    };
+    let window = config.registration_rate_window_secs;
+    let h = Harness::start_with_resolver(
+        config,
+        Arc::new(ClientKeyResolver::new(
+            Arc::new(fetcher),
+            Duration::from_secs(60),
+        )),
+    )
+    .await;
+    let metadata = json!({"redirect_uris":[REDIRECT_URI],"subject_type":"pairwise","sector_identifier_uri":"https://sector.example.test/list"});
+    let (status, registered) = post_json(&h, &register_path(&h), metadata.clone()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let path = to_path(registered["registration_client_uri"].as_str().unwrap());
+    let (status, updated) = send_json(
+        &h,
+        "PUT",
+        &path,
+        registered["registration_access_token"].as_str(),
+        Some(metadata.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(document.received().len(), 2);
+    let (status, _) = send_json(
+        &h,
+        "PUT",
+        &path,
+        updated["registration_access_token"].as_str(),
+        Some(metadata.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        document.received().len(),
+        2,
+        "throttled update performs no network fetch"
+    );
+    h.clock().advance(Duration::from_secs(window + 1));
+    assert_eq!(
+        send_json(
+            &h,
+            "PUT",
+            &path,
+            updated["registration_access_token"].as_str(),
+            Some(metadata)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(document.received().len(), 3);
+}
+
+#[tokio::test]
+async fn omitted_subject_metadata_reverts_policy_without_changing_bound_identity() {
+    let h = Harness::start_store_backed_with(dcr_config()).await;
+    let (status, registered) = post_json(
+        &h,
+        &register_path(&h),
+        json!({"redirect_uris":[REDIRECT_URI],"subject_type":"pairwise"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let client = ironauth_store::ClientId::parse_in_scope(
+        registered["client_id"].as_str().unwrap(),
+        &h.scope(),
+    )
+    .unwrap();
+    h.verify_client(&client).await;
+    let user = h.seed_unique_user().await;
+    let bound = registered_user_subject(&h, &registered, &user).await;
+    assert_ne!(bound, user);
+    let path = to_path(registered["registration_client_uri"].as_str().unwrap());
+    let (status, updated) = send_json(
+        &h,
+        "PUT",
+        &path,
+        registered["registration_access_token"].as_str(),
+        Some(json!({"redirect_uris":[REDIRECT_URI]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["subject_type"], "public");
+    assert!(updated.get("sector_identifier_uri").is_none());
+    let (status, read) = send_json(
+        &h,
+        "GET",
+        &path,
+        updated["registration_access_token"].as_str(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(read["subject_type"], "public");
+    assert_eq!(registered_user_subject(&h, &registered, &user).await, bound);
+    let fresh_user = h.seed_unique_user().await;
+    assert_eq!(
+        registered_user_subject(&h, &registered, &fresh_user).await,
+        fresh_user
+    );
+}

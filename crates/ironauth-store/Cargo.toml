@@ -1197,3 +1197,8 @@ required-features = ["testing"]
 name = "pairwise_salt"
 path = "tests/pairwise_salt.rs"
 required-features = ["testing"]
+
+[[test]]
+name = "client_subject_identity"
+path = "tests/client_subject_identity.rs"
+required-features = ["testing"]

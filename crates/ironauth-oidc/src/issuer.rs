@@ -1155,10 +1155,9 @@ async fn load_issuer_entry(store: &Store, scope: &Scope) -> LoadOutcome {
         // so it 404s deterministically rather than looping a retry.
         return LoadOutcome::Empty;
     };
-    // PLACEHOLDER salt: per-environment salt persistence and the pairwise wiring
-    // are a later milestone; nothing live reads this salt yet (the data-plane token
-    // path resolves PUBLIC subjects, which never consult a salt, see
-    // OidcState::resolve_public_subject). An empty salt is the honest placeholder.
+    // Legacy constructor field, not authoritative identity material. The
+    // registered-client resolver loads the durable envelope salt from the store.
+    // Never use this empty placeholder for a pairwise derivation.
     let salt = PairwiseSalt::new(Vec::new());
     // The environment's TYPED guardrails (issue #42), read from the scope-forced
     // projection the data plane CAN see (the environments level table it cannot).

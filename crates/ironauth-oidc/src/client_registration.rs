@@ -284,6 +284,7 @@ pub async fn register(
     let registration_uri_base = format!("{issuer}/connect/register");
 
     let params = NewDynamicClient {
+        subject_policy: &validated.subject_policy,
         display_name: &validated.display_name,
         auth_method: validated.auth_method.as_str(),
         secret_hash: secret_hash.as_deref(),
@@ -337,7 +338,7 @@ pub async fn register(
             return redirect_error("a redirect_uri is not a registrable target");
         }
         Err(StoreError::Conflict) => {
-            return metadata_error("the client key configuration is invalid");
+            return metadata_error("the client metadata is stale or invalid");
         }
         Err(_) => return server_error(),
     };
@@ -397,6 +398,14 @@ pub async fn update(
         return unauthorized();
     };
 
+    let actor = client_service_actor(StoredClientId::Registered(&record.id));
+    let correlation = CorrelationId::generate(state.env());
+    if let Some(refusal) =
+        enforce_update_rate_limit(&state, scope, &record.id, actor, correlation).await
+    {
+        return refusal;
+    }
+
     let Ok(metadata) = serde_json::from_slice::<Value>(&body) else {
         return metadata_error("the request body must be a JSON object");
     };
@@ -429,6 +438,14 @@ pub async fn update(
         }
     }
 
+    if metadata.get("subject_type").and_then(Value::as_str) == Some("pairwise")
+        && !record.subject_history_ready
+    {
+        return metadata_error(
+            "legacy public identity history requires administrator reconciliation before enabling pairwise",
+        );
+    }
+
     let Some((signable, default_alg)) = env_signing_capability(&state, &scope).await else {
         return server_error();
     };
@@ -459,9 +476,10 @@ pub async fn update(
     // token's hash no longer matches, so it stops working immediately.
     let new_token = generate_registration_token(state.env());
     let new_token_hash = hash_secret(&new_token);
-    let actor = client_service_actor(StoredClientId::Registered(&record.id));
-
     let store_update = DynamicClientUpdate {
+        subject_policy: &validated.subject_policy,
+        expected_subject_policy_revision: record.subject_policy_revision,
+        expected_registration_access_token_hash: record.registration_access_token_hash.as_deref(),
         display_name: &validated.display_name,
         auth_method: validated.auth_method.as_str(),
         redirect_uris: &validated.redirect_uris,
@@ -477,7 +495,7 @@ pub async fn update(
     match state
         .store()
         .scoped(scope)
-        .acting(actor, CorrelationId::generate(state.env()))
+        .acting(actor, correlation)
         .clients()
         .update_dynamic(state.env(), &record.id, store_update)
         .await
@@ -488,7 +506,7 @@ pub async fn update(
         }
         Err(StoreError::NotFound) => return unauthorized(),
         Err(StoreError::Conflict) => {
-            return metadata_error("the client key configuration is invalid");
+            return metadata_error("the client metadata is stale or invalid");
         }
         Err(_) => return server_error(),
     }
@@ -723,6 +741,41 @@ async fn enforce_rate_limits(
     None
 }
 
+/// Authenticated updates can fetch sector documents, so limit them before parsing
+/// or fetching. The stable scoped client key survives registration-token rotation.
+async fn enforce_update_rate_limit(
+    state: &OidcState,
+    scope: Scope,
+    client: &ironauth_store::ClientId,
+    actor: ActorRef,
+    correlation: CorrelationId,
+) -> Option<Response> {
+    let limit = i64::from(state.registration_rate_limit());
+    if limit <= 0 {
+        return None;
+    }
+    let window = i64::try_from(state.registration_rate_window().as_secs()).unwrap_or(i64::MAX);
+    match state
+        .store()
+        .scoped(scope)
+        .dcr_rate_limiter()
+        .check_and_increment(
+            &format!("client:{client}"),
+            limit,
+            window,
+            epoch_micros(state.now()),
+        )
+        .await
+    {
+        Ok(true) => None,
+        Ok(false) => {
+            record_rate_limited(state, scope, actor, correlation).await;
+            Some(rate_limited_refused())
+        }
+        Err(_) => Some(server_error()),
+    }
+}
+
 /// A best-effort source identifier for rate limiting (issue #31, FIX 3): the request's
 /// TRANSPORT PEER address, or a fixed `unknown` bucket when none was resolved.
 ///
@@ -934,6 +987,7 @@ struct ValidatedMetadata {
     display_name: String,
     auth_method: ClientAuthMethod,
     redirect_uris: Vec<String>,
+    subject_policy: ironauth_store::ClientSubjectPolicy,
     application_type: String,
     id_token_signed_response_alg: String,
     jwks: Option<String>,
@@ -943,6 +997,70 @@ struct ValidatedMetadata {
     authorization_signed_response_alg: Option<String>,
     id_token_encrypted_response_alg: Option<String>,
     id_token_encrypted_response_enc: Option<String>,
+}
+
+/// Identity metadata is full-replacement metadata: omission selects public.
+/// Existing bindings remain immutable when the requested policy changes.
+async fn validate_subject_policy(
+    state: &OidcState,
+    metadata: &serde_json::Map<String, Value>,
+    redirects: &[String],
+) -> Result<ironauth_store::ClientSubjectPolicy, RegistrationError> {
+    use ironauth_store::ClientSubjectPolicy;
+    let kind = match metadata.get("subject_type") {
+        None => "public",
+        Some(Value::String(kind)) if matches!(kind.as_str(), "public" | "pairwise") => kind,
+        _ => {
+            return Err(RegistrationError::metadata(
+                "subject_type must be public or pairwise",
+            ));
+        }
+    };
+    let uri = match metadata.get("sector_identifier_uri") {
+        None => None,
+        Some(Value::String(uri)) if !uri.is_empty() => Some(uri.as_str()),
+        _ => {
+            return Err(RegistrationError::metadata(
+                "sector_identifier_uri must be a non-empty HTTPS URL",
+            ));
+        }
+    };
+    if kind == "public" {
+        if uri.is_some() {
+            return Err(RegistrationError::metadata(
+                "sector_identifier_uri requires pairwise subject_type",
+            ));
+        }
+        return Ok(ClientSubjectPolicy::Public);
+    }
+    let sector =
+        if let Some(uri) = uri {
+            if !url::Url::parse(uri)
+                .is_ok_and(|url| url.scheme() == "https" && url.host_str().is_some())
+            {
+                return Err(RegistrationError::metadata(
+                    "sector_identifier_uri must be a valid HTTPS URL",
+                ));
+            }
+            let resolver = state
+                .client_key_resolver()
+                .ok_or(RegistrationError::ValidationUnavailable)?;
+            resolver.pairwise_sector(uri, redirects).await.map_err(|_| {
+                RegistrationError::metadata(
+                    "sector_identifier_uri could not be validated against the registered redirects",
+                )
+            })?
+        } else {
+            crate::sector::inferred_sector(redirects).ok_or_else(|| {
+                RegistrationError::metadata(
+                    "pairwise subject_type requires a sector_identifier_uri for these redirects",
+                )
+            })?
+        };
+    Ok(ClientSubjectPolicy::Pairwise {
+        sector_identifier: sector,
+        sector_identifier_uri: uri.map(str::to_owned),
+    })
 }
 
 /// Validate an RFC 7591 metadata document, applying per-spec defaults, ignoring
@@ -995,6 +1113,7 @@ async fn validate_metadata(
     }
 
     let redirect_uris = validate_redirect_uris(metadata, &application_type, guardrails)?;
+    let subject_policy = validate_subject_policy(state, metadata, &redirect_uris).await?;
 
     // On an RFC 7592 update, switching to a secret-based method requires a secret
     // the client does not have (an update never mints one), so refuse the
@@ -1047,6 +1166,7 @@ async fn validate_metadata(
         display_name,
         auth_method,
         redirect_uris,
+        subject_policy,
         application_type,
         id_token_signed_response_alg,
         jwks,
@@ -1558,7 +1678,7 @@ fn base_metadata(
     validated: &ValidatedMetadata,
     registration_client_uri: &str,
 ) -> serde_json::Map<String, Value> {
-    metadata_object(
+    let mut object = metadata_object(
         client_id,
         issued_at,
         &validated.display_name,
@@ -1570,7 +1690,9 @@ fn base_metadata(
         validated.jwks_uri.as_deref(),
         validated.token_endpoint_auth_signing_alg.as_deref(),
         registration_client_uri,
-    )
+    );
+    subject_metadata(&mut object, &validated.subject_policy);
+    object
 }
 
 /// Build the client-metadata portion of an RFC 7592 read response from the stored
@@ -1586,7 +1708,7 @@ fn read_metadata(
     issued_at: i64,
     registration_client_uri: &str,
 ) -> serde_json::Map<String, Value> {
-    metadata_object(
+    let mut object = metadata_object(
         &record.id.to_string(),
         issued_at,
         &record.display_name,
@@ -1598,7 +1720,29 @@ fn read_metadata(
         record.jwks_uri.as_deref(),
         record.token_endpoint_auth_signing_alg.as_deref(),
         registration_client_uri,
-    )
+    );
+    subject_metadata(&mut object, &record.subject_policy);
+    object
+}
+
+fn subject_metadata(
+    object: &mut serde_json::Map<String, Value>,
+    policy: &ironauth_store::ClientSubjectPolicy,
+) {
+    match policy {
+        ironauth_store::ClientSubjectPolicy::Public => {
+            object.insert("subject_type".to_owned(), json!("public"));
+        }
+        ironauth_store::ClientSubjectPolicy::Pairwise {
+            sector_identifier_uri,
+            ..
+        } => {
+            object.insert("subject_type".to_owned(), json!("pairwise"));
+            if let Some(uri) = sector_identifier_uri {
+                object.insert("sector_identifier_uri".to_owned(), json!(uri));
+            }
+        }
+    }
 }
 
 /// The shared response object builder for the register, update, and read
@@ -1662,6 +1806,8 @@ fn metadata_object(
 /// A validation failure, mapped to the RFC 7591 error object.
 #[derive(Debug)]
 enum RegistrationError {
+    /// The server has no hardened sector fetcher available.
+    ValidationUnavailable,
     /// A metadata property is missing, malformed, or unsupported.
     InvalidClientMetadata(String),
     /// A `redirect_uri` is not a valid registrable target.
@@ -1699,6 +1845,7 @@ impl RegistrationError {
 impl IntoResponse for RegistrationError {
     fn into_response(self) -> Response {
         match self {
+            RegistrationError::ValidationUnavailable => server_error(),
             RegistrationError::InvalidClientMetadata(description) => {
                 error_body("invalid_client_metadata", &description)
             }

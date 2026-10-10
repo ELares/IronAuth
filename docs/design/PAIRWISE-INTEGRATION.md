@@ -1,10 +1,11 @@
 # Production pairwise subjects (#19)
 
-The original #19 and hosted-profile #1385 criteria remain open. At merged base
-`9d31109c`, production uses `resolve_public_subject` and `ClientRecord` has no
-persisted subject policy. Generic hashing tests do not qualify token/UserInfo
-parity. The sector resolver changes in this branch are prerequisites, not a
-production pairwise implementation.
+The original #19 and hosted-profile #1385 criteria remain open. This branch
+integrates durable client identity policy with issuance, credential consumers,
+dynamic registration and the management API. The candidate has been deployed
+and qualified with Civio in an isolated local Kubernetes environment. Production
+identity reconciliation and cutover remain required; the qualification below
+is evidence for that copied environment, not a production rollout certificate.
 
 ## Durable salt prerequisite
 
@@ -20,8 +21,9 @@ of silently replacing identity. Debug output redacts the 256-bit value.
 Real PostgreSQL tests cover eight independent concurrent pools, read/retry and
 pool restart, KEK/DEK rotation, ciphertext replay across scopes, corruption,
 crypto-shredding, rollback on audit failure, and byte-identical configuration
-exports before and after provisioning. Backup/restore qualification and live
-token integration are still required. No network endpoint exposes this salt.
+exports before and after provisioning. The encrypted backup/restore and live
+token qualification below provide additional evidence. No network endpoint
+exposes this salt.
 
 ## Sector selection
 
@@ -51,9 +53,10 @@ and [Registration section 5](https://openid.net/specs/openid-connect-registratio
 3. Preserve already-issued identity bindings and define policy-transition
    semantics explicitly. Public-to-pairwise conversion changes the external
    identifier by definition; preserving a previously public value for an old
-   user is a legacy exception to full pairwise privacy. No migration choice has
-   been approved or implemented. Do not claim an immutable public policy has
-   fulfilled the issue's requested switching behavior.
+   user is a legacy exception to full pairwise privacy. The reconciliation and
+   switching workflow below is qualified locally; production history and cutover
+   still need their own evidence. An immutable public-only policy does not
+   fulfill the requested switching behavior.
 4. Keep local user IDs as all authorization/store keys. Client-aware derivation
    belongs only at the external identity boundary. Direct public-resolver sites
    include authorize, code/refresh, UserInfo (JWT and opaque), introspection
@@ -76,3 +79,334 @@ policy. Schema expansion alone does not make an old binary pairwise-capable;
 plan rollout and rollback around that fact. No current application identity or
 live provider configuration is changed by this branch yet. The complete original
 Civio U01/U02/U04/U07 objective is unchanged.
+
+
+## Integration after PR #1492
+
+Migration 0251 and the scoped client repository now persist identity policy,
+a revision shared with redirect edits, and immutable client/user bindings. The
+revision trigger also detects redirects changed and then restored (ABA). A
+pairwise row pins the exact validated redirect set; a legacy writer cannot edit
+that set without atomically updating its validated policy. Failed audits roll
+back both policy revisions and binding inserts. Bindings carry composite scoped
+foreign keys and no direct UPDATE/DELETE grants.
+
+The OIDC adapter reads durable policy/salt and binds through the shared derivation.
+Code/refresh issuance, UserInfo, opaque/refresh introspection, front-channel ID
+tokens, device and CIBA grants, FedCM assertions, recipient proofs, mapped JWT
+bearer users and native SSO now use registered-client identities. FedCM account
+selection remains a provider-scoped browser handle. Workload mappings retain
+their existing principal identifiers.
+
+Token exchange recovers the local principal from the verified token's scoped
+stored grant and checks its original client binding before authorizing it. New
+subject/actor identifiers follow the receiving client policy; historical actor
+chains remain the verified history. Access rules and audit/storage attribution
+use local principals, including transaction tokens. Mint request types now carry
+local and client-facing subjects separately.
+
+Session impersonation resolves scoped user actors under the receiving client
+policy for code/refresh, device, implicit/hybrid and FedCM. The original local
+actor and written justification remain in session/family storage; only the
+structured reason accompanies the client-facing actor. Non-user operator and
+workload identifiers retain their existing representation. A missing or unreadable
+session at the actor lookup refuses issuance instead of silently dropping `act`.
+Local user actors must still be eligible to authenticate even when they already
+have a stable client identity binding.
+
+Session templates are an independent credential profile with dedicated keys,
+audiences and token type, not registered OIDC clients. Their subject remains the
+local account; a template audience does not select an OIDC client identity policy.
+Logout hints and backchannel delivery select sessions by `sid`, independently of
+pairwise subjects. Protocol regressions cover cross-browser hint targeting and
+per-client backchannel delivery without a local-subject claim.
+Dynamic registration now accepts and returns `subject_type` and an optional
+`sector_identifier_uri`. Create and full-replacement update validate the sector
+through the shared hardened HTTPS fetcher, then commit policy, redirects and
+registration-token rotation in one audited transaction. Updates compare both the
+policy/redirect revision and the authenticating registration-token hash, so a
+concurrent policy edit or token rotation cannot be overwritten after validation.
+The existing registration rate/window settings also bound authenticated updates,
+using a scoped client key that survives token rotation. A zero limit retains its
+existing explicit opt-out meaning.
+
+Omitting `subject_type` in a registration update selects the public default;
+clients retaining pairwise policy must include it in replacement metadata.
+`sector_identifier_uri` is accepted only with explicit pairwise policy. Existing
+user bindings survive either policy transition; only previously unbound users
+receive an identity from the replacement policy. Protocol tests exercise actual
+ID tokens and UserInfo before and after updates and a pool/registry restart,
+real TLS sector validation, private/link-local refusal and the update fetch budget.
+Store tests exercise concurrent updates and audit-failure rollback. These
+checks are supplemented by the isolated browser qualification below.
+Management now exposes GET/PUT
+`/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/subject-policy`.
+The response includes policy, sector, redirects and revision. PUT requires
+`expected_revision` and explicit `subject_type`; it cannot edit redirects or
+issued bindings. Read/write management permissions, fresh privilege and live
+scope resolution run before metadata validation. Explicit sector URLs use the
+same hardened resolver as DCR; missing fetcher configuration returns 503.
+Migration 0252 grants the control role only the four policy columns, with no
+redirect, secret or runtime-binding authority. The writer locks and rechecks a
+live environment and the original policy/redirect revision before its audited
+update. Historical identity reconciliation remains required before activating pairwise
+on a legacy client. Deploying this binary preserves its existing public policy.
+
+A bound public identifier survives a later pairwise switch as a documented legacy
+privacy exception. Historical identities issued before binding persistence require the recovery
+and reconciliation workflow below. Only the isolated qualification client has
+been switched; the original Civio client retains public policy. Configuration snapshots now carry
+stored policy and redirects from one coherent read, excluding salts, runtime
+bindings and revisions. Offline validation checks policy shape without fetching;
+it cannot certify current sector-document ownership. Older snapshots default to
+public policy. The promotion engine still excludes all OAuth clients because
+their IDs are scoped. Database qualification checks that a real promotion retains
+the target's identity policy, salt and existing user binding without a reset.
+Algorithm policy remains promotable as required by #19.
+
+### Retained public history backfill primitive
+
+The store now exposes `backfill_public_subject_history` for one client's retained
+history while its policy is still public. It unions grant subjects, refresh-family
+subjects and impersonators, client-session subjects and impersonators, and
+impersonators on sessions referenced by grants. Every edge is scope constrained
+and joined to a registered user in that scope. Service principals and foreign
+subjects do not become user bindings. Revocation, expiry and soft deletion do not
+erase history; recovering a binding does not restore login eligibility.
+
+Each audited transaction locks and compares the expected public policy revision
+and redirects, then inserts at most 500 immutable bindings. Existing bindings,
+including pairwise bindings on a client later changed back to public, remain
+unchanged. The response counts examined users separately from inserted bindings
+and returns an exclusive user cursor when another page exists. Retrying a page
+is safe and records another attributed backfill attempt. Failed audits roll back
+the entire page. The page limit bounds output and writes, not total source scan
+cost; the grant-heavy scale qualification below does not bound arbitrary
+source mixes or every client size.
+
+The management workflow below exposes this primitive. It is not rollout
+certification or automatic migration.
+Quiesce old issuers before the final pass and policy cutover: an old binary can
+write new public history without consulting immutable bindings. The retained
+edges can also include authorization attempts that never returned a token, so
+their public bindings conservatively preserve recorded relationships rather
+than prove token receipt.
+
+Retained history is incomplete for some legacy paths. The transaction-token
+prototype records issuance only in the audit log, which retention can prune;
+external exchanged actor chains can lack a durable receiving-client/user edge.
+Owner-level history removal and tenant purges are not repaired by this primitive.
+Do not infer completeness from reaching the last page. An explicit strategy for
+these gaps, operational cutover, and live relying-party qualification remain
+prerequisites to enabling pairwise on existing clients. Only the isolated
+qualification copy has been switched by this work.
+
+### Legacy activation guard
+
+Migration 0253 gives every existing client `subject_history_ready=false` and
+keeps that default for old INSERT shapes. All five current creation paths set
+it true on INSERT because their clients begin with the binding-aware issuer.
+This requires every serving issuer to be upgraded before activation; creation
+readiness is not a claim that old binaries understand the new policy.
+
+The database refuses pairwise policy while readiness is false. Both policy
+repositories recheck readiness under their client lock, and readiness changes
+advance the shared policy revision to invalidate outstanding validation.
+The data plane receives no UPDATE authority for the new field. Migration 0254
+adds that authority only to the control plane for the audited reconciliation
+workflow below.
+The management policy view reports `history_ready`; a pending pairwise PUT
+returns 409 before sector fetching. DCR checks the effective metadata after its
+saved policy chain and refuses pending pairwise activation before fetching or
+registration-token rotation. Public issuance, public metadata updates and
+history backfill remain available. A caller cannot set readiness through either
+policy request, and finishing the last history page never sets it implicitly.
+
+The migration intentionally refuses a pre-existing pairwise row from an
+unsupported partial deployment rather than declaring its history complete or
+rewriting its identity. Existing supported deployments have public policy. Do
+not manually flip readiness to bypass reconciliation. Use the audited workflow
+below. Readiness and its receipt are runtime migration state, excluded from
+configuration snapshots and promotion. The workflow is locally qualified; a
+production cutover has not yet been performed.
+
+
+### Operator reconciliation workflow
+
+All paths below are relative to
+`/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}`.
+GET requires `management.read`. Each PUT requires `management.write_config`,
+configured fresh privilege, a live environment, and the current policy revision.
+Every successful PUT writes an attributed audit in the same transaction.
+
+1. Stop every legacy issuer before the final recovery pass. Deploy only binaries
+   that persist client bindings, and retain a restorable database/key backup.
+   Neither an API checkbox nor a database scan can prove that an old process has
+   stopped. Do not activate pairwise while an old issuer can serve this client.
+2. Read `GET /subject-policy` and `GET /subject-history`. A legacy client starts
+   public with `history_ready=false`. History reports retained users, missing
+   bindings, non-public conflicts and any existing receipt. These counts are not
+   a complete relying-party roster. New clients are ready without a legacy receipt.
+3. Recover retained history using `PUT /subject-history/backfill` with
+   `{"expected_revision":N,"limit":100}`. Use the returned opaque `next_cursor`
+   in the next request until it is null. The configured page maximum and a hard
+   cap of 500 bound each page. Cursors bind the client, scope and revision, not
+   completion authority. Retrying a page is safe and reports zero newly inserted
+   bindings where rows already exist. Each successful retry records an attempt.
+4. Reconcile the relying party's historical public account/actor identifiers with
+   retained grants, sessions and available audit evidence. Cover audit-only
+   transaction tokens and external exchanged actors explicitly. Where necessary,
+   call `PUT /subject-history/bindings` with
+   `{"expected_revision":N,"user_ids":["<scoped account ID>"]}` in batches of
+   1..500 rows. Duplicates collapse. Only existing users in the client's scope
+   are accepted, including soft-deleted accounts without reactivating them. An
+   unknown account or conflicting binding refuses the whole batch. This API
+   accepts only local IDs whose historical public value is that same ID; it
+   cannot assign an arbitrary external subject. The audit records a SHA-256 of
+   the sorted, unique IDs joined by newline, plus the count, rather than the roster.
+5. Retain an evidence artifact describing the client/scope, relying-party sources,
+   recovered public IDs, excluded non-user actors, any historical limitations,
+   and confirmation that old issuers are stopped. Compute its SHA-256. If missing
+   history cannot be reconciled, keep the client pending; use a new pairwise client
+   for a new integration rather than claiming the old client is fully recovered.
+6. Call `PUT /subject-history/reconciliation` with the current revision, lowercase
+   `evidence_sha256`, and explicit true values for `legacy_issuers_stopped`,
+   `external_history_reconciled`, and `public_identifiers_retained`. The server
+   independently rescans all retained edges under the client lock; skipped pages,
+   a forged cursor or an earlier zero count cannot bypass missing/conflicting
+   bindings. It checks digest syntax, not the artifact's contents: external
+   completeness is the authorized operator's attestation, never an automatic
+   server guarantee. Readiness, evidence digest, application-clock time and audit
+   commit together. Failure leaves all of them unchanged.
+7. Read the returned new revision and receipt. Reconciliation leaves the client
+   public. Use the ordinary `PUT /subject-policy` to activate the validated pairwise
+   policy. Existing public bindings remain unchanged; previously unbound users
+   receive pairwise identifiers. Verify ID tokens, UserInfo, token consumers and
+   relying-party account continuity before exposing the change to users.
+
+A repeated successful reconciliation cannot replace its receipt. A stale repeat
+returns 409; GET reports committed status after an ambiguous response. Import
+and reconciliation refuse an already-ready client. History import is a union of
+public bindings, never a replacement roster. No endpoint updates or deletes an
+existing binding. Mutation failures roll back their audit and writes together.
+Migration 0254 grants the control role SELECT/INSERT on bindings and UPDATE on
+only the readiness/receipt columns; it grants no binding UPDATE/DELETE and no
+readiness mutation to the authentication data plane. The policy repository stays
+separate from the recovery repository.
+
+Local qualification covers real control-role HTTP requests, rejected permission
+and scope combinations, fresh-privilege requirements, opaque cursor context,
+retries, missing/conflicting history, audit rollback, concurrent finalization,
+and a reconciled legacy client issuing stable verified token/UserInfo identities.
+The encrypted CLI backup/restore harness additionally recovers three scopes
+(two environments in one tenant and an environment in another tenant) after
+DEK rotation, salt re-encryption and KEK rotation. Fresh restricted-role pools
+and OIDC identity resolvers retain the exact salt, policy, history receipt and
+existing public/pairwise bindings. A previously unbound account derives the
+expected identity from restored material; a second pool reads that binding.
+Missing or wrong envelope master keys refuse derivation without creating a
+binding or replacing the salt. Database grants and forced RLS survive recovery.
+This is local database/identity-resolver evidence, not browser or HTTP token
+issuance against a restored deployment. Follow the separate role/key recovery
+requirements in [operations](../OPERATIONS.md#upgrade-back-up-and-recover).
+
+The grant-heavy source workload below provides local scale evidence. Production
+relying-party cutover still needs separate evidence. The scan limit bounds
+output and inserts, not total
+query work. This API must not be treated as proof that all original #19 or Civio
+milestone requirements have been completed.
+
+### Retained-history scale qualification
+
+The opt-in `grant_heavy_history_scale_qualification` test registers 10,000
+accounts, seeds 100,000 revoked grants for the selected client, and adds up to
+one million revoked grants for another client in the same environment. It calls
+the actual control-role repositories, checks exact retained coverage, recovers
+all users in 20 pages of 500 and completes reconciliation with zero missing or
+conflicting bindings. A restricted-role `EXPLAIN (ANALYZE, BUFFERS)` records the
+grant access path with forced RLS. Run it explicitly:
+
+```sh
+scripts/with-test-db.sh cargo test -p ironauth-store --all-features \
+  --test client_subject_identity grant_heavy_history_scale_qualification \
+  -- --ignored --nocapture
+```
+
+Before migration 0255, the grant access path scanned all 1.1 million rows and
+discarded one million unrelated rows. With `grants_client_history_idx`, it uses
+the scoped client index; the observed grant access time changed from 97 ms to
+12 ms and shared blocks accessed fell from 45,834 to 4,256. In these local runs,
+the complete 20-page recovery changed from 2.88 seconds to 1.02 seconds with the
+index alone. These are individual local observations, not latency guarantees or
+a concurrent production-load qualification. The additional batched insert sends
+one statement per page instead of up to 500 individual insert statements;
+with both changes, the same complete recovery took 0.56 seconds locally.
+
+Migration 0255 builds a normal transactional index and blocks grant writes while
+building it. Apply it during the migration maintenance window and allow capacity
+for the index. It neither prunes history nor changes permissions. Refresh-family
+and client-session source edges already have scoped client indexes. Functional
+tests exercise all history edge types, but this large dataset is specifically
+grant-heavy; it does not establish equivalent timings for every source mix.
+Each page can still scan the selected client's history to deduplicate users.
+Neither the row limit nor this index bounds total work for an arbitrarily large
+client, and the externally reconciled history requirement remains unchanged.
+
+### Civio browser qualification
+
+Candidate `0c64075b` was built on Linux and deployed into an isolated local
+Kubernetes namespace with a copied provider database migrated from 250 to 255.
+Civio `718a5c36` used copied workspace data, a separate PostgreSQL instance and
+an independent IronCache instance. The copied membership issuer was explicitly
+relocated to the candidate origin; this is fixture preparation, not a supported
+production issuer-migration procedure. Artifact and messaging workers were
+omitted from this authentication fixture. The active website/provider stayed on
+their existing versions and the website readiness check remained successful.
+
+Headed Chrome followed actual HTTPS authorization and Civio callback routes,
+without response interception. A copied legacy client started public and pending.
+The audited API recovered nine retained users and imported the six Civio
+membership subjects, recorded an evidence receipt and activated pairwise policy.
+A fresh browser login preserved the existing account's exact Civio user, provider
+subject and administrator role. A newly registered account received a stored
+pairwise subject different from its local user ID; Civio denied it membership
+with `access_denied` instead of granting access by matching email.
+
+Separate browser authorization-code/PKCE exchanges verified EdDSA signatures
+against the served JWKS, exact issuer/audience/nonce and expiration, and equal
+subjects in ID tokens, UserInfo and introspection for both legacy-public and new
+pairwise identities. After replacement of the provider pod, a new exchange kept
+the pairwise subject stable and the existing Civio session still resolved to the
+same user, role and subject. The history receipt and readiness survived. The
+extra callback used for token inspection was removed afterwards. Existing-user
+screens at desktop width and 390 pixels had no horizontal overflow.
+
+This evidence covers an isolated real relying-party flow and process replacement,
+not a production cutover, cluster-node reschedule, arbitrary external history,
+all browser/device combinations or all original #19/Civio milestone criteria.
+The browser accepted the local self-signed certificate; token inspection and
+Civio's provider connection used the configured certificate trust. Stored
+bindings preserving a subject after restart alone do not prove salt recovery;
+the separate envelope and encrypted-backup tests cover that boundary.
+
+## Integration review and deployment boundary
+
+The final review at `8fb305a5` covered scoped persistence and immutable binding
+races, policy/redirect revision checks, issuer and consumer identity boundaries,
+local authorization and impersonation, registration and management authority,
+retained-history reconciliation, snapshots, and encrypted restore privileges.
+No additional code blocker was found. Earlier database, protocol, scale, backup
+and browser evidence above remains the validation basis; this review is not a
+claim that the complete original issue or Civio milestones are finished.
+
+The history report is a public-history recovery report. Its
+`conflicting_bindings` count means retained users bound to non-public identifiers.
+Before legacy reconciliation these block activation. After successful activation,
+new pairwise users can legitimately increase that count; it does not revoke the
+receipt or mean their identities are corrupt.
+
+Deploy migrations 0251 through 0255 with a database/role backup and a brief
+provider maintenance window: migration 0255 builds its grant index transactionally.
+Stop the old issuer, migrate, and start the qualified binary. Existing clients
+remain public and pending reconciliation. Do not activate pairwise or attest
+external history merely because the deployment and sign-in checks pass.

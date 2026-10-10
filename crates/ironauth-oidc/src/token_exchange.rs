@@ -87,7 +87,7 @@ use crate::util::{client_service_actor, epoch_micros};
 
 /// One presented token, after full revalidation.
 struct ValidatedToken {
-    /// The token's subject, as this server derives it.
+    /// The local principal from the verified token's authoritative stored grant.
     subject: String,
     /// The client the token was ISSUED to, which is what decides downscope vs impersonation.
     client_id: Option<String>,
@@ -120,6 +120,10 @@ fn space_set(raw: Option<&str>) -> std::collections::BTreeSet<String> {
 /// [`TokenError`] per the module documentation: `invalid_request` for a malformed request,
 /// `invalid_client` for a failed authentication, `invalid_target` for an unknown target,
 /// and an opaque `invalid_grant` for every refusal that concerns the tokens themselves.
+#[allow(
+    clippy::too_many_lines,
+    reason = "ordered validation, authorization and issuance keep the exchange trust boundaries visible"
+)]
 pub async fn token_exchange_grant(
     state: &OidcState,
     headers: &HeaderMap,
@@ -245,6 +249,15 @@ pub async fn token_exchange_grant(
     let impersonation_allowed = authenticated.token_exchange_impersonation_allowed;
     let refresh_allowed = authenticated.token_exchange_refresh_allowed;
 
+    let actor_subject = match actor.as_ref() {
+        Some(actor) => Some(
+            state
+                .resolve_grant_subject(scope, &client_id_str, &actor.subject)
+                .await
+                .map_err(|_| TokenError::ServerError)?,
+        ),
+        None => None,
+    };
     let decision = decide(&ExchangeDecisionInput {
         client_policy: &policy,
         impersonation_allowed,
@@ -267,7 +280,7 @@ pub async fn token_exchange_grant(
             params.requested_token_type.as_deref()
         },
         existing_act: subject.act.as_ref(),
-        actor_subject: actor.as_ref().map(|token| token.subject.as_str()),
+        actor_subject: actor_subject.as_deref(),
     })
     .map_err(|refusal| refused(&client_id_str, mode, &refusal))?;
 
@@ -464,6 +477,10 @@ async fn issue(
     // control that only one of three doors applies is not a control.
     let agent =
         crate::token::gate_agent_issuance(state, scope, client_id_str, granted_scope).await?;
+    let external_subject = state
+        .resolve_grant_subject(scope, client_id_str, &subject.subject)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
     let (minted, expires_in) = tokens::mint_client_credentials_access_token(
         state,
         signer,
@@ -471,9 +488,9 @@ async fn issue(
         &ClientCredentialsMintRequest {
             scope,
             issuer: &issuer,
-            // The SUBJECT's subject, not the client's: an exchange issues a token for the
-            // identity the subject token represented, which is the entire point.
-            subject: &subject.subject,
+            local_subject: &subject.subject,
+            // Rebind the verified local principal to the receiving client's policy.
+            subject: &external_subject,
             // The machine identity's organization and roles (issue #126), resolved through the
             // ONE shared helper so all three doors that mint under a service-account principal
             // answer alike. `(None, None)` for a subject that is not one.
@@ -809,16 +826,56 @@ async fn revalidated(
     if !claims.is_access_token {
         return Err(TokenError::InvalidGrant);
     }
-    let subject = claims.sub.ok_or(TokenError::InvalidGrant)?;
+    let (subject, client_id) = stored_token_principal(state, scope, token)
+        .await
+        .ok_or(TokenError::InvalidGrant)?;
+    let expected = state
+        .resolve_grant_subject(scope, &client_id, &subject)
+        .await
+        .map_err(|_| TokenError::InvalidGrant)?;
+    if claims.sub.as_deref() != Some(expected.as_str())
+        || claims.client_id.as_deref() != Some(client_id.as_str())
+    {
+        return Err(TokenError::InvalidGrant);
+    }
     Ok(ValidatedToken {
         subject,
-        client_id: claims.client_id,
+        client_id: Some(client_id),
         scope: space_set(claims.scope.as_deref()),
         audience: claims.aud.into_iter().collect(),
         act: claims.act,
         // An ordinary access-token subject. Only the Native SSO redemption sets this.
         native_sso_bootstrap: false,
     })
+}
+
+/// Recover the local principal only from the scoped store after cryptographic
+/// revalidation. A wire `sub` can be pairwise and is never an authorization key.
+async fn stored_token_principal(
+    state: &OidcState,
+    scope: Scope,
+    token: &str,
+) -> Option<(String, String)> {
+    use crate::token_credential::{PresentedTokenKind, classify, peek_jti};
+    let repo = state.store().scoped(scope).authorization();
+    match classify(token) {
+        PresentedTokenKind::JwtAccess => {
+            let raw = peek_jti(token)?;
+            let id = ironauth_store::IssuedTokenId::parse_in_scope(&raw, &scope).ok()?;
+            let resolved = repo.resolve_access_token(&id).await.ok()??;
+            resolved
+                .active
+                .then_some((resolved.subject, resolved.client_id))
+        }
+        PresentedTokenKind::OpaqueAccess => {
+            let resolved = repo
+                .resolve_opaque_access_token(token, epoch_micros(state.now()))
+                .await
+                .ok()??;
+            Some((resolved.subject, resolved.client_id))
+        }
+        PresentedTokenKind::Refresh => None,
+    }
 }
 
 /// Revalidate the presented tokens, by whichever of the two shapes this request is.
@@ -933,23 +990,17 @@ async fn native_sso_subject(
         TokenError::InvalidGrant
     })?;
 
-    // The person. REDUNDANT BY CONSTRUCTION today and kept deliberately: both sides derive from
-    // the same `bindings.subject` at one mint -- the ROW keeps the local value and the TOKEN
-    // carries the public one -- and `ds_hash` already pins the token to this exact row, so
-    // nothing can currently reach it. Note which side is which: the row is written raw and only
-    // the token goes through `resolve_public_subject`, which is exactly why the comparison
-    // below applies that derivation rather than comparing the two strings directly. It is here against the divergence its own comment describes -- a
-    // per-client pairwise `sub` would make the two differ -- and a reviewer confirmed deleting
-    // it changes no test, which is what "redundant" means rather than a gap in coverage.
-    //
-    // The row records the LOCAL subject and the token carries the PUBLIC one, which
-    // are the same string today and are documented as free to diverge, so the comparison goes
-    // through the same derivation the mint used rather than comparing the two directly.
+    // The device-secret row retains the local user; compare the ID token against
+    // the identity issued to its ORIGINAL client before deriving one for a sibling.
     let token_subject = verified
         .claims()
         .subject()
         .ok_or(TokenError::InvalidGrant)?;
-    if token_subject != state.resolve_public_subject(&record.subject) {
+    let expected_subject = state
+        .resolve_registered_subject(scope, &record.issued_to_client_id, &record.subject)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
+    if token_subject != expected_subject {
         return Err(TokenError::InvalidGrant);
     }
 
@@ -1049,6 +1100,10 @@ async fn transaction_token(
     let agent =
         crate::token::gate_agent_issuance(state, scope, client_id_str, granted_scope).await?;
 
+    let external_subject = state
+        .resolve_grant_subject(scope, client_id_str, &subject.subject)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
     let response = crate::transaction_tokens::issue_transaction_token(
         state,
         scope,
@@ -1057,6 +1112,7 @@ async fn transaction_token(
             client_id,
             requester: client_id_str,
             subject: &subject.subject,
+            external_subject: &external_subject,
             authorization_context: &decision.scope,
             // The MODE and the actor chain. Delegation is the mode with no per-client policy
             // flag: its only accountability control is that `act` rides in the issued token, so

@@ -1326,6 +1326,14 @@ async fn build_admin_state(
     };
     match AdminState::new(store, env.clone(), &config.admin) {
         Ok(state) => {
+            let state = match shared_config::outbound_fetcher(ironauth_fetch::FetchLimits::default())
+            {
+                Ok(fetcher) => state.with_sector_fetcher(Arc::new(fetcher)),
+                Err(error) => {
+                    tracing::error!(%error, "client sector validation unavailable: TLS setup failed");
+                    state
+                }
+            };
             // The ONE data-plane issuer registry this plane reads signing keys through
             // (issue #414). Two installs need it, the compatibility wizard's
             // signable-algorithm resolution (issue #93) and the console credential
@@ -10041,8 +10049,12 @@ async fn sealed_backup_dump(
                 .to_string(),
         );
     };
+    // Preserve schema/table/column ACLs: the restored migration ledger means
+    // startup will not replay the GRANTs. Dropping privileges produces a valid
+    // dump that only the restore owner can use. Provision the named roles on
+    // the destination cluster before restoring; role credentials stay external.
     let dump = match std::process::Command::new(&pg_dump)
-        .args(["--no-owner", "--no-privileges", "--dbname", url])
+        .args(["--no-owner", "--dbname", url])
         .output()
     {
         Ok(output) if output.status.success() => output.stdout,

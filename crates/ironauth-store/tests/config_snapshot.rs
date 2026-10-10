@@ -608,3 +608,221 @@ async fn a_snapshot_exports_only_its_own_scope() {
         "no scope B client may appear in scope A's snapshot"
     );
 }
+
+async fn set_pairwise_policy(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    client: &ironauth_store::ClientId,
+    host: &str,
+) {
+    let current = db
+        .store()
+        .scoped(scope)
+        .clients()
+        .subject_policy(client)
+        .await
+        .unwrap();
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .clients()
+        .set_subject_policy(
+            env,
+            &current,
+            &ironauth_store::ClientSubjectPolicy::Pairwise {
+                sector_identifier: host.to_owned(),
+                sector_identifier_uri: Some(format!("https://{host}/sector.json")),
+            },
+            &[format!("https://{host}/z"), format!("https://{host}/a")],
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pairwise_snapshot_round_trips_without_runtime_identity_material() {
+    use ironauth_store::ClientSubjectPolicy;
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acting = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    let client = acting.clients().create(&env, "pairwise app").await.unwrap();
+    set_pairwise_policy(&db, &env, scope, &client, "sector.example.test").await;
+    let before = export_snapshot(&db.control_store().scoped(scope))
+        .await
+        .unwrap();
+    let bytes = before.to_canonical_bytes().unwrap();
+    assert_eq!(
+        before.resources.client[0].redirect_uris,
+        vec![
+            "https://sector.example.test/a",
+            "https://sector.example.test/z"
+        ]
+    );
+    assert_eq!(
+        validate_document(&bytes)
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap(),
+        bytes
+    );
+    assert!(matches!(
+        before.resources.client[0].subject_policy,
+        ClientSubjectPolicy::Pairwise { .. }
+    ));
+
+    let user = acting
+        .users()
+        .register(&env, "snapshot@example.test", "test-hash", None)
+        .await
+        .unwrap();
+    let identity = db
+        .store()
+        .scoped(scope)
+        .clients()
+        .subject_policy(&client)
+        .await
+        .unwrap();
+    let bound = "A".repeat(43);
+    acting
+        .clients()
+        .bind_subject(&env, &identity, &user, &bound)
+        .await
+        .unwrap();
+    acting.envelope().ensure_pairwise_salt(&env).await.unwrap();
+    let after = export_snapshot(&db.control_store().scoped(scope))
+        .await
+        .unwrap()
+        .to_canonical_bytes()
+        .unwrap();
+    assert_eq!(
+        bytes, after,
+        "salt and first user binding do not alter config exports"
+    );
+    let text = String::from_utf8(after).unwrap();
+    for forbidden in [
+        &bound,
+        &user.to_string(),
+        "subject_policy_revision",
+        "subject_policy_redirect_uris",
+        "client_subject_bindings",
+        "encrypted_secrets",
+    ] {
+        assert!(!text.contains(forbidden));
+    }
+
+    let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    legacy["resources"]["client"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("subject_policy");
+    assert_eq!(
+        validate_document(&serde_json::to_vec(&legacy).unwrap())
+            .unwrap()
+            .resources
+            .client[0]
+            .subject_policy,
+        ClientSubjectPolicy::Public
+    );
+}
+
+#[tokio::test]
+async fn snapshot_refuses_malformed_or_runtime_subject_policy_fields() {
+    use serde_json::json;
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "policy shape")
+        .await
+        .unwrap();
+    let snapshot = export_snapshot(&db.control_store().scoped(scope))
+        .await
+        .unwrap();
+    let mut value = serde_json::to_value(snapshot).unwrap();
+    for invalid in [
+        json!(null),
+        json!("pairwise"),
+        json!({"subject_type":"unknown"}),
+        json!({"subject_type":"pairwise"}),
+        json!({"subject_type":"pairwise","sector_identifier":""}),
+        json!({"subject_type":"pairwise","sector_identifier":"bad host"}),
+        json!({"subject_type":"pairwise","sector_identifier":"éxample.test"}),
+        json!({"subject_type":"pairwise","sector_identifier":"x".repeat(256)}),
+        json!({"subject_type":"pairwise","sector_identifier":"example.test","sector_identifier_uri":"http://example.test/sector"}),
+        json!({"subject_type":"pairwise","sector_identifier":"example.test","binding":"user-id"}),
+        json!({"subject_type":"public","sector_identifier":"example.test"}),
+        json!({"subject_type":"public","revision":1}),
+    ] {
+        value["resources"]["client"][0]["subject_policy"] = invalid;
+        let errors = validate_document(&serde_json::to_vec(&value).unwrap())
+            .expect_err("malformed policy refused");
+        assert!(
+            errors
+                .iter()
+                .any(|v| v.path == "/resources/client/0/subject_policy")
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_policy_edits_never_export_mixed_policy_and_redirects() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "concurrent export")
+        .await
+        .unwrap();
+    set_pairwise_policy(&db, &env, scope, &client, "first.example.test").await;
+    let writes = async {
+        for n in 0..16 {
+            set_pairwise_policy(
+                &db,
+                &env,
+                scope,
+                &client,
+                &format!("sector{n}.example.test"),
+            )
+            .await;
+        }
+    };
+    let reads = async {
+        for _ in 0..16 {
+            let snapshot = export_snapshot(&db.control_store().scoped(scope))
+                .await
+                .unwrap();
+            let client = &snapshot.resources.client[0];
+            let ironauth_store::ClientSubjectPolicy::Pairwise {
+                sector_identifier,
+                sector_identifier_uri,
+            } = &client.subject_policy
+            else {
+                panic!("pairwise policy")
+            };
+            assert_eq!(
+                sector_identifier_uri.as_deref(),
+                Some(format!("https://{sector_identifier}/sector.json").as_str())
+            );
+            assert_eq!(
+                client.redirect_uris,
+                vec![
+                    format!("https://{sector_identifier}/a"),
+                    format!("https://{sector_identifier}/z")
+                ]
+            );
+        }
+    };
+    tokio::join!(writes, reads);
+}

@@ -110,6 +110,7 @@ use crate::views::{
                                                   PATCH writes exactly one column, the \
                                                   permission-claim opt-in, and refuses to enable \
                                                   it on an `opaque` resource server"),
+        (name = "client-subjects", description = "Registered-client identity policy with revision-checked updates"),
         (name = "client-scopes", description = "The per-client OAuth SCOPE allowlist \
                                                 (issue #98): which scope tokens a \
                                                 machine grant (`client_credentials`, \
@@ -269,6 +270,12 @@ use crate::views::{
         crate::variables::get_variable,
         crate::variables::set_variable,
         crate::variables::delete_variable,
+        crate::client_subject_history::get_client_subject_history,
+        crate::client_subject_history::backfill_client_subject_history,
+        crate::client_subject_history::import_client_subject_history,
+        crate::client_subject_history::reconcile_client_subject_history,
+        crate::client_subjects::get_client_subject_policy,
+        crate::client_subjects::set_client_subject_policy,
         crate::client_scopes::get_client_allowed_scopes,
         crate::client_scopes::set_client_allowed_scopes,
         crate::resource_servers::list_resource_servers,
@@ -585,6 +592,15 @@ use crate::views::{
         crate::variables::VariableList,
         crate::variables::SetVariableRequest,
         crate::permissions::UpdatePermissionRequest,
+        crate::client_subject_history::ClientSubjectHistoryView,
+        crate::client_subject_history::BackfillClientSubjectHistoryRequest,
+        crate::client_subject_history::ClientSubjectHistoryPageView,
+        crate::client_subject_history::ImportClientSubjectHistoryRequest,
+        crate::client_subject_history::ClientSubjectHistoryImportView,
+        crate::client_subject_history::ReconcileClientSubjectHistoryRequest,
+        crate::client_subjects::SubjectType,
+        crate::client_subjects::ClientSubjectPolicyView,
+        crate::client_subjects::SetClientSubjectPolicyRequest,
         crate::client_scopes::ClientAllowedScopesView,
         crate::client_scopes::SetClientAllowedScopesRequest,
         crate::resource_servers::ResourceServerView,

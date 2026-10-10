@@ -1806,7 +1806,7 @@
         },
         "registration_rate_limit": {
           "default": 20,
-          "description": "The maximum number of registration requests one source (or one initial\naccess token) may make within `registration_rate_window_secs` (issue #31). A\nrequest beyond the limit is refused with a typed error and a\n`dcr.rate_limited` audit event. The default (20) is a conservative\nendpoint-local guard; set it to 0 to disable rate limiting (relying on the\nquota alone). This ships endpoint-local controls that later delegate to the\nM15 layered rate limiter.",
+          "description": "The maximum number of registration requests per source or initial access\ntoken, and authenticated metadata updates per scoped client, within\n`registration_rate_window_secs` (issues #31, #19). Updates consume a separate\nclient budget before outbound metadata fetches; registration-token rotation\ndoes not reset it. A request beyond the limit is refused with a typed error\nand a `dcr.rate_limited` audit event. The default is 20. Set to 0 to disable\nthese endpoint-local rate limits; the client-count quota still limits new\nregistrations but does not bound update traffic.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"

@@ -4088,13 +4088,14 @@ pub struct OidcConfig {
     /// legitimately hosts many self-service clients.
     pub registration_max_clients: u32,
 
-    /// The maximum number of registration requests one source (or one initial
-    /// access token) may make within `registration_rate_window_secs` (issue #31). A
-    /// request beyond the limit is refused with a typed error and a
-    /// `dcr.rate_limited` audit event. The default (20) is a conservative
-    /// endpoint-local guard; set it to 0 to disable rate limiting (relying on the
-    /// quota alone). This ships endpoint-local controls that later delegate to the
-    /// M15 layered rate limiter.
+    /// The maximum number of registration requests per source or initial access
+    /// token, and authenticated metadata updates per scoped client, within
+    /// `registration_rate_window_secs` (issues #31, #19). Updates consume a separate
+    /// client budget before outbound metadata fetches; registration-token rotation
+    /// does not reset it. A request beyond the limit is refused with a typed error
+    /// and a `dcr.rate_limited` audit event. The default is 20. Set to 0 to disable
+    /// these endpoint-local rate limits; the client-count quota still limits new
+    /// registrations but does not bound update traffic.
     pub registration_rate_limit: u32,
 
     /// The fixed rate-limit window in seconds for `registration_rate_limit` (issue

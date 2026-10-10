@@ -917,3 +917,32 @@ async fn the_ciba_grant_runs_the_hook() {
          is a way around a deployed hook: {claims}"
     );
 }
+
+#[tokio::test]
+async fn pairwise_ciba_approval_issues_the_registered_client_identity() {
+    let (h, client) = ciba_harness().await;
+    common::pairwise::configure(&h, h.client_id(), "ciba.example.test").await;
+    let (request, user) = start_request(&h, &client).await;
+    approve(&h, &request, &user).await;
+    pace(&h);
+    let (status, body) = redeem(&h, &request, &client).await;
+    assert_eq!(status, StatusCode::OK);
+    let expected = h
+        .state()
+        .resolve_registered_subject(h.scope(), &client, &user)
+        .await
+        .unwrap();
+    assert_ne!(expected, user);
+    for (field, policy) in [
+        ("id_token", h.id_token_policy(&client)),
+        ("access_token", h.access_token_policy(&client)),
+    ] {
+        let verified = verify(
+            body[field].as_str().unwrap(),
+            &policy,
+            &common::verify_clock(),
+        )
+        .unwrap();
+        assert_eq!(verified.claims().subject(), Some(expected.as_str()));
+    }
+}

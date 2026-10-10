@@ -115,6 +115,16 @@ impl ClientKeyResolver {
         }
     }
 
+    /// Use the same hardened network boundary for sector documents. The test-only
+    /// HTTP JWKS option does not relax sector validation's HTTPS requirement.
+    pub(crate) async fn pairwise_sector(
+        &self,
+        uri: &str,
+        redirects: &[String],
+    ) -> Result<String, crate::SectorError> {
+        crate::resolve_pairwise_sector(&self.fetcher, Some(uri), redirects).await
+    }
+
     /// How long a successful resolution is cached.
     ///
     /// Exposed so the BOOT path can be asserted to have passed the configured

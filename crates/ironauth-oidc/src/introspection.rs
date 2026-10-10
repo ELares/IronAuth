@@ -651,6 +651,11 @@ async fn resolve_opaque(
         .resolve_opaque_access_token(token, epoch_micros(state))
         .await
         .ok()??;
+    // The resolved row contains the local grant principal, not a wire identifier.
+    let external_subject = state
+        .resolve_grant_subject(scope, &active.client_id, &active.subject)
+        .await
+        .ok()?;
     Some(IntrospectionClaims {
         active: true,
         // An opaque token carries no claims, so no chain is observable; an exchange from
@@ -661,7 +666,7 @@ async fn resolve_opaque(
         client_id: Some(active.client_id.clone()),
         // The opaque row stores the LOCAL subject; derive the public sub through the
         // ONE shared function so it is byte-identical to the ID token's / UserInfo's.
-        sub: Some(state.resolve_public_subject(&active.subject)),
+        sub: Some(external_subject),
         is_access_token: true,
         exp: Some(active.expires_at_unix_micros.div_euclid(1_000_000)),
         iat: Some(active.issued_at_unix_micros.div_euclid(1_000_000)),
@@ -714,7 +719,12 @@ async fn resolve_refresh(
         authorization_details: None,
         scope: resolution.scope.clone(),
         client_id: Some(resolution.client_id.clone()),
-        sub: Some(state.resolve_public_subject(&resolution.subject)),
+        sub: Some(
+            state
+                .resolve_registered_subject(scope, &resolution.client_id, &resolution.subject)
+                .await
+                .ok()?,
+        ),
         // A refresh token carries no RFC 6749 5.1 token type and no audience.
         is_access_token: false,
         exp: Some(resolution.idle_expires_at_unix_micros.div_euclid(1_000_000)),

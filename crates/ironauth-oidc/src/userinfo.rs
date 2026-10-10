@@ -16,7 +16,7 @@
 //!   (a query token) is a `400` `invalid_request`.
 //! - **`sub` is byte-identical to the ID token's.** `UserInfo` resolves the token to
 //!   its local subject and derives `sub` through the ONE shared subject function
-//!   ([`OidcState::resolve_public_subject`]), the same call the ID token used, so
+//!   ([`OidcState::resolve_registered_subject`]), the same call the ID token used, so
 //!   the two can never diverge (including for pairwise subjects when they land).
 //! - **CORS for registered SPA origins, on this endpoint ONLY.** A browser SPA
 //!   calling `UserInfo` cross-origin needs CORS; the authorization endpoint never
@@ -230,8 +230,11 @@ async fn resolve(
 
     // sub is ALWAYS present and derived through the ONE shared subject function,
     // exactly as the ID token derived it, so the two are byte-identical (including
-    // pairwise, once it lands). It can never be shadowed by stored claim data.
-    let sub = state.resolve_public_subject(&resolution.subject);
+    // persisted pairwise policy). It can never be shadowed by stored claim data.
+    let sub = state
+        .resolve_registered_subject(scope, &resolution.client_id, &resolution.subject)
+        .await
+        .map_err(|_| UserInfoError::ServerError)?;
     released.insert("sub".to_owned(), Value::String(sub));
 
     Ok((released, resolution.client_id, scope))
@@ -418,7 +421,10 @@ async fn resolve_opaque(
     // sub is derived through the ONE shared subject function from the resolved LOCAL
     // subject, byte-identical to the ID token's (the opaque row stores the usr_
     // subject, never the public sub), and can never be shadowed by stored claim data.
-    let sub = state.resolve_public_subject(&active.subject);
+    let sub = state
+        .resolve_registered_subject(scope, &active.client_id, &active.subject)
+        .await
+        .map_err(|_| UserInfoError::ServerError)?;
     released.insert("sub".to_owned(), Value::String(sub));
 
     Ok((released, active.client_id, scope))

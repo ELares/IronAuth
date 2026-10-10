@@ -118,10 +118,15 @@ The claims mapper runs against the **session's** attributes, not the user's prof
 
 | claim | what it is |
 |---|---|
-| `sub` | the authenticated subject |
+| `sub` | the local authenticated account ID; OIDC client pairwise policies do not apply |
 | `sid` | a per-template, one-way reference to the session, never the session id |
 | `auth_time` | when the subject authenticated |
 | `amr` | the recorded authentication methods |
+
+A template is a separate credential profile, with its own audience and signing keys.
+Its subject identifies the local account even when an OIDC client uses a pairwise
+identifier for that account. Consider that disclosure before configuring a template
+for an external service; matching an audience to a client ID does not adopt its policy.
 
 Two things about `sid` are worth stating outright. It is **not the session id**: the session id is
 the cookie value, a bearer credential, and a token that travels to a third party must never carry

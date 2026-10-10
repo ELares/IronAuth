@@ -674,3 +674,82 @@ async fn a_fenced_user_mints_no_front_channel_id_token() {
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn pairwise_implicit_id_token_uses_the_registered_client_identity() {
+    let h = Harness::start_store_backed_with(legacy_enabled()).await;
+    common::pairwise::configure(&h, h.client_id(), "implicit.example.test").await;
+    let client = h.client_id().to_string();
+    let (user, cookie) = consenting_subject(&h, &client).await;
+    let (status, headers, _) = h
+        .authorize_with_cookie(
+            &front_channel_query("id_token", &client, "pairwise-implicit"),
+            &cookie,
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let token = location_fragment_param(&headers, "id_token").expect("implicit token");
+    let claims = verified_claims(&h, &client, &token);
+    let expected = h
+        .state()
+        .resolve_registered_subject(h.scope(), &client, &user)
+        .await
+        .unwrap();
+    assert_ne!(expected, user);
+    assert_eq!(claims["sub"], expected);
+}
+
+#[tokio::test]
+async fn pairwise_front_channel_tokens_name_the_impersonator_for_this_client() {
+    let h = Harness::start_store_backed_with(legacy_enabled()).await;
+    common::pairwise::configure(&h, h.client_id(), "implicit-actor.example.test").await;
+    let client = h.client_id().to_string();
+    let user = h.seed_unique_user().await;
+    let actor = h.seed_unique_user().await;
+    h.grant_consent(&user, &client).await;
+    let (_, cookie) = common::pairwise::impersonated_session(&h, &user, &actor).await;
+    let expected = h
+        .state()
+        .resolve_registered_subject(h.scope(), &client, &actor)
+        .await
+        .unwrap();
+    assert_ne!(expected, actor);
+    for response_type in ["id_token", "code id_token"] {
+        let (status, headers, _) = h
+            .authorize_with_cookie(
+                &front_channel_query(response_type, &client, "pairwise-actor"),
+                &cookie,
+            )
+            .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let token = location_fragment_param(&headers, "id_token").expect("front-channel token");
+        let claims = verified_claims(&h, &client, &token);
+        assert_eq!(claims["act"]["sub"], expected);
+    }
+}
+
+#[tokio::test]
+async fn session_ending_during_sid_assignment_cannot_lose_its_actor_and_mint() {
+    let h = Harness::start_store_backed_with(legacy_enabled()).await;
+    let client = h.client_id().to_string();
+    let user = h.seed_unique_user().await;
+    let actor = h.seed_unique_user().await;
+    h.grant_consent(&user, &client).await;
+    let (_, cookie) = common::pairwise::impersonated_session(&h, &user, &actor).await;
+    // End the session between ensure_sid's live-row check and the actor read.
+    // A security-definer fixture trigger models this interleaving deterministically.
+    sqlx::raw_sql("CREATE FUNCTION test_end_after_sid() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$ BEGIN UPDATE sessions SET ended_at = now() WHERE id = NEW.session_id; RETURN NEW; END $$; CREATE TRIGGER test_end_after_sid AFTER INSERT ON client_sessions FOR EACH ROW EXECUTE FUNCTION test_end_after_sid();")
+        .execute(h.db().owner_pool()).await.unwrap();
+    let (status, headers, _) = h
+        .authorize_with_cookie(
+            &front_channel_query("id_token", &client, "ended-actor"),
+            &cookie,
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(location_fragment_param(&headers, "id_token").is_none());
+    assert_eq!(
+        location_fragment_param(&headers, "error").as_deref(),
+        Some("server_error")
+    );
+}

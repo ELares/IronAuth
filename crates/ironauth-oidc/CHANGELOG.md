@@ -6,6 +6,16 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Reject dynamic-registration updates that enable pairwise for a legacy client with unresolved identity history (#19). Refuse before sector fetching or credential rotation, after applying the saved registration policy chain. New pairwise registrations and legacy public updates remain supported.
+
+- Expose the shared pure sector-host inference helper for management configuration so DCR and management use the same hostname rule (#19).
+
+- Support public/pairwise subject metadata in dynamic registration and replacement updates (#19). Validate explicit sector documents through hardened HTTPS, preserve existing issued identities, reject stale concurrent edits, and rate-limit authenticated updates by scoped client before outbound fetches. This integration is not yet deployed; management and historical identity rollout remain pending.
+
+- Apply client identity policy to user impersonators in code/refresh, device, implicit/hybrid and FedCM tokens while retaining local actor IDs in session/family storage (#19). Refuse blocked local user actors and missing or unreadable session actor data instead of dropping the impersonation claim. Check legacy device-grant account eligibility before deriving an identity.
+
+- Apply persisted client identities to code/refresh, UserInfo/introspection, device/CIBA, implicit/FedCM, native SSO, recipient proof, mapped user assertions and token exchange (#19). Keep local account IDs for access rules, lifecycle checks and stored grants; exchanges emit the receiving client's subject and actor identifiers. Registration remains disabled pending the remaining integration and rollout work.
+
 - Resolve pairwise sector hostnames independently of network ports and DNS case (#19). Require an explicit sector document for mixed hosts, hostless native redirects or an empty redirect set; validate supplied documents through the hardened fetcher even for single-host clients. Registration/token wiring remains pending.
 
 - Keep a validated application return available when the hosted profile session expires (#1385).

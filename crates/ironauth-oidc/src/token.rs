@@ -1564,13 +1564,9 @@ pub(crate) async fn resolve_workload_org_and_roles(
 ///
 /// `subject` must be the LOCAL user id the grant recorded, never the public subject
 /// the token carries: resolution is a store read keyed by the real user, and a
-/// pairwise `sub` names no `users` row. The two are the same string TODAY only
-/// because [`OidcState::resolve_public_subject`] hard-codes the public subject type
-/// while per-client pairwise configuration is unpersisted client-registration state
-/// (issue #19). Both call sites therefore resolve roles BEFORE deriving the public
-/// subject, so there is no `subject` binding in scope to pass here by mistake; the
-/// issue that persists the pairwise configuration must keep it that way, or every
-/// pairwise client with an organization context starts failing closed at the mint.
+/// pairwise `sub` names no `users` row. Both call sites resolve roles BEFORE
+/// deriving the client-facing subject, so there is no external `subject` binding
+/// in scope to accidentally use as an authorization key.
 ///
 /// Returns [`None`] when there is no organization context, symmetric with `org_id`: a
 /// role is org-scoped, so with no org there is no set to resolve and the claim is
@@ -1898,10 +1894,12 @@ async fn mint_tokens(
     let issuer = state.issuer_for(&scope);
     // Resolve the `sub` through the ONE shared subject-derivation function, so the
     // ID token's subject can never diverge from what `UserInfo`/introspection would
-    // return for the same client and user (OIDC Core 8.1). Public today; the
-    // per-client pairwise configuration is client-registration state a later issue
-    // persists (see OidcState::resolve_public_subject).
-    let subject = state.resolve_public_subject(&bindings.subject);
+    // return for the same client and user (OIDC Core 8.1). The durable binding
+    // preserves an already-issued identity across policy changes and restarts.
+    let subject = state
+        .resolve_registered_subject(scope, &bindings.client_id, &bindings.subject)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
 
     // NATIVE SSO (issue #133, PROTOTYPE): mint the device secret BEFORE the ID token, because
     // the token has to carry its hash. Three conditions, all required:
@@ -1926,6 +1924,20 @@ async fn mint_tokens(
     // the RFC 8707 resource indicators by the caller (issue #28/#29). No resource
     // resolves to the environment default (the client id as audience), keeping the
     // existing at+jwt/UserInfo behavior intact.
+    let actor = tokens::client_token_actor(
+        state,
+        scope,
+        &bindings.client_id,
+        session
+            .impersonation
+            .as_ref()
+            .map(|imp| tokens::TokenActor {
+                subject: &imp.impersonator,
+                reason_code: &imp.reason_code,
+            }),
+    )
+    .await
+    .map_err(map_store_error)?;
     let minted = tokens::mint(
         state,
         signer,
@@ -1937,15 +1949,10 @@ async fn mint_tokens(
             // The `act` claim comes from the SESSION, never from the request (issue #101).
             // It rides the same read that proved the session live, so a token cannot claim
             // an impersonation the liveness check did not agree with.
-            actor: session
-                .impersonation
-                .as_ref()
-                .map(|imp| tokens::TokenActor {
-                    subject: &imp.impersonator,
-                    reason_code: &imp.reason_code,
-                }),
+            actor: actor.as_ref().map(tokens::ClientTokenActor::as_token_actor),
             scope,
             issuer: &issuer,
+            local_subject: &bindings.subject,
             subject: &subject,
             client_id: &bindings.client_id,
             nonce: bindings.nonce.as_deref(),
@@ -3063,7 +3070,10 @@ async fn mint_refresh_access(
     let entry = grant_issuer_entry(state, scope).await?;
     let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
     let issuer = state.issuer_for(&scope);
-    let subject = state.resolve_public_subject(&resolution.subject);
+    let subject = state
+        .resolve_registered_subject(scope, &resolution.client_id, &resolution.subject)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
     // The client's declarative mapping (issue #113 criterion 4), applied on REFRESH as well as
     // on the code exchange, and that is not symmetry for its own sake. Refresh is the
     // highest-volume grant, so a mapping that only shaped the code exchange would be bypassed by
@@ -3099,6 +3109,20 @@ async fn mint_refresh_access(
         &mut extra_claims,
     )
     .await?;
+    let actor = tokens::client_token_actor(
+        state,
+        scope,
+        &resolution.client_id,
+        resolution
+            .impersonation
+            .as_ref()
+            .map(|imp| tokens::TokenActor {
+                subject: &imp.impersonator,
+                reason_code: &imp.reason_code,
+            }),
+    )
+    .await
+    .map_err(map_store_error)?;
     let minted = tokens::mint_access_token(
         state,
         signer,
@@ -3111,15 +3135,10 @@ async fn mint_refresh_access(
             // the family was minted. The bound checked earlier means a family past its cap
             // never reaches here, so a token carrying this claim is one the impersonation
             // still authorizes.
-            actor: resolution
-                .impersonation
-                .as_ref()
-                .map(|imp| tokens::TokenActor {
-                    subject: &imp.impersonator,
-                    reason_code: &imp.reason_code,
-                }),
+            actor: actor.as_ref().map(tokens::ClientTokenActor::as_token_actor),
             scope,
             issuer: &issuer,
+            local_subject: &resolution.subject,
             subject: &subject,
             client_id: &resolution.client_id,
             nonce: None,

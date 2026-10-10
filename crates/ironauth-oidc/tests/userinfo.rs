@@ -129,6 +129,13 @@ async fn a_client_registered_for_signed_userinfo_receives_a_signed_jwt() {
         .await
         .expect("DCR fixture origin");
     // A client registered for the signed form.
+    let identity = harness
+        .store()
+        .scoped(harness.scope())
+        .clients()
+        .subject_policy(harness.client_id())
+        .await
+        .unwrap();
     let (actor, corr) = harness.seeding_actor();
     harness
         .store()
@@ -139,6 +146,9 @@ async fn a_client_registered_for_signed_userinfo_receives_a_signed_jwt() {
             harness.env(),
             harness.client_id(),
             ironauth_store::DynamicClientUpdate {
+                subject_policy: &ironauth_store::ClientSubjectPolicy::Public,
+                expected_subject_policy_revision: identity.revision,
+                expected_registration_access_token_hash: None,
                 display_name: "signed userinfo",
                 auth_method: "none",
                 redirect_uris: &[REDIRECT_URI.to_owned()],

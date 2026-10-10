@@ -1489,7 +1489,9 @@ async fn resolve_front_channel_sid(
     // read that the code-exchange path gets for free, and the alternative is worse: an
     // implicit or hybrid ID token minted for an impersonated session with no `act` is an
     // audit hole on exactly the flows where the token goes straight to the browser.
-    let impersonation = tokens::session_actor(state, scope, &session_id, now_micros).await;
+    let impersonation = tokens::session_actor(state, scope, &session_id, now_micros)
+        .await
+        .map_err(|_| ())?;
     Ok(FrontChannelSession { sid, impersonation })
 }
 
@@ -1524,8 +1526,11 @@ async fn mint_front_channel_id_token(
     // The `sub` is resolved through the ONE shared derivation, so a front-channel
     // ID token's subject can never diverge from what the token endpoint or UserInfo
     // returns for the same client and user.
-    let subject = state.resolve_public_subject(resolved.subject);
     let client_id_str = client_id.to_string();
+    let subject = state
+        .resolve_registered_subject(scope, &client_id_str, resolved.subject)
+        .await
+        .map_err(|_| ())?;
     // The per-client `sid` (issue #32), resolved from the SAME authenticating SSO
     // session and through the SAME (client, session) row the token endpoint uses, so an
     // implicit/hybrid ID token carries the SAME sid the code flow would issue for this
@@ -1572,21 +1577,30 @@ async fn mint_front_channel_id_token(
     )
     .await
     .map_err(|_| ())?;
-    let request = MintRequest {
-        // No RFC 9396 details on this door (issue #131 criterion 4): only the CIBA grant
-        // carries an approved document today.
-        authorization_details: None,
-        // From the SESSION, never the request (issue #101), so an implicit or hybrid ID
-        // token names the impersonator exactly when the code-exchange path would.
-        actor: session
+    let actor = tokens::client_token_actor(
+        state,
+        scope,
+        &client_id_str,
+        session
             .impersonation
             .as_ref()
             .map(|imp| tokens::TokenActor {
                 subject: &imp.impersonator,
                 reason_code: &imp.reason_code,
             }),
+    )
+    .await
+    .map_err(|_| ())?;
+    let request = MintRequest {
+        // No RFC 9396 details on this door (issue #131 criterion 4): only the CIBA grant
+        // carries an approved document today.
+        authorization_details: None,
+        // From the SESSION, never the request (issue #101), so an implicit or hybrid ID
+        // token names the impersonator exactly when the code-exchange path would.
+        actor: actor.as_ref().map(tokens::ClientTokenActor::as_token_actor),
         scope,
         issuer: iss,
+        local_subject: resolved.subject,
         subject: &subject,
         client_id: &client_id_str,
         nonce: resolved.nonce,

@@ -6,6 +6,8 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Document that the registration rate/window settings also bound authenticated client metadata updates before fetching, independently of registration-token rotation (#19). A zero limit explicitly disables both registration and update rate controls.
+
 - Add independent default-off password-recovery SMTP settings, shared strict TLS relay validation and complete secret-reference lint coverage (#1479).
 
 - Add default-off subject-bound recipient verification settings with strict TLS relay validation and redacted username/password secret references (#1475).

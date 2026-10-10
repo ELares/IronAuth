@@ -7,6 +7,11 @@
 //! ordinary session cookie and receives a JWT that a service mesh, a third-party API, or an edge
 //! worker verifies against the template's own published JWKS with NO database call.
 //!
+//! This is an independent credential profile, not an OIDC client token. Its `sub`
+//! remains the local account ID under the template's dedicated key and audience.
+//! A registered client's pairwise policy does not govern a named template. Operators
+//! must account for this disclosure when configuring templates for external services.
+//!
 //! # The bound is the feature
 //!
 //! Verifying without a database call means the underlying session's revocation cannot reach a

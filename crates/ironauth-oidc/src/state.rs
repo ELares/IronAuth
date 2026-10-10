@@ -2993,10 +2993,9 @@ impl OidcState {
     /// Resolve an end user's `sub` for a client through the ONE shared derivation
     /// function ([`crate::resolve_subject`]), memoized.
     ///
-    /// This is the single call every token surface uses, so the ID token,
-    /// `UserInfo`, and future introspection responses cannot return a different
-    /// `sub` for the same client and user. `config` selects public or pairwise;
-    /// `salt` is the environment's pairwise salt (ignored for a public subject).
+    /// This pure derivation does not load registration or preserve issued bindings.
+    /// Registered-user protocol paths use `resolve_registered_subject`, which
+    /// selects persisted policy and salt before calling this shared primitive.
     #[must_use]
     pub fn resolve_subject(
         &self,
@@ -3007,12 +3006,9 @@ impl OidcState {
         self.inner.subjects.resolve(config, local_subject, salt)
     }
 
-    /// Resolve a PUBLIC `sub` (the local account identifier) through the shared
-    /// derivation. The per-client pairwise configuration (subject type, sector
-    /// identifier, and the environment salt) is client-registration state that a
-    /// later issue persists; until then the data-plane token path resolves public
-    /// subjects, still routed through the one shared function so the wiring cannot
-    /// diverge when pairwise registration lands.
+    /// Resolve a known-PUBLIC `sub` through the shared pure derivation. This
+    /// bypasses client policy; registered-user protocol paths must instead use
+    /// `resolve_registered_subject` to select durable policy and bindings.
     #[must_use]
     pub fn resolve_public_subject(&self, local_subject: &str) -> String {
         // A public subject never consults the salt, so an empty one is correct
@@ -3022,6 +3018,89 @@ impl OidcState {
             local_subject,
             &PairwiseSalt::new(Vec::new()),
         )
+    }
+
+    /// Derive a client-facing identifier for a trusted stored grant principal.
+    /// User identities follow client policy; existing workload mappings retain
+    /// their principal. Callers must separately enforce lifecycle/authorization.
+    ///
+    /// # Errors
+    /// Refuses foreign user IDs and any failure to resolve a user's binding.
+    pub(crate) async fn resolve_grant_subject(
+        &self,
+        scope: Scope,
+        client_id: &str,
+        local_subject: &str,
+    ) -> Result<String, ironauth_store::StoreError> {
+        if ironauth_store::UserId::parse_declared_scope(local_subject).is_ok() {
+            self.resolve_registered_subject(scope, client_id, local_subject)
+                .await
+        } else {
+            Ok(local_subject.to_owned())
+        }
+    }
+
+    /// Resolve a registered user's client-facing identity from durable policy,
+    /// salt and immutable bindings. Local IDs remain the authorization keys.
+    /// This does not authorize a grant or replace user lifecycle validation.
+    ///
+    /// # Errors
+    /// Refuses foreign/malformed IDs, unreadable identity material and repeated
+    /// policy races. Never falls back from pairwise to a public identifier.
+    pub async fn resolve_registered_subject(
+        &self,
+        scope: Scope,
+        client_id: &str,
+        local_subject: &str,
+    ) -> Result<String, ironauth_store::StoreError> {
+        use ironauth_store::{
+            CimdClientId, ClientSubjectPolicy, StoreError, StoredClientId, UserId,
+        };
+        let user = UserId::parse_in_scope(local_subject, &scope)?;
+        // CIMD clients are independently authenticated URL metadata, not rows in
+        // the registered-client policy table. Their existing public policy stays
+        // public; a malformed or foreign client ID never takes this branch.
+        if CimdClientId::parse_in_scope(client_id, &scope).is_ok() {
+            return Ok(self.resolve_public_subject(local_subject));
+        }
+        let client = ClientId::parse_in_scope(client_id, &scope)?;
+        let reader = self.store().scoped(scope).clients();
+        let actor = crate::util::client_service_actor(StoredClientId::Registered(&client));
+        // Bounded retries cover a validation/first-issuance race. A previously
+        // bound value wins even after policy changes, on every process/replica.
+        for _ in 0..3 {
+            if let Some(bound) = reader.subject_binding(&client, &user).await? {
+                return Ok(bound);
+            }
+            let snapshot = reader.subject_policy(&client).await?;
+            let acting = self
+                .store()
+                .scoped(scope)
+                .acting(actor, CorrelationId::generate(self.env()));
+            let candidate = match &snapshot.policy {
+                ClientSubjectPolicy::Public => self.resolve_public_subject(local_subject),
+                ClientSubjectPolicy::Pairwise {
+                    sector_identifier, ..
+                } => {
+                    let material = acting.envelope().ensure_pairwise_salt(self.env()).await?;
+                    self.resolve_subject(
+                        &SubjectConfig::pairwise(sector_identifier),
+                        local_subject,
+                        &PairwiseSalt::new(material.as_bytes().to_vec()),
+                    )
+                }
+            };
+            match acting
+                .clients()
+                .bind_subject(self.env(), &snapshot, &user, &candidate)
+                .await
+            {
+                Ok(bound) => return Ok(bound),
+                Err(StoreError::Conflict) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(StoreError::Conflict)
     }
 
     /// The data-plane store.
@@ -3628,9 +3707,9 @@ impl OidcState {
         self.inner.registration_max_clients
     }
 
-    /// The endpoint-local registration rate limit (issue #31): the maximum number
-    /// of registration requests one source (or one initial access token) may make
-    /// within [`OidcState::registration_rate_window`]. 0 disables rate limiting.
+    /// The endpoint-local rate limit for registrations per source/initial token
+    /// and metadata updates per scoped client (issues #31, #19), within
+    /// [`OidcState::registration_rate_window`]. 0 disables these rate limits.
     #[must_use]
     pub fn registration_rate_limit(&self) -> u32 {
         self.inner.registration_rate_limit

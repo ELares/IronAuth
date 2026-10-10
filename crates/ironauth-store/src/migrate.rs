@@ -2110,6 +2110,36 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0250_password_reset_no_delete.sql"),
         },
+        Migration {
+            version: 251,
+            name: "client_subject_identity",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0251_client_subject_identity.sql"),
+        },
+        Migration {
+            version: 252,
+            name: "client_subject_policy_control",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0252_client_subject_policy_control.sql"),
+        },
+        Migration {
+            version: 253,
+            name: "client_subject_history_guard",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0253_client_subject_history_guard.sql"),
+        },
+        Migration {
+            version: 254,
+            name: "client_subject_reconciliation",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0254_client_subject_reconciliation.sql"),
+        },
+        Migration {
+            version: 255,
+            name: "grants_client_history_index",
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0255_grants_client_history_index.sql"),
+        },
     ]
 }
 

@@ -448,6 +448,7 @@ async fn the_use_mtls_endpoint_aliases_declaration_is_stored() {
         .register_dynamic(
             h.env(),
             ironauth_store::NewDynamicClient {
+                subject_policy: &ironauth_store::ClientSubjectPolicy::Public,
                 display_name: "declaring client",
                 auth_method: "none",
                 secret_hash: None,

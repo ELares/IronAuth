@@ -6,6 +6,12 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- Expose scoped identity-history coverage, bounded backfill, roster import and reconciliation PUT endpoints (#19). Require config authority, fresh privilege and current revision; bind cursors to the client and revision. Document external completeness as an operator attestation, not a server-verified fact.
+
+- Report `history_ready` on client subject-policy reads and reject legacy pairwise activation with an actionable 409 before sector fetching (#19). The policy endpoint cannot mark history reconciled; public policy remains available.
+
+- Add scoped GET/PUT client subject-policy endpoints with required revision checks, management read/write permissions and fresh-privilege enforcement (#19). Validate explicit sectors through hardened HTTPS, preserve existing bindings, and return 503 when validation is unavailable.
+
 - Require deployment-operator credentials for offline advisory imports because the accepted projection is deployment-wide; environment-scoped keys remain eligible for permission-checked reads.
 - Publish `security_advisory.imported` atomically with an offline verified projection replacement. The importing scope receives aggregate counts with explicit deployment-wide projection semantics; no advisory content enters the event (#1475 gate repair).
 

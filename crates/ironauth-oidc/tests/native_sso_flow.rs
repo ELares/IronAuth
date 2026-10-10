@@ -530,3 +530,59 @@ async fn an_id_token_subject_with_an_access_token_actor_is_not_a_pair() {
         "an ID-token subject is admitted ONLY beside a device-secret actor: {response}"
     );
 }
+
+#[tokio::test]
+async fn pairwise_native_sso_validates_source_binding_and_issues_sibling_identity() {
+    let mut h = Harness::start_store_backed().await;
+    h.install_native_sso();
+    let (source, secret) = family_app(&h).await;
+    let (target, target_secret) = family_app(&h).await;
+    common::pairwise::configure(&h, &source, "native-source.example.test").await;
+    common::pairwise::configure(&h, &target, "native-target.example.test").await;
+    let user = h.seed_unique_user().await;
+    let (status, body) = sign_in_as(
+        &h,
+        &source,
+        &secret,
+        &user,
+        &format!("openid profile {DEVICE_SSO}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let issued = json(&body);
+    let id_token = issued["id_token"].as_str().unwrap();
+    let original = ironauth_jose::verify(
+        id_token,
+        &h.id_token_policy(&source.to_string()),
+        &common::verify_clock(),
+    )
+    .unwrap();
+    let (status, body) = present_pair(
+        &h,
+        &target,
+        &target_secret,
+        id_token,
+        issued["device_secret"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "valid pairwise native SSO pair refused"
+    );
+    let exchanged = json(&body);
+    let verified = ironauth_jose::verify(
+        exchanged["access_token"].as_str().unwrap(),
+        &h.access_token_policy(&target.to_string()),
+        &common::verify_clock(),
+    )
+    .unwrap();
+    let expected = h
+        .state()
+        .resolve_registered_subject(h.scope(), &target.to_string(), &user)
+        .await
+        .unwrap();
+    assert_ne!(Some(expected.as_str()), original.claims().subject());
+    assert_ne!(expected, user);
+    assert_eq!(verified.claims().subject(), Some(expected.as_str()));
+}

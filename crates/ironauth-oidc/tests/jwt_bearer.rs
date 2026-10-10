@@ -4289,3 +4289,39 @@ async fn every_ordinary_jwt_bearer_refusal_still_fires_on_an_id_jag() {
     assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
     assert_refused_because(&h, &client_id, "assertion_subject_unmapped").await;
 }
+
+#[tokio::test]
+async fn pairwise_asserted_human_identity_preserves_workload_subjects() {
+    let h = Harness::start_store_backed().await;
+    let (client, user) = seed_user_and_workload_trust(&h, "pairwise-mapped@example.test").await;
+    common::pairwise::configure(&h, h.client_id(), "asserted.example.test").await;
+    let expected = h
+        .state()
+        .resolve_registered_subject(h.scope(), &client, &user)
+        .await
+        .unwrap();
+    assert_ne!(expected, user);
+    for (external, expected_subject, jti) in [
+        (EXTERNAL_HUMAN_SUBJECT, expected.as_str(), "pairwise-human"),
+        (EXTERNAL_SUBJECT, MAPPED_PRINCIPAL, "pairwise-workload"),
+    ] {
+        let assertion = assertion(
+            &issuer_key(),
+            EXTERNAL_ISSUER,
+            external,
+            h.issuer(),
+            3600,
+            jti,
+        );
+        let (status, _, body) = present(&h, &client, &assertion).await;
+        assert_eq!(status, StatusCode::OK);
+        let issued = json(&body);
+        let verified = ironauth_jose::verify(
+            issued["access_token"].as_str().unwrap(),
+            &h.access_token_policy(&client),
+            &common::verify_clock(),
+        )
+        .unwrap();
+        assert_eq!(verified.claims().subject(), Some(expected_subject));
+    }
+}

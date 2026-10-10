@@ -1553,3 +1553,79 @@ async fn plant_impersonation(harness: &Harness, subject: &str, window: &str) {
         "exactly one live session belongs to this subject, so the plant is unambiguous"
     );
 }
+
+#[tokio::test]
+async fn pairwise_impersonation_code_and_refresh_keep_actor_local_in_storage() {
+    let h = Harness::start_store_backed().await;
+    common::pairwise::configure(&h, h.client_id(), "impersonation.example.test").await;
+    let client = h.client_id().to_string();
+    let user = h.seed_unique_user().await;
+    let actor = h.seed_unique_user().await;
+    h.grant_consent(&user, &client).await;
+    let (session, cookie) = common::pairwise::impersonated_session(&h, &user, &actor).await;
+    let code = authorize_to_code(&h, &client, &[], &cookie).await;
+    let (id, access, family_token) = exchange(&h, &client, &code).await;
+    let expected_user = h
+        .state()
+        .resolve_registered_subject(h.scope(), &client, &user)
+        .await
+        .unwrap();
+    let expected_actor = h
+        .state()
+        .resolve_registered_subject(h.scope(), &client, &actor)
+        .await
+        .unwrap();
+    assert_ne!(expected_actor, actor);
+    assert_ne!(expected_user, user);
+    let (refreshed, _) = refresh(&h, &client, &family_token).await;
+    for claims in [id, access, refreshed] {
+        assert_eq!(claims["sub"], expected_user);
+        assert_eq!(
+            claims["act"],
+            serde_json::json!({"sub":expected_actor,"reason_code":"support_ticket"})
+        );
+        assert!(!claims.to_string().contains("Private test justification"));
+    }
+    let stored: String = sqlx::query_scalar("SELECT impersonator FROM sessions WHERE id = $1")
+        .bind(session.to_string())
+        .fetch_one(h.db().owner_pool())
+        .await
+        .unwrap();
+    assert_eq!(stored, actor);
+    let family_actors: Vec<String> = sqlx::query_scalar(
+        "SELECT impersonator FROM refresh_families WHERE impersonator IS NOT NULL",
+    )
+    .fetch_all(h.db().owner_pool())
+    .await
+    .unwrap();
+    assert_eq!(family_actors, vec![actor]);
+}
+
+#[tokio::test]
+async fn a_blocked_pairwise_impersonator_cannot_keep_minting_with_an_existing_binding() {
+    let h = Harness::start_store_backed().await;
+    common::pairwise::configure(&h, h.client_id(), "actor-fence.example.test").await;
+    let client = h.client_id().to_string();
+    let user = h.seed_unique_user().await;
+    let actor = h.seed_unique_user().await;
+    h.grant_consent(&user, &client).await;
+    let (_, cookie) = common::pairwise::impersonated_session(&h, &user, &actor).await;
+    let code = authorize_to_code(&h, &client, &[], &cookie).await;
+    let (_, _, refresh_token) = exchange(&h, &client, &code).await;
+    // The actor binding already exists; the target user's session remains live.
+    h.set_user_state(&actor, ironauth_store::UserState::Blocked)
+        .await;
+    let code = authorize_to_code(&h, &client, &[], &cookie).await;
+    for request in [
+        token_form(&code, &client),
+        form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh_token),
+            ("client_id", &client),
+        ]),
+    ] {
+        let (status, _, body) = h.token(&request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json(&body)["error"], "invalid_grant");
+    }
+}
