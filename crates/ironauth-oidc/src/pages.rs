@@ -1155,11 +1155,12 @@ pub(crate) fn notice_page_with_link(
         message = escape_html(message),
     );
     if let Some((href, label)) = link {
-        body.push_str(&format!(
+        let _ = write!(
+            body,
             "<p><a href=\"{}\">{}</a></p>",
             escape_html(href),
             escape_html(label),
-        ));
+        );
     }
     notice_document(&escape_html(title), &body)
 }
