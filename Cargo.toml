@@ -130,7 +130,7 @@ getrandom = "0.4"
 # extractors. The utoipa-axum route-binding helper is deliberately NOT used: it
 # pulls the unmaintained `paste` crate (RUSTSEC-2024-0436), which `cargo deny`
 # rejects; wiring the router by hand keeps the dependency graph clean.
-utoipa = { version = "5", features = ["axum_extras"] }
+utoipa = { version = "6", features = ["axum_extras"] }
 
 # Persistence and isolation layer (crates/ironauth-store). Runtime query API
 # only (sqlx::query / query_as / QueryBuilder), never the compile-time-checked
