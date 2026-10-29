@@ -24,7 +24,7 @@ sha2.workspace = true
 # runtime never compiles a hook on the request path, only deserializes what deployment
 # already compiled. See `engine.rs` for why that distinction is a security boundary and
 # not just a latency one.
-wasmtime = { version = "=49.0.2", default-features = false, features = [
+wasmtime = { version = "=50.0.0", default-features = false, features = [
     "component-model",
     "cranelift",
     "runtime",
